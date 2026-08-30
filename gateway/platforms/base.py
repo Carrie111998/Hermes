@@ -151,6 +151,12 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         scope_id = getattr(source, "scope_id", None)
         if scope_id:
             metadata["slack_team_id"] = str(scope_id)
+    if (
+        _platform_name(getattr(source, "platform", None)) == "feishu"
+        and thread_id is not None
+        and reply_to_message_id is not None
+    ):
+        metadata["reply_to_message_id"] = str(reply_to_message_id)
     if not metadata:
         return None
     if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
@@ -207,10 +213,10 @@ def _reply_anchor_for_event(event) -> str | None:
             # the newest user message. A quoted parent remains only a recovery
             # fallback when a synthetic/resumed event has no current message ID.
             return getattr(event, "message_id", None) or getattr(event, "reply_to_message_id", None)
-        if getattr(source, "chat_type", None) == "group":
-            # A group-channel mention is a new top-level chat message unless the
-            # inbound event carries a real Feishu thread_id.  Passing message_id
-            # here would call message.reply and render the answer as a reply/topic.
+        if getattr(source, "chat_type", None) != "dm":
+            # A non-DM mention is a new top-level chat message unless the inbound
+            # event carries a real Feishu thread_id. Passing message_id here would
+            # call message.reply and render group/forum/channel answers as topics.
             return None
     return getattr(event, "message_id", None)
 

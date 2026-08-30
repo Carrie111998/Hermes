@@ -4323,8 +4323,11 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client or not message_id:
             return FeishuQuotedMessageContext()
         if message_id in self._message_text_cache:
-            self._message_text_cache.move_to_end(message_id)
-            return self._message_text_cache[message_id]
+            cached_context = self._message_text_cache[message_id]
+            if all(os.path.exists(path) for path in cached_context.media_urls):
+                self._message_text_cache.move_to_end(message_id)
+                return cached_context
+            self._message_text_cache.pop(message_id, None)
         try:
             request = self._build_get_message_request(message_id)
             response = await self._run_blocking(self._client.im.v1.message.get, request)
