@@ -6201,6 +6201,7 @@ def _run_with_idle_timeout(
     idle_timeout_seconds: int = 180,
     indent: str = "    ",
     env: dict[str, str] | None = None,
+    activity: str = "Build",
 ) -> subprocess.CompletedProcess:
     """Run a subprocess that streams output, with an idle-output timeout.
 
@@ -6283,7 +6284,7 @@ def _run_with_idle_timeout(
     combined = "".join(merged_chunks)
     if idle_killed:
         msg = (
-            f"\n  ⚠ Build produced no output for {idle_timeout_seconds}s — terminated.\n"
+            f"\n  ⚠ {activity} produced no output for {idle_timeout_seconds}s — terminated.\n"
             "    Common causes: out-of-memory on a low-RAM host (WSL/container),\n"
             "    a stuck Node process, or an antivirus scan stalling I/O.\n"
         )
@@ -6389,11 +6390,26 @@ def _run_npm_install_deterministic(
     run_env = _npm_lifecycle_env(env)
 
     def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-        return _run_npm_watching_for_engine_failure(
+        if capture_output:
+            return _run_npm_watching_for_engine_failure(
+                cmd,
+                cwd=cwd,
+                env=run_env,
+                capture_output=True,
+            )
+        # Streaming callers (the `hermes update` ui-tui/web install) previously
+        # invoked the bare subprocess with no timeout, so a deadlocked `npm ci`
+        # (Issue #39267: reify stalls silently on some hosts) blocked `hermes
+        # update` forever instead of failing over to `npm install`. Reuse the
+        # same idle-output timeout the `npm run build` path already uses
+        # (#33788): a silent stall is terminated and `_attempt`'s ci->install
+        # fallback can finally fire.
+        return _run_with_idle_timeout(
             cmd,
             cwd=cwd,
             env=run_env,
-            capture_output=capture_output,
+            indent="",
+            activity="npm install",
         )
 
     def _attempt(npm_exe: str) -> subprocess.CompletedProcess:
