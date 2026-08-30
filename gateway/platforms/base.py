@@ -3919,12 +3919,6 @@ class BasePlatformAdapter(ABC):
         """Return whether this adapter currently owns a run for ``session_key``."""
         return session_key in self._active_sessions
 
-    def active_session_generation(self, session_key: str) -> int | None:
-        """Return the run generation owning ``session_key``, when available."""
-        guard = self._active_sessions.get(session_key)
-        generation = getattr(guard, "_hermes_run_generation", None)
-        return int(generation) if generation is not None else None
-
     def set_platform_event_handler(
         self,
         handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]],
@@ -6131,6 +6125,11 @@ class BasePlatformAdapter(ABC):
         if guard is not None and current_guard is not guard:
             return
         del self._active_sessions[session_key]
+        callback = self._session_idle_callbacks.pop(session_key, None)
+        if callable(callback):
+            task = asyncio.create_task(self._run_session_idle_callback(callback))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
     def _session_task_is_stale(self, session_key: str) -> bool:
         """Return True if the owner task for ``session_key`` is done/cancelled.
@@ -6417,7 +6416,10 @@ class BasePlatformAdapter(ABC):
         if deferred_service is None:
             deferred_service = getattr(self, "_deferred_question_service", None)
         pending_deferred = (
-            deferred_service.pending_for_session(session_key)
+            deferred_service.pending_for_session(
+                session_key,
+                adapter_profile=event.source.adapter_profile,
+            )
             if deferred_service is not None and not event.get_command()
             else None
         )
@@ -6463,6 +6465,8 @@ class BasePlatformAdapter(ABC):
                     return
                 if deferred_result is not None:
                     return
+            else:
+                deferred_service.park_awaiting(pending_deferred.id)
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -7451,11 +7455,6 @@ class BasePlatformAdapter(ABC):
         self._release_session_guard(session_key, guard=interrupt_event)
         if session_key not in self._active_sessions:
             self._session_tasks.pop(session_key, None)
-            callback = self._session_idle_callbacks.pop(session_key, None)
-            if callable(callback):
-                task = asyncio.create_task(self._run_session_idle_callback(callback))
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
     
     async def cancel_background_tasks(self) -> None:
         """Cancel any in-flight background message-processing tasks.

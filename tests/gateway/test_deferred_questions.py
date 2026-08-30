@@ -563,23 +563,11 @@ class _DeliveryAdapter:
         self.active = active
         self.outcomes = list(outcomes)
         self.attempts = 0
-        self.callbacks = {}
         self.sent = []
 
     def is_session_active(self, session_key: str) -> bool:
         assert session_key == "plow_chat:home:owner"
         return self.active
-
-    def active_session_generation(self, session_key: str) -> int | None:
-        return 7 if self.active else None
-
-    def register_post_delivery_callback(
-        self, session_key, callback, *, generation=None
-    ) -> None:
-        self.callbacks[session_key] = (generation, callback)
-
-    def register_session_idle_callback(self, session_key, callback) -> None:
-        self.callbacks[session_key] = (None, callback)
 
     async def deliver_deferred_message(self, delivery_source, content):
         self.attempts += 1
@@ -680,31 +668,10 @@ async def test_relay_deferred_delivery_uses_transport_and_restores_routing(
 
 
 @pytest.mark.asyncio
-async def test_busy_session_delivers_only_from_completion_callback(
-    tmp_path: Path,
-) -> None:
-    service = _service(tmp_path / "questions.sqlite3")
-    question = _enqueue(service)
-    adapter = _DeliveryAdapter(service, active=True)
-    service.bind_adapter("plow_chat", adapter)
-    service.adapter_connected("plow_chat", adapter)
-
-    await service.deliver_ready("plow_chat")
-
-    assert adapter.sent == []
-    assert service.get(question.id).state == "queued"
-    generation, callback = adapter.callbacks[question.session_key]
-    assert generation is None
-    adapter.active = False
-    await callback()
-
-    assert adapter.sent == [("home", "May I send invites?")]
-    assert service.get(question.id).state == "awaiting"
-
-
-@pytest.mark.asyncio
+@pytest.mark.parametrize("release_path", ["cleanup", "direct"])
 async def test_busy_question_wakes_only_after_session_guard_is_released(
     tmp_path: Path,
+    release_path: str,
 ) -> None:
     import asyncio
 
@@ -745,7 +712,10 @@ async def test_busy_question_wakes_only_after_session_guard_is_released(
 
     assert adapter.sent == []
     assert session_key in adapter._session_idle_callbacks
-    adapter._cleanup_finished_session_task(session_key, guard)
+    if release_path == "cleanup":
+        adapter._cleanup_finished_session_task(session_key, guard)
+    else:
+        adapter._release_session_guard(session_key, guard=guard)
     await asyncio.sleep(0)
     await asyncio.sleep(0)
 
@@ -755,37 +725,53 @@ async def test_busy_question_wakes_only_after_session_guard_is_released(
 
 @pytest.mark.asyncio
 async def test_profile_owned_adapter_delivers_its_own_questions(tmp_path: Path) -> None:
+    import asyncio
+
+    from gateway.deferred_questions import DeferredQuestionResult
+    from gateway.platforms.base import MessageEvent, MessageType
     from gateway.session import SessionSource, build_session_key
 
     service = _service(tmp_path / "questions.sqlite3")
     primary = _GatewayAdapter()
+    primary.set_owner_profile("work")
     primary._running = True
-    primary.set_deferred_question_service(service, profile_name="work")
+    primary.set_deferred_question_service(service, profile_name="default")
+    primary.set_authorization_check(lambda *_args: True)
+    primary._message_handler = AsyncMock(return_value="ordinary")
     secondary = _GatewayAdapter()
-    secondary.set_owner_profile("work")
+    secondary.set_owner_profile("default")
     secondary._running = True
-    secondary.set_deferred_question_service(service, profile_name="work")
-    service.register_handler("plow-chat", "invite-consent", AsyncMock())
+    secondary.set_deferred_question_service(service)
+    secondary.set_authorization_check(lambda *_args: True)
+    secondary._message_handler = AsyncMock(return_value="ordinary")
+    handled = []
+
+    async def handle(record, answer):
+        handled.append((record.id, answer))
+        return DeferredQuestionResult.done("")
+
+    service.register_handler("plow-chat", "invite-consent", handle)
 
     primary_source = SessionSource(
         platform=Platform.TELEGRAM,
-        chat_id="primary-chat",
+        chat_id="shared-chat",
         chat_type="dm",
         user_id="owner",
-        profile="work",
-        adapter_profile="default",
+        profile="default",
+        adapter_profile="work",
     )
     secondary_source = SessionSource(
         platform=Platform.TELEGRAM,
-        chat_id="secondary-chat",
+        chat_id="shared-chat",
         chat_type="dm",
         user_id="owner",
-        profile="work",
-        adapter_profile="work",
+        profile="default",
+        adapter_profile="default",
     )
+    session_key = build_session_key(primary_source, profile="default")
     primary_question = service.enqueue(
         plugin_id="plow-chat",
-        session_key=build_session_key(primary_source, profile="work"),
+        session_key=session_key,
         delivery_source=primary_source.to_dict(),
         question="Primary prompt",
         handler_name="invite-consent",
@@ -794,7 +780,7 @@ async def test_profile_owned_adapter_delivers_its_own_questions(tmp_path: Path) 
     )
     secondary_question = service.enqueue(
         plugin_id="plow-chat",
-        session_key=build_session_key(secondary_source, profile="work"),
+        session_key=session_key,
         delivery_source=secondary_source.to_dict(),
         question="Secondary prompt",
         handler_name="invite-consent",
@@ -805,10 +791,53 @@ async def test_profile_owned_adapter_delivers_its_own_questions(tmp_path: Path) 
     await service.deliver_ready("telegram")
 
     assert service.get(primary_question.id).state == "awaiting"
+    assert service.get(secondary_question.id).state == "queued"
+    assert primary.sent == [("shared-chat", "Primary prompt", None, {"notify": True})]
+    assert secondary.sent == []
+
+    await secondary.handle_message(
+        MessageEvent(
+            text="too early",
+            source=SessionSource.from_dict(secondary_source.to_dict()),
+            message_id="secondary-early",
+            message_type=MessageType.TEXT,
+        )
+    )
+    await asyncio.gather(*tuple(secondary._background_tasks))
+
+    assert handled == []
+    assert service.get(primary_question.id).state == "awaiting"
+
+    await primary.handle_message(
+        MessageEvent(
+            text="yes-primary",
+            source=SessionSource.from_dict(primary_source.to_dict()),
+            message_id="primary-answer",
+            message_type=MessageType.TEXT,
+        )
+    )
+
+    assert handled == [(primary_question.id, "yes-primary")]
     assert service.get(secondary_question.id).state == "awaiting"
-    assert primary.sent == [("primary-chat", "Primary prompt", None, {"notify": True})]
-    assert secondary.sent == [
-        ("secondary-chat", "Secondary prompt", None, {"notify": True})
+    assert secondary.sent[-1] == (
+        "shared-chat",
+        "Secondary prompt",
+        None,
+        {"notify": True},
+    )
+
+    await secondary.handle_message(
+        MessageEvent(
+            text="yes-secondary",
+            source=SessionSource.from_dict(secondary_source.to_dict()),
+            message_id="secondary-answer",
+            message_type=MessageType.TEXT,
+        )
+    )
+
+    assert handled == [
+        (primary_question.id, "yes-primary"),
+        (secondary_question.id, "yes-secondary"),
     ]
 
 
@@ -835,22 +864,6 @@ async def test_question_waits_while_plugin_handler_is_unavailable(
     assert service.get(question.id).state == "awaiting"
 
 
-def test_session_source_round_trips_adapter_profile() -> None:
-    from gateway.session import SessionSource
-
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="home",
-        profile="work",
-        adapter_profile="default",
-    )
-
-    restored = SessionSource.from_dict(source.to_dict())
-
-    assert restored.profile == "work"
-    assert restored.adapter_profile == "default"
-
-
 @pytest.mark.asyncio
 async def test_reply_is_not_consumed_while_plugin_handler_is_unavailable(
     tmp_path: Path,
@@ -862,6 +875,7 @@ async def test_reply_is_not_consumed_while_plugin_handler_is_unavailable(
 
     service = _service(tmp_path / "questions.sqlite3")
     adapter = _GatewayAdapter()
+    adapter._running = True
     adapter.set_deferred_question_service(service)
     adapter.set_authorization_check(lambda *_args: True)
     adapter._message_handler = AsyncMock(return_value="ordinary")
@@ -890,9 +904,21 @@ async def test_reply_is_not_consumed_while_plugin_handler_is_unavailable(
     )
     await asyncio.gather(*tuple(adapter._background_tasks))
 
-    assert service.get(question.id).state == "awaiting"
+    assert service.get(question.id).state == "queued"
     adapter._message_handler.assert_awaited_once()
     assert adapter.sent == [("home", "ordinary", "msg-answer", {"notify": True})]
+
+    service.register_handler("plow-chat", "invite-consent", AsyncMock())
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert service.get(question.id).state == "awaiting"
+    assert adapter.sent[-1] == (
+        "home",
+        "May I send invites?",
+        None,
+        {"notify": True},
+    )
 
 
 @pytest.mark.asyncio

@@ -13382,6 +13382,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # default profile needs the same whole-handler runtime scope as a
             # secondary profile: authorization and prompt rendering both run
             # before the narrower agent-turn scope is installed.
+            _set_owner = getattr(adapter, "set_owner_profile", None)
+            if callable(_set_owner):
+                _set_owner(self._active_profile_name())
             adapter.set_message_handler(self._primary_message_handler())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
@@ -15186,6 +15189,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         del self._failed_platforms[platform]
                         continue
 
+                    _set_owner = getattr(adapter, "set_owner_profile", None)
+                    if callable(_set_owner):
+                        _set_owner(self._active_profile_name())
                     adapter.set_message_handler(self._primary_message_handler())
                     self._bind_multiplex_deferred_services(adapter)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)

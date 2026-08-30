@@ -272,17 +272,47 @@ class DeferredQuestionService:
         self._wake_record(record)
         return record
 
-    def pending_for_session(self, session_key: str) -> DeferredQuestion | None:
+    def pending_for_session(
+        self,
+        session_key: str,
+        *,
+        adapter_profile: str | None = None,
+    ) -> DeferredQuestion | None:
+        sql = """
+            SELECT * FROM deferred_questions
+            WHERE session_key = ?
+        """
+        params: tuple[object, ...] = (session_key,)
+        if adapter_profile is not None:
+            normalized_profile = adapter_profile.strip() or "default"
+            sql += """
+                AND COALESCE(
+                    json_extract(delivery_source_json, '$.adapter_profile'),
+                    'default'
+                ) = ?
+            """
+            params += (normalized_profile,)
+        sql += " ORDER BY created_at ASC LIMIT 1"
         with self._lock, self._transaction() as conn:
-            row = conn.execute(
-                """
-                SELECT * FROM deferred_questions
-                WHERE session_key = ?
-                ORDER BY created_at ASC LIMIT 1
-                """,
-                (session_key,),
-            ).fetchone()
+            row = conn.execute(sql, params).fetchone()
         return self._from_row(row)
+
+    def park_awaiting(self, question_id: str) -> DeferredQuestion | None:
+        """Return an unanswered prompt to the queue while its handler is absent."""
+        with self._lock, self._transaction() as conn:
+            changed = conn.execute(
+                """
+                UPDATE deferred_questions
+                SET state = 'queued', response = NULL, delivery_attempted = 0,
+                    updated_at = ?
+                WHERE id = ? AND state = 'awaiting'
+                """,
+                (time.time(), question_id),
+            ).rowcount
+        record = self.get(question_id) if changed else None
+        if record is not None:
+            self._wake_record(record)
+        return record
 
     def claim_for_delivery(self, question_id: str) -> DeferredQuestion | None:
         now = time.time()
@@ -700,11 +730,7 @@ class DeferredQuestionService:
                             """,
                             (record.id,),
                         )
-                    await self.deliver_ready(
-                        record.platform,
-                        record.session_key,
-                        adapter_profile=record.adapter_profile,
-                    )
+                    await self.deliver_ready(record.platform, record.session_key)
                 else:
                     with self._lock, self._transaction() as conn:
                         conn.execute(
@@ -742,11 +768,7 @@ class DeferredQuestionService:
                     (result.question, now, record.id),
                 )
         if result.resolved:
-            await self.deliver_ready(
-                record.platform,
-                record.session_key,
-                adapter_profile=record.adapter_profile,
-            )
+            await self.deliver_ready(record.platform, record.session_key)
         return result
 
     async def _recover_handling(self) -> None:
