@@ -21,14 +21,19 @@ def _(rid, params: dict) -> dict:
     _paste_counter += 1
     line_count = text.count("\n") + 1
     paste_dir = _hermes_home / "pastes"
-    paste_dir.mkdir(parents=True, exist_ok=True)
+    from tools.spill_safety import ensure_spill_dir, write_text_exclusive
+
+    ensure_spill_dir(paste_dir, private=True)
 
     from datetime import datetime
 
     paste_file = (
         paste_dir / f"paste_{_paste_counter}_{datetime.now().strftime('%H%M%S')}.txt"
     )
-    paste_file.write_text(text, encoding="utf-8")
+    write_text_exclusive(paste_file, text, private=True, overwrite=True)
+    from agent.oversized_paste import cleanup_paste_cache
+
+    cleanup_paste_cache(protected_paths=(paste_file,))
 
     placeholder = (
         f"[Pasted text #{_paste_counter}: {line_count} lines \u2192 {paste_file}]"

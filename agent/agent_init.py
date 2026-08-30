@@ -2099,6 +2099,30 @@ def init_agent(
     _compression_cfg = _agent_cfg.get("compression", {})
     if not isinstance(_compression_cfg, dict):
         _compression_cfg = {}
+
+    # Oversized-paste ingestion offload wiring (see agent/oversized_paste.py).
+    # Read once here from the top-level ``oversized_input`` config section and
+    # stash the resolved values on the agent so the per-turn ingestion
+    # chokepoint (agent/turn_context.py) stays config-load-free on the hot path.
+    _oversized_cfg = _agent_cfg.get("oversized_input", {})
+    if not isinstance(_oversized_cfg, dict):
+        _oversized_cfg = {}
+    agent._oversized_input_enabled = str(
+        _oversized_cfg.get("enabled", True)
+    ).lower() in {"true", "1", "yes"}
+    try:
+        agent._oversized_input_char_threshold = int(
+            _oversized_cfg.get("char_threshold", 50000)
+        )
+    except (TypeError, ValueError):
+        agent._oversized_input_char_threshold = 50000
+    for _key, _default in (("max_age_hours", 24.0), ("max_cache_mb", 100.0)):
+        try:
+            _value = float(_oversized_cfg.get(_key, _default))
+        except (TypeError, ValueError):
+            _value = _default
+        setattr(agent, f"_oversized_input_{_key}", max(0.0, _value))
+
     compression_threshold = float(_compression_cfg.get("threshold", 0.50))
     # Per-model/route compaction-threshold override. Codex gpt-5.4 / gpt-5.5
     # raise to 85% (the Codex backend caps both families at 272K, so the
