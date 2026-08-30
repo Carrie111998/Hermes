@@ -7574,7 +7574,7 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id,
         query_user_name,
     ) -> None:
-        """Plan and explicitly confirm a safe managed Wisdom operation."""
+        """Run a user-selected managed Wisdom operation in this bot's profile."""
         caller_id = str(getattr(query.from_user, "id", ""))
         if not self._is_callback_user_authorized(
             caller_id,
@@ -7607,32 +7607,55 @@ class TelegramAdapter(BasePlatformAdapter):
         phase, action, value = parts[1], parts[2], parts[3]
         await query.answer(text="Verifying…" if phase == "plan" else "Applying…")
 
+        async def run_scoped(operation):
+            owner_profile = getattr(self, "_owner_profile", None)
+            if not isinstance(owner_profile, str) or not owner_profile.strip():
+                return await asyncio.to_thread(operation)
+
+            # Secondary multiplexed bots must operate on the profile that owns
+            # their Telegram credential, not whichever profile happens to be
+            # active in the shared gateway process.
+            from gateway.run import _profile_runtime_scope
+            from hermes_cli.profiles import get_profile_dir
+
+            with _profile_runtime_scope(get_profile_dir(owner_profile)):
+                return await asyncio.to_thread(operation)
+
+        def apply_receipt(receipt: str):
+            from hermes_wisdom.service import WisdomService
+
+            service = WisdomService()
+            service.require_setup()
+            if action == "install":
+                if not receipt.startswith("wip_"):
+                    raise ValueError("invalid install receipt")
+                return service.install_apply(receipt, accept_partial=False)
+            if not receipt.startswith("wup_"):
+                raise ValueError("invalid update receipt")
+            return service.update_apply(
+                receipt,
+                accept_sensitive=False,
+                accept_partial=False,
+                preserve_modified=False,
+            )
+
         try:
             from hermes_wisdom.service import WisdomService
 
-            def run_action():
+            def plan_action():
                 service = WisdomService()
                 service.require_setup()
-                if phase == "plan":
-                    return (
-                        service.install_plan(value)
-                        if action == "install"
-                        else service.update_plan(value)
-                    )
-                if action == "install":
-                    if not value.startswith("wip_"):
-                        raise ValueError("invalid install receipt")
-                    return service.install_apply(value, accept_partial=False)
-                if not value.startswith("wup_"):
-                    raise ValueError("invalid update receipt")
-                return service.update_apply(
-                    value,
-                    accept_sensitive=False,
-                    accept_partial=False,
-                    preserve_modified=False,
+                return (
+                    # Omitting update_mode deliberately asks Gateway to apply
+                    # the organization's current default for this installation.
+                    service.install_plan(value, update_mode=None)
+                    if action == "install"
+                    else service.update_plan(value)
                 )
 
-            result = await asyncio.to_thread(run_action)
+            result = await run_scoped(
+                plan_action if phase == "plan" else lambda: apply_receipt(value)
+            )
         except Exception as exc:
             logger.warning(
                 "[%s] Collective Wisdom Telegram action failed: %s",
@@ -7707,26 +7730,40 @@ class TelegramAdapter(BasePlatformAdapter):
                 pass
             return
 
+        # The notification button is the explicit user action. Once the exact
+        # package has planned as fully compatible and non-sensitive, apply its
+        # hash-bound receipt immediately. Any condition that needs judgment was
+        # stopped above and remains available in the full Collective UI.
         receipt = str(result["receipt"])
-        verb = "Install" if action == "install" else "Update"
-        reply_markup = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    f"Confirm {verb.lower()}",
-                    callback_data=f"wi:confirm:{action}:{receipt}",
+        try:
+            applied = await run_scoped(lambda: apply_receipt(receipt))
+        except Exception as exc:
+            logger.warning(
+                "[%s] Collective Wisdom Telegram apply failed: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+            )
+            try:
+                await query.edit_message_text(
+                    text=(
+                        f"<b>{name}{version_label} could not be applied</b>\n"
+                        "Open Collective in Hermes to review the current state and try again."
+                    ),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
                 )
-            ],
-            [InlineKeyboardButton("Cancel", callback_data="wi:cancel")],
-        ])
+            except Exception:
+                pass
+            return
+
+        applied_version = applied.get("version") if isinstance(applied, dict) else None
+        applied_suffix = f" v{applied_version}" if isinstance(applied_version, int) else ""
+        verb = "installed" if action == "install" else "updated"
         try:
             await query.edit_message_text(
-                text=(
-                    f"<b>{verb} {name}{version_label}?</b>\n"
-                    "Hermes verified the exact package and local compatibility. "
-                    "Nothing changes until you confirm."
-                ),
+                text=f"✅ <b>{name}{applied_suffix} {verb}</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
+                reply_markup=None,
             )
         except Exception:
             pass

@@ -271,17 +271,10 @@ class TestTelegramApprovalCallback:
         assert (tmp_path / ".update_response").read_text() == "y"
 
     @pytest.mark.asyncio
-    async def test_wisdom_update_callback_plans_before_offering_confirmation(
+    async def test_wisdom_update_callback_plans_and_applies_compatible_update(
         self, monkeypatch
     ):
         adapter = _make_adapter()
-        monkeypatch.setattr(
-            "plugins.platforms.telegram.adapter.InlineKeyboardButton",
-            lambda text, callback_data: {"text": text, "callback_data": callback_data},
-        )
-        monkeypatch.setattr(
-            "plugins.platforms.telegram.adapter.InlineKeyboardMarkup", lambda rows: rows
-        )
         query = AsyncMock()
         query.data = "wi:plan:update:skill-3"
         query.message = MagicMock()
@@ -300,20 +293,120 @@ class TestTelegramApprovalCallback:
             "modified": False,
             "sensitive_expansion": [],
         }
+        service.update_apply.return_value = {
+            "skill_id": "skill-3",
+            "slug": "team-runbook",
+            "version": 3,
+        }
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
             with patch("hermes_wisdom.service.WisdomService", return_value=service):
                 await adapter._handle_callback_query(update, MagicMock())
 
-        service.require_setup.assert_called_once_with()
+        assert service.require_setup.call_count == 2
         service.update_plan.assert_called_once_with("skill-3")
-        service.update_apply.assert_not_called()
+        service.update_apply.assert_called_once_with(
+            "wup_deadbeef",
+            accept_sensitive=False,
+            accept_partial=False,
+            preserve_modified=False,
+        )
         edit_kwargs = query.edit_message_text.await_args.kwargs
-        assert "Update team-runbook v3?" in edit_kwargs["text"]
-        assert edit_kwargs["reply_markup"][0][0] == {
-            "callback_data": "wi:confirm:update:wup_deadbeef",
-            "text": "Confirm update",
+        assert "team-runbook v3 updated" in edit_kwargs["text"]
+        assert edit_kwargs["reply_markup"] is None
+
+    @pytest.mark.asyncio
+    async def test_wisdom_install_callback_uses_org_default_and_owning_profile(
+        self, monkeypatch, tmp_path
+    ):
+        adapter = _make_adapter()
+        adapter.set_owner_profile("customer-b")
+        query = AsyncMock()
+        query.data = "wi:plan:install:skill-4"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+        service = MagicMock()
+        service.install_plan.return_value = {
+            "receipt": "wip_deadbeef",
+            "skill_id": "skill-4",
+            "slug": "release-checklist",
+            "version": 2,
+            "compatibility": {"outcome": "compatible"},
+            "allowed": True,
         }
+        service.install_apply.return_value = {
+            "skill_id": "skill-4",
+            "slug": "release-checklist",
+            "version": 2,
+        }
+        entered_profiles = []
+
+        class _ProfileScope:
+            def __init__(self, home):
+                self.home = home
+
+            def __enter__(self):
+                entered_profiles.append(self.home)
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir",
+            lambda profile: tmp_path / "profiles" / profile,
+        )
+        monkeypatch.setattr("gateway.run._profile_runtime_scope", _ProfileScope)
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(update, MagicMock())
+
+        service.install_plan.assert_called_once_with("skill-4", update_mode=None)
+        service.install_apply.assert_called_once_with(
+            "wip_deadbeef", accept_partial=False
+        )
+        assert entered_profiles == [
+            tmp_path / "profiles" / "customer-b",
+            tmp_path / "profiles" / "customer-b",
+        ]
+        assert "release-checklist v2 installed" in (
+            query.edit_message_text.await_args.kwargs["text"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_wisdom_callback_does_not_apply_when_full_review_is_required(self):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "wi:plan:update:skill-3"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        update = MagicMock(callback_query=query)
+        service = MagicMock()
+        service.update_plan.return_value = {
+            "receipt": "wup_deadbeef",
+            "skill_id": "skill-3",
+            "slug": "team-runbook",
+            "version": 3,
+            "compatibility": {"outcome": "partial"},
+            "modified": False,
+            "sensitive_expansion": [],
+        }
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(update, MagicMock())
+
+        service.update_apply.assert_not_called()
+        assert "needs a full review" in (
+            query.edit_message_text.await_args.kwargs["text"]
+        )
 
     @pytest.mark.asyncio
     async def test_wisdom_update_confirmation_applies_exact_receipt(self):

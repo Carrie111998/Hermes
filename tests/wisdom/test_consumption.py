@@ -490,11 +490,13 @@ def test_feed_cursor_is_durable_deduplicated_and_telegram_uses_home_target(
     assert delivered == {"attempted": True, "delivered": 1}
     assert "managed-skill" in calls[0]["message"]
     assert "skill-1" not in calls[0]["message"]
-    assert calls[0]["buttons"] == [
-        {
-            "label": "View managed-skill v2",
-            "url": "https://portal.nousresearch.com/orgs/org-1/wisdom/skills/skill-1?version=2",
-        }
+    assert calls[0]["button_rows"] == [
+        [
+            {
+                "label": "View ↗",
+                "url": "https://portal.nousresearch.com/orgs/org-1/wisdom/skills/skill-1?version=2",
+            }
+        ]
     ]
 
 
@@ -530,15 +532,17 @@ def test_telegram_update_available_offers_verified_update_action(
     )
 
     assert manager.dispatch_telegram() == {"attempted": True, "delivered": 1}
-    assert calls[0]["buttons"] == [
-        {
-            "label": "Update managed-skill v2",
-            "callback_data": "wi:plan:update:skill-1",
-        },
-        {
-            "label": "View managed-skill v2",
-            "url": "https://portal.nousresearch.com/orgs/org-1/wisdom/skills/skill-1?version=2",
-        },
+    assert calls[0]["button_rows"] == [
+        [
+            {
+                "label": "Update",
+                "callback_data": "wi:plan:update:skill-1",
+            },
+            {
+                "label": "View ↗",
+                "url": "https://portal.nousresearch.com/orgs/org-1/wisdom/skills/skill-1?version=2",
+            },
+        ]
     ]
 
 
@@ -619,15 +623,17 @@ def test_notifications_resolve_org_skill_names_filter_noise_and_deep_link(
         lambda **kwargs: calls.append(kwargs) or {"success": True},
     )
     assert manager.dispatch_telegram() == {"attempted": True, "delivered": 1}
-    assert calls[0]["buttons"] == [
-        {
-            "label": "Install team-runbook v3",
-            "callback_data": "wi:plan:install:remote-skill",
-        },
-        {
-            "label": "View team-runbook v3",
-            "url": "http://127.0.0.1:3111/orgs/org-1/wisdom/skills/remote-skill?version=3",
-        },
+    assert calls[0]["button_rows"] == [
+        [
+            {
+                "label": "Install",
+                "callback_data": "wi:plan:install:remote-skill",
+            },
+            {
+                "label": "View ↗",
+                "url": "http://127.0.0.1:3111/orgs/org-1/wisdom/skills/remote-skill?version=3",
+            },
+        ]
     ]
 
     manager.notifications(mark_seen=True)

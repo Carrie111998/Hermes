@@ -1139,32 +1139,34 @@ class WisdomConsumption:
             "<b>Collective Wisdom</b>",
             f"{len(selected)} new {'update' if len(selected) == 1 else 'updates'}",
         ]
-        buttons: list[dict[str, str]] = []
+        button_rows: list[list[dict[str, str]]] = []
         for event in selected:
             heading, detail = self._telegram_notification_text(event)
             lines.extend(["", heading, detail])
-            version = f" v{event['version']}" if event.get("version") else ""
+            row: list[dict[str, str]] = []
             if event["category"] == "new_skill":
-                buttons.append({
-                    "label": f"Install {event['skill_name']}{version}",
+                row.append({
+                    "label": "Install",
                     "callback_data": f"wi:plan:install:{event['skill_id']}",
                 })
             elif event["category"] == "update_available":
-                buttons.append({
-                    "label": f"Update {event['skill_name']}{version}",
+                row.append({
+                    "label": "Update",
                     "callback_data": f"wi:plan:update:{event['skill_id']}",
                 })
             portal_url = event.get("portal_url")
             if isinstance(portal_url, str) and portal_url:
-                buttons.append({
-                    "label": f"View {event['skill_name']}{version}",
+                row.append({
+                    "label": "View ↗",
                     "url": portal_url,
                 })
+            if row:
+                button_rows.append(row)
         try:
             from tools.send_message_tool import send_telegram_notification_pane
 
             raw = send_telegram_notification_pane(
-                message="\n".join(lines), buttons=buttons
+                message="\n".join(lines), button_rows=button_rows
             )
             result = json.loads(raw) if isinstance(raw, str) else raw
         except Exception as exc:

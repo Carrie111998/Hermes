@@ -321,12 +321,14 @@ class TestSendMessageTool:
              patch("tools.send_message_tool._send_telegram", new=AsyncMock(return_value={"success": True})) as send_mock:
             result = send_telegram_notification_pane(
                 message="Collective Wisdom",
-                buttons=[
-                    {
-                        "label": "Update team-runbook v3",
-                        "callback_data": "wi:plan:update:skill-3",
-                    },
-                    {"label": "Unsafe", "callback_data": "ea:always:1"},
+                button_rows=[
+                    [
+                        {
+                            "label": "Update",
+                            "callback_data": "wi:plan:update:skill-3",
+                        },
+                        {"label": "Unsafe", "callback_data": "ea:always:1"},
+                    ],
                 ],
             )
 
@@ -336,11 +338,13 @@ class TestSendMessageTool:
             "123",
             "Collective Wisdom",
             disable_link_previews=True,
-            action_buttons=[
-                {
-                    "label": "Update team-runbook v3",
-                    "callback_data": "wi:plan:update:skill-3",
-                }
+            action_button_rows=[
+                [
+                    {
+                        "label": "Update",
+                        "callback_data": "wi:plan:update:skill-3",
+                    }
+                ]
             ],
         )
 
@@ -888,7 +892,7 @@ class TestSendTelegramHtmlDetection:
             ]
         }
 
-    def test_notification_callback_buttons_render_as_action_rows(self, monkeypatch):
+    def test_notification_action_buttons_share_their_requested_rows(self, monkeypatch):
         bot = self._make_bot()
         _install_telegram_mock(monkeypatch, bot)
 
@@ -897,15 +901,17 @@ class TestSendTelegramHtmlDetection:
                 "tok",
                 "123",
                 "<b>Collective Wisdom</b>",
-                action_buttons=[
-                    {
-                        "label": "Update team-runbook v3",
-                        "callback_data": "wi:plan:update:skill-3",
-                    },
-                    {
-                        "label": "View team-runbook v3",
-                        "url": "https://portal.example/orgs/team/wisdom/skills/skill-3?version=3",
-                    },
+                action_button_rows=[
+                    [
+                        {
+                            "label": "Update",
+                            "callback_data": "wi:plan:update:skill-3",
+                        },
+                        {
+                            "label": "View ↗",
+                            "url": "https://portal.example/orgs/team/wisdom/skills/skill-3?version=3",
+                        },
+                    ],
                 ],
             )
         )
@@ -916,14 +922,12 @@ class TestSendTelegramHtmlDetection:
                 [
                     {
                         "callback_data": "wi:plan:update:skill-3",
-                        "text": "Update team-runbook v3",
-                    }
-                ],
-                [
+                        "text": "Update",
+                    },
                     {
-                        "text": "View team-runbook v3",
+                        "text": "View ↗",
                         "url": "https://portal.example/orgs/team/wisdom/skills/skill-3?version=3",
-                    }
+                    },
                 ],
             ]
         }

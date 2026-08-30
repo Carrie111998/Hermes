@@ -262,13 +262,15 @@ def send_message_tool(args, **kw):
 
 
 def send_telegram_notification_pane(
-    *, message: str, buttons: list[dict[str, str]]
+    *, message: str, button_rows: list[list[dict[str, str]]]
 ) -> dict:
     """Send an internal notification to the Telegram home chat with trusted actions.
 
     This is intentionally not part of the model-facing ``send_message`` schema.
-    Product notifications can offer trusted Portal deep links without giving an
-    arbitrary tool caller a second, Telegram-specific message surface.
+    Product notifications can offer trusted managed actions and Portal deep
+    links without giving an arbitrary tool caller a second, Telegram-specific
+    message surface. Rows are explicit so each skill keeps its action and link
+    together in Telegram's compact inline keyboard.
     """
     prepare_send_message_platforms()
     try:
@@ -283,27 +285,36 @@ def send_telegram_notification_pane(
         if not home:
             return _error("Telegram has no configured home channel")
 
-        safe_buttons: list[dict[str, str]] = []
-        for button in buttons[:16]:
-            label = str(button.get("label") or "").strip()[:64]
-            url = str(button.get("url") or "").strip()
-            if label and re.fullmatch(r"https?://[^\s]+", url):
-                safe_buttons.append({"label": label, "url": url})
-                continue
-            callback_data = str(button.get("callback_data") or "").strip()
-            if (
-                label
-                and len(callback_data.encode("utf-8")) <= 64
-                and re.fullmatch(
-                    r"wi:(?:plan:(?:install|update):[A-Za-z0-9_-]+|"
-                    r"confirm:(?:install|update):w(?:ip|up)_[a-f0-9]+|cancel)",
-                    callback_data,
-                )
-            ):
-                safe_buttons.append({
-                    "label": label,
-                    "callback_data": callback_data,
-                })
+        safe_rows: list[list[dict[str, str]]] = []
+        button_count = 0
+        for row in button_rows[:8]:
+            safe_row: list[dict[str, str]] = []
+            for button in row[:2]:
+                if button_count >= 16:
+                    break
+                label = str(button.get("label") or "").strip()[:32]
+                url = str(button.get("url") or "").strip()
+                if label and re.fullmatch(r"https?://[^\s]+", url):
+                    safe_row.append({"label": label, "url": url})
+                    button_count += 1
+                    continue
+                callback_data = str(button.get("callback_data") or "").strip()
+                if (
+                    label
+                    and len(callback_data.encode("utf-8")) <= 64
+                    and re.fullmatch(
+                        r"wi:(?:plan:(?:install|update):[A-Za-z0-9_-]+|"
+                        r"confirm:(?:install|update):w(?:ip|up)_[a-f0-9]+|cancel)",
+                        callback_data,
+                    )
+                ):
+                    safe_row.append({
+                        "label": label,
+                        "callback_data": callback_data,
+                    })
+                    button_count += 1
+            if safe_row:
+                safe_rows.append(safe_row)
 
         from model_tools import _run_async
 
@@ -313,7 +324,7 @@ def send_telegram_notification_pane(
                 home.chat_id,
                 message,
                 disable_link_previews=True,
-                action_buttons=safe_buttons,
+                action_button_rows=safe_rows,
             )
         )
         return result if isinstance(result, dict) else {"success": bool(result)}
@@ -1413,6 +1424,7 @@ async def _send_telegram(
     force_document=False,
     url_buttons=None,
     action_buttons=None,
+    action_button_rows=None,
 ):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
@@ -1505,7 +1517,23 @@ async def _send_telegram(
         if disable_link_previews:
             text_kwargs["disable_web_page_preview"] = True
         reply_markup = None
-        if action_buttons:
+        if action_button_rows:
+            reply_markup = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        str(button["label"]),
+                        **(
+                            {"url": str(button["url"])}
+                            if button.get("url")
+                            else {"callback_data": str(button["callback_data"])}
+                        ),
+                    )
+                    for button in row
+                ]
+                for row in action_button_rows
+                if row
+            ])
+        elif action_buttons:
             reply_markup = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton(
