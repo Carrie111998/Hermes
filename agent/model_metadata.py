@@ -676,6 +676,7 @@ def is_grok_46_family(model: str) -> bool:
 _CONTEXT_LENGTH_KEYS = (
     "context_length",
     "context_window",
+    "contextwindow",
     "context_size",
     "max_context_length",
     "max_position_embeddings",
