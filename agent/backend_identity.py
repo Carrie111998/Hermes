@@ -38,6 +38,8 @@ from enum import Enum
 from typing import Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from agent.failure_scope import is_deterministic_tls_failure_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -75,7 +77,10 @@ _REASON_SCOPES = {
 
 def classify_failure_scope(reason: Optional[str]) -> FailureScope:
     """Map a human-readable failure reason to the identity axis it kills."""
-    return _REASON_SCOPES.get((reason or "").strip().lower(), FailureScope.MODEL)
+    normalized = (reason or "").strip().lower()
+    if is_deterministic_tls_failure_text(normalized):
+        return FailureScope.ENDPOINT
+    return _REASON_SCOPES.get(normalized, FailureScope.MODEL)
 
 
 def _norm_provider(value: Optional[str]) -> str:

@@ -470,3 +470,61 @@ class TestTopLevelFallbackIdentity:
         assert [kwargs["model"] for _, kwargs in resolver_calls] == ["model-valid"]
         assert resolver_calls[0][1]["explicit_api_key"] == "entry-key-b"
         assert resolver_calls[0][1]["allow_provider_fallback"] is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "sslv3 alert handshake failure",
+        "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure (_ssl.c:1000)",
+        "[SSL: SSL3_ALERT_HANDSHAKE_FAILURE] ssl3 alert handshake failure",
+        "[SSL: TLSV1_ALERT_PROTOCOL_VERSION] tlsv1 alert protocol version",
+        "httpx.ConnectError: [SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] handshake failure",
+    ],
+)
+def test_alert_form_tls_failures_are_endpoint_scoped(message):
+    error = ssl.SSLError(message)
+    assert is_connection_error(error)
+    assert is_endpoint_unreachable_error(error)
+    assert not is_transient_transport_error(error)
+    assert classify_failure_scope(message) is FailureScope.ENDPOINT
+
+
+def test_sync_alert_form_tls_failure_skips_same_endpoint_retry(monkeypatch):
+    primary = MagicMock(base_url="https://untrusted.example/v1")
+    primary.chat.completions.create.side_effect = ssl.SSLError(
+        "[SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure"
+    )
+    fallback = MagicMock(base_url="https://healthy.example/v1")
+    fallback.chat.completions.create.return_value = {"fallback": True}
+    monkeypatch.setattr("agent.auxiliary_client._transient_retry_count", lambda: 2)
+    p1, p2, p3 = _patches(primary)
+    with p1, p2, p3, patch(
+        "agent.auxiliary_client._try_configured_fallback_chain",
+        return_value=(fallback, "fallback-model", "fallback_chain[0](custom)"),
+    ) as chain:
+        result = call_llm(task="session_search", messages=[{"role": "user", "content": "hi"}])
+    assert result == {"fallback": True}
+    assert primary.chat.completions.create.call_count == 1
+    assert chain.call_args.kwargs["failure_scope"] is FailureScope.ENDPOINT
+    assert chain.call_args.kwargs["failed_model"] is None
+
+
+@pytest.mark.asyncio
+async def test_async_alert_form_tls_failure_skips_same_endpoint_retry(monkeypatch):
+    primary = MagicMock(base_url="https://untrusted.example/v1")
+    primary.chat.completions.create = AsyncMock(
+        side_effect=ssl.SSLError(
+            "[SSL: TLSV1_ALERT_PROTOCOL_VERSION] tlsv1 alert protocol version"
+        )
+    )
+    fallback = MagicMock(base_url="https://healthy.example/v1")
+    fallback.chat.completions.create = AsyncMock(return_value={"fallback": True})
+    monkeypatch.setattr("agent.auxiliary_client._transient_retry_count", lambda: 2)
+    p1, p2, p3, p4, p5 = TestAsyncFallbackScope()._run_patches(primary, fallback)
+    with p1, p2, p3, p4 as chain, p5:
+        result = await async_call_llm(task="session_search", messages=[{"role": "user", "content": "hi"}])
+    assert result == {"fallback": True}
+    assert primary.chat.completions.create.await_count == 1
+    assert chain.call_args.kwargs["failure_scope"] is FailureScope.ENDPOINT
+    assert chain.call_args.kwargs["failed_model"] is None

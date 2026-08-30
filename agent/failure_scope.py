@@ -8,8 +8,21 @@ stronger claim that every model behind the URL should be skipped.
 
 from __future__ import annotations
 
+import re
 import ssl
 from typing import Optional
+
+
+_TLS_ALERT_RE = re.compile(r"\b(?:ssl|tls)(?:v?\d+)?_alert_[a-z0-9_]+\b")
+
+
+def is_deterministic_tls_failure_text(text: str) -> bool:
+    """Recognize OpenSSL alert text that deterministically invalidates a route."""
+    return bool(
+        _TLS_ALERT_RE.search(text)
+        or "alert handshake failure" in text
+        or "alert protocol failure" in text
+    )
 
 
 def is_timeout_error(exc: Exception) -> bool:
@@ -70,7 +83,7 @@ def is_endpoint_unreachable_error(exc: Exception) -> bool:
         if isinstance(current, ssl.SSLError):
             # Generic SSLError is endpoint-scoped only when its text proves a
             # deterministic certificate or protocol-negotiation failure.
-            if any(
+            if is_deterministic_tls_failure_text(text) or any(
                 marker in text
                 for marker in (
                     "certificate verify failed",
@@ -95,7 +108,7 @@ def is_endpoint_unreachable_error(exc: Exception) -> bool:
             return False
         if error_type in {"sslcertverificationerror", "certificateerror"}:
             return True
-        if any(
+        if is_deterministic_tls_failure_text(text) or any(
             marker in text
             for marker in (
                 "certificate verify failed",
@@ -175,7 +188,7 @@ def is_connection_error(exc: Exception) -> bool:
     )):
         return True
     err_lower = str(exc).lower()
-    if any(kw in err_lower for kw in (
+    if is_deterministic_tls_failure_text(err_lower) or any(kw in err_lower for kw in (
         "connection refused", "name or service not known",
         "no route to host", "network is unreachable", "timed out",
         "connection reset", "all connection attempts failed",
