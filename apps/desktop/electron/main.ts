@@ -11151,7 +11151,11 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
       return {
         ...primaryDescriptor,
         profile: profileKey,
-        connectionId: id
+        connectionId: id,
+        // Same contract as the fresh-dial remote/cloud branch below: one host
+        // serves every profile of this source, so REST paths must carry
+        // ?profile= instead of relying on the backend's own home scope.
+        sharedRemote: true
       }
     }
   }
