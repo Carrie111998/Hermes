@@ -19,8 +19,24 @@ vi.mock("@/lib/api", () => ({
 }));
 vi.mock("@/components/OAuthLoginModal", () => ({ OAuthLoginModal: () => null }));
 vi.mock("@nous-research/ui/ui/components/confirm-dialog", () => ({
-  ConfirmDialog: ({ open, onConfirm }: { open: boolean; onConfirm: () => void }) =>
-    open ? <button onClick={onConfirm}>Potwierdź rozłączenie</button> : null,
+  ConfirmDialog: ({
+    open,
+    onConfirm,
+    title,
+    description,
+  }: {
+    open: boolean;
+    onConfirm: () => void;
+    title: string;
+    description: string;
+  }) =>
+    open ? (
+      <div role="dialog">
+        <h2>{title}</h2>
+        <p>{description}</p>
+        <button onClick={onConfirm}>Potwierdź rozłączenie</button>
+      </div>
+    ) : null,
 }));
 
 import { OAuthProvidersCard } from "./OAuthProvidersCard";
@@ -30,7 +46,7 @@ const provider = {
   name: "OpenAI",
   flow: "pkce" as const,
   cli_command: "hermes login openai",
-  docs_url: "",
+  docs_url: "https://platform.openai.com/docs",
   status: { logged_in: true },
 };
 
@@ -60,6 +76,25 @@ describe("OAuthProvidersCard Polish disconnect feedback", () => {
       expect(onSuccess).toHaveBeenCalledWith("Rozłączono dostawcę OpenAI");
     });
     expect(onSuccess).not.toHaveBeenCalledWith(expect.stringContaining("Rozłączed"));
+  });
+
+  it("renders the exact Polish docs tooltip and disconnect dialog copy", async () => {
+    render(<OAuthProvidersCard />);
+
+    expect(
+      (await screen.findByTitle("Otwórz dokumentację OpenAI")).getAttribute("href"),
+    ).toBe("https://platform.openai.com/docs");
+
+    fireEvent.click(screen.getByRole("button", { name: "Rozłącz" }));
+
+    expect(screen.getByRole("dialog")).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "Rozłączyć dostawcę OpenAI?" })).not.toBeNull();
+    expect(
+      screen.getByText(
+        "Zapisane tokeny OAuth dostawcy OpenAI zostaną usunięte. Aby ponownie z niego korzystać, trzeba będzie się uwierzytelnić.",
+      ),
+    ).not.toBeNull();
+    expect(screen.queryByText(/This will remove/)).toBeNull();
   });
 
   it("uses a locale-owned complete error message", async () => {

@@ -172,6 +172,26 @@ describe("SkillsPage Polish active controls", () => {
     expect(screen.queryByTitle("Edit SKILL.md")).toBeNull();
   });
 
+  it("localizes known category labels while preserving the fallback for unknown external categories", async () => {
+    mocks.getSkills.mockResolvedValue([
+      { name: "cloud", description: "Test", category: "mlops/cloud", enabled: true },
+      { name: "evaluation", description: "Test", category: "mlops/evaluation", enabled: true },
+      { name: "vectors", description: "Test", category: "mlops/vector-databases", enabled: true },
+      { name: "red", description: "Test", category: "red-teaming", enabled: true },
+      { name: "external", description: "Test", category: "partner/custom-tools", enabled: true },
+    ]);
+
+    renderPolishPage();
+
+    expect(await screen.findByText("MLOps / Chmura")).not.toBeNull();
+    expect(screen.getByText("MLOps / Ewaluacja")).not.toBeNull();
+    expect(screen.getByText("MLOps / Bazy wektorowe")).not.toBeNull();
+    expect(screen.getByText("Red teaming")).not.toBeNull();
+    expect(screen.getByText("Partner Custom Tools")).not.toBeNull();
+    expect(screen.queryByText("MLOps / Cloud")).toBeNull();
+    expect(screen.queryByText("MLOps / Evaluation")).toBeNull();
+  });
+
   it("localizes the hub landing, connected-source status, cards, and accessibility names", async () => {
     renderPolishPage();
     await openHub();

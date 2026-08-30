@@ -163,6 +163,9 @@ describe('Polish dashboard localization', () => {
       'Połączono dostawców OAuth: {connected}/{total}. Wybierz „Zaloguj” dla przepływów obsługiwanych przez panel; polecenia CLI pozostają dostępne dla konfiguracji zewnętrznej lub zapasowej.'
     )
     expect(pl.oauth.login).toBe('Zaloguj')
+    expect(pl.oauth.notConnected).toBe(
+      'Nie połączono. Wybierz „Zaloguj”, gdy ta opcja jest dostępna, albo uruchom {command} w terminalu.'
+    )
     expect(pl.kanban.columnHelp.todo).toBe('Oczekuje na zależności lub nie ma przypisanego profilu')
     expect([pl.kanban.tenant, pl.kanban.allTenants]).toEqual(['Tenant', 'Wszystkie tenanty'])
     expect(pl.env.keySaved?.('OPENAI_API_KEY')).toBe('Zapisano klucz OPENAI_API_KEY')
@@ -178,6 +181,23 @@ describe('Polish dashboard localization', () => {
 
   it('owns the active Skills Hub vocabulary and enum mappings in Polish', () => {
     const hub = pl.skills.hub!
+
+    expect(pl.skills.categoryLabels).toEqual({
+      mlops: 'MLOps',
+      'mlops/cloud': 'MLOps / Chmura',
+      'mlops/evaluation': 'MLOps / Ewaluacja',
+      'mlops/inference': 'MLOps / Inferencja',
+      'mlops/models': 'MLOps / Modele',
+      'mlops/training': 'MLOps / Uczenie',
+      'mlops/vector-databases': 'MLOps / Bazy wektorowe',
+      mcp: 'MCP',
+      'red-teaming': 'Red teaming',
+      ocr: 'OCR',
+      p5js: 'p5.js',
+      ai: 'AI',
+      ux: 'UX',
+      ui: 'UI'
+    })
 
     expect([pl.skills.configure, pl.skills.editSkillMd, pl.skills.editSkill?.('audit')]).toEqual([
       'Konfiguruj',

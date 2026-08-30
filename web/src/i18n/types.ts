@@ -444,6 +444,8 @@ export interface Translations {
     enabledOf: string;
     all: string;
     categories: string;
+    /** Known bundled category ids; unknown external ids keep the UI fallback. */
+    categoryLabels?: Record<string, string>;
     filters: string;
     noSkills: string;
     noSkillsMatch: string;
@@ -678,6 +680,10 @@ export interface Translations {
     disconnectSuccess?: (provider: string) => string;
     disconnectFailed?: (error: string) => string;
     loadProvidersFailed?: (error: string) => string;
+    docsTooltip?: (provider: string) => string;
+    disconnectConfirmTitle?: (provider: string) => string;
+    disconnectConfirmDescription?: (provider: string) => string;
+    tokenLabel?: string;
   };
 
   // ── Language switcher ──

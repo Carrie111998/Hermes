@@ -419,6 +419,22 @@ export const pl: Translations = {
     enabledOf: 'włączone: {enabled}/{total}',
     all: 'Wszystkie',
     categories: 'Kategorie',
+    categoryLabels: {
+      mlops: 'MLOps',
+      'mlops/cloud': 'MLOps / Chmura',
+      'mlops/evaluation': 'MLOps / Ewaluacja',
+      'mlops/inference': 'MLOps / Inferencja',
+      'mlops/models': 'MLOps / Modele',
+      'mlops/training': 'MLOps / Uczenie',
+      'mlops/vector-databases': 'MLOps / Bazy wektorowe',
+      mcp: 'MCP',
+      'red-teaming': 'Red teaming',
+      ocr: 'OCR',
+      p5js: 'p5.js',
+      ai: 'AI',
+      ux: 'UX',
+      ui: 'UI'
+    },
     filters: 'Filtry',
     noSkills: 'Nie znaleziono umiejętności. Umiejętności są wczytywane z ~/.hermes/skills/',
     noSkillsMatch: 'Żadna umiejętność ani zestaw narzędzi nie pasuje do wyszukiwania lub filtra.',
@@ -629,7 +645,8 @@ Tutaj umieść ponumerowane kroki, dokładne polecenia i pułapki.
       'Połączono dostawców OAuth: {connected}/{total}. Wybierz „Zaloguj” dla przepływów obsługiwanych przez panel; polecenia CLI pozostają dostępne dla konfiguracji zewnętrznej lub zapasowej.',
     connected: 'Połączono',
     expired: 'Wygasło',
-    notConnected: 'Nie połączono. Użyj Logowania, gdy jest dostępne, albo uruchom {command} w terminalu.',
+    notConnected:
+      'Nie połączono. Wybierz „Zaloguj”, gdy ta opcja jest dostępna, albo uruchom {command} w terminalu.',
     runInTerminal: 'w terminalu.',
     noProviders: 'Nie wykryto dostawców obsługujących OAuth.',
     login: 'Zaloguj',
@@ -664,7 +681,12 @@ Tutaj umieść ponumerowane kroki, dokładne polecenia i pułapki.
     expiresIn: 'wygasa za {time}',
     disconnectSuccess: provider => `Rozłączono dostawcę ${provider}`,
     disconnectFailed: error => `Nie udało się rozłączyć dostawcy: ${error}`,
-    loadProvidersFailed: error => `Nie udało się wczytać dostawców: ${error}`
+    loadProvidersFailed: error => `Nie udało się wczytać dostawców: ${error}`,
+    docsTooltip: provider => `Otwórz dokumentację ${provider}`,
+    disconnectConfirmTitle: provider => `Rozłączyć dostawcę ${provider}?`,
+    disconnectConfirmDescription: provider =>
+      `Zapisane tokeny OAuth dostawcy ${provider} zostaną usunięte. Aby ponownie z niego korzystać, trzeba będzie się uwierzytelnić.`,
+    tokenLabel: 'token'
   },
 
   language: { switchTo: 'Zmień język' },

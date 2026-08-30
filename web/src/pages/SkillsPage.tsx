@@ -68,29 +68,13 @@ import { PluginSlot } from "@/plugins";
 /*  Types & helpers                                                    */
 /* ------------------------------------------------------------------ */
 
-const CATEGORY_LABELS: Record<string, string> = {
-  mlops: "MLOps",
-  "mlops/cloud": "MLOps / Cloud",
-  "mlops/evaluation": "MLOps / Evaluation",
-  "mlops/inference": "MLOps / Inference",
-  "mlops/models": "MLOps / Models",
-  "mlops/training": "MLOps / Training",
-  "mlops/vector-databases": "MLOps / Vector DBs",
-  mcp: "MCP",
-  "red-teaming": "Red Teaming",
-  ocr: "OCR",
-  p5js: "p5.js",
-  ai: "AI",
-  ux: "UX",
-  ui: "UI",
-};
-
 function prettyCategory(
   raw: string | null | undefined,
   generalLabel: string,
+  categoryLabels: Record<string, string>,
 ): string {
   if (!raw) return generalLabel;
-  if (CATEGORY_LABELS[raw]) return CATEGORY_LABELS[raw];
+  if (categoryLabels[raw]) return categoryLabels[raw];
   return raw
     .split(/[-_/]/)
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
@@ -303,7 +287,11 @@ export default function SkillsPage() {
       })
       .map(([key, count]) => ({
         key,
-        name: prettyCategory(key === "__none__" ? null : key, t.common.general),
+        name: prettyCategory(
+          key === "__none__" ? null : key,
+          t.common.general,
+          t.skills.categoryLabels ?? en.skills.categoryLabels!,
+        ),
         count,
       }));
   }, [skills, t]);
@@ -511,6 +499,7 @@ export default function SkillsPage() {
                       ? prettyCategory(
                           activeCategory === "__none__" ? null : activeCategory,
                           t.common.general,
+                          t.skills.categoryLabels ?? en.skills.categoryLabels!,
                         )
                       : t.skills.all}
                   </CardTitle>
