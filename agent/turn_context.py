@@ -35,6 +35,7 @@ from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
+    context_compression_timed_out,
     conversation_history_after_compression,
     recover_rotated_compression_session,
 )
@@ -503,6 +504,8 @@ class TurnContext:
     ext_prefetch_cache: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
+    # The threshold preflight exhausted the host's progress-aware wait.
+    preflight_compression_timed_out: bool = False
 
 
 def build_turn_context(
@@ -959,6 +962,7 @@ def build_turn_context(
     # issue #27405 (a few very large messages slipping past the count gate).
     _preflight_compressed = False
     _preflight_compression_blocked = False
+    _preflight_compression_timed_out = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
     if (
@@ -1113,6 +1117,14 @@ def build_turn_context(
                     messages, system_message, approx_tokens=_preflight_tokens,
                     task_id=effective_task_id,
                 )
+                if context_compression_timed_out(agent):
+                    # The host already spent the full progress-aware budget.
+                    # Preserve the transcript and tell run_conversation to end
+                    # before the unchanged over-limit request reaches provider
+                    # overflow recovery and invokes compression again.
+                    _preflight_compression_blocked = True
+                    _preflight_compression_timed_out = True
+                    break
                 if (
                     messages is _preflight_input
                     and compression_skipped_due_to_lock(agent)
@@ -1575,4 +1587,5 @@ def build_turn_context(
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=_preflight_compression_blocked,
+        preflight_compression_timed_out=_preflight_compression_timed_out,
     )

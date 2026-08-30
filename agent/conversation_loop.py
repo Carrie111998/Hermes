@@ -34,6 +34,7 @@ from agent.conversation_compression import (
     COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE,
     PRE_API_COMPRESSION_STATUS_TEMPLATE,
     compression_skipped_due_to_lock,
+    context_compression_timed_out,
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
@@ -294,6 +295,12 @@ def _should_skip_model_call_for_reference_handoff(
 _HANDOFF_SKIP_FINAL_RESPONSE = (
     "Context was compacted. The previous response is complete — "
     "awaiting your next message."
+)
+
+_COMPRESSION_TIMEOUT_FINAL_RESPONSE = (
+    "Context compression timed out without reducing this conversation. "
+    "No messages were dropped. Start a fresh session with /new, or check "
+    "auxiliary.compression before retrying /compress."
 )
 
 
@@ -2026,6 +2033,10 @@ def run_conversation(
     max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
     _last_preflight_pressure: Optional[int] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
+    _preflight_compression_timed_out = (
+        _ctx.preflight_compression_timed_out is True
+    )
+    _compression_timeout_exhausted = False
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     # Last composed answer intentionally held back by a verification gate. If
     # that continuation consumes the remaining budget, this is the best
@@ -2072,6 +2083,15 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        if _preflight_compression_timed_out:
+            # A turn-start threshold pass already exhausted the full host
+            # budget. Do not send the unchanged oversized request: a provider
+            # overflow would immediately invoke compression again.
+            final_response = _COMPRESSION_TIMEOUT_FINAL_RESPONSE
+            failed = True
+            _compression_timeout_exhausted = True
+            _turn_exit_reason = "context_compression_timeout"
+            break
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -2816,6 +2836,19 @@ def run_conversation(
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
             )
+            if context_compression_timed_out(agent):
+                # This preflight iteration never reached the provider. Refund
+                # its provisional call/budget exactly like a successful
+                # pre-API compaction, then stop before overflow recovery can
+                # invoke compression again on the unchanged transcript.
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                agent.iteration_budget.refund()
+                final_response = _COMPRESSION_TIMEOUT_FINAL_RESPONSE
+                failed = True
+                _compression_timeout_exhausted = True
+                _turn_exit_reason = "context_compression_timeout"
+                break
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's
                 # compression lock, so this pass no-oped. That is a temporary
@@ -8738,7 +8771,7 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
-    return finalize_turn(
+    result = finalize_turn(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
@@ -8755,6 +8788,14 @@ def run_conversation(
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
+    if _compression_timeout_exhausted:
+        # Reuse the gateway's existing context-recovery contract. The bloated
+        # transcript remains intact while future input can move to a clean
+        # session instead of replaying the summarize timeout loop.
+        result["error"] = _COMPRESSION_TIMEOUT_FINAL_RESPONSE
+        result["partial"] = True
+        result["compression_exhausted"] = True
+    return result
 
 
 

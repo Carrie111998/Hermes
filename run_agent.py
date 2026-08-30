@@ -8066,6 +8066,8 @@ class AIAgent:
         from agent.conversation_compression import (
             CompressionCommitFence,
             compress_context,
+            mark_context_compression_timed_out,
+            reset_context_compression_timeout_outcome,
             resolve_context_compression_timeouts,
             run_compress_context_with_progress_timeout,
         )
@@ -8096,6 +8098,10 @@ class AIAgent:
         # Every AIAgent compression has a fence, including ordinary in-turn and
         # manual paths. hard_interrupt() uses this exact instance to serialize
         # cancel admission against begin_commit().
+        # Automatic callers inspect this typed outcome immediately after the
+        # call. Clear it per invocation so a prior turn's timeout cannot leak
+        # through a later cooldown skip.
+        reset_context_compression_timeout_outcome(self)
         active_fence = commit_fence or CompressionCommitFence()
         # A single agent can receive overlapping automatic/manual entrypoints.
         # Serialize fence publication so a waiter cannot replace the fence of
@@ -8180,6 +8186,7 @@ class AIAgent:
                         return system_message or ""
 
                 def _on_timeout(idle, waited, since_progress):
+                    mark_context_compression_timed_out(self)
                     logger.warning(
                         "Context compression made no progress for %.1fs "
                         "(total wait %.1fs, ceiling %.1fs); continuing without "

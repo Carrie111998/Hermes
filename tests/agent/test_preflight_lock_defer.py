@@ -73,6 +73,29 @@ def test_preflight_lock_skip_does_not_set_blocked_flag():
     assert ctx.preflight_compression_blocked is False
 
 
+def test_preflight_timeout_is_exposed_as_terminal_outcome():
+    """A host timeout must not look like an ordinary compressible no-op.
+
+    The conversation loop needs this typed outcome to stop before sending the
+    unchanged over-limit request and entering the provider overflow retry path.
+    """
+    agent = _make_agent()
+    calls = []
+
+    def _timed_out_compress(messages, _system_message, **_kwargs):
+        calls.append(1)
+        agent._last_context_compression_timed_out = True
+        return messages, "SYSTEM"
+
+    agent._compress_context = _timed_out_compress
+
+    ctx = _build(agent, conversation_history=list(_HISTORY))
+
+    assert calls == [1]
+    assert ctx.preflight_compression_blocked is True
+    assert ctx.preflight_compression_timed_out is True
+
+
 
 
 

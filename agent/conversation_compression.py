@@ -1611,6 +1611,43 @@ def compression_skipped_due_to_lock(agent: Any) -> bool:
     return _sig is True or isinstance(_sig, str)
 
 
+def reset_context_compression_timeout_outcome(agent: Any) -> None:
+    """Clear the current thread's owned-compression timeout outcome."""
+    state = vars(agent).get("_context_compression_timeout_state")
+    if not isinstance(state, threading.local):
+        state = threading.local()
+        vars(agent)["_context_compression_timeout_state"] = state
+    state.timed_out = False
+    agent._last_context_compression_timed_out = False
+
+
+def mark_context_compression_timed_out(agent: Any) -> None:
+    """Mark the current owned compression as host-timed-out."""
+    state = vars(agent).get("_context_compression_timeout_state")
+    if not isinstance(state, threading.local):
+        state = threading.local()
+        vars(agent)["_context_compression_timeout_state"] = state
+    state.timed_out = True
+    agent._last_context_compression_timed_out = True
+
+
+def context_compression_timed_out(agent: Any) -> bool:
+    """Return whether this thread's owned compression hit its host timeout.
+
+    A single agent may receive overlapping automatic/manual entrypoints. The
+    thread-local outcome prevents one entrypoint's reset from hiding another's
+    timeout. The attribute fallback supports older/minimal agent doubles.
+    Every read is type-pinned to avoid MagicMock auto-attributes.
+    """
+    try:
+        state = vars(agent).get("_context_compression_timeout_state")
+    except TypeError:
+        state = None
+    if isinstance(state, threading.local):
+        return getattr(state, "timed_out", None) is True
+    return getattr(agent, "_last_context_compression_timed_out", None) is True
+
+
 def _adopt_live_compression_child(
     agent: Any,
     session_db: Any,

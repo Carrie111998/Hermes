@@ -423,6 +423,7 @@ class TestCompressContextForwarderOwnsTimeout:
         assert out_msgs is original
         assert out_prompt == "sys"
         assert calls["n"] == 1
+        assert agent._last_context_compression_timed_out is True
         agent._emit_warning.assert_called_once()
         assert agent.context_compressor._consecutive_timeout_failures == 1
         agent.context_compressor._record_compression_failure_cooldown.assert_called_once()
