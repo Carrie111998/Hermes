@@ -6,6 +6,7 @@ rate-limited provider concurrently.
 """
 
 import random
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -85,6 +86,72 @@ def parse_retry_after_seconds(value_or_headers: Any) -> Optional[float]:
     if when.tzinfo is None:
         when = when.replace(tzinfo=timezone.utc)
     return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+def provider_retry_after_seconds(error: Any, *, max_delay: float = 600.0) -> Optional[float]:
+    """Return a bounded provider retry delay from headers or error text.
+
+    Google Gemini commonly puts ``Please retry in 36.3s`` in a structured
+    response body instead of sending ``Retry-After``. Headers take precedence;
+    malformed or negative hints are ignored/clamped by the shared parser.
+    """
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    delay = parse_retry_after_seconds(headers)
+    if delay is not None:
+        return min(delay, max_delay)
+
+    text = _error_text(error)
+    match = re.search(r"please\s+retry\s+in\s+([0-9]+(?:\.[0-9]+)?)\s*(?:seconds?|secs?|s)\b", text)
+    if not match:
+        return None
+    try:
+        return min(max(0.0, float(match.group(1))), max_delay)
+    except (TypeError, ValueError):
+        return None
+
+
+# Signals that a 429 is a hard PER-DAY quota ceiling rather than a per-minute
+# throttle.  Google Gemini's free tier returns
+#   "Quota exceeded for metric: generativelanguage.googleapis.com/
+#    generate_content_free_tier_requests, limit: 500, model: ..."
+# alongside a "Please retry in ~59s" hint — but that hint only reflects when
+# the per-minute sub-bucket ticks over, NOT when the daily cap resets. A
+# same-provider retry loop that honours the hint will burn its whole retry
+# budget re-hitting the identical daily-exhaustion 429 every ~60s and never
+# consider the fallback chain, because a parsed retry-after hint normally
+# means "the primary will recover in the retry window" (see
+# ``provider_retry_after_seconds`` and its callers in conversation_loop.py).
+# Detecting this distinct failure mode lets callers discard the misleading
+# short hint and fail over immediately instead of waiting out a quota that
+# will not clear for hours.
+_DAILY_QUOTA_PATTERNS = [
+    "free_tier_requests",              # Gemini metric name fragment (per-day and per-minute variants)
+    "requests per day",                # generic "N requests per day" phrasing
+    "perday",                          # Gemini quota id fragment, e.g. GenerateContentPerDayPerProjectPerModel
+    "per_day",
+    "generate_content_free_tier_requests",
+]
+
+
+def is_daily_quota_exhaustion(error: Any) -> bool:
+    """True when a 429/RESOURCE_EXHAUSTED body signals a per-DAY cap, not a
+    per-minute rate limit.
+
+    Distinguishing the two matters because a per-day cap will not clear
+    within any sane retry window: same-provider retries should be abandoned
+    in favour of the fallback chain, even when the provider also included a
+    (misleadingly short) "Please retry in Ns" hint that would otherwise
+    suppress eager failover.
+    """
+    text = _error_text(error).lower()
+    if not text:
+        return False
+    if "resource_exhausted" not in text and "quota" not in text and "429" not in text:
+        # Cheap pre-filter: only bother pattern-matching on plausible quota bodies.
+        if "exceeded your current quota" not in text:
+            return False
+    return any(p in text for p in _DAILY_QUOTA_PATTERNS)
 
 
 def jittered_backoff(

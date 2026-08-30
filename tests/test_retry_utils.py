@@ -2,10 +2,17 @@
 
 import threading
 
+import pytest
+
 import agent.retry_utils as retry_utils
 from types import SimpleNamespace
 
-from agent.retry_utils import adaptive_rate_limit_backoff, is_zai_coding_overload_error, jittered_backoff
+from agent.retry_utils import (
+    adaptive_rate_limit_backoff,
+    is_zai_coding_overload_error,
+    jittered_backoff,
+    provider_retry_after_seconds,
+)
 
 
 def test_backoff_is_exponential():
@@ -208,3 +215,101 @@ class TestParseRetryAfterSeconds:
                 raise RuntimeError("boom")
 
         assert parse_retry_after_seconds(Explosive()) is None
+
+
+def test_provider_retry_after_seconds_reads_gemini_retry_message():
+    error = SimpleNamespace(
+        status_code=429,
+        body={"error": {"message": "Resource exhausted. Please retry in 36.3s."}},
+        response=SimpleNamespace(headers={}),
+    )
+    assert provider_retry_after_seconds(error) == pytest.approx(36.3)
+
+
+def test_provider_retry_hint_uses_response_status_and_text_shape():
+    response = SimpleNamespace(
+        status_code=429,
+        headers={},
+        text='{"error":{"message":"Please retry in 58.7s."}}',
+    )
+    error = SimpleNamespace(status_code=None, body=None, response=response)
+    assert provider_retry_after_seconds(error) == pytest.approx(58.7)
+
+
+def test_provider_retry_after_seconds_prefers_retry_after_header_for_503():
+    error = SimpleNamespace(
+        status_code=503,
+        body={"error": {"message": "UNAVAILABLE"}},
+        response=SimpleNamespace(headers={"Retry-After": "12.5"}),
+    )
+    assert provider_retry_after_seconds(error) == pytest.approx(12.5)
+
+
+# ---------------------------------------------------------------------------
+# is_daily_quota_exhaustion — distinguishing a per-DAY cap from a per-minute
+# rate limit so the fallback-suppressing retry-after hint doesn't strand a
+# session on a provider that cannot recover within the retry window.
+# ---------------------------------------------------------------------------
+
+
+class TestIsDailyQuotaExhaustion:
+    def test_gemini_free_tier_daily_cap_detected(self):
+        """Real body shape captured from a Gemini free-tier RESOURCE_EXHAUSTED
+        429 — includes a short retry hint that would otherwise suppress
+        fallback even though the daily cap won't clear in that window."""
+        from agent.retry_utils import is_daily_quota_exhaustion
+
+        error = SimpleNamespace(
+            status_code=429,
+            body={
+                "error": {
+                    "code": 429,
+                    "status": "RESOURCE_EXHAUSTED",
+                    "message": (
+                        "You exceeded your current quota, please check your plan "
+                        "and billing details. * Quota exceeded for metric: "
+                        "generativelanguage.googleapis.com/generate_content_free_tier_requests, "
+                        "limit: 500, model: gemini-3.5-flash-lite. Please retry in 59.468589331s."
+                    ),
+                }
+            },
+            response=SimpleNamespace(headers={}),
+        )
+        assert is_daily_quota_exhaustion(error) is True
+
+    def test_per_minute_rate_limit_not_flagged_as_daily(self):
+        """A generic per-minute 429 (no per-day quota metric in the body)
+        should NOT be classified as daily-quota exhaustion — the short
+        retry-after hint is trustworthy there and fallback should stay
+        gated on it as before."""
+        from agent.retry_utils import is_daily_quota_exhaustion
+
+        error = SimpleNamespace(
+            status_code=429,
+            body={"error": {"message": "Resource exhausted. Please retry in 6.5s."}},
+            response=SimpleNamespace(headers={}),
+        )
+        assert is_daily_quota_exhaustion(error) is False
+
+    def test_non_quota_error_not_flagged(self):
+        from agent.retry_utils import is_daily_quota_exhaustion
+
+        error = SimpleNamespace(
+            status_code=500,
+            body={"error": {"message": "internal error"}},
+            response=SimpleNamespace(headers={}),
+        )
+        assert is_daily_quota_exhaustion(error) is False
+
+    def test_string_error_text_detected(self):
+        """Callers also probe the flattened lowercased error message string
+        directly (conversation_loop.py passes both the exception and
+        error_msg through this check)."""
+        from agent.retry_utils import is_daily_quota_exhaustion
+
+        msg = (
+            "gemini http 429 (resource_exhausted): quota exceeded for metric: "
+            "generativelanguage.googleapis.com/generate_content_free_tier_requests, "
+            "limit: 500, model: gemini-3.1-flash-lite. please retry in 12.0s."
+        )
+        assert is_daily_quota_exhaustion(msg) is True
