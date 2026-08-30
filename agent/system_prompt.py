@@ -295,6 +295,13 @@ def _session_start_like(agent: Any, now: Any) -> Any:
     a Thursday-morning resume), contradicting the fresh per-turn time hint.
     Prefer, in order:
 
+    0. the LINEAGE-ROOT session id's embedded timestamp — compaction can
+       rotate the session id, and each rotated id embeds its OWN mint time,
+       so after months of compactions rung 1 alone would quietly re-birth
+       the conversation at its latest rotation. Walking to the lineage root
+       (same walk as ``_conversation_root_id``) recovers the ORIGINAL
+       birth stamp — a Bot Mode forever-chat keeps knowing when it was
+       first born, across every compaction (maintainer-directed, #98426);
     1. the timestamp embedded in ``session_id`` (``YYYYMMDD_HHMMSS_...``) —
        immutable for the life of the session, so the line is byte-stable
        across every rebuild boundary (preserving prefix-cache KV);
@@ -326,18 +333,30 @@ def _session_start_like(agent: Any, now: Any) -> Any:
                 pass
         return dt
 
-    # 1. Session id embeds the true start as YYYYMMDD_HHMMSS.
+    # 0. Lineage root: compaction rotation mints NEW ids with NEW embedded
+    # stamps. Walk to the root id (cached on the agent — the lineage only
+    # grows at compaction, and this function runs at that exact boundary,
+    # so one walk per rebuild is fresh enough) and prefer ITS embedded
+    # timestamp: the conversation's true birth. Fail-open to rung 1.
     session_id = getattr(agent, "session_id", None)
-    if isinstance(session_id, str) and session_id:
-        m = re.match(r"^(\d{8})_(\d{6})", session_id)
-        if m:
-            try:
-                embedded = datetime.strptime(
-                    f"{m.group(1)}_{m.group(2)}", "%Y%m%d_%H%M%S"
-                )
-                return _to_display_tz(embedded)
-            except ValueError:
-                pass
+    root_id = None
+    try:
+        db = getattr(agent, "_session_db", None)
+        if db is not None and isinstance(session_id, str) and session_id:
+            root_id = db.get_conversation_root(session_id)
+    except Exception:
+        root_id = None
+    for candidate in (root_id, session_id):
+        if isinstance(candidate, str) and candidate:
+            m = re.match(r"^(\d{8})_(\d{6})", candidate)
+            if m:
+                try:
+                    embedded = datetime.strptime(
+                        f"{m.group(1)}_{m.group(2)}", "%Y%m%d_%H%M%S"
+                    )
+                    return _to_display_tz(embedded)
+                except ValueError:
+                    pass
 
     # 2. Session-creation stamp set by the runner.
     session_start = getattr(agent, "session_start", None)
