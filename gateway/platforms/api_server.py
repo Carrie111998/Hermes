@@ -5221,7 +5221,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # clients can render a thinking block without persisting it as
                 # assistant output.  ``reasoning_content`` is the established
                 # OpenAI-compatible extension used by reasoning-model clients.
-                if delta is not None:
+                if delta:
                     _stream_q.put_threadsafe(("__reasoning__", delta))
 
             # Track which tool_call_ids we've emitted a "running" lifecycle
@@ -6479,7 +6479,7 @@ class APIServerAdapter(BasePlatformAdapter):
             def _on_reasoning(delta):
                 # Reasoning must stay separate from answer text so Responses
                 # clients can render it without polluting the final message.
-                if delta is not None:
+                if delta:
                     _stream_q.put_threadsafe(("__reasoning__", delta))
 
             def _on_tool_progress(event_type, name, preview, args, **kwargs):
@@ -7229,7 +7229,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _extract_reasoning_text(result: Dict[str, Any], start_index: int = 0) -> str:
-        """Return textual reasoning from this turn's assistant messages."""
+        """Return completed-message reasoning from this turn.
+
+        Streaming callers must use this only when no live reasoning deltas
+        were received.  Live deltas are authoritative; combining both forms
+        can duplicate or replace the provider's streamed representation.
+        """
         messages = result.get("messages", []) if isinstance(result, dict) else []
         if start_index > 0:
             messages = messages[start_index:]
@@ -7884,7 +7889,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _reasoning_cb(delta: Optional[str]) -> None:
             """Push live reasoning without mixing it into message.delta."""
-            if delta is None or run_id not in self._run_streams:
+            if not delta or run_id not in self._run_streams:
                 return
             try:
                 loop.call_soon_threadsafe(_put_event_if_active, {
