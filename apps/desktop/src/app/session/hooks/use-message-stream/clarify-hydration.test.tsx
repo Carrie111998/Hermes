@@ -100,6 +100,25 @@ describe('clarify.request stream hydration', () => {
     expect(scrollToBottom).not.toHaveBeenCalled()
   })
 
+  it('captures the exact gateway source that delivered the request', () => {
+    mountStream()
+
+    act(() =>
+      stream.handleEvent({
+        connectionId: 'conn-owner',
+        payload: { choices: ['yes', 'no'], question: 'Ship it?', request_id: 'req-scoped' },
+        profile: 'owner-profile',
+        session_id: SID,
+        type: 'clarify.request'
+      })
+    )
+
+    expect($clarifyRequests.get()[SID]).toMatchObject({
+      owner: { connectionId: 'conn-owner', profile: 'owner-profile' },
+      requestId: 'req-scoped'
+    })
+  })
+
   it('preserves multi-select through the store and hydrated tool row', () => {
     mountStream()
 

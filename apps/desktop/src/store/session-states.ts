@@ -1028,9 +1028,14 @@ export function requestForOwnedSession<T>(
   method: string,
   params: Record<string, unknown> = {},
   timeoutMs?: number,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  capturedOwner?: SessionOwnerScope
 ): Promise<T> {
-  const owner = knownOwnerForSession(sessionId)
+  // A blocking-input request's source socket is the strongest possible owner
+  // evidence: that backend emitted the request and is waiting for the reply.
+  // Keep it ahead of mutable tile/hint/row state, which reconnect cleanup can
+  // legitimately retire while the rendered card remains answerable.
+  const owner = capturedOwner ?? knownOwnerForSession(sessionId)
 
   try {
     assertSessionOwnerResolved(owner, { method, sessionId })

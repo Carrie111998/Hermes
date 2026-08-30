@@ -1128,7 +1128,8 @@ export function useSessionActions({
                 activated,
                 cachedRuntimeId,
                 activateStartedAt,
-                clarifyRequestIdAtActivateStart
+                clarifyRequestIdAtActivateStart,
+                sessionOwner
               )
 
               const pendingClarify = pendingClarifyState.request
@@ -1666,7 +1667,13 @@ export function useSessionActions({
         // the row, or a topology change made the owner resolvable again).
         clearStoredTranscriptReadOnly(storedSessionId)
         const pendingApproval = restorePendingApproval(resumed, resumed.session_id)
-        const pendingClarifyState = restorePendingClarifyFromSnapshot(resumed, resumed.session_id, resumeStartedAt)
+        const pendingClarifyState = restorePendingClarifyFromSnapshot(
+          resumed,
+          resumed.session_id,
+          resumeStartedAt,
+          undefined,
+          sessionOwner
+        )
         const pendingClarify = pendingClarifyState.request
 
         const clarifyAuthoritativelyAbsent =

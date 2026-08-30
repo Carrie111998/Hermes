@@ -788,6 +788,32 @@ describe('ClarifyTool owner routing', () => {
     expect(ambient).not.toHaveBeenCalled()
   })
 
+  it('keeps the request source route when reconnect cleanup loses the session owner hint', async () => {
+    $profiles.set([{ name: OWNER_PROFILE }, { name: 'profile-b' }] as never)
+    const ambient = vi.fn().mockResolvedValue({ ok: true })
+
+    $activeSessionId.set('session-a')
+    $gateway.set({ request: ambient } as never)
+    setClarifyRequest({
+      choices: ['staging', 'production'],
+      multiSelect: false,
+      owner: { connectionId: OWNER_CONNECTION_ID, profile: OWNER_PROFILE },
+      question: 'Which deployment target?',
+      requestId: 'request-reconnected',
+      sessionId: 'session-a'
+    })
+    renderClarify(<ClarifyTool {...liveClarifyProps()} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /staging/ }))
+    fireEvent.click(screen.getByRole('button', { name: /Continue/ }))
+
+    await waitFor(() => {
+      expect(gatewayMocks.requestGatewayForAgent).toHaveBeenCalledTimes(1)
+    })
+    expectOwnerCall(1, { answer: 'staging', request_id: 'request-reconnected' })
+    expect(ambient).not.toHaveBeenCalled()
+  })
+
   it('sends both sequential batch locks on the owner socket, in order', async () => {
     const ambient = armCrossProfileOwner()
 

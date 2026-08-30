@@ -7,6 +7,7 @@ import {
   normalizeQuestions,
   setClarifyRequest
 } from '@/store/clarify'
+import type { SessionOwnerScope } from '@/store/session-request-router'
 import type { SessionResumeResponse } from '@/types/hermes'
 
 export interface PendingClarifyResumeState {
@@ -33,7 +34,8 @@ export function restorePendingClarifyFromSnapshot(
   response: Pick<SessionResumeResponse, 'pending_clarify'>,
   sessionId: string,
   resumeStartedAt: number,
-  requestIdAtStart?: string
+  requestIdAtStart?: string,
+  owner?: SessionOwnerScope
 ): PendingClarifyResumeState {
   const pending = response.pending_clarify
 
@@ -73,6 +75,7 @@ export function restorePendingClarifyFromSnapshot(
     choices: choices.length > 0 ? choices : null,
     lockedAnswers,
     multiSelect: pending.multi_select === true,
+    owner,
     question,
     receivedAt: Date.now() / 1000,
     requestId: pending.request_id,

@@ -13,6 +13,7 @@ import { $gateway } from '@/store/gateway'
 import { setMcpSetupRequest } from '@/store/mcp-setup'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { receiveApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
+import type { SessionOwnerScope } from '@/store/session-request-router'
 import { requestScrollToBottom } from '@/store/thread-scroll'
 
 import type { GatewayEventContext } from './types'
@@ -23,6 +24,10 @@ import type { GatewayEventContext } from './types'
 export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
   const { deps, event, payload, sessionId, occurredAt } = ctx
   const { activeSessionIdRef, sessionInterrupted, updateSessionState, upsertToolCall } = deps
+
+  const requestOwner: SessionOwnerScope = event.connectionId
+    ? { connectionId: event.connectionId, profile: event.profile?.trim() || 'default' }
+    : event.profile?.trim() || undefined
 
   if (event.type === 'clarify.request') {
     // Surface the clarify tool's overlay. The Python side is blocked on
@@ -63,6 +68,7 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
         choices: null,
         lockedAnswers,
         multiSelect: false,
+        owner: requestOwner,
         question: '',
         questions,
         receivedAt: Date.now() / 1000,
@@ -114,6 +120,7 @@ export function handleInputRequestEvent(ctx: GatewayEventContext): boolean {
         question,
         choices: choices.length > 0 ? choices : null,
         multiSelect,
+        owner: requestOwner,
         receivedAt: Date.now() / 1000,
         sessionId: sessionId ?? null
       }

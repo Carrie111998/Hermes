@@ -60,6 +60,20 @@ describe('restorePendingClarifyFromSnapshot', () => {
     )
   })
 
+  it('preserves the routed resume owner on the restored request', () => {
+    const owner = { connectionId: 'conn-owner', profile: 'owner-profile' }
+
+    restorePendingClarifyFromSnapshot(
+      { pending_clarify: { question: 'Proceed?', request_id: 'rid-owner' } },
+      'sess-owner',
+      resumeStartedAt,
+      undefined,
+      owner
+    )
+
+    expect(setClarifyRequestMock).toHaveBeenCalledWith(expect.objectContaining({ owner, requestId: 'rid-owner' }))
+  })
+
   it('carries server-locked answers into the replayed batch card', () => {
     restorePendingClarifyFromSnapshot(
       {

@@ -484,7 +484,10 @@ function ClarifyToolSinglePending({
           {
             request_id: matchingRequest.requestId,
             answer
-          }
+          },
+          undefined,
+          undefined,
+          matchingRequest.owner
         )
         triggerHaptic('submit')
         onAnswered()
@@ -1039,7 +1042,10 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
             answer: answer ?? '',
             question_id: question.qid,
             request_id: request.requestId
-          }
+          },
+          undefined,
+          undefined,
+          request.owner
         )
       }
 
@@ -1087,7 +1093,10 @@ function ClarifyToolBatchPending({ onAnswered, request }: { onAnswered: () => vo
           request.sessionId,
           gateway.request.bind(gateway) as typeof gateway.request,
           'clarify.respond',
-          { answer: '', request_id: request.requestId }
+          { answer: '', request_id: request.requestId },
+          undefined,
+          undefined,
+          request.owner
         )
       }
     } catch {

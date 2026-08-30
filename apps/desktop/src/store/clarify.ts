@@ -2,6 +2,7 @@ import { atom, computed } from 'nanostores'
 
 import { $gateway } from './gateway'
 import { $activeSessionId } from './session'
+import type { SessionOwnerScope } from './session-request-router'
 
 export interface ClarifyQuestion {
   /** Server-generated wire id (q0..qN) — clarify.respond keys answers by it. */
@@ -19,6 +20,8 @@ export interface ClarifyRequest {
   /** Local receipt time (Unix seconds), used to reject stale resume cleanup. */
   receivedAt?: number
   sessionId: string | null
+  /** Exact gateway source that delivered this blocking request. */
+  owner?: SessionOwnerScope
   /** Batch (multi-question) clarify: present instead of question/choices. */
   questions?: ClarifyQuestion[]
   /** Answers already locked server-side (reconnect replay): qid → answer. */
