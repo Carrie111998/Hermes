@@ -3,6 +3,7 @@ import { atom } from 'nanostores'
 import { keyedTimeouts } from '@/lib/keyed-timeouts'
 
 import { $gateway } from './gateway'
+import { requestForOwnedSession } from './session-states'
 
 export type GoalStatus = 'active' | 'done' | 'paused' | 'waiting'
 
@@ -17,12 +18,18 @@ export const $goalsBySession = atom<Record<string, SessionGoal>>({})
 
 const DONE_LINGER_MS = 8_000
 const clearTimers = keyedTimeouts()
+const refreshGenerationBySession = new Map<string, number>()
+
+function invalidateRefresh(sid: string): void {
+  refreshGenerationBySession.set(sid, (refreshGenerationBySession.get(sid) ?? 0) + 1)
+}
 
 export function setSessionGoal(sid: string, goal: SessionGoal) {
   if (!sid) {
     return
   }
 
+  invalidateRefresh(sid)
   clearTimers.cancel(sid)
   $goalsBySession.set({ ...$goalsBySession.get(), [sid]: goal })
 
@@ -32,6 +39,11 @@ export function setSessionGoal(sid: string, goal: SessionGoal) {
 }
 
 export function clearSessionGoal(sid: string) {
+  if (!sid) {
+    return
+  }
+
+  invalidateRefresh(sid)
   clearTimers.cancel(sid)
 
   const map = $goalsBySession.get()
@@ -161,14 +173,29 @@ export function applyGoalStatusText(sid: string, text: string, opts?: { hydrate?
 }
 
 export async function refreshSessionGoal(sid: string): Promise<void> {
+  if (!sid) {
+    return
+  }
+
+  const generation = (refreshGenerationBySession.get(sid) ?? 0) + 1
+  refreshGenerationBySession.set(sid, generation)
   const gateway = $gateway.get()
 
-  if (!sid || !gateway) {
+  if (!gateway) {
     return
   }
 
   try {
-    const result = await gateway.request<{ output?: string }>('slash.exec', { command: 'goal status', session_id: sid })
+    const result = await requestForOwnedSession<{ output?: string }>(
+      sid,
+      gateway.request.bind(gateway) as typeof gateway.request,
+      'slash.exec',
+      { command: 'goal status', session_id: sid }
+    )
+
+    if (refreshGenerationBySession.get(sid) !== generation) {
+      return
+    }
 
     applyGoalStatusText(sid, result?.output ?? '', { hydrate: true })
   } catch {

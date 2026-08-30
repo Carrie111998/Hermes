@@ -1,8 +1,9 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/i18n'
+import { $gateway } from '@/store/gateway'
 import { $goalsBySession, type SessionGoal } from '@/store/goals'
 
 import { ComposerStatusStack } from './index'
@@ -37,11 +38,13 @@ function renderStack(sessionId: null | string = SID) {
 
 describe('ComposerStatusStack goal indicator', () => {
   beforeEach(() => {
+    $gateway.set(null)
     $goalsBySession.set({})
   })
 
   afterEach(() => {
     cleanup()
+    $gateway.set(null)
     $goalsBySession.set({})
   })
 
@@ -83,5 +86,18 @@ describe('ComposerStatusStack goal indicator', () => {
     const view = renderStack()
 
     expect(view.container.firstChild).toBeNull()
+  })
+
+  it('rehydrates a stale goal when the gateway becomes available after mount', async () => {
+    const request = vi.fn().mockResolvedValue({ output: 'No active goal. Set one with /goal <text>.' })
+    $goalsBySession.set({ [SID]: goal('active') })
+
+    renderStack()
+    expect(screen.getByText('Goal active')).toBeTruthy()
+
+    $gateway.set({ request } as never)
+
+    await waitFor(() => expect(screen.queryByText('Goal active')).toBeNull())
+    expect(request).toHaveBeenCalledWith('slash.exec', { command: 'goal status', session_id: SID })
   })
 })

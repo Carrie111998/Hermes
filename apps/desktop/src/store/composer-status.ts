@@ -10,7 +10,7 @@ import { $goalsBySession, type GoalStatus } from './goals'
 import { dispatchNativeNotification } from './native-notifications'
 import { notifyError } from './notifications'
 import { $sessions, lineageAliases } from './session'
-import { $sessionStates } from './session-states'
+import { $sessionStates, requestForOwnedSession } from './session-states'
 import { $subagentsBySession, type SubagentProgress } from './subagents'
 import { $todosBySession } from './todos'
 
@@ -394,6 +394,11 @@ export function reconcileBackgroundProcesses(sid: string, procs: GatewayProcessE
  *  forever: one runtime id accumulated 18,614 gateway rejections in a single day
  *  (#94219 fallout). Latch the id here and skip it until something rebinds it. */
 const goneSessions = new Set<string>()
+const refreshGenerationBySession = new Map<string, number>()
+
+function invalidateRefresh(sid: string): void {
+  refreshGenerationBySession.set(sid, (refreshGenerationBySession.get(sid) ?? 0) + 1)
+}
 
 /** Gateway JSON-RPC code for "session not found" (tui_gateway _sess_nowait). */
 const GATEWAY_SESSION_NOT_FOUND_CODE = 4001
@@ -422,26 +427,50 @@ export function isSessionGoneForBackgroundPolling(error: unknown): boolean {
 export function resetBackgroundPollingGuard(sid?: string): void {
   if (sid) {
     goneSessions.delete(sid)
+    invalidateRefresh(sid)
 
     return
   }
 
   goneSessions.clear()
+
+  for (const sessionId of refreshGenerationBySession.keys()) {
+    invalidateRefresh(sessionId)
+  }
 }
 
 /** Pull the session's live process snapshot from the gateway. */
 export async function refreshBackgroundProcesses(sid: string): Promise<void> {
+  if (!sid) {
+    return
+  }
+
+  const generation = (refreshGenerationBySession.get(sid) ?? 0) + 1
+  refreshGenerationBySession.set(sid, generation)
   const gateway = $gateway.get()
 
-  if (!sid || !gateway || goneSessions.has(sid)) {
+  if (!gateway || goneSessions.has(sid)) {
     return
   }
 
   try {
-    const result = await gateway.request<{ processes?: GatewayProcessEntry[] }>('process.list', { session_id: sid })
+    const result = await requestForOwnedSession<{ processes?: GatewayProcessEntry[] }>(
+      sid,
+      gateway.request.bind(gateway) as typeof gateway.request,
+      'process.list',
+      { session_id: sid }
+    )
+
+    if (refreshGenerationBySession.get(sid) !== generation) {
+      return
+    }
 
     reconcileBackgroundProcesses(sid, result?.processes ?? [])
   } catch (error) {
+    if (refreshGenerationBySession.get(sid) !== generation) {
+      return
+    }
+
     // A gone session never comes back under this runtime id: stop polling it,
     // or the 5s timer hammers the gateway with 4001s for the window's lifetime.
     if (isSessionGoneForBackgroundPolling(error)) {
@@ -475,8 +504,17 @@ export function dismissBackgroundProcess(sid: string, id: string) {
  *  row while the process lived on, stranding rogue tasks. On failure the row
  *  stays so the user can retry / see it didn't die. */
 export async function stopBackgroundProcess(sid: string, id: string): Promise<void> {
+  const gateway = $gateway.get()
+
+  if (!gateway) {
+    return
+  }
+
   try {
-    await $gateway.get()?.request('process.kill', { process_id: id, session_id: sid })
+    await requestForOwnedSession(sid, gateway.request.bind(gateway) as typeof gateway.request, 'process.kill', {
+      process_id: id,
+      session_id: sid
+    })
     dismissBackgroundProcess(sid, id)
   } catch (err) {
     notifyError(err, 'Could not stop the process')
@@ -504,8 +542,11 @@ export function resetSessionBackground(sid: string) {
   for (const item of list) {
     dismissed.add(item.id)
 
-    if (item.state === 'running') {
-      void gateway?.request('process.kill', { process_id: item.id, session_id: sid }).catch(() => undefined)
+    if (item.state === 'running' && gateway) {
+      void requestForOwnedSession(sid, gateway.request.bind(gateway) as typeof gateway.request, 'process.kill', {
+        process_id: item.id,
+        session_id: sid
+      }).catch(() => undefined)
     }
   }
 
