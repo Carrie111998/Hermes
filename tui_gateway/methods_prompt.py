@@ -357,14 +357,15 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
-    # Re-bind to the current client transport for this request. This keeps
-    # streaming events on the active websocket even if an earlier disconnect
-    # or fallback moved the session transport to stdio.
-    if (t := current_transport()) is not None:
-        session["transport"] = t
+    # Attach this client without stealing a healthy controller. A vacant,
+    # dead, or detached seat is still claimed so a reconnecting websocket
+    # rebinds after disconnect — the original reason this path existed.
+    t = current_transport()
     while True:
         busy_transport = None
         with session["history_lock"]:
+            if t is not None:
+                _subscribe_session_transport(session, t, sid=sid)
             if session.get("running"):
                 # Don't reject a mid-turn prompt — queue it (and, by default,
                 # interrupt the live turn) so it runs as the next turn. The

@@ -1505,12 +1505,21 @@ def _close_sessions_for_transport(
     the single WS-disconnect teardown entry point — there is no second
     independent reap loop in ``handle_ws``.
 
+    Also unregisters *transport* from every session it was only observing
+    (``session["viewers"]``) so a second-surface disconnect cannot leave a
+    stale subscriber or promote itself into the controller seat.
+
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
     with _sessions_lock:
-        owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
+        tracked = [
+            (sid, s)
+            for sid, s in _sessions.items()
+            if s.get("transport") is transport
+            or transport in (s.get("viewers") or ())
+        ]
     reaped = 0
     detached = 0
-    for sid, session in owned:
+    for sid, session in tracked:
         claimed_for_teardown = None
         should_schedule_reap = False
         # A session.resume fast-path rebinds its live session while holding
@@ -1523,8 +1532,10 @@ def _close_sessions_for_transport(
                 if current is not session:
                     continue
                 if current.get("transport") is not transport:
-                    # The reconnect owns this session now. Drop only the old
-                    # viewer registration; it must not affect the new owner.
+                    # Observer-only disconnect, or a reconnect that claimed
+                    # the controller seat after our snapshot: drop only this
+                    # transport's viewer registration. The runtime and the
+                    # remaining controller stay put.
                     viewers = current.get("viewers")
                     if viewers:
                         viewers.pop(transport, None)
@@ -1568,6 +1579,22 @@ def _close_sessions_for_transport(
             except Exception:
                 pass
     return reaped, detached
+
+
+def detach_sessions_for_transport(
+    transport, *, end_reason: str = "ws_disconnect"
+) -> tuple[int, int]:
+    """Detach *transport* from every live session it is attached to.
+
+    Public lifecycle seam for in-process plugin transports whose sockets are
+    not the core WS path. Delegates to the same disconnect logic used by
+    ``tui_gateway.ws``: observer-only attachments are dropped without reaping
+    a healthy controller; a last remaining controller is parked on the drop
+    sentinel and handed to the orphan reaper.
+
+    Returns ``(reaped, detached)`` counts.
+    """
+    return _close_sessions_for_transport(transport, end_reason=end_reason)
 
 
 def _shutdown_sessions() -> None:
@@ -2475,14 +2502,68 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
+def _snapshot_session_viewers(session: dict) -> list:
+    """Copy viewer keys without taking ``history_lock``.
+
+    Emitters (``write_json`` / ``_emit``) may already hold ``history_lock``,
+    which is a non-reentrant ``threading.Lock`` — acquiring it here would
+    deadlock the producer. Disconnect mutates ``viewers`` under
+    ``_sessions_lock`` (not ``history_lock``), and subscribe mutates under
+    ``history_lock`` then may take ``_sessions_lock`` (``_cancel_ws_orphan_reap``),
+    so neither existing lock can serialize both writers without inverting
+    lock order.
+
+    CPython's ``dict.copy()`` does not release the GIL, so the snapshot is
+    consistent; iterating the private copy cannot raise ``RuntimeError``
+    from a concurrent subscribe or disconnect. A viewer added after the
+    copy is missed for this one frame and caught on the next emit.
+    """
+    viewers = session.get("viewers")
+    if not viewers:
+        return []
+    return list(viewers.copy())
+
+
+def _session_event_targets(session: dict) -> list:
+    """Controller plus live viewers, identity-deduplicated.
+
+    ``session["transport"]`` is the controlling writer; ``session["viewers"]``
+    holds every surface that has attached (pop-out, Cyllene, reconnect).
+    Dead/detached transports are skipped when any live target exists so a
+    parked sentinel does not swallow a fan-out. If nothing live remains, the
+    controller is returned as-is (including the detached sentinel) so
+    write_json keeps today's drop-on-detach return value.
+    """
+    controller = session.get("transport")
+    live: list = []
+
+    def _add(candidate) -> None:
+        if candidate is None:
+            return
+        for existing in live:
+            if existing is candidate:
+                return
+        live.append(candidate)
+
+    if controller is not None and not _transport_is_dead(controller):
+        _add(controller)
+    for viewer in _snapshot_session_viewers(session):
+        if not _transport_is_dead(viewer):
+            _add(viewer)
+    if live:
+        return live
+    return [controller] if controller is not None else []
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
     Precedence:
 
-    1. Event frames with a session id → the transport stored on that session,
-       so async events land with the client that owns the session even if
-       the emitting thread has no contextvar binding.
+    1. Event frames with a session id → the session's controlling transport
+       plus any live viewers/subscribers, identity-deduplicated, so a second
+       surface can observe without stealing control. Async events still land
+       with the owner even if the emitting thread has no contextvar binding.
     2. Otherwise the transport bound on the current context (set by
        :func:`dispatch` for the lifetime of a request).
     3. Otherwise the module-level stdio transport, matching the historical
@@ -2491,16 +2572,36 @@ def write_json(obj: dict) -> bool:
     Every routed event frame is stamped with a per-session monotonic
     ``seq`` and recorded in the bounded replay ring (tui_gateway.event_replay)
     so a WS client can resume losslessly after a reconnect via
-    ``session.events.since``.
+    ``session.events.since``. Session-less global events (``skin.changed``)
+    do not use this path; see ``_broadcast_global_event``.
     """
     if obj.get("method") == "event":
         params = obj.get("params")
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            from tui_gateway.event_replay import _stamp_event
+        if sid:
+            session = _sessions.get(sid)
+            if isinstance(session, dict):
+                targets = _session_event_targets(session)
+                if targets:
+                    from tui_gateway.event_replay import _stamp_event
 
-            _stamp_event(obj)
-            return t.write(obj)
+                    _stamp_event(obj)
+                    delivered = False
+                    event_type = params.get("type") if isinstance(params, dict) else None
+                    for target in targets:
+                        try:
+                            if target.write(obj):
+                                delivered = True
+                        except Exception:
+                            # One wedged subscriber must not stall the
+                            # controller or remaining observers — same
+                            # isolation as ``_broadcast_global_event``.
+                            logger.debug(
+                                "session-event fan-out write failed type=%s",
+                                event_type,
+                                exc_info=True,
+                            )
+                    return delivered
 
     from tui_gateway.event_replay import _stamp_event
 
@@ -9885,8 +9986,8 @@ def _enqueue_prompt(
     arrivals share a slot and merge losslessly (mirroring the consecutive-user
     merge in ``repair_message_sequence``). Image-bearing submissions stay as
     separate envelopes, so their attachment ownership and chronology survive.
-    ``transport`` is pinned so the drained turn streams back to the client that
-    sent it even if the session transport is rebound meanwhile.
+    ``transport`` is recorded so drain can subscribe the sender if the
+    controller seat is vacant; a healthy controller is not replaced.
     """
     image_paths = list(image_paths or [])
     # #84417: scrub any live-turn self-duplicates first so the consecutive-text
@@ -10152,8 +10253,12 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued_prompts:
             session.pop("queued_prompts", None)
         session["running"] = True
-        if queued.get("transport") is not None:
-            session["transport"] = queued["transport"]
+        queued_transport = queued.get("transport")
+        if queued_transport is not None:
+            # Subscribe the sender so the drained turn still reaches them.
+            # Do not replace a healthy controller — the same ownership
+            # rule as prompt.submit / session.resume.
+            _subscribe_session_transport(session, queued_transport, sid=sid)
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
@@ -10810,6 +10915,34 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
     return in_memory_fallback
 
 
+def _subscribe_session_transport(
+    session: dict,
+    transport,
+    *,
+    sid: str | None = None,
+) -> None:
+    """Attach *transport* as an observer of *session* without stealing control.
+
+    ``session["transport"]`` stays the controlling writer. The caller is
+    recorded in the identity-keyed ``viewers`` collection so session events
+    fan out to every attached surface. The caller becomes controller only
+    when the seat is vacant, already theirs, or parked on a dead/detached
+    transport (reconnect after WS drop). Callers must hold
+    ``session["history_lock"]`` when the session has one.
+    """
+    if transport is None:
+        return
+    viewers = session.setdefault("viewers", {})
+    viewers[transport] = time.time()
+    current = session.get("transport")
+    if current is None or current is transport or _transport_is_dead(current):
+        session["transport"] = transport
+    if sid is not None and transport is not _detached_ws_transport:
+        # A live attach (controller claim OR observer subscribe) means a
+        # client is present — any pending ws-orphan reap must not fire.
+        _cancel_ws_orphan_reap(sid)
+
+
 def _live_session_payload(
     sid: str,
     session: dict,
@@ -10823,18 +10956,7 @@ def _live_session_payload(
         if cols is not None:
             session["cols"] = cols
         if transport is not None:
-            session["transport"] = transport
-            # Track every transport that has shown this session (multi-window:
-            # pop-out windows each resume the same sid). The last viewer
-            # becomes the transport on the disconnect path so closing a
-            # pop-out re-binds the session to a still-open window instead of
-            # stranding it on the drop sentinel (#83716).
-            viewers = session.setdefault("viewers", {})
-            viewers[transport] = time.time()
-            if transport is not _detached_ws_transport:
-                # A live transport rebind means the client is back — any
-                # pending ws-orphan reap must not fire (storm killer).
-                _cancel_ws_orphan_reap(sid)
+            _subscribe_session_transport(session, transport, sid=sid)
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(

@@ -467,8 +467,12 @@ def _(rid, params: dict) -> dict:
                     transport = current_transport()
                     if transport is not None:
                         with live.setdefault("history_lock", threading.Lock()):
-                            live["transport"] = transport
-                            live.setdefault("viewers", {})[transport] = time.time()
+                            # Subscribe without replacing a different live
+                            # controller (Cyllene watching Desktop). A
+                            # sentinel-parked record still gets claimed.
+                            _subscribe_session_transport(
+                                live, transport, sid=live_sid
+                            )
                     _cancel_ws_orphan_reap(live_sid)
                     history = live.get("history") or []
                     return _ok(
