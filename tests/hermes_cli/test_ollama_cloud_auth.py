@@ -12,6 +12,16 @@ Covers:
 import os
 
 
+def _set_injected_direct_aliases(monkeypatch, aliases):
+    """Keep test-injected aliases and their cache state explicit."""
+    import hermes_cli.model_switch as ms
+
+    cache_key = ("test-config.yaml", 0, 0)
+    monkeypatch.setattr(ms, "DIRECT_ALIASES", aliases)
+    monkeypatch.setattr(ms, "_DIRECT_ALIASES_CACHE_KEY", cache_key)
+    monkeypatch.setattr(ms, "_direct_aliases_cache_key", lambda: cache_key)
+
+
 # ---------------------------------------------------------------------------
 # OLLAMA_API_KEY credential resolution
 # ---------------------------------------------------------------------------
@@ -85,7 +95,7 @@ class TestDirectAliases:
         test_aliases = {
             "glm": DirectAlias("glm-4.7", "custom", "https://ollama.com/v1"),
         }
-        monkeypatch.setattr(ms, "DIRECT_ALIASES", test_aliases)
+        _set_injected_direct_aliases(monkeypatch, test_aliases)
 
         result = resolve_alias("glm", "openrouter")
         assert result is not None
@@ -232,16 +242,65 @@ class TestEnsureDirectAliases:
             lambda: mock_config,
         )
         monkeypatch.setattr(ms, "DIRECT_ALIASES", {})
+        monkeypatch.setattr(ms, "_DIRECT_ALIASES_CACHE_KEY", None)
         ms._ensure_direct_aliases()
         assert "test" in ms.DIRECT_ALIASES
 
-    def test_ensure_no_reload_when_populated(self, monkeypatch):
-        """_ensure_direct_aliases does not reload if already populated."""
+    def test_ensure_caches_empty_config(self, monkeypatch):
+        """An empty alias config is loaded once, not on every lookup."""
+        import hermes_cli.model_switch as ms
+
+        calls = []
+        cache_key = ("config.yaml", 10, 0)
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {})
+        monkeypatch.setattr(ms, "_DIRECT_ALIASES_CACHE_KEY", None)
+        monkeypatch.setattr(ms, "_direct_aliases_cache_key", lambda: cache_key)
+        monkeypatch.setattr(
+            ms,
+            "_load_direct_aliases",
+            lambda: calls.append(True) or {},
+        )
+
+        ms._ensure_direct_aliases()
+        ms._ensure_direct_aliases()
+
+        assert calls == [True]
+        assert ms.DIRECT_ALIASES == {}
+
+    def test_ensure_refreshes_when_config_stat_changes(self, monkeypatch):
+        """A changed config identity refreshes aliases in a long-lived process."""
+        import hermes_cli.model_switch as ms
+        from hermes_cli.model_switch import DirectAlias
+
+        keys = iter([
+            ("config.yaml", 10, 1),
+            ("config.yaml", 11, 1),
+        ])
+        loads = iter([
+            {"old": DirectAlias("old-model", "custom", "")},
+            {"new": DirectAlias("new-model", "custom", "")},
+        ])
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {})
+        monkeypatch.setattr(ms, "_DIRECT_ALIASES_CACHE_KEY", None)
+        monkeypatch.setattr(ms, "_direct_aliases_cache_key", lambda: next(keys))
+        monkeypatch.setattr(ms, "_load_direct_aliases", lambda: next(loads))
+
+        ms._ensure_direct_aliases()
+        assert "old" in ms.DIRECT_ALIASES
+        ms._ensure_direct_aliases()
+        assert "new" in ms.DIRECT_ALIASES
+        assert "old" not in ms.DIRECT_ALIASES
+
+
         import hermes_cli.model_switch as ms
         from hermes_cli.model_switch import DirectAlias
 
         existing = {"pre": DirectAlias("pre-model", "custom", "")}
         monkeypatch.setattr(ms, "DIRECT_ALIASES", existing)
+
+        cache_key = ("test-config.yaml", 123, 456)
+        monkeypatch.setattr(ms, "_DIRECT_ALIASES_CACHE_KEY", cache_key)
+        monkeypatch.setattr(ms, "_direct_aliases_cache_key", lambda: cache_key)
 
         call_count = [0]
         original_load = ms._load_direct_aliases
@@ -271,7 +330,7 @@ class TestResolveAliasEdgeCases:
         test_aliases = {
             "myalias": DirectAlias("my-model", "custom", "https://example.com"),
         }
-        monkeypatch.setattr(ms, "DIRECT_ALIASES", test_aliases)
+        _set_injected_direct_aliases(monkeypatch, test_aliases)
 
         result = ms.resolve_alias("  myalias  ", "openrouter")
         assert result is not None
@@ -376,7 +435,7 @@ class TestSwitchModelDirectAliasOverride:
         test_aliases = {
             "qwen": DirectAlias("qwen3.5:397b", "custom", "https://ollama.com/v1"),
         }
-        monkeypatch.setattr(ms, "DIRECT_ALIASES", test_aliases)
+        _set_injected_direct_aliases(monkeypatch, test_aliases)
 
         monkeypatch.setattr(ms, "resolve_alias",
             lambda raw, prov: ("custom", "qwen3.5:397b", "qwen"))
@@ -404,7 +463,7 @@ class TestSwitchModelDirectAliasOverride:
         test_aliases = {
             "local": DirectAlias("local-model", "custom", "http://localhost:11434/v1"),
         }
-        monkeypatch.setattr(ms, "DIRECT_ALIASES", test_aliases)
+        _set_injected_direct_aliases(monkeypatch, test_aliases)
         monkeypatch.setattr(ms, "resolve_alias",
             lambda raw, prov: ("custom", "local-model", "local"))
         monkeypatch.setattr(
