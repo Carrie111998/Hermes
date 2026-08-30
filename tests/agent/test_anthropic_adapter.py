@@ -894,9 +894,62 @@ class TestConvertMessages:
         assert tool_block["content"] == "result"
         assert tool_block["cache_control"] == {"type": "ephemeral"}
 
+    def test_tool_result_list_of_text_parts_converts_to_anthropic_blocks(self):
+        messages = [
+            {"role": "system", "content": "You are an assistant"},
+            {"role": "user", "content": "run tool"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "tc_1", "function": {"name": "test", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "tc_1", "content": [{"type": "text", "text": "part 1"}, {"type": "text", "text": "part 2"}]},
+        ]
+        _, result = convert_messages_to_anthropic(messages)
+        user_msg = next(
+            m for m in result
+            if m["role"] == "user"
+            and isinstance(m["content"], list)
+            and any(b.get("type") == "tool_result" for b in m["content"])
+        )
+        tool_block = user_msg["content"][0]
+        assert tool_block["type"] == "tool_result"
+        assert tool_block["content"] == [
+            {"type": "text", "text": "part 1"},
+            {"type": "text", "text": "part 2"},
+        ]
 
+    def test_tool_result_whitespace_scalar_coerces_to_placeholder(self):
+        messages = [
+            {"role": "system", "content": "You are an assistant"},
+            {"role": "user", "content": "run tool"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "tc_1", "function": {"name": "test", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "tc_1", "content": "   \n\t  "},
+        ]
+        _, result = convert_messages_to_anthropic(messages)
+        user_msg = next(
+            m for m in result
+            if m["role"] == "user"
+            and isinstance(m["content"], list)
+            and any(b.get("type") == "tool_result" for b in m["content"])
+        )
+        tool_block = user_msg["content"][0]
+        assert tool_block["type"] == "tool_result"
+        assert tool_block["content"] == "(no output)"
 
-
+    def test_tool_result_whitespace_only_blocks_coerces_to_placeholder(self):
+        messages = [
+            {"role": "system", "content": "You are an assistant"},
+            {"role": "user", "content": "run tool"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "tc_1", "function": {"name": "test", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "tc_1", "content": [{"type": "text", "text": "   "}]},
+        ]
+        _, result = convert_messages_to_anthropic(messages)
+        user_msg = next(
+            m for m in result
+            if m["role"] == "user"
+            and isinstance(m["content"], list)
+            and any(b.get("type") == "tool_result" for b in m["content"])
+        )
+        tool_block = user_msg["content"][0]
+        assert tool_block["type"] == "tool_result"
+        assert tool_block["content"] == "(no output)"
 
     def test_empty_user_message_string_gets_placeholder(self):
         """Empty user message strings should get '(empty message)' placeholder.
