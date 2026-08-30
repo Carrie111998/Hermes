@@ -657,6 +657,15 @@ class EmailAdapter(BasePlatformAdapter):
         # Map chat_id (sender email) -> last subject + message-id for threading
         self._thread_context: Dict[str, Dict[str, str]] = {}
 
+        # Outbound subject prefix: distinguishes Hermes mail in busy inboxes and
+        # keeps spam filters from reading a generic "Hermes Agent" as bot traffic
+        # (#98649). Operator-set via EMAIL_SUBJECT_PREFIX; falls back to the
+        # historical default when unset/blank. Resolved once at init so every
+        # send path reads a stable value.
+        self._subject_prefix = (
+            _get_secret("EMAIL_SUBJECT_PREFIX", "") or "Hermes Agent"
+        ).strip() or "Hermes Agent"
+
         logger.info("[Email] Adapter initialized for %s", self._address)
 
     def _trim_seen_uids(self) -> None:
@@ -1213,7 +1222,7 @@ class EmailAdapter(BasePlatformAdapter):
         try:
             loop = asyncio.get_running_loop()
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None, self._send_email, chat_id, content, reply_to, metadata
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -1230,22 +1239,77 @@ class EmailAdapter(BasePlatformAdapter):
             return self._address.rsplit("@", 1)[-1] or "localhost"
         return "localhost"
 
+    # ── Outbound subject helpers (#98649) ──────────────────────────────────
+    # Three small, dependency-free helpers compose the subject for every
+    # outbound path. They keep reply threading intact (a remembered thread
+    # subject still wins, and gets the correct "Re:" prefix) while letting an
+    # operator set a distinctive prefix and, when the caller passes task
+    # metadata, derive a meaningful one-off subject.
+
+    @staticmethod
+    def _task_reason(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Extract a short task reason from send ``metadata``.
+
+        Prefers ``job_name`` (set by the cron scheduler's ``route_metadata``),
+        then ``reason``, ``task``, ``title``. Returns a stripped non-empty
+        string, or ``None`` when no usable key is present. Callers must treat
+        ``None`` as "no task context" and fall back to the thread/prefix.
+        """
+        if not metadata or not isinstance(metadata, dict):
+            return None
+        for key in ("job_name", "reason", "task", "title"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def _build_subject(
+        self,
+        ctx: Dict[str, str],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Compose the outbound subject for a (reply) send path.
+
+        Priority:
+          1. Task context (``metadata``) -> ``"<PREFIX>: <reason>"`` as a
+             *fresh* subject (no "Re:", even when there is a thread context).
+          2. Remembered thread subject -> ``"Re: <thread subject>"`` (preserves
+             the historical reply-threading behavior).
+          3. No context -> the configured ``_subject_prefix`` (no spurious
+             "Re:" — a fresh outbound email is not a reply, #98649).
+
+        The prefix only substitutes the hardcoded fallback; a remembered
+        thread subject is always preserved verbatim (we never rewrite it).
+        """
+        reason = self._task_reason(metadata)
+        if reason:
+            return f"{self._subject_prefix}: {reason}"
+        thread_subject = ctx.get("subject")
+        if thread_subject:
+            if not thread_subject.startswith("Re:"):
+                thread_subject = f"Re: {thread_subject}"
+            return thread_subject
+        return self._subject_prefix
+
     def _send_email(
         self,
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Send an email via SMTP. Runs in executor thread."""
+        """Send an email via SMTP. Runs in executor thread.
+
+        ``metadata`` optionally carries a task reason (``job_name``/``reason``/
+        ``task``/``title``) used to derive a meaningful subject (#98649).
+        """
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
         # Thread context for reply
         ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        subject = self._build_subject(ctx, metadata)
         msg["Subject"] = subject
 
         # Threading headers
@@ -1340,6 +1404,7 @@ class EmailAdapter(BasePlatformAdapter):
                 chat_id,
                 body,
                 local_paths,
+                metadata,
             )
         except Exception as e:
             logger.error("[Email] Multi-image send failed, falling back: %s", e, exc_info=True)
@@ -1350,16 +1415,19 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         file_paths: List[str],
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Send an email with multiple file attachments via SMTP."""
+        """Send an email with multiple file attachments via SMTP.
+
+        ``metadata`` optionally carries a task reason used to derive the subject
+        (#98649).
+        """
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        subject = self._build_subject(ctx, metadata)
         msg["Subject"] = subject
 
         original_msg_id = ctx.get("message_id")
@@ -1418,6 +1486,7 @@ class EmailAdapter(BasePlatformAdapter):
                 caption or "",
                 file_path,
                 file_name,
+                kwargs.get("metadata"),
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -1430,16 +1499,19 @@ class EmailAdapter(BasePlatformAdapter):
         body: str,
         file_path: str,
         file_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Send an email with a file attachment via SMTP."""
+        """Send an email with a file attachment via SMTP.
+
+        ``metadata`` optionally carries a task reason used to derive the subject
+        (#98649).
+        """
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
         ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        subject = self._build_subject(ctx, metadata)
         msg["Subject"] = subject
 
         original_msg_id = ctx.get("message_id")
@@ -1507,9 +1579,14 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    metadata=None,
 ):
     """Out-of-process Email delivery via SMTP (one-shot). Implements the
-    standalone_sender_fn contract; replaces the legacy _send_email helper."""
+    standalone_sender_fn contract; replaces the legacy _send_email helper.
+
+    ``metadata`` optionally carries a task reason (e.g. cron ``job_name``) used
+    to derive a meaningful subject (#98649).
+    """
     import smtplib
     from email.mime.text import MIMEText
     from email.utils import formatdate
@@ -1534,11 +1611,21 @@ async def _standalone_send(
     if not all([address, password, smtp_host]):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
+    subject_prefix = (_get_secret("EMAIL_SUBJECT_PREFIX", "") or "Hermes Agent").strip() or "Hermes Agent"
+    reason = None
+    if isinstance(metadata, dict):
+        for key in ("job_name", "reason", "task", "title"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                reason = value.strip()
+                break
+    subject = f"{subject_prefix}: {reason}" if reason else subject_prefix
+
     try:
         msg = MIMEText(message, "plain", "utf-8")
         msg["From"] = address
         msg["To"] = chat_id
-        msg["Subject"] = "Hermes Agent"
+        msg["Subject"] = subject
         msg["Date"] = formatdate(localtime=True)
 
         ctx = _tls_context(smtp_tls_verify, smtp_host)

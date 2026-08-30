@@ -1122,5 +1122,154 @@ class TestSenderAuthentication(unittest.TestCase):
         self.assertFalse(ok, reason)
 
 
+class TestOutboundSubjectPrefixAndContext(unittest.TestCase):
+    """Verify EMAIL_SUBJECT_PREFIX and task-context subject derivation (#98649).
+
+    Backward compatibility: with no env var and no metadata, the subject must
+    stay the historical default "Hermes Agent" and replies keep their "Re:"
+    prefix off a remembered thread subject.
+    """
+
+    def _make_adapter(self, env=None):
+        env = env or {}
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+            **env,
+        }):
+            from plugins.platforms.email.adapter import EmailAdapter
+            return EmailAdapter(PlatformConfig(enabled=True))
+
+    def test_default_subject_when_no_prefix_and_no_metadata(self):
+        adapter = self._make_adapter()
+        self.assertEqual(adapter._subject_prefix, "Hermes Agent")
+
+    def test_subject_prefix_from_env(self):
+        adapter = self._make_adapter({"EMAIL_SUBJECT_PREFIX": "  My Agent  "})
+        self.assertEqual(adapter._subject_prefix, "My Agent")
+
+    def test_prefix_falls_back_when_env_blank(self):
+        adapter = self._make_adapter({"EMAIL_SUBJECT_PREFIX": "   "})
+        self.assertEqual(adapter._subject_prefix, "Hermes Agent")
+
+    def test_task_reason_prefers_job_name(self):
+        from plugins.platforms.email.adapter import EmailAdapter
+        self.assertEqual(
+            EmailAdapter._task_reason({"job_name": "Daily Digest"}),
+            "Daily Digest",
+        )
+        self.assertEqual(
+            EmailAdapter._task_reason({"reason": "r", "job_name": "j"}),
+            "j",
+        )
+        self.assertIsNone(EmailAdapter._task_reason({"foo": "bar"}))
+        self.assertIsNone(EmailAdapter._task_reason(None))
+
+    def test_build_subject_task_context_fresh(self):
+        adapter = self._make_adapter({"EMAIL_SUBJECT_PREFIX": "Ops"})
+        # Task context wins and is a FRESH subject (no "Re:"), even with a thread ctx.
+        subject = adapter._build_subject(
+            {"subject": "Old thread"}, {"job_name": "Backup"}
+        )
+        self.assertEqual(subject, "Ops: Backup")
+        self.assertFalse(subject.startswith("Re:"))
+
+    def test_build_subject_thread_reply(self):
+        adapter = self._make_adapter()
+        # No task context -> remembered thread subject keeps "Re:".
+        subject = adapter._build_subject({"subject": "Project question"})
+        self.assertEqual(subject, "Re: Project question")
+
+    def test_build_subject_no_context_uses_prefix(self):
+        adapter = self._make_adapter({"EMAIL_SUBJECT_PREFIX": "Ops"})
+        subject = adapter._build_subject({})
+        self.assertEqual(subject, "Ops")
+
+    def test_send_email_uses_task_context_subject(self):
+        adapter = self._make_adapter({"EMAIL_SUBJECT_PREFIX": "Ops"})
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            adapter._send_email(
+                "user@test.com", "body", None, {"job_name": "Nightly Report"}
+            )
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["Subject"], "Ops: Nightly Report")
+
+    def test_send_email_reply_keeps_re_prefix(self):
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com"] = {
+            "subject": "Question",
+            "message_id": "<orig@test.com>",
+        }
+        with patch("smtplib.SMTP") as mock_smtp:
+            mock_server = MagicMock()
+            mock_smtp.return_value = mock_server
+            adapter._send_email("user@test.com", "answer", None)
+            send_call = mock_server.send_message.call_args[0][0]
+            self.assertEqual(send_call["Subject"], "Re: Question")
+
+    def test_standalone_send_task_context_subject(self):
+        import asyncio
+        from types import SimpleNamespace
+        from plugins.platforms.email.adapter import _standalone_send
+
+        async def _run(extra, message, metadata):
+            return await _standalone_send(
+                SimpleNamespace(token=None, api_key=None, extra=extra or {}),
+                "user@test.com",
+                message,
+                metadata=metadata,
+            )
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            with patch("smtplib.SMTP") as mock_smtp:
+                mock_server = MagicMock()
+                mock_smtp.return_value = mock_server
+                result = asyncio.run(_run(
+                    {"address": "hermes@test.com", "smtp_host": "smtp.test.com"},
+                    "Hello",
+                    {"job_name": "Cron Digest"},
+                ))
+                self.assertTrue(result["success"])
+                send_call = mock_server.send_message.call_args[0][0]
+                self.assertEqual(send_call["Subject"], "Hermes Agent: Cron Digest")
+
+    def test_standalone_send_default_subject(self):
+        import asyncio
+        from types import SimpleNamespace
+        from plugins.platforms.email.adapter import _standalone_send
+
+        async def _run(extra, message):
+            return await _standalone_send(
+                SimpleNamespace(token=None, api_key=None, extra=extra or {}),
+                "user@test.com",
+                message,
+            )
+
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            with patch("smtplib.SMTP") as mock_smtp:
+                mock_server = MagicMock()
+                mock_smtp.return_value = mock_server
+                result = asyncio.run(_run(
+                    {"address": "hermes@test.com", "smtp_host": "smtp.test.com"},
+                    "Hello",
+                ))
+                self.assertTrue(result["success"])
+                send_call = mock_server.send_message.call_args[0][0]
+                self.assertEqual(send_call["Subject"], "Hermes Agent")
+
+
 if __name__ == "__main__":
     unittest.main()
