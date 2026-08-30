@@ -9605,6 +9605,24 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+
+def _non_dispatchable_assignees() -> frozenset[str]:
+    """Assignees configured to never be auto-spawned by the dispatcher.
+
+    Reads ``kanban.non_dispatchable_assignees`` (a list of profile names).
+    Lets a real, addressable profile — e.g. a human-owner lane — opt out
+    of autonomous dispatch entirely, the same way ``review_dispatch``
+    lets a whole status opt out, without waiting for the spawn to fail
+    and the block-recurrence breaker to file the card as blocked.
+    """
+    try:
+        raw = (load_config() or {}).get("kanban", {}).get("non_dispatchable_assignees", [])
+    except Exception:
+        return frozenset()
+    if isinstance(raw, str):
+        raw = [raw]
+    return frozenset(str(name).strip() for name in raw if str(name).strip())
+
 def review_dispatch_enabled() -> bool:
     """Return whether first-class review tasks should dispatch automatically.
 
@@ -10169,6 +10187,12 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        # Operator-designated non-dispatch lanes (human-owner profiles,
+        # review-only roles): skip before the profile check — the assignee
+        # may be a perfectly real profile that must never auto-spawn.
+        if row_assignee in _non_dispatchable_assignees():
+            result.skipped_nonspawnable.append(row["id"])
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
