@@ -78,7 +78,12 @@ def resolve_exec_command() -> str:
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
             # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # NOTE: do NOT .resolve() sys.executable here. In venvs whose
+            # python is a symlink to a base interpreter (uv-managed Pythons),
+            # resolve() escapes the venv and the written Exec= loses
+            # site-packages (#hermes-desktop-entry-symlink) — the DE launch
+            # then dies on the first third-party import.
+            argv = [str(Path(sys.executable)), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
