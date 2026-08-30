@@ -3171,21 +3171,50 @@ class CLICommandsMixin:
             _cprint("  Usage: /goal gate [list | add <command> | remove <N> | clear]")
             return
 
-        # Otherwise treat the arg as the goal text. Inline `field: value`
-        # lines (verify:, constraints:, boundaries:, stop when:) are parsed
-        # into a completion contract; the remaining prose is the headline.
-        # A plain free-form goal with no such lines behaves exactly as before.
-        from hermes_cli.goals import parse_contract
+        # Otherwise treat the arg as the goal text. First resolve autonomous
+        # mode (`--auto` / `--autonomous`) and optional GOAL.md file loading,
+        # then parse inline `field: value` lines (verify:, constraints:,
+        # boundaries:, stop when:) into a completion contract; the remaining
+        # prose is the headline. A plain free-form goal behaves exactly as
+        # before (autonomous stays off, no file is read).
+        from hermes_cli.goals import parse_contract, resolve_goal_input
 
-        headline, contract = parse_contract(arg)
-        goal_text = headline or arg
+        auto_default = bool(
+            (self.config.get("goals") or {}).get("autonomous", False)
+        )
+        # Single-session override: GOAL_AUTONOMOUS forces the autonomous default
+        # on or OFF without editing config. Truthy (1/true/yes/on) and falsy
+        # (0/false/no/off) spellings both override; anything else is ignored.
+        _env_auto = os.environ.get("GOAL_AUTONOMOUS", "").strip().lower()
+        if _env_auto in {"1", "true", "yes", "on"}:
+            auto_default = True
+        elif _env_auto in {"0", "false", "no", "off"}:
+            auto_default = False
+        resolved, autonomous, note = resolve_goal_input(
+            arg, cwd=os.getcwd(), autonomous_default=auto_default
+        )
+        if note:
+            _cprint(f"  {_DIM}{note}{_RST}")
+
+        headline, contract = parse_contract(resolved)
+        goal_text = headline or resolved
         try:
-            state = mgr.set(goal_text, contract=contract if not contract.is_empty() else None)
+            state = mgr.set(
+                goal_text,
+                contract=contract if not contract.is_empty() else None,
+                autonomous=autonomous,
+            )
         except ValueError as exc:
             _cprint(f"  Invalid goal: {exc}")
             return
 
-        _cprint(f"  ⊙ Goal set ({state.max_turns}-turn budget): {state.goal}")
+        mode = " · autonomous" if state.autonomous else ""
+        _cprint(f"  ⊙ Goal set ({state.max_turns}-turn budget{mode}): {state.goal}")
+        if state.autonomous:
+            _cprint(
+                f"  {_DIM}Autonomous mode is recorded on this goal; on its own "
+                f"it is an inert marker — nothing else changes yet.{_RST}"
+            )
         if state.has_contract():
             _cprint(f"  {_DIM}Completion contract:{_RST}")
             for line in state.contract.render_block().splitlines():

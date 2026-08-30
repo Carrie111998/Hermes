@@ -421,8 +421,115 @@ def parse_contract(text: str) -> Tuple[str, GoalContract]:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Quality gates
+# Autonomous-mode + file-goal input resolution
 # ──────────────────────────────────────────────────────────────────────
+
+# Autonomous-mode switches. The dashed forms (--auto/--autonomous) are
+# unambiguous and accepted anywhere in the argument. A bare keyword is accepted
+# only when it is the entire argument. It must never consume part of goal prose.
+_AUTONOMOUS_DASH_FLAGS = {"--auto", "--autonomous"}
+_AUTONOMOUS_BARE_KEYWORDS = {"auto", "autonomous"}
+
+# Upper bound on a goal file we will read inline, so a stray huge/binary file
+# path can never flood the goal text. A real GOAL.md is a handful of KB.
+_GOAL_FILE_MAX_BYTES = 64 * 1024
+
+
+def _looks_like_path(token: str) -> bool:
+    """Heuristic: does this single token look like a goal file path?
+
+    True for tokens that carry a path separator or a text-ish extension and
+    contain no whitespace. Kept deliberately conservative so a normal prose
+    goal ("fix the parser") is never mistaken for a file.
+    """
+    if not token or any(c.isspace() for c in token):
+        return False
+    if token.startswith(("/", "./", "../", "~/")):
+        return True
+    lowered = token.lower()
+    return lowered.endswith((".md", ".txt", ".goal"))
+
+
+def resolve_goal_input(
+    arg: str, *, cwd: Optional[str] = None, autonomous_default: bool = False
+) -> Tuple[str, bool, str]:
+    """Resolve a raw `/goal` argument into (goal_text, autonomous, note).
+
+    Two additive behaviours on top of plain goal text:
+
+      * Autonomous mode: a ``--auto`` / ``--autonomous`` flag anywhere in the
+        argument opts the goal in and is stripped from the text. For backwards
+        compatibility, a bare ``auto`` / ``autonomous`` keyword is also accepted
+        when it is the entire argument. A bare keyword in goal prose always stays
+        in the goal, including in the leading position.
+        ``autonomous_default`` (from config) seeds the flag when no explicit
+        switch is present.
+      * If what remains is a single path-like token pointing at a readable file,
+        the file's contents become the goal text (the ``GOAL.md`` pattern). A
+        missing/oversized/unreadable file falls back to treating the token
+        literally, so this never raises into the command handler.
+
+    ``note`` is a short human-readable provenance string ('' when the text was
+    used verbatim). Fail-open by construction: any error yields the original
+    text with the resolved autonomous flag.
+    """
+    text = (arg or "").strip()
+    autonomous = bool(autonomous_default)
+
+    tokens = text.split()
+    # A bare keyword is a switch only when it is the entire argument. This keeps
+    # the old shorthand without consuming a leading word from normal goal prose.
+    if len(tokens) == 1 and tokens[0].lower() in _AUTONOMOUS_BARE_KEYWORDS:
+        autonomous = True
+        tokens = tokens[1:]
+
+    # Dashed flags (--auto/--autonomous) are unambiguous and stripped anywhere.
+    kept: List[str] = []
+    for tok in tokens:
+        if tok.lower() in _AUTONOMOUS_DASH_FLAGS:
+            autonomous = True
+            continue
+        kept.append(tok)
+    text = " ".join(kept).strip()
+
+    note = ""
+    if len(kept) == 1 and _looks_like_path(kept[0]):
+        loaded, note = _read_goal_file(kept[0], cwd=cwd)
+        if loaded is not None:
+            text = loaded
+    return text, autonomous, note
+
+
+def _read_goal_file(token: str, *, cwd: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """Read a goal file, returning (contents, note).
+
+    On success returns (contents, "loaded goal from <token>"). On a miss returns
+    (None, note): when the token looked like a path but no file was found the
+    note says so (so a typo like ``GOL.md`` is diagnosable rather than silently
+    becoming the literal goal); other misses return (None, "").
+    """
+    try:
+        path = os.path.expanduser(token)
+        if not os.path.isabs(path) and cwd:
+            path = os.path.join(cwd, path)
+        if not os.path.isfile(path):
+            return None, (
+                f"'{token}' looks like a file path but no such file was "
+                "found — using it as the goal text instead."
+            )
+        if os.path.getsize(path) > _GOAL_FILE_MAX_BYTES:
+            return None, (
+                f"'{token}' exceeds the {_GOAL_FILE_MAX_BYTES // 1024} KB goal-"
+                "file cap — using it as the goal text instead."
+            )
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            contents = fh.read().strip()
+        if not contents:
+            return None, f"'{token}' is empty — using it as the goal text instead."
+        return contents, f"loaded goal from {token}"
+    except Exception:  # never raise into the command handler
+        return None, ""
+
 
 
 @dataclass
@@ -599,6 +706,11 @@ class GoalState:
     # must ALL pass before the judge may declare the goal done. Empty by
     # default — a goal with no gates behaves exactly as before.
     gates: List[GoalGate] = field(default_factory=list)
+    # Autonomous mode (/goal --auto <text>): opts this goal into the autonomous
+    # engine expansions (session-recycle, decision log, deception check, council
+    # gate) that layer on top of the base Ralph loop. Off by default so a plain
+    # goal behaves exactly as before; back-compatible with old state_meta rows.
+    autonomous: bool = False
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -636,6 +748,7 @@ class GoalState:
                 for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
             ],
+            autonomous=bool(data.get("autonomous", False)),
         )
 
     # --- contract helpers -------------------------------------------------
@@ -1473,7 +1586,7 @@ class GoalManager:
 
     # --- mutation -----------------------------------------------------
 
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None, autonomous: bool = False) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
@@ -1485,6 +1598,7 @@ class GoalManager:
             created_at=time.time(),
             last_turn_at=0.0,
             contract=contract if contract is not None else GoalContract(),
+            autonomous=bool(autonomous),
         )
         self._state = state
         save_goal(self.session_id, state)
