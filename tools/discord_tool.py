@@ -665,6 +665,29 @@ def _create_thread(
     return json.dumps(result)
 
 
+def _send_message(token: str, channel_id: str, content: str, **_kwargs: Any) -> str:
+    """Send a message to a text channel, thread, or forum post.
+
+    Threads and forum posts are channels in Discord's API, so a single
+    ``POST /channels/{id}/messages`` covers all three targets — no
+    channel-type lookup needed.  Forum/media channels themselves (types
+    15/16) reject direct messages; use ``create_thread`` to start a post
+    there.
+    """
+    text = (content or "").strip()
+    if not text:
+        return tool_error("content must be a non-empty string.")
+    msg = _discord_request(
+        "POST", f"/channels/{channel_id}/messages", token,
+        body={"content": text},
+    )
+    return json.dumps({
+        "success": True,
+        "message_id": msg.get("id"),
+        "channel_id": channel_id,
+    })
+
+
 def _add_role(token: str, guild_id: str, user_id: str, role_id: str, **_kwargs: Any) -> str:
     """Add a role to a guild member."""
     _discord_request("PUT", f"/guilds/{guild_id}/members/{user_id}/roles/{role_id}", token)
@@ -695,11 +718,12 @@ _ACTIONS = {
     "unpin_message": _unpin_message,
     "delete_message": _delete_message,
     "create_thread": _create_thread,
+    "send_message": _send_message,
     "add_role": _add_role,
     "remove_role": _remove_role,
 }
 
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
+_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread", "send_message"})
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
@@ -722,6 +746,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
     ("create_thread", "(channel_id, name, [content])", "create a public thread or forum post (content = starter message); optional message_id anchor"),
+    ("send_message", "(channel_id, content)", "send a message to a text channel, thread, or forum post"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
 ]
@@ -743,6 +768,7 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "unpin_message": ["channel_id", "message_id"],
     "delete_message": ["channel_id", "message_id"],
     "create_thread": ["channel_id", "name"],
+    "send_message": ["channel_id", "content"],
     "add_role": ["guild_id", "user_id", "role_id"],
     "remove_role": ["guild_id", "user_id", "role_id"],
 }
@@ -907,8 +933,9 @@ def _build_schema(
         "content": {
             "type": "string",
             "description": (
-                "Starter message content (create_thread). Optional for normal "
-                "threads (sent as first thread message); for forum channels it "
+                "Message text (send_message) or starter message content "
+                "(create_thread). Optional for create_thread in normal threads "
+                "(sent as first thread message); for forum channels it "
                 "becomes the post's first message (falls back to the thread "
                 "name when omitted)."
             ),
@@ -993,6 +1020,10 @@ _ACTION_403_HINT = {
     "create_thread": (
         "Bot lacks CREATE_PUBLIC_THREADS in this channel, or cannot view it. "
         "Forum channels additionally need SEND_MESSAGES to create posts."
+    ),
+    "send_message": (
+        "Bot lacks SEND_MESSAGES or VIEW_CHANNEL in this channel, or the "
+        "target forbids posting (archived/locked thread)."
     ),
     "add_role": (
         "Either the bot lacks MANAGE_ROLES, or the target role sits higher "
@@ -1092,6 +1123,7 @@ def _run_discord_action(
         "message_id": message_id,
         "query": query,
         "name": name,
+        "content": content,
     }
 
     missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not local_vars.get(p)]

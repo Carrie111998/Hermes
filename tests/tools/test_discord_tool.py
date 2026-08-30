@@ -10,6 +10,7 @@ import pytest
 from tools.discord_tool import (
     DiscordAPIError,
     _ACTIONS,
+    _ACTION_MANIFEST,
     _ADMIN_ACTIONS,
     _CORE_ACTIONS,
     _available_actions,
@@ -442,6 +443,210 @@ class TestCreateThread:
         assert "error" in result
         assert "404" in result["error"]
         assert mock_req.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Action: send_message
+# ---------------------------------------------------------------------------
+
+class TestSendMessage:
+    @patch("tools.discord_tool._discord_request")
+    def test_send_to_text_channel(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "5000", "channel_id": "11", "content": "hello"}
+        result = json.loads(discord_core(action="send_message", channel_id="11", content="hello"))
+        assert result["success"] is True
+        assert result["message_id"] == "5000"
+        assert result["channel_id"] == "11"
+        # Single call — no channel-type lookup needed for text channels.
+        mock_req.assert_called_once_with(
+            "POST", "/channels/11/messages", "test-token",
+            body={"content": "hello"},
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_send_to_existing_thread(self, mock_req, monkeypatch):
+        """Threads ARE channels in Discord's API — the same endpoint works,
+        with no channel-type lookup round trip."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "6000"}
+        result = json.loads(discord_core(
+            action="send_message", channel_id="800", content="thread reply",
+        ))
+        assert result["success"] is True
+        assert result["message_id"] == "6000"
+        mock_req.assert_called_once_with(
+            "POST", "/channels/800/messages", "test-token",
+            body={"content": "thread reply"},
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_send_to_existing_forum_post(self, mock_req, monkeypatch):
+        """A forum post is a thread — addressed by its own channel ID."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.return_value = {"id": "7000"}
+        result = json.loads(discord_core(
+            action="send_message", channel_id="900", content="follow-up on the post",
+        ))
+        assert result["success"] is True
+        assert result["message_id"] == "7000"
+        mock_req.assert_called_once_with(
+            "POST", "/channels/900/messages", "test-token",
+            body={"content": "follow-up on the post"},
+        )
+
+    @patch("tools.discord_tool._discord_request")
+    def test_missing_content_rejected(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(action="send_message", channel_id="11"))
+        assert "error" in result
+        assert "content" in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_whitespace_only_content_rejected(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(action="send_message", channel_id="11", content="   "))
+        assert "error" in result
+        assert "non-empty" in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_missing_channel_id_rejected(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(action="send_message", content="hi"))
+        assert "error" in result
+        assert "channel_id" in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_api_error_handled(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = DiscordAPIError(400, '{"message": "Cannot send to a forum channel"}')
+        result = json.loads(discord_core(action="send_message", channel_id="15", content="hi"))
+        assert "error" in result
+        assert "400" in result["error"]
+        assert "forum channel" in result["error"]
+
+    @patch("tools.discord_tool._discord_request")
+    def test_403_is_enriched(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = DiscordAPIError(403, '{"message": "Missing Access"}')
+        result = json.loads(discord_core(action="send_message", channel_id="11", content="hi"))
+        assert "error" in result
+        assert "SEND_MESSAGES" in result["error"]
+        assert "Missing Access" in result["error"]
+
+    @patch("tools.discord_tool._discord_request")
+    def test_unexpected_error_handled(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        mock_req.side_effect = RuntimeError("boom")
+        result = json.loads(discord_core(action="send_message", channel_id="11", content="hi"))
+        assert "error" in result
+        assert "boom" in result["error"]
+
+    def test_send_message_in_core_schema_only(self):
+        """send_message is a participation action — core tool, not admin."""
+        from tools.discord_tool import _STATIC_ADMIN_SCHEMA, _STATIC_CORE_SCHEMA
+        core_actions = _STATIC_CORE_SCHEMA["parameters"]["properties"]["action"]["enum"]
+        admin_actions = _STATIC_ADMIN_SCHEMA["parameters"]["properties"]["action"]["enum"]
+        assert "send_message" in core_actions
+        assert "send_message" not in admin_actions
+        # Manifest line describes all three target kinds.
+        manifest = {m[0]: m for m in _ACTION_MANIFEST}
+        assert "thread" in manifest["send_message"][2]
+        assert "forum" in manifest["send_message"][2]
+
+
+# ---------------------------------------------------------------------------
+# Fake-Discord E2E: real HTTP transport against a localhost REST stub
+# ---------------------------------------------------------------------------
+
+class TestFakeDiscordE2E:
+    """Exercise the tool's REAL urllib request path against a local HTTP
+    server that stubs the Discord REST API — no mocks between handler and
+    transport, no live network (localhost only)."""
+
+    @pytest.fixture
+    def fake_discord(self, monkeypatch):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        received = []
+
+        class _Handler(BaseHTTPRequestHandler):
+            def _reply(self, status, payload):
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                received.append({"method": "POST", "path": self.path,
+                                 "body": payload,
+                                 "auth": self.headers.get("Authorization")})
+                if "/messages" in self.path:
+                    channel_id = self.path.split("/")[2]
+                    if channel_id == "missing-channel":
+                        self._reply(404, {"message": "Unknown Channel", "code": 10003})
+                    else:
+                        self._reply(200, {"id": f"msg-{channel_id}",
+                                          "channel_id": channel_id,
+                                          "content": payload.get("content", "")})
+                else:
+                    self._reply(404, {"message": "Unknown endpoint", "code": 0})
+
+            def log_message(self, *args):  # silence request logging
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        monkeypatch.setattr(
+            "tools.discord_tool.DISCORD_API_BASE",
+            f"http://127.0.0.1:{server.server_address[1]}",
+        )
+        yield received
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    @pytest.mark.parametrize("channel_id,kind", [
+        ("11", "text-channel"),
+        ("800", "thread"),
+        ("900", "forum-post"),
+    ])
+    def test_send_message_real_transport(self, fake_discord, monkeypatch, channel_id, kind):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(
+            action="send_message", channel_id=channel_id, content=f"hi from {kind}",
+        ))
+        assert result["success"] is True
+        assert result["message_id"] == f"msg-{channel_id}"
+        assert result["channel_id"] == channel_id
+        assert len(fake_discord) == 1
+        req = fake_discord[0]
+        assert req["path"] == f"/channels/{channel_id}/messages"
+        assert req["body"] == {"content": f"hi from {kind}"}
+        assert req["auth"] == "Bot test-token"
+
+    def test_error_response_propagates_through_real_transport(
+        self, fake_discord, monkeypatch,
+    ):
+        """HTTP error responses surface as tool errors end-to-end: the stub
+        404s the designated channel → real urllib HTTPError → tool_error with
+        the real response body preserved."""
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        result = json.loads(discord_core(
+            action="send_message", channel_id="missing-channel", content="hi",
+        ))
+        assert "error" in result
+        assert "Unknown Channel" in result["error"]
+        assert fake_discord[0]["path"] == "/channels/missing-channel/messages"
 
 
 # ---------------------------------------------------------------------------
