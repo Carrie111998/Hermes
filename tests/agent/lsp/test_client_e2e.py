@@ -137,6 +137,23 @@ async def test_reader_failure_retires_client_and_rejects_later_work(
 
 
 @pytest.mark.asyncio
+async def test_transport_death_interrupts_preserved_push_wait(tmp_path: Path):
+    path = tmp_path / "x.py"
+    path.write_text("print('hi')\n")
+    client = _client(tmp_path, "diagnostic_eof")
+    await client.start()
+    try:
+        version = await client.open_file(str(path), language_id="python")
+        with pytest.raises(LSPProtocolError):
+            await asyncio.wait_for(
+                client.wait_for_diagnostics(str(path), version, timeout=3.0),
+                timeout=0.5,
+            )
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_client_diagnostics_are_deduped(tmp_path: Path):
     """Repeated identical pushes must not produce duplicate diagnostics."""
     f = tmp_path / "x.py"

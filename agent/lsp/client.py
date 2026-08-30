@@ -441,9 +441,16 @@ class LSPClient:
         except (asyncio.CancelledError, OSError):
             pass
         finally:
-            unexpected_close = not self._stopping and self._state in {"starting", "running"}
+            unexpected_close = not self._stopping and self._state in {
+                "starting",
+                "running",
+            }
             if unexpected_close:
                 self._state = "error"
+            # Diagnostic waiters can be parked on the push event after an
+            # unsupported pull completes. Wake them so transport death is
+            # observed immediately instead of consuming the remaining budget.
+            self._push_event.set()
             # Wake up any pending requests so they can fail fast.
             for fut in list(self._pending.values()):
                 if not fut.done():
@@ -1140,6 +1147,10 @@ class LSPClient:
         observed_counter = self._push_counter
         stabilization_deadline: Optional[float] = None
         while True:
+            if not self._connection_is_open():
+                raise LSPProtocolError(
+                    "server connection closed while waiting for diagnostics"
+                )
             doc = self._docs.get(path)
             if doc is None or doc.version != version:
                 return False
@@ -1149,6 +1160,10 @@ class LSPClient:
                 # unversioned pushes need rolling quiet, bounded from the first
                 # unversioned push in the current settling episode.
                 while True:
+                    if not self._connection_is_open():
+                        raise LSPProtocolError(
+                            "server connection closed while waiting for diagnostics"
+                        )
                     push_counter = doc.push_counter
                     now = asyncio.get_event_loop().time()
                     if doc.push_is_versioned:

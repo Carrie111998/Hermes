@@ -29,6 +29,8 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
   process and stdin alive.
 - ``"malformed_frame"`` — writes an invalid frame after ``didOpen``,
   then keeps the process and stdin alive.
+- ``"diagnostic_eof"`` — accepts ``didOpen`` without publishing, then
+  closes stdout when the client requests pull diagnostics.
 - ``"reject_then_unversioned_push"`` — publishes a versioned result on
   didOpen, then after didChange rejects the pull request first and sends a
   delayed unversioned push.  Exercises the real reader-loop race.
@@ -129,6 +131,8 @@ def main():
                 while read_message() is not None:
                     pass
                 return 0
+            if script == "diagnostic_eof":
+                continue
             error_diag = [
                 {
                     "range": {
@@ -269,6 +273,11 @@ def main():
             continue
 
         if msg.get("method") == "textDocument/diagnostic":
+            if script == "diagnostic_eof":
+                os.close(sys.stdout.fileno())
+                while read_message() is not None:
+                    pass
+                return 0
             if script == "reject_then_unversioned_push":
                 write_message({
                     "jsonrpc": "2.0",
