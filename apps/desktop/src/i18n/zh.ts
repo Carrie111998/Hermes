@@ -2514,7 +2514,39 @@ export const zh: Translations = {
       working: '进行中',
       done: '已完成'
     },
-    markAllRead: '全部标记为已读'
+    markAllRead: '全部标记为已读',
+    filterMenu: {
+      grouping: '分组方式',
+      ordering: '排序方式',
+      show: '显示',
+      filters: '筛选',
+      status: '状态',
+      pullRequest: '拉取请求',
+      profile: '配置文件',
+      project: '项目',
+      resetToDefaults: '恢复默认',
+      expandAll: '全部展开',
+      collapseAll: '全部折叠',
+      updated: '更新时间',
+      created: '创建时间',
+      tokens: '令牌数',
+      cost: '花费',
+      manual: '手动',
+      preview: '预览',
+      pr: 'PR',
+      open: '开启',
+      draft: '草稿',
+      merged: '已合并',
+      closed: '已关闭',
+      noPr: '无 PR',
+      needsInput: '需要输入',
+      workingStatus: '进行中',
+      unread: '未读',
+      draftStatus: '草稿',
+      idle: '空闲',
+      archived: '已归档',
+      inboxStyle: '收件箱样式'
+    }
   },
 
   composer: {
