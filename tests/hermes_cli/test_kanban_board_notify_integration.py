@@ -283,26 +283,28 @@ def test_board_pin_crud_uses_default_db_without_override(isolated_kanban_home):
     assert (isolated_kanban_home / "kanban.db").exists()
 
 
-def test_board_pin_allows_explicit_custom_connection_without_board_label(
+def test_board_pin_requires_explicit_board_for_custom_connection(
     isolated_kanban_home,
 ):
     custom_db = isolated_kanban_home / "explicit" / "kanban.db"
     conn = kb.connect(db_path=custom_db)
     try:
-        pin = kb.set_board_notify(
-            conn,
-            platform="discord",
-            chat_id="777",
-            thread_id="888",
-            replace_existing=False,
-        )
+        with pytest.raises(ValueError, match="board.*required"):
+            kb.set_board_notify(
+                conn,
+                platform="discord",
+                chat_id="777",
+                thread_id="888",
+                replace_existing=False,
+            )
+        assert kb.get_board_notify(conn) is None
+        with pytest.raises(ValueError, match="board.*required"):
+            kb.remove_board_notify(conn)
     finally:
         conn.close()
 
-    assert pin["chat_id"] == "777"
 
-
-def test_create_source_allows_boardless_explicit_custom_connection(
+def test_create_source_falls_back_to_card_route_without_board_label(
     isolated_kanban_home,
 ):
     custom_db = isolated_kanban_home / "explicit-create" / "kanban.db"
@@ -317,13 +319,17 @@ def test_create_source_allows_boardless_explicit_custom_connection(
             thread_id="000",
             chat_type="thread",
         )
+        subscriptions = _discord_subscriptions(conn, task_id)
     finally:
         conn.close()
 
     assert subscribed is True
+    assert [(sub["chat_id"], sub["thread_id"]) for sub in subscriptions] == [
+        ("999", "000")
+    ]
 
 
-def test_create_source_allows_boardless_custom_connection_on_active_scoped_board(
+def test_create_source_does_not_infer_active_board_for_boardless_connection(
     isolated_kanban_home,
     monkeypatch,
 ):
@@ -351,13 +357,11 @@ def test_create_source_allows_boardless_custom_connection_on_active_scoped_board
             thread_id="456",
             chat_type="thread",
         )
-        pin = kb.get_board_notify(conn)
+        subscriptions = _discord_subscriptions(conn, task_id)
     finally:
         conn.close()
 
     assert subscribed is True
-    assert pin == {
-        "platform": "discord",
-        "chat_id": "123",
-        "thread_id": "456",
-    }
+    assert [(sub["chat_id"], sub["thread_id"]) for sub in subscriptions] == [
+        ("123", "456")
+    ]

@@ -2973,7 +2973,7 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
             return 1
         if (
             args.platform.strip().lower() == "discord"
-            and kb.get_board_notify(conn) is not None
+            and kb.get_board_notify(conn, board=kb.get_current_board()) is not None
         ):
             print(
                 "Discord card subscriptions are disabled while this board is "
