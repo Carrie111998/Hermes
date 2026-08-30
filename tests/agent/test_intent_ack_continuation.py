@@ -251,6 +251,8 @@ def test_pronounless_action_guardrails_reject_questions_and_finals():
         "Possible fixes. 1. Checking the actual log. 2. Bumping the timeout.",
         "Two options: pinning the dep, checking the actual log.",
         "Two fixes: bumping the timeout, relaunching with corrected arguments.",
+        "Option: 1. Launching it now.",
+        "Options: 1. Creating the session now.",
     )
     for final in final_answers:
         assert not looks_like_codex_intermediate_ack(

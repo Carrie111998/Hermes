@@ -4415,7 +4415,7 @@ def looks_like_codex_intermediate_ack(
     numbered_markers = {
         match.group(1) for match in numbered_item_pattern.finditer(numbering_text)
     }
-    has_numbered_list = has_step_sequence or len(numbered_markers) >= 2
+    has_numbered_list = has_step_sequence or bool(numbered_markers)
     if not question_pattern.search(assistant_text):
         for action_match in action_clause_pattern.finditer(assistant_text):
             action_prefix = assistant_text[: action_match.start("action")]
