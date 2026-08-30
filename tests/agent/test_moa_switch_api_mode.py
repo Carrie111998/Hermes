@@ -49,6 +49,14 @@ def _make_fake_agent():
     agent._ensure_lmstudio_runtime_loaded = lambda *_a, **_k: None
     agent._lmstudio_load_was_unverified = lambda *_a, **_k: False
     agent._effective_lmstudio_context_length = lambda *a, **k: None
+    # switch_model (Finding #3) re-evaluates the prompt-cache policy as part
+    # of its rollback-protected post-client transaction. On a real AIAgent
+    # this is a mandatory method (run_agent.py:1644 → anthropic_prompt_cache
+    # _policy); for a moa provider it resolves to (False, False) — no caching,
+    # no native layout — because neither "moa" nor "moa://local" matches any
+    # caching branch. Mirror that no-op so the fixture satisfies the same
+    # production invariant the rollback contract requires.
+    agent._anthropic_prompt_cache_policy = lambda **_k: (False, False)
     return agent
 
 
