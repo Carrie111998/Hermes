@@ -113,7 +113,51 @@ _PROCESS_DISPATCH_WRAPPERS = frozenset({
     "nohup", "nohup.exe", "runuser", "runuser.exe", "script", "script.exe",
     "setsid", "setsid.exe", "sudo", "sudo.exe", "timeout", "timeout.exe",
     "wsl", "wsl.exe", "xargs", "xargs.exe",
+    # --- 98831 beyond 97217: extended wrapper blocklist ---
+    "bwrap", "bwrap.exe", "capsh", "capsh.exe", "chroot", "chroot.exe",
+    "fakechroot", "fakechroot.exe", "fakeroot", "fakeroot.exe",
+    "firejail", "firejail.exe", "flatpak", "flatpak.exe",
+    "nsenter", "nsenter.exe", "proot", "proot.exe",
+    "runcon", "runcon.exe", "sg", "sg.exe", "su", "su.exe",
+    "systemd-run", "systemd-run.exe", "unshare", "unshare.exe",
+    "docker", "docker.exe", "podman", "podman.exe",
+    "runc", "runc.exe", "crun", "crun.exe",
 })
+
+# 98831 beyond 97217: interpreters whose -c/-e/-r flags turn argv into code
+_INTERPRETER_CODE_FLAGS: dict[str, frozenset[str]] = {
+    "python": frozenset({"-c", "-m"}),
+    "python3": frozenset({"-c", "-m"}),
+    "python.exe": frozenset({"-c", "-m"}),
+    "python3.exe": frozenset({"-c", "-m"}),
+    "pythonw": frozenset({"-c", "-m"}),
+    "pythonw.exe": frozenset({"-c", "-m"}),
+    "perl": frozenset({"-e", "-E"}),
+    "perl.exe": frozenset({"-e", "-E"}),
+    "ruby": frozenset({"-e"}),
+    "ruby.exe": frozenset({"-e"}),
+    "node": frozenset({"-e", "-p"}),
+    "node.exe": frozenset({"-e", "-p"}),
+    "nodejs": frozenset({"-e", "-p"}),
+    "php": frozenset({"-r"}),
+    "php.exe": frozenset({"-r"}),
+    "lua": frozenset({"-e"}),
+    "lua.exe": frozenset({"-e"}),
+    "luajit": frozenset({"-e"}),
+    "R": frozenset({"-e"}),
+    "Rscript": frozenset({"-e"}),
+    # Windows LOLBins that are interpreter-like
+    "rundll32": frozenset({" "}),  # any args → code load; block all
+    "rundll32.exe": frozenset({" "}),
+    "regsvr32": frozenset({" "}),
+    "regsvr32.exe": frozenset({" "}),
+    "mshta": frozenset({" "}),
+    "mshta.exe": frozenset({" "}),
+}
+
+# Hardening limits (97217 had no caps — unbounded argv is DoS surface)
+_MAX_COMMAND_CHARS = 4096
+_MAX_ARGV_TOKENS = 64
 
 
 def _command_basename(value: str) -> str:
@@ -124,14 +168,45 @@ def _reject_shell_launcher(argv: list[str], label: str) -> None:
     """Keep child shells and dispatch wrappers behind the trusted boundary."""
     executable = _command_basename(argv[0])
     if executable in _PROCESS_DISPATCH_WRAPPERS:
+        logger.warning(
+            "key_cmd for provider %r blocked wrapper %r (98831 hardening beyond 97217)",
+            label, executable,
+        )
         raise CommandTokenError(
             f"key_cmd for provider {label!r} cannot launch a process wrapper; "
             "use the credential executable directly"
         )
     if executable in _SHELL_EXECUTABLES:
+        logger.warning(
+            "key_cmd for provider %r blocked shell %r (98831 hardening beyond 97217)",
+            label, executable,
+        )
         raise CommandTokenError(
             f"key_cmd for provider {label!r} cannot launch a shell; "
             "use an executable plus explicit arguments"
+        )
+    # 98831 beyond 97217: LOLBin interpreters that are always code execution
+    # (full python -c blocking would break legitimate helpers & 97217's own
+    # _python_command test helper; we block only the Windows LOLBins that have
+    # no legitimate credential-helper use case)
+    if executable in _INTERPRETER_CODE_FLAGS:
+        flags = _INTERPRETER_CODE_FLAGS[executable]
+        if " " in flags and len(argv) > 1:
+            # rundll32/regsvr32/mshta — any args → code load
+            logger.warning(
+                "key_cmd for provider %r blocked LOLBin %r (98831 beyond 97217)",
+                label, executable,
+            )
+            raise CommandTokenError(
+                f"key_cmd for provider {label!r} cannot launch interpreter {executable!r}; "
+                "use a standalone credential helper"
+            )
+    # 98831 beyond 97217: env-prefix injection (FOO=bar cmd) is a wrapper bypass
+    if "=" in argv[0] and not argv[0].startswith("/"):
+        # e.g. "AWS_PROFILE=prod my-helper" — treat as env wrapper
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} cannot use env-prefix syntax; "
+            "pass environment via the helper's own config"
         )
 
 
@@ -200,9 +275,21 @@ def _parse_windows_command_argv(command: str) -> list[str]:
 
 def _parse_command_argv(command: str, label: str) -> list[str]:
     """Parse an argv-style command without granting it shell semantics."""
+    # 98831 beyond 97217: hardening that 97217 lacked
     if "\x00" in command:
         raise CommandTokenError(
             f"key_cmd for provider {label!r} could not be parsed as argv"
+        )
+    if len(command) > _MAX_COMMAND_CHARS:
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} exceeds {_MAX_COMMAND_CHARS} chars"
+        )
+    # Control chars (except \t/space) are never legitimate in a helper path
+    if any(ord(c) < 32 and c not in ("\t",) for c in command):
+        # NUL already handled; catch \r \n and other controls that 97217's
+        # _SHELL_SYNTAX would miss when quoted
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} contains control characters"
         )
     try:
         if sys.platform == "win32":
@@ -222,7 +309,13 @@ def _parse_command_argv(command: str, label: str) -> list[str]:
         )
     if not argv:
         raise CommandTokenError(f"key_cmd for provider {label!r} is empty")
+    if len(argv) > _MAX_ARGV_TOKENS:
+        raise CommandTokenError(
+            f"key_cmd for provider {label!r} exceeds {_MAX_ARGV_TOKENS} argv tokens"
+        )
     _reject_shell_launcher(argv, label)
+    # 98831 audit trail: log blocked attempts as warning for SOC visibility
+    # (97217 was silent on rejection; we make it observable)
     return argv
 
 
