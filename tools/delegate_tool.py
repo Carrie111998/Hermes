@@ -2661,7 +2661,29 @@ def _run_single_child(
     # Worktree-isolation state: populated inside the try once the child's
     # task id is known; the default no-op keeps every early error path safe.
     _worktree_info: Optional[Dict[str, str]] = None
-    _defer_child_close_to_worker = False
+    _defer_child_cleanup_to_worker = False
+    _child_cleanup_lock = threading.Lock()
+    _child_cleanup_done = False
+
+    def _cleanup_child_lifetime() -> None:
+        """Release worker-owned resources exactly once after its lifetime ends."""
+        nonlocal _child_cleanup_done
+        with _child_cleanup_lock:
+            if _child_cleanup_done:
+                return
+            _child_cleanup_done = True
+
+        try:
+            if hasattr(child, "close"):
+                child.close()
+        except Exception:
+            logger.debug("Failed to close child agent after delegation", exc_info=True)
+        finally:
+            if child_pool is not None and leased_cred_id is not None:
+                try:
+                    child_pool.release_lease(leased_cred_id)
+                except Exception as exc:
+                    logger.debug("Failed to release credential lease: %s", exc)
 
     def _attach_worktree(entry_dict: Dict[str, Any]) -> None:
         """Inspect + prune the child worktree, reporting into the entry."""
@@ -2861,18 +2883,12 @@ def _run_single_child(
                 # Keep ownership with the worker until it actually exits; a
                 # future callback is race-safe even if completion happens
                 # between done() and add_done_callback().
-                _defer_child_close_to_worker = True
+                _defer_child_cleanup_to_worker = True
 
-                def _close_detached_child(_future) -> None:
-                    try:
-                        child.close()
-                    except Exception:
-                        logger.debug(
-                            "Failed to close detached child agent after worker exit",
-                            exc_info=True,
-                        )
+                def _cleanup_detached_child(_future) -> None:
+                    _cleanup_child_lifetime()
 
-                _child_future.add_done_callback(_close_detached_child)
+                _child_future.add_done_callback(_cleanup_detached_child)
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -3364,12 +3380,6 @@ def _run_single_child(
         if _subagent_id:
             _unregister_subagent(_subagent_id, agent=child)
 
-        if child_pool is not None and leased_cred_id is not None:
-            try:
-                child_pool.release_lease(leased_cred_id)
-            except Exception as exc:
-                logger.debug("Failed to release credential lease: %s", exc)
-
         # Restore the parent's tool names so the process-global is correct
         # for any subsequent execute_code calls or other consumers.
         import model_tools
@@ -3392,15 +3402,10 @@ def _run_single_child(
             except (ValueError, UnboundLocalError) as e:
                 logger.debug("Could not remove child from active_children: %s", e)
 
-        # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
-        if not _defer_child_close_to_worker:
-            try:
-                if hasattr(child, "close"):
-                    child.close()
-            except Exception:
-                logger.debug("Failed to close child agent after delegation")
+        # Close tool resources and release the credential lease together. A
+        # timed-out worker still owns both until its Future reports completion.
+        if not _defer_child_cleanup_to_worker:
+            _cleanup_child_lifetime()
 
         # The AIAgent turn boundary normally closes the child scope itself. This
         # fallback covers failures before that boundary starts, but must not pop
