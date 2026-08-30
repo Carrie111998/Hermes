@@ -124,7 +124,7 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/redraw')).toBe(false)
     expect(isDesktopSlashSuggestion('/approve')).toBe(false)
     expect(isDesktopSlashSuggestion('/model')).toBe(false)
-    expect(isDesktopSlashSuggestion('/skills')).toBe(false)
+    expect(isDesktopSlashSuggestion('/pets')).toBe(false)
     expect(isDesktopSlashSuggestion('/voice')).toBe(false)
     expect(isDesktopSlashSuggestion('/curator')).toBe(false)
   })
@@ -159,6 +159,16 @@ describe('desktop slash command curation', () => {
     expect(desktopSlashUnavailableMessage('/tools')).toBeNull()
     expect(desktopSlashUnavailableMessage('/save')).toBeNull()
     expect(desktopSlashUnavailableMessage('/personality')).toBeNull()
+  })
+
+  it('surfaces /skills on the desktop so pending write-approval review is reachable', () => {
+    // /skills' pending/approve/reject/diff subcommands run on the backend via
+    // the slash worker — the same exec path /memory uses. Marking it a
+    // "settings" surface left staged skill writes with no desktop review
+    // path while the pending store grew silently (#98330).
+    expect(isDesktopSlashSuggestion('/skills')).toBe(true)
+    expect(isDesktopSlashCommand('/skills')).toBe(true)
+    expect(desktopSlashUnavailableMessage('/skills')).toBeNull()
   })
 
   it('routes /pet through the desktop action handler and drops /pets', () => {
@@ -365,7 +375,7 @@ describe('desktop slash command curation', () => {
 
   it('explains known commands that desktop owns elsewhere', () => {
     expect(desktopSlashUnavailableMessage('/model sonnet')).toContain('model picker')
-    expect(desktopSlashUnavailableMessage('/skills')).toContain('desktop sidebar')
+    expect(desktopSlashUnavailableMessage('/pets')).toContain('desktop sidebar')
     expect(desktopSlashUnavailableMessage('/clear')).toContain('terminal interface')
   })
 

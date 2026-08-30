@@ -301,7 +301,11 @@ const NO_DESKTOP_SURFACE: Record<DesktopUnavailableReason, readonly string[]> = 
     '/verbose'
   ],
   messaging: ['/approve', '/deny'],
-  settings: ['/skills', '/pets'],
+  // /skills stays out: its write-approval review subcommands (pending/
+  // approve/reject/diff) run on the backend via the slash worker — the same
+  // exec path /memory already uses — and hiding it here left staged skill
+  // writes with no review surface on desktop (#98330).
+  settings: ['/pets'],
   advanced: [
     '/curator',
     '/fast',
