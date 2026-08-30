@@ -1969,7 +1969,7 @@ def run_doctor(args):
         check_info(f"Install for faster search: {_system_package_install_cmd('ripgrep')}")
     
     # Docker (optional)
-    terminal_env = os.getenv("TERMINAL_ENV", "local")
+    terminal_env = os.getenv("TERMINAL_ENV") or "local"
     try:
         from hermes_constants import is_container as _is_container
         running_in_container = _is_container()
