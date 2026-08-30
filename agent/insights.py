@@ -188,11 +188,11 @@ class InsightsEngine:
         # Compute insights
         models = self._compute_model_breakdown(sessions, cutoff, source)
         overview = self._compute_overview(sessions, message_stats, models)
-        platforms = self._compute_platform_breakdown(sessions)
+        platforms = self._compute_platform_breakdown(sessions, cutoff, source)
         tools = self._compute_tool_breakdown(tool_usage)
         skills = self._compute_skill_breakdown(skill_usage)
         activity = self._compute_activity_patterns(sessions)
-        top_sessions = self._compute_top_sessions(sessions)
+        top_sessions = self._compute_top_sessions(sessions, cutoff, source)
 
         return {
             "days": days,
@@ -763,29 +763,112 @@ class InsightsEngine:
         result.sort(key=lambda x: (x["total_tokens"], x["sessions"]), reverse=True)
         return result
 
-    def _compute_platform_breakdown(self, sessions: List[Dict]) -> List[Dict]:
-        """Break down usage by platform/source."""
-        platform_data = defaultdict(lambda: {
+    def _compute_platform_breakdown(
+        self,
+        sessions: List[Dict],
+        cutoff: Optional[float] = None,
+        source: Optional[str] = None,
+    ) -> List[Dict]:
+        """Break down usage by platform/source.
+
+        Token totals are derived from ``session_model_usage`` when available
+        so auxiliary rows (vision/compression/titles — task dimension,
+        #23270) are counted consistently with the overview (#65603).
+        Without a cutoff (direct caller) or when no model-usage rows
+        exist, falls back to the session-aggregate counters.
+        """
+        platform_data: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
             "sessions": 0, "messages": 0, "input_tokens": 0,
             "output_tokens": 0, "cache_read_tokens": 0,
             "cache_write_tokens": 0, "total_tokens": 0, "tool_calls": 0,
         })
 
         for s in sessions:
-            source = s.get("source") or "unknown"
-            d = platform_data[source]
+            src = s.get("source") or "unknown"
+            d = platform_data[src]
             d["sessions"] += 1
             d["messages"] += s.get("message_count") or 0
-            inp = s.get("input_tokens") or 0
-            out = s.get("output_tokens") or 0
-            cache_read = s.get("cache_read_tokens") or 0
-            cache_write = s.get("cache_write_tokens") or 0
-            d["input_tokens"] += inp
-            d["output_tokens"] += out
-            d["cache_read_tokens"] += cache_read
-            d["cache_write_tokens"] += cache_write
-            d["total_tokens"] += inp + out + cache_read + cache_write
             d["tool_calls"] += s.get("tool_call_count") or 0
+
+        # If caller didn't supply a window, or the model-usage table is
+        # missing/empty, keep the legacy session-counter path.
+        if cutoff is None:
+            for s in sessions:
+                src = s.get("source") or "unknown"
+                d = platform_data[src]
+                inp = s.get("input_tokens") or 0
+                out = s.get("output_tokens") or 0
+                cr = s.get("cache_read_tokens") or 0
+                cw = s.get("cache_write_tokens") or 0
+                d["input_tokens"] += inp
+                d["output_tokens"] += out
+                d["cache_read_tokens"] += cr
+                d["cache_write_tokens"] += cw
+                d["total_tokens"] += inp + out + cr + cw
+            result = [
+                {"platform": platform, **data}
+                for platform, data in platform_data.items()
+            ]
+            result.sort(key=lambda x: x["sessions"], reverse=True)
+            return result
+
+        usage_rows = self._get_model_usage(cutoff, source)
+        if not usage_rows:
+            for s in sessions:
+                src = s.get("source") or "unknown"
+                d = platform_data[src]
+                inp = s.get("input_tokens") or 0
+                out = s.get("output_tokens") or 0
+                cr = s.get("cache_read_tokens") or 0
+                cw = s.get("cache_write_tokens") or 0
+                d["input_tokens"] += inp
+                d["output_tokens"] += out
+                d["cache_read_tokens"] += cr
+                d["cache_write_tokens"] += cw
+                d["total_tokens"] += inp + out + cr + cw
+            result = [
+                {"platform": platform, **data}
+                for platform, data in platform_data.items()
+            ]
+            result.sort(key=lambda x: x["sessions"], reverse=True)
+            return result
+
+        # Aggregate via per-model rows so aux usage is included.
+        session_source = {s["id"]: s.get("source") or "unknown" for s in sessions}
+        # Per-session totals from usage_rows to compute residuals.
+        totals_per_session: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0}
+        )
+        for r in usage_rows:
+            src = session_source.get(r["session_id"], "unknown")
+            d = platform_data[src]
+            d["input_tokens"] += r["input_tokens"] or 0
+            d["output_tokens"] += r["output_tokens"] or 0
+            d["cache_read_tokens"] += r["cache_read_tokens"] or 0
+            d["cache_write_tokens"] += r["cache_write_tokens"] or 0
+            t = totals_per_session[r["session_id"]]
+            t["input_tokens"] += r["input_tokens"] or 0
+            t["output_tokens"] += r["output_tokens"] or 0
+            t["cache_read_tokens"] += r["cache_read_tokens"] or 0
+            t["cache_write_tokens"] += r["cache_write_tokens"] or 0
+
+        # Residual: legacy sessions or absolute overwrites not yet in the per-model table.
+        for s in sessions:
+            src = s.get("source") or "unknown"
+            totals = totals_per_session.get(s["id"], {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0})
+            inp_res = max(0, (s.get("input_tokens") or 0) - totals["input_tokens"])
+            out_res = max(0, (s.get("output_tokens") or 0) - totals["output_tokens"])
+            cr_res = max(0, (s.get("cache_read_tokens") or 0) - totals["cache_read_tokens"])
+            cw_res = max(0, (s.get("cache_write_tokens") or 0) - totals["cache_write_tokens"])
+            if inp_res or out_res or cr_res or cw_res:
+                d = platform_data[src]
+                d["input_tokens"] += inp_res
+                d["output_tokens"] += out_res
+                d["cache_read_tokens"] += cr_res
+                d["cache_write_tokens"] += cw_res
+
+        for data in platform_data.values():
+            data["total_tokens"] = data["input_tokens"] + data["output_tokens"] + data["cache_read_tokens"] + data["cache_write_tokens"]
 
         result = [
             {"platform": platform, **data}
@@ -905,8 +988,19 @@ class InsightsEngine:
             "max_streak": max_streak,
         }
 
-    def _compute_top_sessions(self, sessions: List[Dict]) -> List[Dict]:
-        """Find notable sessions (longest, most messages, most tokens)."""
+    def _compute_top_sessions(
+        self,
+        sessions: List[Dict],
+        cutoff: Optional[float] = None,
+        source: Optional[str] = None,
+    ) -> List[Dict]:
+        """Find notable sessions (longest, most messages, most tokens).
+
+        ``Most tokens`` ranks by the true total including cache and
+        auxiliary usage (session_model_usage + residuals, #65603 pattern).
+        Without a cutoff or when no per-model rows exist, falls back to
+        the legacy session-counter ranking to keep direct callers stable.
+        """
         top = []
 
         # Longest by duration
@@ -937,19 +1031,72 @@ class InsightsEngine:
                 "date": datetime.fromtimestamp(most_msgs["started_at"]).strftime("%b %d") if most_msgs.get("started_at") else "?",
             })
 
-        # Most tokens
-        most_tokens = max(
-            sessions,
-            key=lambda s: (s.get("input_tokens") or 0) + (s.get("output_tokens") or 0),
-        )
-        token_total = (most_tokens.get("input_tokens") or 0) + (most_tokens.get("output_tokens") or 0)
-        if token_total > 0:
-            top.append({
-                "label": "Most tokens",
-                "session_id": most_tokens["id"][:16],
-                "value": f"{token_total:,} tokens",
-                "date": datetime.fromtimestamp(most_tokens["started_at"]).strftime("%b %d") if most_tokens.get("started_at") else "?",
-            })
+        # Most tokens — include cache tokens and auxiliary usage for consistency
+        # with overview.  When no window is supplied (legacy direct call) or no
+        # per-model rows are present, keep the session-counter fallback.
+        def _session_total(s: Dict) -> int:
+            return (
+                (s.get("input_tokens") or 0)
+                + (s.get("output_tokens") or 0)
+                + (s.get("cache_read_tokens") or 0)
+                + (s.get("cache_write_tokens") or 0)
+            )
+
+        per_session_totals: Optional[Dict[str, int]] = None
+        if cutoff is not None:
+            usage_rows = self._get_model_usage(cutoff, source)
+            if usage_rows:
+                # Per-token aggregates so residual is per field like
+                # _compute_model_breakdown / _compute_platform_breakdown.
+                # Using a single sum would undercount when one field
+                # exceeds and another is short (e.g. aux adds input but
+                # session output is ahead of rows).
+                per_token_totals: Dict[str, Dict[str, int]] = defaultdict(
+                    lambda: {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0}
+                )
+                for r in usage_rows:
+                    t = per_token_totals[r["session_id"]]
+                    t["input_tokens"] += r["input_tokens"] or 0
+                    t["output_tokens"] += r["output_tokens"] or 0
+                    t["cache_read_tokens"] += r["cache_read_tokens"] or 0
+                    t["cache_write_tokens"] += r["cache_write_tokens"] or 0
+                per_session_totals = {}
+                for s in sessions:
+                    t = per_token_totals.get(
+                        s["id"],
+                        {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0},
+                    )
+                    inp_res = max(0, (s.get("input_tokens") or 0) - t["input_tokens"])
+                    out_res = max(0, (s.get("output_tokens") or 0) - t["output_tokens"])
+                    cr_res = max(0, (s.get("cache_read_tokens") or 0) - t["cache_read_tokens"])
+                    cw_res = max(0, (s.get("cache_write_tokens") or 0) - t["cache_write_tokens"])
+                    per_session_totals[s["id"]] = (
+                        t["input_tokens"] + t["output_tokens"] + t["cache_read_tokens"] + t["cache_write_tokens"]
+                        + inp_res + out_res + cr_res + cw_res
+                    )
+
+        if per_session_totals is not None:
+            most_id = max(per_session_totals, key=lambda sid: per_session_totals[sid])
+            token_total = per_session_totals[most_id]
+            # Resolve display row for date.
+            most_row = next((s for s in sessions if s["id"] == most_id), sessions[0])
+            if token_total > 0:
+                top.append({
+                    "label": "Most tokens",
+                    "session_id": most_row["id"][:16],
+                    "value": f"{token_total:,} tokens",
+                    "date": datetime.fromtimestamp(most_row["started_at"]).strftime("%b %d") if most_row.get("started_at") else "?",
+                })
+        else:
+            most_tokens = max(sessions, key=_session_total)
+            token_total = _session_total(most_tokens)
+            if token_total > 0:
+                top.append({
+                    "label": "Most tokens",
+                    "session_id": most_tokens["id"][:16],
+                    "value": f"{token_total:,} tokens",
+                    "date": datetime.fromtimestamp(most_tokens["started_at"]).strftime("%b %d") if most_tokens.get("started_at") else "?",
+                })
 
         # Most tool calls
         most_tools = max(sessions, key=lambda s: s.get("tool_call_count") or 0)
