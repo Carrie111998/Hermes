@@ -612,15 +612,15 @@ def _provider_wait_notice_text(
     """Live wait-state line for provider queueing/rate-limit backoff.
 
     Surfaced through ``_emit_wait_notice`` → ``thinking.delta`` on
-    CLI/TUI/Desktop. The desktop provider-wait row only renders text whose
-    prefix matches ``⏳ waiting on`` (see apps/desktop/src/store/provider-wait.ts
+    CLI/TUI/Desktop. The desktop provider-wait row renders text whose prefix
+    matches ``⏳ waiting on``/``⏳ 等待`` (see apps/desktop/src/store/provider-wait.ts
     ``providerWaitText``), so keep that phrasing — a 429 from a queueing
     provider (e.g. coding-plan Token Plan) otherwise reads as a frozen turn
     while Hermes silently backs off.
     """
     return (
-        f"⏳ waiting on {model} — provider queueing/rate-limited, "
-        f"retrying in {wait_time:.0f}s (attempt {retry_count}/{max_retries})"
+        f"⏳ 等待 {model} — 对方排队/限流中，"
+        f"{wait_time:.0f} 秒后重试（第 {retry_count}/{max_retries} 次）"
     )
 
 
@@ -7124,9 +7124,8 @@ def run_conversation(
                     # without a distinct notice the user only sees a generic
                     # thinking spinner ("infinite thinking", #64434).
                     agent._emit_wait_notice(
-                        f"↻ model returned reasoning with no final answer — "
-                        f"asking it to continue "
-                        f"({agent._codex_incomplete_retries}/3)"
+                        f"↻ 模型已返回推理但无最终答复 — "
+                        f"正在请它继续（{agent._codex_incomplete_retries}/3）"
                     )
                     agent._session_messages = messages
                     continue

@@ -78,15 +78,15 @@ def test_backoff_wait_notice_matches_desktop_provider_wait_contract(tmp_path, mo
 
     # Mirror of apps/desktop/src/store/provider-wait.ts providerWaitText().
     provider_wait_re = re.compile(
-        r"^(?:⏳|⚠|↻)\s*(?:waiting on|no (?:output|response)|model returned)",
+        r"^(?:⏳|⚠|↻)\s*(?:waiting on|no (?:output|response)|model returned|等待|无(?:输出|响应)|模型已返回)",
         re.I,
     )
 
     notice = _provider_wait_notice_text("qwen3.8-flash", 2, 4, 45.0)
     assert provider_wait_re.match(notice), f"desktop would drop this notice: {notice!r}"
     assert "qwen3.8-flash" in notice
-    assert "45s" in notice
-    assert "(attempt 2/4)" in notice
+    assert "45" in notice
+    assert "2/4" in notice
 
 
 def test_backoff_wait_notice_roundtrip_to_thinking_callback(tmp_path, monkeypatch):
@@ -101,7 +101,7 @@ def test_backoff_wait_notice_roundtrip_to_thinking_callback(tmp_path, monkeypatc
     agent._emit_wait_notice(notice)
 
     assert seen == [notice]
-    assert "waiting on qwen3.8-flash" in agent.get_activity_summary()["last_activity_desc"]
+    assert "等待 qwen3.8-flash" in agent.get_activity_summary()["last_activity_desc"]
 
 
 def test_nonstream_wait_loop_emits_explained_notice(tmp_path, monkeypatch):
@@ -147,6 +147,6 @@ def test_nonstream_wait_loop_emits_explained_notice(tmp_path, monkeypatch):
     finally:
         stop["flag"] = True
 
-    reconnect_notices = [s for s in seen if "reconnecting" in s]
+    reconnect_notices = [s for s in seen if "重新连接" in s]
     assert reconnect_notices, f"expected a reconnect wait-notice, saw: {seen}"
-    assert "no response from provider" in reconnect_notices[0]
+    assert "无响应" in reconnect_notices[0]
