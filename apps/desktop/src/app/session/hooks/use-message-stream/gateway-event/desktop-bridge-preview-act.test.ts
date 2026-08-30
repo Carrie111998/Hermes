@@ -103,15 +103,43 @@ describe('preview.act.request gate', () => {
     expect(navigate).toHaveBeenCalledWith('https://example.com')
   })
 
-  it('still refuses a session that is neither primary nor focused', async () => {
+  it('keeps acting for the tile while the user clicks the preview pane itself', async () => {
+    // The tool's own main scenario, and what rules focus out as the predicate:
+    // the preview pane is a pane in the layout tree, so a pointerdown in it
+    // takes the interaction tracker. $focusedRuntimeId then falls back off the
+    // tile to the primary — the user clicking the page the agent is driving
+    // would revoke the agent's permission to drive it.
+    $sessionTiles.set([{ runtimeId: TILE, storedSessionId: 'stored-tile' }] as never)
+    $layoutTree.set(
+      group(['workspace', 'session-tile:stored-tile', 'preview'], { active: 'preview', id: 'grp-main' })
+    )
+    noteActiveTreeGroup('grp-main')
+
+    handleDesktopBridgeEvent(actEvent(TILE, { action: 'navigate', url: 'https://example.com' }))
+
+    expect(await answered()).toMatchObject({ success: true })
+    expect(navigate).toHaveBeenCalledWith('https://example.com')
+  })
+
+  it('still refuses a session with no surface on screen', async () => {
     handleDesktopBridgeEvent(actEvent('runtime-background', { action: 'navigate', url: 'https://example.com' }))
 
     const result = await answered()
 
     expect(result.success).toBe(false)
-    // Both ids named, so a bug report says which chat asked.
+    // The session is named, so a bug report says which chat asked.
     expect(result.error).toContain('runtime-background')
-    expect(result.error).toContain(PRIMARY)
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('refuses a tile that has been closed, even as the last thing on screen', async () => {
+    // Closing the tile takes the surface away; a turn still running in it must
+    // not keep driving the pane.
+    $sessionTiles.set([])
+
+    handleDesktopBridgeEvent(actEvent(TILE, { action: 'navigate', url: 'https://example.com' }))
+
+    expect(await answered()).toMatchObject({ success: false })
     expect(navigate).not.toHaveBeenCalled()
   })
 })

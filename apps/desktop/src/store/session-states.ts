@@ -420,6 +420,20 @@ function runtimeReferenced(runtimeId: string, storedSessionId: null | string): b
     .some(t => t.runtimeId === runtimeId || (storedSessionId !== null && t.storedSessionId === storedSessionId))
 }
 
+/** Does this runtime have a surface the user can see in this window — the
+ *  primary view or an open tile?
+ *
+ *  The permission predicate for agent actions on a SHARED desktop surface (the
+ *  preview pane is one pane for all sessions). "Focused" is too narrow for
+ *  those: `$focusedRuntimeId` follows the interaction tracker, and every pane
+ *  group takes the tracker on pointerdown — so clicking into the preview pane
+ *  itself, which is precisely what the user does while the agent drives it,
+ *  moves focus off the tile that owns the turn. On screen is the property that
+ *  actually holds; a session with no surface is still refused. */
+export function runtimeHasOpenSurface(runtimeId: null | string): boolean {
+  return !!runtimeId && runtimeReferenced(runtimeId, null)
+}
+
 /** A state no surface needs anymore: its turn is over (not busy, not waiting
  *  on the user) and neither the primary view nor any tile holds the runtime.
  *  `needsInput` states stay — the sidebar's attention dot reads them. */

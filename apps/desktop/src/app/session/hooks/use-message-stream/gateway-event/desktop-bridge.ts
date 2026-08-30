@@ -9,7 +9,7 @@ import { $gateway } from '@/store/gateway'
 import { applyDesktopLayoutPreset, revealDesktopPane } from '@/store/pane-focus'
 import { recordAgentReaction } from '@/store/reactions-local'
 import { setMessages } from '@/store/session'
-import { $focusedRuntimeId } from '@/store/session-states'
+import { runtimeHasOpenSurface } from '@/store/session-states'
 import { $tipsEnabled, type ActiveTip, showTip } from '@/store/tips'
 import { $toursEnabled } from '@/store/tours'
 
@@ -117,20 +117,27 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
   if (event.type === 'preview.act.request') {
     // drive_preview tool: click/type/scroll/press inside the guest page, or
     // drive the pane's history. Dynamic import keeps the injected engine off
-    // the boot path. Focused session only: a background turn must never reach
-    // into the page the user is working in (desktop AGENTS.md: offer, don't
-    // hijack).
+    // the boot path. On-screen sessions only: a background turn must never
+    // reach into the page the user is working in (desktop AGENTS.md: offer,
+    // don't hijack).
     //
-    // "Focused" is NOT `isActiveEvent`. This bridge mounts once, in wiring, so
-    // its `activeSessionIdRef` is the PRIMARY view's runtime — but a tile (and
-    // every ⌘T tab, which `openNewSessionTile` creates unlisted) binds a
-    // runtime id of its own. Gating on the primary therefore refused every
+    // `isActiveEvent` was the wrong test for that. This bridge mounts once, in
+    // wiring, so its `activeSessionIdRef` is the PRIMARY view's runtime — but a
+    // tile (and every ⌘T tab, which `openNewSessionTile` creates unlisted)
+    // binds a runtime id of its own. Gating on the primary refused every
     // request from a tile the user was looking at, permanently, while its
     // siblings on this same global pane — `preview.read.request` and the
-    // `preview.open` route — went through ungated. A tool that can navigate
-    // the pane but not click in it is not an anti-hijack property, just a
-    // broken one. `$focusedRuntimeId` is the predicate the guard always meant:
-    // the tile holding the active tab, else the primary's session.
+    // `preview.open` route — went through ungated. A tool that can navigate the
+    // pane but not click in it is not an anti-hijack property, just a broken
+    // one.
+    //
+    // Focus is the wrong test too, and fails on this tool's own main use: the
+    // preview pane is a pane in the layout tree, so a pointerdown in it takes
+    // the interaction tracker (tree-group's `noteActiveTreeGroup`) and
+    // `$focusedRuntimeId` falls back off the tile to the primary. The user
+    // clicking the very page the agent is driving would revoke the agent's
+    // permission to drive it. `runtimeHasOpenSurface` is the property that
+    // holds while that happens.
     const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
     if (requestId) {
@@ -140,24 +147,20 @@ export function handleDesktopBridgeEvent(ctx: GatewayEventContext): boolean {
           text: result ? JSON.stringify(result) : ''
         })
 
-      const focusedRuntimeId = $focusedRuntimeId.get()
-      const isFocusedEvent = isActiveEvent || (!!sessionId && sessionId === focusedRuntimeId)
-
-      if (isFocusedEvent) {
+      if (isActiveEvent) {
         void loadPreviewEngine()
           .then(run => run(previewActionFromPayload(payload)))
           .then(answer, error =>
             answer({ error: error instanceof Error ? error.message : String(error), success: false })
           )
       } else {
-        // Name both sides. The bare sentence sent the agent hunting for a
+        // Name the session. The bare sentence sent the agent hunting for a
         // window to focus when the real answer is which chat asked, and it
         // gave whoever reads a bug report nothing to correlate against.
         void answer({
           error:
-            'The in-app browser only takes actions in the session the user is looking at. ' +
-            `This request came from session ${sessionId || '(none)'}; the focused session is ` +
-            `${focusedRuntimeId || '(none)'}.`,
+            'The in-app browser only takes actions for a session that is open on screen. ' +
+            `Session ${sessionId || '(none)'} has no open surface in this window.`,
           success: false
         })
       }
