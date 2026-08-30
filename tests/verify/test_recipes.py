@@ -1,6 +1,7 @@
 """Tests for agent/verify/recipes.py — static run-recipe detection."""
 
 import json
+import sys
 
 import pytest
 
@@ -105,6 +106,43 @@ class TestNodeDetection:
         (tmp_path / "go.mod").write_text("module x\n", encoding="utf-8")
         recipe = detect_recipe(tmp_path)
         assert recipe.kind == "go"
+
+    def test_symlinked_node_modules_outside_root_skips_install(self, tmp_path):
+        if sys.platform == "win32":
+            pytest.skip("Symlinks require elevated privileges on Windows")
+        primary = tmp_path / "primary"
+        primary.mkdir()
+        (primary / "node_modules").mkdir()
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        (worktree / "node_modules").symlink_to(primary / "node_modules")
+        write_pkg(worktree, {"scripts": {"build": "tsc", "test": "jest"}})
+        (worktree / "yarn.lock").touch()
+        recipe = detect_recipe(worktree)
+        assert recipe.bootstrap == []
+        assert any("symlink" in e and "skipped" in e for e in recipe.evidence)
+        # build/test are unaffected — only the destructive install is skipped
+        assert recipe.build == ["yarn build"]
+        assert recipe.test == ["yarn test"]
+
+    def test_in_place_node_modules_directory_still_installs(self, tmp_path):
+        (tmp_path / "node_modules").mkdir()
+        write_pkg(tmp_path, {"scripts": {"test": "jest"}})
+        recipe = detect_recipe(tmp_path)
+        assert recipe.bootstrap == ["npm install"]
+
+    def test_symlinked_node_modules_inside_root_still_installs(self, tmp_path):
+        if sys.platform == "win32":
+            pytest.skip("Symlinks require elevated privileges on Windows")
+        # A symlink that resolves back inside the project root (e.g. a
+        # relocated cache dir within the same tree) is not the
+        # worktree-sharing hazard — must not be treated as shared.
+        real_dir = tmp_path / "_node_modules_real"
+        real_dir.mkdir()
+        (tmp_path / "node_modules").symlink_to(real_dir)
+        write_pkg(tmp_path, {"scripts": {"test": "jest"}})
+        recipe = detect_recipe(tmp_path)
+        assert recipe.bootstrap == ["npm install"]
 
 
 class TestPythonDetection:

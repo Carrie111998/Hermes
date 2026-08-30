@@ -190,6 +190,27 @@ def _script_runner(package_manager: str | None, entry: str) -> str:
     return f"npm run {entry}"
 
 
+def _shared_node_modules_target(root: Path) -> Path | None:
+    """Return the resolved target when ``root/node_modules`` is a symlink
+    pointing OUTSIDE ``root`` (e.g. a git-worktree checkout sharing an
+    install with its primary tree, ``ln -s ../primary/node_modules``),
+    else ``None``. Distinguishes the common worktree-sharing pattern from
+    an in-place directory, which is safe to reinstall into.
+    """
+    link = root / "node_modules"
+    try:
+        if not link.is_symlink():
+            return None
+        target = link.resolve()
+    except OSError:
+        return None
+    try:
+        target.relative_to(root.resolve())
+    except ValueError:
+        return target
+    return None
+
+
 def _detect_node_recipe(root: Path, pkg: dict[str, Any]) -> Recipe:
     raw_scripts = pkg.get("scripts")
     scripts: dict[str, str] = raw_scripts if isinstance(raw_scripts, dict) else {}
@@ -222,6 +243,9 @@ def _detect_node_recipe(root: Path, pkg: dict[str, Any]) -> Recipe:
         "npm": "npm install",
     }.get(package_manager or "npm", "npm install")
 
+    shared_target = _shared_node_modules_target(root)
+    bootstrap = [] if shared_target else [install]
+
     start_script = "dev" if scripts.get("dev") else ("start" if scripts.get("start") else None)
     start_body = scripts.get(start_script) if start_script else None
     start = _script_runner(package_manager, start_script) if start_script else None
@@ -237,7 +261,7 @@ def _detect_node_recipe(root: Path, pkg: dict[str, Any]) -> Recipe:
     return Recipe(
         name=label,
         kind=kind,
-        bootstrap=[install],
+        bootstrap=bootstrap,
         build=build,
         test=test,
         start=start,
@@ -247,6 +271,13 @@ def _detect_node_recipe(root: Path, pkg: dict[str, Any]) -> Recipe:
                 "Detected package.json",
                 f"Package manager: {package_manager}" if package_manager else None,
                 f"Scripts: {', '.join(scripts) or '(none)'}",
+                (
+                    f"node_modules is a symlink to {shared_target} (outside this "
+                    "project root, e.g. a shared git-worktree install) — skipped "
+                    f"'{install}' to avoid mutating the shared install"
+                )
+                if shared_target
+                else None,
             ]
         ),
     )
