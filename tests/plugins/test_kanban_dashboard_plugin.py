@@ -154,6 +154,45 @@ def test_locate_task_treats_unknown_and_archived_cards_as_not_found(client):
         assert response.status_code == 404
 
 
+def test_locate_task_rejects_ids_duplicated_across_active_boards(client):
+    first = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Default copy"},
+    ).json()["task"]
+    kb.create_board("ops")
+    second = client.post(
+        "/api/plugins/kanban/tasks?board=ops",
+        json={"title": "Ops copy"},
+    ).json()["task"]
+    conn = kb.connect(board="ops")
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET id = ? WHERE id = ?",
+                (first["id"], second["id"]),
+            )
+    finally:
+        conn.close()
+
+    response = client.get(f"/api/plugins/kanban/tasks/locate/{first['id']}")
+
+    assert response.status_code == 409
+    assert "ambiguous" in response.json()["detail"].lower()
+
+
+def test_locate_task_excludes_archived_boards(client):
+    kb.create_board("retired")
+    created = client.post(
+        "/api/plugins/kanban/tasks?board=retired",
+        json={"title": "Retired card"},
+    ).json()["task"]
+    kb.remove_board("retired", archive=True)
+
+    response = client.get(f"/api/plugins/kanban/tasks/locate/{created['id']}")
+
+    assert response.status_code == 404
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
@@ -1266,4 +1305,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-

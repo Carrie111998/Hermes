@@ -484,7 +484,7 @@ class TestAuthCallbackNext:
         assert r.headers["location"] == "/sessions"
 
     def test_callback_preserves_kanban_task_deep_link(self, gated_app):
-        deep_link = "/kanban?task=t_03dc00df"
+        deep_link = "/kanban?board=ops&task=t_03dc00df"
 
         r = self._drive_oauth_via_login(gated_app, next_path=deep_link)
 

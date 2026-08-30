@@ -521,29 +521,34 @@ def get_board(
 def locate_task(task_id: str):
     """Return the active board containing ``task_id``.
 
-    Dashboard links intentionally carry only the globally-random task id so
-    chat integrations do not need to know which board currently owns a card.
-    Archived boards and archived cards are excluded: those links fall back to
-    the normal board with a small not-found notice instead of opening stale
-    work.
+    Task-only compatibility links are accepted only when the id has exactly
+    one match across active boards. Archived boards and cards are excluded.
     """
+    matches = []
     for meta in kanban_db.list_boards(include_archived=False):
         slug = meta["slug"]
         conn = _conn(board=slug)
         try:
             task = kanban_db.get_task(conn, task_id)
             if task is not None and task.status != "archived":
-                return {
+                matches.append({
                     "board": slug,
                     "task": {
                         "id": task.id,
                         "title": task.title,
                         "status": task.status,
                     },
-                }
+                })
         finally:
             conn.close()
-    raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"task id {task_id} is ambiguous across active boards",
+        )
+    return matches[0]
 
 
 # ---------------------------------------------------------------------------
