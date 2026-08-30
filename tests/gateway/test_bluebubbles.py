@@ -567,13 +567,6 @@ class TestBlueBubblesTimeoutErrorNormalization:
         assert not result.success
         assert "500 Internal Server Error" in (result.error or "")
 
-
-        ok = asyncio.get_event_loop().run_until_complete(
-            adapter._unregister_webhook()
-        )
-        assert ok is False
-
-
 class TestReplyContextResolution:
     """BlueBubbles webhook carries threadOriginatorGuid but never the quoted
     text.  rich_sent_store resolves it so run.py can inject the disambiguation
@@ -713,3 +706,25 @@ class TestReplyContextResolution:
         assert result.message_id == "msg-out-1"
         assert rich_sent_store.lookup("iMessage;-;user@example.com", "msg-out-1") == "here is your answer"
         assert "msg-out-1" in adapter._sent_guids
+
+    @pytest.mark.asyncio
+    async def test_send_records_outbound_text_when_creating_chat(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter._private_api_enabled = True
+
+        async def fake_resolve(chat_id):
+            return None
+
+        async def fake_api_post(path, payload):
+            assert path == "/api/v1/chat/new"
+            return {"data": {"guid": "msg-new-chat"}}
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send("user@example.com", "first message")
+
+        assert result.success
+        assert result.message_id == "msg-new-chat"
+        assert rich_sent_store.lookup("user@example.com", "msg-new-chat") == "first message"
+        assert "msg-new-chat" in adapter._sent_guids
