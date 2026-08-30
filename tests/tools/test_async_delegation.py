@@ -153,6 +153,43 @@ def test_active_for_session_counts_every_live_delegation_state():
     assert ad.active_for_session("") == 0
 
 
+def test_owner_process_classification_preserves_indeterminate_live_owner():
+    """A failed start-time probe must not turn a slow live owner into an orphan."""
+    assert ad._classify_owner_process(
+        4321,
+        100,
+        pid_exists=lambda _pid: True,
+        process_start_time=lambda _pid: None,
+    ) is None
+
+
+@pytest.mark.parametrize(
+    ("pid", "started_at", "exists", "observed_start", "reason"),
+    [
+        (None, None, False, None, "owner_identity_missing"),
+        (4321, 100, False, None, "owner_process_missing"),
+        (4321, 100, True, 200, "owner_pid_reused"),
+    ],
+)
+def test_owner_process_classification_reports_only_observable_evidence(
+    pid, started_at, exists, observed_start, reason
+):
+    evidence = ad._classify_owner_process(
+        pid,
+        started_at,
+        pid_exists=lambda _pid: exists,
+        process_start_time=lambda _pid: observed_start,
+    )
+
+    assert evidence is not None
+    assert evidence["reason"] == reason
+    assert evidence["exit_code"] is None
+    assert evidence["signal"] is None
+    assert "check the process supervisor or OS crash report" in ad._owner_exit_error(
+        evidence
+    )
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 
