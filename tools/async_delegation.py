@@ -36,8 +36,11 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
+import os
+from pathlib import Path
 import sqlite3
 import threading
 import time
@@ -241,6 +244,95 @@ def _capture_routing_origin() -> Dict[str, Any]:
     return origin
 
 
+_REDACT_KEYS = {
+    "api_key", "apikey", "secret", "password", "token", "auth",
+    "access_token", "refresh_token", "private_key", "credentials",
+}
+
+
+def _sanitize_for_persistence(obj: Any, seen: Optional[set] = None, depth: int = 0) -> Any:
+    """Normalize objects for durable JSON persistence:
+    - Cycle-safe
+    - Depth-bounded (max 10)
+    - Length-bounded strings (max 50,000 chars)
+    - Typed tag representations for Path, datetime, Exception, bytes, set, custom objects
+    - Secret redaction for sensitive dictionary keys
+    """
+    if seen is None:
+        seen = set()
+
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+
+    if isinstance(obj, str):
+        if len(obj) > 50000:
+            return obj[:50000] + "... [truncated]"
+        return obj
+
+    if isinstance(obj, (bytes, bytearray)):
+        return f"<bytes len={len(obj)}>"
+
+    if isinstance(obj, (os.PathLike, Path)):
+        return str(obj)
+
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+
+    if isinstance(obj, BaseException):
+        return {
+            "__type__": type(obj).__name__,
+            "error": str(obj)[:5000],
+        }
+
+    if depth > 10:
+        return "<max_depth_exceeded>"
+
+    obj_id = id(obj)
+    if obj_id in seen:
+        return "<circular_reference>"
+
+    seen.add(obj_id)
+    try:
+        if isinstance(obj, dict):
+            clean_dict = {}
+            for k, v in obj.items():
+                str_k = str(k)
+                if any(sec in str_k.lower() for sec in _REDACT_KEYS):
+                    clean_dict[str_k] = "[REDACTED]"
+                else:
+                    clean_dict[str_k] = _sanitize_for_persistence(v, seen, depth + 1)
+            return clean_dict
+
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            return [_sanitize_for_persistence(item, seen, depth + 1) for item in obj]
+
+        # For arbitrary objects, inspect __dict__ or fallback to repr/str
+        if hasattr(obj, "__dict__"):
+            clean_obj = {"__type__": type(obj).__name__}
+            for k, v in obj.__dict__.items():
+                if k.startswith("_"):
+                    continue
+                str_k = str(k)
+                if any(sec in str_k.lower() for sec in _REDACT_KEYS):
+                    clean_obj[str_k] = "[REDACTED]"
+                else:
+                    clean_obj[str_k] = _sanitize_for_persistence(v, seen, depth + 1)
+            return clean_obj
+
+        return str(obj)
+    finally:
+        seen.remove(obj_id)
+
+
+def _safe_json_dumps(data: Any) -> str:
+    """Serialize payload to JSON string safely with cycle/type-safe sanitization."""
+    try:
+        sanitized = _sanitize_for_persistence(data)
+        return json.dumps(sanitized, default=str, ensure_ascii=False)
+    except Exception:
+        return "{}"
+
+
 def _persist_dispatch(record: Dict[str, Any]) -> None:
     now = time.time()
     try:
@@ -259,26 +351,35 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         )
         if key in record
     }
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
-               (delegation_id, origin_session, origin_ui_session_id,
-                parent_session_id, state, dispatched_at, updated_at,
-                delivery_state, delivery_attempts, owner_pid,
-                owner_started_at, task_json, origin_session_id)
-               VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
-            (record["delegation_id"], record.get("session_key", ""),
-             record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
-             record["dispatched_at"], now, __import__("os").getpid(),
-             owner_started_at, json.dumps(task_payload),
-             record.get("origin_session_id", "")),
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO async_delegations
+                   (delegation_id, origin_session, origin_ui_session_id,
+                    parent_session_id, state, dispatched_at, updated_at,
+                    delivery_state, delivery_attempts, owner_pid,
+                    owner_started_at, task_json, origin_session_id)
+                   VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+                (record["delegation_id"], record.get("session_key", ""),
+                 record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
+                 record["dispatched_at"], now, __import__("os").getpid(),
+                 owner_started_at, _safe_json_dumps(task_payload),
+                 record.get("origin_session_id", "")),
+            )
+        _prune_durable_records()
+    except Exception as exc:
+        logger.error(
+            "Async delegation %s: failed to persist dispatch to state.db: %s",
+            record.get("delegation_id"), exc,
         )
-    _prune_durable_records()
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+    except Exception as exc:
+        logger.error("Failed to delete durable delegation %s: %s", delegation_id, exc)
 
 
 def _prune_durable_records() -> None:
@@ -322,13 +423,19 @@ def _prune_durable_records() -> None:
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
-               WHERE delegation_id=?""",
-            (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
+    try:
+        with _DB_LOCK, _transaction() as conn:
+            conn.execute(
+                """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+                   event_json=?, result_json=?, delivery_state='pending'
+                   WHERE delegation_id=?""",
+                (event.get("status", "completed"), event.get("completed_at", now), now,
+                 _safe_json_dumps(event), _safe_json_dumps(result), event["delegation_id"]),
+            )
+    except Exception as exc:
+        logger.error(
+            "Async delegation %s: failed to persist completion to state.db: %s",
+            event.get("delegation_id"), exc,
         )
 
 
@@ -391,7 +498,7 @@ def recover_abandoned_delegations() -> int:
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
                    WHERE delegation_id=?""",
-                (now, now, json.dumps(event), json.dumps(result), delegation_id),
+                (now, now, _safe_json_dumps(event), _safe_json_dumps(result), delegation_id),
             )
             recovered += 1
     return recovered
@@ -912,8 +1019,10 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
-    _push_completion_event(event_record, result, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_completion_event(event_record, result, status)
+    finally:
+        _finish_finalization(delegation_id, status)
 
 
 def _begin_finalization(
@@ -1162,8 +1271,10 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
-    _push_batch_completion_event(event_record, combined, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_batch_completion_event(event_record, combined, status)
+    finally:
+        _finish_finalization(delegation_id, status)
 
 
 def _push_batch_completion_event(
