@@ -588,8 +588,13 @@ class EmailAdapter(BasePlatformAdapter):
         # Optional authserv-id to pin Authentication-Results to the operator's
         # own receiving server (defends against an injected header that sorts
         # first). Defaults to the From-domain of the agent's own address.
+        # The "@" guard keeps _domain_of from returning the whole address when
+        # EMAIL_ADDRESS is malformed (no domain to derive — no pinning, same
+        # as before the fallback existed).
         self._authserv_id = (
-            extra.get("authserv_id", "") or _get_secret("EMAIL_AUTHSERV_ID", "")
+            extra.get("authserv_id", "")
+            or _get_secret("EMAIL_AUTHSERV_ID", "")
+            or (_domain_of(self._address) if "@" in self._address else "")
         ).strip().lower()
 
         # Track message IDs we've already processed to avoid duplicates
