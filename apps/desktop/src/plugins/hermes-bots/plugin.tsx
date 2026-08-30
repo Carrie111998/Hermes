@@ -359,7 +359,7 @@ export default {
     ctx.register({
       id: 'pane',
       area: 'panes',
-      title: 'Bots',
+      title: ctx.i18n.t('paneTitle'),
       // dock: explicit adoption gesture — CENTER-STACK into the sessions zone
       // so the sidebar grows a SESSIONS | BOTS tab strip instead of splitting
       // two cramped panes down the column. Center is safe now: insertAtGroup
@@ -387,6 +387,7 @@ export default {
         width: '260px',
         collapsible: true,
         hideOnly: true,
+        tabTitle: () => ctx.i18n.t('paneTitle'),
         dock: {
           pane: 'sessions',
           pos: 'center',

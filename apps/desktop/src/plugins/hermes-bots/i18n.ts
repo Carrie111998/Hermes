@@ -35,11 +35,17 @@ import { useMemo } from 'react'
 import { getPluginCtx } from './shared'
 
 type BotsMessages = {
+  paneTitle: string
   /** Left rail: the bot + group-chat roster. */
   roster: {
     search: string
     searchPlaceholder: string
     newBotOrGroup: string
+    newMenuTip: string
+    activityToastsOn: string
+    activityToastsOff: string
+    allGateways: string
+    currentGateway: string
     groupChats: string
     emptyTitle: string
     emptyDesc: string
@@ -48,6 +54,7 @@ type BotsMessages = {
     noMatchFiltersOn: (gateway: string) => string
     noMatchFilters: string
     clearFilters: string
+    filterRoster: (activeCount: number) => string
     allHidden: string
     allHiddenDesc: string
     showHidden: string
@@ -243,10 +250,16 @@ type BotsMessages = {
 }
 
 const en: BotsMessages = {
+  paneTitle: 'Bots',
   roster: {
     search: 'Search bots and group chats',
     searchPlaceholder: 'Search bots and group chats…',
     newBotOrGroup: 'New bot or group chat',
+    newMenuTip: 'New…',
+    activityToastsOn: 'Activity toasts on — click to silence',
+    activityToastsOff: 'Activity toasts off — click to enable',
+    allGateways: 'All gateways',
+    currentGateway: 'Current gateway',
     groupChats: 'Group chats',
     emptyTitle: 'No bots yet',
     emptyDesc: 'Create your first bot.',
@@ -255,6 +268,7 @@ const en: BotsMessages = {
     noMatchFiltersOn: gateway => `No bots or group chats match these filters on ${gateway}`,
     noMatchFilters: 'No bots or group chats match these filters.',
     clearFilters: 'Clear filters',
+    filterRoster: activeCount => (activeCount ? `Filters (${activeCount} active)` : 'Filter roster'),
     allHidden: 'All bots are hidden',
     allHiddenDesc: 'They keep working and retain their history.',
     showHidden: 'Show hidden bots',
@@ -434,11 +448,216 @@ const en: BotsMessages = {
   }
 }
 
+const ptBr: BotsMessages = {
+  paneTitle: 'Robôs',
+  roster: {
+    search: 'Buscar bots e chats em grupo',
+    searchPlaceholder: 'Buscar bots e chats em grupo…',
+    newBotOrGroup: 'Novo bot ou chat em grupo',
+    newMenuTip: 'Novo…',
+    activityToastsOn: 'Alertas de atividade ativados — clique para silenciar',
+    activityToastsOff: 'Alertas de atividade desativados — clique para ativar',
+    allGateways: 'Todos os gateways',
+    currentGateway: 'Gateway atual',
+    groupChats: 'Chats em grupo',
+    emptyTitle: 'Nenhum bot ainda',
+    emptyDesc: 'Crie seu primeiro bot.',
+    noMatchQuery: (query: string) => `Nenhum bot ou chat em grupo corresponde a “${query}”`,
+    noMatchQueryOn: (query: string, gateway: string) => `Nenhum bot ou chat em grupo corresponde a “${query}” em ${gateway}`,
+    noMatchFiltersOn: (gateway: string) => `Nenhum bot ou chat em grupo corresponde a estes filtros em ${gateway}`,
+    noMatchFilters: 'Nenhum bot ou chat em grupo corresponde a estes filtros.',
+    clearFilters: 'Limpar filtros',
+    filterRoster: (activeCount: number) => (activeCount ? `Filtros (${activeCount} ativos)` : 'Filtrar lista'),
+    allHidden: 'Todos os bots estão ocultos',
+    allHiddenDesc: 'Eles continuam trabalhando e mantêm o histórico.',
+    showHidden: 'Mostrar bots ocultos',
+    noHiddenMatch: 'Nenhum bot oculto corresponde a estes filtros.',
+    hiddenFromRoster: 'Oculto da lista',
+    pinned: 'Fixado',
+    needsAttention: 'precisa de atenção',
+    needsInput: 'Precisa da sua resposta',
+    botsAndGroups: 'Bots e chats em grupo',
+    botsOnly: 'Somente bots',
+    groupsOnly: 'Somente chats em grupo',
+    anyActivity: 'Qualquer atividade',
+    activeNow: 'Ativo agora',
+    recentlyActive: 'Ativo recentemente',
+    older: 'Mais antigos',
+    gatewayRemoved: 'Gateway removido',
+    onDemand: 'Sob demanda',
+    ready: 'Pronto',
+    statusUnknown: 'Status desconhecido',
+    unavailable: 'Indisponível',
+    retryNow: 'Tentar agora',
+    rosterUnavailable: (reason: string) =>
+      `Lista indisponível: ${reason}. Se o gateway for anterior a profiles.list, atualize o Hermes e reinicie o gateway.`,
+    waitingForGateway:
+      'Aguardando a conexão com o gateway… (gateways remotos podem levar alguns segundos; as tentativas são automáticas)'
+  },
+  bot: {
+    newTitle: 'Novo bot',
+    editTitle: 'Editar perfil',
+    editMenu: 'Editar…',
+    helpPromptPlaceholder: 'No que este bot deve ajudar?',
+    descriptionHint: 'Deixe em branco para gerar a partir do nome e da descrição do bot.',
+    newChatWith: 'Nova conversa com este bot',
+    openBotChat: 'Abrir chat do bot',
+    duplicate: 'Duplicar',
+    duplicateFailed: 'Falha ao duplicar',
+    deleteTitle: 'Excluir bot e perfil?',
+    removeFromAllGroups: 'Remover de todos os grupos',
+    createFirstHint: 'Abra o painel Bots e clique em “Novo bot”.',
+    createFailed: 'Ainda não foi possível criar o perfil',
+    advanced: 'Avançado',
+    advancedHint: 'Avançado — modelo, skills, conjuntos de ferramentas, SOUL.md',
+    advancedFailed: 'Falha na configuração avançada',
+    openAnotherChatUnsupported: 'Atualize o Hermes Desktop para abrir outro chat do bot.',
+    remoteConnectionsUnsupported: 'Atualize o Hermes Desktop para conversar com bots de outras conexões.',
+    chatEmpty: 'Diga alguma coisa para começar.',
+    kickoff: 'Oi! Me conte sobre você!'
+  },
+  avatar: {
+    classicShapes: 'Formas clássicas',
+    blobFromName: 'Rosto blob — criado a partir do nome do bot',
+    unlockFollowsName: 'Desbloquear — o rosto volta a acompanhar o nome do bot',
+    randomize: 'Sortear',
+    tabBot: 'Bot',
+    tabGenerate: 'Gerar',
+    upload: 'Enviar imagem',
+    tabPet: 'Pet',
+    removeImage: 'Remover imagem — usar forma',
+    removeBackToShape: 'Remover — voltar ao avatar de forma',
+    describePlaceholder: 'Descreva seu avatar…',
+    describeHint: 'Deixe em branco para gerar automaticamente a partir do nome/título/descrição + lista do agent-messaging.',
+    matchTheName: 'Combinar com o nome',
+    pickPet: 'Escolha um pet para ser a foto de perfil deste bot.',
+    petLoadFailed: 'Não foi possível carregar esse pet — tente outro.',
+    imageTooLarge: 'Imagem grande demais (máx. 15MB).',
+    generationFailed: 'Falha ao gerar o avatar',
+    savedLocally: 'Visual salvo localmente; falha ao salvar remotamente',
+    savedLocallyDescriptionFailed: 'Visual salvo localmente; falha ao atualizar a descrição',
+    generate: 'Gerar',
+    generating: 'Gerando…'
+  },
+  group: {
+    newTitle: 'Novo chat em grupo',
+    manageDesc: 'Um bot pode participar de vários chats em grupo. As participações são sincronizadas em todas as máquinas.',
+    manageTitle: 'Gerenciar grupos',
+    settingsTitle: 'Configurações do grupo',
+    settingsDesc: 'Renomeie o grupo ou defina uma imagem para a sala. Os membros e o histórico serão mantidos.',
+    nameLabel: 'Nome do grupo',
+    searchToAdd: 'Buscar bots para adicionar',
+    searchToAddPlaceholder: 'Buscar bots para adicionar…',
+    removeFromSelection: 'Remover da seleção',
+    disbandTitle: 'Desfazer chat em grupo?',
+    deleteTitle: 'Excluir chat em grupo?',
+    deleteAction: 'Excluir',
+    composerPlaceholder: 'Diga alguma coisa — todos os bots deste grupo ouvem a sala.',
+    attachHint: 'Anexar arquivos — todos os bots que responderem poderão vê-los',
+    newThread: 'Novo tópico',
+    reply: 'Responder',
+    replyInThread: 'Responder no tópico',
+    replyInThreadPlaceholder: 'Responder no tópico…',
+    openThread: 'Abrir este tópico',
+    collapseThread: 'Recolher tópico',
+    collapseThreadLabel: 'Recolher este tópico',
+    activity: 'Atividade',
+    noActivityYet: 'Nenhuma atividade nesta rodada ainda.',
+    showActivity: 'Mostrar atividade da sala',
+    hideActivity: 'Ocultar atividade da sala',
+    stop: 'Parar',
+    stopHint: 'Parar esta execução — interrompe o membro da vez e segura os demais',
+    needsYourInput: 'Um bot deste chat em grupo precisa da sua resposta',
+    pictureGenerationFailed: 'Falha ao gerar a imagem do grupo',
+    nameTaken: (name: string) => `Já existe um grupo chamado “${name}”.`,
+    memberCount: (count: number) => `${count} bots`,
+    settingsHint: (group: string) => `Configurações do grupo — renomeie ${group} ou defina uma imagem para a sala`,
+    settingsLabel: (group: string) => `Configurações do grupo ${group}`,
+    disbandHint: (group: string) => `Desfazer o chat em grupo ${group}`,
+    disbandLabel: (group: string) => `Desfazer ${group}`,
+    disbandAction: 'Desfazer',
+    disbanding: 'Desfazendo…',
+    disbandDone: 'Desfeito',
+    disbanded: (group: string) => `“${group}” desfeito`,
+    disbandDescPrefix: 'Isso remove o grupo ',
+    disbandDescSuffix: (count: number) =>
+      ` dos seus ${count} bots e limpa o histórico compartilhado da sala. Os bots e suas sessões individuais nesse grupo serão mantidos.`,
+    stopped: (group: string) => `${group} foi interrompido — as rodadas restantes ficam suspensas até você retomar`,
+    removeAttachment: 'Remover anexo',
+    threadFallback: 'Tópico',
+    replyCount: (replies: number) => `${replies} ${replies === 1 ? 'resposta' : 'respostas'}`,
+    dropToThread: 'Solte para anexar a esta resposta do tópico',
+    dropToRoom: 'Solte para anexar — todos os bots que responderem poderão ver',
+    waitingForAnswer: 'Aguardando sua resposta…',
+    memberThinking: (name: string) => `${name} está pensando…`,
+    roomWorking: 'A sala está trabalhando…',
+    messageRoom: (group: string) => `Enviar mensagem para ${group}`,
+    newThreadPlaceholder: (group: string) => `Novo tópico em ${group}… (@name para direcionar, @everyone para todos)`,
+    everyoneMeta: 'Todos os bots da sala',
+    commandApproval: 'aprovação de comando',
+    answerFailed: (handle: string, error: string) => `Não foi possível enviar a resposta para @${handle}: ${error}`,
+    wantsToRunCommand: (handle: string) => `@${handle} quer executar um comando:`,
+    asks: (handle: string) => `@${handle} pergunta:`,
+    answerTo: (member: string) => `Responder a @${member}`
+  },
+  tools: {
+    skillsHub: 'Central de skills do Hermes',
+    filterSkills: 'Filtrar skills…',
+    searchHub: 'Buscar na central (comunidade + fontes conhecidas)…',
+    noMcpServers: 'Nenhum servidor MCP configurado ou disponível no catálogo.'
+  },
+  cron: {
+    filterHint:
+      'Há tarefas agendadas neste perfil, mas nenhuma está marcada para este bot. Nomeie uma tarefa como "[bot:<name>] …" para mostrá-la aqui ou veja todas em Cron abaixo.',
+    needsRosterFirst: 'Este bot precisa aparecer na lista primeiro.',
+    staleNotice: 'Não foi possível atualizar as tarefas agendadas. Mostrando a última lista disponível.',
+    readFailure: 'A lista pode continuar lá — foi uma falha de leitura, não uma exclusão.',
+    createDesc: (bot: string) => `Uma tarefa recorrente que ${bot} executa conforme um agendamento. As execuções ficam no próprio histórico de conversa.`,
+    instruction: 'Instrução',
+    whenToRun: 'Quando executar',
+    dayOfMonth: 'Dia do mês',
+    sendResultsTo: 'Enviar resultados para',
+    runHistoryOnly: 'Somente histórico de execuções',
+    botChatTarget: (bot: string) => `Chat de ${bot} (o bot responde)`,
+    continuity: 'Continuidade: cada execução vê a saída da anterior (remove duplicatas e continua de onde parou)',
+    onceIn: (when: string) => `Uma vez (${when})`,
+    everyNDays: (days: number) => `A cada ${days} dias`,
+    everyNHours: (hours: number) => `A cada ${hours}h`,
+    everyNMinutes: (minutes: number) => `A cada ${minutes}m`,
+    freqOnce: 'Uma vez, daqui a…',
+    freqHourly: 'A cada hora',
+    freqDaily: 'Todos os dias',
+    freqWeekdays: 'Dias úteis',
+    freqWeekly: 'Toda semana',
+    freqMonthly: 'Todo mês',
+    freqInterval: 'Intervalo',
+    freqAdvanced: 'Avançado…',
+    unitMinutes: 'minuto(s)',
+    unitHours: 'hora(s)',
+    unitDays: 'dia(s)',
+    runsOnce: (count: number, unit: string) => `Executa uma vez, daqui a ${count} ${unit}`,
+    runsHourly: 'Executa no início de cada hora',
+    runsDaily: (time: string) => `Executa todos os dias às ${time}`,
+    runsWeekdays: (time: string) => `Executa de segunda a sexta às ${time}`,
+    runsWeekly: (day: string, time: string) => `Executa toda ${day} às ${time}`,
+    runsMonthly: (day: string, time: string) => `Executa no dia ${day} de cada mês às ${time}`,
+    runsInterval: (count: number, unit: string) => `Executa a cada ${count} ${unit}`,
+    runsRaw: 'Agendamento bruto — a cada Nm/Nh/Nd ou cron de 5 campos',
+    timesTotal: (count: number) => `, ${count} vez(es) no total`
+  }
+}
+
 const ja: BotsMessages = {
+  paneTitle: 'ボット',
   roster: {
     search: 'ボットとグループチャットを検索',
     searchPlaceholder: 'ボットとグループチャットを検索…',
     newBotOrGroup: '新しいボットまたはグループチャット',
+    newMenuTip: '新規…',
+    activityToastsOn: 'アクティビティ通知はオンです — クリックして消音',
+    activityToastsOff: 'アクティビティ通知はオフです — クリックして有効化',
+    allGateways: 'すべてのゲートウェイ',
+    currentGateway: '現在のゲートウェイ',
     groupChats: 'グループチャット',
     emptyTitle: 'ボットはまだありません',
     emptyDesc: '最初のボットを作成しましょう。',
@@ -447,6 +666,7 @@ const ja: BotsMessages = {
     noMatchFiltersOn: gateway => `${gateway} にこれらのフィルタに一致するボットやグループチャットはありません`,
     noMatchFilters: 'これらのフィルタに一致するボットやグループチャットはありません。',
     clearFilters: 'フィルタをクリア',
+    filterRoster: activeCount => (activeCount ? `フィルタ（${activeCount} 件有効）` : '一覧をフィルタ'),
     allHidden: 'すべてのボットが非表示です',
     allHiddenDesc: '非表示でも動作を続け、履歴も残ります。',
     showHidden: '非表示のボットを表示',
@@ -626,10 +846,16 @@ const ja: BotsMessages = {
 }
 
 const zh: BotsMessages = {
+  paneTitle: '机器人',
   roster: {
     search: '搜索机器人和群聊',
     searchPlaceholder: '搜索机器人和群聊…',
     newBotOrGroup: '新建机器人或群聊',
+    newMenuTip: '新建…',
+    activityToastsOn: '活动通知已开启 — 点击静音',
+    activityToastsOff: '活动通知已关闭 — 点击开启',
+    allGateways: '所有网关',
+    currentGateway: '当前网关',
     groupChats: '群聊',
     emptyTitle: '还没有机器人',
     emptyDesc: '创建你的第一个机器人。',
@@ -638,6 +864,7 @@ const zh: BotsMessages = {
     noMatchFiltersOn: gateway => `${gateway} 上没有机器人或群聊匹配这些筛选条件`,
     noMatchFilters: '没有机器人或群聊匹配这些筛选条件。',
     clearFilters: '清除筛选',
+    filterRoster: activeCount => (activeCount ? `筛选（${activeCount} 个已启用）` : '筛选列表'),
     allHidden: '所有机器人都已隐藏',
     allHiddenDesc: '它们会继续运行，并保留各自的历史。',
     showHidden: '显示已隐藏的机器人',
@@ -816,10 +1043,16 @@ const zh: BotsMessages = {
 }
 
 const zhHant: BotsMessages = {
+  paneTitle: '機器人',
   roster: {
     search: '搜尋機器人和群組聊天',
     searchPlaceholder: '搜尋機器人和群組聊天…',
     newBotOrGroup: '新增機器人或群組聊天',
+    newMenuTip: '新增…',
+    activityToastsOn: '活動通知已開啟 — 點擊靜音',
+    activityToastsOff: '活動通知已關閉 — 點擊開啟',
+    allGateways: '所有閘道',
+    currentGateway: '目前閘道',
     groupChats: '群組聊天',
     emptyTitle: '還沒有機器人',
     emptyDesc: '建立你的第一個機器人。',
@@ -828,6 +1061,7 @@ const zhHant: BotsMessages = {
     noMatchFiltersOn: gateway => `${gateway} 上沒有機器人或群組聊天符合這些篩選條件`,
     noMatchFilters: '沒有機器人或群組聊天符合這些篩選條件。',
     clearFilters: '清除篩選',
+    filterRoster: activeCount => (activeCount ? `篩選（${activeCount} 個已啟用）` : '篩選清單'),
     allHidden: '所有機器人都已隱藏',
     allHiddenDesc: '它們會繼續運作，並保留各自的歷史。',
     showHidden: '顯示已隱藏的機器人',
@@ -1006,7 +1240,7 @@ const zhHant: BotsMessages = {
 }
 
 /** Registered via `ctx.i18n.register` at plugin load (disposer tracked). */
-export const BOTS_LOCALES: PluginLocaleBundles = { en, ja, zh, 'zh-hant': zhHant }
+export const BOTS_LOCALES: PluginLocaleBundles = { 'pt-br': ptBr, en, ja, zh, 'zh-hant': zhHant }
 
 // Bind the message SHAPE to a plugin translator: string leaves resolve now,
 // function leaves forward their args through t(path, …).
