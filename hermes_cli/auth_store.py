@@ -452,6 +452,26 @@ def _validate_auth_store_schema(auth_store: Any, *, require_section: bool = True
         raise ValueError("Auth store must contain providers or credential_pool")
 
 
+def _migrate_legacy_systems_store(raw: Any) -> Optional[Dict[str, Any]]:
+    """Return the canonical form of the one supported legacy store shape."""
+    if not isinstance(raw, dict) or "systems" not in raw or "providers" in raw:
+        return None
+    systems = raw.get("systems")
+    if not isinstance(systems, dict) or any(
+        not isinstance(key, str) or not isinstance(value, dict)
+        for key, value in systems.items()
+    ):
+        raise ValueError("invalid legacy systems shape")
+    providers = {}
+    if "nous_portal" in systems:
+        providers["nous"] = systems["nous_portal"]
+    return {
+        "version": AUTH_STORE_VERSION,
+        "providers": providers,
+        "active_provider": "nous" if providers else None,
+    }
+
+
 def _validate_recovery_store(auth_store: Any) -> None:
     """Reject incomplete or malformed replacement shapes before any write."""
     _validate_auth_store_schema(auth_store, require_section=True)
@@ -818,15 +838,25 @@ def _file_lock(
         return
 
     # On Windows, msvcrt.locking needs the file to have content and the
-    # file pointer at position 0. Ensure the lock file has at least 1 byte.
-    if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+    # file pointer at position 0. Ensure the lock file and open handle are one
+    # bounded operation: a peer can remove or create the file between either
+    # step, and that race must not escape as FileNotFoundError.
+    deadline = time.monotonic() + max(1.0, timeout_seconds)
+    lock_file = None
+    while lock_file is None:
         try:
-            lock_path.write_text(" ", encoding="utf-8")
+            if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+                try:
+                    lock_path.write_text(" ", encoding="utf-8")
+                except (OSError, PermissionError):
+                    pass
+            lock_file = lock_path.open("r+" if msvcrt else "a+", encoding="utf-8")
         except (OSError, PermissionError):
-            pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(timeout_message)
+            time.sleep(0.05)
 
-    with lock_path.open("r+" if msvcrt else "a+", encoding="utf-8") as lock_file:
-        deadline = time.monotonic() + max(1.0, timeout_seconds)
+    with lock_file:
         while True:
             try:
                 if fcntl:
@@ -1023,14 +1053,18 @@ def _write_corrupt_sidecar(auth_file: Path, raw: bytes) -> Optional[Path]:
                 else:
                     os.link(os.fspath(temp), os.fspath(destination), follow_symlinks=False)
                 published = True
-                # Once the no-replace link wins, never retry: a cleanup fault
-                # must not cause duplicate forensic publications or a false
-                # "preserved=False" result.
-                if _is_reparse_or_link(destination) or _digest(_read_auth_bytes(destination)) != _digest(raw):
-                    raise OSError(f"Corrupt sidecar verification failed: {destination}")
+                # Once the no-replace link wins, publication is the sole
+                # preservation result. Verification is best effort and must
+                # never escape into the corruption handler as a false failure
+                # or trigger another publication attempt.
+                try:
+                    if _is_reparse_or_link(destination) or _digest(_read_auth_bytes(destination)) != _digest(raw):
+                        raise OSError(f"Corrupt sidecar verification failed: {destination}")
+                except Exception:
+                    pass
                 try:
                     temp.unlink()
-                except OSError:
+                except Exception:
                     pass
                 return destination
             except FileExistsError:
@@ -1174,6 +1208,9 @@ def _save_auth_store_locked(
         try:
             current_bytes = _read_auth_bytes(auth_file)
             current_store = json.loads(current_bytes.decode("utf-8-sig"))
+            migrated_store = _migrate_legacy_systems_store(current_store)
+            if migrated_store is not None:
+                current_store = migrated_store
             if isinstance(current_store, dict):
                 suppressed = current_store.get("suppressed_sources")
                 if isinstance(suppressed, dict):

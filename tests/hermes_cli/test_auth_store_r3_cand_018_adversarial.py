@@ -119,6 +119,46 @@ def test_post_publication_verification_failure_stops_without_retry(
     assert not list(tmp_path.glob(".auth.json.corrupt*.tmp.*"))
 
 
+
+def test_non_oserror_post_publication_verification_keeps_single_winner(
+    tmp_path, monkeypatch
+):
+    """A non-OSError verification fault cannot orphan or duplicate evidence."""
+    primary = tmp_path / "auth.json"
+    original = _corrupt(primary, b"{non-oserror-verification")
+    real_is_reparse_or_link = owner._is_reparse_or_link
+    publication_attempts = 0
+
+    def count_publication(*args, **kwargs):
+        nonlocal publication_attempts
+        publication_attempts += 1
+        return real_publish(*args, **kwargs)
+
+    def fail_sidecar_verification(path):
+        if path.name.startswith("auth.json.corrupt"):
+            raise RuntimeError("synthetic non-OSError verification failure")
+        return real_is_reparse_or_link(path)
+
+    if os.name == "nt":
+        real_publish = owner._windows_link_sidecar_relative
+        monkeypatch.setattr(owner, "_windows_link_sidecar_relative", count_publication)
+    else:
+        real_publish = owner.os.link
+        monkeypatch.setattr(owner.os, "link", count_publication)
+    monkeypatch.setattr(owner, "_is_reparse_or_link", fail_sidecar_verification)
+
+    with pytest.raises(auth.AuthStoreCorruptionError) as caught:
+        auth._load_auth_store(primary)
+
+    assert caught.value.preserved is True
+    assert caught.value.corrupt_path == primary.with_name("auth.json.corrupt")
+    sidecars = list(tmp_path.glob("auth.json.corrupt*"))
+    assert len(sidecars) == 1
+    assert sidecars[0].read_bytes() == original
+    assert not list(tmp_path.glob(".auth.json.corrupt*.tmp.*"))
+    assert publication_attempts == 1
+
+
 def test_recovery_rejects_changed_reviewed_source(tmp_path):
     primary = tmp_path / "auth.json"
     original = _corrupt(primary)
@@ -508,7 +548,6 @@ def test_windows_publication_rejects_ancestor_swap_before_source_open(tmp_path, 
 def test_windows_lock_init_permission_error_retries_until_timeout(tmp_path, monkeypatch):
     """A raced lock-file init must reach the bounded acquisition timeout."""
     lock_path = tmp_path / "auth.lock"
-    lock_path.write_bytes(b"")
     init_attempts = []
     lock_attempts = []
 
@@ -540,4 +579,4 @@ def test_windows_lock_init_permission_error_retries_until_timeout(tmp_path, monk
             pass
 
     assert init_attempts == [lock_path]
-    assert len(lock_attempts) == 1
+    assert lock_attempts == []

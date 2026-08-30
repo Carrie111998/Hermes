@@ -15,6 +15,40 @@ def _malformed_store(path):
     return original
 
 
+def test_legacy_systems_store_migrates_on_ordinary_save(tmp_path):
+    primary = tmp_path / "auth.json"
+    primary.write_text(
+        json.dumps(
+            {
+                "systems": {
+                    "nous_portal": {"api_key": "preserved"},
+                    "unused_system": {"state": "ignored"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    store = auth._load_auth_store(primary)
+    assert store == {
+        "version": auth.AUTH_STORE_VERSION,
+        "providers": {"nous": {"api_key": "preserved"}},
+        "active_provider": "nous",
+    }
+    store["providers"]["nous"]["rotated"] = True
+
+    auth._save_auth_store(store, primary)
+
+    disk_store = json.loads(primary.read_text(encoding="utf-8"))
+    assert disk_store["version"] == auth.AUTH_STORE_VERSION
+    assert disk_store["providers"] == {
+        "nous": {"api_key": "preserved", "rotated": True}
+    }
+    assert disk_store["active_provider"] == "nous"
+    assert "systems" not in disk_store
+    assert isinstance(disk_store["updated_at"], str)
+
+
 def test_corruption_is_read_only_and_preserved(tmp_path, monkeypatch):
     primary = tmp_path / "auth.json"
     original = _malformed_store(primary)
