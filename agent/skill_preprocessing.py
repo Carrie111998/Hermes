@@ -149,11 +149,95 @@ def preprocess_skill_content(
     return content
 
 
+def _is_onload_authorized(skills_cfg: dict | None = None) -> bool:
+    """Check whether onload execution is enabled in config.
+
+    Authorized when either:
+      * ``skills.inline_shell`` is true (existing trust gate), OR
+      * ``skills.onload_enabled`` is true (new separate gate)
+
+    Both default to false.
+    """
+    cfg = skills_cfg if isinstance(skills_cfg, dict) else load_skills_config()
+    return bool(cfg.get("inline_shell", False)) or bool(cfg.get("onload_enabled", False))
+
+
+def _build_onload_env(extra_env: dict | None = None) -> dict[str, str]:
+    """Construct an allowlisted environment for onload child processes.
+
+    Only passes variables the child genuinely needs.  Strips ALL secrets,
+    API keys, tokens, and credentials from the parent environment.
+    """
+    allowlist = {
+        "PATH",
+        "HERMES_MODEL",
+        "HERMES_PROVIDER",
+        "HERMES_HOME",
+        "HERMES_SKILL_DIR",
+    }
+    if IS_WINDOWS:
+        allowlist.update({"SYSTEMROOT", "TEMP", "TMP"})
+
+    # Start with empty dict, explicitly copy only allowlisted vars
+    child_env: dict[str, str] = {}
+    for _key in allowlist:
+        _val = os.environ.get(_key)
+        if _val is not None:
+            child_env[_key] = _val
+
+    # Merge any extra_env keys that were explicitly configured to pass through
+    if extra_env:
+        for _key, _val in extra_env.items():
+            child_env[_key] = str(_val)
+
+    return child_env
+
+
+def _validate_onload_path(
+    script_rel_path: str,
+    skill_dir: Path,
+) -> Path | None:
+    """Validate and resolve an onload script path.
+
+    Returns the resolved ``Path`` if the path is safe, or ``None`` (with a
+    logged warning) if the path attempts to escape the skill directory.
+
+    Safety checks:
+      1. Absolute paths are rejected immediately.
+      2. The resolved path MUST be inside the resolved skill directory.
+    """
+    rel = Path(script_rel_path)
+
+    # Reject absolute paths
+    if rel.is_absolute():
+        logger.warning(
+            "Absolute onload script path rejected: %s (skill_dir=%s)",
+            script_rel_path, skill_dir,
+        )
+        return None
+
+    resolved_skill = skill_dir.resolve()
+    candidate = (resolved_skill / rel).resolve()
+
+    # Verify containment inside the skill directory
+    try:
+        candidate.relative_to(resolved_skill)
+    except ValueError:
+        logger.warning(
+            "onload script path escapes skill root: %s -> %s (resolved skill_dir=%s)",
+            script_rel_path, candidate, resolved_skill,
+        )
+        return None
+
+    return candidate
+
+
 def run_onload_script(
     script_rel_path: str,
     skill_dir: Path,
     extra_env: dict | None = None,
     timeout: int = 30,
+    skills_cfg: dict | None = None,
 ) -> str:
     """Run a skill's onload script and return its stdout (stripped).
 
@@ -161,13 +245,33 @@ def run_onload_script(
     to signal that the skill body should be pre-loaded into the system
     prompt.  Any other output (or an empty string) means "skip".
 
+    .. security::
+
+       * Execution requires ``skills.inline_shell`` or
+         ``skills.onload_enabled`` in config (both default false).
+       * The child process receives only an allowlisted environment —
+         no secrets, API keys, or credentials from the parent.
+       * Path traversal (absolute paths, ``../``, symlink escapes) is
+         rejected before any subprocess is spawned.
+
     Supports ``.sh`` (bash) and ``.py`` (python) scripts.  Falls back to
     running the command directly via bash for unrecognised extensions.
 
     Reuses the same subprocess machinery as ``run_inline_shell`` so any
     platform quirks (Windows hide-console flags) are already handled.
     """
-    script_path = skill_dir / script_rel_path
+    # ── Security gate: trust check ────────────────────────────────────
+    if not _is_onload_authorized(skills_cfg):
+        logger.debug(
+            "onload execution blocked for %s (trust gate not enabled)",
+            script_rel_path,
+        )
+        return ""
+
+    # ── Security gate: path containment ───────────────────────────────
+    script_path = _validate_onload_path(script_rel_path, skill_dir)
+    if script_path is None:
+        return ""
     if not script_path.exists():
         logger.warning(
             "onload script %s not found for skill at %s",
@@ -190,9 +294,8 @@ def run_onload_script(
     else:
         args = ["bash", script_path_str]  # default fallback
 
-    env = os.environ.copy()
-    if extra_env:
-        env.update(extra_env)
+    # ── Security gate: allowlisted environment ────────────────────────
+    env = _build_onload_env(extra_env)
 
     _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     try:

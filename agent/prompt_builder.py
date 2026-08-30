@@ -1767,8 +1767,8 @@ def build_skills_system_prompt(
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
     skills_dir_override: "Path | None" = None,
-) -> tuple[str, list[dict]]:
-    """Build a compact skill index for the system prompt.
+) -> str:
+    """Build a compact skill index for the system prompt.  Returns ``str``.
 
     Two-layer cache:
       1. In-process LRU dict keyed by (skills_dir, tools, toolsets, hidden)
@@ -1787,6 +1787,54 @@ def build_skills_system_prompt(
     the rendered index. Nothing is ever hidden: every skill name stays
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
+    """
+    result, _ = _build_skills_system_prompt_with_onload(
+        available_tools=available_tools,
+        available_toolsets=available_toolsets,
+        compact_categories=compact_categories,
+        skills_dir_override=skills_dir_override,
+    )
+    return result
+
+
+def get_onload_entries(
+    available_tools: "set[str] | None" = None,
+    available_toolsets: "set[str] | None" = None,
+    compact_categories: "frozenset[str] | None" = None,
+    skills_dir_override: "Path | None" = None,
+) -> list[dict]:
+    """Return onload-entry metadata for every visible skill with ``onload:``.
+
+    This is a companion to :func:`build_skills_system_prompt` that exposes
+    onload metadata without changing that function's ``-> str`` contract.
+
+    Returns a list of dicts, each with keys:
+      ``onload``, ``skill_dir``, ``skill_md_path``, ``skill_name``
+
+    Shares the same in-process cache as ``build_skills_system_prompt``, so
+    callers pay the build cost only once.
+    """
+    _, entries = _build_skills_system_prompt_with_onload(
+        available_tools=available_tools,
+        available_toolsets=available_toolsets,
+        compact_categories=compact_categories,
+        skills_dir_override=skills_dir_override,
+    )
+    return entries
+
+
+def _build_skills_system_prompt_with_onload(
+    available_tools: "set[str] | None" = None,
+    available_toolsets: "set[str] | None" = None,
+    compact_categories: "frozenset[str] | None" = None,
+    skills_dir_override: "Path | None" = None,
+) -> tuple[str, list[dict]]:
+    """Build skill index + collect onload metadata.
+
+    Internal helper shared by :func:`build_skills_system_prompt` and
+    :func:`get_onload_entries` so both share the same resolution chain
+    and in-process cache.  Returns the prompt string and onload entries
+    as a pair.
     """
     # Home resolution is EXPLICIT when a caller passes skills_dir_override
     # (the agent knows its own profile home from its session_db path). This
@@ -1811,7 +1859,7 @@ def build_skills_system_prompt(
         project_dirs = get_project_skills_dirs()
 
         if not skills_dir.exists() and not external_dirs and not project_dirs:
-            return ""
+            return "", []
 
         return _build_skills_system_prompt_inner(
             skills_dir,

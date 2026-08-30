@@ -50,6 +50,7 @@ def _captured_context_cwd(agent):
         patch("run_agent.load_soul_md", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", side_effect=fake_context_files),
+        patch("run_agent.get_onload_entries", return_value=[]),
     ):
         build_system_prompt_parts(agent)
     return captured["cwd"]
@@ -72,6 +73,7 @@ def _stable_prompt(agent):
         patch("run_agent.load_soul_md", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
+        patch("run_agent.get_onload_entries", return_value=[]),
     ):
         return build_system_prompt_parts(agent)["stable"]
 
@@ -81,6 +83,7 @@ def _prompt_parts(agent):
         patch("run_agent.load_soul_md", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
+        patch("run_agent.get_onload_entries", return_value=[]),
     ):
         return build_system_prompt_parts(agent)
 
@@ -270,6 +273,7 @@ def test_build_system_prompt_records_stable_prefix():
         patch("run_agent.load_soul_md", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value="context"),
+        patch("run_agent.get_onload_entries", return_value=[]),
     ):
         prompt = build_system_prompt(agent)
 
@@ -319,6 +323,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         patch("run_agent.load_soul_md", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value="CONTEXT_FILES"),
+        patch("run_agent.get_onload_entries", return_value=[]),
         patch(
             "agent.coding_context.coding_system_prompt_parts",
             return_value=(
@@ -465,6 +470,7 @@ def _build(builder, **overrides):
         patch("run_agent.build_context_files_prompt", return_value=_CONTEXT),
         patch("run_agent.get_toolset_for_tool", return_value=None),
         patch("run_agent.build_skills_system_prompt", return_value=_SKILLS),
+        patch("run_agent.get_onload_entries", return_value=[]),
     ):
         return builder(agent)
 

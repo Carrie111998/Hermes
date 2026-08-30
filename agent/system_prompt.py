@@ -646,14 +646,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             compact_categories=_compact_cats or None,
             skills_dir_override=_agent_skills_dir(agent),
         )
-        # Unpack onload entries (new-style tuple) with backward compat for
-        # cached strings from v2 snapshots.
-        onload_entries: list[dict] = []
-        if isinstance(skills_prompt, tuple):
-            skills_prompt, onload_entries = skills_prompt
+        onload_entries = _r.get_onload_entries(
+            available_tools=agent.valid_tool_names,
+            available_toolsets=avail_toolsets,
+            compact_categories=_compact_cats or None,
+            skills_dir_override=_agent_skills_dir(agent),
+        )
     else:
         skills_prompt = ""
-        onload_entries = []
+        onload_entries: list[dict] = []
 
     # Resolve the help-guidance variant now that the skills index exists:
     # the skill-pointer variant requires BOTH skill_view in the toolset AND
@@ -940,6 +941,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             _onload_env["HERMES_MODEL"] = _model
         if _provider:
             _onload_env["HERMES_PROVIDER"] = _provider
+        _onload_skills_cfg = getattr(agent, "_skills_config", None)
+        if not isinstance(_onload_skills_cfg, dict):
+            from agent.skill_preprocessing import load_skills_config
+            _onload_skills_cfg = load_skills_config()
         for _entry in onload_entries:
             _script = (_entry.get("onload") or "").strip()
             _skill_dir = (_entry.get("skill_dir") or "")
@@ -954,6 +959,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
                 _output = run_onload_script(
                     _script, _dir_path,
                     extra_env=_onload_env or None,
+                    skills_cfg=_onload_skills_cfg,
                 )
             except Exception as _exc:
                 logger.warning("onload script error for %s: %s", _name, _exc)
