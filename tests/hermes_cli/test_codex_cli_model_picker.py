@@ -38,8 +38,10 @@ def hermes_auth_only_env(tmp_path, monkeypatch):
     # Point CODEX_HOME to nonexistent dir to prove it's not needed
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no_codex"))
 
+    from hermes_cli.auth import AUTH_STORE_VERSION
+
     (hermes_home / "auth.json").write_text(json.dumps({
-        "version": 2,
+        "version": AUTH_STORE_VERSION,
         "providers": {
             "openai-codex": {
                 "tokens": {
@@ -86,8 +88,10 @@ def claude_code_only_env(tmp_path, monkeypatch):
     # No Codex CLI
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no_codex"))
 
+    from hermes_cli.auth import AUTH_STORE_VERSION
+
     (hermes_home / "auth.json").write_text(
-        json.dumps({"version": 2, "providers": {}})
+        json.dumps({"version": AUTH_STORE_VERSION, "providers": {}})
     )
 
     # Claude Code credentials in the correct format
@@ -140,8 +144,10 @@ def test_no_codex_when_no_credentials(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no_codex"))
 
+    from hermes_cli.auth import AUTH_STORE_VERSION
+
     (hermes_home / "auth.json").write_text(
-        json.dumps({"version": 2, "providers": {}})
+        json.dumps({"version": AUTH_STORE_VERSION, "providers": {}})
     )
 
     for var in [

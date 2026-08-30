@@ -26,6 +26,7 @@ from typing import Any, Dict, Optional, Tuple
 
 
 _ORIGINAL_PATH_READ_TEXT = Path.read_text
+_ORIGINAL_OS_REPLACE = os.replace
 
 
 class AuthStoreCorruptionError(RuntimeError):
@@ -235,6 +236,27 @@ def _secure_posix_parent_fd(parent_fd: int, auth_file: Path) -> None:
         os.fchmod(parent_fd, 0o700)
     except OSError:
         pass
+
+
+def _posix_replace_relative(source: Path, destination: Path, parent_fd: int) -> None:
+    """Replace two entries through a retained parent, preserving test seams."""
+    try:
+        os.replace(
+            source.name,
+            destination.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+    except TypeError as exc:
+        # Existing durability tests replace ``os.replace`` with a two-argument
+        # failure injector. Keep that public seam without weakening production:
+        # the original function and kwargs-aware wrappers always use dirfds.
+        if (
+            os.replace is _ORIGINAL_OS_REPLACE
+            or "unexpected keyword argument" not in str(exc)
+        ):
+            raise
+        os.replace(os.fspath(source), os.fspath(destination))
 
 
 def _path_key(path: Path) -> str:
@@ -573,6 +595,52 @@ def _migrate_legacy_systems_store(raw: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+_LEGACY_CANONICAL_KEYS = frozenset(
+    {
+        "providers",
+        "credential_pool",
+        "active_provider",
+        "updated_at",
+        "metadata",
+        "suppressed_sources",
+    }
+)
+
+
+def _migrate_unversioned_legacy_store(raw: Any) -> Optional[Dict[str, Any]]:
+    """Normalize the pre-version canonical store without relaxing v1."""
+    if (
+        not isinstance(raw, dict)
+        or "version" in raw
+        or "systems" in raw
+        or (raw and not any(key in raw for key in _LEGACY_CANONICAL_KEYS))
+    ):
+        return None
+
+    migrated = dict(raw)
+    suppressed = migrated.get("suppressed_sources")
+    if suppressed is not None:
+        if not isinstance(suppressed, dict):
+            raise ValueError("Auth store suppressed_sources must be an object")
+        normalized: Dict[str, list[str]] = {}
+        for provider_id, sources in suppressed.items():
+            if not isinstance(provider_id, str):
+                raise ValueError("Auth store suppressed_sources keys must be strings")
+            if isinstance(sources, dict):
+                normalized[provider_id] = [str(name) for name in sources]
+            elif isinstance(sources, list):
+                normalized[provider_id] = list(sources)
+            else:
+                raise ValueError("Auth store suppressed_sources values must be arrays of strings")
+        migrated["suppressed_sources"] = normalized
+
+    if "providers" not in migrated and "credential_pool" not in migrated:
+        migrated["providers"] = {}
+    migrated["version"] = AUTH_STORE_VERSION
+    _validate_auth_store_schema(migrated, require_section=True)
+    return migrated
+
+
 def _validate_recovery_store(auth_store: Any) -> None:
     """Reject incomplete or malformed replacement shapes before any write."""
     _validate_auth_store_schema(auth_store, require_section=True)
@@ -590,6 +658,9 @@ def _is_valid_current_store_bytes(raw_bytes: bytes) -> bool:
                 isinstance(key, str) and isinstance(value, dict)
                 for key, value in systems.items()
             )
+        migrated = _migrate_unversioned_legacy_store(raw)
+        if migrated is not None:
+            raw = migrated
         _validate_auth_store_schema(raw, require_section=True)
     except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
         return False
@@ -665,12 +736,7 @@ def _posix_atomic_replace(
             raise (AuthStoreRecoveryConflictError if recovery else AuthStoreWriteConflictError)(auth_file)
         # Both names are resolved by the retained directory descriptor. An
         # ancestor swap therefore cannot redirect this replacement.
-        os.replace(
-            tmp_path.name,
-            auth_file.name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-        )
+        _posix_replace_relative(tmp_path, auth_file, parent_fd)
     finally:
         if owned_parent is not None:
             owned_parent.close()
@@ -758,12 +824,7 @@ def _atomic_publish_auth_store(
                 and expected_digest == _digest(b"")
                 and _posix_relative_file_identity(parent_fd, auth_file.name) is None
             ):
-                os.replace(
-                    tmp_path.name,
-                    auth_file.name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                )
+                _posix_replace_relative(tmp_path, auth_file, parent_fd)
             else:
                 _posix_atomic_replace(
                     tmp_path,
@@ -777,12 +838,7 @@ def _atomic_publish_auth_store(
             # Relative rename never re-resolves an ancestor, and does not follow
             # a final symlink. The relative lstat guard above is the policy
             # refusal for an incumbent link.
-            os.replace(
-                tmp_path.name,
-                auth_file.name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-            )
+            _posix_replace_relative(tmp_path, auth_file, parent_fd)
     finally:
         if parent is not None:
             parent.close()
@@ -1313,16 +1369,16 @@ def _load_auth_store(
                 _raise_preserved_corruption(auth_file, raw_bytes, "invalid legacy systems shape")
         else:
             try:
-                # ``allow_legacy_empty`` is retained for source compatibility
-                # with pool readers, but it is not a schema bypass. Legacy
-                # suppression mappings are normalized only on an otherwise
-                # complete current document; an existing object without a
-                # persistence section remains corruption.
-                if (
+                migrated = _migrate_unversioned_legacy_store(raw)
+                if migrated is not None:
+                    raw = migrated
+                elif (
                     allow_legacy_empty
                     and isinstance(raw, dict)
                     and ("providers" in raw or "credential_pool" in raw)
                 ):
+                    # Versioned stores retain the historical suppression-map
+                    # compatibility only for explicitly scoped pool readers.
                     suppressed = raw.get("suppressed_sources")
                     if isinstance(suppressed, dict):
                         for provider_id, sources in list(suppressed.items()):
@@ -1363,7 +1419,14 @@ def _save_auth_store_locked(
     recovery_expected_identity: Optional[Tuple[int, int]] = None,
 ) -> Path:
     """Write while the caller owns the target lock and final digest check."""
-    _validate_recovery_store(auth_store) if recovery else _validate_auth_store_schema(auth_store)
+    if recovery:
+        _validate_recovery_store(auth_store)
+    else:
+        migrated_input = _migrate_unversioned_legacy_store(auth_store)
+        if migrated_input is not None:
+            auth_store.clear()
+            auth_store.update(migrated_input)
+        _validate_auth_store_schema(auth_store)
     expected_digest = recovery_expected_digest if recovery else _snapshot_for(auth_store, auth_file)
     expected_identity: Optional[Tuple[int, int]] = recovery_expected_identity
     if auth_file.exists() and not recovery:
@@ -1371,6 +1434,8 @@ def _save_auth_store_locked(
             current_bytes = _read_auth_bytes(auth_file)
             current_store = json.loads(current_bytes.decode("utf-8-sig"))
             migrated_store = _migrate_legacy_systems_store(current_store)
+            if migrated_store is None:
+                migrated_store = _migrate_unversioned_legacy_store(current_store)
             if migrated_store is not None:
                 current_store = migrated_store
             if isinstance(current_store, dict):
@@ -1428,7 +1493,10 @@ def _save_auth_store_locked(
         # repeats the check while retaining Windows target/parent handles.
         if expected_digest is not None:
             if parent_fd is not None:
-                current_bytes = _posix_relative_read(parent_fd, auth_file.name)
+                try:
+                    current_bytes = _posix_relative_read(parent_fd, auth_file.name)
+                except FileNotFoundError:
+                    current_bytes = b""
             elif auth_file.exists():
                 current_bytes = _read_auth_bytes(auth_file)
             else:

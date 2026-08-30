@@ -1287,7 +1287,7 @@ def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
 def test_custom_endpoint_pool_seeds_from_config(tmp_path, monkeypatch):
     """Verify seeding from custom_providers api_key in config.yaml."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_auth_store(tmp_path, {"version": 1})
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
     # Write config.yaml with a custom_providers entry
     config_path = tmp_path / "hermes" / "config.yaml"
@@ -1315,7 +1315,7 @@ def test_custom_endpoint_pool_seeds_from_config(tmp_path, monkeypatch):
 def test_custom_endpoint_pool_seeds_from_model_config(tmp_path, monkeypatch):
     """Verify seeding from model.api_key when model.provider=='custom' and base_url matches."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    _write_auth_store(tmp_path, {"version": 1})
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
 
     import yaml
     config_path = tmp_path / "hermes" / "config.yaml"

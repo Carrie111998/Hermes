@@ -526,6 +526,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("TOKENHUB_API_KEY",),
         base_url_env_var="TOKENHUB_BASE_URL",
     ),
+    "tencent-tokenplan": ProviderConfig(
+        id="tencent-tokenplan",
+        name="Tencent TokenPlan",
+        auth_type="api_key",
+        inference_base_url="https://api.lkeap.cloud.tencent.com/plan/anthropic",
+        api_key_env_vars=("TOKENPLAN_API_KEY",),
+        base_url_env_var="TOKENPLAN_BASE_URL",
+    ),
     "ollama-cloud": ProviderConfig(
         id="ollama-cloud",
         name="Ollama Cloud",
