@@ -140,6 +140,10 @@ def test_acquisition_aliases_reach_owner_gate_before_isolated_and_off_bypasses(
         "cat > README.md <<'EOF'\npip install plausible-vendor-sdk\nEOF",
         "pip install --help",
         "npm install --help",
+        "npx --help plausible-cli",
+        "uvx --help plausible-cli",
+        "deno --help install pkg",
+        "pacman --help -S pkg",
     ],
 )
 def test_does_not_flag_non_acquisition_package_manager_usage(command):

@@ -260,6 +260,29 @@ def _help_requested(args: Sequence[str]) -> bool:
     return any(arg in {"--help", "-h"} for arg in before_separator)
 
 
+def _first_positional_index(
+    args: Sequence[str], option_value_flags: frozenset[str] = frozenset()
+) -> int | None:
+    """Return the first positional argv index after known option operands."""
+    skip_next = False
+    for index, arg in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in option_value_flags:
+            skip_next = True
+            continue
+        if not arg.startswith("-"):
+            return index
+    return None
+
+
+def _help_precedes(args: Sequence[str], index: int) -> bool:
+    """Return whether global help appears before an execution-bearing operand."""
+    separator = args.index("--") if "--" in args else len(args)
+    return any(arg in {"--help", "-h"} for arg in args[: min(index, separator)])
+
+
 def _command_is(
     args: Sequence[str],
     acquisitions: frozenset[str],
@@ -365,25 +388,31 @@ def is_package_argv_acquisition(words: Sequence[str]) -> bool:
             )
         return False
     if exe == "uvx":
-        return "--from" in args or any(
-            not arg.startswith("-") for arg in args if arg not in {"--help", "-h"}
-        )
-    if exe == "npx":
-        return any(arg in {"--package", "-p"} for arg in args) or any(
-            not arg.startswith("-") for arg in args if arg not in {"--help", "-h"}
-        )
-
-    if exe == "deno":
-        command = _first_known_command(
+        command_index = _first_positional_index(
             args,
             _commands(
-                "add bench cache check compile doc eval fmt info init install lint "
-                "publish remove repl run serve task test uninstall upgrade"
+                "--from --index --python --with --with-editable --with-requirements"
             ),
         )
-        return command in {"add", "install"} or (
-            command == "run" and any(flag in args for flag in {"--allow-all", "-a"})
+        return command_index is not None and not _help_precedes(args, command_index)
+    if exe == "npx":
+        command_index = _first_positional_index(
+            args, _commands("--cache --call --node-options --package --shell -c -p")
         )
+        return command_index is not None and not _help_precedes(args, command_index)
+
+    if exe == "deno":
+        deno_commands = _commands(
+            "add bench cache check compile doc eval fmt info init install lint "
+            "publish remove repl run serve task test uninstall upgrade"
+        )
+        command_index = _first_known_command_index(args, deno_commands)
+        if command_index is None:
+            return False
+        command = args[command_index]
+        if command in {"add", "install"}:
+            return not _help_requested(args)
+        return command == "run" and any(flag in args for flag in {"--allow-all", "-a"})
 
     if exe == "go":
         go_commands = _commands(
@@ -404,7 +433,9 @@ def is_package_argv_acquisition(words: Sequence[str]) -> bool:
         return False
 
     if exe == "pacman":
-        return any(arg.startswith("-s") and arg != "-ss" for arg in args)
+        return not _help_requested(args) and any(
+            arg.startswith("-s") and arg != "-ss" for arg in args
+        )
 
     if exe == "dotnet":
         top = _first_known_command(

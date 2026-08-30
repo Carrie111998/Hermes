@@ -25,6 +25,7 @@ from tools.package_acquisition import is_package_argv_acquisition
         ["uv", "run", "--with", "plausible-vendor-sdk", "python", "--", "--help"],
         ["go", "run", "example.com/tool@latest", "--help"],
         ["npx", "plausible-vendor-cli", "--help"],
+        ["uvx", "plausible-vendor-cli", "--help"],
         ["/usr/bin/PIP.EXE", "INSTALL", "plausible-vendor-sdk"],
         ["pip", "--cache-dir", "list", "install", "pkg"],
         ["python", "-m", "pip", "--cache-dir", "list", "install", "pkg"],
@@ -54,6 +55,10 @@ def test_acquisition_argv(argv):
         ["brew", "info", "install"],
         ["poetry", "source", "add", "internal"],
         ["pip", "install", "--help"],
+        ["npx", "--help", "plausible-cli"],
+        ["uvx", "--help", "plausible-cli"],
+        ["deno", "--help", "install", "pkg"],
+        ["pacman", "--help", "-S", "pkg"],
         ["uv", "run", "python", "script.py"],
     ],
 )
