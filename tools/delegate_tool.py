@@ -3882,6 +3882,12 @@ def delegate_task(
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
         task_list, context, model=creds.get("model"), provider=creds.get("provider")
     )
+    if not live_deleg_id:
+        # Child-scoped durable rows and the optional live transcript must share
+        # one stable parent identity, even when transcript creation is disabled.
+        from tools.async_delegation import _new_delegation_id
+
+        live_deleg_id = _new_delegation_id()
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
     # constructed: _build_child_agent() -> AIAgent() -> agent_init calls
@@ -3972,6 +3978,27 @@ def delegate_task(
             setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
 
+    def _publish_ready_result(entry: Dict[str, Any]) -> None:
+        """Publish one ready child without waiting for its batch siblings."""
+        if not background:
+            return
+        task_index = int(entry.get("task_index", 0))
+        payload = dict(entry)
+        if 0 <= task_index < len(live_paths):
+            payload.setdefault("live_transcript", live_paths[task_index])
+        try:
+            from tools.async_delegation import publish_batch_child_completion
+
+            publish_batch_child_completion(live_deleg_id, task_index, payload)
+        except Exception:
+            # Batch finalization republishes all children idempotently as the
+            # durable safety net for callback/persistence failures.
+            logger.exception(
+                "Failed to publish ready child %s/%s",
+                live_deleg_id,
+                task_index,
+            )
+
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
         fire subagent_stop hooks + cost rollup, and return the combined result
@@ -3995,6 +4022,7 @@ def delegate_task(
                 owner_session_record=_origin_owner_session_record,
             )
             results.append(result)
+            _publish_ready_result(result)
         else:
             # Batch -- run in parallel with per-task progress lines
             completed_count = 0
@@ -4069,6 +4097,7 @@ def delegate_task(
                                     ),
                                 }
                             results.append(entry)
+                            _publish_ready_result(entry)
                             completed_count += 1
                         break
 
@@ -4094,6 +4123,7 @@ def delegate_task(
                                 ),
                             }
                         results.append(entry)
+                        _publish_ready_result(entry)
                         completed_count += 1
 
                         # Print per-task completion line above the spinner
@@ -4356,10 +4386,10 @@ def delegate_task(
                 "continue."
                 if n == 1 else
                 f"{n} subagents are running in parallel in the background. You "
-                f"and the user can keep working; they wait on each other and "
-                f"their consolidated results re-enter the conversation as a "
-                f"single message once ALL of them finish. Do not wait or poll "
-                f"— just continue."
+                f"and the user can keep working; every result ready at the next "
+                f"turn boundary re-enters in one grouped message without waiting "
+                f"for slower siblings. Later results arrive in later grouped "
+                f"messages. Do not wait or poll — just continue."
             )
             payload = {
                 "status": "dispatched",
