@@ -10,10 +10,10 @@ conversation transcript on every chat completion, so this transport:
 * on close(), kills the POSIX process group. ACP launchers fork workers
   (kiro-cli acp execs kiro-cli-chat) that otherwise survive as orphans.
 
-Permission policy is injected by the vendor profile. Kiro's handler
-selects allow_once only — never session-wide allow/approve. Hermes does
-not own Kiro's exec tools. Copilot ACP stays on its own client and
-continues to deny session/request_permission.
+Permission policy is injected by the vendor profile. Kiro denies native
+tool permissions so Hermes executes the mapped tool_calls (Codex-parity).
+Copilot ACP stays on its own client and continues to deny
+session/request_permission.
 
 On Windows, spawn uses windows_detach_flags and close() tree-kills via
 kill_process_tree (taskkill /T /F). POSIX still uses start_new_session
@@ -38,6 +38,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
+from agent.acp_tool_bridge import extract_acp_usage, parse_acp_tool_update
 from agent.file_safety import (
     get_read_block_error,
     get_write_denied_error,
@@ -68,6 +69,56 @@ def acp_scheme_host(url: Any) -> str:
         return ""
     rest = text.split("://", 1)[1]
     return rest.split("/")[0].split("?")[0].strip().lower()
+
+
+def acp_uses_oneshot_completion(*, provider: Any = None, base_url: Any = None) -> bool:
+    """True when the ACP client cannot yield live session/update chunks.
+
+    KiroACPClient implements stream=True (tool/text cards mid-turn).
+    CopilotACPClient and unknown ACP hosts still return a one-shot
+    SimpleNamespace, so the conversation loop must stay non-streaming.
+    """
+    slug = str(provider or "").strip().lower()
+    host = acp_scheme_host(base_url)
+    if slug == "kiro-acp" or host == "kiro":
+        return False
+    if slug == "copilot-acp" or host == "copilot":
+        return True
+    url = str(base_url or "").strip().lower()
+    return url.startswith("acp://") or url.startswith("acp+tcp://")
+
+
+def coerce_session_update(params: Any) -> list[dict[str, Any]]:
+    """Normalize Kiro/ACP session/update params into a list of update dicts.
+
+    Vendors nest the payload as ``params.update``, send a list, or put
+    ``sessionUpdate`` on ``params`` itself. We accept all three.
+    """
+    if not isinstance(params, dict):
+        return []
+    raw = params.get("update")
+    if raw is None:
+        raw = params.get("sessionUpdate")
+        if isinstance(raw, str):
+            return [params]
+        if raw is None and (
+            params.get("sessionUpdate")
+            or params.get("toolCallId")
+            or params.get("tool_call_id")
+            or params.get("kind")
+        ):
+            return [params]
+        raw = params
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    if isinstance(raw, dict):
+        nested = raw.get("toolCall") or raw.get("tool_call")
+        if isinstance(nested, dict) and not raw.get("sessionUpdate"):
+            merged = dict(nested)
+            merged.setdefault("sessionUpdate", "tool_call")
+            return [merged]
+        return [raw]
+    return []
 
 
 def resolve_home_dir() -> str:
@@ -352,6 +403,10 @@ class AcpStdioTransport:
         self._connection: AcpConnection | None = None
         self._active_process_lock = threading.Lock()
         self._prompt_lock = threading.RLock()
+        self._on_update: Callable[[str, Any], None] | None = None
+        self.last_usage: Any = None
+        self._prompt_session_id: str | None = None
+        self._cancel_requested = False
 
     @property
     def active_process(self) -> Any:
@@ -376,8 +431,55 @@ class AcpStdioTransport:
         except Exception:
             pass
 
-    def run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _emit_update(self, kind: str, payload: Any) -> None:
+        callback = self._on_update
+        if callback is None:
+            return
+        try:
+            callback(kind, payload)
+        except Exception:
+            logger.debug("ACP on_update callback failed for %s", kind, exc_info=True)
+
+    def _notify(self, conn: AcpConnection, method: str, params: dict[str, Any]) -> None:
+        """JSON-RPC notification (no id). Used for session/cancel."""
+        proc = conn.process
+        if proc is None or proc.stdin is None:
+            return
+        payload = {"jsonrpc": "2.0", "method": method, "params": params}
+        try:
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
+        except Exception:
+            logger.debug("ACP notify %s failed", method, exc_info=True)
+
+    def cancel_prompt(self) -> None:
+        """End the in-flight session/prompt like Codex finish_reason=tool_calls."""
+        session_id = self._prompt_session_id
+        conn = self._connection
+        if not session_id or conn is None or self._cancel_requested:
+            return
+        self._cancel_requested = True
+        self._notify(conn, "session/cancel", {"sessionId": session_id})
+
+    def _remember_usage(self, payload: Any) -> None:
+        usage = extract_acp_usage(payload)
+        if usage is None:
+            return
+        self.last_usage = usage
+        self._emit_update("usage", usage)
+
+    def run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        on_update: Callable[[str, Any], None] | None = None,
+    ) -> tuple[str, str]:
         with self._prompt_lock:
+            self._on_update = on_update
+            self.last_usage = None
+            self._cancel_requested = False
+            self._prompt_session_id = None
             conn = self._ensure_connection(timeout_seconds=timeout_seconds)
             conn.drain_inbox()
             text_parts: list[str] = []
@@ -389,10 +491,12 @@ class AcpStdioTransport:
                     {"cwd": self.cwd, "mcpServers": []},
                     timeout_seconds=timeout_seconds,
                 ) or {}
+                self._remember_usage(session)
                 session_id = str(session.get("sessionId") or "").strip()
                 if not session_id:
                     raise RuntimeError(f"{self.vendor_label} did not return a sessionId.")
-                self._request(
+                self._prompt_session_id = session_id
+                result = self._request(
                     conn,
                     "session/prompt",
                     {
@@ -403,9 +507,13 @@ class AcpStdioTransport:
                     text_parts=text_parts,
                     reasoning_parts=reasoning_parts,
                 )
+                self._remember_usage(result)
             except BaseException:
                 self._discard_connection(conn)
                 raise
+            finally:
+                self._prompt_session_id = None
+                self._on_update = None
             return "".join(text_parts), "".join(reasoning_parts)
 
     def _ensure_connection(self, *, timeout_seconds: float) -> AcpConnection:
@@ -432,7 +540,8 @@ class AcpStdioTransport:
                 {
                     "protocolVersion": 1,
                     "clientCapabilities": {
-                        "fs": {"readTextFile": True, "writeTextFile": True}
+                        "fs": {"readTextFile": False, "writeTextFile": False},
+                        "terminal": False,
                     },
                     "clientInfo": {
                         "name": "hermes-agent",
@@ -527,8 +636,12 @@ class AcpStdioTransport:
 
         deadline = time.monotonic() + timeout_seconds
         drain_deadline: float | None = None
+        last_heartbeat = time.monotonic()
         while True:
             now = time.monotonic()
+            if self._on_update is not None and (now - last_heartbeat) >= 15.0:
+                self._emit_update("heartbeat", None)
+                last_heartbeat = now
             if now >= deadline:
                 raise TimeoutError(
                     f"Timed out waiting for {self.vendor_label} response to {method}."
@@ -553,6 +666,10 @@ class AcpStdioTransport:
             if msg.get("id") != request_id:
                 continue
             if "error" in msg:
+                if method == "session/prompt" and self._cancel_requested:
+                    self._remember_usage(msg.get("error"))
+                    self._remember_usage(msg)
+                    return {"stopReason": "cancelled"}
                 err = msg.get("error") or {}
                 raise RuntimeError(
                     f"{self.vendor_label} {method} failed: {err.get('message') or err}"
@@ -568,6 +685,66 @@ class AcpStdioTransport:
             f"(exit code {conn.process.poll()}){detail}"
         )
 
+    def _handle_session_update(
+        self,
+        update: dict[str, Any],
+        *,
+        text_parts: list[str] | None,
+        reasoning_parts: list[str] | None,
+    ) -> None:
+        self._remember_usage(update)
+        kind = str(update.get("sessionUpdate") or update.get("type") or "").strip()
+        content = update.get("content") or {}
+        chunk_text = ""
+        if isinstance(content, dict):
+            chunk_text = str(content.get("text") or "")
+        elif isinstance(content, str):
+            chunk_text = content
+        elif isinstance(content, list):
+            bits: list[str] = []
+            for item in content:
+                if isinstance(item, str) and item:
+                    bits.append(item)
+                elif isinstance(item, dict):
+                    inner = item.get("content") if isinstance(item.get("content"), dict) else item
+                    if isinstance(inner, dict) and inner.get("text"):
+                        bits.append(str(inner.get("text") or ""))
+            chunk_text = "".join(bits)
+        if kind == "agent_message_chunk" and chunk_text:
+            if text_parts is not None:
+                text_parts.append(chunk_text)
+            self._emit_update("text", chunk_text)
+            return
+        if kind == "agent_thought_chunk" and chunk_text:
+            if reasoning_parts is not None:
+                reasoning_parts.append(chunk_text)
+            self._emit_update("reasoning", chunk_text)
+            return
+        parsed = parse_acp_tool_update(update)
+        if parsed is not None:
+            logger.info(
+                "ACP session/update tool kind=%s name=%s status=%s keys=%s",
+                kind or parsed.get("name"),
+                parsed.get("name"),
+                parsed.get("status"),
+                sorted(update.keys())[:16],
+            )
+            self._emit_update("tool", parsed)
+            return
+        if kind and kind not in {
+            "agent_message_chunk",
+            "agent_thought_chunk",
+            "usage_update",
+            "available_commands_update",
+            "current_mode_update",
+            "session_info_update",
+        }:
+            logger.info(
+                "ACP session/update unparsed kind=%s keys=%s",
+                kind,
+                sorted(update.keys())[:16],
+            )
+
     def handle_server_message(
         self,
         msg: dict[str, Any],
@@ -582,69 +759,33 @@ class AcpStdioTransport:
             return False
         if method == "session/update":
             params = msg.get("params") or {}
-            update = params.get("update") or {}
-            kind = str(update.get("sessionUpdate") or "").strip()
-            content = update.get("content") or {}
-            chunk_text = ""
-            if isinstance(content, dict):
-                chunk_text = str(content.get("text") or "")
-            if kind == "agent_message_chunk" and chunk_text and text_parts is not None:
-                text_parts.append(chunk_text)
-            elif kind == "agent_thought_chunk" and chunk_text and reasoning_parts is not None:
-                reasoning_parts.append(chunk_text)
+            self._remember_usage(params)
+            for update in coerce_session_update(params):
+                self._handle_session_update(
+                    update,
+                    text_parts=text_parts,
+                    reasoning_parts=reasoning_parts,
+                )
             return True
         if process.stdin is None:
             return True
         message_id = msg.get("id")
         params = msg.get("params") or {}
         if method == "session/request_permission":
+            tool_call = params.get("toolCall") or params.get("tool_call")
+            if isinstance(tool_call, dict):
+                update = dict(tool_call)
+                update.setdefault("sessionUpdate", "tool_call")
+                parsed = parse_acp_tool_update(update)
+                if parsed is not None:
+                    self._emit_update("tool", parsed)
             response = self.permission_handler(message_id, params.get("options"))
-        elif method == "fs/read_text_file":
-            try:
-                path = ensure_path_within_cwd(str(params.get("path") or ""), cwd)
-                block_error = get_read_block_error(str(path))
-                if block_error:
-                    raise PermissionError(block_error)
-                try:
-                    content = path.read_text(encoding="utf-8")
-                except FileNotFoundError:
-                    content = ""
-                line = params.get("line")
-                limit = params.get("limit")
-                if isinstance(line, int) and line > 1:
-                    lines = content.splitlines(keepends=True)
-                    start = line - 1
-                    end = start + limit if isinstance(limit, int) and limit > 0 else None
-                    content = "".join(lines[start:end])
-                if content:
-                    content = redact_sensitive_text(content, force=True)
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": message_id,
-                    "result": {"content": content},
-                }
-            except Exception as exc:
-                response = jsonrpc_error(message_id, -32602, str(exc))
-        elif method == "fs/write_text_file":
-            try:
-                path = ensure_path_within_cwd(str(params.get("path") or ""), cwd)
-                denied = get_write_denied_error(str(path))
-                if denied:
-                    raise PermissionError(denied)
-                if is_write_approval_required(str(path)):
-                    raise PermissionError(
-                        f"Write denied: '{path}' requires interactive approval "
-                        "and cannot be written through the ACP file bridge."
-                    )
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(str(params.get("content") or ""), encoding="utf-8")
-                response = {
-                    "jsonrpc": "2.0",
-                    "id": message_id,
-                    "result": None,
-                }
-            except Exception as exc:
-                response = jsonrpc_error(message_id, -32602, str(exc))
+        elif method in {"fs/read_text_file", "fs/write_text_file"}:
+            response = jsonrpc_error(
+                message_id,
+                -32601,
+                "Hermes owns file tools. Kiro fs bridge is disabled.",
+            )
         else:
             if message_id is None:
                 # JSON-RPC notification: never reply, especially not -32601.

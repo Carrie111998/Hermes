@@ -3981,6 +3981,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             pass
         if normalized == "copilot-acp":
             return list(_PROVIDER_MODELS.get("copilot", []))
+    if normalized == "kiro-acp":
+        # acp://kiro has no HTTP /models. Use the curated Kiro CLI catalog.
+        return list(_PROVIDER_MODELS.get("kiro-acp", []))
     if normalized == "nous":
         # Try live Nous Portal /models endpoint
         try:

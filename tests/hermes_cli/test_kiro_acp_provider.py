@@ -127,3 +127,98 @@ def test_aux_client_builds_kiro_acp_client(monkeypatch):
     assert model == "claude-opus-5"
     assert "--model" in client._acp_args
     assert "claude-opus-5" in client._acp_args
+
+
+# ---------------------------------------------------------------------------
+# /model picker visibility (list_authenticated_providers / list_picker_providers)
+# ---------------------------------------------------------------------------
+#
+# The in-session picker (cli.py ``/model``) builds its menu from
+# ``build_models_payload`` → ``list_authenticated_providers``. Section 2 of
+# that function historically gated only api_key / oauth / aws_sdk / vertex,
+# so ``external_process`` providers (kiro-acp, copilot-acp) were silently
+# dropped even when ``kiro-cli`` was on PATH and the session was already
+# running on Kiro ACP.
+
+
+def _kiro_status(*, configured: bool):
+    return {
+        "configured": configured,
+        "logged_in": configured,
+        "provider": "kiro-acp",
+        "name": "Kiro ACP",
+        "command": "kiro-cli",
+        "args": ["acp"],
+        "resolved_command": "/usr/local/bin/kiro-cli" if configured else None,
+        "base_url": "acp://kiro",
+    }
+
+
+def test_kiro_acp_appears_in_picker_when_cli_configured(monkeypatch):
+    """Configured kiro-cli must surface a first-class Kiro ACP picker row."""
+    from hermes_cli.inventory import build_models_payload, load_picker_context
+    from hermes_cli.model_switch import list_authenticated_providers, list_picker_providers
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_external_process_provider_status",
+        lambda provider: _kiro_status(configured=True)
+        if provider == "kiro-acp"
+        else {"configured": False, "logged_in": False},
+    )
+
+    rows = list_authenticated_providers(
+        current_provider="openrouter",
+        max_models=50,
+    )
+    kiro = next((p for p in rows if p["slug"] == "kiro-acp"), None)
+    assert kiro is not None, f"kiro-acp missing from authenticated picker: {[p['slug'] for p in rows]}"
+    assert kiro["name"] == "Kiro ACP"
+    assert kiro["models"] == ["claude-opus-5", "claude-sonnet-5"]
+    assert kiro["total_models"] == 2
+
+    picker = list_picker_providers(current_provider="openrouter", max_models=50)
+    picker_kiro = next((p for p in picker if p["slug"] == "kiro-acp"), None)
+    assert picker_kiro is not None, "list_picker_providers must not drop kiro-acp"
+    assert picker_kiro["models"] == ["claude-opus-5", "claude-sonnet-5"]
+
+    ctx = load_picker_context().with_overrides(current_provider="openrouter")
+    menu = build_models_payload(ctx)["providers"]
+    assert any(p["slug"] == "kiro-acp" for p in menu), (
+        f"kiro-acp missing from /model menu: {[p['slug'] for p in menu]}"
+    )
+
+
+def test_kiro_acp_hidden_from_picker_when_cli_missing(monkeypatch):
+    """No kiro-cli (and not the current provider) → no Kiro ACP row."""
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_external_process_provider_status",
+        lambda provider: _kiro_status(configured=False),
+    )
+
+    rows = list_authenticated_providers(
+        current_provider="openrouter",
+        max_models=50,
+    )
+    assert not any(p["slug"] == "kiro-acp" for p in rows)
+
+
+def test_kiro_acp_stays_in_picker_when_it_is_the_current_provider(monkeypatch):
+    """A live kiro-acp session must remain selectable even if PATH lookup fails."""
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_external_process_provider_status",
+        lambda provider: _kiro_status(configured=False),
+    )
+
+    rows = list_authenticated_providers(
+        current_provider="kiro-acp",
+        current_model="claude-opus-5",
+        max_models=50,
+    )
+    kiro = next((p for p in rows if p["slug"] == "kiro-acp"), None)
+    assert kiro is not None, "current kiro-acp session must stay in the picker"
+    assert kiro["is_current"] is True
+    assert "claude-opus-5" in kiro["models"]

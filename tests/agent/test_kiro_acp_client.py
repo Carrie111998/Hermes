@@ -9,6 +9,7 @@ import queue
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,7 +24,6 @@ from agent.acp_stdio_transport import (
     permission_denied,
 )
 from agent.kiro_acp_client import (
-    KIRO_ACP_TOOL_ALLOWLIST,
     KiroACPClient,
     build_acp_client,
     format_messages_as_prompt,
@@ -50,21 +50,55 @@ def test_factory_keys_on_acp_scheme_not_copilot_only():
         raise AssertionError("unknown acp:// host must refuse, not build CopilotACPClient")
 
 
-def test_prompt_forwards_only_agent_level_tools():
+def test_prompt_is_a_transcript_not_an_xml_tool_bridge():
+    """Codex-parity: no XML contract, no Hermes schema dump in the prompt."""
     tools = [
         {"type": "function", "function": {"name": "memory", "description": "d", "parameters": {}}},
-        {"type": "function", "function": {"name": "read_file", "description": "d", "parameters": {}}},
-        {"type": "function", "function": {"name": "todo", "description": "d", "parameters": {}}},
+        {"type": "function", "function": {"name": "terminal", "description": "d", "parameters": {}}},
     ]
     prompt = format_messages_as_prompt(
         [{"role": "user", "content": "hi"}],
         model="claude-opus-5",
         tools=tools,
-        allowlist=KIRO_ACP_TOOL_ALLOWLIST,
     )
-    assert '"name": "memory"' in prompt
-    assert '"name": "todo"' in prompt
-    assert '"name": "read_file"' not in prompt
+    assert "<tool_call>" not in prompt
+    assert "inference backend" not in prompt.lower()
+    assert '"name": "memory"' not in prompt
+    assert "User:\nhi" in prompt
+
+
+def test_prompt_keeps_prior_hermes_tool_calls_and_named_results():
+    """Empty-content assistant(tool_calls) must not vanish from the next Kiro prompt."""
+    prompt = format_messages_as_prompt(
+        [
+            {"role": "user", "content": "status of ubnt1"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": '{"command": "hostname"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "terminal",
+                "content": "box",
+            },
+        ],
+        model="claude-opus-5",
+    )
+    assert "<tool_call>" not in prompt
+    assert "Hermes tools requested: terminal" in prompt
+    assert "terminal (call_1) result:" in prompt
+    assert "box" in prompt
 
 
 def test_permission_allowed_picks_allow_once():
@@ -92,7 +126,7 @@ def test_missing_binary_raises_clear_error(tmp_path):
         )
 
 
-def test_write_approval_required_is_still_enforced(tmp_path):
+def test_kiro_fs_bridge_is_disabled(tmp_path):
     target = tmp_path / "gated.txt"
     transport = AcpStdioTransport(
         command="true",
@@ -101,26 +135,21 @@ def test_write_approval_required_is_still_enforced(tmp_path):
         permission_handler=permission_allowed,
     )
     process = SimpleNamespace(stdin=io.StringIO())
-    with patch(
-        "agent.acp_stdio_transport.is_write_approval_required",
-        return_value=True,
-    ):
-        handled = transport.handle_server_message(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "fs/write_text_file",
-                "params": {"path": str(target), "content": "nope"},
-            },
-            process=process,
-            cwd=str(tmp_path),
-            text_parts=[],
-            reasoning_parts=[],
-        )
+    handled = transport.handle_server_message(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "fs/write_text_file",
+            "params": {"path": str(target), "content": "nope"},
+        },
+        process=process,
+        cwd=str(tmp_path),
+        text_parts=[],
+        reasoning_parts=[],
+    )
     assert handled
     payload = json.loads(process.stdin.getvalue())
     assert "error" in payload
-    assert "interactive approval" in payload["error"]["message"]
     assert not target.exists()
 
 
@@ -196,21 +225,68 @@ class _FakeACPProcess:
                 }
             )
         elif method == "session/prompt":
-            self.stdout.push(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "session/update",
-                    "params": {
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {"text": self.reply},
-                        }
-                    },
-                }
-            )
-            self.stdout.push(
-                {"jsonrpc": "2.0", "id": message_id, "result": {"stopReason": "end_turn"}}
-            )
+            def _emit_prompt_tail() -> None:
+                if getattr(self, "tool_updates", None):
+                    for update in self.tool_updates:
+                        self.stdout.push(
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "session/update",
+                                "params": {"update": update},
+                            }
+                        )
+                if getattr(self, "permission_requests", None):
+                    for req in self.permission_requests:
+                        self.stdout.push(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": 9000 + self._sessions,
+                                "method": "session/request_permission",
+                                "params": req,
+                            }
+                        )
+                if getattr(self, "usage", None):
+                    usage_result = {"stopReason": "end_turn", "usage": self.usage}
+                else:
+                    usage_result = {"stopReason": "end_turn"}
+                self.stdout.push(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {"text": self.reply},
+                            }
+                        },
+                    }
+                )
+                self.stdout.push(
+                    {"jsonrpc": "2.0", "id": message_id, "result": usage_result}
+                )
+
+            prefix = getattr(self, "reply_prefix", "")
+            if prefix:
+                self.stdout.push(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {"text": prefix},
+                            }
+                        },
+                    }
+                )
+            gap = float(getattr(self, "mid_prompt_gap_s", 0) or 0)
+            if gap > 0:
+                threading.Thread(
+                    target=lambda: (time.sleep(gap), _emit_prompt_tail()),
+                    daemon=True,
+                ).start()
+            else:
+                _emit_prompt_tail()
         elif method == "session/request_permission":
             pass
 
@@ -286,15 +362,11 @@ def test_two_completions_reuse_one_process_and_open_two_sessions(tmp_path):
     assert "OPENAI_API_KEY" not in env or not env.get("OPENAI_API_KEY")
 
 
-def test_permission_handler_allows_on_kiro_transport(tmp_path):
-    transport = AcpStdioTransport(
-        command="true",
-        args=[],
-        cwd=str(tmp_path),
-        permission_handler=permission_allowed,
-    )
+def test_kiro_client_denies_native_permissions_like_copilot(tmp_path):
+    """Hermes executes tools; Kiro must not run its own execute/read/write."""
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
     process = SimpleNamespace(stdin=io.StringIO())
-    handled = transport.handle_server_message(
+    handled = client._transport.handle_server_message(
         {
             "jsonrpc": "2.0",
             "id": 3,
@@ -308,7 +380,7 @@ def test_permission_handler_allows_on_kiro_transport(tmp_path):
     )
     assert handled
     payload = json.loads(process.stdin.getvalue())
-    assert payload["result"]["outcome"]["optionId"] == "allow_once"
+    assert payload["result"]["outcome"]["outcome"] == "cancelled"
 
 
 def test_subprocess_does_not_inherit_hermes_api_keys(tmp_path, monkeypatch):
@@ -450,6 +522,473 @@ def test_close_kills_real_grandchild_process_group(tmp_path):
     with pytest.raises(OSError):
         os.kill(grandchild_pid, 0)
     assert launcher.poll() is not None
+
+
+
+def test_resolve_kiro_args_never_adds_trust_all_tools():
+    args = __import__("agent.kiro_acp_client", fromlist=["resolve_kiro_args"]).resolve_kiro_args(
+        model="claude-opus-5"
+    )
+    assert "--trust-all-tools" not in args
+    assert args[:1] == ["acp"]
+
+
+def _tool_calls_from_stream(chunks):
+    for chunk in chunks:
+        if getattr(chunk, "choices", None) and chunk.choices[0].delta.tool_calls:
+            return list(chunk.choices[0].delta.tool_calls)
+    return []
+
+
+def test_stream_execute_stub_then_command_is_one_ready_terminal(tmp_path):
+    """First ACP execute has no command; later update with same id must dispatch once."""
+    process = _FakeACPProcess(pid=440, reply="listing")
+    process.tool_updates = [
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-ls",
+            "kind": "execute",
+            "status": "in_progress",
+            "title": "ls",
+            "rawInput": {"command": None},
+        },
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-ls",
+            "kind": "execute",
+            "status": "in_progress",
+            "rawInput": {"command": "ls -la"},
+        },
+    ]
+    spawner = _FakeACPSpawner(process)
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
+    with patch("agent.acp_stdio_transport.subprocess.Popen", spawner):
+        chunks = list(
+            client.chat.completions.create(
+                model="claude-opus-5",
+                messages=[{"role": "user", "content": "hi"}],
+                stream=True,
+                timeout=5,
+            )
+        )
+    calls = _tool_calls_from_stream(chunks)
+    assert len(calls) == 1
+    assert calls[0].function.name == "terminal"
+    assert json.loads(calls[0].function.arguments)["command"] == "ls -la"
+    assert "session/cancel" in process.methods()
+
+
+def test_stream_stub_and_real_ids_dispatch_only_real_terminal(tmp_path):
+    """Kiro often emits a command-less execute plus a later real toolCallId."""
+    process = _FakeACPProcess(pid=441, reply="listing")
+    process.tool_updates = [
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-stub",
+            "kind": "execute",
+            "status": "in_progress",
+            "title": "preparing terminal",
+            "rawInput": {},
+        },
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-real",
+            "kind": "execute",
+            "status": "in_progress",
+            "rawInput": {"command": "pwd"},
+        },
+    ]
+    spawner = _FakeACPSpawner(process)
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
+    with patch("agent.acp_stdio_transport.subprocess.Popen", spawner):
+        completion = client.chat.completions.create(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "hi"}],
+            timeout=5,
+        )
+    calls = completion.choices[0].message.tool_calls
+    assert len(calls) == 1
+    assert calls[0].id == "tc-real"
+    assert json.loads(calls[0].function.arguments)["command"] == "pwd"
+
+
+def test_prompt_after_empty_terminal_keeps_assistant_and_tool_result():
+    """Next Kiro prompt must still carry the failed terminal, not look like a new user turn."""
+    prompt = format_messages_as_prompt(
+        [
+            {"role": "user", "content": "check mlir-gym"},
+            {
+                "role": "assistant",
+                "content": "I'll check the worktrees.",
+                "tool_calls": [
+                    {
+                        "id": "call_empty",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_empty",
+                "name": "terminal",
+                "content": "Invalid command: expected string, got NoneType",
+            },
+        ],
+        model="claude-opus-5",
+    )
+    assert "User:\ncheck mlir-gym" in prompt
+    assert "I'll check the worktrees." in prompt
+    assert "Hermes tools requested: terminal" in prompt
+    assert "terminal (call_empty) result:" in prompt
+    assert "expected string, got NoneType" in prompt
+    assert "<tool_call>" not in prompt
+
+
+def test_intercept_refuses_unready_terminal_and_drops_stub_id(tmp_path):
+    from agent.acp_tool_bridge import build_hermes_tool_call
+
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
+    bucket: list = []
+    stub = {
+        "id": "tc-stub",
+        "name": "terminal",
+        "args": {"command": None},
+        "status": "in_progress",
+    }
+    assert client._intercept_tool(stub, bucket) is None
+    assert bucket == []
+
+    same = {
+        "id": "tc-ls",
+        "name": "terminal",
+        "args": {},
+        "status": "in_progress",
+    }
+    assert client._intercept_tool(same, bucket) is None
+    ready = {
+        "id": "tc-ls",
+        "name": "terminal",
+        "args": {"command": "ls -la"},
+        "status": "in_progress",
+    }
+    assert client._intercept_tool(ready, bucket) is not None
+    assert len(bucket) == 1
+    assert json.loads(bucket[0].function.arguments)["command"] == "ls -la"
+
+    bucket[:] = [
+        build_hermes_tool_call(call_id="tc-leftover", name="terminal", arguments="{}")
+    ]
+    other = {
+        "id": "tc-real",
+        "name": "terminal",
+        "args": {"command": "pwd"},
+        "status": "in_progress",
+    }
+    assert client._intercept_tool(other, bucket) is not None
+    assert [item.id for item in bucket] == ["tc-real"]
+
+
+def test_stream_search_kind_with_shell_command_is_hermes_terminal(tmp_path):
+    """kind=search + rawInput.command=pipeline must dispatch terminal, not search_files."""
+    process = _FakeACPProcess(pid=442, reply="listing")
+    process.tool_updates = [
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-ps",
+            "kind": "search",
+            "status": "in_progress",
+            "title": "grep",
+            "rawInput": {"command": "ps aux | grep foo"},
+        }
+    ]
+    spawner = _FakeACPSpawner(process)
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
+    with patch("agent.acp_stdio_transport.subprocess.Popen", spawner):
+        chunks = list(
+            client.chat.completions.create(
+                model="claude-opus-5",
+                messages=[{"role": "user", "content": "hi"}],
+                stream=True,
+                timeout=5,
+            )
+        )
+    calls = _tool_calls_from_stream(chunks)
+    assert len(calls) == 1
+    assert calls[0].function.name == "terminal"
+    assert json.loads(calls[0].function.arguments)["command"] == "ps aux | grep foo"
+    assert "session/cancel" in process.methods()
+
+
+def test_stream_native_execute_becomes_hermes_terminal_tool_call(tmp_path):
+    """Codex-parity: Kiro execute intent is a Hermes `terminal` tool_call."""
+    process = _FakeACPProcess(pid=401, reply="I will list files")
+    process.tool_updates = [
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-ls",
+            "kind": "execute",
+            "status": "in_progress",
+            "title": "ls",
+            "rawInput": {"command": "ls"},
+        },
+        {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "tc-ls",
+            "status": "cancelled",
+            "rawOutput": "denied",
+        },
+    ]
+    process.usage = {"inputTokens": 111, "outputTokens": 9}
+    spawner = _FakeACPSpawner(process)
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
+    with patch("agent.acp_stdio_transport.subprocess.Popen", spawner):
+        stream = client.chat.completions.create(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            timeout=5,
+        )
+        chunks = list(stream)
+    tool_chunks = [
+        c for c in chunks
+        if c.choices and c.choices[0].delta.tool_calls
+    ]
+    assert tool_chunks, "Kiro execute must become a Hermes-executable tool_call"
+    names = [tc.function.name for tc in tool_chunks[0].choices[0].delta.tool_calls]
+    assert names == ["terminal"]
+    args = json.loads(tool_chunks[0].choices[0].delta.tool_calls[0].function.arguments)
+    assert args["command"] == "ls"
+    assert tool_chunks[0].choices[0].finish_reason == "tool_calls"
+    usage_chunks = [c for c in chunks if not c.choices]
+    assert usage_chunks
+    assert usage_chunks[-1].usage.prompt_tokens == 111
+    assert usage_chunks[-1].usage.completion_tokens == 9
+    assert "session/cancel" in process.methods()
+
+
+def test_stream_without_vendor_usage_does_not_stamp_zeros(tmp_path):
+    process = _FakeACPProcess(pid=402, reply="done")
+    process.tool_updates = [
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-ls",
+            "kind": "execute",
+            "status": "in_progress",
+            "title": "ls",
+            "rawInput": {"command": "ls"},
+        },
+    ]
+    spawner = _FakeACPSpawner(process)
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
+    with patch("agent.acp_stdio_transport.subprocess.Popen", spawner):
+        chunks = list(
+            client.chat.completions.create(
+                model="claude-opus-5",
+                messages=[{"role": "user", "content": "hi"}],
+                stream=True,
+                timeout=5,
+            )
+        )
+    usage_chunks = [c for c in chunks if getattr(c, "usage", None) is not None]
+    assert usage_chunks == []
+
+
+def _stream_would_mark_truncated(chunks) -> bool:
+    """Mirror chat_completion_helpers text-only drop: no finish_reason + text."""
+    finish_reason = None
+    has_content = False
+    has_tools = False
+    for chunk in chunks:
+        if not getattr(chunk, "choices", None):
+            continue
+        delta = chunk.choices[0].delta
+        if getattr(delta, "content", None):
+            has_content = True
+        if getattr(delta, "tool_calls", None):
+            has_tools = True
+        reason = getattr(chunk.choices[0], "finish_reason", None)
+        if reason:
+            finish_reason = reason
+    return finish_reason is None and has_content and not has_tools
+
+
+def test_xml_in_assistant_text_is_not_executed_as_a_tool(tmp_path):
+    xml = (
+        '<tool_call>{"id": "call_1", "type": "function", '
+        '"function": {"name": "terminal", "arguments": "{\\"command\\": \\"pwd\\"}"}}'
+        "</tool_call>"
+    )
+    process = _FakeACPProcess(pid=500, reply=xml)
+    spawner = _FakeACPSpawner(process)
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
+    with patch("agent.acp_stdio_transport.subprocess.Popen", spawner):
+        completion = client.chat.completions.create(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "hi"}],
+            timeout=5,
+        )
+    assert not completion.choices[0].message.tool_calls
+    assert completion.choices[0].finish_reason == "stop"
+
+
+def test_stream_does_not_paint_tool_progress_as_reasoning(tmp_path):
+    process = _FakeACPProcess(pid=412, reply="Checking.")
+    process.tool_updates = [
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-pwd",
+            "kind": "execute",
+            "status": "in_progress",
+            "rawInput": {"command": "pwd"},
+        }
+    ]
+    spawner = _FakeACPSpawner(process)
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
+    with patch("agent.acp_stdio_transport.subprocess.Popen", spawner):
+        stream = client.chat.completions.create(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            timeout=5,
+        )
+        chunks = list(stream)
+    reasoning = "".join(
+        str(c.choices[0].delta.reasoning or "")
+        for c in chunks
+        if getattr(c, "choices", None)
+    )
+    assert "💻" not in reasoning
+    assert "session/cancel" in process.methods()
+
+
+def test_stream_text_only_yields_finish_reason_stop(tmp_path):
+    """Live text must end with finish_reason=stop, not a silent iterator end."""
+    process = _FakeACPProcess(pid=410, reply="Hi. What would you like to work on?")
+    spawner = _FakeACPSpawner(process)
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
+    with patch("agent.acp_stdio_transport.subprocess.Popen", spawner):
+        stream = client.chat.completions.create(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            timeout=5,
+        )
+        chunks = list(stream)
+    finish_reasons = [
+        c.choices[0].finish_reason
+        for c in chunks
+        if getattr(c, "choices", None) and c.choices[0].finish_reason
+    ]
+    assert finish_reasons[-1] == "stop"
+    assert not _stream_would_mark_truncated(chunks)
+    text = "".join(
+        str(c.choices[0].delta.content or "")
+        for c in chunks
+        if getattr(c, "choices", None)
+    )
+    assert "What would you like" in text
+
+
+def test_stream_survives_quiet_gap_then_finishes_stop(tmp_path):
+    """A 20s quiet think after the first update is not EOF / truncated.
+
+    session/prompt stays in flight across the gap, then a final message
+    plus the RPC result must yield finish_reason=stop.
+    """
+    process = _FakeACPProcess(pid=411, reply="final message")
+    process.reply_prefix = "partial "
+    process.mid_prompt_gap_s = 20
+    spawner = _FakeACPSpawner(process)
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
+    with patch("agent.acp_stdio_transport.subprocess.Popen", spawner):
+        stream = client.chat.completions.create(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            timeout=60,
+        )
+        chunks = list(stream)
+    text = "".join(
+        str(c.choices[0].delta.content or "")
+        for c in chunks
+        if getattr(c, "choices", None)
+    )
+    assert "partial" in text
+    assert "final message" in text
+    finish_reasons = [
+        c.choices[0].finish_reason
+        for c in chunks
+        if getattr(c, "choices", None) and c.choices[0].finish_reason
+    ]
+    assert finish_reasons[-1] == "stop"
+    assert not _stream_would_mark_truncated(chunks)
+    keepalives = [
+        c for c in chunks
+        if not getattr(c, "choices", None) and getattr(c, "usage", None) is None
+    ]
+    assert keepalives, "quiet gap must emit keep-alives, not close the stream"
+
+
+def test_permission_toolcall_without_session_update_becomes_hermes_tool_call(tmp_path):
+    """Kiro often only names the tool on request_permission, not session/update."""
+    process = _FakeACPProcess(pid=403, reply="need a command")
+    process.permission_requests = [
+        {
+            "options": [{"optionId": "allow_once"}],
+            "toolCall": {
+                "toolCallId": "tc-perm",
+                "kind": "execute",
+                "title": "pwd",
+                "rawInput": {"command": "pwd"},
+            },
+        }
+    ]
+    spawner = _FakeACPSpawner(process)
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
+    with patch("agent.acp_stdio_transport.subprocess.Popen", spawner):
+        completion = client.chat.completions.create(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "hi"}],
+            timeout=5,
+        )
+    calls = completion.choices[0].message.tool_calls
+    assert calls
+    assert calls[0].function.name == "terminal"
+    assert json.loads(calls[0].function.arguments)["command"] == "pwd"
+
+
+def test_nonstream_native_read_becomes_hermes_read_file_tool_call(tmp_path):
+    process = _FakeACPProcess(pid=402, reply="reading")
+    process.tool_updates = [
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-rd",
+            "kind": "read",
+            "status": "in_progress",
+            "locations": [{"path": "/tmp/foo.py"}],
+        },
+    ]
+    spawner = _FakeACPSpawner(process)
+    client = KiroACPClient(command="kiro-cli", args=["acp"], acp_cwd=str(tmp_path))
+    with patch("agent.acp_stdio_transport.subprocess.Popen", spawner):
+        completion = client.chat.completions.create(
+            model="claude-opus-5",
+            messages=[{"role": "user", "content": "hi"}],
+            timeout=5,
+        )
+    calls = completion.choices[0].message.tool_calls
+    assert calls
+    assert calls[0].function.name == "read_file"
+    assert json.loads(calls[0].function.arguments)["path"] == "/tmp/foo.py"
+    assert completion.choices[0].finish_reason == "tool_calls"
+
+
+def test_permission_allowed_helper_still_picks_allow_once_when_asked():
+    from agent.acp_stdio_transport import permission_allowed, permission_denied
+
+    assert permission_allowed(1, [{"optionId": "allow_once"}])["result"]["outcome"]["optionId"] == "allow_once"
+    assert permission_denied(2)["result"]["outcome"]["outcome"] == "cancelled"
 
 
 _KIRO_AVAILABLE = shutil.which("kiro-cli") is not None

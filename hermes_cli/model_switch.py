@@ -58,6 +58,23 @@ _UNCAPPED_PICKER_PROVIDERS: frozenset[str] = frozenset({"opencode-zen", "opencod
 logger = logging.getLogger(__name__)
 
 
+def _has_external_process_creds(slug: str) -> bool:
+    """True when a local CLI (or acp+tcp:// URL) backs this provider.
+
+    ``copilot-acp`` / ``kiro-acp`` authenticate via the installed CLI, not
+    an API key or auth-store token. Without this gate Section 2 of
+    ``list_authenticated_providers`` drops them from ``/model``.
+    """
+    try:
+        from hermes_cli.auth import get_external_process_provider_status
+
+        status = get_external_process_provider_status(slug)
+        return bool(status.get("configured") or status.get("logged_in"))
+    except Exception as exc:
+        logger.debug("External-process credential check failed for %s: %s", slug, exc)
+        return False
+
+
 def _declared_model_ids(value: Any) -> list[str]:
     """Return configured model IDs from supported config shapes.
 
@@ -2507,6 +2524,8 @@ def _collect_authed_provider_slugs(
                 has_creds = has_vertex_credentials()
             except Exception:
                 pass
+        elif overlay.auth_type == "external_process":
+            has_creds = _has_external_process_creds(hermes_slug)
         elif overlay.extra_env_vars:
             has_creds = any(_scoped_key_env(ev) for ev in overlay.extra_env_vars)
         if not has_creds and overlay.auth_type == "api_key":
@@ -2561,6 +2580,8 @@ def _collect_authed_provider_slugs(
                 pass
         if not _cp_has_creds and _cp_config and getattr(_cp_config, "auth_type", "") == "aws_sdk":
             continue  # skip AWS SDK in prefetch
+        if not _cp_has_creds and _cp_config and getattr(_cp_config, "auth_type", "") == "external_process":
+            _cp_has_creds = _has_external_process_creds(_cp.slug)
         if _cp_has_creds:
             slugs.append(_cp.slug)
             seen.add(_cp.slug.lower())
@@ -2972,6 +2993,12 @@ def list_authenticated_providers(
                 has_creds = has_vertex_credentials()
             except Exception as exc:
                 logger.debug("Vertex credential check failed: %s", exc)
+        elif overlay.auth_type == "external_process":
+            # copilot-acp / kiro-acp: auth is the local CLI on PATH
+            # (or an acp+tcp:// override). Same gate as vertex/aws_sdk —
+            # without it the /model picker silently hides first-class ACP
+            # providers even when the CLI is installed.
+            has_creds = _has_external_process_creds(hermes_slug)
         elif overlay.extra_env_vars:
             has_creds = any(os.environ.get(ev) for ev in overlay.extra_env_vars)
         # Also check api_key_env_vars from PROVIDER_REGISTRY for api_key auth_type
@@ -3039,6 +3066,14 @@ def list_authenticated_providers(
                     has_creds = True
             except Exception as exc:
                 logger.debug("Anthropic external creds check failed: %s", exc)
+        if (
+            not has_creds
+            and overlay.auth_type == "external_process"
+            and hermes_slug == _current_provider_norm
+        ):
+            # Live session is already on this ACP provider — keep the row
+            # even if PATH lookup failed this pass.
+            has_creds = True
         if not has_creds:
             continue
 
@@ -3051,6 +3086,11 @@ def list_authenticated_providers(
             # curated list when the live endpoint is unreachable, so this
             # is safe for unauthenticated and offline cases too.
             model_ids = cached_provider_model_ids(hermes_slug)
+        elif hermes_slug == "kiro-acp":
+            # acp://kiro has no HTTP /models. Use the curated Kiro CLI list.
+            model_ids = list(curated.get("kiro-acp") or [])
+            if not model_ids:
+                model_ids = cached_provider_model_ids(hermes_slug)
         # For aws_sdk providers (bedrock), use live discovery so the list
         # reflects the active region (eu.*, ap.*) not the static us.* list.
         elif overlay.auth_type == "aws_sdk":
@@ -3166,13 +3206,21 @@ def list_authenticated_providers(
         # ~/.aws/credentials, instance roles, etc.)
         if not _cp_has_creds and _cp_config and getattr(_cp_config, "auth_type", "") == "aws_sdk":
             _cp_has_creds = _has_aws_sdk_creds_for_listing(_cp.slug)
+        if not _cp_has_creds and _cp_config and getattr(_cp_config, "auth_type", "") == "external_process":
+            _cp_has_creds = _has_external_process_creds(_cp.slug)
+            if not _cp_has_creds and _cp.slug.lower() == _current_provider_norm:
+                _cp_has_creds = True
 
         if not _cp_has_creds:
             continue
 
         # For bedrock, use live discovery so the list reflects the active
         # region (eu.*, us.*, ap.*) instead of the hardcoded us.* static list.
-        if _cp_config and getattr(_cp_config, "auth_type", "") == "aws_sdk":
+        if _cp.slug == "kiro-acp":
+            _cp_model_ids = list(curated.get("kiro-acp") or [])
+            if not _cp_model_ids:
+                _cp_model_ids = cached_provider_model_ids(_cp.slug)
+        elif _cp_config and getattr(_cp_config, "auth_type", "") == "aws_sdk":
             try:
                 _ids = cached_provider_model_ids(_cp.slug)
                 _cp_model_ids = _ids if _ids else curated.get(_cp.slug, [])

@@ -231,7 +231,7 @@ hermes chat --provider copilot-acp --model copilot-acp
 # Requires the GitHub Copilot CLI in PATH and an existing `copilot login` session
 ```
 
-**`kiro-acp` — Kiro ACP agent backend**. Spawns the local Kiro CLI as a subprocess. Opt-in only — Hermes' shipped default stays `openai-codex`. Kiro still owns its own read/edit/exec tools; Hermes only forwards agent-level tools and answers Kiro permission prompts with `allow_once`.
+**`kiro-acp` — Kiro as a Hermes inference backend**. Spawns the local Kiro CLI as a subprocess. Opt-in only — Hermes' shipped default stays `openai-codex`. Same agent loop as Codex: Hermes owns terminal / read / write / memory / QMD; Kiro native tool permissions are denied and those intents become Hermes `tool_calls`.
 
 ```bash
 hermes chat --provider kiro-acp --model claude-opus-5

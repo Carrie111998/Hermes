@@ -168,6 +168,8 @@ def get_tool_emoji(tool_name: str, default: str = "⚡") -> str:
     except Exception:
         pass
     # 3. Hardcoded fallback
+    if isinstance(tool_name, str) and "qmd" in tool_name.lower():
+        return "🧠"
     return default
 
 
@@ -542,6 +544,14 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         query = _oneline(args.get("query", ""))
         return f"recall: \"{query[:25]}{'...' if len(query) > 25 else ''}\""
 
+    if isinstance(tool_name, str) and "qmd" in tool_name.lower():
+        searches = args.get("searches")
+        query = ""
+        if isinstance(searches, list) and searches and isinstance(searches[0], dict):
+            query = _oneline(str(searches[0].get("query") or ""))
+        query = query or _oneline(str(args.get("query") or ""))
+        return f"vault: \"{query[:25]}{'...' if len(query) > 25 else ''}\"" if query else "vault search"
+
     if tool_name == "memory":
         action = args.get("action", "")
         target = args.get("target", "")
@@ -653,6 +663,7 @@ _TOOL_VERBS: dict[str, str] = {
     "text_to_speech": "Generating speech",
     "vision_analyze": "Looking at the image",
     "session_search": "Searching past sessions",
+    "mcp__qmd__query": "Searching memories",
     "skill_view": "Reading skill",
     "skills_list": "Listing skills",
     "skill_manage": "Updating skill",
@@ -1502,6 +1513,13 @@ def _get_cute_tool_message(
             return _wrap(f"┊ 📋 plan      {len(todos_arg)} task(s)  {dur}")
     if tool_name == "session_search":
         return _wrap(f"┊ 🔍 recall    \"{_trunc(args.get('query', ''), 35)}\"  {dur}")
+    if isinstance(tool_name, str) and "qmd" in tool_name.lower():
+        searches = args.get("searches")
+        query = ""
+        if isinstance(searches, list) and searches and isinstance(searches[0], dict):
+            query = str(searches[0].get("query") or "")
+        query = query or str(args.get("query") or "")
+        return _wrap(f"┊ 🧠 qmd       \"{_trunc(query, 35)}\"  {dur}")
     if tool_name == "memory":
         action = args.get("action", "?")
         target = args.get("target", "")

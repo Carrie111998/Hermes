@@ -390,7 +390,7 @@ def _parent_can_emit_tool_calls(agent: Any) -> bool:
     shim, and a shim that cannot carry Hermes tool calls back turns the fork into
     a guaranteed no-op — one that still pays for a full agent spawn (a whole CLI
     process, sometimes a JVM) on every review cadence. The in-tree ACP client CAN
-    carry them (it uses the text bridge in ``agent/acp_openai_bridge.py``); this
+    carry them (it uses the text bridge in ``agent/acp_tool_bridge.py``); this
     exists so a shim that can't declares ``SUPPORTS_HERMES_TOOL_CALLS = False``
     and is skipped instead of burning a spawn. Anything that doesn't say
     otherwise is assumed capable, so ordinary providers are unaffected.

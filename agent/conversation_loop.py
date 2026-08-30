@@ -49,6 +49,7 @@ from agent.turn_context import (
 )
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
+from agent.acp_stdio_transport import acp_uses_oneshot_completion
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
     _repair_tool_call_arguments,
@@ -3175,15 +3176,12 @@ def run_conversation(
                 # session instead of re-failing every retry.
                 if getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
-                # An ACP client communicates via subprocess stdio and returns a
-                # plain SimpleNamespace — not an iterable stream.  Keyed on the
-                # `acp://` scheme rather than one vendor, so any ACP client is
-                # excluded.  Mirror the ACP exclusion used for Responses API
-                # upgrade (lines ~1083-1085).
-                elif (
-                    agent.provider in {"copilot-acp", "kiro-acp"}
-                    or str(agent.base_url or "").lower().startswith("acp://")
-                    or str(agent.base_url or "").lower().startswith("acp+tcp://")
+                # Copilot ACP (and unknown ACP hosts) still return a one-shot
+                # SimpleNamespace. Kiro ACP yields live session/update chunks
+                # when stream=True — do not exclude it here or tool cards never
+                # paint because run_prompt is called without on_update.
+                elif acp_uses_oneshot_completion(
+                    provider=agent.provider, base_url=agent.base_url
                 ):
                     _use_streaming = False
                 # MoA streams only when a display/TTS consumer is present to
@@ -4285,6 +4283,21 @@ def run_conversation(
                     # charged to that old compaction, and so preflight deferral
                     # does not remain latched indefinitely.
                     agent.context_compressor.update_from_response({})
+
+                # Usage-less providers (ACP vendors that cancel before
+                # PromptResponse.usage, local models, …) leave last_prompt_tokens
+                # at 0. The status bar and compression already share the rough
+                # request estimate recorded before the call — surface that so
+                # the meter moves the same way as Codex without inventing a
+                # vendor-specific token count.
+                _compressor = agent.context_compressor
+                if (
+                    int(getattr(_compressor, "last_prompt_tokens", 0) or 0) <= 0
+                    and int(getattr(_compressor, "_pending_request_rough_tokens", 0) or 0) > 0
+                ):
+                    _compressor.last_prompt_tokens = int(
+                        _compressor._pending_request_rough_tokens
+                    )
 
                 if hasattr(response, 'usage') and response.usage:
                     # Cache discovered context length after successful call.

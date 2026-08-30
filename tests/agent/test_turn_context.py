@@ -452,3 +452,20 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+
+def test_kiro_acp_turn_does_not_side_channel_qmd():
+    """Kiro is a model. QMD/memory cards only happen if the model tool_calls them."""
+    agent, mm = _agent_with_memory_manager()
+    agent.provider = "kiro-acp"
+    agent.base_url = "acp://kiro"
+    mm.prefetch_all.return_value = ""
+    events = []
+    agent.tool_progress_callback = lambda *a, **k: events.append((a, k))
+
+    ctx = _build(agent, user_message="what is happening with int1 mlir-gym")
+
+    assert ctx.ext_prefetch_cache == ""
+    assert events == []
+    assert not any("qmd" in str(item).lower() for item in events)

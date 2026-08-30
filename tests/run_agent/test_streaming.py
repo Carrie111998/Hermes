@@ -1447,13 +1447,12 @@ class TestCopilotACPStreamingDecision:
             patch.object(agent, "_interruptible_streaming_api_call") as mock_stream,
         ):
             # Verify the decision logic correctly disables streaming
+            from agent.acp_stdio_transport import acp_uses_oneshot_completion
             _use_streaming = True
             if getattr(agent, "_disable_streaming", False):
                 _use_streaming = False
-            elif (
-                agent.provider == "copilot-acp"
-                or str(agent.base_url or "").lower().startswith("acp://copilot")
-                or str(agent.base_url or "").lower().startswith("acp+tcp://")
+            elif acp_uses_oneshot_completion(
+                provider=agent.provider, base_url=agent.base_url
             ):
                 _use_streaming = False
 
@@ -1473,14 +1472,11 @@ class TestCopilotACPStreamingDecision:
         agent = _make_acp_agent(provider="custom", base_url="acp://copilot")
         agent.provider = "custom"
 
-        _use_streaming = True
-        if (
-            agent.provider == "copilot-acp"
-            or str(agent.base_url or "").lower().startswith("acp://copilot")
-            or str(agent.base_url or "").lower().startswith("acp+tcp://")
-        ):
-            _use_streaming = False
-
+        from agent.acp_stdio_transport import acp_uses_oneshot_completion
+        _use_streaming = not acp_uses_oneshot_completion(
+            provider=agent.provider, base_url=agent.base_url
+        )
+        # oneshot => streaming disabled
         assert _use_streaming is False
 
 
@@ -1499,17 +1495,25 @@ class TestCopilotACPStreamingDecision:
         )
         agent.api_mode = "chat_completions"
 
+        from agent.acp_stdio_transport import acp_uses_oneshot_completion
         _use_streaming = True
         if getattr(agent, "_disable_streaming", False):
             _use_streaming = False
-        elif (
-            agent.provider == "copilot-acp"
-            or str(agent.base_url or "").lower().startswith("acp://copilot")
-            or str(agent.base_url or "").lower().startswith("acp+tcp://")
+        elif acp_uses_oneshot_completion(
+            provider=agent.provider, base_url=agent.base_url
         ):
             _use_streaming = False
 
         assert _use_streaming is True
+
+
+    def test_kiro_acp_allows_streaming(self):
+        """kiro-acp / acp://kiro must stream so session/update paints cards."""
+        from agent.acp_stdio_transport import acp_uses_oneshot_completion
+
+        assert acp_uses_oneshot_completion(provider="kiro-acp", base_url="acp://kiro") is False
+        assert acp_uses_oneshot_completion(provider="openai-codex", base_url="acp://kiro") is False
+        assert acp_uses_oneshot_completion(provider="copilot-acp", base_url="acp://copilot") is True
 
 
 class TestBedrockIamStreamingFallback:
