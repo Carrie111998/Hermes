@@ -1156,11 +1156,12 @@ def session_search(
     window: int = 5,
     # Discovery shape
     sort: str = None,
-    semantic: bool = False,
     # Cross-profile (any shape)
     profile: str = None,
     # Discovery result shaping (appended to preserve positional compatibility)
     detail: str = "adaptive",
+    # Semantic rerank (keyword-only, appended last to preserve positional compat)
+    semantic: bool = False,
 ) -> str:
     """Run session search and close databases opened by this invocation."""
     owned_dbs: List[Any] = []

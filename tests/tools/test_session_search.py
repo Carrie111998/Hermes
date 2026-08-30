@@ -99,7 +99,7 @@ class TestSchema:
             "sort",
             "profile",
         ]
-        assert parameters == [*historical_prefix, "detail"]
+        assert parameters == [*historical_prefix, "detail", "semantic"]
 
 
 class TestFormatTimestamp:
