@@ -19,6 +19,7 @@ from hermes_cli.tools_config import (
     _reconfigure_provider,
     _get_platform_tools,
     _platform_toolset_summary,
+    _get_effective_configurable_toolsets,
     _reconfigure_tool,
     _run_post_setup,
     _save_platform_tools,
@@ -1219,3 +1220,28 @@ def test_explicit_plugin_toolset_admitted_against_real_a2a_plugin(monkeypatch):
         f"plugin-provided 'a2a' toolset dropped by _get_platform_tools "
         f"(Layer 2 of #81163); enabled={sorted(enabled)}"
     )
+
+
+def test_toolset_summary_matches_configurable_universe():
+    """`hermes tools --summary` must not count MCP server names or
+    non-configurable recovered toolsets (e.g. ``kanban``), or it would print
+    ``count > total`` (e.g. ``28/25``) against the configurable-toolset
+    denominator and render ``✓ <mcp-server>`` / ``✓ kanban`` rows.
+    Regression for #97015.
+    """
+    config = {
+        "platform_toolsets": {"cli": ["hermes-cli"]},
+        "mcp_servers": {"mcp-chrome": {"command": "npx", "args": ["x"]}},
+    }
+
+    summary = _platform_toolset_summary(config, platforms=["cli"])
+    enabled = summary["cli"]
+
+    # MCP server names and non-configurable recovered toolsets must not
+    # inflate the summary's count.
+    assert "mcp-chrome" not in enabled
+    assert "kanban" not in enabled
+
+    # Every counted key is one the configurable-toolset universe can label.
+    universe = {k for k, _, _ in _get_effective_configurable_toolsets()}
+    assert all(k in universe for k in enabled)
