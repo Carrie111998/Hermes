@@ -45,7 +45,13 @@ export type ScanOutcome =
 // Constants
 // ---------------------------------------------------------------------------
 
-const SCAN_TIMEOUT_MS = 15000
+// The venv-blocker scan invokes `python -m hermes_cli._scan_venv_blockers`
+// which enumerates all running processes via psutil.  On Windows hosts with
+// many running processes (400+) the scan takes 20-25 s.  The old 15 s hard
+// cap caused every update attempt to fail with a silent probe-failure on
+// such machines, with no actionable error surfaced in the UI (#98377).
+// Raised to 60 s — still bounded, but accommodates the realistic worst case.
+const SCAN_TIMEOUT_MS = 60000
 const SCAN_MODULE = 'hermes_cli._scan_venv_blockers'
 
 // ---------------------------------------------------------------------------
