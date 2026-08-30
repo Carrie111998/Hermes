@@ -2132,13 +2132,6 @@ SKILL_MANAGE_SCHEMA = {
                         "file_content": {
                             "type": "string",
                             "description": "Content for write_file."
-                        },
-                        "absorbed_into": {
-                            "type": "string",
-                            "description": (
-                                "delete: existing umbrella skill that absorbed "
-                                "this skill; required for curator consolidation."
-                            )
                         }
                     },
                     "required": ["name", "action"]
@@ -2147,8 +2140,10 @@ SKILL_MANAGE_SCHEMA = {
             # NOTE: the handler also accepts the legacy flat single-op shape
             # (top-level action/name/content/old_string/new_string/
             # replace_all/category/file_path/file_content) — old transcripts
-            # and staged-write replay depend on it). The curator-only
-            # `absorbed_into` field is advertised on operations[] above.
+            # and staged-write replay depend on it — plus `absorbed_into` on
+            # delete ops (curator-only vocabulary; the curator's prompt
+            # documents it and the delete guard's error re-teaches it).
+            # None are advertised.
         },
         "required": ["operations"],
     },
