@@ -54,6 +54,30 @@ from typing import List, Optional
 _conversation_id: ContextVar[Optional[str]] = ContextVar(
     "nous_portal_conversation_id", default=None
 )
+_affinity_scope: ContextVar[Optional[str]] = ContextVar(
+    "hermes_affinity_scope", default=None
+)
+
+
+def set_affinity_scope(scope: Optional[str]):
+    """Publish the declared routing/affinity scope for this turn.
+
+    Returns the ContextVar token; pair with :func:`reset_affinity_scope`.
+    """
+    return _affinity_scope.set(scope or None)
+
+
+def reset_affinity_scope(token) -> None:
+    """Restore the previous affinity scope (pair with ``set_affinity_scope``)."""
+    try:
+        _affinity_scope.reset(token)
+    except Exception:
+        _affinity_scope.set(None)
+
+
+def get_affinity_scope() -> Optional[str]:
+    """Return the declared routing/affinity scope, or ``None`` when unset."""
+    return _affinity_scope.get()
 
 
 def set_conversation_context(conversation_id: Optional[str]):

@@ -507,6 +507,7 @@ class AIAgent:
         chat_type: str = None,
         thread_id: str = None,
         gateway_session_key: str = None,
+        gateway_conversation_epoch: int = 1,
         skip_context_files: bool = False,
         load_soul_identity: bool = False,
         skip_memory: bool = False,
@@ -598,6 +599,7 @@ class AIAgent:
             chat_type=chat_type,
             thread_id=thread_id,
             gateway_session_key=gateway_session_key,
+            gateway_conversation_epoch=gateway_conversation_epoch,
             skip_context_files=skip_context_files,
             load_soul_identity=load_soul_identity,
             skip_memory=skip_memory,
@@ -8624,9 +8626,12 @@ class AIAgent:
         from agent import relay_runtime
         from agent.conversation_loop import run_conversation
         from agent.portal_tags import (
+            reset_affinity_scope,
             reset_conversation_context,
+            set_affinity_scope,
             set_conversation_context,
         )
+        from agent.prompt_cache_scope import declared_conversation_scope_safe
         from hermes_cli.observability.relay_shared_metrics import (
             finish_task_run,
             start_task_run,
@@ -8648,6 +8653,9 @@ class AIAgent:
             if task_context["platform"] == "subagent"
             else ""
         )
+        token = None
+        acct_token = None
+        affinity_token = None
         relay_lease = None
         relay_turn = None
         durable_turn_lease = None
@@ -8948,6 +8956,8 @@ class AIAgent:
             # (which copy this Context into their thread) — inherits the
             # ``conversation=<root>`` tag with zero per-call-site plumbing.
             token = set_conversation_context(self._conversation_root_id())
+            declared_scope = declared_conversation_scope_safe(self)
+            affinity_token = set_affinity_scope(declared_scope)
             # Publish the session accounting handles the same way so auxiliary
             # calls record their token usage into session_model_usage (task
             # dimension) — the fix for aux spend being invisible in analytics
@@ -9071,6 +9081,8 @@ class AIAgent:
                         self._relay_pending_turn_id = None
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
+                    if affinity_token is not None:
+                        reset_affinity_scope(affinity_token)
                     if token is not None:
                         reset_conversation_context(token)
 
