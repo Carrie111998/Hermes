@@ -967,3 +967,96 @@ def test_batch_non_json_serializable_result_finalizes_and_delivers():
     assert ad.active_count() == 0
 
 
+def test_sanitize_for_persistence_cycle_safe_and_typed():
+    """Verify _sanitize_for_persistence handles circular references, types, and secrets."""
+    import datetime
+    from pathlib import Path
+    from tools.async_delegation import _sanitize_for_persistence, _safe_json_dumps
+
+    # Circular dict
+    cyclic = {"name": "loop"}
+    cyclic["self"] = cyclic
+
+    sanitized_cyclic = _sanitize_for_persistence(cyclic)
+    assert sanitized_cyclic["name"] == "loop"
+    assert sanitized_cyclic["self"] == "<circular_reference>"
+
+    # Deeply nested structure past depth 10
+    deep = {}
+    curr = deep
+    for _ in range(15):
+        curr["next"] = {}
+        curr = curr["next"]
+    sanitized_deep = _sanitize_for_persistence(deep)
+    assert _safe_json_dumps(sanitized_deep) != "{}"
+
+    # Types: bytes, Path, datetime, Exception
+    types_payload = {
+        "raw_bytes": b"binary data",
+        "file_path": Path("/var/log/app.log"),
+        "timestamp": datetime.datetime(2026, 8, 30, 12, 0, 0),
+        "error_obj": ValueError("invalid argument passed"),
+        "api_key": "sk-secret-12345",
+        "access_token": "bearer-secret-token",
+        "user_secret": "my-password",
+    }
+    sanitized_types = _sanitize_for_persistence(types_payload)
+    assert sanitized_types["raw_bytes"] == "<bytes len=11>"
+    assert sanitized_types["file_path"] == str(Path("/var/log/app.log"))
+    assert sanitized_types["timestamp"] == "2026-08-30T12:00:00"
+    assert sanitized_types["error_obj"]["__type__"] == "ValueError"
+    assert "invalid argument" in sanitized_types["error_obj"]["error"]
+    assert sanitized_types["api_key"] == "[REDACTED]"
+    assert sanitized_types["access_token"] == "[REDACTED]"
+    assert sanitized_types["user_secret"] == "[REDACTED]"
+
+
+def test_durable_serialization_redacts_credentials_and_truncates():
+    """Verify that credentials and huge strings in runner results are sanitized in event/result JSON."""
+    huge_str = "x" * 60000
+    res = ad.dispatch_async_delegation(
+        goal="Secret task",
+        context=None,
+        toolsets=None,
+        role="worker",
+        model=None,
+        session_key="test_session",
+        runner=lambda: {
+            "status": "completed",
+            "summary": "Finished",
+            "api_key": "super_secret_key",
+            "big_output": huge_str,
+        },
+    )
+    assert res["status"] == "dispatched"
+    delegation_id = res["delegation_id"]
+
+    evt = _drain_for(delegation_id, timeout=5.0)
+    assert evt is not None
+    assert evt["status"] == "completed"
+
+    # Query durable state.db directly to check stored JSON
+    import sqlite3
+    from tools.async_delegation import _db_path
+    conn = sqlite3.connect(_db_path())
+    row = conn.execute(
+        "SELECT event_json, result_json FROM async_delegations WHERE delegation_id=?",
+        (delegation_id,),
+    ).fetchone()
+    conn.close()
+
+    assert row is not None
+    event_json, result_json = row
+    assert "super_secret_key" not in event_json
+    assert "super_secret_key" not in result_json
+    assert "[REDACTED]" in result_json
+    assert "... [truncated]" in result_json
+
+    # Clean up active count
+    deadline = time.monotonic() + 2.0
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ad.active_count() == 0
+
+
+

@@ -36,8 +36,11 @@ logic stays in one place.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
+import os
+from pathlib import Path
 import sqlite3
 import threading
 import time
@@ -241,10 +244,91 @@ def _capture_routing_origin() -> Dict[str, Any]:
     return origin
 
 
-def _safe_json_dumps(data: Any) -> str:
-    """Serialize payload to JSON string safely with default=str fallback."""
+_REDACT_KEYS = {
+    "api_key", "apikey", "secret", "password", "token", "auth",
+    "access_token", "refresh_token", "private_key", "credentials",
+}
+
+
+def _sanitize_for_persistence(obj: Any, seen: Optional[set] = None, depth: int = 0) -> Any:
+    """Normalize objects for durable JSON persistence:
+    - Cycle-safe
+    - Depth-bounded (max 10)
+    - Length-bounded strings (max 50,000 chars)
+    - Typed tag representations for Path, datetime, Exception, bytes, set, custom objects
+    - Secret redaction for sensitive dictionary keys
+    """
+    if seen is None:
+        seen = set()
+
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+
+    if isinstance(obj, str):
+        if len(obj) > 50000:
+            return obj[:50000] + "... [truncated]"
+        return obj
+
+    if isinstance(obj, (bytes, bytearray)):
+        return f"<bytes len={len(obj)}>"
+
+    if isinstance(obj, (os.PathLike, Path)):
+        return str(obj)
+
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+
+    if isinstance(obj, BaseException):
+        return {
+            "__type__": type(obj).__name__,
+            "error": str(obj)[:5000],
+        }
+
+    if depth > 10:
+        return "<max_depth_exceeded>"
+
+    obj_id = id(obj)
+    if obj_id in seen:
+        return "<circular_reference>"
+
+    seen.add(obj_id)
     try:
-        return json.dumps(data, default=str)
+        if isinstance(obj, dict):
+            clean_dict = {}
+            for k, v in obj.items():
+                str_k = str(k)
+                if any(sec in str_k.lower() for sec in _REDACT_KEYS):
+                    clean_dict[str_k] = "[REDACTED]"
+                else:
+                    clean_dict[str_k] = _sanitize_for_persistence(v, seen, depth + 1)
+            return clean_dict
+
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            return [_sanitize_for_persistence(item, seen, depth + 1) for item in obj]
+
+        # For arbitrary objects, inspect __dict__ or fallback to repr/str
+        if hasattr(obj, "__dict__"):
+            clean_obj = {"__type__": type(obj).__name__}
+            for k, v in obj.__dict__.items():
+                if k.startswith("_"):
+                    continue
+                str_k = str(k)
+                if any(sec in str_k.lower() for sec in _REDACT_KEYS):
+                    clean_obj[str_k] = "[REDACTED]"
+                else:
+                    clean_obj[str_k] = _sanitize_for_persistence(v, seen, depth + 1)
+            return clean_obj
+
+        return str(obj)
+    finally:
+        seen.remove(obj_id)
+
+
+def _safe_json_dumps(data: Any) -> str:
+    """Serialize payload to JSON string safely with cycle/type-safe sanitization."""
+    try:
+        sanitized = _sanitize_for_persistence(data)
+        return json.dumps(sanitized, default=str, ensure_ascii=False)
     except Exception:
         return "{}"
 
