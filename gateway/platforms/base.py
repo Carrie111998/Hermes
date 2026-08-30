@@ -6304,7 +6304,12 @@ class BasePlatformAdapter(ABC):
         # question was delivered. Slash commands remain commands and leave the
         # question pending.
         deferred_service = getattr(self, "_deferred_question_service", None)
-        if deferred_service is not None and not event.get_command():
+        pending_deferred = (
+            deferred_service.pending_for_session(session_key)
+            if deferred_service is not None and not event.get_command()
+            else None
+        )
+        if pending_deferred is not None and pending_deferred.state == "awaiting":
             authorized = self._is_sender_authorized(
                 event.source.user_id,
                 event.source.chat_type,
