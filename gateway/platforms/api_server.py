@@ -1208,6 +1208,83 @@ def _resolve_media_to_data_urls(text: str) -> str:
         return text
 
 
+class _StreamingMediaResolver:
+    """Buffers SSE ``delta.content`` text so a ``MEDIA:<path>`` tag split
+    across chunk boundaries still gets resolved to an inline base64 image
+    before reaching the client, matching what the non-streaming dispatch
+    path already does via :func:`_resolve_media_to_data_urls`.
+
+    Without this, ``/v1/chat/completions`` with ``stream: true`` forwards
+    the model's raw text deltas as they're generated — the literal
+    ``MEDIA:/path/to/plot.png`` string reaches the client untouched, since
+    the non-streaming branch's post-hoc resolve step never runs on
+    already-sent chunks (#see api-server MEDIA streaming bug).
+    """
+
+    _MAX_PREFIX = len("MEDIA:")
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def feed(self, chunk: str) -> str:
+        """Feed a chunk of streamed text; returns text now safe to emit."""
+        if not chunk:
+            return ""
+        self._buf += chunk
+        return self._drain(final=False)
+
+    def flush(self) -> str:
+        """Call once at end of stream to emit any remaining buffered text."""
+        out = self._drain(final=True)
+        self._buf = ""
+        return out
+
+    def _drain(self, *, final: bool) -> str:
+        out_parts: list[str] = []
+        while True:
+            match = None
+            # Only resolve matches that end strictly before the end of the
+            # buffer (unless this is the final flush) — a match ending
+            # exactly at the buffer's end could still be extended by the
+            # next chunk (e.g. a longer path continues past what's known
+            # so far), so it stays buffered until we're sure it's complete.
+            for m in MEDIA_TAG_CLEANUP_RE.finditer(self._buf):
+                if final or m.end() < len(self._buf):
+                    match = m
+            if match is None:
+                break
+            out_parts.append(self._buf[: match.start()])
+            out_parts.append(_resolve_media_to_data_urls(match.group(0)))
+            self._buf = self._buf[match.end() :]
+
+        if final:
+            out_parts.append(self._buf)
+            self._buf = ""
+        else:
+            safe_len = self._safe_flush_length(self._buf)
+            out_parts.append(self._buf[:safe_len])
+            self._buf = self._buf[safe_len:]
+        return "".join(out_parts)
+
+    @classmethod
+    def _safe_flush_length(cls, buf: str) -> int:
+        """Return how much of ``buf`` is safe to emit now — i.e. excludes
+        any trailing text that could still turn into (or extend) a
+        ``MEDIA:`` tag once more chunks arrive."""
+        idx = buf.find("MEDIA:")
+        if idx != -1:
+            # An in-progress tag (incomplete path, no resolved extension
+            # yet) — hold back everything from its start.
+            return idx
+        # No full "MEDIA:" yet, but the tail might be the start of one
+        # split across the next chunk boundary (e.g. buffer ends "...MED").
+        tail = buf[-cls._MAX_PREFIX :]
+        for k in range(min(len(tail), cls._MAX_PREFIX), 0, -1):
+            if tail.endswith("MEDIA:"[:k]):
+                return len(buf) - k
+        return len(buf)
+
+
 def _redact_api_error_text(value: Any, *, limit: int | None = None) -> str:
     """Redact API-bound error text before it crosses the HTTP boundary."""
     redacted = redact_sensitive_text(str(value), force=True)
@@ -5440,11 +5517,17 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(_sse_frame(role_chunk))
             last_activity = time.monotonic()
 
+            # Buffers plain-text deltas so a ``MEDIA:<path>`` tag split
+            # across SSE chunks still resolves to an inline base64 image
+            # instead of reaching the client as literal, unrendered text.
+            media_resolver = _StreamingMediaResolver()
+
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
                 """Write a single queue item to the SSE stream.
 
-                Plain strings are sent as normal ``delta.content`` chunks.
+                Plain strings are sent as normal ``delta.content`` chunks
+                (after passing through ``media_resolver`` — see above).
                 Tagged tuples ``("__tool_progress__", payload)`` are sent
                 as a custom ``event: hermes.tool.progress`` SSE event so
                 frontends can display them without storing the markers in
@@ -5454,12 +5537,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
                 else:
-                    content_chunk = {
-                        "id": completion_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"content": item}, "finish_reason": None}],
-                    }
-                    await response.write(_sse_frame(content_chunk))
+                    resolved = media_resolver.feed(item)
+                    if resolved:
+                        content_chunk = {
+                            "id": completion_id, "object": "chat.completion.chunk",
+                            "created": created, "model": model,
+                            "choices": [{"index": 0, "delta": {"content": resolved}, "finish_reason": None}],
+                        }
+                        await response.write(_sse_frame(content_chunk))
                 return time.monotonic()
 
             # Stream content chunks as they arrive from the agent. Woken
@@ -5490,6 +5575,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
 
                 last_activity = await _emit(delta)
+
+            # Flush any text still held back by media_resolver (e.g. a
+            # MEDIA: tag that only completed in the very last chunk) so it
+            # reaches the client instead of being silently dropped.
+            trailing = media_resolver.flush()
+            if trailing:
+                content_chunk = {
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": trailing}, "finish_reason": None}],
+                }
+                await response.write(_sse_frame(content_chunk))
 
             # Get usage from completed agent. The agent can fail two ways
             # after the content queue terminates cleanly: (1) ``agent_task``
