@@ -64,6 +64,14 @@ _AWS_ENV_AT_COLLECTION = {
     k: v for k, v in os.environ.items() if k.startswith("AWS_")
 }
 
+# Escape hatch for the coverage check below: Claude slugs that model_metadata
+# knows but Bedrock genuinely does not offer, so BEDROCK_CONTEXT_LENGTHS is right
+# to stay silent about them. Empty today — every claude-* slug in
+# DEFAULT_CONTEXT_LENGTHS is served by Bedrock. Anthropic sometimes ships to
+# their own API before Bedrock, so add a slug here (with a note) rather than
+# inventing a Bedrock row for a model that isn't there.
+_METADATA_SLUGS_NOT_ON_BEDROCK: frozenset = frozenset()
+
 # Measured against live Bedrock, us-east-2, 2026-08-30. See module docstring.
 LIVE_VERIFIED_WINDOWS = {
     "us.anthropic.claude-sonnet-4-6": 1_000_000,
@@ -184,6 +192,50 @@ class TestTableAgreesWithModelMetadata:
             + "\n  ".join(divergences)
         )
         assert compared, "no rows compared — the key-slug mapping has drifted"
+
+    def test_every_claude_model_in_metadata_is_covered(self):
+        """The other direction: a *missing* row, which is the one that bites.
+
+        The test above only compares rows the Bedrock table already has, so it
+        is blind to the failure that actually happens — a model the rest of the
+        codebase knows about having no Bedrock row at all, and silently
+        resolving to the 128K default. That halves the compression threshold to
+        64K, and the symptom users report is constant "🗜️ Compacting context"
+        rather than anything naming a context window.
+
+        This is exactly how ``claude-opus-5`` was missed (#92273): present in
+        DEFAULT_CONTEXT_LENGTHS at 1M, absent from BEDROCK_CONTEXT_LENGTHS.
+        """
+        from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
+
+        checked = 0
+        gaps = []
+        for slug, want in sorted(DEFAULT_CONTEXT_LENGTHS.items()):
+            if not slug.startswith("claude-"):
+                continue
+            if "." in slug:
+                continue  # dotted aliases (claude-opus-4.6) are not Bedrock IDs
+            if slug in _METADATA_SLUGS_NOT_ON_BEDROCK:
+                continue
+            checked += 1
+            got = _static_bedrock_context_length(f"anthropic.{slug}")
+            if got != want:
+                how = (
+                    "no row at all — falls to the default"
+                    if got == BEDROCK_DEFAULT_CONTEXT_LENGTH
+                    else "resolves via a different row"
+                )
+                gaps.append(f"{slug}: metadata {want:,} vs Bedrock {got:,} ({how})")
+
+        assert not gaps, (
+            "Claude models known to model_metadata do not resolve to the same "
+            "window on Bedrock:\n  "
+            + "\n  ".join(gaps)
+            + "\n\nAdd the missing row to BEDROCK_CONTEXT_LENGTHS. If the model "
+            "genuinely is not offered on Bedrock, add its slug to "
+            "_METADATA_SLUGS_NOT_ON_BEDROCK in this file with a note saying so."
+        )
+        assert checked, "no slugs checked — the claude- prefix filter has drifted"
 
 
 @pytest.mark.integration
