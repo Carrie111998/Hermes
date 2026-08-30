@@ -6,6 +6,7 @@ gateway deployments.
 """
 
 import os
+import psutil
 import signal
 import subprocess
 import sys
@@ -22,11 +23,14 @@ def _spawn_sleep(seconds: float = 60) -> subprocess.Popen:
 
 def _pid_alive(pid: int) -> bool:
     """Return True if a process with the given PID is still running."""
+    return psutil.pid_exists(pid)
+
+
+def _kill_pid(pid: int) -> None:
     try:
-        os.kill(pid, 0)
-        return True
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
     except (ProcessLookupError, PermissionError):
-        return False
+        pass
 
 
 class TestZombieReproduction:
@@ -57,10 +61,7 @@ class TestZombieReproduction:
                 )
         finally:
             for pid in pids:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    pass
+                _kill_pid(pid)
 
     def test_explicit_terminate_reaps_processes(self):
         """Explicitly terminating+waiting on Popen handles works.

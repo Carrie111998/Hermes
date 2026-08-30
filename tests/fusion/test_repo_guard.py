@@ -5,7 +5,15 @@ from agent.fusion.repo_guard import RepoMutationGuard
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=repo, text=True, capture_output=True, check=True)
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=True,
+    )
 
 
 def _init_repo(repo: Path) -> Path:

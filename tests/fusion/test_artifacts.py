@@ -33,9 +33,9 @@ def test_artifacts_record_models_phases_candidates_and_votes(tmp_path):
         decision="consensus",
     )
     write_fusion_artifacts(result)
-    manifest = json.loads((Path(result.run_dir) / "manifest.json").read_text())
-    status = json.loads((Path(result.run_dir) / "status.json").read_text())
-    votes = json.loads((Path(result.run_dir) / "verification" / "votes.json").read_text())
+    manifest = json.loads((Path(result.run_dir) / "manifest.json").read_text(encoding="utf-8"))
+    status = json.loads((Path(result.run_dir) / "status.json").read_text(encoding="utf-8"))
+    votes = json.loads((Path(result.run_dir) / "verification" / "votes.json").read_text(encoding="utf-8"))
     assert manifest["schema"] == "fusion-v2-run/v2"
     assert manifest["model_diversity"]["distinct_count"] == 1
     assert manifest["routing"]["task_kind"] == "design_wide_solution"

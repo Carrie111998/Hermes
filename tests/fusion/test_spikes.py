@@ -5,7 +5,15 @@ from agent.fusion.spikes import capture_spike_diff, cleanup_spike_worktree, crea
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=repo, check=True, text=True, capture_output=True)
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+    )
 
 
 def _init_repo(repo: Path) -> Path:
