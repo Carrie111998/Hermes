@@ -183,6 +183,13 @@ describe('Polish dashboard localization', () => {
     const hub = pl.skills.hub!
 
     expect(pl.skills.categoryLabels).toEqual({
+      apple: 'Apple',
+      'autonomous-ai-agents': 'Autonomiczne agenty AI',
+      creative: 'Twórczość',
+      devops: 'DevOps',
+      email: 'E-mail',
+      github: 'GitHub',
+      media: 'Media',
       mlops: 'MLOps',
       'mlops/cloud': 'MLOps / Chmura',
       'mlops/evaluation': 'MLOps / Ewaluacja',
@@ -191,7 +198,13 @@ describe('Polish dashboard localization', () => {
       'mlops/training': 'MLOps / Uczenie',
       'mlops/vector-databases': 'MLOps / Bazy wektorowe',
       mcp: 'MCP',
+      'note-taking': 'Notatki',
+      productivity: 'Produktywność',
       'red-teaming': 'Red teaming',
+      research: 'Badania',
+      'smart-home': 'Inteligentny dom',
+      'social-media': 'Media społecznościowe',
+      'software-development': 'Tworzenie oprogramowania',
       ocr: 'OCR',
       p5js: 'p5.js',
       ai: 'AI',

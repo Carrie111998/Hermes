@@ -174,6 +174,11 @@ describe("SkillsPage Polish active controls", () => {
 
   it("localizes known category labels while preserving the fallback for unknown external categories", async () => {
     mocks.getSkills.mockResolvedValue([
+      { name: "code", description: "Test", category: "software-development", enabled: true },
+      { name: "agents", description: "Test", category: "autonomous-ai-agents", enabled: true },
+      { name: "notes", description: "Test", category: "note-taking", enabled: true },
+      { name: "home", description: "Test", category: "smart-home", enabled: true },
+      { name: "social", description: "Test", category: "social-media", enabled: true },
       { name: "cloud", description: "Test", category: "mlops/cloud", enabled: true },
       { name: "evaluation", description: "Test", category: "mlops/evaluation", enabled: true },
       { name: "vectors", description: "Test", category: "mlops/vector-databases", enabled: true },
@@ -183,13 +188,20 @@ describe("SkillsPage Polish active controls", () => {
 
     renderPolishPage();
 
-    expect(await screen.findByText("MLOps / Chmura")).not.toBeNull();
+    expect(await screen.findByText("Tworzenie oprogramowania")).not.toBeNull();
+    expect(screen.getByText("Autonomiczne agenty AI")).not.toBeNull();
+    expect(screen.getByText("Notatki")).not.toBeNull();
+    expect(screen.getByText("Inteligentny dom")).not.toBeNull();
+    expect(screen.getByText("Media społecznościowe")).not.toBeNull();
+    expect(screen.getByText("MLOps / Chmura")).not.toBeNull();
     expect(screen.getByText("MLOps / Ewaluacja")).not.toBeNull();
     expect(screen.getByText("MLOps / Bazy wektorowe")).not.toBeNull();
     expect(screen.getByText("Red teaming")).not.toBeNull();
     expect(screen.getByText("Partner Custom Tools")).not.toBeNull();
     expect(screen.queryByText("MLOps / Cloud")).toBeNull();
     expect(screen.queryByText("MLOps / Evaluation")).toBeNull();
+    expect(screen.queryByText("Software Development")).toBeNull();
+    expect(screen.queryByText("Autonomous Ai Agents")).toBeNull();
   });
 
   it("localizes the hub landing, connected-source status, cards, and accessibility names", async () => {
