@@ -46,3 +46,17 @@ async def test_send_sanitizes_outbound_text(monkeypatch: pytest.MonkeyPatch) -> 
     assert body["text"] == 'run "df -h" - now'
     assert "\u201c" not in body["text"]
     assert "\u2014" not in body["text"]
+
+
+@pytest.mark.asyncio
+async def test_send_preserves_emoji_zwj_sequences(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PHOTON_MARKDOWN", raising=False)
+    adapter = _make_adapter(monkeypatch)
+    calls = _capture_sidecar(adapter)
+
+    family = "\U0001f468\u200d\U0001f469\u200d\U0001f467\u200d\U0001f466"  # 👨👩👧👦
+    await adapter.send("+155****4567", f"ok {family}")
+
+    path, body = calls[0]
+    assert path == "/send"
+    assert body["text"] == f"ok {family}"

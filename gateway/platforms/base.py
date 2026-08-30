@@ -3040,7 +3040,12 @@ _TYPOGRAPHIC_TO_ASCII = str.maketrans({
     "\u2009": " ",  # THIN SPACE
     "\u2026": "...",  # … HORIZONTAL ELLIPSIS
 })
-_TYPOGRAPHIC_DROP = frozenset("\u200b\u200c\u200d\u2060\ufeff")  # zero-width / BOM
+# Only characters that are unambiguously accidental in outbound text are
+# dropped: ZWSP, word joiner, and BOM/ZWNBSP are invisible and carry no
+# content. ZWJ (U+200D) and ZWNJ (U+200C) are deliberately NOT included —
+# they are meaningful inside emoji ZWJ sequences (family/profession emoji)
+# and in scripts such as Persian, so stripping them corrupts real content.
+_TYPOGRAPHIC_DROP = frozenset("\u200b\u2060\ufeff")  # ZWSP / word joiner / BOM
 
 
 def sanitize_outbound_typography(text: str) -> str:
@@ -3049,8 +3054,12 @@ def sanitize_outbound_typography(text: str) -> str:
     Curly quotes become straight quotes, en/em dashes become a single hyphen
     (matching ``iconv -t ASCII//TRANSLIT`` so behaviour is predictable),
     non-breaking/thin spaces become ordinary spaces, ellipsis becomes
-    ``...``, and zero-width characters are dropped entirely. Everything else
-    — CJK, emoji, real non-ASCII filenames — is left untouched.
+    ``...``, and invisible formatting — zero-width space, word joiner, and
+    BOM/ZWNBSP — is dropped entirely. ZWJ/ZWNJ (U+200C/U+200D) are preserved:
+    they are meaningful inside emoji ZWJ sequences (family, profession,
+    skin-tone) and in scripts such as Persian, so removing them would corrupt
+    real content. Everything else — CJK, emoji, real non-ASCII filenames —
+    is left untouched.
     """
     text = text.translate(_TYPOGRAPHIC_TO_ASCII)
     if _TYPOGRAPHIC_DROP.intersection(text):
