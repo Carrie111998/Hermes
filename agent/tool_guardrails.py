@@ -56,6 +56,17 @@ MUTATING_TOOL_NAMES = frozenset(
         "cronjob",
         "delegate_task",
         "process",
+        "text_to_speech",
+        "image_generate",
+        "video_generate",
+    }
+)
+
+UNIQUE_OUTPUT_TOOL_NAMES = frozenset(
+    {
+        "text_to_speech",
+        "image_generate",
+        "video_generate",
     }
 )
 
@@ -103,6 +114,10 @@ def is_stall_guard_repeatable(tool_name: str) -> bool:
     if tool_name in STALL_GUARD_REPEATABLE_TOOLS:
         return True
     return tool_name.endswith(_STALL_GUARD_REPEATABLE_SUFFIXES)
+
+
+def is_unique_output_tool(tool_name: str) -> bool:
+    return tool_name in UNIQUE_OUTPUT_TOOL_NAMES
 
 
 @dataclass(frozen=True)
@@ -341,6 +356,7 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._unique_output_repeats: dict[ToolCallSignature, int] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
         # Identical-call loop-breaker state (agent.stall_guards): tracks the
         # CONSECUTIVE streak of identical (tool, canonical args) calls whose
@@ -353,6 +369,8 @@ class ToolCallGuardrailController:
         self._identical_streak_sig: ToolCallSignature | None = None
         self._identical_streak_result_hash: str = ""
         self._identical_streak_count: int = 0
+        self._args_streak_sig: ToolCallSignature | None = None
+        self._args_streak_count: int = 0
         # tool_call_id of the FIRST call in the current streak, so a
         # result-reference stub can point at the message that carries the
         # full payload.
@@ -425,6 +443,24 @@ class ToolCallGuardrailController:
                     self._halt_decision = decision
                     return decision
 
+        if is_unique_output_tool(tool_name):
+            repeat_count = self._unique_output_repeats.get(signature, 0)
+            if repeat_count >= self.config.no_progress_block_after:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="unique_output_no_progress_block",
+                    message=(
+                        f"Blocked {tool_name}: this call ran {repeat_count} times "
+                        "with identical arguments. A unique result is not progress; "
+                        "stop repeating it unchanged."
+                    ),
+                    tool_name=tool_name,
+                    count=repeat_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
     def after_call(
@@ -444,6 +480,7 @@ class ToolCallGuardrailController:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
             self._exact_failure_counts[signature] = exact_count
             self._no_progress.pop(signature, None)
+            self._unique_output_repeats.pop(signature, None)
 
             same_count = self._same_tool_failure_counts.get(tool_name, 0) + 1
             self._same_tool_failure_counts[tool_name] = same_count
@@ -491,6 +528,26 @@ class ToolCallGuardrailController:
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
+
+        if is_unique_output_tool(tool_name):
+            repeat_count = self._unique_output_repeats.get(signature, 0) + 1
+            self._unique_output_repeats[signature] = repeat_count
+            if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
+                return ToolGuardrailDecision(
+                    action="warn",
+                    code="unique_output_no_progress_warning",
+                    message=(
+                        f"{tool_name} ran {repeat_count} times with identical arguments. "
+                        "A unique generated path is not progress; change the input or "
+                        "use the result already delivered."
+                    ),
+                    tool_name=tool_name,
+                    count=repeat_count,
+                    signature=signature,
+                )
+            return ToolGuardrailDecision(
+                tool_name=tool_name, count=repeat_count, signature=signature
+            )
 
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
@@ -590,20 +647,41 @@ class ToolCallGuardrailController:
             self._identical_streak_count = 1 if is_plain_str else 0
             self._identical_streak_first_call_id = tool_call_id or ""
 
+        if is_plain_str and is_unique_output_tool(tool_name):
+            if self._args_streak_sig == signature:
+                self._args_streak_count += 1
+            else:
+                self._args_streak_sig = signature
+                self._args_streak_count = 1
+        else:
+            self._args_streak_sig = None
+            self._args_streak_count = 0
+
         count = self._identical_streak_count
+        args_count = self._args_streak_count
+        unique_output = is_unique_output_tool(tool_name)
+        notice_count = args_count if unique_output else count
 
         notice = None
         if (
             not is_stall_guard_repeatable(tool_name)
-            and count >= STALL_GUARD_IDENTICAL_CALL_THRESHOLD
+            and notice_count >= STALL_GUARD_IDENTICAL_CALL_THRESHOLD
         ):
-            ordinal = f"{count}{'th' if 11 <= count % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(count % 10, 'th')}"
-            notice = (
-                f"[hermes note: this is the {ordinal} consecutive identical call to "
-                f"{tool_name} with identical arguments returning the same result. "
-                "Do not repeat it — change arguments, use a different tool, or "
-                "proceed with what you have.]"
-            )
+            ordinal = f"{notice_count}{'th' if 11 <= notice_count % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(notice_count % 10, 'th')}"
+            if unique_output:
+                notice = (
+                    f"[hermes note: this is the {ordinal} consecutive identical call to "
+                    f"{tool_name} with identical arguments. A unique generated path "
+                    "is not progress. Do not repeat it — change arguments, use a "
+                    "different tool, or proceed with what you have.]"
+                )
+            else:
+                notice = (
+                    f"[hermes note: this is the {ordinal} consecutive identical call to "
+                    f"{tool_name} with identical arguments returning the same result. "
+                    "Do not repeat it — change arguments, use a different tool, or "
+                    "proceed with what you have.]"
+                )
 
         stub = None
         if (

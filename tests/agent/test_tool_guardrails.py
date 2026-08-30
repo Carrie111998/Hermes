@@ -131,6 +131,57 @@ def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_succes
         assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
 
 
+def test_unique_output_tools_warn_and_block_on_repeated_args_even_when_results_differ():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            warnings_enabled=True,
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=5,
+            same_tool_failure_halt_after=99,
+        )
+    )
+    args = {"text": "hi"}
+    warns = 0
+    block = None
+    for i in range(8):
+        before = controller.before_call("text_to_speech", args)
+        if before.action in ("block", "halt"):
+            block = (i + 1, before.code)
+            break
+        after = controller.after_call(
+            "text_to_speech", args, f"/cache/tts_{i}.ogg", failed=False
+        )
+        if after.action == "warn":
+            warns += 1
+            assert after.code == "unique_output_no_progress_warning"
+    assert warns == 4
+    assert block == (6, "unique_output_no_progress_block")
+
+
+def test_image_and_video_generate_share_the_unique_output_contract():
+    from agent.tool_guardrails import is_unique_output_tool
+
+    for tool in ("image_generate", "video_generate"):
+        assert is_unique_output_tool(tool)
+        controller = ToolCallGuardrailController(
+            ToolCallGuardrailConfig(
+                hard_stop_enabled=True,
+                no_progress_warn_after=2,
+                no_progress_block_after=2,
+            )
+        )
+        args = {"prompt": "a cat"}
+        assert controller.before_call(tool, args).action == "allow"
+        first = controller.after_call(tool, args, f"/out/{tool}_1.bin", failed=False)
+        assert first.action == "allow"
+        second = controller.after_call(tool, args, f"/out/{tool}_2.bin", failed=False)
+        assert second.action == "warn"
+        blocked = controller.before_call(tool, args)
+        assert blocked.action == "block"
+        assert blocked.code == "unique_output_no_progress_block"
+
+
 
 
 
