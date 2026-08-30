@@ -412,24 +412,39 @@ describe('toChatMessages', () => {
       },
       {
         role: 'user',
+        content: '[ASYNC DELEGATION BATCH COMPLETE — deleg_8246d5af]\n2 background agents finished.',
+        display_kind: 'internal_notification',
+        timestamp: 6
+      },
+      {
+        role: 'user',
         content: '[System note: Your previous turn was interrupted mid-run…]\n\noriginal prompt',
         display_kind: 'auto_continue',
-        timestamp: 6
+        timestamp: 7
       },
       {
         role: 'user',
         content: "[System: The user has changed the assistant's personality…]",
         display_kind: 'personality_switch',
-        timestamp: 7
+        timestamp: 8
       }
     ])
 
-    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'system', 'system', 'system', 'system'])
+    expect(messages.map(message => message.role)).toEqual([
+      'user',
+      'assistant',
+      'system',
+      'system',
+      'system',
+      'system',
+      'system'
+    ])
     expect(messages.map(chatMessageText)).toEqual([
       'real user turn',
       'real assistant reply',
       'model changed',
       'background agent work finished',
+      '[ASYNC DELEGATION BATCH COMPLETE — deleg_8246d5af]\n2 background agents finished.',
       'resumed interrupted turn',
       'personality changed'
     ])

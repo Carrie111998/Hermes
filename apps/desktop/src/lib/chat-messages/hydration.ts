@@ -203,6 +203,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       message.display_kind === 'model_switch' ||
       message.display_kind === 'async_delegation_complete' ||
       message.display_kind === 'auto_continue' ||
+      message.display_kind === 'internal_notification' ||
       message.display_kind === 'personality_switch'
         ? 'system'
         : message.role
