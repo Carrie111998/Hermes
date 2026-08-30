@@ -432,6 +432,12 @@ describe('desktop slash command curation', () => {
     )
   })
 
+  it('describes /skills as the review slice the desktop actually exposes', () => {
+    expect(desktopSlashDescription('/skills', 'Search, install, inspect, or manage skills')).toBe(
+      'Review staged skill writes and approval mode'
+    )
+  })
+
   it('builds /skin completions from desktop themes', () => {
     const completions = desktopSkinSlashCompletions(
       [
