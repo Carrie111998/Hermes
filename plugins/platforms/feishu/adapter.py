@@ -305,6 +305,7 @@ FALLBACK_SHARE_CHAT_TEXT = "[Shared chat]"
 FALLBACK_INTERACTIVE_TEXT = "[Interactive message]"
 FALLBACK_IMAGE_TEXT = "[Image]"
 FALLBACK_ATTACHMENT_TEXT = "[Attachment]"
+FALLBACK_QUOTED_MESSAGE_TEXT = "[Quoted message unavailable]"
 # ---------------------------------------------------------------------------
 # Post/card parsing helpers
 # ---------------------------------------------------------------------------
@@ -3366,16 +3367,6 @@ class FeishuAdapter(BasePlatformAdapter):
             if text.startswith("/"):
                 inbound_type = MessageType.COMMAND
 
-        # Guard runs post-strip so a pure "@Bot" message (stripped to "") is dropped.
-        if inbound_type == MessageType.TEXT and not text and not media_urls:
-            logger.debug("[Feishu] Ignoring empty text message id=%s", message_id)
-            return
-
-        if inbound_type != MessageType.COMMAND:
-            hint = _build_mention_hint(mentions)
-            if hint:
-                text = f"{hint}\n\n{text}" if text else hint
-
         thread_id = getattr(message, "thread_id", None) or None
         reply_to_message_id = (
             getattr(message, "parent_id", None)
@@ -3391,6 +3382,20 @@ class FeishuAdapter(BasePlatformAdapter):
         reply_to_text = quoted_context.text
         media_urls.extend(quoted_context.media_urls)
         media_types.extend(quoted_context.media_types)
+        if reply_to_message_id and not reply_to_text and not quoted_context.media_urls:
+            reply_to_text = FALLBACK_QUOTED_MESSAGE_TEXT
+
+        # Guard runs post-strip and post-quote lookup. A pure "@Bot" message
+        # without any semantic payload is still ignored, while a mention-only
+        # reply is admitted when the quoted parent contributes text or media.
+        if inbound_type == MessageType.TEXT and not text and not media_urls and not reply_to_text:
+            logger.debug("[Feishu] Ignoring empty text message id=%s", message_id)
+            return
+
+        if inbound_type != MessageType.COMMAND:
+            hint = _build_mention_hint(mentions)
+            if hint:
+                text = f"{hint}\n\n{text}" if text else hint
 
         sender_primary = (
             getattr(sender_id, "open_id", None)

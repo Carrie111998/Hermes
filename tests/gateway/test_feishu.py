@@ -2311,6 +2311,120 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         self.assertEqual(event.reply_to_message_id, "om_quoted")
         self.assertIsNone(adapter.build_source.call_args.kwargs["thread_id"])
 
+    def _run_mention_only(self, *, parent_id, quoted_context, thread_id=None):
+        adapter = self._build_adapter()
+        fetch_message_context = AsyncMock(return_value=quoted_context)
+        dispatch_inbound_event = AsyncMock()
+        build_source = Mock(return_value=SimpleNamespace(thread_id=thread_id))
+        adapter._fetch_message_context = fetch_message_context
+        adapter._dispatch_inbound_event = dispatch_inbound_event
+        adapter.build_source = build_source
+        bot_mention = SimpleNamespace(
+            key="@_user_1",
+            id=SimpleNamespace(open_id="ou_bot", user_id=""),
+            name="Hermes",
+        )
+        message = SimpleNamespace(
+            content=json.dumps({"text": "@_user_1"}),
+            message_type="text",
+            message_id="om_current",
+            mentions=[bot_mention],
+            chat_id="oc_chat",
+            parent_id=parent_id,
+            upper_message_id=None,
+            root_id=None,
+            thread_id=thread_id,
+        )
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=message,
+                message=message,
+                sender_id=None,
+                chat_type="group",
+                message_id="om_current",
+            )
+        )
+        await_args = dispatch_inbound_event.await_args
+        event = await_args.args[0] if await_args is not None else None
+        return event, fetch_message_context, build_source
+
+    def test_mention_only_quote_dispatches_quoted_text(self):
+        from plugins.platforms.feishu.adapter import FeishuQuotedMessageContext
+
+        event, fetch_message_context, build_source = self._run_mention_only(
+            parent_id="om_quoted",
+            quoted_context=FeishuQuotedMessageContext(text="quoted parent text"),
+        )
+
+        if event is None:
+            self.fail("mention-only quoted reply was not dispatched")
+        self.assertEqual(event.text, "")
+        self.assertEqual(event.reply_to_message_id, "om_quoted")
+        self.assertEqual(event.reply_to_text, "quoted parent text")
+        fetch_message_context.assert_awaited_once_with("om_quoted")
+        self.assertIsNone(build_source.call_args.kwargs["thread_id"])
+
+    def test_mention_only_unavailable_quote_dispatches_fallback(self):
+        from plugins.platforms.feishu.adapter import FeishuQuotedMessageContext
+
+        event, fetch_message_context, _ = self._run_mention_only(
+            parent_id="om_unavailable",
+            quoted_context=FeishuQuotedMessageContext(),
+        )
+
+        if event is None:
+            self.fail("mention-only reply with unavailable quote was not dispatched")
+        self.assertEqual(event.text, "")
+        self.assertEqual(event.reply_to_message_id, "om_unavailable")
+        self.assertEqual(event.reply_to_text, "[Quoted message unavailable]")
+        fetch_message_context.assert_awaited_once_with("om_unavailable")
+
+    def test_mention_only_without_quote_is_ignored(self):
+        from plugins.platforms.feishu.adapter import FeishuQuotedMessageContext
+
+        event, fetch_message_context, _ = self._run_mention_only(
+            parent_id=None,
+            quoted_context=FeishuQuotedMessageContext(),
+        )
+
+        self.assertIsNone(event)
+        fetch_message_context.assert_not_awaited()
+
+    def test_mention_only_image_quote_dispatches_media(self):
+        from plugins.platforms.feishu.adapter import FeishuQuotedMessageContext
+
+        event, fetch_message_context, _ = self._run_mention_only(
+            parent_id="om_quoted_image",
+            quoted_context=FeishuQuotedMessageContext(
+                text="[Image]",
+                media_urls=("/tmp/quoted-image.jpg",),
+                media_types=("image/jpeg",),
+            ),
+        )
+
+        if event is None:
+            self.fail("mention-only image quote was not dispatched")
+        self.assertEqual(event.text, "")
+        self.assertEqual(event.reply_to_text, "[Image]")
+        self.assertEqual(event.media_urls, ["/tmp/quoted-image.jpg"])
+        self.assertEqual(event.media_types, ["image/jpeg"])
+        fetch_message_context.assert_awaited_once_with("om_quoted_image")
+
+    def test_mention_only_topic_quote_preserves_native_thread(self):
+        from plugins.platforms.feishu.adapter import FeishuQuotedMessageContext
+
+        event, fetch_message_context, build_source = self._run_mention_only(
+            parent_id="om_quoted",
+            quoted_context=FeishuQuotedMessageContext(text="quoted parent text"),
+            thread_id="omt_topic",
+        )
+
+        if event is None:
+            self.fail("mention-only topic quote was not dispatched")
+        self.assertEqual(event.source.thread_id, "omt_topic")
+        self.assertEqual(build_source.call_args.kwargs["thread_id"], "omt_topic")
+        fetch_message_context.assert_awaited_once_with("om_quoted")
+
     @patch.dict(os.environ, {}, clear=True)
     def test_reply_to_image_injects_quoted_image_context(self):
         from gateway.config import PlatformConfig
