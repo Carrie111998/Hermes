@@ -1800,6 +1800,182 @@ class TestAuxiliaryFallbackLayering:
         exc.status_code = 402
         return exc
 
+    @staticmethod
+    def _fallback_entries():
+        return [
+            {"provider": "fallback-zero", "model": "model-zero"},
+            {"provider": "fallback-one", "model": "model-one"},
+        ]
+
+    def _patch_real_fallback_chain(
+        self, entries, primary_client, fallback_clients, *, async_clients=None,
+    ):
+        patches = [
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("primary", "primary-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(primary_client, "primary-model"),
+            ),
+            patch(
+                "agent.auxiliary_client._get_auxiliary_task_config",
+                return_value={"fallback_chain": entries},
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=lambda provider, model=None, **kwargs: (
+                    fallback_clients[provider], model
+                ),
+            ),
+            patch(
+                "agent.auxiliary_client._try_main_agent_model_fallback",
+                return_value=(None, None, ""),
+            ),
+            patch("agent.auxiliary_client._recoverable_pool_provider", return_value=None),
+        ]
+        if async_clients is not None:
+            patches.append(
+                patch(
+                    "agent.auxiliary_client._to_async_client",
+                    side_effect=lambda client, model, **kwargs: (
+                        async_clients[id(client)], model
+                    ),
+                )
+            )
+        return patches
+
+    def test_sync_configured_chain_continues_after_fallback_402(self):
+        """Primary 402 -> fallback[0] 402 -> fallback[1] success."""
+        entries = self._fallback_entries()
+        primary = MagicMock()
+        primary.chat.completions.create.side_effect = self._make_payment_err()
+        fallback_zero = MagicMock()
+        fallback_zero.chat.completions.create.side_effect = self._make_payment_err()
+        fallback_one = MagicMock()
+        fallback_one.chat.completions.create.return_value = _DummyResponse("chain-success")
+        fallback_clients = {
+            "fallback-zero": fallback_zero,
+            "fallback-one": fallback_one,
+        }
+
+        patches = self._patch_real_fallback_chain(
+            entries, primary, fallback_clients,
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "chain-success"
+        assert fallback_zero.chat.completions.create.call_count == 1
+        assert fallback_one.chat.completions.create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_async_configured_chain_continues_after_fallback_402(self):
+        """Async primary 402 -> fallback[0] 402 -> fallback[1] success."""
+        entries = self._fallback_entries()
+        primary = MagicMock()
+        primary.chat.completions.create = AsyncMock(side_effect=self._make_payment_err())
+        sync_zero, sync_one = MagicMock(), MagicMock()
+        async_zero, async_one = MagicMock(), MagicMock()
+        async_zero.chat.completions.create = AsyncMock(side_effect=self._make_payment_err())
+        async_one.chat.completions.create = AsyncMock(
+            return_value=_DummyResponse("async-chain-success")
+        )
+        fallback_clients = {
+            "fallback-zero": sync_zero,
+            "fallback-one": sync_one,
+        }
+        async_clients = {
+            id(sync_zero): async_zero,
+            id(sync_one): async_one,
+        }
+
+        patches = self._patch_real_fallback_chain(
+            entries, primary, fallback_clients, async_clients=async_clients,
+        )
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4],
+            patches[5], patches[6],
+        ):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "async-chain-success"
+        assert async_zero.chat.completions.create.await_count == 1
+        assert async_one.chat.completions.create.await_count == 1
+
+    def test_configured_chain_exhaustion_preserves_original_error_and_warning(
+        self, caplog,
+    ):
+        entries = self._fallback_entries()
+        primary_error = self._make_payment_err()
+        primary = MagicMock()
+        primary.chat.completions.create.side_effect = primary_error
+        fallback_clients = {}
+        for entry in entries:
+            client = MagicMock()
+            client.chat.completions.create.side_effect = self._make_payment_err()
+            fallback_clients[entry["provider"]] = client
+
+        patches = self._patch_real_fallback_chain(
+            entries, primary, fallback_clients,
+        )
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            caplog.at_level("WARNING", logger="agent.auxiliary_client"),
+        ):
+            with pytest.raises(Exception) as raised:
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "summarize"}],
+                )
+
+        assert raised.value is primary_error
+        assert all(
+            client.chat.completions.create.call_count == 1
+            for client in fallback_clients.values()
+        )
+        assert any("all fallbacks exhausted" in record.message for record in caplog.records)
+
+    def test_stale_auth_fallback_still_advances_configured_chain(self):
+        entries = self._fallback_entries()
+        primary = MagicMock()
+        primary.chat.completions.create.side_effect = self._make_payment_err()
+        stale = MagicMock()
+        stale.chat.completions.create.side_effect = _AuxAuth401("expired fallback token")
+        healthy = MagicMock()
+        healthy.chat.completions.create.return_value = _DummyResponse("auth-chain-success")
+        fallback_clients = {
+            "fallback-zero": stale,
+            "fallback-one": healthy,
+        }
+
+        patches = self._patch_real_fallback_chain(
+            entries, primary, fallback_clients,
+        )
+        with (
+            patches[0], patches[1], patches[2], patches[3], patches[4], patches[5],
+            patch(
+                "agent.auxiliary_client._refresh_provider_credentials",
+                return_value=False,
+            ) as refresh,
+        ):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "auth-chain-success"
+        refresh.assert_called_once_with("fallback-zero")
+        assert stale.chat.completions.create.call_count == 1
+        assert healthy.chat.completions.create.call_count == 1
+
 
 
 
