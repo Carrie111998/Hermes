@@ -537,6 +537,24 @@ class TestPrunePreCheckpointItems:
         users = [i["content"] for i in out if i.get("role") == "user"]
         assert users == ["next ask"]
 
+    def test_image_only_user_message_is_retained_across_checkpoint(self):
+        from agent.native_compaction import prune_pre_checkpoint_items
+
+        image_user = {
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": "data:image/png;base64,AAAA"}],
+        }
+        items = [
+            image_user,
+            {"role": "assistant", "content": "I see the screenshot."},
+            {"type": "compaction", "encrypted_content": "blob_cp"},
+            {"role": "user", "content": "what was in that screenshot?"},
+        ]
+        out = prune_pre_checkpoint_items(items)
+        assert out[0] == {"type": "compaction", "encrypted_content": "blob_cp"}
+        assert out[1] == image_user
+        assert out[2] == {"role": "user", "content": "what was in that screenshot?"}
+
     def test_adapter_applies_prune_end_to_end(self):
         from agent.codex_responses_adapter import _chat_messages_to_responses_input
 

@@ -389,11 +389,13 @@ def prune_pre_checkpoint_items(
 
         text = _extract_item_text(item)
         if text is None:
-            continue
-        # Image-only user messages have empty text but non-empty content —
-        # main retains them at 1-token cost (images count as zero, matching
-        # Codex's retention accounting). Don't skip them just because text
-        # is falsy.
+            # Image-only user messages have empty text but non-empty content (list of image parts) —
+            # retain them at 1-token cost (images count as zero, matching Codex's retention accounting).
+            if is_user and isinstance(item.get("content"), list) and item["content"]:
+                text = ""
+            else:
+                continue
+
         if not text and not is_user:
             continue
 
@@ -405,7 +407,7 @@ def prune_pre_checkpoint_items(
         elif is_user:
             if user_remaining <= 0:
                 continue
-            cost = _approx_tokens(text)
+            cost = max(1, _approx_tokens(text)) if not text else _approx_tokens(text)
             if cost <= user_remaining:
                 retained_reversed.append(item)
                 user_remaining -= cost
