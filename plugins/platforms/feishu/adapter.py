@@ -2081,7 +2081,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     "tag": "button",
                     "text": {"tag": "plain_text", "content": label},
                     "type": btn_type,
-                    "value": {"hermes_action": action_name, "approval_id": approval_id},
+                    "value": {"hermes_action": action_name, "approval_id": str(approval_id)},
                 }
 
             actions = [_btn("✅ Allow Once", "approve_once", "primary")]
@@ -2140,7 +2140,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 "type": btn_type,
                 "value": {
                     "hermes_update_prompt_action": answer,
-                    "update_prompt_id": prompt_id,
+                    "update_prompt_id": str(prompt_id),
                 },
             }
 
@@ -2807,6 +2807,12 @@ class FeishuAdapter(BasePlatformAdapter):
         if approval_id is None:
             logger.debug("[Feishu] Card action missing approval_id, ignoring")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+        # Feishu always sends numeric IDs as strings — cast to match int keys in state dict
+        try:
+            approval_id = int(approval_id)
+        except (ValueError, TypeError):
+            logger.warning("[Feishu] Card action has invalid approval_id=%r, ignoring", approval_id)
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
         state = self._approval_state.get(approval_id)
         if not state:
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
@@ -2816,7 +2822,10 @@ class FeishuAdapter(BasePlatformAdapter):
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
         sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
-        if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
+        # DM approval cards: skip group policy check — chat_id mismatch below provides sufficient security.
+        # _allow_group_message is designed for group chat policy (allowlist/blacklist) and rejects all DM clicks
+        # when group_policy="allowlist" (the default).
+        if not open_id:
             logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
@@ -2863,6 +2872,11 @@ class FeishuAdapter(BasePlatformAdapter):
         if prompt_id is None:
             logger.debug("[Feishu] Card action missing update_prompt_id, ignoring")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+        try:
+            prompt_id = int(prompt_id)
+        except (ValueError, TypeError):
+            logger.warning("[Feishu] Card action has invalid update_prompt_id=%r, ignoring", prompt_id)
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
         state = self._update_prompt_state.get(prompt_id)
         if not state:
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
@@ -2876,7 +2890,7 @@ class FeishuAdapter(BasePlatformAdapter):
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
         sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
-        if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
+        if not self._is_interactive_operator_authorized(open_id):
             logger.warning("[Feishu] Unauthorized update prompt click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
 
@@ -2983,8 +2997,7 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.debug("[Feishu] Update prompt %s already resolved or unknown", prompt_id)
             return
         if open_id:
-            sender_id = SimpleNamespace(open_id=open_id, user_id="")
-            if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
+            if not self._is_interactive_operator_authorized(open_id):
                 logger.warning("[Feishu] Unauthorized update prompt click by %s for prompt %s", open_id, prompt_id)
                 return
         expected_chat_id = str(state.get("chat_id", "") or "")
