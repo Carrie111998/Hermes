@@ -75,9 +75,13 @@ def _category(fm: dict[str, Any], skill_md: Path) -> str:
 
 
 def _iter_skill_files(roots: list[tuple[str, Path]]):
+    from agent.skill_utils import is_excluded_skill_path
+
     for source, root in roots:
         if root.exists():
             for path in root.rglob("SKILL.md"):
+                if is_excluded_skill_path(path):
+                    continue
                 yield source, path
 
 
