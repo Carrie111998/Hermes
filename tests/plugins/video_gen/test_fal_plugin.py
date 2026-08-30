@@ -161,11 +161,9 @@ class TestFamilyRouting:
         fake.submit = _submit  # type: ignore
         monkeypatch.setitem(sys.modules, "fal_client", fake)
 
-        # Point the lazy global straight at our stub. Going through
-        # sys.modules alone is not enough: import_fal_client() calls
-        # lazy_deps.ensure() first, which raises when the fal-client
-        # package is not installed (it is a lazy extra, absent from CI
-        # and fresh dev envs) — the stubbed import is never reached.
+        # Point the lazy global straight at our stub: import_fal_client()
+        # calls lazy_deps.ensure() first, which raises when the fal-client
+        # extra is absent (CI, fresh envs) — the sys.modules stub never gets read.
         from plugins.video_gen import fal as fal_plugin
         monkeypatch.setattr(fal_plugin, "_fal_client", fake)
         # Also reset the managed client cache
