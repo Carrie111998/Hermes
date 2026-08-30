@@ -7201,12 +7201,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with a different reason. Use ``reopen_session()`` first if you
         intentionally need to re-end a closed session with a new reason.
         """
+        # Audit trail (#98495): an end write on a still-live gateway session
+        # row is invisible today — the writer cannot be identified from logs,
+        # only inferred from the next routing self-heal warning. Record who
+        # ended what and why. Frame 1 is the direct caller; taken here because
+        # _execute_write runs _do synchronously but with extra frames in between.
+        _cf = sys._getframe(1)
+        _caller = f"{_cf.f_globals.get('__name__', '?')}.{_cf.f_code.co_name}"
+
         def _do(conn):
-            conn.execute(
+            updated = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? "
                 "WHERE id = ? AND ended_at IS NULL",
                 (time.time(), end_reason, session_id),
             )
+            if updated.rowcount:
+                logger.info(
+                    "Session ended: session=%s reason=%s caller=%s",
+                    session_id, end_reason, _caller,
+                )
+            else:
+                logger.debug(
+                    "Session end no-op (already ended, first reason wins): "
+                    "session=%s reason=%s caller=%s",
+                    session_id, end_reason, _caller,
+                )
         self._execute_write(_do)
 
     def reopen_session(self, session_id: str) -> None:
@@ -7215,6 +7234,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Before clearing a reset boundary, stabilize markerless legacy reset
         children that still depend on the parent's mutable end_reason.
         """
+        _cf = sys._getframe(1)
+        _caller = f"{_cf.f_globals.get('__name__', '?')}.{_cf.f_code.co_name}"
+
         def _do(conn):
             placeholders = ",".join("?" for _ in _RESET_END_REASONS)
             # WHERE shape shared with _RESET_CHILD_SQL's fallback arm via
@@ -7230,10 +7252,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 f"AND {_legacy_reset_child_sql('child', placeholders)}",
                 (session_id, *_RESET_END_REASONS),
             )
+            _was_ended = conn.execute(
+                "SELECT ended_at FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
             conn.execute(
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),
             )
+            if _was_ended and _was_ended[0] is not None:
+                # Only the ended -> open transition is interesting: that is
+                # the stale-route recovery path silently resurrecting a row
+                # (#54878 self-heal), the counterpart of the end audit above.
+                logger.info(
+                    "Session reopened: session=%s caller=%s",
+                    session_id, _caller,
+                )
         self._execute_write(_do)
 
     def promote_to_session_reset(
