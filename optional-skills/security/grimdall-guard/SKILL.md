@@ -2,14 +2,13 @@
 name: grimdall-guard
 description: Install and configure Grimdall policy checkpoint plugin.
 version: 1.0.0
-author: grimdalltech
+author: Aniket (@grimdalltech, Grimdall Tech)
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [security, policy, guardrails, checkpoint, egress, secrets]
     category: security
-    related_skills: [security-guidance]
 ---
 
 # Grimdall Guard
