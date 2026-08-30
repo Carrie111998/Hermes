@@ -13148,6 +13148,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    def update_assistant_message_content(
+        self, session_id: str, message_row_id: int, content: str
+    ) -> bool:
+        """Replace one exact active assistant row after a required Host gate."""
+        if (
+            not session_id
+            or not isinstance(message_row_id, int)
+            or isinstance(message_row_id, bool)
+            or not isinstance(content, str)
+            or not content
+        ):
+            return False
+        encoded = self._encode_content(content)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT role, active FROM messages WHERE id = ? AND session_id = ?",
+                (message_row_id, session_id),
+            ).fetchone()
+            if row is None or row["role"] != "assistant" or row["active"] != 1:
+                return False
+            updated = conn.execute(
+                "UPDATE messages SET content = ? WHERE id = ? AND session_id = ? "
+                "AND role = 'assistant' AND active = 1",
+                (encoded, message_row_id, session_id),
+            )
+            return updated.rowcount == 1
+
+        return bool(
+            self._execute_write(
+                _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+            )
+        )
+
     # =========================================================================
     # Search
     # =========================================================================

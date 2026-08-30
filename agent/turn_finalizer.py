@@ -46,14 +46,6 @@ def _is_pure_tool_call_tail(msg: dict) -> bool:
     return _assistant_row_missing_visible_text(msg)
 
 
-def _fill_assistant_tail_content(agent, tail: dict, final_response) -> None:
-    """Write delivered text onto an already-persisted blank assistant row."""
-    tail["content"] = final_response
-    stamp_message_timestamp(tail)
-    tail.pop(_DB_PERSISTED_MARKER, None)
-    agent._db_flush_scan_prefix = None
-
-
 # Verification continuation scaffolding flags: verify-on-stop / pre_verify
 # inject a synthetic user nudge to keep the agent going one more turn.
 # These nudges must be stripped from returned/live history to avoid
@@ -62,6 +54,11 @@ def _fill_assistant_tail_content(agent, tail: dict, final_response) -> None:
 _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+)
+
+_LENGTH_CONTINUATION_FLAGS = (
+    "_length_continuation_fragment",
+    "_length_continuation_nudge",
 )
 
 
@@ -124,6 +121,64 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
         m for m in messages
         if not (isinstance(m, dict) and any(m.get(f) for f in _VERIFICATION_CONTINUATION_FLAGS))
     ]
+
+
+def _drop_length_continuation_scaffolding(messages) -> None:
+    """Remove provider-length retry fragments before a gated terminal flush."""
+    messages[:] = [
+        m for m in messages
+        if not (
+            isinstance(m, dict)
+            and any(m.get(flag) for flag in _LENGTH_CONTINUATION_FLAGS)
+        )
+    ]
+
+
+def _ensure_authorized_assistant_row(
+    agent,
+    messages,
+    final_response: str,
+    *,
+    hard_gate: bool,
+    replace_blank_tail: bool = False,
+) -> None:
+    """Make the live and committed assistant tail equal the authorized body."""
+    if not isinstance(final_response, str) or not final_response:
+        return
+    tail = messages[-1] if messages and isinstance(messages[-1], dict) else None
+    if tail is None or tail.get("role") != "assistant":
+        append_message(messages, {"role": "assistant", "content": final_response})
+        return
+    if tail.get("content") == final_response:
+        return
+    if not (
+        hard_gate
+        or _is_pure_tool_call_tail(tail)
+        or (replace_blank_tail and _assistant_row_missing_visible_text(tail))
+    ):
+        return
+
+    tail["content"] = final_response
+    stamp_message_timestamp(tail)
+    row_id = tail.get("_row_id")
+    session_db = getattr(agent, "_session_db", None)
+    updater = getattr(session_db, "update_assistant_message_content", None)
+    if (
+        hard_gate
+        and isinstance(row_id, int)
+        and not isinstance(row_id, bool)
+        and callable(updater)
+    ):
+        try:
+            if updater(agent.session_id or "", row_id, final_response):
+                tail[_DB_PERSISTED_MARKER] = True
+                return
+        except Exception:
+            # The terminal flush is the recoverable fallback. The required
+            # receipt still fails closed if it cannot observe this exact row.
+            pass
+    tail.pop(_DB_PERSISTED_MARKER, None)
+    agent._db_flush_scan_prefix = None
 
 
 def finalize_turn(
@@ -300,10 +355,57 @@ def finalize_turn(
         _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
         logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
 
+    # #95514 can recover a visible answer from the stream even when the
+    # terminal provider object is blank. Recover before the required Host
+    # gate so that path cannot bypass output authorization.
+    _recovered_from_stream = False
+    if not interrupted and not failed:
+        _streamed = getattr(agent, "_current_streamed_assistant_text", "") or ""
+        if isinstance(_streamed, str):
+            _streamed = _streamed.strip()
+        else:
+            _streamed = ""
+        _final_visible = (
+            flatten_message_text(final_response).strip() if final_response else ""
+        )
+        if not _final_visible and _streamed:
+            final_response = _streamed
+            _recovered_from_stream = True
+
+    # Optional Host-owned final-content gate. It runs before the terminal
+    # assistant row is flushed. Callback and ownership failures are fatal.
+    _hard_persist_gate_applied = False
+    _persist_gate_content_sha256 = None
+    if final_response and not interrupted:
+        from hermes_cli.lifecycle import invoke_required_hook as _invoke_required_hook
+
+        _persist_gate = _invoke_required_hook(
+            "assistant_persist_gate",
+            response_text=final_response,
+            session_id=agent.session_id or "",
+            task_id=effective_task_id,
+            turn_id=turn_id,
+            model=agent.model,
+            platform=getattr(agent, "platform", None) or "",
+        )
+        if _persist_gate is not None:
+            if (
+                not isinstance(_persist_gate, dict)
+                or _persist_gate.get("action") != "ALLOW"
+                or not isinstance(_persist_gate.get("content"), str)
+            ):
+                raise RuntimeError("assistant persistence aborted by Host gate")
+            final_response = _persist_gate["content"]
+            _persist_gate_content_sha256 = _persist_gate.get("content_sha256")
+            if not isinstance(_persist_gate_content_sha256, str):
+                raise RuntimeError("Host gate returned no content hash")
+            _hard_persist_gate_applied = True
+
     # Persist session to both JSON log and SQLite only after private retry
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
+    _session_persisted = False
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
@@ -312,21 +414,8 @@ def finalize_turn(
         # nudges need stripping; the assistant candidate persists in
         # state.db. (#65919 §7)
         _drop_verification_continuation_scaffolding(messages)
-
-        # #95514: an empty terminal completion is not authoritative when the
-        # stream already delivered text. Recover before persist so a blank
-        # assistant tail is filled instead of frozen as content=''.
-        _recovered_from_stream = False
-        if not interrupted and not failed:
-            _streamed = getattr(agent, "_current_streamed_assistant_text", "") or ""
-            if isinstance(_streamed, str):
-                _streamed = _streamed.strip()
-            else:
-                _streamed = ""
-            _final_visible = flatten_message_text(final_response).strip() if final_response else ""
-            if not _final_visible and _streamed:
-                final_response = _streamed
-                _recovered_from_stream = True
+        if _hard_persist_gate_applied:
+            _drop_length_continuation_scaffolding(messages)
 
         # When the turn was interrupted and the last message is a tool
         # result, append a synthetic assistant message to close the
@@ -362,35 +451,13 @@ def finalize_turn(
         # matches the final response is not duplicated at budget
         # exhaustion. (#65919 §7)
         if final_response and not interrupted:
-            try:
-                _tail = messages[-1] if messages else None
-            except Exception:
-                _tail = None
-            _tail_role = _tail.get("role") if isinstance(_tail, dict) else None
-            if _tail_role != "assistant":
-                # Tail is not an assistant row — append the final response
-                # so the durable turn closes with the answer (#43849/#44100).
-                append_message(
-                    messages,
-                    {"role": "assistant", "content": final_response},
-                )
-            elif (
-                isinstance(_tail, dict)
-                and _tail.get("content") != final_response
-                and (
-                    _is_pure_tool_call_tail(_tail)
-                    or (
-                        _recovered_from_stream
-                        and _assistant_row_missing_visible_text(_tail)
-                    )
-                )
-            ):
-                # The tail IS an assistant row, but a *pure tool-call turn* or
-                # a blank assistant tail whose content was recovered from the
-                # stream buffer (#95514). Fill that row's content instead of
-                # appending, so the durable turn ends with the answer without
-                # creating an assistant→assistant pair.
-                _fill_assistant_tail_content(agent, _tail, final_response)
+            _ensure_authorized_assistant_row(
+                agent,
+                messages,
+                final_response,
+                hard_gate=_hard_persist_gate_applied,
+                replace_blank_tail=_recovered_from_stream,
+            )
 
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the
@@ -462,9 +529,44 @@ def finalize_turn(
                 logger.info("Micro-compaction failed: %s", _mc_err)
 
         agent._persist_session(messages, conversation_history)
+        _session_persisted = True
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+
+    if _hard_persist_gate_applied:
+        if not _session_persisted:
+            raise RuntimeError("authorized assistant content was not persisted")
+        _persisted_tail = messages[-1] if messages else None
+        _message_id = (
+            _persisted_tail.get("_row_id")
+            if isinstance(_persisted_tail, dict)
+            else None
+        )
+        _persisted_content = (
+            _persisted_tail.get("content")
+            if isinstance(_persisted_tail, dict)
+            else None
+        )
+        if not isinstance(_persisted_content, str):
+            raise RuntimeError("Session persistence returned no assistant body")
+        _receipt = _invoke_required_hook(
+            "assistant_persist_receipt",
+            session_id=agent.session_id or "",
+            task_id=effective_task_id,
+            turn_id=turn_id,
+            message_id=_message_id,
+            assistant_response=final_response,
+            content_sha256=_persist_gate_content_sha256,
+            persisted_message_id=_message_id,
+            persisted_content=_persisted_content,
+            model=agent.model,
+            platform=getattr(agent, "platform", None) or "",
+        )
+        if not isinstance(_receipt, dict) or _receipt.get("action") != "COMMITTED":
+            raise RuntimeError(
+                "Host did not acknowledge the assistant persistence receipt"
+            )
 
     # The gateway owns a separate in-memory history snapshot. Keep it current
     # even when finalization reports a cleanup error: a later prompt must not be
@@ -533,7 +635,7 @@ def finalize_turn(
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns
     # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _hard_persist_gate_applied:
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
             if _failed and agent._file_mutation_verifier_enabled():
@@ -559,7 +661,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and not _hard_persist_gate_applied:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -608,7 +710,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _hard_persist_gate_applied:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(

@@ -1322,7 +1322,40 @@ def build_turn_context(
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
-    # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
+    # Optional Host-owned request gate. Unlike compatibility hooks, callback
+    # failures and explicit ABORT results stop the turn before a provider call.
+    from hermes_cli.lifecycle import invoke_required_hook as _invoke_required_hook
+    _provider_gate = _invoke_required_hook(
+        "provider_request_gate",
+        session_id=agent.session_id,
+        task_id=effective_task_id,
+        turn_id=turn_id,
+        user_message=original_user_message,
+        conversation_history=list(messages),
+        is_first_turn=(not bool(conversation_history)),
+        model=agent.model,
+        platform=getattr(agent, "platform", None) or "",
+        parent_session_id=getattr(agent, "_parent_session_id", None) or "",
+        sender_id=getattr(agent, "_user_id", None) or "",
+    )
+    if _provider_gate is not None:
+        if (
+            not isinstance(_provider_gate, dict)
+            or _provider_gate.get("action") != "ALLOW"
+        ):
+            reason = (
+                _provider_gate.get("message")
+                if isinstance(_provider_gate, dict)
+                else None
+            )
+            raise RuntimeError(reason or "provider request aborted by Host gate")
+    _provider_gate_context = (
+        str(_provider_gate.get("context"))
+        if isinstance(_provider_gate, dict) and _provider_gate.get("context")
+        else ""
+    )
+
+    # Compatibility plugin context hook (not a control boundary).
     plugin_user_context = ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
@@ -1339,7 +1372,9 @@ def build_turn_context(
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
         )
-        _ctx_parts: list[str] = []
+        _ctx_parts: list[str] = (
+            [_provider_gate_context] if _provider_gate_context else []
+        )
         # Spill oversized per-hook context to disk so a runaway plugin
         # can't inflate every subsequent turn's prompt. Ported from
         # openai/codex PR #21069 ("Spill large hook outputs from context").

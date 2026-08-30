@@ -22,6 +22,13 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     return plugins.invoke_hook(hook_name, **kwargs)
 
 
+def invoke_required_hook(hook_name: str, **kwargs: Any) -> Any:
+    """Run one optional Host gate with fail-closed callback semantics."""
+    from hermes_cli import plugins
+
+    return plugins.invoke_required_hook(hook_name, **kwargs)
+
+
 def has_hook(hook_name: str) -> bool:
     """Return whether a first-party observer or plugin consumes a hook."""
     try:

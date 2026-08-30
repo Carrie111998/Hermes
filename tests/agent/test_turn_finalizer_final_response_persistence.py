@@ -273,6 +273,170 @@ def test_final_response_fill_invalidates_flush_scan_cursor():
     assert agent._db_flush_scan_prefix is None
 
 
+def test_required_gate_rewrites_committed_tail_and_receipts_exact_body(
+    monkeypatch,
+):
+    """The receipt describes the exact body authorized by the Host gate."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    seen_receipt: dict[str, Any] = {}
+
+    def required(name, **kwargs):
+        if name == "assistant_persist_gate":
+            return {
+                "action": "ALLOW",
+                "content": "authorized body",
+                "content_sha256": "gate-hash",
+            }
+        if name == "assistant_persist_receipt":
+            seen_receipt.update(kwargs)
+            assert kwargs["message_id"] == kwargs["persisted_message_id"]
+            assert kwargs["assistant_response"] == kwargs["persisted_content"]
+            return {"action": "COMMITTED", "message_id": str(kwargs["message_id"])}
+        return None
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_required_hook", required)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "provisional",
+            "_row_id": 41,
+            "_db_persisted": True,
+        },
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="untrusted body",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert result["final_response"] == "authorized body"
+    assert agent.persisted_messages[-1]["content"] == "authorized body"
+    assert seen_receipt["message_id"] == 41
+    assert seen_receipt["persisted_content"] == "authorized body"
+
+
+def test_required_gate_updates_exact_sqlite_row(monkeypatch, tmp_path):
+    """A gated replacement updates its committed row instead of guessing."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    receipts: list[dict[str, Any]] = []
+
+    def required(name, **kwargs):
+        if name == "assistant_persist_gate":
+            return {
+                "action": "ALLOW",
+                "content": "authorized body",
+                "content_sha256": "gate-hash",
+            }
+        if name == "assistant_persist_receipt":
+            receipts.append(kwargs)
+            return {"action": "COMMITTED", "message_id": str(kwargs["message_id"])}
+        return None
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_required_hook", required)
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("sess-test", source="cli")
+    agent = FakeAgent()
+    agent._session_db = db
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "provisional"},
+    ]
+    db.append_messages_batch("sess-test", messages)
+    for message in messages:
+        message["_db_persisted"] = True
+
+    try:
+        finalize_turn(
+            agent,
+            final_response="untrusted body",
+            api_call_count=1,
+            interrupted=False,
+            failed=False,
+            messages=messages,
+            conversation_history=[],
+            effective_task_id="task",
+            turn_id="turn",
+            user_message="q",
+            original_user_message="q",
+            _should_review_memory=False,
+            _turn_exit_reason="text_response(final)",
+        )
+        stored = db.get_messages_as_conversation(
+            "sess-test", include_row_ids=True
+        )
+        assert stored[-1]["content"] == "authorized body"
+        assert stored[-1]["_row_id"] == messages[-1]["_row_id"]
+        assert receipts[-1]["persisted_content"] == "authorized body"
+    finally:
+        db.close()
+
+
+def test_stream_recovery_cannot_bypass_required_gate(monkeypatch):
+    """A blank terminal object with streamed text is still Host-authorized."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    gated_inputs: list[str] = []
+
+    def required(name, **kwargs):
+        if name == "assistant_persist_gate":
+            gated_inputs.append(kwargs["response_text"])
+            return {
+                "action": "ALLOW",
+                "content": "authorized streamed body",
+                "content_sha256": "gate-hash",
+            }
+        if name == "assistant_persist_receipt":
+            return {"action": "COMMITTED", "message_id": str(kwargs["message_id"])}
+        return None
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_required_hook", required)
+    agent = FakeAgent()
+    agent._current_streamed_assistant_text = "untrusted streamed body"
+    messages = [
+        {"role": "user", "content": "q"},
+        {
+            "role": "assistant",
+            "content": "",
+            "_row_id": 42,
+            "_db_persisted": True,
+        },
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert gated_inputs == ["untrusted streamed body"]
+    assert result["final_response"] == "authorized streamed body"
+    assert agent.persisted_messages[-1]["content"] == "authorized streamed body"
+
+
 def test_empty_final_response_recovers_stream_buffer_into_blank_assistant_row(
     monkeypatch, tmp_path
 ):
@@ -408,4 +572,3 @@ def test_delivery_only_reasoning_excerpt_does_not_fill_blank_assistant(monkeypat
         and "only internal reasoning" in (m.get("content") or "")
         for m in result["messages"]
     )
-

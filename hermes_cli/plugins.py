@@ -161,6 +161,9 @@ _install_plugin_debug_handler()
 # ---------------------------------------------------------------------------
 
 VALID_HOOKS: Set[str] = {
+    "provider_request_gate",
+    "assistant_persist_gate",
+    "assistant_persist_receipt",
     "pre_tool_call",
     "post_tool_call",
     "transform_terminal_output",
@@ -5698,6 +5701,17 @@ class PluginManager:
                 )
         return results
 
+    def invoke_required_hook(self, hook_name: str, **kwargs: Any) -> Any:
+        """Invoke one fail-closed Host gate without compatibility isolation."""
+        callbacks = self._hooks.get(hook_name, [])
+        if not callbacks:
+            return None
+        if len(callbacks) != 1:
+            raise RuntimeError(
+                f"required Host gate {hook_name!r} must have exactly one owner"
+            )
+        return self._invoke_hook_callback(callbacks[0], kwargs)
+
     def _subscribe_event(
         self,
         owner: str,
@@ -6470,6 +6484,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     Returns a list of non-``None`` return values from plugin callbacks.
     """
     return _delivery_manager().invoke_hook(hook_name, **kwargs)
+
+
+def invoke_required_hook(hook_name: str, **kwargs: Any) -> Any:
+    """Invoke a single Host gate and propagate registration/callback errors."""
+    return _delivery_manager().invoke_required_hook(hook_name, **kwargs)
 
 
 def render_system_prompt_sections(

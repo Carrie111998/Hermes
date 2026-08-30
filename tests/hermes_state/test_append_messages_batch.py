@@ -120,6 +120,23 @@ class TestAppendMessagesBatch:
         ).fetchone()
         assert row["message_count"] == 0
 
+    def test_update_assistant_content_targets_exact_active_row(self, db):
+        rows = [{"role": "assistant", "content": "provisional"}]
+        db.append_messages_batch("sess-batch", rows)
+        row_id = rows[0]["_row_id"]
+
+        assert db.update_assistant_message_content(
+            "sess-batch", row_id, "authorized"
+        ) is True
+        stored = db.get_messages_as_conversation(
+            "sess-batch", include_row_ids=True
+        )
+        assert stored[-1]["_row_id"] == row_id
+        assert stored[-1]["content"] == "authorized"
+        assert db.update_assistant_message_content(
+            "other-session", row_id, "should not move"
+        ) is False
+
     def test_atomicity_all_or_nothing(self, db, monkeypatch):
         """A failure mid-batch leaves ZERO rows and untouched counters."""
         real_insert = SessionDB._insert_message_rows
