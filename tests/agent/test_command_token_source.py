@@ -64,12 +64,19 @@ class TestMinting:
             CommandTokenSource("true", "dbx")()
 
     def test_nonzero_exit_is_an_error(self):
+        # argv-style: /bin/sh -c lets us exit with a specific code without using
+        # shell-only metachars (the previous `exit 3` was a shell builtin that
+        # has no argv form). shlex.split() yields ["/bin/sh","-c","exit 3"] and
+        # the exit code is preserved.
         with pytest.raises(CommandTokenError, match="exited 3"):
-            CommandTokenSource("exit 3", "dbx")()
+            CommandTokenSource("/bin/sh -c 'exit 3'", "dbx")()
 
     def test_failure_message_is_actionable_without_echoing_the_command(self):
         """Actionable, but never echoes the command (it may embed a secret)."""
-        secret_cmd = "print-token --client-secret=SENTINEL-SECRET; exit 1"
+        # argv-style: the secret argument is a plain argv token, not a shell
+        # metachar — so the shell-mode rejection (which would otherwise fire on
+        # `;`) does not trigger.
+        secret_cmd = "/bin/sh -c 'print-token --client-secret=SENTINEL-SECRET; exit 1'"
         with pytest.raises(CommandTokenError) as excinfo:
             CommandTokenSource(secret_cmd, "dbx")()
         message = str(excinfo.value)
@@ -81,8 +88,12 @@ class TestMinting:
 class TestNoCredentialLeak:
     def test_failure_message_excludes_command_output(self):
         """A failing auth helper may print a token — it must not be surfaced."""
+        # argv-style: keep the multi-statement semantics inside a single quoted
+        # argv token (`/bin/sh -c '...'`) so the helper still emits SENTINEL to
+        # stdout/stderr before exiting non-zero. No shell metachars in the
+        # outer command string — the argv-mode default accepts it.
         source = CommandTokenSource(
-            "printf 'SENTINEL-SECRET'; printf 'stderr-SENTINEL' >&2; exit 1",
+            "/bin/sh -c \"printf 'SENTINEL-SECRET'; printf 'stderr-SENTINEL' >&2; exit 1\"",
             "dbx",
         )
         with pytest.raises(CommandTokenError) as excinfo:
@@ -98,10 +109,20 @@ class TestCaching:
         assert source() == source()
 
     def test_expired_token_is_reminted(self):
-        # date +%s%N changes every run; $RANDOM would be bash-only (empty
-        # under dash, which is what /bin/sh is on Debian-family CI).
+        # argv-style: a counter on disk changes every run. `$RANDOM` would be
+        # bash-only (empty under dash, which is /bin/sh on Debian-family CI),
+        # and the original `$(date +%s%N)` used `$()` — a shell metachar that
+        # the argv-mode default blocks. `cat /tmp/...` reads the counter.
+        import os
+        counter = os.path.join(os.environ.get("TMPDIR", "/tmp"), "hermes_keycmd_expired_test")
+        with open(counter, "w") as _f:
+            _f.write("0")
+        # python3 prints whatever value is in the file, then we bump it.
         source = CommandTokenSource(
-            """printf '{"access_token":"tok-%s","expires_in":3600}' "$(date +%s%N)" """,
+            f'python3 -c "import time; '
+            f'v=open({counter!r}).read().strip(); '
+            f'open({counter!r},\'w\').write(str(int(v)+1)); '
+            f'print(\'{{\\"access_token\\":\\"tok-\' + v + \'\\",\\"expires_in\\":3600}}\')"',
             "dbx",
         )
         first = source()
@@ -282,9 +303,14 @@ class TestAbsoluteExpiry:
     def test_the_token_actually_gets_re_minted(self, tmp_path):
         """The regression that mattered: a deadline must expire the cache."""
         counter = tmp_path / "calls"
+        # argv-style: a python one-liner appends `x` to the counter and prints
+        # the JSON token. The original used `printf x >> {counter}; printf ...`
+        # which depends on shell redirection (`>>`) and command chaining (`;`)
+        # — both shell metachars blocked by argv-mode.
+        deadline = self._iso(1)
         cmd = (
-            f"printf x >> {counter}; "
-            f"printf '%s' '{{\"access_token\":\"t\",\"expiry\":\"{self._iso(1)}\"}}'"
+            f"python3 -c \"open({str(counter)!r}, 'a').write('x'); "
+            f"print('{{\\\\\"access_token\\\\\":\\\\\"t\\\\\",\\\\\"expiry\\\\\":\\\\\"{deadline}\\\\\"}}')\""
         )
         src = CommandTokenSource(cmd, "p")
         src()
