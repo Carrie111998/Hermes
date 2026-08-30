@@ -8,6 +8,8 @@ provider/base_url/api_key empty in AIAgent, causing HTTP 404.
 import os
 from unittest.mock import MagicMock, patch
 
+from hermes_cli.auth import AuthError
+
 
 def test_make_agent_passes_resolved_provider():
     """_make_agent forwards provider/base_url/api_key/api_mode from
@@ -58,6 +60,51 @@ def test_make_agent_passes_resolved_provider():
         assert call_kwargs.kwargs["base_url"] == "https://api.anthropic.com"
         assert call_kwargs.kwargs["api_key"] == "sk-test-key"
         assert call_kwargs.kwargs["api_mode"] == "anthropic_messages"
+
+
+def test_make_agent_preserves_named_custom_provider_on_auth_fallback():
+    """Setup-time fallback keeps the configured provider identity for billing."""
+    fallback_runtime = {
+        "provider": "custom",
+        "requested_provider": "my-custom-provider",
+        "base_url": "https://example.com/v1",
+        "api_key": "sk-fallback",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": None,
+        "credential_pool": None,
+    }
+    fake_cfg = {
+        "model": {"default": "primary-model", "provider": "xiaomi"},
+        "agent": {"system_prompt": "test"},
+    }
+    fallback_chain = [
+        {"provider": "my-custom-provider", "model": "some-model"},
+    ]
+
+    with (
+        patch("tui_gateway.server._load_cfg", return_value=fake_cfg),
+        patch("tui_gateway.server._get_db", return_value=MagicMock()),
+        patch("tui_gateway.server._load_reasoning_config", return_value=None),
+        patch("tui_gateway.server._load_service_tier", return_value=None),
+        patch("tui_gateway.server._load_enabled_toolsets", return_value=None),
+        patch("tui_gateway.server._load_fallback_model", return_value=fallback_chain),
+        patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=[
+                AuthError("primary unavailable", provider="xiaomi"),
+                fallback_runtime,
+            ],
+        ),
+        patch("run_agent.AIAgent") as mock_agent,
+    ):
+        from tui_gateway.server import _make_agent
+
+        _make_agent("sid-fallback", "key-fallback")
+
+    call_kwargs = mock_agent.call_args.kwargs
+    assert call_kwargs["model"] == "some-model"
+    assert call_kwargs["provider"] == "my-custom-provider"
 
 
 def test_probe_config_health_flags_null_sections():

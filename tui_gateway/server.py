@@ -8310,11 +8310,22 @@ def _make_agent(
             if not resolution.selected_model:
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
+    # Runtime resolution deliberately separates the transport/billing class
+    # (``custom``) from the configured provider identity. Setup-time fallback
+    # must expose the selected identity just like in-loop fallback and /model;
+    # otherwise Desktop UI and token accounting collapse every named custom
+    # fallback to the generic ``custom`` bucket (#98739).
+    active_provider = (
+        runtime.get("requested_provider")
+        if resolution.used_fallback
+        else runtime.get("provider")
+    )
     _pr = _load_provider_routing()
     return AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
-        provider=runtime.get("provider"),
+        provider=active_provider,
+        requested_provider=runtime.get("requested_provider"),
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
         api_mode=runtime.get("api_mode"),
