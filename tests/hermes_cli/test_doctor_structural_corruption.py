@@ -87,6 +87,41 @@ class TestClassifier:
         integrity = [("Tree 999 page 1: btreeInitPage() returns error code 11",)]
         assert _integrity_damage_is_non_fts(integrity, _master([])) is False
 
+    def test_fts_lookalike_foreign_object_is_structural(self):
+        # The FTS set is anchored on the Hermes-owned messages_fts roots: a
+        # user-created table whose name merely ends like an FTS shadow must
+        # NOT be swallowed into the FTS-repairable set.
+        integrity = [("Tree 21 page 30: 2nd reference to page 5453",)]
+        master = _master([(21, "table", "archive_fts_data")])
+        assert _integrity_damage_is_non_fts(integrity, master) is True
+
+    def test_freelist_damage_is_structural(self):
+        # Field-reported lines from a gateway_routing incident: freelist
+        # damage belongs to the database file itself and no FTS rebuild
+        # repairs the free-page chain, so it is structural even when no
+        # canonical tree line is present.
+        integrity = [
+            ("Freelist: freelist leaf count too big on page 408680",),
+            ("Freelist: invalid page number 167772160",),
+        ]
+        assert _integrity_damage_is_non_fts(integrity, _master([])) is True
+
+    def test_field_reported_gateway_routing_incident_is_structural(self):
+        # The exact shape from the production follow-up: a damaged canonical
+        # table (tree 15 -> gateway_routing) with freelist damage alongside.
+        integrity = [
+            ("Tree 15 page 15 cell 0:      2nd reference to page 5453",),
+            ("Tree 15 page 15 cell 61: 2nd reference to page 5454",),
+            ("Freelist: freelist leaf count too big on page 408680",),
+            ("Freelist: invalid page number 167772160",),
+        ]
+        master = _master([
+            (15, "table", "gateway_routing"),
+            (12, "table", "messages_fts_data"),
+            (7, "table", "messages_fts_trigram"),
+        ])
+        assert _integrity_damage_is_non_fts(integrity, master) is True
+
 
 class TestProbeAgainstRealDb:
     def test_healthy_db_is_not_structural(self, tmp_path):

@@ -1235,12 +1235,16 @@ def check_macos_full_disk_access() -> None:
 
 # FTS5 object-name shapes (virtual table + shadow tables) for the messages
 # search indexes: messages_fts{,_trigram,_cjk} plus their _data/_idx/
-# _content/_docsize/_config/_segdir/_segments shadows.
+# _content/_docsize/_config/_segdir/_segments shadows. Full-match anchored on
+# the Hermes-owned roots: a suffix-only pattern would also swallow a
+# user-created lookalike such as archive_fts_data into the FTS set and keep
+# routing its damage to the FTS rebuild paths.
 _FTS_OBJECT_RE = re.compile(
-    r"_fts(_trigram|_cjk)?(_data|_idx|_content|_docsize|_config|_segdir|_segments)?$"
+    r"messages_fts(_trigram|_cjk)?(_data|_idx|_content|_docsize|_config|_segdir|_segments)?"
 )
 _TREE_RE = re.compile(r"\bTree (\d+)\b")
 _MISSING_INDEX_RE = re.compile(r"missing from index (\S+)")
+_FREELIST_RE = re.compile(r"^Freelist\b")
 
 
 def _integrity_damage_is_non_fts(integrity_rows: list, master_rows: list) -> bool:
@@ -1249,18 +1253,24 @@ def _integrity_damage_is_non_fts(integrity_rows: list, master_rows: list) -> boo
     ``integrity_rows`` are the raw PRAGMA integrity_check result rows;
     ``master_rows`` are ``(rootpage, type, name)`` triples from sqlite_master.
     Damage is structural when any damaged object — a tree id mapped through
-    rootpage, or an index named in a "row N missing from index X" line —
-    falls outside the FTS shadow set. Unparseable lines are deliberately
-    NOT counted (fail-closed toward the existing FTS wording, which is
-    never wrong to show, just incomplete).
+    rootpage, an index named in a "row N missing from index X" line, or the
+    database's own freelist — falls outside the FTS shadow set. Unparseable
+    lines are deliberately NOT counted (fail-closed toward the existing FTS
+    wording, which is never wrong to show, just incomplete).
     """
     name_by_rootpage = {int(rp): name for rp, _t, name in master_rows if rp}
 
     def _is_fts(name: str) -> bool:
-        return bool(_FTS_OBJECT_RE.search(name))
+        return bool(_FTS_OBJECT_RE.fullmatch(name))
 
     for row in integrity_rows:
         text = str(row[0]) if isinstance(row, (tuple, list)) else str(row)
+        if _FREELIST_RE.match(text):
+            # Freelist damage belongs to the database file itself, not to any
+            # FTS object: the free-page chain survives no FTS rebuild, so it
+            # is structural by definition (field-reported alongside a damaged
+            # canonical tree in the #88587 follow-up incident).
+            return True
         m = _TREE_RE.search(text)
         if m:
             name = name_by_rootpage.get(int(m.group(1)), "")
