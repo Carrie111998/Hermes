@@ -474,6 +474,39 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
             "optimize-storage' with the gateway stopped)",
         ))
 
+    cjk_pending = stats.get("fts_cjk_rebuild_pending") is True
+    cjk_stale = stats.get("fts_cjk_stale") is True
+    if cjk_pending or cjk_stale:
+        indexed = stats.get("fts_cjk_rebuild_progress")
+        total = stats.get("fts_cjk_rebuild_high_water")
+        has_progress = (
+            isinstance(indexed, int)
+            and isinstance(total, int)
+            and total > 0
+        )
+        progress = ""
+        if has_progress:
+            percent = min(100, max(0, int(100 * indexed / total)))
+            progress = (
+                f"; backfill progress is {percent}% "
+                f"({indexed:,}/{total:,})"
+            )
+
+        if cjk_stale:
+            lines.append((
+                "warn",
+                "CJK search index is stale" + progress,
+                "(run 'hermes sessions optimize-storage' to rebuild it; "
+                "stale recovery restarts the CJK index from scratch)",
+            ))
+        else:
+            lines.append((
+                "warn",
+                "CJK search-index rebuild is incomplete" + progress,
+                "(run 'hermes sessions optimize-storage' to resume; CJK "
+                "search uses the fallback path until it completes)",
+            ))
+
     # Advisory: oversized database. Suggest auto_prune, and — when the v23
     # FTS rebuild is pending OR the DB still carries the legacy inline
     # trigram layout (fts_storage_version marker absent) — the offline

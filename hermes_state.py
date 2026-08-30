@@ -4108,6 +4108,10 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
     - ``fts_rebuild_pending`` — True when the deferred v23 backfill has not
       finished (high_water present and progress < high_water)
     - ``fts_rebuild_high_water`` / ``fts_rebuild_progress`` — raw ints
+    - ``fts_cjk_rebuild_pending`` — True when the optional CJK index backfill
+      has not finished
+    - ``fts_cjk_rebuild_high_water`` / ``fts_cjk_rebuild_progress`` — raw ints
+    - ``fts_cjk_stale`` — True when the CJK index requires a clean rebuild
     - ``fts_rebuild_deferral`` — durable blocked-repair diagnostic, when present
     """
     stats: Dict[str, Any] = {
@@ -4124,6 +4128,10 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
         "fts_rebuild_pending": None,
         "fts_rebuild_high_water": None,
         "fts_rebuild_progress": None,
+        "fts_cjk_rebuild_pending": None,
+        "fts_cjk_rebuild_high_water": None,
+        "fts_cjk_rebuild_progress": None,
+        "fts_cjk_stale": None,
         "fts_rebuild_deferral": None,
     }
 
@@ -4215,6 +4223,26 @@ def collect_state_db_stats(db_path: Path) -> Dict[str, Any]:
             stats["fts_rebuild_pending"] = False
         else:
             stats["fts_rebuild_pending"] = (progress or 0) < high_water
+
+        cjk_high_water = _meta_int("fts_cjk_rebuild_high_water")
+        cjk_progress = _meta_int("fts_cjk_rebuild_progress")
+        stats["fts_cjk_rebuild_high_water"] = cjk_high_water
+        stats["fts_cjk_rebuild_progress"] = cjk_progress
+        if cjk_high_water is None:
+            stats["fts_cjk_rebuild_pending"] = False
+        else:
+            stats["fts_cjk_rebuild_pending"] = (
+                (cjk_progress or 0) < cjk_high_water
+            )
+        try:
+            stats["fts_cjk_stale"] = bool(
+                conn.execute(
+                    "SELECT 1 FROM state_meta WHERE key = ? LIMIT 1",
+                    (FTS_CJK_STALE_KEY,),
+                ).fetchone()
+            )
+        except Exception:
+            pass
         try:
             row = conn.execute(
                 "SELECT value FROM state_meta WHERE key = ? LIMIT 1",

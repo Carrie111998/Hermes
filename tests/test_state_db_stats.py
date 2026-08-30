@@ -3,7 +3,7 @@
 Covers:
 - ``hermes_state.collect_state_db_stats``: read-only, best-effort stats
   (page_count, freelist, WAL size, journal mode, row counts, FTS presence,
-  pending v23 FTS-rebuild bookkeeping).
+  pending v23/CJK FTS-rebuild bookkeeping).
 - ``hermes_state.count_db_holders``: /proc-based best-effort probe for how
   many processes hold the DB file open (Linux only; None elsewhere/on error).
 - ``hermes_cli.doctor._render_state_db_stats``: formatting/threshold helper
@@ -62,6 +62,8 @@ def test_collect_stats_sane_values(populated_db):
 
     # No rebuild pending on a fresh DB.
     assert stats["fts_rebuild_pending"] in (False, None)
+    assert stats["fts_cjk_rebuild_pending"] in (False, None)
+    assert stats["fts_cjk_stale"] in (False, None)
 
 
 def test_collect_stats_is_read_only(populated_db):
@@ -132,6 +134,27 @@ def test_collect_stats_rebuild_pending_flag(populated_db):
     assert stats["fts_rebuild_progress"] == 40
 
 
+def test_collect_stats_cjk_rebuild_and_stale_state(populated_db):
+    conn = sqlite3.connect(str(populated_db))
+    conn.executemany(
+        "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, ?)",
+        (
+            ("fts_cjk_rebuild_high_water", "290407"),
+            ("fts_cjk_rebuild_progress", "148500"),
+            ("fts_cjk_stale", "1"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    stats = collect_state_db_stats(populated_db)
+
+    assert stats["fts_cjk_rebuild_pending"] is True
+    assert stats["fts_cjk_rebuild_high_water"] == 290407
+    assert stats["fts_cjk_rebuild_progress"] == 148500
+    assert stats["fts_cjk_stale"] is True
+
+
 # ── count_db_holders ────────────────────────────────────────────────────
 
 
@@ -175,6 +198,10 @@ def _base_stats(**overrides):
         "fts_rebuild_pending": False,
         "fts_rebuild_high_water": None,
         "fts_rebuild_progress": None,
+        "fts_cjk_rebuild_pending": False,
+        "fts_cjk_rebuild_high_water": None,
+        "fts_cjk_rebuild_progress": None,
+        "fts_cjk_stale": False,
     }
     stats.update(overrides)
     return stats
@@ -234,6 +261,41 @@ def test_render_large_db_legacy_trigram_suggests_optimize():
     )
     blob = " ".join(" ".join(str(p) for p in line) for line in lines)
     assert "optimize-storage" in blob
+
+
+def test_render_warns_on_interrupted_cjk_rebuild_regardless_of_db_size():
+    from hermes_cli.doctor import _render_state_db_stats
+
+    lines = _render_state_db_stats(_base_stats(
+        fts_cjk_rebuild_pending=True,
+        fts_cjk_rebuild_high_water=290407,
+        fts_cjk_rebuild_progress=148500,
+    ))
+
+    warnings = [line for line in lines if line[0] == "warn"]
+    blob = " ".join(" ".join(str(part) for part in line) for line in warnings)
+    assert "51%" in blob
+    assert "148,500/290,407" in blob
+    assert "optimize-storage" in blob
+    assert "resume" in blob
+
+
+def test_render_stale_cjk_rebuild_warns_progress_will_be_discarded():
+    from hermes_cli.doctor import _render_state_db_stats
+
+    lines = _render_state_db_stats(_base_stats(
+        fts_cjk_rebuild_pending=True,
+        fts_cjk_rebuild_high_water=290407,
+        fts_cjk_rebuild_progress=148500,
+        fts_cjk_stale=True,
+    ))
+
+    warnings = [line for line in lines if line[0] == "warn"]
+    assert len(warnings) == 1
+    blob = " ".join(str(part) for part in warnings[0])
+    assert "stale" in blob
+    assert "51%" in blob
+    assert "from scratch" in blob
 
 
 def test_render_does_not_duplicate_legacy_wal_warning():
