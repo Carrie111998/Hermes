@@ -1348,10 +1348,31 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         for msg_data in messages:
                             event = await self._build_message_event(msg_data)
                             if event:
+                                # Preserve one native message per exclusive
+                                # admission. This must precede WhatsApp text
+                                # debounce and BasePlatformAdapter's active-
+                                # session merging so quote/message identity is
+                                # never coalesced into another delivery.
+                                # Poll updates are native Hermes interaction
+                                # traffic, not ordinary inbox messages. Keep
+                                # them on the stock WhatsApp path even when the
+                                # containing chat has an exclusive text/media
+                                # claim.
+                                is_poll_update = (
+                                    (event.metadata or {}).get("whatsapp_native_type")
+                                    == "pollUpdateMessage"
+                                )
+                                claimed = (
+                                    False
+                                    if is_poll_update
+                                    else await self.dispatch_exclusive_inbound(event)
+                                )
                                 # Fire-and-forget: a slow bridge /read must not
                                 # delay message dispatch (matches BlueBubbles
                                 # asyncio.create_task pattern for mark_read).
                                 asyncio.create_task(self._send_read_receipt(msg_data))
+                                if claimed:
+                                    continue
                                 if event.message_type == MessageType.TEXT:
                                     self._enqueue_text_event(event)
                                 else:
