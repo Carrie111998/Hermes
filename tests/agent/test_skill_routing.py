@@ -5,6 +5,40 @@ import json
 import pytest
 
 
+def test_skill_retriever_reads_behavioral_settings_from_config(monkeypatch):
+    from agent import skill_retriever
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "skills": {
+                "retrieval": {
+                    "enabled": "off",
+                    "top_k": 9,
+                    "embedding_model": "example/model",
+                }
+            }
+        },
+    )
+
+    config = skill_retriever._retrieval_config()
+    assert skill_retriever._retrieval_enabled(config) is False
+    assert skill_retriever._retrieval_top_k(config) == 9
+    assert config["embedding_model"] == "example/model"
+
+
+def test_skill_retriever_config_fails_open_and_bounds_top_k(monkeypatch):
+    from agent import skill_retriever
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", lambda: {"skills": "bad"}
+    )
+    assert skill_retriever._retrieval_config() == {}
+    assert skill_retriever._retrieval_enabled({}) is True
+    assert skill_retriever._retrieval_top_k({"top_k": False}) == 5
+    assert skill_retriever._retrieval_top_k({"top_k": 999}) == 50
+
+
 def _skill(skill_name: str, **overrides):
     skill = {
         "qualified_name": f"testing/{skill_name}",

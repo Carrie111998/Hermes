@@ -1400,8 +1400,9 @@ def usage_report() -> List[Dict[str, Any]]:
 # Extends the sidecar telemetry with an *effectiveness* signal — not just
 # "how often was this skill used" (use_count) but "how well did it work"
 # (success/failure outcomes). The derived utility score feeds:
-#   1. Retrieval re-ranking  — prefer skills that historically worked for
-#      this task type (SkillRetriever.retrieve_detailed layer 6).
+#   1. Retrieval re-ranking  — prefer skills with enough known outcomes over
+#      alternatives that only matched textually. This is global per-skill
+#      utility, not task-type attribution: no raw task text is stored.
 #   2. Curator evidence      — archive/consolidate decisions backed by
 #      effectiveness data instead of activity counts alone.
 #   3. Reflection loop       — failure-heavy skills become candidates for
@@ -1579,13 +1580,12 @@ def list_low_utility_skills(min_samples: int = _UTILITY_MIN_SAMPLES, max_score: 
 
 
 def utility_rerank(skill_names: List[str]) -> List[str]:
-    """Re-rank a list of retrieved skill names by utility score.
+    """Re-rank retrieved skill names by global per-skill utility.
 
     Skills with a utility signal (score is not None) are preferred, ordered
     best-first; skills with no signal keep their original relative order and
-    sort after the scored ones. This is the retrieval-side hook that turns
-    telemetry into better routing: a skill that historically worked for a
-    task type outranks one that only matched textually.
+    sort after the scored ones. Outcome records deliberately omit raw task
+    text, so this is not task-type-specific attribution.
     """
     if not skill_names:
         return skill_names

@@ -15,7 +15,6 @@ Usage:
 
 import logging
 import math
-import os
 import re
 import threading
 import time
@@ -29,8 +28,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──────────────────────────────────────────────
-_DISABLE_ENV = "HERMES_DISABLE_SKILL_RETRIEVAL"
-_TOP_K_ENV = "HERMES_SKILL_RETRIEVAL_TOP_K"
+_DEFAULT_TOP_K = 5
+
+
+def _retrieval_config() -> dict:
+    """Return optional retrieval settings from config.yaml.
+
+    Missing or malformed config is fail-open: retrieval remains enabled with
+    the built-in top-k default. Behavioural settings belong in config.yaml,
+    never in the secret-only environment file.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        skills = config.get("skills", {}) if isinstance(config, dict) else {}
+        retrieval = skills.get("retrieval", {}) if isinstance(skills, dict) else {}
+        return retrieval if isinstance(retrieval, dict) else {}
+    except Exception:
+        return {}
+
+
+def _retrieval_enabled(config: dict) -> bool:
+    value = config.get("enabled", True)
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return value is not False
+
+
+def _retrieval_top_k(config: dict) -> int:
+    value = config.get("top_k", _DEFAULT_TOP_K)
+    if isinstance(value, bool):
+        return _DEFAULT_TOP_K
+    try:
+        return max(1, min(50, int(value)))
+    except (TypeError, ValueError):
+        return _DEFAULT_TOP_K
 
 # RRF parameters
 _RRF_K = 60
@@ -122,13 +155,13 @@ class SkillRetriever:
         self._emb_matrix = None
         self._model = None
         self._jieba_initialized = False
-        self._top_k = int(os.environ.get(_TOP_K_ENV, "5"))
+        config = _retrieval_config()
+        self._top_k = _retrieval_top_k(config)
+        if not _retrieval_enabled(config):
+            logger.info("Skill retrieval disabled by skills.retrieval.enabled")
+            return
         # Start background initialization immediately
         threading.Thread(target=self._lazy_init, daemon=True).start()
-
-        if os.environ.get(_DISABLE_ENV, "").lower() in ("1", "true", "yes"):
-            logger.info("Skill retrieval disabled via %s", _DISABLE_ENV)
-            return
 
     def is_ready(self) -> bool:
         return self._ready
@@ -464,10 +497,13 @@ class SkillRetriever:
             self._emb_matrix = None
             return
 
-        model_name = os.environ.get(
-            "HERMES_EMBEDDING_MODEL",
-            "shibing624/text2vec-base-chinese-paraphrase"
-        )
+        config = _retrieval_config()
+        model_name = str(
+            config.get(
+                "embedding_model",
+                "shibing624/text2vec-base-chinese-paraphrase",
+            )
+        ).strip() or "shibing624/text2vec-base-chinese-paraphrase"
         try:
             self._model = SentenceTransformer(model_name)
             texts = [f"{n}, {d}" for n, d in zip(self._skill_names, self._skill_descs)]
