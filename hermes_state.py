@@ -6122,6 +6122,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chat_id: str = None,
         chat_type: str = None,
         thread_id: str = None,
+        cwd: str = None,
         display_name: str = None,
         origin_json: str = None,
         include_compression_ancestors: bool = False,
@@ -6186,6 +6187,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     chat_id,
                     chat_type,
                     thread_id,
+                    cwd,
                     display_name,
                     origin_json,
                 )
@@ -6197,6 +6199,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    UPDATE sessions
                    SET session_key = ?, source = ?, user_id = ?, chat_id = ?,
                        chat_type = ?, thread_id = ?,
+                       cwd = CASE
+                           WHEN TRIM(COALESCE(cwd, '')) = '' THEN ?
+                           ELSE cwd
+                       END,
                        display_name = COALESCE(?, display_name),
                        origin_json = COALESCE(?, origin_json)
                    {target_clause}""",
@@ -6215,15 +6221,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     conn.execute(
                         """INSERT INTO sessions (
                                id, source, user_id, session_key, chat_id,
-                               chat_type, thread_id, display_name, origin_json,
-                               started_at
+                               chat_type, thread_id, cwd, display_name,
+                               origin_json, started_at
                            )
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT(id) DO UPDATE SET
                                session_key = COALESCE(sessions.session_key, excluded.session_key),
                                chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
                                chat_type = COALESCE(sessions.chat_type, excluded.chat_type),
                                thread_id = COALESCE(sessions.thread_id, excluded.thread_id),
+                               cwd = CASE
+                                   WHEN TRIM(COALESCE(sessions.cwd, '')) = ''
+                                   THEN excluded.cwd
+                                   ELSE sessions.cwd
+                               END,
                                display_name = COALESCE(sessions.display_name, excluded.display_name),
                                origin_json = COALESCE(sessions.origin_json, excluded.origin_json)""",
                         (
@@ -6234,6 +6245,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             chat_id,
                             chat_type,
                             thread_id,
+                            cwd,
                             display_name,
                             origin_json,
                             time.time(),
