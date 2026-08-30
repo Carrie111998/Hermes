@@ -613,6 +613,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    session_write_policy=None,
 ):
     """
     Initialize the AI Agent.
@@ -700,6 +701,41 @@ def init_agent(
     # skip_memory=True already disables the memory-review trigger; this
     # flag is the explicit single-switch off for both review paths.
     agent.skip_background_review = bool(skip_background_review)
+    # Retain explicit turn authority even for ordinary sessions.  The turn
+    # boundary never treats a missing retained policy as a legitimate NORMAL.
+    from agent.session_write_policy import SessionWritePolicy
+    if session_write_policy is None:
+        agent.session_write_policy = SessionWritePolicy.normal()
+        agent._session_write_policy_protected = False
+    elif isinstance(session_write_policy, SessionWritePolicy):
+        agent.session_write_policy = session_write_policy
+        agent._session_write_policy_protected = bool(session_write_policy.protected)
+    else:
+        # Preserve an invalid explicit value as an invariant failure for the
+        # turn boundary rather than silently coercing it to NORMAL.
+        agent.session_write_policy = session_write_policy
+        agent._session_write_policy_protected = True
+    # Evaluate self-improvement authority once from the initial agent inputs.
+    # Its retained Decision, not later process-environment state, authorizes
+    # background-review suggestion mutations during a turn.
+    try:
+        from agent.self_improvement_policy import BACKGROUND_REVIEW_ORIGIN, evaluate
+
+        policy = agent.session_write_policy
+        agent.self_improvement_decision = evaluate(
+            environment_disabled=agent.skip_background_review,
+            session_read_only=bool(
+                getattr(policy, "protected", True)
+                and getattr(policy, "denies_mutations", True)
+            ),
+            operation_kind="suggestions_write",
+            origin=BACKGROUND_REVIEW_ORIGIN,
+            explicit_opt_in=True,
+        )
+    except Exception:
+        from agent.self_improvement_decision_context import DENY_FALLBACK_DECISION
+
+        agent.self_improvement_decision = DENY_FALLBACK_DECISION
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
