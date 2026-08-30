@@ -1090,7 +1090,13 @@ def _set_nested(config, dotted_key: str, value):
                     f"Cannot navigate into list at key {dotted_key!r}: "
                     f"segment {part!r} is not a numeric index"
                 )
-            current = current[idx]
+            try:
+                current = current[idx]
+            except IndexError:
+                raise IndexError(
+                    f"Cannot navigate into list at key {dotted_key!r}: "
+                    f"index {idx} is out of bounds (length {len(current)})"
+                )
         elif isinstance(current, dict):
             existing = current.get(part)
             # Preserve dicts and lists; replace missing/scalar with a fresh dict.
@@ -1103,7 +1109,20 @@ def _set_nested(config, dotted_key: str, value):
             )
     last = parts[-1]
     if isinstance(current, list):
-        current[int(last)] = value
+        try:
+            idx = int(last)
+        except (TypeError, ValueError):
+            raise TypeError(
+                f"Cannot navigate into list at key {dotted_key!r}: "
+                f"segment {last!r} is not a numeric index"
+            )
+        try:
+            current[idx] = value
+        except IndexError:
+            raise IndexError(
+                f"Cannot assign to list at key {dotted_key!r}: "
+                f"index {idx} is out of bounds (length {len(current)})"
+            )
     else:
         current[last] = value
 
@@ -5772,7 +5791,11 @@ def set_config_value(key: str, value: str, force: bool = False):
                     file=sys.stderr,
                 )
                 sys.exit(1)
-    _set_nested(user_config, key, value)
+    try:
+        _set_nested(user_config, key, value)
+    except (TypeError, IndexError) as exc:
+        print(f"✗ Cannot set {key!r}: {exc}", file=sys.stderr)
+        sys.exit(1)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
     # key the runtime resolver actually reads, instead of being silently
