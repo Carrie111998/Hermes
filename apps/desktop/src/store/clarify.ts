@@ -316,8 +316,13 @@ export function rebindClarifyRequest(fromSessionId: string | null | undefined, t
   const next = { ...requests }
   delete next[fromKey]
 
+  // Never demote a request the target identity already owns — that one is the
+  // newer live epoch. If both name the same request, keep the target payload
+  // and carry the renderer-only alias so settlement still works.
   if (!next[toKey]) {
     next[toKey] = { ...carried, sessionId: toSessionId }
+  } else if (next[toKey].requestId === carried.requestId && !next[toKey].toolCallId && carried.toolCallId) {
+    next[toKey] = { ...next[toKey], toolCallId: carried.toolCallId }
   }
 
   $clarifyRequests.set(next)
@@ -387,12 +392,6 @@ export function settleClarifyRequest(
   const question = correlation.question?.trim()
 
   if (question && question === current.question.trim()) {
-    clearClarifyRequest(current.requestId, current.sessionId)
-
-    return true
-  }
-
-  if (!correlation.requestId && !question) {
     clearClarifyRequest(current.requestId, current.sessionId)
 
     return true

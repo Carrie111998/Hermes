@@ -408,6 +408,23 @@ describe('clarify answered by another renderer', () => {
     expect(hasClarifyRequest(REMOTE_SID)).toBe(false)
     expect(states.get(REMOTE_SID)?.needsInput).toBe(false)
   })
+
+  it('does not settle or clear attention on a clarify completion with no identity and no question', () => {
+    const states = new Map()
+    stream = renderMessageStream(REMOTE_SID, { states })
+
+    startClarify('call-malformed')
+    requestClarify('req-malformed')
+
+    expect($clarifyRequests.get()[REMOTE_SID]?.requestId).toBe('req-malformed')
+    expect(states.get(REMOTE_SID)?.needsInput).toBe(true)
+
+    remoteEvent('tool.complete', { name: 'clarify', result: 'ok' })
+
+    expect($clarifyRequests.get()[REMOTE_SID]?.requestId).toBe('req-malformed')
+    expect(hasClarifyRequest(REMOTE_SID)).toBe(true)
+    expect(states.get(REMOTE_SID)?.needsInput).toBe(true)
+  })
 })
 
 const LONG_SID = 'runtime-long-1'

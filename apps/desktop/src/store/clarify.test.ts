@@ -344,4 +344,12 @@ describe('clarify same-epoch tool-call alias', () => {
     expect(clarifyToolCallAlias('session-alias', 'req-first', { question: 'Proceed?' })).toBe('call-once')
     expect(clarifyToolCallAlias('session-alias', 'req-second', { question: 'Proceed?' })).toBeUndefined()
   })
+
+  it('does not settle a malformed clarify completion with no request id and no usable question', () => {
+    aliased('session-alias', 'req-live', 'call-live')
+
+    expect(settleClarifyRequest('session-alias', { toolName: 'clarify' })).toBe(false)
+    expect($clarifyRequests.get()['session-alias']?.requestId).toBe('req-live')
+    expect(hasClarifyRequest('session-alias')).toBe(true)
+  })
 })
