@@ -1,14 +1,14 @@
-"""``hermes logs`` — view and filter Hermes log files.
+"""Helpers for filtering exported Hermes structured logs.
 
-Supports tailing, following, session filtering, level filtering,
-component filtering, and relative time ranges.  All log files live
-under ``~/.hermes/logs/``.
+The runtime emits logs to stdout/stderr for the container or service supervisor
+to collect. This module keeps JSONL/text filtering helpers for exported log
+streams, but does not read or create a local Hermes log file.
 
 Usage examples::
 
-    hermes logs                    # last 50 lines of agent.log
-    hermes logs -f                 # follow agent.log in real time
-    hermes logs errors             # last 50 lines of errors.log
+    kubectl logs <pod>             # view the JSON stream in Kubernetes
+    gcloud logging read ...        # query Google Cloud Logging
+    hermes logs                    # explain where runtime logs are collected
     hermes logs gateway -n 100    # last 100 lines of gateway.log
     hermes logs gui -f            # follow gui.log (dashboard/pty/ws)
     hermes logs desktop -f        # follow desktop.log (Electron app boot/backend)
@@ -19,6 +19,7 @@ Usage examples::
     hermes logs --since 30m -f     # follow, starting 30 min ago
 """
 
+import json
 import re
 import sys
 import time
@@ -26,17 +27,16 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Sequence
 
-from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_constants import get_hermes_home
 
-# Known log files (name → filename)
+# Retained logical names for API/CLI callers. Runtime logging no longer creates
+# these files, but existing/exported files can still be parsed by the helpers.
 LOG_FILES = {
     "agent": "agent.log",
     "errors": "errors.log",
     "gateway": "gateway.log",
     "gui": "gui.log",
     "desktop": "desktop.log",
-    # Every stdio MCP subprocess's stderr (tools/mcp_tool.py redirects it
-    # here, with per-server session markers) — the "MCP output channel".
     "mcp": "mcp-stderr.log",
 }
 
@@ -81,7 +81,14 @@ def _parse_since(since_str: str) -> Optional[datetime]:
 
 
 def _parse_line_timestamp(line: str) -> Optional[datetime]:
-    """Extract timestamp from a log line. Returns None if not parseable."""
+    """Extract a timestamp from a legacy text or GCP JSON log line."""
+    try:
+        payload = json.loads(line)
+        value = payload.get("time") or payload.get("timestamp")
+        if isinstance(value, str):
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        pass
     m = _TS_RE.match(line)
     if not m:
         return None
@@ -92,13 +99,27 @@ def _parse_line_timestamp(line: str) -> Optional[datetime]:
 
 
 def _extract_level(line: str) -> Optional[str]:
-    """Extract the log level from a line."""
+    """Extract severity from a legacy text or GCP JSON log line."""
+    try:
+        payload = json.loads(line)
+        severity = payload.get("severity")
+        if isinstance(severity, str):
+            return severity.upper()
+    except (ValueError, TypeError, json.JSONDecodeError):
+        pass
     m = _LEVEL_RE.search(line)
     return m.group(1) if m else None
 
 
 def _extract_logger_name(line: str) -> Optional[str]:
-    """Extract the logger name from a log line."""
+    """Extract the logger name from a legacy text or GCP JSON log line."""
+    try:
+        payload = json.loads(line)
+        logger_name = payload.get("logger")
+        if isinstance(logger_name, str):
+            return logger_name
+    except (ValueError, TypeError, json.JSONDecodeError):
+        pass
     m = _LOGGER_NAME_RE.search(line)
     return m.group(1) if m else None
 
@@ -177,80 +198,47 @@ def tail_log(
         sys.exit(1)
 
     log_path = get_hermes_home() / "logs" / filename
-    if not log_path.exists():
-        print(f"Log file not found: {log_path}")
-        print("(Logs are created when Hermes runs — try 'hermes chat' first)")
-        sys.exit(1)
-
-    # Parse --since into a datetime cutoff
-    since_dt = None
-    if since:
-        since_dt = _parse_since(since)
-        if since_dt is None:
+    if log_path.exists():
+        since_dt = _parse_since(since) if since else None
+        if since and since_dt is None:
             print(f"Invalid --since value: {since!r}. Use format like '1h', '30m', '2d'.")
             sys.exit(1)
-
-    min_level = level.upper() if level else None
-    if min_level and min_level not in _LEVEL_ORDER:
-        print(f"Invalid --level: {level!r}. Use DEBUG, INFO, WARNING, ERROR, or CRITICAL.")
-        sys.exit(1)
-
-    # Resolve component to logger name prefixes
-    component_prefixes = None
-    if component:
-        from hermes_logging import COMPONENT_PREFIXES
-        component_lower = component.lower()
-        if component_lower not in COMPONENT_PREFIXES:
-            available = ", ".join(sorted(COMPONENT_PREFIXES))
-            print(f"Unknown component: {component!r}. Available: {available}")
+        min_level = level.upper() if level else None
+        if min_level and min_level not in _LEVEL_ORDER:
+            print(f"Invalid --level: {level!r}. Use DEBUG, INFO, WARNING, ERROR, or CRITICAL.")
             sys.exit(1)
-        component_prefixes = COMPONENT_PREFIXES[component_lower]
-
-    has_filters = (
-        min_level is not None
-        or session is not None
-        or since_dt is not None
-        or component_prefixes is not None
-    )
-
-    # Read and display the tail
-    try:
-        lines = _read_tail(log_path, num_lines, has_filters=has_filters,
-                           min_level=min_level, session_filter=session,
-                           since=since_dt, component_prefixes=component_prefixes)
-    except PermissionError:
-        print(f"Permission denied: {log_path}")
-        sys.exit(1)
-
-    # Print header
-    filter_parts = []
-    if min_level:
-        filter_parts.append(f"level>={min_level}")
-    if session:
-        filter_parts.append(f"session={session}")
-    if component:
-        filter_parts.append(f"component={component}")
-    if since:
-        filter_parts.append(f"since={since}")
-    filter_desc = f" [{', '.join(filter_parts)}]" if filter_parts else ""
-
-    if follow:
-        print(f"--- {display_hermes_home()}/logs/{filename}{filter_desc} (Ctrl+C to stop) ---")
-    else:
-        print(f"--- {display_hermes_home()}/logs/{filename}{filter_desc} (last {num_lines}) ---")
-
-    for line in lines:
-        print(line, end="")
-
-    if not follow:
+        component_prefixes = None
+        if component:
+            from hermes_logging import COMPONENT_PREFIXES
+            component_lower = component.lower()
+            if component_lower not in COMPONENT_PREFIXES:
+                available = ", ".join(sorted(COMPONENT_PREFIXES))
+                print(f"Unknown component: {component!r}. Available: {available}")
+                sys.exit(1)
+            component_prefixes = COMPONENT_PREFIXES[component_lower]
+        lines = _read_tail(
+            log_path,
+            num_lines,
+            has_filters=bool(min_level or session or since_dt or component_prefixes),
+            min_level=min_level,
+            session_filter=session,
+            since=since_dt,
+            component_prefixes=component_prefixes,
+        )
+        for line in lines:
+            print(line, end="")
+        if follow:
+            _follow_log(
+                log_path,
+                min_level=min_level,
+                session_filter=session,
+                since=since_dt,
+                component_prefixes=component_prefixes,
+            )
         return
 
-    # Follow mode — poll for new content
-    try:
-        _follow_log(log_path, min_level=min_level, session_filter=session,
-                     since=since_dt, component_prefixes=component_prefixes)
-    except KeyboardInterrupt:
-        print("\n--- stopped ---")
+    print("Hermes runtime logs are emitted as JSON to stderr/stdout; no local log files are created.")
+    print("For Kubernetes, use `kubectl logs <pod>` or query Google Cloud Logging.")
 
 
 def _read_tail(
@@ -363,35 +351,15 @@ def _follow_log(
 
 
 def list_logs() -> None:
-    """Print available log files with sizes."""
+    """List legacy local logs, then explain the stream-based default."""
     log_dir = get_hermes_home() / "logs"
-    if not log_dir.exists():
-        print(f"No logs directory at {display_hermes_home()}/logs/")
-        return
-
-    print(f"Log files in {display_hermes_home()}/logs/:\n")
     found = False
-    for entry in sorted(log_dir.iterdir()):
-        if entry.is_file() and entry.suffix == ".log":
-            size = entry.stat().st_size
-            mtime = datetime.fromtimestamp(entry.stat().st_mtime)
-            if size < 1024:
-                size_str = f"{size}B"
-            elif size < 1024 * 1024:
-                size_str = f"{size / 1024:.1f}KB"
-            else:
-                size_str = f"{size / (1024 * 1024):.1f}MB"
-            age = datetime.now() - mtime
-            if age.total_seconds() < 60:
-                age_str = "just now"
-            elif age.total_seconds() < 3600:
-                age_str = f"{int(age.total_seconds() / 60)}m ago"
-            elif age.total_seconds() < 86400:
-                age_str = f"{int(age.total_seconds() / 3600)}h ago"
-            else:
-                age_str = mtime.strftime("%Y-%m-%d")
-            print(f"  {entry.name:<25} {size_str:>8}   {age_str}")
-            found = True
-
+    if log_dir.exists():
+        for entry in sorted(log_dir.iterdir()):
+            if entry.is_file() and entry.suffix == ".log":
+                print(f"  {entry.name} ({entry.stat().st_size} bytes)")
+                found = True
     if not found:
-        print("  (no log files yet — run 'hermes chat' to generate logs)")
+        print("No local Hermes log files found.")
+    print("Runtime logs are newline-delimited JSON on stderr/stdout.")
+    print("For Kubernetes, use `kubectl logs <pod>` or Google Cloud Logging.")

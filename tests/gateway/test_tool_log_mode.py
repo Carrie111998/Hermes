@@ -1,9 +1,8 @@
 """Tests for the `log` tool_progress mode (salvage of #3459 / #3458).
 
-`display.tool_progress: log` keeps the chat silent and appends tool-call
-lines to ~/.hermes/logs/tool_calls.log via write_tool_log's rotating handler.
-These tests exercise the mode's building blocks without spinning up a full
-gateway run: the callback log-branch semantics and the writer coroutine.
+`display.tool_progress: log` keeps the chat silent and emits tool-call lines
+through Hermes' structured container log stream. These tests exercise the
+mode's building blocks without spinning up a full gateway run.
 """
 
 import asyncio
@@ -40,30 +39,19 @@ class TestLogBranchSemantics:
 
 
 @pytest.mark.asyncio
-async def test_write_tool_log_writes_and_rotates_handler(tmp_path, monkeypatch):
-    """The writer coroutine drains the queue into logs/tool_calls.log."""
-    import gateway.run as gateway_run
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-
+async def test_write_tool_log_uses_structured_stream():
+    """Tool progress log records are emitted as Cloud Logging JSON."""
     log_queue: queue.Queue = queue.Queue()
     log_queue.put("2026-07-02 10:00:00  terminal: \"echo hi\"")
     log_queue.put("2026-07-02 10:00:01  read_file: \"foo.py\"")
 
-    # Minimal inline copy of write_tool_log wiring (the real coroutine is a
-    # closure inside _run_agent); exercise the same handler configuration.
     import logging
-    from logging.handlers import RotatingFileHandler
+    import io
+    import json
+    from hermes_logging import GCPStructuredLogHandler
 
-    from agent.redact import RedactingFormatter
-
-    log_dir = tmp_path / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(
-        log_dir / "tool_calls.log", maxBytes=5 * 1024 * 1024, backupCount=3,
-        encoding="utf-8",
-    )
-    handler.setFormatter(RedactingFormatter("%(message)s"))
+    stream = io.StringIO()
+    handler = GCPStructuredLogHandler(stream)
     tool_logger = logging.getLogger(f"hermes.tool_calls.test.{id(log_queue)}")
     tool_logger.setLevel(logging.INFO)
     tool_logger.propagate = False
@@ -79,10 +67,9 @@ async def test_write_tool_log_writes_and_rotates_handler(tmp_path, monkeypatch):
         handler.flush()
         handler.close()
 
-    content = (log_dir / "tool_calls.log").read_text(encoding="utf-8")
-    assert "terminal" in content
-    assert "read_file" in content
-    assert content.count("\n") == 2
+    records = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert len(records) == 2
+    assert "terminal" in records[0]["message"]
+    assert "read_file" in records[1]["message"]
+    assert all(record["severity"] == "INFO" for record in records)
     await asyncio.sleep(0)  # keep the asyncio marker honest
-
-

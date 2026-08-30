@@ -533,51 +533,16 @@ def _register_service(scandir: Path, profile: str, *, start: bool) -> None:
 def _write_reconcile_log(
     hermes_home: Path, actions: list[ReconcileAction],
 ) -> None:
-    """Append one line per profile to $HERMES_HOME/logs/container-boot.log.
-
-    Operators inspect this to debug "why didn't my profile come back
-    up". Keeping a separate log file (vs. mixing into agent.log) lets
-    troubleshooters grep for "profile=foo" without wading through
-    unrelated activity.
-
-    Size-bounded: when the file exceeds ``_LOG_ROTATE_BYTES``
-    (defaults to 256 KiB ≈ 3000 reconcile lines), the current file
-    is renamed to ``container-boot.log.1`` (replacing any previous
-    rotation) before the new entries are appended. This gives long-
-    lived containers a soft cap of ~512 KiB across the two files
-    without pulling in logrotate or s6-log machinery just for this
-    one append-only file (PR #30136 review item O3).
-    """
-    import time
-    log_dir = hermes_home / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "container-boot.log"
-
-    # Rotate before opening to append, so the new entries always land
-    # in a fresh file when we crossed the threshold last time.
-    try:
-        if log_path.exists() and log_path.stat().st_size >= _LOG_ROTATE_BYTES:
-            log_path.replace(log_dir / "container-boot.log.1")
-    except OSError as exc:
-        # Rotation failure is non-fatal — keep appending to the
-        # existing file rather than losing the entry entirely.
-        log.warning("could not rotate %s: %s", log_path, exc)
-
-    ts = time.strftime("%Y-%m-%dT%H:%M:%S%z")
-    with log_path.open("a", encoding="utf-8") as f:
-        for a in actions:
-            f.write(
-                f"{ts} profile={a.profile} prior_state={a.prior_state} "
-                f"action={a.action} prior_exit={a.prior_exit}\n"
-            )
-
-
-# 256 KiB soft cap on container-boot.log; rotated to .1 when crossed.
-# At ~80 B per reconcile-action line this is ~3000 lines, or about a
-# year of daily reboots on a 5-profile container. Two files = ~512 KiB
-# worst case. Tuned for visibility (small enough to grep / cat without
-# scrolling forever) more than space (the persistent volume has GB).
-_LOG_ROTATE_BYTES = 256 * 1024
+    """Emit one structured record per reconciled profile."""
+    del hermes_home
+    for action in actions:
+        log.info(
+            "container boot reconcile: profile=%s prior_state=%s action=%s prior_exit=%s",
+            action.profile,
+            action.prior_state,
+            action.action,
+            action.prior_exit,
+        )
 
 
 def main() -> int:

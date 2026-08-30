@@ -6001,11 +6001,9 @@ def launchd_status(deep: bool = False):
             print(f"  Note: a detached gateway process is running (PID {fallback_pid})")
 
     if deep:
-        log_file = get_hermes_home() / "logs" / "gateway.log"
-        if log_file.exists():
-            print()
-            print("Recent logs:")
-            subprocess.run(["tail", "-20", str(log_file)], timeout=10)
+        print()
+        print("Recent logs are available from the service supervisor or container runtime.")
+        print("For Kubernetes, use: kubectl logs <pod>")
 
 
 # =============================================================================
@@ -6347,13 +6345,15 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     from gateway.run import start_gateway
 
-    print("┌─────────────────────────────────────────────────────────┐")
-    print("│           ⚕ Hermes Gateway Starting...                 │")
-    print("├─────────────────────────────────────────────────────────┤")
-    print("│  Messaging platforms + cron scheduler                    │")
-    print("│  Press Ctrl+C to stop                                   │")
-    print("└─────────────────────────────────────────────────────────┘")
-    print()
+    # Keep machine-readable container streams free of the interactive banner.
+    if sys.stdout.isatty():
+        print("┌─────────────────────────────────────────────────────────┐")
+        print("│           ⚕ Hermes Gateway Starting...                 │")
+        print("├─────────────────────────────────────────────────────────┤")
+        print("│  Messaging platforms + cron scheduler                    │")
+        print("│  Press Ctrl+C to stop                                   │")
+        print("└─────────────────────────────────────────────────────────┘")
+        print()
 
     # Exit with code 1 if gateway fails to connect any platform,
     # so systemd Restart=always will retry on transient errors

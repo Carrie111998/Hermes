@@ -110,9 +110,9 @@ def _warn_config_parse_failure(
     is dropped. Before this helper that was a one-line ``print(...)`` that
     scrolled off-screen on the first invocation and was never seen again.
 
-    Now: warn once per (path, mtime_ns, size) on stderr **and** in
-    ``agent.log`` / ``errors.log`` at WARNING level so ``hermes logs``
-    surfaces it. Re-warns automatically if the file changes (different
+     Now: warn once per (path, mtime_ns, size) on stderr and in the structured
+     runtime stream at WARNING level so container log collectors surface it.
+     Re-warns automatically if the file changes (different
     mtime/size), so users editing the config see the next failure. On the
     first warning for a given broken file we also snapshot it to a
     timestamped ``.bak`` (best-effort) so the user's recoverable content

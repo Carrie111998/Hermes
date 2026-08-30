@@ -108,7 +108,7 @@ def _exit_after_oneshot(rc: object) -> None:
 
     The SIGABRT this guards against (#30387, #43055) fires in a
     native-extension finalizer during CPython's ``Py_FinalizeEx``, *after*
-    the response has printed. Flush streams, shut down file logging, then
+    the response has printed. Flush streams, shut down logging, then
     ``os._exit`` past interpreter finalization. The ``atexit`` chain is
     deliberately skipped — several handlers re-enter native code that may
     be the abort source. Stateful cleanup is handled in ``_run_agent`` and
@@ -772,10 +772,10 @@ try:
 except Exception:
     pass  # best-effort — redaction stays at default (enabled) on config errors
 
-# Initialize centralized file logging early — all `hermes` subcommands
-# (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
-# Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
-# during GUI testing, including pre-dispatch startup failures.
+# Initialize centralized structured stream logging early — all `hermes`
+# subcommands emit newline-delimited JSON to stderr for the process supervisor.
+# Dashboard entrypoints use the same handler before dispatch so startup failures
+# are visible to the container/service log collector.
 try:
     from hermes_logging import setup_logging as _setup_logging
 

@@ -117,9 +117,7 @@ Examples:
     hermes sessions list          List past sessions
     hermes sessions browse        Interactive session picker
     hermes sessions rename ID T   Rename/title a session
-    hermes logs                   View agent.log (last 50 lines)
-    hermes logs -f                Follow agent.log in real time
-    hermes logs errors            View errors.log
+    hermes logs                   Show how to retrieve structured runtime logs
     hermes logs --since 1h        Lines from the last hour
     hermes debug share             Upload debug report for support
     hermes console                Open the safe Hermes command console

@@ -365,7 +365,7 @@ class LogSnapshot:
 
 
 def _primary_log_path(log_name: str) -> Optional[Path]:
-    """Where *log_name* would live if present. Doesn't check existence."""
+    """Return the legacy path when an imported log file is present."""
     from hermes_cli.logs import LOG_FILES
 
     filename = LOG_FILES.get(log_name)

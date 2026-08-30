@@ -92,7 +92,7 @@ TIPS = [
     "hermes mcp serve runs Hermes itself as an MCP server for other agents.",
     "hermes auth add lets you add multiple API keys for credential pool rotation.",
     "hermes completion bash >> ~/.bashrc enables tab completion for all commands and profiles.",
-    "hermes logs -f follows agent.log in real time. --level WARNING --since 1h filters output.",
+    "Hermes emits JSON logs to stderr/stdout. In Kubernetes, use kubectl logs or Google Cloud Logging.",
     "hermes backup creates a zip backup of your entire Hermes home directory.",
     "hermes profile create coder creates an isolated profile that becomes its own command.",
     "hermes profile create work --clone copies your current config and keys to a new profile.",

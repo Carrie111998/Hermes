@@ -114,7 +114,7 @@ docker run -d \
   nousresearch/hermes-agent gateway run
 ```
 
-The dashboard is supervised by s6 — if it crashes, `s6-supervise` restarts it automatically after a short backoff. Dashboard stdout/stderr is forwarded to `docker logs <container>` (no prefix; the gateway's own output now lives in a per-profile s6-log file — see [Where the logs go](#where-the-logs-go) below — so the two streams don't clash).
+The dashboard is supervised by s6 — if it crashes, `s6-supervise` restarts it automatically after a short backoff. Dashboard stdout/stderr is forwarded to `docker logs <container>`; gateway and dashboard records use the same configured stream format.
 
 | Environment variable | Description | Default |
 |---------------------|-------------|---------|
@@ -278,7 +278,7 @@ Before the s6 migration, "one container per profile" was the recommended pattern
 | Memory overhead | Shared Python interpreter cache, shared node_modules | Duplicated per container |
 | Profile creation | `docker exec ... hermes profile create <name>` (seconds) | New `docker run` invocation + port allocation + bind-mount config |
 | Per-profile crash recovery | `s6-supervise` auto-restart | Docker's `--restart unless-stopped` (slower, kills sibling work) |
-| Logs | Per-profile rotated file via `s6-log`, plus container-boot audit log | `docker logs <name>` per container — no built-in rotation |
+| Logs | Container stderr/stdout as newline-delimited JSON | `docker logs <name>`, `kubectl logs`, or Google Cloud Logging |
 | Backup | One `~/.hermes` directory | N directories to coordinate |
 
 The default profile (`default`) is always registered on first boot, so a fresh container ships with one supervised gateway out of the box. Additional profiles are pure runtime adds.
@@ -321,19 +321,21 @@ The warning from [Persistent volumes](#persistent-volumes) still applies: never 
 
 ## Where the logs go
 
-The s6 container has four distinct log surfaces, and "why isn't my gateway showing anything in `docker logs`" is a common surprise. Cheatsheet:
+The s6 container forwards runtime output to the container stream. Hermes
+application records are newline-delimited JSON, so the container runtime or
+Google Cloud Logging owns retention and querying. Cheatsheet:
 
 | Source | Where it lands | How to read it |
 |---|---|---|
-| **Per-profile gateway** (`hermes gateway run` and per-profile gateways under s6) | Tee'd to two places: `docker logs <container>` (real time, no extra prefix) **and** `${HERMES_HOME}/logs/gateways/<profile>/current` (rotated, ISO-8601 timestamped, 10 archives × 1 MB each) | `docker logs -f hermes` or `tail -F ~/.hermes/logs/gateways/default/current` on the host |
-| **Dashboard** (when `HERMES_DASHBOARD=1`) | `docker logs <container>` (no prefix) | `docker logs -f hermes` — interleaved with gateway lines |
-| **Boot reconciler** (records which profile gateways were restored on each container start) | `${HERMES_HOME}/logs/container-boot.log` (append-only audit log) | `tail -F ~/.hermes/logs/container-boot.log` |
-| **Generic Hermes logs** (`agent.log`, `errors.log`) | `${HERMES_HOME}/logs/` (profile-aware) | `docker exec hermes hermes logs --follow [--level WARNING] [--session <id>]` |
+| **Per-profile gateway** (`hermes gateway run` and per-profile gateways under s6) | Container stderr/stdout; `text` by default or newline-delimited JSON with `logging.format: gcp_json` | `docker logs -f hermes`, `kubectl logs -f <pod>`, or Google Cloud Logging |
+| **Dashboard** (when `HERMES_DASHBOARD=1`) | Container stderr/stdout using the configured format | `docker logs -f hermes` — interleaved with gateway lines |
+| **Boot reconciler** | Container stderr/stdout as structured operational output | `docker logs`, `kubectl logs`, or Google Cloud Logging |
+| **Generic Hermes logs** | Container stderr/stdout using the configured format | `docker logs`, `kubectl logs`, or Google Cloud Logging |
 
 Two practical consequences worth knowing:
 
-- The file copy at `logs/gateways/<profile>/current` is what survives container restarts. `docker logs` only retains output from the current container's lifetime (and is wiped on `docker rm`); the rotated files persist on the bind-mounted volume.
-- The boot reconciler's audit line shape is `<iso-timestamp> profile=<name> prior_state=<state> action=<registered|started>`, so a quick `grep profile=coder ~/.hermes/logs/container-boot.log` reveals when a given profile was last restored and whether s6 auto-started it.
+- Container log retention is controlled by Docker, GKE, or the configured logging backend.
+- `hermes logs` remains able to parse explicitly imported legacy log files, but does not create or tail runtime logs locally.
 
 ## Environment variable forwarding
 
@@ -541,7 +543,7 @@ Each profile created with `hermes profile create <name>` automatically gets an s
 - Gateway crashes are auto-restarted by `s6-supervise` after a ~1s backoff.
 - Dashboard, when enabled with `HERMES_DASHBOARD=1`, is supervised on the same supervision tree and gets the same auto-restart treatment.
 - `docker restart`, image upgrades (`docker compose up -d --force-recreate`), and unexpected exits preserve running gateways: the cont-init reconciler reads `$HERMES_HOME/profiles/<name>/gateway_state.json` and brings the slot back up if the last recorded state was `running`. Only an explicit `hermes gateway stop` records `stopped` and keeps the gateway down across the restart; the container/s6 SIGTERM sent on a restart or upgrade is treated as "still running" and auto-starts.
-- Per-profile gateway logs persist under `$HERMES_HOME/logs/gateways/<profile>/current` (rotated by `s6-log`), and the reconciler's actions are appended to `$HERMES_HOME/logs/container-boot.log` per boot. See [Where the logs go](#where-the-logs-go) for the full routing map.
+- Gateway and reconciler diagnostics are emitted to the container stream. See [Where the logs go](#where-the-logs-go) for the full routing map.
 
 `hermes status` inside the container reports `Manager: s6 (container supervisor)`. Use `/command/s6-svstat /run/service/gateway-<name>` for the raw supervisor view (note `/command/` is on PATH for supervision-tree processes only; pass the absolute path when calling from `docker exec`).
 

@@ -745,14 +745,20 @@ class S6ServiceManager:
     def _render_log_run(profile: str) -> str:
         """Generate the log/run script for a profile-gateway service.
 
-        OQ8-C: persist to ``${HERMES_HOME}/logs/gateways/<profile>/``.
+        Runtime output is forwarded to the container stream; no gateway log
+        file is created by this supervisor.
         CRITICAL: the HERMES_HOME path is sourced from the runtime env
         via with-contenv — NOT Python-substituted at registration time
         — so a container started with ``-e HERMES_HOME=/data/hermes``
         gets its logs under /data/hermes/logs/..., not the build-time
         default.
 
-        Output routing — the script is two action directives, applied
+        Output routing — the script forwards each line to the container
+        stream. The ``1`` action propagates output through the s6-supervise
+        pipeline to ``docker logs``. Hermes application records already use
+        newline-delimited JSON, so container logging owns retention and query.
+
+        Historical output routing — the script used two action directives, applied
         per line, in order:
 
           1. ``1`` (forward to stdout) — propagates the line up the
@@ -806,8 +812,8 @@ class S6ServiceManager:
             f'  rm -f "$log_dir/lock"\n'
             f'fi\n'
             # Skip the drop when already non-root (CAP_SETGID).
-            f'[ "$(id -u)" = 0 ] || exec s6-log 1 n10 s1000000 T "$log_dir"\n'
-            f'exec s6-setuidgid hermes s6-log 1 n10 s1000000 T "$log_dir"\n'
+            f'[ "$(id -u)" = 0 ] || exec s6-log 1 # forward to container stream\n'
+            f'exec s6-setuidgid hermes s6-log 1 # forward to container stream\n'
         )
 
     # -- lifecycle ---------------------------------------------------------

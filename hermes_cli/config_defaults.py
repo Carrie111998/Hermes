@@ -3004,12 +3004,11 @@ DEFAULT_CONFIG = {
         },
     },
 
-    # Logging — controls file logging to ~/.hermes/logs/.
-    # agent.log captures INFO+ (all agent activity); errors.log captures WARNING+.
+    # Logging — controls the stderr stream consumed by terminals and
+    # container logging systems such as Google Cloud Logging.
     "logging": {
-        "level": "INFO",       # Minimum level for agent.log: DEBUG, INFO, WARNING
-        "max_size_mb": 5,      # Max size per log file before rotation
-        "backup_count": 3,     # Number of rotated backup files to keep
+        "level": "INFO",       # Minimum stream level: DEBUG, INFO, WARNING
+        "format": "text",      # text or gcp_json
     },
 
     # Remotely-hosted model catalog manifest.  When enabled, the CLI fetches

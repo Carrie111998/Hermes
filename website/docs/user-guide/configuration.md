@@ -24,7 +24,7 @@ Run `hermes setup --portal` — one OAuth gets you a model provider and all four
 ├── skills/         # Agent-created skills (managed via skill_manage tool)
 ├── cron/           # Scheduled jobs
 ├── sessions/       # Gateway sessions
-└── logs/           # Logs (errors.log, gateway.log — secrets auto-redacted)
+└── logs/           # Reserved for optional diagnostics; runtime logs use stderr/stdout
 ```
 
 ## Managing Configuration
@@ -119,6 +119,21 @@ Hermes also warns (once per process per database) when an existing
 database's on-disk journal mode is silently flipped to WAL on open — for
 example a database an operator had manually converted to `delete` — and
 names `database.journal_mode` as the setting that makes the choice stick.
+### Logging Format
+
+Runtime logs are written to stderr as one record per line. The default is
+human-readable text. For Google Cloud Logging, Kubernetes, or another JSON log
+collector, set:
+
+```yaml
+logging:
+  format: gcp_json
+  level: INFO
+```
+
+`gcp_json` emits Cloud Logging-compatible `time`, `severity`, and `message`
+fields. Hermes does not create local application log files; retention and
+queries are handled by the container or service supervisor.
 
 ## Environment Variable Substitution
 

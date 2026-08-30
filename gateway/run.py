@@ -29699,32 +29699,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         async def write_tool_log():
-            """Drain log_queue and append tool-call lines to tool_calls.log.
-
-            Only active when ``display.tool_progress`` is ``log``. Uses a
-            RotatingFileHandler (5MB × 3 backups) so the audit log can't grow
-            unbounded, and the shared RedactingFormatter so secrets never land
-            on disk.
-            """
+            """Drain log_queue into the structured container log stream."""
             if log_queue is None:
                 return
-            from logging.handlers import RotatingFileHandler
-
-            from agent.redact import RedactingFormatter
-
-            log_dir = _hermes_home / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            file_handler = RotatingFileHandler(
-                log_dir / "tool_calls.log",
-                maxBytes=5 * 1024 * 1024,
-                backupCount=3,
-                encoding="utf-8",
-            )
-            file_handler.setFormatter(RedactingFormatter("%(message)s"))
-            tool_logger = logging.getLogger(f"hermes.tool_calls.{id(log_queue)}")
+            tool_logger = logging.getLogger("hermes.tool_calls")
             tool_logger.setLevel(logging.INFO)
-            tool_logger.propagate = False
-            tool_logger.addHandler(file_handler)
+            tool_logger.propagate = True
             try:
                 while True:
                     try:
@@ -29746,12 +29726,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         break
                     except Exception:
                         break
-                tool_logger.removeHandler(file_handler)
-                try:
-                    file_handler.flush()
-                    file_handler.close()
-                except Exception:
-                    pass
 
         # Extracted to TurnRunner.send_progress_messages. The threading
         # metadata computed above is published onto the shared TurnContext
@@ -31888,10 +31862,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception:
         pass
 
-    # Centralized logging — agent.log (INFO+), errors.log (WARNING+),
-    # and gateway.log (INFO+, gateway-component records only).
-    # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
-    from hermes_logging import setup_logging, _safe_stderr
+    # Centralized logging — newline-delimited GCP structured records on stderr.
+    # The non-TTY default is INFO so container log collectors receive the full
+    # operational stream; interactive terminals retain the quieter WARNING
+    # default unless verbosity is explicitly increased.
+    from hermes_logging import setup_logging, set_stream_log_level
     setup_logging(hermes_home=_hermes_home, mode="gateway")
 
     # Startup security posture audit — warn-on-load, never blocks. Surfaces
@@ -31912,20 +31887,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as _audit_exc:
         logger.debug("Startup security audit failed (non-fatal): %s", _audit_exc)
 
-    # Optional stderr handler — level driven by -v/-q flags on the CLI.
-    # verbosity=None (-q/--quiet): no stderr output
-    # verbosity=0    (default):    WARNING and above
-    # verbosity=1    (-v):         INFO and above
-    # verbosity=2+   (-vv/-vvv):   DEBUG
+    # Adjust the shared structured handler for CLI verbosity. In a container
+    # (non-TTY), the default remains INFO so Cloud Logging sees normal events.
     if verbosity is not None:
-        _stderr_level = {0: logging.WARNING, 1: logging.INFO}.get(verbosity, logging.DEBUG)
-        _stderr_handler = logging.StreamHandler(_safe_stderr())
-        _stderr_handler.setLevel(_stderr_level)
-        _stderr_handler.setFormatter(_gateway_stderr_formatter())
-        logging.getLogger().addHandler(_stderr_handler)
-        # Lower root logger level if needed so DEBUG records can reach the handler
-        if _stderr_level < logging.getLogger().level:
-            logging.getLogger().setLevel(_stderr_level)
+        if verbosity <= 0:
+            set_stream_log_level(
+                logging.WARNING if sys.stderr.isatty() else logging.INFO
+            )
+        elif verbosity == 1:
+            set_stream_log_level(logging.INFO)
+        else:
+            set_stream_log_level(logging.DEBUG)
+    else:
+        set_stream_log_level(logging.CRITICAL + 1)
 
     runner = GatewayRunner(config)
     # ``--replace`` is explicit startup authority, not a durable reconnect

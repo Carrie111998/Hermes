@@ -42,10 +42,20 @@ class TestParseLineTimestamp:
         ts = _parse_line_timestamp("2026-04-11 10:23:45 INFO gateway.run: msg")
         assert ts == datetime(2026, 4, 11, 10, 23, 45)
 
+    def test_gcp_json_format(self):
+        ts = _parse_line_timestamp(
+            '{"time":"2026-04-11T10:23:45.123Z","severity":"INFO",'
+            '"logger":"gateway.run","message":"msg"}'
+        )
+        assert ts == datetime(2026, 4, 11, 10, 23, 45, 123000)
+
 
 class TestExtractLevel:
     def test_info(self):
         assert _extract_level("2026-01-01 00:00:00 INFO gateway.run: msg") == "INFO"
+
+    def test_gcp_severity(self):
+        assert _extract_level('{"severity":"ERROR","message":"failed"}') == "ERROR"
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +70,9 @@ class TestExtractLoggerName:
 
     def test_no_match(self):
         assert _extract_logger_name("random text") is None
+
+    def test_gcp_logger(self):
+        assert _extract_logger_name('{"logger":"gateway.run","message":"started"}') == "gateway.run"
 
 
 class TestLineMatchesComponent:

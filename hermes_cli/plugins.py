@@ -112,7 +112,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 #
 # Set ``HERMES_PLUGINS_DEBUG=1`` to surface verbose plugin-discovery logs to
-# stderr in addition to ~/.hermes/logs/agent.log. Aimed at plugin authors
+# stderr in addition to the structured container log stream. Aimed at plugin authors
 # trying to figure out why their plugin isn't showing up: which directories
 # were scanned, which manifests parsed, which plugins were skipped (and why),
 # what each ``register(ctx)`` call registered, and full tracebacks on load
@@ -146,7 +146,7 @@ def _install_plugin_debug_handler(force: bool = False) -> None:
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)
     # Don't double-emit through the root logger when the central logging
-    # config also writes to stderr. agent.log still captures everything.
+    # config also writes to stderr. The shared structured handler captures it.
     logger.propagate = True
     _DEBUG_HANDLER_INSTALLED = True
     logger.debug(
