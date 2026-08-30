@@ -1568,8 +1568,8 @@ def execute_code(
     # PID-file ownership, not the inherited env marker (#92560) and not on
     # external supervision (#98221) — a direct-spawn gateway with no
     # supervisor is just as interruptible by its own lifecycle command.
-    from tools.process_registry import _is_gateway_process
-    if _is_gateway_process():
+    from tools.process_registry import _is_gateway_process_or_unknown
+    if _is_gateway_process_or_unknown():
         from cron.lifecycle_guard import contains_gateway_lifecycle_command
         if contains_gateway_lifecycle_command(code):
             return tool_error(

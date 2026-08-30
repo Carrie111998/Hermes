@@ -518,7 +518,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         monkeypatch.setattr(tt, "_task_env_overrides", {})
         monkeypatch.setattr(tt, "_get_env_config", self._minimal_config)
         monkeypatch.setattr(
-            process_registry, "_is_gateway_process",
+            process_registry, "_is_gateway_process_or_unknown",
             lambda: inside_gateway,
         )
 
@@ -901,8 +901,54 @@ class TestTerminalToolBlocksUnsupervisedDirectSpawnGateway:
         monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
         monkeypatch.delenv("HERMES_GATEWAY_EXTERNAL_SUPERVISOR", raising=False)
         monkeypatch.setattr(
-            "gateway.status.get_running_pid",
-            lambda *, cleanup_stale=False: os.getpid(),
+            "gateway.status.get_running_pid_identity_strict",
+            lambda pid_path: (os.getpid(), 123.0),
+        )
+
+        result = json.loads(tt.terminal_tool(command="hermes gateway restart"))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
+    def test_blocks_restart_on_unreadable_identity(self, monkeypatch):
+        """P1 (review, 2026-08-30): an unreadable PID/lock record is not
+        proof this process is NOT the gateway -- it is unproven. The hard
+        block must fail closed (still refuse) rather than let a transient
+        identity-read error grant the destructive command safe passage.
+        """
+        import tools.terminal_tool as tt
+
+        self._patch_env(monkeypatch, self._make_fake_env())
+
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+
+        def _raise(pid_path):
+            raise OSError("PID file unreadable")
+
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid_identity_strict", _raise
+        )
+
+        result = json.loads(tt.terminal_tool(command="hermes gateway restart"))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
+    def test_blocks_restart_on_malformed_identity_metadata(self, monkeypatch):
+        """P1 (review, 2026-08-30): an active-but-malformed PID/lock record
+        (the exact case ``get_running_pid_identity_strict`` raises for) must
+        also fail closed, not be read as "not the gateway"."""
+        import tools.terminal_tool as tt
+
+        self._patch_env(monkeypatch, self._make_fake_env())
+
+        monkeypatch.setenv("_HERMES_GATEWAY", "1")
+
+        def _raise(pid_path):
+            raise RuntimeError("gateway PID or lock metadata is malformed")
+
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid_identity_strict", _raise
         )
 
         result = json.loads(tt.terminal_tool(command="hermes gateway restart"))
@@ -1913,7 +1959,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         monkeypatch.setattr(tt, "_task_env_overrides", {})
         monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 60, "lifetime_seconds": 3600})
         monkeypatch.setattr(
-            process_registry, "_is_gateway_process",
+            process_registry, "_is_gateway_process_or_unknown",
             lambda: inside_gateway,
         )
 

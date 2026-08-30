@@ -281,6 +281,38 @@ def _is_gateway_process() -> bool:
         return False
 
 
+def _is_gateway_process_or_unknown() -> bool:
+    """Return True if this process is the live gateway, or identity is unproven.
+
+    Destructive lifecycle hard-blocks (terminal_tool / code_execution_tool)
+    must use this instead of :func:`_is_gateway_process`. That function
+    treats any read failure the same as "definitely not the gateway", but an
+    unreadable or malformed PID/lock record is not proof of that -- it is
+    just unproven. Collapsing "unproven" into the allow case would let the
+    destructive command this guard exists to refuse run unguarded on a
+    transient or malformed identity read. Non-destructive callers (systemd-
+    scope isolation, via :func:`_is_supervised_gateway_process`) are
+    unaffected: getting those wrong just skips an optimization, not a safety
+    check.
+    """
+    if os.environ.get("_HERMES_GATEWAY") != "1":
+        return False
+
+    try:
+        from gateway.status import _get_pid_path, get_running_pid_identity_strict
+
+        identity = get_running_pid_identity_strict(_get_pid_path())
+    except Exception as exc:
+        logger.debug(
+            "Could not verify gateway process identity, failing closed: %s", exc
+        )
+        return True
+
+    if identity is None:
+        return False
+    return identity[0] == os.getpid()
+
+
 def _is_supervised_gateway_process() -> bool:
     """Return whether this process is in a supervised Hermes gateway runtime.
 
