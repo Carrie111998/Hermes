@@ -37,6 +37,13 @@ class TestSkillManageSchemaDiet(unittest.TestCase):
         self.assertNotIn("unique", props["old_string"]["description"])
         self.assertNotIn("surrounding context", props["old_string"]["description"])
 
+    def test_delete_consolidation_target_is_advertised(self):
+        prop = self._op_props()["absorbed_into"]
+        self.assertEqual(prop["type"], "string")
+        self.assertIn("delete", prop["description"])
+        self.assertIn("umbrella", prop["description"])
+        self.assertIn("curator", prop["description"])
+
     def test_file_path_states_relative_shape(self):
         desc = self._op_props()["file_path"]["description"]
         self.assertIn("RELATIVE", desc)
