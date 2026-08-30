@@ -2810,6 +2810,17 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+async def _drain_global_telegram_retired_generations() -> bool:
+    """Drain Telegram retirement ownership even after adapter removal."""
+    try:
+        from plugins.platforms.telegram.adapter import (
+            drain_telegram_retired_generations,
+        )
+    except ImportError:
+        return True
+    return await drain_telegram_retired_generations()
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -15818,6 +15829,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Shutdown phase: all adapters disconnected at +%.2fs",
                 _phase_elapsed(),
             )
+            try:
+                telegram_retired_drained = (
+                    await _drain_global_telegram_retired_generations()
+                )
+                if not telegram_retired_drained:
+                    logger.error(
+                        "Gateway shutdown left bounded Telegram retired-generation "
+                        "ownership pending"
+                    )
+            except Exception:
+                logger.exception(
+                    "Gateway global Telegram retired-generation drain failed"
+                )
 
             for _task in list(self._background_tasks):
                 if _task is self._stop_task:

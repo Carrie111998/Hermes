@@ -9,12 +9,14 @@ rather than silently leaving polling dead.
 import ast
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from plugins.platforms.telegram import adapter as tg_adapter  # noqa: E402
+from plugins.platforms.telegram import retirement as tg_retirement  # noqa: E402
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 from gateway.run import GatewayRunner  # noqa: E402
 
@@ -215,51 +217,27 @@ async def test_general_pool_drain_is_bounded_when_close_hangs(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_reconnect_continues_if_drain_hangs(monkeypatch):
-    """If the polling request drain HANGS (wedged httpx pool close on a
-    CLOSE-WAIT socket), the reconnect ladder must still advance rather than
-    freezing the tracked _polling_error_task forever.
-
-    Regression test for #66377: an unbounded ``shutdown()`` /
-    ``initialize()`` in ``_drain_polling_connections`` leaves the handler
-    task pending, which gates every escalation path and silently kills the
-    gateway. The drain awaits are bounded by ``_DRAIN_TIMEOUT``, so the
-    handler must complete and reach ``start_polling`` within a hard bound.
-    """
+async def test_reconnect_retires_generation_if_drain_hangs(monkeypatch):
+    """A timed-out drain escalates without reusing the retired application."""
     adapter = _make_adapter()
     adapter._polling_network_error_count = 1
-
     mock_app, mock_polling_req = _make_mock_app()
-
-    async def _hang(*args, **kwargs):
-        await asyncio.Event().wait()  # never returns
-
-    # Both drain awaits wedge indefinitely.
-    mock_polling_req.shutdown = AsyncMock(side_effect=_hang)
-    mock_polling_req.initialize = AsyncMock(side_effect=_hang)
+    mock_app.running = False
+    mock_app.shutdown = AsyncMock()
+    mock_app.bot._request = ()
     adapter._app = mock_app
-
-    # Keep the drain timeout tiny so the test stays fast; the real default
-    # is generous enough not to truncate healthy closes.
-    monkeypatch.setattr(tg_adapter, "_DRAIN_TIMEOUT", 0.01, raising=False)
+    adapter._drain_polling_connections = AsyncMock(return_value=False)
+    adapter._notify_fatal_error = AsyncMock()
 
     with patch("asyncio.sleep", new_callable=AsyncMock):
-        # Hard outer bound: on unfixed code the drain hangs forever and this
-        # trips; with the fix the inner wait_for releases well before it.
         await asyncio.wait_for(
             adapter._handle_polling_network_error(Exception("Timed out")),
             timeout=5,
         )
 
-    # Ladder advanced past the wedged drain despite it never returning.
-    mock_app.updater.start_polling.assert_called_once()
-    assert adapter._polling_network_error_count == 2
-    # The tracked task must not be stuck pending — otherwise every
-    # escalation path stays gated behind an in-flight guard.
-    assert (
-        adapter._polling_error_task is None
-        or adapter._polling_error_task.done()
-    )
+    mock_app.updater.start_polling.assert_not_called()
+    adapter._drain_polling_connections.assert_awaited_once()
+    assert adapter.has_fatal_error
 
 
 @pytest.mark.asyncio
@@ -304,6 +282,13 @@ async def test_reconnect_stop_deadline_does_not_wait_for_cancel_cleanup(monkeypa
     adapter._notify_fatal_error = AsyncMock()
 
     monkeypatch.setattr(tg_adapter, "_UPDATER_STOP_TIMEOUT", 0.01)
+    async def _abandon(awaitable, timeout, **_kwargs):
+        task = asyncio.ensure_future(awaitable)
+        await asyncio.sleep(0)
+        task.cancel()
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(tg_adapter, "_await_with_thread_deadline", _abandon)
     with patch("asyncio.sleep", new_callable=AsyncMock):
         recovery = asyncio.create_task(
             adapter._handle_polling_network_error(Exception("Timed out"))
@@ -311,11 +296,13 @@ async def test_reconnect_stop_deadline_does_not_wait_for_cancel_cleanup(monkeypa
         done, _ = await asyncio.wait({recovery}, timeout=0.2)
 
     try:
+        await asyncio.sleep(0)
         assert recovery in done, (
             "reconnect remained blocked waiting for cancellation-shielded "
             "updater.stop() cleanup"
         )
-        assert stop_cancelled.is_set()
+        registry = adapter._retirement_registry()
+        assert registry.entries and registry.entries[0].app is mock_app
         assert adapter.has_fatal_error
         adapter._notify_fatal_error.assert_awaited_once()
         mock_updater.start_polling.assert_not_awaited()
@@ -664,7 +651,7 @@ async def test_polling_bootstrap_conflict_schedules_conflict_recovery_task():
 
 
 @pytest.mark.asyncio
-async def test_handle_polling_network_error_updater_stop_timeout():
+async def test_handle_polling_network_error_updater_stop_timeout(monkeypatch):
     """updater.stop() hanging (CLOSE-WAIT) must not block the reconnect ladder.
 
     When the underlying TCP connection is in CLOSE-WAIT, PTB's polling task is
@@ -686,19 +673,12 @@ async def test_handle_polling_network_error_updater_stop_timeout():
     app.updater.running = True
 
     async def _hanging_stop():
-        await asyncio.sleep(0.2)  # simulate CLOSE-WAIT block
+        await asyncio.Event().wait()  # simulate CLOSE-WAIT block
 
     app.updater.stop = _hanging_stop
     app.updater.start_polling = AsyncMock()
     adapter._app = app
     adapter._notify_fatal_error = AsyncMock()
-
-    drain_called = []
-
-    async def _fake_drain():
-        drain_called.append(True)
-
-    adapter._drain_polling_connections = _fake_drain
 
     start_polling_called = []
 
@@ -712,6 +692,13 @@ async def test_handle_polling_network_error_updater_stop_timeout():
     # cleaner than monkeypatching asyncio.wait_for process-wide.
     import plugins.platforms.telegram.adapter as _mod
 
+    async def _abandon(awaitable, timeout, **_kwargs):
+        task = asyncio.ensure_future(awaitable)
+        await asyncio.sleep(0)
+        task.cancel()
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(_mod, "_await_with_thread_deadline", _abandon)
     with patch.object(_mod, "_UPDATER_STOP_TIMEOUT", 0.05):
         await adapter._handle_polling_network_error(OSError("CLOSE-WAIT test"))
 
@@ -720,7 +707,6 @@ async def test_handle_polling_network_error_updater_stop_timeout():
     # runner a retryable fatal and rebuild the adapter instead.
     assert adapter.has_fatal_error
     adapter._notify_fatal_error.assert_awaited_once()
-    assert not drain_called
     assert not start_polling_called
 
 
@@ -790,3 +776,52 @@ async def test_disconnect_advances_past_cancellation_swallowing_lifecycle(monkey
 
     release.set()
     await asyncio.wait({wedged}, timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_drain_retires_whole_application_without_private_client_swap(monkeypatch):
+    """A timed-out drain is owned to completion and never reuses its app."""
+    adapter = _make_adapter()
+
+    class _Client:
+        is_closed = False
+
+    class _PollingRequest:
+        def __init__(self):
+            self._client = _Client()
+            self.rebuilt = []
+
+        def _build_client(self):
+            self.rebuilt.append(_Client())
+            return self.rebuilt[-1]
+
+        async def shutdown(self):
+            return None
+
+        async def initialize(self):
+            return None
+
+    request = _PollingRequest()
+    original_client = request._client
+    app = MagicMock()
+    app.updater = None
+    app.running = False
+    app.shutdown = AsyncMock()
+    app.bot._request = (request, SimpleNamespace(shutdown=AsyncMock()))
+    adapter._app = app
+    monkeypatch.setattr(tg_adapter, "_DRAIN_TIMEOUT", 0.02)
+    monkeypatch.setattr(tg_retirement, "CLEANUP_RETRY_DELAY", 0.001)
+
+    async def _abandon(_awaitable, _timeout, **_kwargs):
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(tg_adapter, "_await_with_thread_deadline", _abandon)
+
+    drained = await adapter._drain_polling_connections()
+    assert drained is False
+    assert request._client is original_client
+    assert request.rebuilt == []
+    registry = adapter._retirement_registry()
+    assert len(registry.entries) == 1
+    assert await registry.wait_for_capacity(1.0)
+    assert not registry.entries
