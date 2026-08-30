@@ -106,3 +106,27 @@ def test_validate_workdir_still_blocks_metachars_in_unicode_paths():
 def test_count_real_sudo_invocations_ignores_mentions(monkeypatch):
     assert terminal_tool._count_real_sudo_invocations("grep sudo README.md") == 0
     assert terminal_tool._count_real_sudo_invocations("sudo a; sudo b") == 2
+
+
+def test_terminal_description_steers_ssh_away_from_the_devnull_traps():
+    """Reaching a host other than the configured backend means shelling out.
+
+    Two traps make that shell-out fail in ways the tool surface doesn't hint
+    at: commands run with stdin on /dev/null (`local.py`, `base.py`), so any
+    prompt dies unanswered; and the only in-tree ssh example (the
+    pinggy-tunnel skill) uses `UserKnownHostsFile=/dev/null`, which discards
+    the host key on every connection. Both must be called out.
+    """
+    desc = terminal_tool.TERMINAL_TOOL_DESCRIPTION
+    assert "ssh" in desc
+    assert "BatchMode=yes" in desc
+    assert "StrictHostKeyChecking=accept-new" in desc
+    assert "UserKnownHostsFile=/dev/null" in desc
+
+
+def test_pty_param_names_ssh_as_an_interactive_case():
+    """`pty` already supports the SSH backend but only advertised REPL-style
+    CLIs, so the model never reached for the one flag that fixes a prompting
+    ssh command."""
+    pty = terminal_tool.TERMINAL_SCHEMA["parameters"]["properties"]["pty"]
+    assert "ssh" in pty["description"]

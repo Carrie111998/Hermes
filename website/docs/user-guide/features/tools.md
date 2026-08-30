@@ -222,7 +222,7 @@ process(action="kill", session_id="proc_abc123")   # Terminate
 process(action="write", session_id="proc_abc123", data="y")  # Send input
 ```
 
-PTY mode (`pty=true`) enables interactive CLI tools like Codex and Claude Code.
+PTY mode (`pty=true`) enables interactive CLI tools like Codex and Claude Code, and `ssh` to a host that has to prompt. Without it commands run with stdin on `/dev/null`, so a password, passphrase, or host-key confirmation fails unanswered rather than asking. PTY mode works on the local and SSH backends only.
 
 ## Sudo Support
 

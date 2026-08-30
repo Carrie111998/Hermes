@@ -1084,6 +1084,7 @@ Foreground (default): returns INSTANTLY when the command finishes, even with a h
 Background: set background=true (returns a session_id). Pair with notify_on_complete=true for bounded tasks; leave silent only for servers/daemons that never exit. Never use nohup/setsid/trailing '&' — use background=true so Hermes tracks the process. After starting a server, verify readiness with a health check, then act in a separate call; no blind sleep loops. Manage with process(action="poll"/"wait").
 Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
 PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output to cat if it might page.
+Remote hosts: ssh/scp run from here with stdin on /dev/null, so password/passphrase/host-key prompts fail instead of asking. Use key auth with `-o BatchMode=yes -o StrictHostKeyChecking=accept-new`; if a prompt is unavoidable, pty=true (local/ssh backends only). Don't pass `-o UserKnownHostsFile=/dev/null` for a real host — it discards host keys and breaks where /dev/null isn't writable.
 """
 
 # Global state for environment lifecycle management
@@ -3766,7 +3767,7 @@ TERMINAL_SCHEMA = {
             },
             "pty": {
                 "type": "boolean",
-                "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, or Python REPL. Only works with local and SSH backends. Default: false.",
+                "description": "Run in pseudo-terminal (PTY) mode for interactive CLI tools like Codex, Claude Code, a Python REPL, or `ssh` to a remote host that has to prompt. Without it stdin is /dev/null and every prompt fails unanswered. Only works with local and SSH backends. Default: false.",
                 "default": False
             },
             "notify_on_complete": {
