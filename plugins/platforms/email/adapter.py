@@ -597,7 +597,6 @@ class EmailAdapter(BasePlatformAdapter):
         if not authserv_raw:
             authserv_raw = self._address.rsplit("@", 1)[-1] if "@" in self._address else ""
         self._authserv_id = authserv_raw.lower()
-        ).strip().lower()
 
         # Track message IDs we've already processed to avoid duplicates
         self._seen_uids: set = set()
