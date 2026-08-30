@@ -32,8 +32,8 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, asdict, field
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,10 @@ class HeartbeatState:
     created_at: float = 0.0
     last_fired_at: float = 0.0
     fire_count: int = 0
+    # Originating platform/chat/thread (gateway only). Lets the gateway
+    # rebuild a MessageEvent source and re-arm the in-memory watch after a
+    # restart, instead of requiring the user to touch /heartbeat again.
+    route: Dict[str, str] = field(default_factory=dict)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -114,6 +118,7 @@ class HeartbeatState:
     @classmethod
     def from_json(cls, raw: str) -> "HeartbeatState":
         data = json.loads(raw)
+        route = data.get("route")
         return cls(
             prompt=str(data.get("prompt") or ""),
             interval_seconds=int(data.get("interval_seconds", 0) or 0),
@@ -121,6 +126,7 @@ class HeartbeatState:
             created_at=float(data.get("created_at", 0.0) or 0.0),
             last_fired_at=float(data.get("last_fired_at", 0.0) or 0.0),
             fire_count=int(data.get("fire_count", 0) or 0),
+            route=route if isinstance(route, dict) else {},
         )
 
     def is_due(self, now: Optional[float] = None) -> bool:
@@ -142,8 +148,11 @@ class HeartbeatState:
 # ──────────────────────────────────────────────────────────────────────
 
 
+_META_PREFIX = "heartbeat:"
+
+
 def _meta_key(session_id: str) -> str:
-    return f"heartbeat:{session_id}"
+    return f"{_META_PREFIX}{session_id}"
 
 
 def _get_session_db() -> Optional[Any]:
@@ -194,6 +203,37 @@ def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
         logger.debug("HeartbeatManager: set_meta failed: %s", exc)
 
 
+def list_active_heartbeats() -> List[Tuple[str, HeartbeatState]]:
+    """Return ``[(session_id, HeartbeatState), ...]`` for every ACTIVE heartbeat.
+
+    Used by the gateway at startup to re-arm ``_heartbeat_watch`` from
+    persisted state — the in-memory watch is empty on every process boot,
+    so without this an active heartbeat is orphaned (state survives in the
+    DB, but nothing polls it) until the user runs /heartbeat again.
+    Best-effort: any DB error yields ``[]``.
+    """
+    db = _get_session_db()
+    if db is None:
+        return []
+    try:
+        rows = db.list_meta_prefix(_META_PREFIX)
+    except Exception as exc:
+        logger.debug("HeartbeatManager: list_meta_prefix failed: %s", exc)
+        return []
+    out: List[Tuple[str, HeartbeatState]] = []
+    for key, raw in rows:
+        session_id = key[len(_META_PREFIX):]
+        if not session_id or not raw:
+            continue
+        try:
+            state = HeartbeatState.from_json(raw)
+        except Exception:
+            continue
+        if state.status == "active":
+            out.append((session_id, state))
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Manager — the surface CLI + gateway talk to
 # ──────────────────────────────────────────────────────────────────────
@@ -238,7 +278,12 @@ class HeartbeatManager:
 
     # --- mutation -----------------------------------------------------
 
-    def set(self, prompt: str, interval_seconds: int) -> HeartbeatState:
+    def set(
+        self,
+        prompt: str,
+        interval_seconds: int,
+        route: Optional[Dict[str, str]] = None,
+    ) -> HeartbeatState:
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("heartbeat prompt is empty")
@@ -250,6 +295,7 @@ class HeartbeatManager:
             interval_seconds=interval_seconds,
             status="active",
             created_at=time.time(),
+            route=dict(route or {}),
         )
         self._state = state
         save_heartbeat(self.session_id, state)
@@ -328,6 +374,7 @@ __all__ = [
     "format_interval",
     "load_heartbeat",
     "save_heartbeat",
+    "list_active_heartbeats",
     "migrate_heartbeat_to_session",
     "HEARTBEAT_PROMPT_TEMPLATE",
     "MIN_INTERVAL_SECONDS",

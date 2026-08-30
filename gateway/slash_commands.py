@@ -2977,8 +2977,25 @@ class GatewaySlashCommandsMixin:
         if not prompt.strip():
             return "Usage: /heartbeat every <interval> <prompt> — the prompt is required."
 
+        route: dict = {}
         try:
-            state = mgr.set(prompt, interval)
+            src = event.source
+            if src is not None:
+                platform = getattr(src, "platform", "")
+                route = {
+                    "platform": platform.value if hasattr(platform, "value") else str(platform or ""),
+                    "chat_id": str(getattr(src, "chat_id", "") or ""),
+                    "chat_type": str(getattr(src, "chat_type", "") or ""),
+                    "thread_id": str(getattr(src, "thread_id", "") or ""),
+                    "user_id": str(getattr(src, "user_id", "") or ""),
+                    "user_name": str(getattr(src, "user_name", "") or ""),
+                }
+                route = {k: v for k, v in route.items() if v}
+        except Exception:
+            route = {}
+
+        try:
+            state = mgr.set(prompt, interval, route=route)
         except ValueError as exc:
             return f"Invalid heartbeat: {exc}"
         if quick_key and event.source is not None:

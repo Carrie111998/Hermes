@@ -9,11 +9,29 @@ from hermes_cli.heartbeat import (
     HeartbeatState,
     MIN_INTERVAL_SECONDS,
     format_interval,
+    list_active_heartbeats,
     load_heartbeat,
     migrate_heartbeat_to_session,
     parse_interval,
     save_heartbeat,
 )
+
+
+@pytest.fixture
+def hermes_home(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME so SessionDB.state_meta writes don't clobber the real one."""
+    from pathlib import Path
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    from hermes_cli import goals
+
+    goals._DB_CACHE.clear()
+    yield home
+    goals._DB_CACHE.clear()
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -185,3 +203,50 @@ def test_migrate_heartbeat_to_session():
 def test_migrate_noop_without_source():
     assert migrate_heartbeat_to_session("hb-none-a", "hb-none-b") is False
     assert migrate_heartbeat_to_session("same", "same") is False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# restart recovery — route persistence + list_active_heartbeats
+# ──────────────────────────────────────────────────────────────────────
+
+
+def test_state_roundtrip_defaults_route_to_empty_dict():
+    s = HeartbeatState(prompt="check CI", interval_seconds=600)
+    assert s.route == {}
+    loaded = HeartbeatState.from_json(s.to_json())
+    assert loaded.route == {}
+
+
+def test_manager_set_persists_route_across_instances():
+    route = {"platform": "telegram", "chat_id": "12345"}
+    mgr = HeartbeatManager(session_id="hb-route-sid")
+    mgr.set("watch it", 600, route=route)
+
+    again = HeartbeatManager(session_id="hb-route-sid")
+    assert again.state.route == route
+
+
+def test_list_active_heartbeats(hermes_home):
+    HeartbeatManager(session_id="hb-a").set("task a", 600)
+    mgr_b = HeartbeatManager(session_id="hb-b")
+    mgr_b.set("task b", 600)
+    mgr_b.pause()
+
+    active = dict(list_active_heartbeats())
+    assert "hb-a" in active
+    assert "hb-b" not in active
+
+
+def test_list_active_heartbeats_carries_route_for_restart_recovery(hermes_home):
+    """The gateway rebuilds its in-memory watch from this on every boot.
+
+    Without a persisted route, a heartbeat set on a gateway platform has no
+    way to resume firing after the process restarts (the in-memory
+    ``_heartbeat_watch`` registry starts empty on every boot) short of the
+    user re-touching /heartbeat.
+    """
+    route = {"platform": "telegram", "chat_id": "999", "user_id": "42"}
+    HeartbeatManager(session_id="hb-gateway-sid").set("watch deploy", 600, route=route)
+
+    active = dict(list_active_heartbeats())
+    assert active["hb-gateway-sid"].route == route
