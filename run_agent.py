@@ -1811,6 +1811,11 @@ class AIAgent:
         messages: Optional[list] = None,
     ) -> bool:
         """Detect conservative stop->length misreports for Ollama-hosted GLM models."""
+        # Cleared on every evaluation: this flag is a per-API-call diagnostic
+        # consumed by the truncation handler in conversation_loop.  A leftover
+        # True from a previous call would misclassify an unrelated genuine
+        # length truncation as heuristic-driven (see #98406).
+        self._suspicious_stop_rewrite = False
         if finish_reason != "stop" or self.api_mode != "chat_completions":
             return False
         if not self._is_ollama_glm_backend():
@@ -1833,7 +1838,17 @@ class AIAgent:
         if len(visible_text) < 20 or not re.search(r"\s", visible_text):
             return False
 
-        return not self._has_natural_response_ending(visible_text)
+        if not self._has_natural_response_ending(visible_text):
+            # The stop->length rewrite below is driven by the punctuation
+            # heuristic, not by provider-reported evidence.  conversation_loop
+            # uses this to cap heuristic-guided continuations at one attempt
+            # instead of four — with a reasoning model the injected
+            # continuation nudge itself gets deliberated over and produces yet
+            # another unpunctuated tail, so full-budget retries only
+            # manufacture the next false positive (#98406).
+            self._suspicious_stop_rewrite = True
+            return True
+        return False
 
     def _looks_like_codex_intermediate_ack(
         self,

@@ -4390,6 +4390,57 @@ class TestRunConversation:
 
 
 
+    def test_ollama_glm_suspicious_stop_converges_after_one_continuation(self, agent):
+        """A second heuristic-fired stop converges instead of burning 4 retries (#98406).
+
+        With a reasoning model, the injected continuation nudge itself becomes
+        the topic of the next reasoning pass, so full-budget retries keep
+        manufacturing unpunctuated tails.  After one salvage continuation the
+        loop must accept the stitched response as complete (no error banner).
+        """
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.3-flash:cloud"
+
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="c1")],
+        )
+        # Every response ends unpunctuated — the punctuation heuristic fires
+        # on each of them, exactly as observed live in #98406.
+        first_stop = _mock_response(
+            content="Based on the search results, the best next",
+            finish_reason="stop",
+        )
+        continued = _mock_response(
+            content=" step is to update the config file now",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_turn,
+            first_stop,
+            continued,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        # Converged: response delivered as complete, no truncation error.
+        assert result["completed"] is True
+        assert result.get("partial") is not True
+        assert result.get("error") is None
+        assert result["api_calls"] == 3
+        assert result["final_response"] == (
+            "Based on the search results, the best next step is to update the config file now"
+        )
+
     def test_length_thinking_exhausted_skips_continuation(self, agent):
         """When finish_reason='length' but content is only thinking, skip retries."""
         self._setup_agent(agent)

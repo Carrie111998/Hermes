@@ -3933,6 +3933,30 @@ def run_conversation(
                             )
                         if assistant_message is not None and not _trunc_has_tool_calls:
                             length_continue_retries += 1
+                            # ── Heuristic-guided stop rewrite converges fast (#98406) ──
+                            # When this truncation was manufactured by the
+                            # Ollama/GLM punctuation heuristic
+                            # (_should_treat_stop_as_truncated rewrote a
+                            # provider-correct ``stop`` to ``length``), one
+                            # continuation attempt is allowed (that preserves
+                            # the salvage behavior 8011aa31ba was written for),
+                            # but a second suspicious event converges instead
+                            # of burning the full retry budget: with a reasoning
+                            # model the injected nudge itself becomes the topic
+                            # of the next reasoning pass — extra full-budget
+                            # retries just produce another unpunctuated tail
+                            # and deepen the false truncation.
+                            _heuristic_truncation = getattr(
+                                agent, "_suspicious_stop_rewrite", False
+                            )
+                            agent._suspicious_stop_rewrite = False
+                            _should_request_continuation = (
+                                length_continue_retries < 4
+                                and not (
+                                    _heuristic_truncation
+                                    and length_continue_retries >= 2
+                                )
+                            )
                             # An EMPTY partial-stream stub (stream dropped
                             # mid tool-call before any text was delivered)
                             # must not be appended as an interim assistant
@@ -3957,7 +3981,7 @@ def run_conversation(
                                 if assistant_message.content:
                                     truncated_response_parts.append(assistant_message.content)
 
-                            if length_continue_retries < 4:
+                            if _should_request_continuation:
                                 _is_partial_stream_stub = (
                                     getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
                                 )
@@ -3999,11 +4023,26 @@ def run_conversation(
                                 break
 
                             partial_response = agent._strip_think_blocks(_join_truncated_parts(truncated_response_parts)).strip()
-                            if partial_response:
+                            # Heuristic-guided rewrites never saw a real output
+                            # cap, so "still truncated" is wrong framing — the
+                            # stitched partial IS the model's answer.  Complete
+                            # the turn instead of reporting a truncation error
+                            # (#98406).  A genuine cap that follows later marks
+                            # itself with _suspicious_stop_rewrite=False and
+                            # runs the full 4-attempt loop as before.
+                            _converged_heuristic = not _should_request_continuation and _heuristic_truncation
+                            if partial_response and not _converged_heuristic:
                                 agent._vprint(
                                     f"{agent.log_prefix}⚠️  Response still truncated "
                                     f"after 4 continuation attempts — keeping the "
                                     f"partial response received so far.",
+                                    force=True,
+                                )
+                            elif _converged_heuristic:
+                                agent._vprint(
+                                    f"{agent.log_prefix}ℹ️  Ollama/GLM stop heuristic "
+                                    f"fired once — accepting stitched response as "
+                                    f"complete.",
                                     force=True,
                                 )
                             # Unanswered continue nudges made every later turn re-truncate.
@@ -4036,9 +4075,13 @@ def run_conversation(
                                 "final_response": partial_response or None,
                                 "messages": messages,
                                 "api_calls": api_call_count,
-                                "completed": False,
-                                "partial": True,
-                                "error": "Response remained truncated after 4 continuation attempts",
+                                "completed": _converged_heuristic,
+                                "partial": not _converged_heuristic,
+                                "error": (
+                                    None
+                                    if _converged_heuristic
+                                    else "Response remained truncated after 4 continuation attempts"
+                                ),
                             }
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
