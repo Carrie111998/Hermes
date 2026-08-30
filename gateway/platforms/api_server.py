@@ -4889,6 +4889,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 # being consumed; surface it so clients can replay it as the
                 # next user turn rather than silently losing it.
                 pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
+                user_row_id = None
+                if isinstance(result, dict):
+                    user_row_id = result.get("user_row_id") or result.get("user_message_id")
+                    if not user_row_id and isinstance(result.get("messages"), list):
+                        for m in reversed(result["messages"]):
+                            if isinstance(m, dict) and m.get("role") == "user":
+                                user_row_id = m.get("_row_id") or m.get("id")
+                                if user_row_id:
+                                    break
                 completed_payload = {
                     "session_id": effective_session_id,
                     "message_id": message_id,
@@ -4897,6 +4906,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     "usage": usage,
                     "runtime": effective_runtime,
                 }
+                if user_row_id is not None:
+                    completed_payload["user_row_id"] = user_row_id
                 if pending_steer:
                     completed_payload["pending_steer"] = pending_steer
                 await queue.put(_event_payload("run.completed", completed_payload))
@@ -7903,6 +7914,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     # see turn_finalizer) rides on the terminal event/status so
                     # the client can replay it as the next user turn.
                     pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
+                    user_row_id = None
+                    if isinstance(result, dict):
+                        user_row_id = result.get("user_row_id") or result.get("user_message_id")
+                        if not user_row_id and isinstance(result.get("messages"), list):
+                            for m in reversed(result["messages"]):
+                                if isinstance(m, dict) and m.get("role") == "user":
+                                    user_row_id = m.get("_row_id") or m.get("id")
+                                    if user_row_id:
+                                        break
                     completed_event = {
                         "event": "run.completed",
                         "run_id": run_id,
@@ -7910,6 +7930,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         "output": final_response,
                         "usage": usage,
                     }
+                    if user_row_id is not None:
+                        completed_event["user_row_id"] = user_row_id
                     if pending_steer:
                         completed_event["pending_steer"] = pending_steer
                     _put_event_if_active(completed_event)

@@ -308,15 +308,16 @@ async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter
 
     session_id = session_db.create_session("transcript-session", "api_server")
 
-    async def fake_run(**kwargs):
+    async def fake_run(*args, **kwargs):
         # Stream the intermediate planning text the way a real turn would.
         kwargs["stream_delta_callback"]("Let me search for that:")
         kwargs["stream_delta_callback"]("Here is the summary.")
         result = {
             "final_response": "Here is the summary.",
             "session_id": session_id,
+            "user_row_id": 42,
             "messages": [
-                {"role": "user", "content": "search then summarize"},
+                {"role": "user", "content": "search then summarize", "_row_id": 42},
                 {
                     "role": "assistant",
                     "content": "Let me search for that:",
@@ -353,6 +354,7 @@ async def test_session_chat_stream_run_completed_carries_turn_transcript(adapter
                     run_completed_payload = _json.loads(line[len("data: "):])
             break
     assert run_completed_payload is not None, body
+    assert run_completed_payload.get("user_row_id") == 42
     messages = run_completed_payload.get("messages")
     assert isinstance(messages, list) and messages, run_completed_payload
 
