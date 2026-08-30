@@ -266,6 +266,10 @@ MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 RESPONSES_AUTO_TRUNCATION_HISTORY_LIMIT = 100
 _COMPRESSED_SUMMARY_METADATA_KEY = "_compressed_summary"
+# Internal result-bus marker consumed by transcript reconstruction. It must
+# never be serialized as a public API field; /v1/runs exposes the corresponding
+# caller-facing state as ``compressed``.
+_RESULT_COMPRESSED_KEY = "_compressed"
 
 
 class ThreadSafeAsyncQueue(asyncio.Queue):
@@ -1499,6 +1503,28 @@ class APIServerAdapter(BasePlatformAdapter):
     # is waiting to answer "session restored — what next?", so a resumed turn
     # should complete the interrupted work rather than acknowledge (#57056).
     interactive_resume: bool = False
+
+    # Public message fields that can safely cross the caller-managed
+    # ``conversation_history`` boundary.  Private persistence/cache markers
+    # deliberately stay server-side, while tool-call linkage and provider
+    # reasoning carriers must survive a return -> resubmit round trip.
+    # Provider integrations that add a structured reasoning/tool carrier must
+    # register it here and extend the round-trip contract test in
+    # tests/gateway/test_api_server_runs.py; otherwise the field is
+    # intentionally stripped at this API boundary.
+    _RUN_HISTORY_MESSAGE_FIELDS = (
+        "role",
+        "content",
+        "name",
+        "tool_name",
+        "tool_call_id",
+        "tool_calls",
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "codex_reasoning_items",
+        "codex_message_items",
+    )
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
@@ -3347,6 +3373,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_submission": True,
                 "run_status": True,
                 "run_events_sse": True,
+                "run_conversation_history": True,
                 "run_stop": True,
                 "run_steer": True,
                 "run_approval_response": True,
@@ -6117,7 +6144,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     final_response_text,
                 )
                 # Compression-aware transcript substitution happens inside
-                # _build_response_conversation_history (result["_compressed"]);
+                # _build_response_conversation_history (via the internal
+                # _RESULT_COMPRESSED_KEY marker);
                 # here we only propagate a compression-rotated session_id so
                 # previous_response_id chaining resumes the child session.
                 _result_sid = result.get("session_id") if isinstance(result, dict) else None
@@ -6983,7 +7011,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         When context compression occurs during a turn the agent returns a
         compressed full transcript in ``result["messages"]`` (starting with a
-        summary) and sets ``result["_compressed"] = True``.  Because the
+        summary) and sets an internal result marker. Because the
         compressed transcript does not share the input ``conversation_history``
         prefix, the normal turn-start detection fails and old code would
         concatenate the uncompressed history on front, bloating the stored
@@ -7006,10 +7034,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # This can happen because compression rewrote the transcript
             # (summary prefix replaces original history), OR because
             # agent_messages only carries the current turn without prior.
-            # The ``_compressed`` flag (set by _run_agent after compaction)
+            # The internal flag (set by _run_agent after compaction)
             # distinguishes — skip the concatenation and use the compressed
             # transcript directly.
-            if result.get("_compressed"):
+            if result.get(_RESULT_COMPRESSED_KEY):
                 return list(agent_messages)
 
             full_history = prior
@@ -7021,6 +7049,22 @@ class APIServerAdapter(BasePlatformAdapter):
         full_history.append(current_user)
         full_history.append({"role": "assistant", "content": final_response})
         return full_history
+
+    @classmethod
+    def _run_conversation_history_response(
+        cls,
+        conversation_history: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Return caller-managed history without internal state markers."""
+        return [
+            {
+                key: message[key]
+                for key in cls._RUN_HISTORY_MESSAGE_FIELDS
+                if key in message
+            }
+            for message in conversation_history
+            if isinstance(message, dict)
+        ]
 
     @staticmethod
     def _response_messages_turn_start_index(
@@ -7222,7 +7266,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _run_agent(
         self,
         user_message: str,
-        conversation_history: List[Dict[str, str]],
+        conversation_history: List[Dict[str, Any]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
@@ -7357,7 +7401,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         and _eff_sid != session_id
                     )
                     if _compacted_in_place or _session_rotated:
-                        result["_compressed"] = True
+                        result[_RESULT_COMPRESSED_KEY] = True
                     include_runtime = bool(
                         requested_runtime
                         or route
@@ -7609,6 +7653,26 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
+        raw_include = body.get("include", [])
+        if raw_include is None:
+            raw_include = []
+        if not isinstance(raw_include, list) or not all(
+            isinstance(item, str) for item in raw_include
+        ):
+            return web.json_response(
+                _openai_error("'include' must be an array of strings"),
+                status=400,
+            )
+        include_conversation_history = "conversation_history" in raw_include
+        unknown_includes = sorted(
+            set(raw_include).difference({"conversation_history"})
+        )
+        if unknown_includes:
+            logger.debug(
+                "Ignoring unsupported /v1/runs include value(s): %s",
+                unknown_includes,
+            )
+
         raw_input = body.get("input")
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
@@ -7622,7 +7686,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
+        conversation_history: List[Dict[str, Any]] = []
         raw_history = body.get("conversation_history")
         if raw_history:
             if not isinstance(raw_history, list):
@@ -7636,7 +7700,38 @@ class APIServerAdapter(BasePlatformAdapter):
                         _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
                         status=400,
                     )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+                role = str(entry["role"])
+                content = entry["content"]
+                has_structured_assistant_payload = any(
+                    entry.get(key)
+                    for key in (
+                        "tool_calls",
+                        "reasoning",
+                        "reasoning_content",
+                        "reasoning_details",
+                        "codex_reasoning_items",
+                        "codex_message_items",
+                    )
+                )
+                preserve_null_content = (
+                    content is None
+                    and role == "assistant"
+                    and has_structured_assistant_payload
+                )
+                message = {
+                    key: entry[key]
+                    for key in self._RUN_HISTORY_MESSAGE_FIELDS
+                    if key in entry
+                }
+                message["role"] = role
+                message["content"] = (
+                    None
+                    if preserve_null_content
+                    else content
+                    if isinstance(content, str)
+                    else str(content)
+                )
+                conversation_history.append(message)
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
@@ -7841,6 +7936,28 @@ class APIServerAdapter(BasePlatformAdapter):
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
                             )
+                            # /v1/runs owns a direct AIAgent lifecycle instead
+                            # of using _run_agent(), so mirror its authoritative
+                            # compression signals before building a caller-
+                            # managed continuation history below.
+                            effective_session_id = getattr(agent, "session_id", session_id)
+                            compacted_in_place = (
+                                getattr(agent, "_last_compaction_in_place", False)
+                                is True
+                            )
+                            session_rotated = (
+                                isinstance(effective_session_id, str)
+                                and bool(effective_session_id)
+                                and effective_session_id != session_id
+                            )
+                            if (
+                                isinstance(r, dict)
+                                and (compacted_in_place or session_rotated)
+                            ):
+                                # Internal reconstruction marker only. The
+                                # terminal event/status uses public
+                                # ``compressed`` below.
+                                r[_RESULT_COMPRESSED_KEY] = True
                         finally:
                             # Worker finished (interrupted or complete) —
                             # clear turn ownership immediately so a later
@@ -7899,6 +8016,20 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    history_was_compressed = bool(
+                        isinstance(result, dict)
+                        and result.get(_RESULT_COMPRESSED_KEY)
+                    )
+                    effective_history = None
+                    if include_conversation_history:
+                        effective_history = self._run_conversation_history_response(
+                            self._build_response_conversation_history(
+                                conversation_history,
+                                user_message,
+                                result if isinstance(result, dict) else {},
+                                final_response,
+                            )
+                        )
                     # Undelivered steer text (accepted after the final response;
                     # see turn_finalizer) rides on the terminal event/status so
                     # the client can replay it as the next user turn.
@@ -7912,6 +8043,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     }
                     if pending_steer:
                         completed_event["pending_steer"] = pending_steer
+                    if effective_history is not None:
+                        completed_event["conversation_history"] = effective_history
+                        completed_event["compressed"] = history_was_compressed
                     _put_event_if_active(completed_event)
                     self._set_run_status(
                         run_id,
@@ -7919,6 +8053,14 @@ class APIServerAdapter(BasePlatformAdapter):
                         output=final_response,
                         usage=usage,
                         last_event="run.completed",
+                        **(
+                            {
+                                "conversation_history": effective_history,
+                                "compressed": history_was_compressed,
+                            }
+                            if effective_history is not None
+                            else {}
+                        ),
                         **({"pending_steer": pending_steer} if pending_steer else {}),
                     )
             except asyncio.CancelledError:
