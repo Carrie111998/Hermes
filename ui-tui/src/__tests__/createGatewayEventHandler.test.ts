@@ -16,6 +16,16 @@ vi.mock('../lib/openExternalUrl.js', () => ({
   openExternalUrl: (url: string) => openExternalUrlMock(url)
 }))
 
+vi.mock('@hermes/ink', async importOriginal => {
+  const mod = await importOriginal<Record<string, unknown>>()
+
+  return {
+    ...mod,
+    onTerminalBackground: vi.fn(),
+    onTerminalForeground: vi.fn()
+  }
+})
+
 const ref = <T>(current: T) => ({ current })
 
 const buildCtx = (appended: Msg[]) =>
