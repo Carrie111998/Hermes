@@ -121,12 +121,12 @@ async def test_reconnect_recovery_does_not_rerun_active_handler(tmp_path: Path) 
 
     service.adapter_connected("plow_chat", adapter)
     await asyncio.sleep(0)
-    if service._recovery_task is not None:
-        await service._recovery_task
-
     assert calls == 1
+    recovery = service._recovery_task
     release.set()
     assert await handling == DeferredQuestionResult.done("Consent recorded.")
+    if recovery is not None:
+        await recovery
     await asyncio.sleep(0)
     assert service._handling_retry_tasks == {}
 
@@ -161,18 +161,68 @@ async def test_reconnect_wake_retries_after_active_handler_fails(
     )
     await started.wait()
 
-    assert await service.retry_handling() == []
+    await asyncio.sleep(0)
+    assert calls == 1
+    recovery = service._recovery_task
+    assert recovery is not None
     release.set()
     with pytest.raises(RuntimeError, match="temporary"):
         await handling
-    await asyncio.sleep(0)
-    await asyncio.sleep(0)
-    retry_tasks = tuple(service._handling_retry_tasks.values())
-    await asyncio.gather(*retry_tasks)
+    await recovery
 
     assert calls == 2
     with pytest.raises(KeyError):
         service.get(question.id)
+
+
+@pytest.mark.asyncio
+async def test_overlapping_recovery_does_not_retry_ambiguous_delivery(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    from gateway.deferred_questions import DeferredQuestionResult
+
+    service = _service(tmp_path / "questions.sqlite3")
+
+    class AmbiguousAdapter(_DeliveryAdapter):
+        def __init__(self, service) -> None:
+            super().__init__(service, active=False)
+            self.attempts = 0
+
+        async def deliver_deferred_message(self, delivery_source, content):
+            self.attempts += 1
+            return SimpleNamespace(
+                success=False, error="delivery timed out", retryable=False
+            )
+
+    adapter = AmbiguousAdapter(service)
+    question, _adapter = _awaiting_question(service, adapter=adapter)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handle(_record, _answer):
+        started.set()
+        await release.wait()
+        return DeferredQuestionResult.done("Consent recorded.")
+
+    service.register_handler("plow-chat", "invite-consent", handle)
+    handling = asyncio.create_task(
+        service.handle_response(question.session_key, "Sure!")
+    )
+    await started.wait()
+    recovery = asyncio.create_task(service.retry_handling())
+    await asyncio.sleep(0)
+
+    release.set()
+    with pytest.raises(RuntimeError, match="delivery timed out"):
+        await handling
+    assert await recovery == []
+
+    persisted = service.get(question.id)
+    assert persisted.state == "handling"
+    assert persisted.delivery_attempted is True
+    assert adapter.attempts == 1
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ class DeferredQuestion:
     state: QuestionState
     response: str | None
     result: DeferredQuestionResult | None
+    delivery_attempted: bool
     created_at: float
     updated_at: float
 
@@ -73,8 +74,7 @@ class DeferredQuestionService:
         self._adapters: dict[str, tuple[Any, asyncio.AbstractEventLoop]] = {}
         self._ready_platforms: set[str] = set()
         self._busy_callbacks: set[str] = set()
-        self._handling_questions: set[str] = set()
-        self._pending_handling_recovery: set[str] = set()
+        self._handler_lock = asyncio.Lock()
         self._handling_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._recovery_task: asyncio.Task[None] | None = None
         self.handling_retry_seconds = 5.0
@@ -159,6 +159,7 @@ class DeferredQuestionService:
             state=row["state"],
             response=row["response"],
             result=result,
+            delivery_attempted=bool(row["delivery_attempted"]),
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -542,28 +543,16 @@ class DeferredQuestionService:
     async def _run_handler(
         self, record: DeferredQuestion, *, schedule_retry: bool = True
     ) -> DeferredQuestionResult | None:
-        if record.id in self._handling_questions:
-            self._pending_handling_recovery.add(record.id)
-            return None
-        self._handling_questions.add(record.id)
-        try:
-            return await self._run_handler_once(record, schedule_retry=schedule_retry)
-        finally:
-            self._handling_questions.discard(record.id)
-            if record.id in self._pending_handling_recovery:
-                self._pending_handling_recovery.discard(record.id)
-                try:
-                    pending = self.get(record.id)
-                except KeyError:
-                    pending = None
-                if pending is not None and pending.state == "handling":
-                    retry = self._handling_retry_tasks.get(record.id)
-                    if retry is not None and not retry.done():
-                        retry.add_done_callback(
-                            lambda _task: self._schedule_handling_retry(pending)
-                        )
-                    else:
-                        self._schedule_handling_retry(pending)
+        async with self._handler_lock:
+            try:
+                pending = self.get(record.id)
+            except KeyError:
+                return None
+            if pending.state != "handling" or (
+                pending.result is not None and pending.delivery_attempted
+            ):
+                return None
+            return await self._run_handler_once(pending, schedule_retry=schedule_retry)
 
     async def _run_handler_once(
         self, record: DeferredQuestion, *, schedule_retry: bool
