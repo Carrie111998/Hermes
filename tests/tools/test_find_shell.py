@@ -15,6 +15,7 @@ import pytest
 from tools.environments.local import _find_bash, _find_shell
 
 
+@pytest.mark.linux_only
 class TestFindShellPrefersUserShell:
     """_find_shell should prefer $SHELL over bash on POSIX."""
 
