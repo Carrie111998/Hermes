@@ -261,6 +261,7 @@ class SessionKernel:
         self.sentinel: str = ""
         self.tool_call_log: List = []
         self.tool_call_counter: List[int] = [0]
+        self.mcp_tool_call_counter: List[int] = [0]
         self.response_q: "queue.Queue[dict]" = queue.Queue()
         self.raw_chunks: List[bytes] = []
         self.raw_bytes = [0]
@@ -425,7 +426,8 @@ def _teardown(kernel: SessionKernel) -> None:
 
 
 def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
-                 sandbox_tools: frozenset) -> None:
+                 sandbox_tools: frozenset, mcp_tools: frozenset,
+                 max_mcp_tool_calls: int) -> None:
     """Serve tool RPC for the kernel's whole life.
 
     ``_rpc_server_loop`` serves one connection and returns on disconnect or
@@ -461,6 +463,9 @@ def _rpc_forever(kernel: SessionKernel, max_tool_calls: int,
             kernel.stop_event,
             kernel.rpc_token,
             dispatch=_dispatch,
+            mcp_tools=mcp_tools,
+            mcp_tool_call_counter=kernel.mcp_tool_call_counter,
+            max_mcp_tool_calls=max_mcp_tool_calls,
         )
 
 
@@ -544,7 +549,8 @@ def _stderr_reader(kernel: SessionKernel) -> None:
 
 
 def _spawn(kernel: SessionKernel, *, task_id: str, child_python: str,
-           child_cwd: str, sandbox_tools: frozenset, max_tool_calls: int) -> None:
+           child_cwd: str, sandbox_tools: frozenset, mcp_tools: frozenset,
+           max_tool_calls: int, max_mcp_tool_calls: int) -> None:
     from tools.code_execution_tool import (
         _build_child_env,
         generate_hermes_tools_module,
@@ -571,7 +577,9 @@ def _spawn(kernel: SessionKernel, *, task_id: str, child_python: str,
     server_sock.listen(1)
     kernel.server_sock = server_sock
 
-    tools_src = generate_hermes_tools_module(list(sandbox_tools))
+    tools_src = generate_hermes_tools_module(
+        list(sandbox_tools), mcp_tools=list(mcp_tools)
+    )
     with open(os.path.join(kernel.tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
         f.write(tools_src)
     runner_path = os.path.join(kernel.tmpdir, "hermes_kernel_runner.py")
@@ -611,7 +619,10 @@ def _spawn(kernel: SessionKernel, *, task_id: str, child_python: str,
     # kernel's whole life. Authority is rebound per cell via CellAuthority.
     threading.Thread(
         target=_rpc_forever,
-        args=(kernel, max_tool_calls, sandbox_tools),
+        args=(
+            kernel, max_tool_calls, sandbox_tools, mcp_tools,
+            max_mcp_tool_calls,
+        ),
         daemon=True,
     ).start()
     threading.Thread(target=_stdout_reader, args=(kernel,), daemon=True).start()
@@ -636,8 +647,10 @@ def execute_in_session_kernel(
     child_python: str,
     child_cwd: str,
     sandbox_tools: frozenset,
+    mcp_tools: frozenset,
     timeout: int,
     max_tool_calls: int,
+    max_mcp_tool_calls: int,
     reset: bool,
     is_interrupted,
 ) -> str:
@@ -693,13 +706,16 @@ def execute_in_session_kernel(
                     child_python=child_python,
                     child_cwd=child_cwd,
                     sandbox_tools=sandbox_tools,
+                    mcp_tools=mcp_tools,
                     max_tool_calls=max_tool_calls,
+                    max_mcp_tool_calls=max_mcp_tool_calls,
                 )
             assert kernel.proc is not None and kernel.proc.stdin is not None
 
             # Per-cell tool budget: the RPC loop enforces counter < max, so a
             # fresh cell starts from zero without restarting the server.
             kernel.tool_call_counter[0] = 0
+            kernel.mcp_tool_call_counter[0] = 0
             # Anything raw that leaked between cells belongs to no cell.
             _drain_raw(kernel)
             _drain_stderr(kernel)
@@ -756,6 +772,7 @@ def execute_in_session_kernel(
                 "output": stdout_text,
                 "exit_code": 0,
                 "tool_calls_made": kernel.tool_call_counter[0],
+                "mcp_tool_calls_made": kernel.mcp_tool_call_counter[0],
                 "duration_seconds": duration,
                 "kernel": {
                     "mode": "session",
@@ -837,6 +854,7 @@ def execute_in_session_kernel(
                 "status": "error",
                 "error": str(exc),
                 "tool_calls_made": kernel.tool_call_counter[0],
+                "mcp_tool_calls_made": kernel.mcp_tool_call_counter[0],
                 "duration_seconds": round(time.monotonic() - exec_start, 2),
             }, ensure_ascii=False)
         finally:

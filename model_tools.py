@@ -520,9 +520,19 @@ def _compute_tool_definitions(
     # execute_code" even when the API key isn't configured or the toolset is
     # disabled (#560-discord).
     if "execute_code" in available_tool_names:
-        from tools.code_execution_tool import SANDBOX_ALLOWED_TOOLS, build_execute_code_schema, _get_execution_mode
+        from tools.code_execution_tool import (
+            SANDBOX_ALLOWED_TOOLS,
+            _get_execution_mode,
+            _sandbox_mcp_tools,
+            build_execute_code_schema,
+        )
         sandbox_enabled = SANDBOX_ALLOWED_TOOLS & available_tool_names
-        dynamic_schema = build_execute_code_schema(sandbox_enabled, mode=_get_execution_mode())
+        mcp_enabled = _sandbox_mcp_tools(available_tool_names)
+        dynamic_schema = build_execute_code_schema(
+            sandbox_enabled,
+            mode=_get_execution_mode(),
+            enabled_mcp_tools=mcp_enabled,
+        )
         for i, td in enumerate(filtered_tools):
             if td.get("function", {}).get("name") == "execute_code":
                 filtered_tools[i] = {"type": "function", "function": dynamic_schema}

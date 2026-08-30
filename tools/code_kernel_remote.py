@@ -158,8 +158,19 @@ class RemoteKernel:
     cell_seq: int = 0
 
 
-def _kernel_key(owner: str, env_type: str, task_env_id: str) -> Tuple:
-    return (owner, "remote", env_type, task_env_id)
+def _kernel_key(
+    owner: str, env_type: str, task_env_id: str, sandbox_tools: frozenset
+) -> Tuple:
+    # Match the local-kernel identity: the generated hermes_tools module is
+    # immutable for a kernel's lifetime, so a changed tool set needs a fresh
+    # runner instead of reusing stubs from an earlier session snapshot.
+    return (
+        owner,
+        "remote",
+        env_type,
+        task_env_id,
+        tuple(sorted(sandbox_tools)),
+    )
 
 
 def _is_alive(kernel: RemoteKernel) -> bool:
@@ -223,7 +234,7 @@ atexit.register(shutdown_all_remote_kernels)
 
 
 def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
-                         sandbox_tools: frozenset, *,
+                         sandbox_tools: frozenset, mcp_tools: frozenset, *,
                          idle_exit: int) -> Optional[RemoteKernel]:
     """Start a detached kernel runner on the remote. None on failure."""
     from tools.code_execution_tool import (
@@ -246,7 +257,7 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
         )
         _ship_file_to_remote(env, f"{kernel_dir}/kernel_runner.py", runner_src)
         tools_src = generate_hermes_tools_module(
-            list(sandbox_tools), transport="file",
+            list(sandbox_tools), transport="file", mcp_tools=list(mcp_tools),
         )
         _ship_file_to_remote(env, f"{kernel_dir}/hermes_tools.py", tools_src)
 
@@ -308,6 +319,8 @@ def execute_in_remote_kernel(
     max_tool_calls: int,
     reset: bool,
     idle_exit: int = 1800,
+    mcp_tools: frozenset = frozenset(),
+    max_mcp_tool_calls: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Run one cell in the owner's remote kernel.
 
@@ -318,13 +331,16 @@ def execute_in_remote_kernel(
     """
     from tools.code_kernel import _resolve_owner
     from tools.code_execution_tool import (
+        DEFAULT_MAX_MCP_TOOL_CALLS,
         _rpc_poll_loop,
         _ship_file_to_remote,
     )
     from tools.thread_context import propagate_context_to_thread
 
     owner = _resolve_owner(task_env_id)
-    key = _kernel_key(owner, env_type, task_env_id)
+    if max_mcp_tool_calls is None:
+        max_mcp_tool_calls = DEFAULT_MAX_MCP_TOOL_CALLS
+    key = _kernel_key(owner, env_type, task_env_id, sandbox_tools)
     state_lost = False
     state_reset = False
 
@@ -350,7 +366,7 @@ def execute_in_remote_kernel(
     reused = kernel is not None
     if kernel is None:
         kernel = _spawn_remote_kernel(
-            env, env_type, owner, task_env_id, sandbox_tools,
+            env, env_type, owner, task_env_id, sandbox_tools, mcp_tools,
             idle_exit=idle_exit,
         )
         if kernel is None:
@@ -377,6 +393,7 @@ def execute_in_remote_kernel(
 
     tool_call_log: list = []
     tool_call_counter = [0]
+    mcp_tool_call_counter = [0]
     stop_event = threading.Event()
     # Per-cell RPC thread carrying THIS call's approval/session context —
     # the remote analogue of CellAuthority: authority lives exactly as long
@@ -388,6 +405,11 @@ def execute_in_remote_kernel(
             tool_call_log, tool_call_counter, max_tool_calls,
             sandbox_tools, stop_event, kernel.rpc_token,
         ),
+        kwargs={
+            "mcp_tools": mcp_tools,
+            "mcp_tool_call_counter": mcp_tool_call_counter,
+            "max_mcp_tool_calls": max_mcp_tool_calls,
+        },
         daemon=True,
     )
     rpc_thread.start()
@@ -447,6 +469,7 @@ def execute_in_remote_kernel(
             "stderr": "",
             "traceback": "",
             "tool_calls_made": tool_call_counter[0],
+            "mcp_tool_calls_made": mcp_tool_call_counter[0],
             "kernel": {
                 "reused": reused,
                 "remote": True,
@@ -476,6 +499,7 @@ def execute_in_remote_kernel(
         "stdout_clipped": bool(cell_payload.get("stdout_clipped")),
         "stderr_clipped": bool(cell_payload.get("stderr_clipped")),
         "tool_calls_made": tool_call_counter[0],
+        "mcp_tool_calls_made": mcp_tool_call_counter[0],
         "kernel": {
             "reused": reused,
             "remote": True,
