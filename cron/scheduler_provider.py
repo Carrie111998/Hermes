@@ -558,6 +558,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -582,6 +583,7 @@ class InProcessCronScheduler(CronScheduler):
                 stop_event,
                 profile_homes=profile_homes,
                 adapters=adapters,
+                profile_adapters=profile_adapters,
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
@@ -653,6 +655,7 @@ class InProcessCronScheduler(CronScheduler):
         *,
         profile_homes,
         adapters=None,
+        profile_adapters=None,
         loop=None,
         interval=60,
         can_dispatch=None,
@@ -664,6 +667,14 @@ class InProcessCronScheduler(CronScheduler):
         agent execution to that profile's home — mirroring how
         ``_profile_runtime_scope`` scopes the multiplexed inbound path and
         ``web_server.py`` scopes per-profile cron API calls.
+
+        ``profile_adapters`` maps profile name → that profile's live adapter
+        map (``{Platform: adapter}``). When provided, each profile ticks with
+        ITS OWN adapters so cron deliveries issued from a secondary profile's
+        store ride that profile's bot identity instead of the default
+        profile's. Fall back to the shared ``adapters`` map for profiles not
+        present in the map (default profile, or a gateway that never started
+        secondary adapters).
         """
         import logging
         from cron.scheduler import tick as cron_tick
@@ -681,6 +692,7 @@ class InProcessCronScheduler(CronScheduler):
             len(profile_homes),
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
+        profile_adapters = profile_adapters or {}
 
         # Recovery + initial heartbeat for every profile.
         # A profile may have been deleted since this snapshot was taken;
@@ -712,12 +724,20 @@ class InProcessCronScheduler(CronScheduler):
                 else:
                     for entry in _existing_profile_homes(profile_homes):
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        profile_name = entry[0] if isinstance(entry, tuple) else None
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
+                                # A secondary profile's own adapters carry its
+                                # bot identity; without this, every profile's
+                                # cron delivery rides the DEFAULT profile's
+                                # adapters (wrong bot for DM deliveries).
+                                tick_adapters = adapters
+                                if profile_name and profile_name in profile_adapters:
+                                    tick_adapters = profile_adapters.get(profile_name)
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=tick_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,

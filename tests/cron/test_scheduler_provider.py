@@ -640,6 +640,63 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_ticker_uses_profile_adapters_for_cron_delivery(tmp_path, monkeypatch):
+    """Cron deliveries from a secondary profile must ride that profile's own
+    adapters (its bot identity), not the default profile's. Regression test:
+    multiplex cron always delivered through the DEFAULT adapters, so
+    agent-fund cron reports arrived as DMs from the PA bot even though the
+    job ran in the agent-fund profile context."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    p1 = tmp_path / "default"
+    p2 = tmp_path / "home-ops"
+    for d in (p1, p2):
+        (d / "cron").mkdir(parents=True)
+
+    profile_homes = [("default", p1), ("home-ops", p2)]
+
+    # Record which adapters map each tick() invocation received.
+    adapters_seen: list[dict] = []
+
+    def _tracking_tick(*args, **kwargs):
+        adapters_seen.append(kwargs.get("adapters"))
+        return 0
+
+    stop = threading.Event()
+    prov = InProcessCronScheduler()
+
+    default_adapters = {"default-platform": object()}
+    home_ops_adapters = {"home-ops-platform": object()}
+
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        t = threading.Thread(
+            target=prov.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": profile_homes,
+                "adapters": default_adapters,
+                "profile_adapters": {"home-ops": home_ops_adapters},
+            },
+            daemon=True,
+        )
+        t.start()
+        deadline = time.monotonic() + 10
+        while len(adapters_seen) < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive()
+    assert len(adapters_seen) >= 2, f"Expected >= 2 tick calls, got {len(adapters_seen)}"
+    # Both profiles must have been ticked, and each with its own adapters map:
+    assert any(a is default_adapters for a in adapters_seen), \
+        "default profile must tick with the default adapters"
+    assert any(a is home_ops_adapters for a in adapters_seen), \
+        "secondary profile must tick with ITS OWN adapters, not the default's"
+
+
 def test_multiplex_ticker_skips_deleted_profile_from_startup_snapshot(tmp_path):
     """A stale profile_homes entry must not recreate a deleted profile."""
     import cron.jobs as jobs

@@ -32303,6 +32303,18 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                     len(profile_homes),
                     [p[0] if isinstance(p, tuple) else p for p in profile_homes],
                 )
+                # Give each served profile its own live adapter map so cron
+                # deliveries from a secondary profile's store ride that
+                # profile's bot identity (e.g. agent-fund reports arrive as
+                # DMs from the agent-fund bot, not the default/PA bot).
+                profile_adapters = getattr(runner, "_profile_adapters", None) or {}
+                if profile_adapters:
+                    cron_start_kwargs["profile_adapters"] = profile_adapters
+                    logger.info(
+                        "Cron scheduler will route deliveries per profile for %d secondary profile(s): %s",
+                        len(profile_adapters),
+                        list(profile_adapters.keys()),
+                    )
         except Exception as exc:
             logger.warning(
                 "Could not resolve profile homes for multiplex cron: %s",
