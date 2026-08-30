@@ -47,6 +47,23 @@ vi.mock("@/plugins", () => ({ PluginSlot: () => null }));
 
 import SkillsPage from "./SkillsPage";
 
+const localStorageMock = (() => {
+  let store: Record<string, string> = {};
+
+  return {
+    clear: () => {
+      store = {};
+    },
+    getItem: (key: string) => store[key] ?? null,
+    removeItem: (key: string) => {
+      delete store[key];
+    },
+    setItem: (key: string, value: string) => {
+      store[key] = String(value);
+    },
+  };
+})();
+
 const hubResult = {
   name: "audit-skill",
   description: "External skill description",
@@ -74,6 +91,8 @@ async function openHub() {
 
 describe("SkillsPage Polish active controls", () => {
   beforeEach(() => {
+    vi.stubGlobal("localStorage", localStorageMock);
+    localStorageMock.clear();
     localStorage.setItem("hermes-locale", "pl");
     mocks.getSkills.mockResolvedValue([
       { name: "test-skill", description: "Test", category: "test", enabled: true },
@@ -135,7 +154,8 @@ describe("SkillsPage Polish active controls", () => {
 
   afterEach(() => {
     cleanup();
-    localStorage.clear();
+    localStorageMock.clear();
+    vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
 
