@@ -15,11 +15,12 @@ The routes:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
-from collections import defaultdict, deque
-from typing import Any, Deque, Dict
+from collections import OrderedDict, deque
+from typing import Any, Deque
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -30,7 +31,11 @@ from hermes_cli.dashboard_auth import (
     list_providers,
     list_session_providers,
 )
-from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+from hermes_cli.dashboard_auth.audit import (
+    AuditEvent,
+    audit_log,
+    client_ip as _client_ip,
+)
 from hermes_cli.dashboard_auth.base import (
     InvalidCodeError,
     InvalidCredentialsError,
@@ -104,13 +109,6 @@ def _redirect_uri(request: Request) -> str:
         return base
     parsed = urlparse(base)
     return urlunparse(parsed._replace(path=f"{prefix}{parsed.path}"))
-
-
-def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
 
 
 def _prefix(request: Request) -> str:
@@ -203,7 +201,10 @@ async def auth_login(request: Request, provider: str, next: str = ""):
         return RedirectResponse(url=login_url, status_code=302)
 
     try:
-        ls = p.start_login(redirect_uri=_redirect_uri(request))
+        ls = await asyncio.to_thread(
+            p.start_login,
+            redirect_uri=_redirect_uri(request),
+        )
     except ProviderError as e:
         audit_log(
             AuditEvent.LOGIN_FAILURE,
@@ -400,7 +401,10 @@ async def auth_native_authorize(
         return resp
 
     try:
-        ls = p.start_login(redirect_uri=_redirect_uri(request))
+        ls = await asyncio.to_thread(
+            p.start_login,
+            redirect_uri=_redirect_uri(request),
+        )
     except ProviderError as e:
         raise HTTPException(status_code=503, detail=f"Provider unreachable: {e}")
 
@@ -501,7 +505,8 @@ async def auth_callback(
         )
 
     try:
-        session = p.complete_login(
+        session = await asyncio.to_thread(
+            p.complete_login,
             code=code,
             state=state,
             code_verifier=verifier,
@@ -652,37 +657,58 @@ def _validate_post_login_target(raw: str) -> str:
 # password we verify locally, so it's a credential-stuffing target. A
 # simple in-process sliding-window limiter per client IP raises the cost
 # of online guessing without any external dependency. It is intentionally
-# best-effort: process-local (resets on restart), and behind a trusting
-# proxy the IP is the proxy's unless X-Forwarded-For is set — which is why
-# this is defence-in-depth on top of the provider's own constant-time
-# verify, not the only line of defence.
+# best-effort and process-local (resets on restart), so it is defence-in-depth
+# on top of the provider's own constant-time verify, not the only line of
+# defence.
 
+_RATE_LIMIT_MAX_CLIENTS = 4096
 _PW_RATE_MAX_ATTEMPTS = 10
 _PW_RATE_WINDOW_SEC = 60.0
-_pw_attempts: Dict[str, Deque[float]] = defaultdict(deque)
+_pw_attempts: OrderedDict[str, Deque[float]] = OrderedDict()
 _pw_attempts_lock = threading.Lock()
+
+
+def _sliding_window_rate_limited(
+    ip: str,
+    *,
+    attempts: OrderedDict[str, Deque[float]],
+    lock: Any,
+    max_attempts: int,
+    window_sec: float,
+) -> bool:
+    """Record an attempt in a bounded per-IP sliding-window map."""
+    now = time.monotonic()
+    cutoff = now - window_sec
+    key = ip or "_unknown_"
+    with lock:
+        # Pop/reinsert gives O(1) least-recently-used ordering. The cap prevents
+        # a stream of unique client addresses from growing process memory
+        # without bound.
+        bucket = attempts.pop(key, deque())
+        while bucket and bucket[0] < cutoff:
+            bucket.popleft()
+        limited = len(bucket) >= max_attempts
+        if not limited:
+            bucket.append(now)
+        attempts[key] = bucket
+        while len(attempts) > _RATE_LIMIT_MAX_CLIENTS:
+            attempts.popitem(last=False)
+        return limited
 
 
 def _password_rate_limited(ip: str) -> bool:
     """True if ``ip`` has exceeded the password-login attempt budget.
 
-    Sliding window: prune attempts older than the window, then check the
-    count. Records the attempt timestamp when allowed. An empty IP (no
-    discernible client) shares a single bucket — fail-safe toward
-    throttling rather than letting unattributable traffic through
-    unmetered.
+    An empty IP (no discernible client) shares a single bucket — fail-safe
+    toward throttling rather than letting unattributable traffic through.
     """
-    now = time.monotonic()
-    cutoff = now - _PW_RATE_WINDOW_SEC
-    key = ip or "_unknown_"
-    with _pw_attempts_lock:
-        bucket = _pw_attempts[key]
-        while bucket and bucket[0] < cutoff:
-            bucket.popleft()
-        if len(bucket) >= _PW_RATE_MAX_ATTEMPTS:
-            return True
-        bucket.append(now)
-        return False
+    return _sliding_window_rate_limited(
+        ip,
+        attempts=_pw_attempts,
+        lock=_pw_attempts_lock,
+        max_attempts=_PW_RATE_MAX_ATTEMPTS,
+        window_sec=_PW_RATE_WINDOW_SEC,
+    )
 
 
 def _reset_password_rate_limit() -> None:
@@ -783,8 +809,10 @@ async def auth_password_login(request: Request, body: _PasswordLoginBody):
         )
 
     try:
-        session = p.complete_password_login(
-            username=body.username, password=body.password
+        session = await asyncio.to_thread(
+            p.complete_password_login,
+            username=body.username,
+            password=body.password,
         )
     except InvalidCredentialsError:
         audit_log(
@@ -883,7 +911,10 @@ async def auth_logout(request: Request):
         # logged but never raised.
         for provider in list_providers():
             try:
-                provider.revoke_session(refresh_token=rt)
+                await asyncio.to_thread(
+                    provider.revoke_session,
+                    refresh_token=rt,
+                )
             except Exception as e:  # noqa: BLE001 — best-effort
                 _log.warning(
                     "dashboard-auth: revoke on %r failed: %s",
@@ -1021,9 +1052,51 @@ async def auth_native_token(request: Request, body: _NativeTokenBody):
     }
 
 
+_NATIVE_REFRESH_RATE_MAX_ATTEMPTS = 10
+_NATIVE_REFRESH_RATE_WINDOW_SEC = 60.0
+_native_refresh_attempts: OrderedDict[str, Deque[float]] = OrderedDict()
+_native_refresh_attempts_lock = threading.Lock()
+
+
+def _native_refresh_rate_limited(ip: str) -> bool:
+    """True if ``ip`` has exhausted the native-refresh attempt budget."""
+    return _sliding_window_rate_limited(
+        ip,
+        attempts=_native_refresh_attempts,
+        lock=_native_refresh_attempts_lock,
+        max_attempts=_NATIVE_REFRESH_RATE_MAX_ATTEMPTS,
+        window_sec=_NATIVE_REFRESH_RATE_WINDOW_SEC,
+    )
+
+
+def _reset_native_refresh_rate_limit() -> None:
+    """Test-only: clear all native-refresh rate-limit buckets."""
+    with _native_refresh_attempts_lock:
+        _native_refresh_attempts.clear()
+
+
+def _native_refresh_expired_response(
+    request: Request, *, provider: str, reason: str
+) -> JSONResponse:
+    """Return the terminal response that makes native clients reauthenticate."""
+    audit_log(
+        AuditEvent.REFRESH_FAILURE,
+        provider=provider,
+        reason=reason,
+        ip=_client_ip(request),
+    )
+    return JSONResponse(
+        {
+            "error": "session_expired",
+            "detail": "Refresh token expired or invalid; start a new sign-in.",
+        },
+        status_code=401,
+    )
+
+
 class _NativeRefreshBody(BaseModel):
     refresh_token: str
-    provider: str
+    provider: str = ""
 
 
 @router.post("/auth/native/refresh", name="auth_native_refresh")
@@ -1037,22 +1110,53 @@ async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
     configured providers.
 
     Failure modes:
+      * a missing or unknown provider → 401 ``session_expired`` so an older
+        native client clears stale credentials instead of retrying forever;
       * the named provider rejects the RT (dead/expired/reuse-detected) → 401
         ``session_expired`` so the desktop starts a fresh native login;
+      * too many attempts from the trusted client address → 429;
       * the named provider's IDP is unreachable → 503.
     """
     from hermes_cli.dashboard_auth.base import RefreshExpiredError
 
     if not body.refresh_token:
         raise HTTPException(status_code=400, detail="refresh_token required")
+
+    ip = _client_ip(request)
+    if _native_refresh_rate_limited(ip):
+        audit_log(
+            AuditEvent.REFRESH_FAILURE,
+            provider=body.provider,
+            reason="rate_limited",
+            ip=ip,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too many refresh attempts. Try again shortly.",
+            headers={
+                "Retry-After": str(int(_NATIVE_REFRESH_RATE_WINDOW_SEC))
+            },
+        )
+
     if not body.provider:
-        raise HTTPException(status_code=400, detail="provider required")
+        return _native_refresh_expired_response(
+            request,
+            provider="",
+            reason="provider_missing",
+        )
 
     provider = get_provider(body.provider)
     if provider is None or not getattr(provider, "supports_session", True):
-        raise HTTPException(status_code=400, detail="Unknown session provider")
+        return _native_refresh_expired_response(
+            request,
+            provider=body.provider,
+            reason="unknown_provider",
+        )
     try:
-        session = provider.refresh_session(refresh_token=body.refresh_token)
+        session = await asyncio.to_thread(
+            provider.refresh_session,
+            refresh_token=body.refresh_token,
+        )
     except RefreshExpiredError:
         session = None
     except ProviderError as e:
@@ -1069,7 +1173,7 @@ async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
             AuditEvent.REFRESH_SUCCESS,
             provider=session.provider,
             user_id=session.user_id,
-            ip=_client_ip(request),
+            ip=ip,
         )
         return {
             "access_token": session.access_token,
@@ -1080,19 +1184,34 @@ async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
             "user_id": session.user_id,
         }
 
-    audit_log(
-        AuditEvent.REFRESH_FAILURE,
+    return _native_refresh_expired_response(
+        request,
         provider=provider.name,
         reason="provider_rejected_rt",
-        ip=_client_ip(request),
     )
-    return JSONResponse(
-        {
-            "error": "session_expired",
-            "detail": "Refresh token expired or invalid; start a new sign-in.",
-        },
-        status_code=401,
+
+
+_NATIVE_LOGOUT_RATE_MAX_ATTEMPTS = 10
+_NATIVE_LOGOUT_RATE_WINDOW_SEC = 60.0
+_native_logout_attempts: OrderedDict[str, Deque[float]] = OrderedDict()
+_native_logout_attempts_lock = threading.Lock()
+
+
+def _native_logout_rate_limited(ip: str) -> bool:
+    """True if ``ip`` has exhausted the native-revocation attempt budget."""
+    return _sliding_window_rate_limited(
+        ip,
+        attempts=_native_logout_attempts,
+        lock=_native_logout_attempts_lock,
+        max_attempts=_NATIVE_LOGOUT_RATE_MAX_ATTEMPTS,
+        window_sec=_NATIVE_LOGOUT_RATE_WINDOW_SEC,
     )
+
+
+def _reset_native_logout_rate_limit() -> None:
+    """Test-only: clear all native-logout rate-limit buckets."""
+    with _native_logout_attempts_lock:
+        _native_logout_attempts.clear()
 
 
 class _NativeLogoutBody(BaseModel):
@@ -1118,9 +1237,28 @@ async def auth_native_logout(request: Request, body: _NativeLogoutBody):
     if provider is None or not getattr(provider, "supports_session", True):
         raise HTTPException(status_code=400, detail="Unknown session provider")
 
+    ip = _client_ip(request)
+    if _native_logout_rate_limited(ip):
+        audit_log(
+            AuditEvent.REVOKE,
+            provider=provider.name,
+            reason="rate_limited",
+            ip=ip,
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="Too many logout attempts. Try again shortly.",
+            headers={
+                "Retry-After": str(int(_NATIVE_LOGOUT_RATE_WINDOW_SEC))
+            },
+        )
+
     outcome = "attempted"
     try:
-        provider.revoke_session(refresh_token=body.refresh_token)
+        await asyncio.to_thread(
+            provider.revoke_session,
+            refresh_token=body.refresh_token,
+        )
     except Exception as exc:  # noqa: BLE001 — revocation is best-effort
         outcome = "provider_error"
         _log.warning(
@@ -1132,6 +1270,6 @@ async def auth_native_logout(request: Request, body: _NativeLogoutBody):
         AuditEvent.REVOKE,
         provider=provider.name,
         reason=outcome,
-        ip=_client_ip(request),
+        ip=ip,
     )
     return {"ok": True}

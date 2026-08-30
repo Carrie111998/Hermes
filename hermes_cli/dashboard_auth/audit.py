@@ -56,6 +56,15 @@ class AuditEvent(enum.Enum):
     NATIVE_TOKEN_FAILURE = "native_token_failure"
 
 
+def client_ip(request: Any) -> str:
+    """Return Uvicorn's trusted request peer for audit/rate-limit identity.
+
+    Proxy-header trust is resolved before the ASGI request is built. Reading
+    raw forwarded headers here would let a direct client forge its identity.
+    """
+    return request.client.host if request.client else ""
+
+
 def _resolve_log_path() -> Path:
     """``$HERMES_HOME/logs/dashboard-auth.log``.
 

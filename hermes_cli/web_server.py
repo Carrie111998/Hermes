@@ -19491,9 +19491,10 @@ def start_server(
         configured_native_redirect_uris,
     )
 
+    server_config = load_config()
     try:
         app.state.native_redirect_uris = configured_native_redirect_uris(
-            load_config()
+            server_config
         )
     except NativeRedirectConfigurationError as exc:
         raise SystemExit(f"Invalid native redirect configuration: {exc}") from exc
@@ -19667,10 +19668,7 @@ def start_server(
     # Non-loopback ping cadence is config-driven (dashboard.ws_ping_interval /
     # dashboard.ws_ping_timeout, #79635); the 20/20 defaults keep the
     # Cloudflare-Tunnel-friendly behaviour when unset or invalid.
-    try:
-        _dash_cfg = load_config().get("dashboard") or {}
-    except Exception:
-        _dash_cfg = {}
+    _dash_cfg = server_config.get("dashboard") or {}
 
     def _ws_ping_setting(key: str, default: float = 20.0) -> float:
         try:

@@ -30,7 +30,7 @@ from hermes_cli.dashboard_auth import (
     clear_providers,
     register_provider,
 )
-from hermes_cli.dashboard_auth import native_flow
+from hermes_cli.dashboard_auth import native_flow, routes
 from hermes_cli.dashboard_auth.base import RefreshExpiredError, Session
 from hermes_cli.dashboard_auth.native_redirects import (
     NativeRedirectConfigurationError,
@@ -90,6 +90,8 @@ class _SecondStubProvider(StubAuthProvider):
 @pytest.fixture(autouse=True)
 def _reset_broker():
     native_flow._reset_for_tests()
+    routes._reset_native_refresh_rate_limit()
+    routes._reset_native_logout_rate_limit()
     # Snapshot the shared app.state auth fields + provider registry so a test
     # that flips auth_required / registers a stub provider can't leak into a
     # later test file (e.g. the MCP dashboard-oauth suite shares web_server.app).
@@ -101,6 +103,8 @@ def _reset_broker():
     )
     yield
     native_flow._reset_for_tests()
+    routes._reset_native_refresh_rate_limit()
+    routes._reset_native_logout_rate_limit()
     clear_providers()
     web_server.app.state.auth_required = prev_required
     web_server.app.state.bound_host = prev_host
@@ -165,6 +169,15 @@ def gated_client():
     web_server.app.state.native_redirect_uris = prev_redirects
 
 
+def _gated_client_from_ip(ip: str) -> TestClient:
+    return TestClient(
+        web_server.app,
+        base_url="https://fly-app.fly.dev",
+        follow_redirects=False,
+        client=(ip, 50000),
+    )
+
+
 def _walk_native_login(client, *, redirect_uri, challenge, state="cli-state"):
     """Drive authorize → (stub redirects to callback) → loopback code.
 
@@ -196,9 +209,9 @@ def _walk_native_login(client, *, redirect_uri, challenge, state="cli-state"):
     )
     assert r2.status_code == 302, r2.text
     # 3. The callback 302s to the desktop's loopback redirect_uri.
-    loop = urlparse(r2.headers["location"])
-    assert f"{loop.scheme}://{loop.netloc}" == redirect_uri.rsplit("/", 1)[0] or \
-        loop.netloc in redirect_uri
+    location = r2.headers["location"]
+    assert location.startswith(f"{redirect_uri}?")
+    loop = urlparse(location)
     loop_qs = parse_qs(loop.query)
     # No session cookie must be set on the native callback response.
     set_cookie = r2.headers.get("set-cookie", "")
@@ -224,6 +237,33 @@ def test_native_authorize_rejects_non_loopback_redirect(gated_client):
     )
     assert r.status_code == 400
     assert "loopback" in r.json()["detail"].lower()
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    [
+        r"http://evil.example\@127.0.0.1/callback",
+        "http://[::1/callback",
+        "http://127.0.0.1/callback#fragment",
+    ],
+)
+def test_native_authorize_rejects_unsafe_loopback_before_state(
+    gated_client, redirect_uri
+):
+    _verifier, challenge = _make_pkce()
+    before = len(native_flow._pending)
+    response = gated_client.get(
+        "/auth/native/authorize",
+        params={
+            "provider": "stub",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": redirect_uri,
+            "state": "unsafe-loopback",
+        },
+    )
+    assert response.status_code == 400
+    assert len(native_flow._pending) == before
 
 
 @pytest.mark.parametrize(
@@ -293,6 +333,8 @@ def test_native_authorize_rejects_private_callback_lookalikes_before_state(
         "com.example:relative",
         "com.example:/callback?query=yes",
         "com.example:/callback#fragment",
+        r"com.example:/callback\unsafe",
+        "com.example://[bad",
         "comexample:/callback",
         " com.example:/callback",
     ],
@@ -318,6 +360,26 @@ def test_native_redirect_configuration_is_immutable_and_empty_by_default():
         }
     )
     assert configured == frozenset({"com.example.hermex:/oauth/callback"})
+
+
+def test_private_callback_is_disabled_when_route_has_no_configuration(
+    gated_client
+):
+    del web_server.app.state.native_redirect_uris
+    _verifier, challenge = _make_pkce()
+    before = len(native_flow._pending)
+    response = gated_client.get(
+        "/auth/native/authorize",
+        params={
+            "provider": "stub",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": "com.uzairansar.hermesmobile:/oauth/callback",
+            "state": "no-config",
+        },
+    )
+    assert response.status_code == 400
+    assert len(native_flow._pending) == before
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +805,13 @@ class _UntargetedProvider(StubAuthProvider):
         self.revoke_calls += 1
 
 
+class _FailingRevocationProvider(_RejectingRecipientProvider):
+    name = "recipient-failing"
+
+    def revoke_session(self, *, refresh_token: str) -> None:
+        raise RuntimeError("simulated IDP failure")
+
+
 def test_native_refresh_routes_only_to_named_provider(gated_client):
     clear_providers()
     target = _RejectingRecipientProvider()
@@ -757,6 +826,65 @@ def test_native_refresh_routes_only_to_named_provider(gated_client):
     assert response.status_code == 401
     assert target.refresh_tokens == ["recipient-secret"]
     assert other.refresh_calls == 0
+
+
+def test_native_refresh_rate_limits_peer_before_provider_forwarding(
+    gated_client, monkeypatch
+):
+    clear_providers()
+    target = _RejectingRecipientProvider()
+    register_provider(target)
+    monkeypatch.setattr(routes, "_NATIVE_REFRESH_RATE_MAX_ATTEMPTS", 1)
+    client_one = _gated_client_from_ip("203.0.113.10")
+    client_two = _gated_client_from_ip("203.0.113.11")
+    try:
+        first = client_one.post(
+            "/auth/native/refresh",
+            json={"refresh_token": "recipient-one", "provider": target.name},
+            headers={"X-Forwarded-For": "198.51.100.1"},
+        )
+        blocked = client_one.post(
+            "/auth/native/refresh",
+            json={"refresh_token": "recipient-two", "provider": target.name},
+            headers={"X-Forwarded-For": "198.51.100.2"},
+        )
+        other_client = client_two.post(
+            "/auth/native/refresh",
+            json={
+                "refresh_token": "recipient-three",
+                "provider": target.name,
+            },
+        )
+    finally:
+        client_one.close()
+        client_two.close()
+
+    assert first.status_code == 401
+    assert blocked.status_code == 429
+    assert int(blocked.headers["retry-after"]) > 0
+    assert other_client.status_code == 401
+    assert target.refresh_tokens == ["recipient-one", "recipient-three"]
+
+
+def test_native_refresh_rate_limits_unknown_provider_requests(
+    gated_client, monkeypatch
+):
+    monkeypatch.setattr(routes, "_NATIVE_REFRESH_RATE_MAX_ATTEMPTS", 1)
+    client = _gated_client_from_ip("203.0.113.12")
+    try:
+        first = client.post(
+            "/auth/native/refresh",
+            json={"refresh_token": "bogus-one", "provider": "unknown"},
+        )
+        blocked = client.post(
+            "/auth/native/refresh",
+            json={"refresh_token": "bogus-two", "provider": "unknown"},
+        )
+    finally:
+        client.close()
+
+    assert first.status_code == 401
+    assert blocked.status_code == 429
 
 
 def test_native_logout_is_public_and_routes_only_to_named_provider(gated_client):
@@ -778,10 +906,100 @@ def test_native_logout_is_public_and_routes_only_to_named_provider(gated_client)
     assert "recipient-secret" not in response.text
 
 
-@pytest.mark.parametrize("path", ["/auth/native/refresh", "/auth/native/logout"])
-def test_native_credential_lifecycle_rejects_unknown_provider(gated_client, path):
+def test_native_logout_stays_successful_when_provider_raises(
+    gated_client, monkeypatch
+):
+    clear_providers()
+    target = _FailingRevocationProvider()
+    register_provider(target)
+    audited = []
+    monkeypatch.setattr(
+        routes,
+        "audit_log",
+        lambda event, **fields: audited.append((event, fields)),
+    )
+
     response = gated_client.post(
-        path,
+        "/auth/native/logout",
+        json={"refresh_token": "recipient-secret", "provider": target.name},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"ok": True}
+    assert audited[-1][1]["reason"] == "provider_error"
+
+
+def test_native_logout_rate_limits_each_client_before_provider_forwarding(
+    gated_client, monkeypatch
+):
+    clear_providers()
+    target = _RejectingRecipientProvider()
+    register_provider(target)
+    monkeypatch.setattr(routes, "_NATIVE_LOGOUT_RATE_MAX_ATTEMPTS", 1)
+    client_one = _gated_client_from_ip("203.0.113.10")
+    client_two = _gated_client_from_ip("203.0.113.11")
+    try:
+        first = client_one.post(
+            "/auth/native/logout",
+            json={"refresh_token": "recipient-one", "provider": target.name},
+            headers={"X-Forwarded-For": "198.51.100.1"},
+        )
+        blocked = client_one.post(
+            "/auth/native/logout",
+            json={"refresh_token": "recipient-two", "provider": target.name},
+            headers={"X-Forwarded-For": "198.51.100.2"},
+        )
+        other_client = client_two.post(
+            "/auth/native/logout",
+            json={
+                "refresh_token": "recipient-three",
+                "provider": target.name,
+            },
+        )
+    finally:
+        client_one.close()
+        client_two.close()
+
+    assert first.status_code == 200
+    assert blocked.status_code == 429
+    assert int(blocked.headers["retry-after"]) > 0
+    assert other_client.status_code == 200
+    assert target.revoked_tokens == ["recipient-one", "recipient-three"]
+
+
+def test_native_rate_limit_client_map_is_bounded(gated_client, monkeypatch):
+    monkeypatch.setattr(routes, "_RATE_LIMIT_MAX_CLIENTS", 2)
+    for index in range(3):
+        routes._native_logout_rate_limited(f"203.0.113.{index}")
+    assert len(routes._native_logout_attempts) <= routes._RATE_LIMIT_MAX_CLIENTS
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"refresh_token": "recipient-secret"},
+        {"refresh_token": "recipient-secret", "provider": "missing"},
+    ],
+)
+def test_native_refresh_unroutable_provider_forces_reauthentication(
+    gated_client, payload
+):
+    clear_providers()
+    other = _UntargetedProvider()
+    register_provider(other)
+    response = gated_client.post(
+        "/auth/native/refresh",
+        json=payload,
+    )
+    assert response.status_code == 401
+    assert response.json()["error"] == "session_expired"
+    assert other.refresh_calls == 0
+    assert "recipient-secret" not in response.text
+
+
+def test_native_logout_rejects_unknown_provider(gated_client):
+    response = gated_client.post(
+        "/auth/native/logout",
         json={"refresh_token": "recipient-secret", "provider": "missing"},
     )
     assert response.status_code == 400

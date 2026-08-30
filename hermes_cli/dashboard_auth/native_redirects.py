@@ -14,10 +14,21 @@ _SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*$")
 _FORBIDDEN_PRIVATE_SCHEMES = frozenset(
     {"http", "https", "file", "data", "javascript"}
 )
+_UNSAFE_URI_CHARACTERS = frozenset('\\"<>^`{|}')
 
 
 class NativeRedirectConfigurationError(ValueError):
     """Raised when an operator-configured native callback is unsafe."""
+
+
+def _contains_unsafe_uri_character(value: str) -> bool:
+    """Reject parser-differential and non-printing URI characters."""
+    return any(
+        char in _UNSAFE_URI_CHARACTERS
+        or ord(char) <= 0x20
+        or ord(char) == 0x7F
+        for char in value
+    )
 
 
 def parse_native_redirect_uris(raw: object) -> frozenset[str]:
@@ -41,15 +52,20 @@ def parse_native_redirect_uris(raw: object) -> frozenset[str]:
                 "dashboard.oauth.native_redirect_uris entries must be "
                 f"non-empty strings (entry {index})"
             )
-        if value != value.strip() or any(
-            ord(char) <= 0x20 or ord(char) == 0x7F for char in value
-        ):
+        if value != value.strip() or _contains_unsafe_uri_character(value):
             raise NativeRedirectConfigurationError(
                 "dashboard.oauth.native_redirect_uris entries must not "
-                f"contain whitespace or control characters (entry {index})"
+                "contain whitespace, control characters, backslashes, or "
+                f"unsafe delimiters (entry {index})"
             )
 
-        parsed = urlsplit(value)
+        try:
+            parsed = urlsplit(value)
+        except ValueError as exc:
+            raise NativeRedirectConfigurationError(
+                "dashboard.oauth.native_redirect_uris entries must be valid "
+                f"URIs (entry {index})"
+            ) from exc
         scheme = parsed.scheme
         if (
             not _SCHEME_RE.fullmatch(scheme)
@@ -94,17 +110,25 @@ def configured_native_redirect_uris(config: object) -> frozenset[str]:
 
 def is_loopback_redirect_uri(raw: str) -> bool:
     """Return whether ``raw`` is an RFC 8252 literal-loopback callback."""
-    if not raw:
-        return False
-    parsed = urlsplit(raw)
-    if parsed.scheme != "http":
+    if (
+        not raw
+        or raw != raw.strip()
+        or _contains_unsafe_uri_character(raw)
+    ):
         return False
     try:
+        parsed = urlsplit(raw)
         host = (parsed.hostname or "").lower()
         parsed.port
     except ValueError:
         return False
-    return host in {"127.0.0.1", "::1"}
+    return (
+        parsed.scheme == "http"
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment
+        and host in {"127.0.0.1", "::1"}
+    )
 
 
 def is_allowed_native_redirect_uri(

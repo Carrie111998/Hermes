@@ -167,6 +167,28 @@ def test_start_server_loopback_sets_auth_required_false(monkeypatch):
     assert web_server.app.state.auth_required is False
 
 
+def test_start_server_invalid_native_redirect_configuration_fails_closed(monkeypatch):
+    _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(monkeypatch, "native_redirect_uris")
+    monkeypatch.setattr(
+        web_server,
+        "load_config",
+        lambda: {
+            "dashboard": {
+                "oauth": {"native_redirect_uris": ["com.example://[bad"]}
+            }
+        },
+    )
+
+    with pytest.raises(SystemExit, match="Invalid native redirect configuration"):
+        web_server.start_server(
+            host="127.0.0.1",
+            port=9119,
+            open_browser=False,
+            allow_public=False,
+        )
+
+
 def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
     """``--insecure`` (allow_public=True) on a public host: gate now ENGAGES.
 
