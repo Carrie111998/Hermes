@@ -221,7 +221,7 @@ export const pl: Translations = {
     model: 'Model',
     tokens: 'Tokeny',
     perDayAvg: 'średnio/dzień',
-    acrossModels: 'Modele: {count}',
+    acrossModels: 'w {count} modelach',
     inOut: 'wejście: {input} / wyjście: {output}'
   },
 
@@ -514,7 +514,7 @@ export const pl: Translations = {
     title: 'Logowania dostawców (OAuth)',
     providerLogins: 'Logowania dostawców (OAuth)',
     description:
-      'Połączono dostawców OAuth: {connected}/{total}. Użyj Logowania dla przepływów obsługiwanych przez panel; polecenia CLI pozostają dostępne dla konfiguracji zewnętrznej lub zapasowej.',
+      'Połączono dostawców OAuth: {connected}/{total}. Wybierz „Zaloguj” dla przepływów obsługiwanych przez panel; polecenia CLI pozostają dostępne dla konfiguracji zewnętrznej lub zapasowej.',
     connected: 'Połączono',
     expired: 'Wygasło',
     notConnected: 'Nie połączono. Użyj Logowania, gdy jest dostępne, albo uruchom {command} w terminalu.',
@@ -582,7 +582,7 @@ export const pl: Translations = {
       secrets: 'Sekrety',
       secrets_hint: 'ukryte do pierwszego sygnału',
       highest_tier: 'Najwyższy poziom',
-      highest_tier_hint: 'Miedź → Srebro → Złoto → Diament → Olimp',
+      highest_tier_hint: 'Miedź → Srebro → Złoto → Diament → Olimpijski',
       latest: 'Najnowsze',
       latest_hint_empty: 'korzystaj częściej z Hermes Agent',
       none_yet: 'Jeszcze brak'
@@ -627,7 +627,7 @@ export const pl: Translations = {
       what_counts: 'Co się liczy',
       evidence_label: 'Dowody',
       evidence_session_fallback: 'sesja',
-      no_evidence: 'Brak dowodów'
+      no_evidence: 'Brak jeszcze dowodów'
     },
     latest: { header: 'Ostatnio odblokowane' },
     empty: {
@@ -686,8 +686,8 @@ export const pl: Translations = {
     createBoard: 'Utwórz tablicę',
     search: 'Szukaj',
     filterCards: 'Filtruj karty…',
-    tenant: 'Przestrzeń',
-    allTenants: 'Wszystkie przestrzenie',
+    tenant: 'Tenant',
+    allTenants: 'Wszystkie tenanty',
     assignee: 'Przypisany profil',
     allProfiles: 'Wszystkie profile',
     showArchived: 'Pokaż zarchiwizowane',
@@ -792,7 +792,7 @@ export const pl: Translations = {
     },
     columnHelp: {
       triage: 'Surowe pomysły — agent doprecyzowujący rozwinie specyfikację',
-      todo: 'Oczekuje na zależności lub przypisanie profilu',
+      todo: 'Oczekuje na zależności lub nie ma przypisanego profilu',
       scheduled: 'Oczekuje na znane opóźnienie czasowe albo zaplanowaną kontynuację',
       ready: 'Zależności spełnione; przypisz profil, aby przekazać do realizacji',
       running: 'Zadanie przejęte przez wykonawcę — w toku',

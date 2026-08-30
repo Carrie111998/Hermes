@@ -156,6 +156,18 @@ describe('Polish dashboard localization', () => {
     expect(pl.sessions.confirmDeleteMessage).toContain('nie można cofnąć')
   })
 
+  it('keeps reviewed Polish product copy precise and consistent', () => {
+    expect(pl.analytics.acrossModels).toBe('w {count} modelach')
+    expect(pl.achievements.stats.highest_tier_hint).toBe('Miedź → Srebro → Złoto → Diament → Olimpijski')
+    expect(pl.oauth.description).toBe(
+      'Połączono dostawców OAuth: {connected}/{total}. Wybierz „Zaloguj” dla przepływów obsługiwanych przez panel; polecenia CLI pozostają dostępne dla konfiguracji zewnętrznej lub zapasowej.'
+    )
+    expect(pl.oauth.login).toBe('Zaloguj')
+    expect(pl.kanban.columnHelp.todo).toBe('Oczekuje na zależności lub nie ma przypisanego profilu')
+    expect([pl.kanban.tenant, pl.kanban.allTenants]).toEqual(['Tenant', 'Wszystkie tenanty'])
+    expect(pl.achievements.card.no_evidence).toBe('Brak jeszcze dowodów')
+  })
+
   it('renders count-dependent labels as complete locale-owned messages', () => {
     expect(pl.skills.skillCount(1)).toBe('Liczba umiejętności: 1')
     expect(pl.skills.resultCount(22)).toBe('Liczba wyników: 22')
