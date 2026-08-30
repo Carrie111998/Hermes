@@ -1,8 +1,19 @@
 import { describe, expect, it } from 'vitest'
 
-import { approvalReplaySessionId, gatewayEventRequiresSessionId, resolveGatewayEventSessionId } from './gateway-events'
+import { sessionMatchesStoredId } from '@/store/session'
+
+import {
+  approvalReplaySessionId,
+  gatewayEventIsActive,
+  gatewayEventRequiresSessionId,
+  resolveGatewayEventSessionId
+} from './gateway-events'
 
 describe('gateway event routing', () => {
+  const lineageSessions = [{ id: 'stored-tip', _lineage_root_id: 'stored-root' }]
+  const storedIdsShareLineage = (left: string, right: string) =>
+    lineageSessions.some(session => sessionMatchesStoredId(session, left) && sessionMatchesStoredId(session, right))
+
   it('rehydrates pending approvals on reconnect ready and resumed session info', () => {
     expect(approvalReplaySessionId('gateway.ready', 'active-1', null)).toBe('active-1')
     expect(approvalReplaySessionId('session.info', 'active-1', 'routed-1')).toBe('routed-1')
@@ -126,5 +137,83 @@ describe('gateway event routing', () => {
       pinned: true,
       sessionId: 'session-a'
     })
+  })
+
+  it('accepts a recovered runtime for the selected conversation from the active source', () => {
+    expect(
+      gatewayEventIsActive({
+        activeRuntimeSessionId: 'runtime-stale',
+        eventRuntimeSessionId: 'runtime-current',
+        eventStoredSessionId: 'stored-visible',
+        fromActiveSource: true,
+        selectedStoredSessionId: 'stored-visible',
+        storedIdsShareLineage: (left, right) => left === right
+      })
+    ).toBe(true)
+  })
+
+  it('rejects a stored-session-id collision from an inactive source', () => {
+    expect(
+      gatewayEventIsActive({
+        activeRuntimeSessionId: 'runtime-visible',
+        eventRuntimeSessionId: 'runtime-background',
+        eventStoredSessionId: 'stored-visible',
+        fromActiveSource: false,
+        selectedStoredSessionId: 'stored-visible',
+        storedIdsShareLineage: (left, right) => left === right
+      })
+    ).toBe(false)
+  })
+
+  it('rejects an exact runtime-id collision from an inactive source', () => {
+    expect(
+      gatewayEventIsActive({
+        activeRuntimeSessionId: 'runtime-visible',
+        eventRuntimeSessionId: 'runtime-visible',
+        eventStoredSessionId: 'stored-visible',
+        fromActiveSource: false,
+        selectedStoredSessionId: 'stored-visible',
+        storedIdsShareLineage: (left, right) => left === right
+      })
+    ).toBe(false)
+  })
+
+  it('rejects a runtime mismatch without a durable conversation mapping', () => {
+    expect(
+      gatewayEventIsActive({
+        activeRuntimeSessionId: 'runtime-visible',
+        eventRuntimeSessionId: 'runtime-recovered',
+        eventStoredSessionId: null,
+        fromActiveSource: true,
+        selectedStoredSessionId: 'stored-visible',
+        storedIdsShareLineage: (left, right) => left === right
+      })
+    ).toBe(false)
+  })
+
+  it('accepts a durable event id at the lineage tip when the selected id is the root', () => {
+    expect(
+      gatewayEventIsActive({
+        activeRuntimeSessionId: 'runtime-stale',
+        eventRuntimeSessionId: 'runtime-current',
+        eventStoredSessionId: 'stored-tip',
+        fromActiveSource: true,
+        selectedStoredSessionId: 'stored-root',
+        storedIdsShareLineage
+      })
+    ).toBe(true)
+  })
+
+  it('rejects a durable event id from an unrelated lineage', () => {
+    expect(
+      gatewayEventIsActive({
+        activeRuntimeSessionId: 'runtime-visible',
+        eventRuntimeSessionId: 'runtime-background',
+        eventStoredSessionId: 'stored-unrelated',
+        fromActiveSource: true,
+        selectedStoredSessionId: 'stored-root',
+        storedIdsShareLineage
+      })
+    ).toBe(false)
   })
 })

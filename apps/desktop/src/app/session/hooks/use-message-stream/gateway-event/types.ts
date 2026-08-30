@@ -9,6 +9,8 @@ import type { ClientSessionState } from '../../../../types'
 export interface GatewayEventDeps {
   activeGatewayProfile: string
   activeSessionIdRef: MutableRefObject<string | null>
+  selectedStoredSessionIdRef: MutableRefObject<string | null>
+  storedIdsShareLineage: (leftStoredId: string, rightStoredId: string) => boolean
   compactedTurnRef: MutableRefObject<Set<string>>
   lastCwdInfoSessionRef: MutableRefObject<string | null>
   nativeSubagentSessionsRef: MutableRefObject<Set<string>>
