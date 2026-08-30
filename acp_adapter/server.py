@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import datetime, timezone
 import base64
 import contextvars
@@ -12,7 +13,7 @@ import os
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Deque, Optional
+from typing import Any, Callable, Deque, Optional
 from urllib.parse import unquote, urlparse
 
 import acp
@@ -63,6 +64,11 @@ from acp.schema import (
 )
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
+from acp_adapter.certification_policy import (
+    artifact_certification_capability,
+    deny_unrendered_edit_approval,
+    deny_unrendered_terminal_approval,
+)
 from acp_adapter.events import (
     _build_plan_update_from_todo_result,
     make_message_cb,
@@ -72,6 +78,12 @@ from acp_adapter.events import (
 )
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
+from acp_adapter.multica_artifact_dispatch import (
+    CertificationContractError,
+    certify_dispatch_result,
+    dispatch_execution_failed,
+    prepare_dispatch_certification,
+)
 from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
 from acp_adapter.tools import build_tool_complete, build_tool_start
 from agent.context_compressor import (
@@ -1315,6 +1327,11 @@ class HermesACPAgent(acp.Agent):
             protocol_version=acp.PROTOCOL_VERSION,
             agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
             agent_capabilities=AgentCapabilities(
+                field_meta={
+                    "hermes": {
+                        "artifactCertification": artifact_certification_capability()
+                    }
+                },
                 load_session=True,
                 prompt_capabilities=PromptCapabilities(image=True),
                 session_capabilities=SessionCapabilities(
@@ -1808,6 +1825,27 @@ class HermesACPAgent(acp.Agent):
         if not has_content:
             return PromptResponse(stop_reason="end_turn")
 
+        # Multica profile launchers opt into a fail-closed artifact lane. The
+        # contract is parsed and snapshotted here, before slash handling,
+        # callbacks, or model execution. Missing/malformed contracts never
+        # reach the model.
+        prepared_certification = None
+        try:
+            prepared_certification = prepare_dispatch_certification(
+                user_text=user_text,
+                session_id=session_id,
+                history=getattr(state, "history", []),
+                workspace_root=state.cwd,
+            )
+        except CertificationContractError as exc:
+            failure = f"ARTIFACT CERTIFICATION CONTRACT FAIL\n{exc}"
+            if self._conn:
+                await self._conn.session_update(
+                    session_id, acp.update_agent_message_text(failure)
+                )
+            logger.warning("Rejected uncertifiable Multica prompt for %s: %s", session_id, exc)
+            return PromptResponse(stop_reason="refusal")
+
         # /steer on an idle session has no in-flight tool call to inject into.
         # Rewrite it so the payload runs as a normal user prompt, matching the
         # gateway's behavior (gateway/run.py ~L4898). Two sub-cases:
@@ -1882,7 +1920,8 @@ class HermesACPAgent(acp.Agent):
         with state.runtime_lock:
             if state.is_running:
                 if (
-                    text_only_prompt
+                    prepared_certification is None
+                    and text_only_prompt
                     and isinstance(user_content, str)
                     and getattr(
                         state.agent,
@@ -1923,6 +1962,20 @@ class HermesACPAgent(acp.Agent):
                 await self._conn.session_update(session_id, update)
             return PromptResponse(stop_reason="end_turn")
 
+        if prepared_certification is not None:
+            try:
+                prepared_certification.wrapper.reserve(prepared_certification.run_id)
+            except Exception as exc:
+                with state.runtime_lock:
+                    state.is_running = False
+                    state.current_prompt_text = ""
+                failure = f"ARTIFACT CERTIFICATION CONTRACT FAIL\n{exc}"
+                if self._conn:
+                    await self._conn.session_update(
+                        session_id, acp.update_agent_message_text(failure)
+                    )
+                return PromptResponse(stop_reason="refusal")
+
         logger.info("Prompt on session %s: %s", session_id, user_text[:100])
 
         conn = self._conn
@@ -1939,44 +1992,87 @@ class HermesACPAgent(acp.Agent):
         streamed_message = False
 
         if conn:
-            tool_progress_cb = make_tool_progress_cb(
-                conn,
-                session_id,
-                loop,
-                tool_call_ids,
-                tool_call_meta,
-                edit_approval_policy_getter=lambda: self._edit_approval_policy_for_state(state),
-            )
-            reasoning_cb = make_thinking_cb(conn, session_id, loop)
-            step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
+            if prepared_certification is None:
+                tool_progress_cb = make_tool_progress_cb(
+                    conn,
+                    session_id,
+                    loop,
+                    tool_call_ids,
+                    tool_call_meta,
+                    edit_approval_policy_getter=lambda: self._edit_approval_policy_for_state(state),
+                )
+                reasoning_cb = make_thinking_cb(conn, session_id, loop)
+                step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
+            else:
+                # No model-derived prose, reasoning, plans, or tool metadata may
+                # escape before the deterministic wrapper rules on this turn.
+                tool_progress_cb = None
+                reasoning_cb = None
+                step_cb = None
             message_cb = make_message_cb(conn, session_id, loop)
 
-            def stream_delta_cb(text: str) -> None:
-                nonlocal streamed_message
-                if text:
-                    streamed_message = True
-                message_cb(text)
+            stream_delta_cb: Callable[[str], None] | None
+            if prepared_certification is None:
+                def _stream_delta(text: str) -> None:
+                    nonlocal streamed_message
+                    if text:
+                        streamed_message = True
+                    message_cb(text)
+                stream_delta_cb = _stream_delta
+            else:
+                # Uncertified model prose must not escape over ACP. The final
+                # response is buffered until the deterministic wrapper owns the
+                # bytes, evaluates the snapshot, and records the ledger result.
+                stream_delta_cb = None
 
-            approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
-            try:
-                from acp_adapter.edit_approval import make_acp_edit_approval_requester
+            if prepared_certification is None:
+                approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
+                try:
+                    from acp_adapter.edit_approval import make_acp_edit_approval_requester
 
-                edit_approval_requester = make_acp_edit_approval_requester(
-                    conn.request_permission,
-                    loop,
-                    session_id,
-                    auto_approve_getter=lambda: self._edit_approval_policy_for_state(state),
-                )
-            except Exception:
-                logger.debug("Could not create ACP edit approval requester", exc_info=True)
+                    edit_approval_requester = make_acp_edit_approval_requester(
+                        conn.request_permission,
+                        loop,
+                        session_id,
+                        auto_approve_getter=lambda: self._edit_approval_policy_for_state(state),
+                    )
+                except Exception:
+                    logger.debug("Could not create ACP edit approval requester", exc_info=True)
+            else:
+                # Authorization still executes, but uncertified command and diff
+                # bytes cannot be rendered over ACP. Bind explicit fail-closed
+                # decisions instead of removing the authorization boundary.
+                approval_cb = deny_unrendered_terminal_approval
+                edit_approval_requester = deny_unrendered_edit_approval
         else:
             tool_progress_cb = None
             reasoning_cb = None
             step_cb = None
             stream_delta_cb = None
-            approval_cb = None
+            approval_cb = (
+                deny_unrendered_terminal_approval
+                if prepared_certification is not None
+                else None
+            )
+            edit_approval_requester = (
+                deny_unrendered_edit_approval
+                if prepared_certification is not None
+                else None
+            )
 
         agent = state.agent
+        previous_certification_defer = bool(
+            getattr(agent, "_certification_persistence_deferred", False)
+        )
+        previous_tool_complete_callback = getattr(
+            agent, "tool_complete_callback", None
+        )
+        previous_compression_enabled = getattr(agent, "compression_enabled", None)
+        if prepared_certification is not None:
+            agent._certification_persistence_deferred = True
+            agent.tool_complete_callback = None
+            if previous_compression_enabled is not None:
+                agent.compression_enabled = False
         agent.tool_progress_callback = tool_progress_cb
         # ACP thought panes should not receive Hermes' local kawaii waiting/status
         # updates. Route provider/model reasoning deltas instead; if the provider
@@ -2035,12 +2131,23 @@ class HermesACPAgent(acp.Agent):
                 clear_session_vars = None  # type: ignore[assignment]
                 logger.debug("Could not set ACP session context", exc_info=True)
             if approval_cb:
+                _terminal_tool = None
                 try:
                     from tools import terminal_tool as _terminal_tool
                     previous_approval_cb = _terminal_tool._get_approval_callback()
                     _terminal_tool.set_approval_callback(approval_cb)
                 except Exception:
                     logger.debug("Could not set ACP approval callback", exc_info=True)
+                    if prepared_certification is not None:
+                        try:
+                            if _terminal_tool is not None:
+                                _terminal_tool.set_approval_callback(previous_approval_cb)
+                        except Exception:
+                            logger.debug(
+                                "Could not restore ACP approval callback after setup failure",
+                                exc_info=True,
+                            )
+                        raise
             if edit_approval_requester:
                 try:
                     from acp_adapter.edit_approval import set_edit_approval_requester
@@ -2048,6 +2155,18 @@ class HermesACPAgent(acp.Agent):
                     edit_approval_token = set_edit_approval_requester(edit_approval_requester)
                 except Exception:
                     logger.debug("Could not set ACP edit approval requester", exc_info=True)
+                    if prepared_certification is not None:
+                        if approval_cb:
+                            try:
+                                from tools import terminal_tool as _terminal_tool
+
+                                _terminal_tool.set_approval_callback(previous_approval_cb)
+                            except Exception:
+                                logger.debug(
+                                    "Could not restore ACP approval callback after edit setup failure",
+                                    exc_info=True,
+                                )
+                        raise
             # Signal to tools.approval that we have an interactive callback
             # and the non-interactive auto-approve path must not fire. Uses a
             # contextvar (not os.environ) so concurrent executor workers don't
@@ -2081,6 +2200,8 @@ class HermesACPAgent(acp.Agent):
                 return result
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)
+                if prepared_certification is not None:
+                    raise
                 return {"final_response": f"Error: {e}", "messages": state.history}
             finally:
                 # Restore the interactive contextvar for this context.
@@ -2110,24 +2231,142 @@ class HermesACPAgent(acp.Agent):
                     except Exception:
                         logger.debug("Could not clear ACP session context", exc_info=True)
 
+        pre_turn_history = copy.deepcopy(state.history)
+        pre_turn_session_messages = copy.deepcopy(
+            getattr(agent, "_session_messages", None)
+        )
+        pre_turn_user_count = getattr(agent, "_user_turn_count", None)
+        pre_turn_memory_count = getattr(agent, "_turns_since_memory", None)
+        pre_turn_skill_count = (
+            getattr(agent, "_iters_since_skill", None)
+            if prepared_certification is not None
+            else None
+        )
+        pre_turn_tool_policy_messages = (
+            copy.deepcopy(getattr(agent, "_tool_policy_messages", None))
+            if prepared_certification is not None
+            else None
+        )
+        pre_turn_hermes_id = getattr(state.agent, "session_id", None)
+        worker_future = None
+        certification_execution_failed = False
         try:
             # Snapshot the internal Hermes DB session id before the turn so we
             # can detect a compression-driven session rotation afterwards. The
             # ACP `session_id` stays the stable client handle; agent.session_id
             # is the live internal head that compression may rotate.
-            pre_turn_hermes_id = getattr(state.agent, "session_id", None)
             # Wrap the executor call in a fresh copy of the current context so
             # concurrent ACP sessions on the shared ThreadPoolExecutor don't
             # stomp on each other's ContextVar writes (HERMES_SESSION_KEY in
             # particular — used by the interactive sudo password cache scope).
             ctx = contextvars.copy_context()
-            result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
-        except Exception:
-            logger.exception("Executor error for session %s", session_id)
+            worker_future = loop.run_in_executor(_executor, ctx.run, _run_agent)
+            result = await asyncio.shield(worker_future)
+        except asyncio.CancelledError:
+            # ThreadPoolExecutor work survives Future.cancel(). Keep the guard
+            # and busy state until the worker has actually stopped. Repeated
+            # client cancellations are absorbed while draining that worker.
+            if worker_future is not None:
+                while not worker_future.done():
+                    try:
+                        await asyncio.shield(worker_future)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
+            if prepared_certification is not None:
+                state.history = pre_turn_history
+                if hasattr(agent, "_session_messages"):
+                    agent._session_messages = pre_turn_session_messages
+                if pre_turn_user_count is not None:
+                    agent._user_turn_count = pre_turn_user_count
+                if pre_turn_memory_count is not None:
+                    agent._turns_since_memory = pre_turn_memory_count
+                if pre_turn_skill_count is not None:
+                    agent._iters_since_skill = pre_turn_skill_count
+                if hasattr(agent, "_tool_policy_messages"):
+                    agent._tool_policy_messages = pre_turn_tool_policy_messages
+                if previous_compression_enabled is not None:
+                    agent.compression_enabled = previous_compression_enabled
+                agent.tool_complete_callback = previous_tool_complete_callback
+                agent._certification_persistence_deferred = previous_certification_defer
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
-            return PromptResponse(stop_reason="end_turn")
+            raise
+        except Exception as exc:
+            logger.exception("Executor error for session %s", session_id)
+            if prepared_certification is None:
+                with state.runtime_lock:
+                    state.is_running = False
+                    state.current_prompt_text = ""
+                return PromptResponse(stop_reason="end_turn")
+            result = {
+                "final_response": f"Runtime execution failed: {type(exc).__name__}: {exc}",
+                "messages": [],
+            }
+            certification_execution_failed = True
+
+        if prepared_certification is not None:
+            # The conversation loop reports some provider and required-
+            # middleware failures as a normal result so other frontends can
+            # render them. Certification must treat those incomplete turns
+            # exactly like an exception and never inspect a stale workspace
+            # artifact.
+            if dispatch_execution_failed(result):
+                certification_execution_failed = True
+            try:
+                if certification_execution_failed:
+                    result["final_response"] = (
+                        "ARTIFACT CERTIFICATION ERROR\n"
+                        "Runtime execution failed before artifact certification."
+                    )
+                    result["artifact_certification"] = None
+                else:
+                    raw_final_response = result.get("final_response", "")
+                    try:
+                        certified_response, certification = certify_dispatch_result(
+                            prepared_certification,
+                            raw_final_response,
+                        )
+                        result["final_response"] = certified_response
+                        result["artifact_certification"] = certification
+                    except Exception as exc:
+                        logger.exception(
+                            "Artifact certification failed closed for session %s", session_id
+                        )
+                        result["final_response"] = (
+                            "ARTIFACT CERTIFICATION ERROR\n"
+                            "Runtime-owned certification could not complete."
+                        )
+                # Force the buffered runtime-owned response over ACP, even if a
+                # provider/plugin marked the original draft as already streamed.
+                result["response_transformed"] = True
+
+                # Collapse the turn to the client prompt plus the runtime-owned
+                # result. Raw drafts, reasoning fields, and intermediate tool events
+                # cannot enter state.db, JSON logs, search, export, or replay.
+                messages = pre_turn_history + [
+                    {"role": "user", "content": user_text or "[Image attachment]"},
+                    {"role": "assistant", "content": result["final_response"]},
+                ]
+                result["messages"] = messages
+                agent._certification_persistence_deferred = previous_certification_defer
+                persist = getattr(agent, "_persist_session", None)
+                if callable(persist):
+                    persist(messages, pre_turn_history)
+            except BaseException:
+                if previous_compression_enabled is not None:
+                    agent.compression_enabled = previous_compression_enabled
+                with state.runtime_lock:
+                    state.is_running = False
+                    state.current_prompt_text = ""
+                raise
+            finally:
+                if previous_compression_enabled is not None:
+                    agent.compression_enabled = previous_compression_enabled
+                agent.tool_complete_callback = previous_tool_complete_callback
+                agent._certification_persistence_deferred = previous_certification_defer
 
         if result.get("messages"):
             state.history = result["messages"]

@@ -5561,7 +5561,9 @@ class PluginManager:
         }
         return callback(**accepted_payload)
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    def invoke_hook(
+        self, hook_name: str, *, required: bool = False, **kwargs: Any
+    ) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
         Hook payloads evolve additively. Callbacks that accept ``**kwargs``
@@ -5690,6 +5692,8 @@ class PluginManager:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
+                if required:
+                    raise
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
                     hook_name,
@@ -6459,7 +6463,9 @@ def _delivery_manager() -> PluginManager:
     return manager
 
 
-def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+def invoke_hook(
+    hook_name: str, *, required: bool = False, **kwargs: Any
+) -> List[Any]:
     """Invoke a lifecycle hook on loaded plugins.
 
     Ensures plugins are discovered on first invocation so callers in
@@ -6469,7 +6475,9 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
-    return _delivery_manager().invoke_hook(hook_name, **kwargs)
+    return _delivery_manager().invoke_hook(
+        hook_name, required=required, **kwargs
+    )
 
 
 def render_system_prompt_sections(
@@ -6595,6 +6603,7 @@ def _get_pre_tool_call_directive_details(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    required: bool = False,
 ) -> _PreToolCallDirective:
     """Check ``pre_tool_call`` hooks for a blocking or approval directive.
 
@@ -6630,19 +6639,26 @@ def _get_pre_tool_call_directive_details(
             message=fmt.format(tool_name=tool_name),
         )
 
-    from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
+    hook_payload = {
+        "tool_name": tool_name,
+        "args": args if isinstance(args, dict) else {},
+        "task_id": task_id,
+        "session_id": session_id,
+        "tool_call_id": tool_call_id,
+        "turn_id": turn_id,
+        "api_request_id": api_request_id,
+        "middleware_trace": list(middleware_trace or []),
+    }
+    if required:
+        # Certification cannot leak uncertified tool arguments to passive
+        # lifecycle observers. Policy-hook failures are enforcement failures.
+        hook_results = invoke_hook(
+            "pre_tool_call", required=True, **hook_payload
+        )
+    else:
+        from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
 
-    hook_results = invoke_lifecycle_hook(
-        "pre_tool_call",
-        tool_name=tool_name,
-        args=args if isinstance(args, dict) else {},
-        task_id=task_id,
-        session_id=session_id,
-        tool_call_id=tool_call_id,
-        turn_id=turn_id,
-        api_request_id=api_request_id,
-        middleware_trace=list(middleware_trace or []),
-    )
+        hook_results = invoke_lifecycle_hook("pre_tool_call", **hook_payload)
 
     block_msg: Optional[str] = None
     modified_args: Optional[Dict[str, Any]] = None
@@ -6837,6 +6853,7 @@ def _dispatch_pre_tool_call_hooks(
     turn_id: str = "",
     api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    required: bool = False,
 ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """Invoke ``pre_tool_call`` hooks once and process all response types.
 
@@ -6860,6 +6877,7 @@ def _dispatch_pre_tool_call_hooks(
         tool_name, args, task_id=task_id, session_id=session_id,
         tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=middleware_trace,
+        required=required,
     )
     block_msg = _resolve_block_from_details(
         details, tool_name,

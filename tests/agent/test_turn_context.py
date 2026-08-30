@@ -15,6 +15,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor
+from agent.conversation_loop import _restore_or_build_system_prompt
+from agent.certification_runtime import (
+    apply_llm_request,
+    run_llm_execution,
+    run_relay_llm_execution,
+)
+from agent.tool_executor import (
+    _emit_terminal_post_tool_call,
+    _run_agent_tool_execution_middleware,
+)
 from agent.turn_context import TurnContext, build_turn_context
 from hermes_state import SessionDB
 
@@ -250,6 +260,380 @@ def test_prefetch_runs_for_substantive_user_message():
     assert ctx.ext_prefetch_cache == "REMEMBERED CONTEXT"
 
 
+def test_certification_deferral_suppresses_turn_observers_and_persistence():
+    agent, memory_manager = _agent_with_memory_manager()
+    agent._certification_persistence_deferred = True
+    agent._ensure_db_prompt_at_call = "not-called"
+
+    with (
+        patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook,
+        patch("agent.turn_context.recover_rotated_compression_session") as recover,
+    ):
+        ctx = _build(agent, user_message="substantive certification prompt")
+
+    invoke_hook.assert_not_called()
+    recover.assert_not_called()
+    memory_manager.on_turn_start.assert_not_called()
+    memory_manager.prefetch_all.assert_not_called()
+    assert agent._ensure_db_prompt_at_call == "not-called"
+    assert agent._persist_calls == 0
+    assert ctx.plugin_user_context == ""
+    assert ctx.ext_prefetch_cache == ""
+
+
+def test_certification_deferral_suppresses_session_start_hook_and_db_write():
+    agent = _FakeAgent()
+    agent._certification_persistence_deferred = True
+    agent._cached_system_prompt = None
+    agent._build_system_prompt = MagicMock(return_value="NEW SYSTEM")
+    agent._session_db = MagicMock()
+
+    with (
+        patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook,
+        patch("agent.credits_tracker.seed_credits_at_session_start") as seed_credits,
+    ):
+        _restore_or_build_system_prompt(agent, None, [])
+
+    assert agent._cached_system_prompt == "NEW SYSTEM"
+    invoke_hook.assert_not_called()
+    seed_credits.assert_not_called()
+    agent._session_db.update_system_prompt.assert_not_called()
+
+
+def test_certification_deferral_runs_required_llm_execution_middleware():
+    agent = types.SimpleNamespace(_certification_persistence_deferred=True)
+    direct_call = MagicMock(return_value="REDACTED RESPONSE")
+    with (
+        patch(
+            "hermes_cli.middleware.llm_execution_middleware_required",
+            return_value=True,
+        ),
+        patch(
+            "hermes_cli.middleware.run_llm_execution_middleware",
+            return_value="REDACTED RESPONSE",
+        ) as middleware,
+    ):
+        response = run_llm_execution(
+            agent, {"messages": []}, direct_call, session_id="certified"
+        )
+    assert response == "REDACTED RESPONSE"
+    middleware.assert_called_once_with(
+        {"messages": []},
+        direct_call,
+        required=True,
+        session_id="certified",
+    )
+
+
+def test_certification_deferral_applies_llm_request_redaction():
+    agent = types.SimpleNamespace(_certification_persistence_deferred=True)
+    request = {"messages": [{"role": "user", "content": "private"}]}
+
+    def redact(_request, **_context):
+        from hermes_cli.middleware import RequestMiddlewareResult
+
+        safe = {"messages": [{"role": "user", "content": "[REDACTED]"}]}
+        return RequestMiddlewareResult(
+            payload=safe,
+            original_payload=request,
+            changed=True,
+            trace=[{"source": "privacy"}],
+        )
+
+    with patch(
+        "hermes_cli.middleware.apply_llm_request_middleware",
+        side_effect=redact,
+    ) as middleware:
+        result = apply_llm_request(agent, request, session_id="certified")
+
+    assert result.payload["messages"][0]["content"] == "[REDACTED]"
+    middleware.assert_called_once_with(
+        request, required=True, session_id="certified"
+    )
+
+
+def test_certification_deferral_runs_non_stream_relay_execution():
+    agent = types.SimpleNamespace(_certification_persistence_deferred=True)
+    direct_call = MagicMock(return_value="RAW RESPONSE")
+    with patch("agent.relay_llm.execute", return_value="RELAY RESPONSE") as relay:
+        response = run_relay_llm_execution(
+            agent,
+            {"messages": []},
+            direct_call,
+            session_id="certified",
+            name="test-provider",
+            model_name="test-model",
+        )
+    assert response == "RELAY RESPONSE"
+    relay.assert_called_once_with(
+        {"messages": []},
+        direct_call,
+        session_id="certified",
+        name="test-provider",
+        model_name="test-model",
+    )
+
+
+def test_certification_deferral_runs_streaming_provider_through_relay():
+    agent = types.SimpleNamespace(_certification_persistence_deferred=True)
+    streaming_call = MagicMock(return_value=iter(["delta"]))
+
+    def relay_execute(request, callback, **_context):
+        rewritten = {**request, "relay_admitted": True}
+        return callback(rewritten)
+
+    with patch("agent.relay_llm.execute", side_effect=relay_execute) as relay:
+        response = run_relay_llm_execution(
+            agent,
+            {"messages": []},
+            streaming_call,
+            session_id="certified-stream",
+        )
+
+    assert list(response) == ["delta"]
+    relay.assert_called_once()
+    streaming_call.assert_called_once_with(
+        {"messages": [], "relay_admitted": True}
+    )
+
+
+def test_normal_non_stream_execution_still_uses_relay():
+    agent = types.SimpleNamespace(_certification_persistence_deferred=False)
+    direct_call = MagicMock()
+    with patch("agent.relay_llm.execute", return_value="RELAY RESPONSE") as relay:
+        response = run_relay_llm_execution(
+            agent,
+            {"messages": []},
+            direct_call,
+            session_id="normal",
+        )
+    assert response == "RELAY RESPONSE"
+    relay.assert_called_once_with(
+        {"messages": []}, direct_call, session_id="normal"
+    )
+
+
+def test_certification_deferral_preserves_tool_rewrite_and_policy_pipeline():
+    guardrails = MagicMock()
+    guardrails.before_call.return_value = types.SimpleNamespace(allows_execution=True)
+    agent = types.SimpleNamespace(
+        _certification_persistence_deferred=True,
+        _tool_policy_callback=None,
+        _tool_guardrails=guardrails,
+        _current_turn_id="turn",
+        _current_api_request_id="request",
+        session_id="session",
+        quiet_mode=True,
+        tool_progress_mode="off",
+        verbose_logging=False,
+        log_prefix_chars=100,
+        tool_progress_callback=MagicMock(),
+        tool_start_callback=MagicMock(),
+        _current_tool=None,
+        _touch_activity=lambda *_args: None,
+    )
+    execute = MagicMock(return_value="TOOL RESULT")
+
+    def relay_execute(name, args, callback, **_context):
+        assert name == "demo_tool"
+        return callback({**args, "relay": True}), {**args, "relay": True}
+
+    def request_middleware(_name, args, **_context):
+        from hermes_cli.middleware import RequestMiddlewareResult
+
+        rewritten = {**args, "request_middleware": True}
+        return RequestMiddlewareResult(
+            payload=rewritten,
+            original_payload=args,
+            changed=True,
+            trace=[{"source": "test"}],
+        )
+
+    def execution_middleware(_name, args, next_call, **_context):
+        return next_call({**args, "execution_middleware": True})
+
+    def plugin_hook(_name, args, **_context):
+        return None, {**args, "plugin": True}
+
+    with (
+        patch("agent.relay_tools.execute", side_effect=relay_execute) as relay,
+        patch(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            side_effect=request_middleware,
+        ) as request_middleware_mock,
+        patch(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            side_effect=execution_middleware,
+        ) as execution_middleware_mock,
+        patch(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            side_effect=plugin_hook,
+        ) as plugin_block,
+    ):
+        managed = _run_agent_tool_execution_middleware(
+            agent,
+            function_name="demo_tool",
+            function_args={"value": 1},
+            effective_task_id="task",
+            tool_call_id="call",
+            execute=execute,
+        )
+    assert managed.result == "TOOL RESULT"
+    execute.assert_called_once_with(
+        {
+            "value": 1,
+            "relay": True,
+            "request_middleware": True,
+            "execution_middleware": True,
+            "plugin": True,
+        }
+    )
+    relay.assert_called_once()
+    request_middleware_mock.assert_called_once()
+    execution_middleware_mock.assert_called_once()
+    assert execution_middleware_mock.call_args.kwargs["required"] is True
+    plugin_block.assert_called_once()
+    agent.tool_progress_callback.assert_not_called()
+    agent.tool_start_callback.assert_not_called()
+
+
+def test_certification_deferral_preserves_tool_execution_block():
+    guardrails = MagicMock()
+    guardrails.before_call.return_value = types.SimpleNamespace(allows_execution=True)
+    agent = types.SimpleNamespace(
+        _certification_persistence_deferred=True,
+        _tool_guardrails=guardrails,
+        _current_turn_id="turn",
+        _current_api_request_id="request",
+        session_id="session",
+        quiet_mode=True,
+        tool_progress_mode="off",
+        verbose_logging=False,
+        log_prefix_chars=100,
+        tool_progress_callback=MagicMock(),
+        tool_start_callback=MagicMock(),
+        _current_tool=None,
+        _touch_activity=lambda *_args: None,
+    )
+    execute = MagicMock(return_value="MUST NOT RUN")
+
+    def relay_execute(_name, args, callback, **_context):
+        return callback(args), args
+
+    def block_execution(_name, _args, _next_call, **_context):
+        return "BLOCKED BY TOOL MIDDLEWARE"
+
+    with (
+        patch("agent.relay_tools.execute", side_effect=relay_execute),
+        patch(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            side_effect=lambda _name, args, **_context: types.SimpleNamespace(
+                payload=args, trace=[]
+            ),
+        ),
+        patch(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            side_effect=block_execution,
+        ),
+        patch(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            return_value=(None, None),
+        ),
+    ):
+        managed = _run_agent_tool_execution_middleware(
+            agent,
+            function_name="demo_tool",
+            function_args={"value": 1},
+            effective_task_id="task",
+            tool_call_id="call",
+            execute=execute,
+        )
+
+    assert managed.result == "BLOCKED BY TOOL MIDDLEWARE"
+    assert managed.dispatched is False
+    execute.assert_not_called()
+    agent.tool_progress_callback.assert_not_called()
+    agent.tool_start_callback.assert_not_called()
+
+
+def test_certification_deferral_fails_closed_when_plugin_pre_tool_hook_raises():
+    from hermes_cli.middleware import RequiredMiddlewareError
+
+    guardrails = MagicMock()
+    guardrails.before_call.return_value = types.SimpleNamespace(allows_execution=True)
+    agent = types.SimpleNamespace(
+        _certification_persistence_deferred=True,
+        _tool_guardrails=guardrails,
+        _current_turn_id="turn",
+        _current_api_request_id="request",
+        session_id="session",
+        quiet_mode=True,
+        tool_progress_mode="off",
+        verbose_logging=False,
+        log_prefix_chars=100,
+        tool_progress_callback=MagicMock(),
+        tool_start_callback=MagicMock(),
+        _current_tool=None,
+        _touch_activity=lambda *_args: None,
+    )
+    execute = MagicMock(return_value="MUST NOT RUN")
+
+    def relay_execute(_name, args, callback, **_context):
+        return callback(args), args
+
+    with (
+        patch("agent.relay_tools.execute", side_effect=relay_execute),
+        patch(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            side_effect=lambda _name, args, **_context: types.SimpleNamespace(
+                payload=args, trace=[]
+            ),
+        ),
+        patch(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            side_effect=lambda _name, args, next_call, **_context: next_call(args),
+        ),
+        patch(
+            "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+            side_effect=RuntimeError("plugin policy crashed"),
+        ),
+    ):
+        with pytest.raises(RequiredMiddlewareError, match="pre_tool_call.*failed"):
+            _run_agent_tool_execution_middleware(
+                agent,
+                function_name="demo_tool",
+                function_args={"value": 1},
+                effective_task_id="task",
+                tool_call_id="call",
+                execute=execute,
+            )
+
+    execute.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [None, "blocked", "cancelled"])
+def test_certification_deferral_bypasses_post_tool_observers(status):
+    agent = types.SimpleNamespace(
+        _certification_persistence_deferred=True,
+        _current_turn_id="turn",
+        _current_api_request_id="request",
+        session_id="session",
+    )
+
+    with patch("model_tools._emit_post_tool_call_hook") as post_tool_hook:
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name="demo_tool",
+            function_args={"secret": "UNCERTIFIED ARGUMENT"},
+            result="UNCERTIFIED RESULT",
+            effective_task_id="task",
+            tool_call_id="call",
+            status=status,
+        )
+
+    post_tool_hook.assert_not_called()
+
+
 def test_turn_start_replaces_stale_parent_history_with_compression_child():
     agent = _FakeAgent()
     stale_history = [{"role": "user", "content": "stale parent"}]
@@ -452,3 +836,36 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
+
+
+def test_certification_deferral_suppresses_auto_title_and_idle_compaction():
+    from agent import turn_context
+
+    agent = _FakeAgent()
+    setattr(agent, "_certification_persistence_deferred", True)
+    setattr(agent, "_session_db", MagicMock())
+    setattr(agent, "_session_db_created", True)
+    agent.compression_enabled = True
+    setattr(agent, "compression_idle_compact_after_seconds", 1)
+    setattr(agent, "_last_activity_ts", 0)
+    setattr(agent.context_compressor, "threshold_tokens", 1)
+    setattr(agent.context_compressor, "summary_target_ratio", 0.5)
+    setattr(
+        agent.context_compressor,
+        "get_active_compression_failure_cooldown",
+        lambda: None,
+    )
+    setattr(agent, "_compress_context", MagicMock())
+
+    with (
+        patch("agent.title_generator.maybe_auto_title") as titler,
+        patch("agent.turn_context.estimate_request_tokens_rough") as estimate,
+    ):
+        turn_context._maybe_title_session_at_turn_start(
+            agent, [{"role": "user", "content": "private"}]
+        )
+        _build(agent)
+
+    titler.assert_not_called()
+    estimate.assert_not_called()
+    getattr(agent, "_compress_context").assert_not_called()

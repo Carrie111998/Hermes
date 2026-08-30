@@ -33,6 +33,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.certification_runtime import publication_deferred
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
     _is_destructive_command,
@@ -311,6 +312,9 @@ def _emit_terminal_post_tool_call(
     error_message: str | None = None,
     middleware_trace: Optional[list[dict[str, Any]]] = None,
 ) -> None:
+    if getattr(agent, "_certification_persistence_deferred", False):
+        return
+
     try:
         from model_tools import _emit_post_tool_call_hook
         _emit_post_tool_call_hook(
@@ -594,6 +598,7 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    suppress_publication = publication_deferred(agent)
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -627,6 +632,7 @@ def _run_agent_tool_execution_middleware(
                 effective_task_id=effective_task_id,
                 tool_call_id=tool_call_id,
                 display_index=display_index,
+                publish_observers=not suppress_publication,
             )
 
         def _advance_start_order(callback=None) -> None:
@@ -656,12 +662,19 @@ def _run_agent_tool_execution_middleware(
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
                         middleware_trace=list(state["middleware_trace"]),
+                        required=suppress_publication,
                     )
                     if modified_args is not None:
                         final_args = modified_args
                         state["args"] = modified_args
                     return block_msg
-                except Exception:
+                except Exception as exc:
+                    if suppress_publication:
+                        from hermes_cli.middleware import RequiredMiddlewareError
+
+                        raise RequiredMiddlewareError(
+                            "required pre_tool_call policy failed before tool dispatch"
+                        ) from exc
                     return None
 
             block_message = (
@@ -739,6 +752,7 @@ def _run_agent_tool_execution_middleware(
             function_name,
             relay_args,
             skip_relay=True,
+            required=suppress_publication,
             task_id=effective_task_id or "",
             session_id=getattr(agent, "session_id", "") or "",
             tool_call_id=tool_call_id or "",
@@ -758,6 +772,7 @@ def _run_agent_tool_execution_middleware(
             lambda next_args: _authorized_dispatch(
                 next_args if isinstance(next_args, dict) else request_args
             ),
+            required=suppress_publication,
             original_args=function_args,
             task_id=effective_task_id or "",
             session_id=getattr(agent, "session_id", "") or "",
@@ -1010,9 +1025,14 @@ def _begin_tool_execution(
     effective_task_id: str,
     tool_call_id: str,
     display_index: int | None,
+    publish_observers: bool = True,
 ) -> None:
     """Run user-visible and checkpoint preflight on final tool arguments."""
-    if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
+    if (
+        publish_observers
+        and not agent.quiet_mode
+        and getattr(agent, "tool_progress_mode", "all") != "off"
+    ):
         display_args = (
             _redact_tool_args_for_display(function_name, function_args) or function_args
         )
@@ -1045,7 +1065,7 @@ def _begin_tool_execution(
     except Exception:
         pass
 
-    if agent.tool_progress_callback:
+    if publish_observers and agent.tool_progress_callback:
         try:
             display_args = (
                 _redact_tool_args_for_display(function_name, function_args)
@@ -1058,7 +1078,7 @@ def _begin_tool_execution(
         except Exception as callback_error:
             logging.debug("Tool progress callback error: %s", callback_error)
 
-    if agent.tool_start_callback:
+    if publish_observers and agent.tool_start_callback:
         try:
             display_args = (
                 _redact_tool_args_for_display(function_name, function_args)
@@ -1860,7 +1880,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # Every completion surface is downstream of the canonical append. If
         # the UI bridge or process dies while projecting one of these events,
         # resume can reconstruct the tool result that was already visible.
-        if not blocked and agent.tool_progress_callback:
+        if (
+            not blocked
+            and not getattr(agent, "_certification_persistence_deferred", False)
+            and agent.tool_progress_callback
+        ):
             try:
                 agent.tool_progress_callback(
                     "tool.completed", progress_function_name, None, None,
@@ -1885,7 +1909,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 response_preview = _preview_str[:agent.log_prefix_chars] + "..." if len(_preview_str) > agent.log_prefix_chars else _preview_str
                 print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
 
-        if not blocked and agent.tool_complete_callback:
+        if (
+            not blocked
+            and not getattr(agent, "_certification_persistence_deferred", False)
+            and agent.tool_complete_callback
+        ):
             try:
                 display_args = _redact_tool_args_for_display(name, args) or args
                 agent.tool_complete_callback(
@@ -1897,6 +1925,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         if (
             risk_metadata is not None
             and risk_metadata.get("risk") != "low"
+            and not getattr(agent, "_certification_persistence_deferred", False)
             and agent.tool_progress_callback
         ):
             try:
@@ -2777,7 +2806,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
-        if not _execution_blocked and agent.tool_progress_callback:
+        if (
+            not _execution_blocked
+            and not getattr(agent, "_certification_persistence_deferred", False)
+            and agent.tool_progress_callback
+        ):
             try:
                 agent.tool_progress_callback(
                     "tool.completed", function_name, None, None,
@@ -2787,7 +2820,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug("Tool progress callback error: %s", cb_err)
 
-        if not _execution_blocked and agent.tool_complete_callback:
+        if (
+            not _execution_blocked
+            and not getattr(agent, "_certification_persistence_deferred", False)
+            and agent.tool_complete_callback
+        ):
             try:
                 display_args = (
                     _redact_tool_args_for_display(function_name, function_args)
@@ -2805,6 +2842,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if (
             risk_metadata is not None
             and risk_metadata.get("risk") != "low"
+            and not getattr(agent, "_certification_persistence_deferred", False)
             and agent.tool_progress_callback
         ):
             try:
