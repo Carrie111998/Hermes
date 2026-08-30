@@ -16304,6 +16304,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # profile-scoped.  Preserve both dimensions in the key so dashboard
         # and NAS health aggregation can see which secondary profile failed.
         adapter._runtime_status_platform_key = f"{profile_name}:{platform.value}"
+        # Ownership must be installed before set_message_handler binds the
+        # profile-scoped deferred service, otherwise every secondary adapter
+        # registers as the primary/default credential.
+        _set_owner = getattr(adapter, "set_owner_profile", None)
+        if callable(_set_owner):
+            _set_owner(profile_name)
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -16315,9 +16321,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # stamps source.profile — without this every secondary bot would key into
         # the default profile's `agent:main:` lane and share it (see
         # BasePlatformAdapter._session_key_profile).
-        _set_owner = getattr(adapter, "set_owner_profile", None)
-        if callable(_set_owner):
-            _set_owner(profile_name)
         adapter.set_busy_session_handler(
             self._make_profile_busy_session_handler(profile_name)
         )

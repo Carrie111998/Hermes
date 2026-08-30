@@ -45,6 +45,10 @@ class DeferredQuestion:
             or self.delivery_source["platform"]
         )
 
+    @property
+    def adapter_profile(self) -> str:
+        return str(self.delivery_source.get("adapter_profile") or "default")
+
 
 @dataclass(frozen=True)
 class DeferredQuestionResult:
@@ -73,9 +77,13 @@ class DeferredQuestionService:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._handlers: dict[tuple[str, str], DeferredQuestionHandler] = {}
-        self._adapters: dict[str, tuple[Any, asyncio.AbstractEventLoop]] = {}
-        self._ready_platforms: set[str] = set()
+        self._handlers: dict[
+            tuple[str, str], tuple[DeferredQuestionHandler, contextvars.Context]
+        ] = {}
+        self._adapters: dict[
+            tuple[str, str], tuple[Any, asyncio.AbstractEventLoop]
+        ] = {}
+        self._ready_adapters: set[tuple[str, str]] = set()
         self._busy_callbacks: set[str] = set()
         self._handler_lock = asyncio.Lock()
         self._handling_retry_tasks: dict[str, asyncio.Task[None]] = {}
@@ -261,7 +269,7 @@ class DeferredQuestionService:
                 )
                 if record is None:
                     raise RuntimeError("inserted deferred question disappeared")
-        self._wake_platform(platform)
+        self._wake_record(record)
         return record
 
     def pending_for_session(self, session_key: str) -> DeferredQuestion | None:
@@ -320,7 +328,12 @@ class DeferredQuestionService:
     ) -> None:
         if not callable(handler):
             raise TypeError("deferred question handler must be callable")
-        self._handlers[(plugin_id, handler_name)] = handler
+        self._handlers[(plugin_id, handler_name)] = (
+            handler,
+            contextvars.copy_context(),
+        )
+        for key in tuple(self._ready_adapters):
+            self._wake_binding(key)
         self._schedule_recovery()
 
     def unregister_handler(
@@ -330,46 +343,82 @@ class DeferredQuestionService:
         handler: DeferredQuestionHandler,
     ) -> None:
         key = (plugin_id, handler_name)
-        if self._handlers.get(key) is handler:
+        binding = self._handlers.get(key)
+        if binding is not None and binding[0] is handler:
             self._handlers.pop(key, None)
 
-    def bind_adapter(self, platform: str, adapter: Any) -> None:
+    def has_handler(self, plugin_id: str, handler_name: str) -> bool:
+        return (plugin_id, handler_name) in self._handlers
+
+    @staticmethod
+    def _adapter_key(platform: str, adapter_profile: str | None) -> tuple[str, str]:
+        return (platform, (adapter_profile or "default").strip() or "default")
+
+    def bind_adapter(
+        self,
+        platform: str,
+        adapter: Any,
+        *,
+        adapter_profile: str | None = None,
+    ) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = asyncio.get_event_loop()
-        self._adapters[platform] = (adapter, loop)
-        self._ready_platforms.discard(platform)
+        key = self._adapter_key(platform, adapter_profile)
+        self._adapters[key] = (adapter, loop)
+        self._ready_adapters.discard(key)
 
-    def adapter_connected(self, platform: str, adapter: Any) -> None:
+    def adapter_connected(
+        self,
+        platform: str,
+        adapter: Any,
+        *,
+        adapter_profile: str | None = None,
+    ) -> None:
         """Wake durable work only after this exact transport is usable."""
-        binding = self._adapters.get(platform)
+        key = self._adapter_key(platform, adapter_profile)
+        binding = self._adapters.get(key)
         if binding is None or binding[0] is not adapter:
             return
-        if platform in self._ready_platforms:
+        if key in self._ready_adapters:
             return
         _adapter, loop = binding
-        self._ready_platforms.add(platform)
+        self._ready_adapters.add(key)
         with self._lock, self._transaction() as conn:
             conn.execute(
                 """
                 UPDATE deferred_questions SET state = 'queued', updated_at = ?
                 WHERE platform = ? AND state = 'delivering'
                   AND delivery_attempted = 0
+                  AND COALESCE(
+                      json_extract(delivery_source_json, '$.adapter_profile'),
+                      'default'
+                  ) = ?
                 """,
-                (time.time(), platform),
+                (time.time(), platform, key[1]),
             )
-        self._wake_platform(platform)
+        self._wake_binding(key)
         self._schedule_recovery(loop)
 
-    def adapter_disconnected(self, platform: str, adapter: Any) -> None:
-        binding = self._adapters.get(platform)
+    def adapter_disconnected(
+        self,
+        platform: str,
+        adapter: Any,
+        *,
+        adapter_profile: str | None = None,
+    ) -> None:
+        key = self._adapter_key(platform, adapter_profile)
+        binding = self._adapters.get(key)
         if binding is not None and binding[0] is adapter:
-            self._ready_platforms.discard(platform)
+            self._ready_adapters.discard(key)
 
-    def _ready_adapter(self, platform: str) -> Any | None:
-        binding = self._adapters.get(platform)
-        if binding is None or platform not in self._ready_platforms:
+    def _ready_adapter(
+        self, platform: str, adapter_profile: str | None = None
+    ) -> Any | None:
+        key = self._adapter_key(platform, adapter_profile)
+        binding = self._adapters.get(key)
+        if binding is None or key not in self._ready_adapters:
             return None
         return binding[0]
 
@@ -377,9 +426,9 @@ class DeferredQuestionService:
         if loop is None:
             loop = next(
                 (
-                    self._adapters[platform][1]
-                    for platform in self._ready_platforms
-                    if platform in self._adapters
+                    self._adapters[key][1]
+                    for key in self._ready_adapters
+                    if key in self._adapters
                 ),
                 None,
             )
@@ -393,14 +442,20 @@ class DeferredQuestionService:
 
         loop.call_soon_threadsafe(recover_captured, context=contextvars.Context())
 
-    def _wake_platform(self, platform: str) -> None:
-        binding = self._adapters.get(platform)
-        if binding is None or platform not in self._ready_platforms:
+    def _wake_record(self, record: DeferredQuestion) -> None:
+        self._wake_binding(self._adapter_key(record.platform, record.adapter_profile))
+
+    def _wake_binding(self, key: tuple[str, str]) -> None:
+        binding = self._adapters.get(key)
+        if binding is None or key not in self._ready_adapters:
             return
         _adapter, loop = binding
+        platform, adapter_profile = key
 
         def schedule() -> None:
-            asyncio.create_task(self.deliver_ready(platform))
+            asyncio.create_task(
+                self.deliver_ready(platform, adapter_profile=adapter_profile)
+            )
 
         if loop.is_running():
             loop.call_soon_threadsafe(schedule, context=contextvars.Context())
@@ -443,15 +498,24 @@ class DeferredQuestionService:
         return [record for row in rows if (record := self._from_row(row)) is not None]
 
     async def deliver_ready(
-        self, platform: str, session_key: str | None = None
+        self,
+        platform: str,
+        session_key: str | None = None,
+        *,
+        adapter_profile: str | None = None,
     ) -> None:
-        adapter = self._ready_adapter(platform)
-        if adapter is None:
-            return
         for record in self._queued(platform, session_key):
-            adapter = self._ready_adapter(platform)
+            if (
+                adapter_profile is not None
+                and record.adapter_profile
+                != self._adapter_key(platform, adapter_profile)[1]
+            ):
+                continue
+            if not self.has_handler(record.plugin_id, record.handler_name):
+                continue
+            adapter = self._ready_adapter(record.platform, record.adapter_profile)
             if adapter is None:
-                return
+                continue
             if adapter.is_session_active(record.session_key):
                 if record.id in self._busy_callbacks:
                     continue
@@ -461,23 +525,22 @@ class DeferredQuestionService:
                     *,
                     question_id: str = record.id,
                     key: str = record.session_key,
+                    profile: str = record.adapter_profile,
                 ) -> None:
                     self._busy_callbacks.discard(question_id)
-                    await self.deliver_ready(platform, key)
+                    await self.deliver_ready(platform, key, adapter_profile=profile)
 
-                adapter.register_post_delivery_callback(
-                    record.session_key,
-                    after_delivery,
-                    generation=adapter.active_session_generation(record.session_key),
+                adapter.register_session_idle_callback(
+                    record.session_key, after_delivery
                 )
                 continue
             claimed = self.claim_for_delivery(record.id)
             if claimed is None:
                 continue
-            adapter = self._ready_adapter(platform)
+            adapter = self._ready_adapter(claimed.platform, claimed.adapter_profile)
             if adapter is None:
                 self.requeue(claimed.id)
-                return
+                continue
             self._mark_delivery_attempted(claimed.id)
             result = await adapter.deliver_deferred_message(
                 claimed.delivery_source, claimed.question
@@ -503,6 +566,8 @@ class DeferredQuestionService:
             record = self._from_row(row)
             if record is None:
                 return None
+            if not self.has_handler(record.plugin_id, record.handler_name):
+                return None
             changed = conn.execute(
                 """
                 UPDATE deferred_questions
@@ -518,15 +583,16 @@ class DeferredQuestionService:
     def _schedule_handling_retry(self, record: DeferredQuestion) -> None:
         if record.id in self._handling_retry_tasks:
             return
-        binding = self._adapters.get(record.platform)
-        if binding is None or self._ready_adapter(record.platform) is not binding[0]:
+        key = self._adapter_key(record.platform, record.adapter_profile)
+        binding = self._adapters.get(key)
+        if binding is None or self._ready_adapter(*key) is not binding[0]:
             return
         _adapter, loop = binding
 
         async def retry_once() -> None:
             try:
                 await asyncio.sleep(self.handling_retry_seconds)
-                if self._ready_adapter(record.platform) is not _adapter:
+                if self._ready_adapter(*key) is not _adapter:
                     return
                 pending = self.get(record.id)
                 await self._run_handler(pending, schedule_retry=False)
@@ -566,8 +632,8 @@ class DeferredQuestionService:
     async def _run_handler_once(
         self, record: DeferredQuestion, *, schedule_retry: bool
     ) -> DeferredQuestionResult:
-        handler = self._handlers.get((record.plugin_id, record.handler_name))
-        if handler is None:
+        handler_binding = self._handlers.get((record.plugin_id, record.handler_name))
+        if handler_binding is None:
             raise LookupError(
                 f"no deferred question handler registered for "
                 f"{record.plugin_id}.{record.handler_name}"
@@ -576,7 +642,11 @@ class DeferredQuestionService:
             raise ValueError("handling question has no captured response")
         result = record.result
         if result is None:
-            result = await handler(record, record.response)
+            handler, handler_context = handler_binding
+            result = await asyncio.create_task(
+                handler(record, record.response),
+                context=handler_context.copy(),
+            )
             if not isinstance(result, DeferredQuestionResult):
                 raise TypeError("deferred question handler returned an invalid result")
             result_json = json.dumps(
@@ -601,7 +671,7 @@ class DeferredQuestionService:
         if not result.resolved and (not reply or not reply.strip()):
             raise ValueError("clarification result requires a question")
         if reply:
-            adapter = self._ready_adapter(record.platform)
+            adapter = self._ready_adapter(record.platform, record.adapter_profile)
             if adapter is None:
                 raise RuntimeError(f"adapter for {record.platform} is not connected")
             self._mark_delivery_attempted(record.id)
@@ -630,7 +700,11 @@ class DeferredQuestionService:
                             """,
                             (record.id,),
                         )
-                    await self.deliver_ready(record.platform, record.session_key)
+                    await self.deliver_ready(
+                        record.platform,
+                        record.session_key,
+                        adapter_profile=record.adapter_profile,
+                    )
                 else:
                     with self._lock, self._transaction() as conn:
                         conn.execute(
@@ -668,7 +742,11 @@ class DeferredQuestionService:
                     (result.question, now, record.id),
                 )
         if result.resolved:
-            await self.deliver_ready(record.platform, record.session_key)
+            await self.deliver_ready(
+                record.platform,
+                record.session_key,
+                adapter_profile=record.adapter_profile,
+            )
         return result
 
     async def _recover_handling(self) -> None:
@@ -695,7 +773,7 @@ class DeferredQuestionService:
             record = self._from_row(row)
             if record is None:
                 continue
-            if self._ready_adapter(record.platform) is None:
+            if self._ready_adapter(record.platform, record.adapter_profile) is None:
                 continue
             if (record.plugin_id, record.handler_name) not in self._handlers:
                 continue
@@ -750,12 +828,9 @@ class DeferredQuestionClient:
     ) -> DeferredQuestion:
         from hermes_cli.plugin_capabilities import plugin_capability_granted
 
-        if not plugin_capability_granted(
-            self._plugin_id, "gateway.platform_actions"
-        ):
+        if not plugin_capability_granted(self._plugin_id, "gateway.platform_actions"):
             raise PermissionError(
-                "gateway.platform_actions capability is required for "
-                "deferred questions"
+                "gateway.platform_actions capability is required for deferred questions"
             )
         return self._service.enqueue(
             plugin_id=self._plugin_id,

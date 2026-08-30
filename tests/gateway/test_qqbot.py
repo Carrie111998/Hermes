@@ -50,7 +50,9 @@ class TestQQAdapterInit:
 
         adapter._mark_transport_disconnected()
 
-        service.adapter_disconnected.assert_called_once_with("qqbot", adapter)
+        service.adapter_disconnected.assert_called_once_with(
+            "qqbot", adapter, adapter_profile="default"
+        )
 
 
     def test_env_fallback(self):
