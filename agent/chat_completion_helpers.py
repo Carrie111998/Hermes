@@ -1882,11 +1882,16 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
 
     if agent.api_mode == "codex_responses":
         _ct = agent._get_transport()
-        from agent.codex_responses_adapter import classify_responses_route
-
-        is_codex_backend, is_xai_responses, is_github_responses = (
-            classify_responses_route(agent)
+        from agent.codex_responses_adapter import (
+            classify_responses_route,
+            supports_openai_text_verbosity_route,
         )
+
+        route = classify_responses_route(agent)
+        is_codex_backend = route.is_codex_backend
+        is_xai_responses = route.is_xai_responses
+        is_github_responses = route.is_github_responses
+        text_verbosity_route_supported = supports_openai_text_verbosity_route(agent)
         _msgs_for_codex = agent._prepare_messages_for_non_vision_model(api_messages)
 
         # Native server-side compaction (gpt-5.6 on direct OpenAI API /
@@ -1937,6 +1942,8 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             messages=_msgs_for_codex,
             tools=tools_for_api,
             reasoning_config=agent.reasoning_config,
+            text_verbosity=getattr(agent, "text_verbosity", None),
+            text_verbosity_route_supported=text_verbosity_route_supported,
             session_id=getattr(agent, "session_id", None),
             cache_scope_id=_cache_scope_id,
             base_url=agent.base_url,
