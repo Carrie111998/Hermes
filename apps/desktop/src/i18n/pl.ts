@@ -252,7 +252,7 @@ const plTranslatedOverrides = {
       'view.nextTerminal': 'Następny terminal',
       'view.prevTerminal': 'Poprzedni terminal',
       'view.closeTerminal': 'Zamknij terminal',
-      'view.terminalSelection': 'Wstaw zaznaczenie z terminala do pola wiadomości',
+      'view.selectionToComposer': 'Wyślij zaznaczenie do pola wiadomości',
       'view.closeTab': 'Zamknij kartę',
       'view.reopenTab': 'Otwórz ponownie zamkniętą kartę',
       'view.flipPanes': 'Zamień paski boczne stronami',
@@ -1055,7 +1055,7 @@ const plTranslatedOverrides = {
         'nie znajduje się na liście modeli tego dostawcy — wywołania mogą zostać obsłużone przez model zapasowy.',
       tasks: {
         vision: { label: 'Wizja', hint: 'Analiza obrazu' },
-        web_extract: { label: 'Pobieranie treści stron', hint: 'Podsumowywanie stron' },
+        review: { label: 'Review', hint: 'Subagent wykonujący /review' },
         compression: { label: 'Kompresja', hint: 'Kompresowanie kontekstu' },
         skills_hub: { label: 'Katalog umiejętności', hint: 'Wyszukiwanie umiejętności' },
         approval: { label: 'Zgoda', hint: 'Inteligentne automatyczne udzielanie zgody' },
@@ -2788,8 +2788,8 @@ const plTranslatedOverrides = {
   },
 
   zones: {
-    showHeader: 'Pokaż nagłówek',
-    hideHeader: 'Ukryj nagłówek',
+    showTabStrip: 'Pokaż karty',
+    hideTabStrip: 'Ukryj karty',
     minimize: 'Minimalizuj',
     restore: 'Przywróć',
     closeRunningTitle: 'Zamknąć działającą kartę?',
@@ -3790,6 +3790,215 @@ const plCurrentMainOverrides = {
   }
 } satisfies TranslationOverrides
 
-export const plOverrides = mergeLocaleOverrides(plTranslatedOverrides, plMissingOverrides, plCurrentMainOverrides)
+const plRebasedMainOverrides = {
+  boot: {
+    errors: {
+      gatewayConnectionLostDetail:
+        'Ponawianie trwa w tle. Możesz nadal czytać i przygotowywać wiadomości — jeśli problem nie ustąpi, otwórz ustawienia bramy.'
+    },
+    failure: {
+      cloudDownTitle: 'Agent Nous Cloud nie działa',
+      cloudDownDescription:
+        'Zarządzany przez Nous agent chmurowy, z którym łączy się ta brama, zwraca błąd serwera. Nie można go stąd uruchomić ponownie — sprawdź jego stan, przełącz się na bramę lokalną albo skontaktuj się z pomocą techniczną.',
+      cloudDownHint: 'Poniższe przyciski otwierają Nous Portal (stan instancji i sterowanie) oraz nasz Discord z pomocą.',
+      cloudDownCheckPortal: 'Sprawdź stan w Portalu',
+      cloudDownDiscord: 'Uzyskaj pomoc na Discordzie'
+    }
+  },
+  sendDiagnostics: {
+    title: 'Wyślij diagnostykę do Nous',
+    privacyNotice:
+      'Spowoduje to przesłanie pakietu diagnostycznego do wewnętrznej pamięci Nous (nie do publicznego serwisu wklejek). Pakiet zawiera informacje o systemie (system operacyjny, wersje, dostawcę i informację, które klucze API są skonfigurowane — nigdy same klucze) oraz pełne logi agenta, bramy i aplikacji Desktop (do 512 KB każdy), które prawdopodobnie zawierają treść rozmów, wyniki narzędzi i ścieżki plików. Sekrety są usuwane przed wysłaniem. Pakiet mogą zobaczyć tylko pracownicy Nous i moderatorzy Discorda z listy dozwolonych osób; zostanie automatycznie usunięty po 14 dniach.',
+    upload: 'Prześlij',
+    uploading: 'Przesyłanie…',
+    cancel: 'Anuluj',
+    close: 'Zamknij',
+    copyLink: 'Kopiuj link',
+    uploadIdFallback: id => `Nie zwrócono linku — podaj pomocy technicznej ID przesłanego pakietu: ${id}`,
+    doneTitle: 'Wysłano diagnostykę',
+    doneDescription:
+      'Pakiet został przesłany prywatnie. Udostępnij poniższy link w wątku pomocy technicznej, aby zespół mógł zobaczyć logi.',
+    failedTitle: 'Przesyłanie nie powiodło się',
+    failedHint:
+      'Możesz też uruchomić w terminalu `hermes debug share --nous` albo `hermes debug share --local`, aby wyświetlić raport bez przesyłania.',
+    handoffLead: 'Kontynuuj rozmowę w:',
+    links: { github: 'GitHub Issues', portal: 'Pomoc Nous Portal', discord: 'Discord' }
+  },
+  titlebar: { resetHudLayout: 'Zresetuj rozmiar i położenie HUD' },
+  keybinds: { actions: { 'view.toggleTabStrip': 'Przełącz karty' } },
+  settings: {
+    appearance: {
+      tabStripTitle: 'Pasek kart',
+      tabStripDesc: 'Pokazuj karty nad strefą. W trybie automatycznym są ukrywane, gdy strefa zawiera jeden panel.',
+      tabStripAuto: 'Automatycznie',
+      tabStripAlways: 'Zawsze',
+      tabStripNever: 'Nigdy',
+      tipsTitle: 'Wskazówki w aplikacji',
+      tipsDesc:
+        'Niewielki dymek wskazujący element aplikacji, wyświetlany od czasu do czasu podczas bezczynności i przez Hermesa, gdy może pomóc. Zamknięcie wskazówki wyłącza ją na stałe.',
+      tipsReset: count => {
+        const noun = count === 1 ? 'zamkniętą wskazówkę' : count % 10 >= 2 && count % 10 <= 4 && (count % 100 < 12 || count % 100 > 14) ? 'zamknięte wskazówki' : 'zamkniętych wskazówek'
+
+        return `Przywróć ${count} ${noun}`
+      },
+      toursTitle: 'Wycieczki z przewodnikiem',
+      toursDesc: 'Pozwól Hermesowi oprowadzić Cię po aplikacji, przyciemniając ekran i wyróżniając kolejne kroki.',
+      vibeHeartsTitle: 'Serca wdzięczności',
+      vibeHeartsDesc:
+        'Latające serca, gdy podziękujesz, napiszesz „ily” lub „good bot” albo wyślesz serce. Działa niezależnie od reakcji na wiadomości powyżej.'
+    },
+    fieldLabels: defineFieldCopy({ browser: { useRealProfile: 'Używaj mojego prawdziwego profilu przeglądarki' } }),
+    fieldDescriptions: defineFieldCopy({
+      browser: {
+        useRealProfile:
+          'Lokalne przeglądanie korzysta z Twoich prawdziwych loginów. Hermes kopiuje profil domyślnej przeglądarki (ciasteczka, loginy i preferencje) do zarządzanej migawki i obsługuje ją za pomocą dołączonego Chromium — aktywny profil nigdy nie jest otwierany bezpośrednio, a kopia jest odświeżana przy każdym uruchomieniu. Pozwala też agentowi na żądanie otworzyć lokalną sesję z prawdziwym profilem, nawet gdy skonfigurowano chmurowy backend przeglądarki. Obsługiwane są tylko przeglądarki Chromium (Chrome, Edge, Brave, Brave Origin i Chromium); inna domyślna przeglądarka spowoduje czytelny błąd. Domyślnie wyłączone.'
+      }
+    }),
+    managedUpdates: {
+      title: 'Zarządzane aktualizacje',
+      intro:
+        'Aktualizuj instalacje SSH zarządzane przez Desktop w sposób transakcyjny: sesje są wygaszane, zdalne repozytorium jest aktualizowane, a każdy profil przywracany wraz z powiązanym potwierdzeniem.',
+      sshConnection: 'Instalacja SSH zarządzana przez Desktop',
+      update: 'Aktualizuj',
+      updating: 'Aktualizowanie…',
+      progress: 'Wygaszanie sesji, aktualizowanie zdalnej instalacji i przywracanie profili…',
+      updated: 'Zaktualizowano',
+      partial: 'Zaktualizowano — przywracanie nie powiodło się',
+      refused: 'Odmówiono',
+      failed: 'Aktualizacja nie powiodła się',
+      alreadyRunning: 'Aktualizacja już trwa',
+      receipt: (id, outcome) => `Potwierdzenie ${id} · ${outcome}`,
+      receiptVersions: (pre, post) => `${pre} → ${post}`,
+      scopesRestored: profiles => `Przywrócone profile: ${profiles}`,
+      scopeNotRestored: (profile, error) => `Nie przywrócono profilu „${profile}”: ${error}`
+    },
+    gateway: {
+      keychainEncryptionTitle: 'Szyfruj zapisane sekrety za pomocą systemowego magazynu kluczy',
+      keychainEncryptionDesc:
+        'Domyślnie wyłączone. Po włączeniu tokeny bramy i dane logowania są szyfrowane przez systemowy magazyn kluczy (Pęk kluczy, GNOME Keyring albo Windows DPAPI) — system może poprosić o zgodę lub hasło. Po wyłączeniu są zapisywane jako zwykłe pliki dostępne tylko dla Twojego konta użytkownika.',
+      keychainEncryptionFailed: 'Nie udało się zmienić szyfrowania sekretów'
+    },
+    toolsets: {
+      browserRealProfile: {
+        label: 'Używaj mojego prawdziwego profilu przeglądarki',
+        description:
+          'Kopiuje loginy i ciasteczka z domyślnej przeglądarki do zarządzanej migawki używanej przez agenta. Aktywny profil nigdy nie jest otwierany bezpośrednio. Dotyczy nowych sesji.',
+        enabledTitle: 'Włączono przeglądanie z prawdziwym profilem',
+        enabledMessage: 'Nowe sesje będą przeglądać za pomocą migawki domyślnego profilu przeglądarki.',
+        disabledTitle: 'Wyłączono przeglądanie z prawdziwym profilem',
+        disabledMessage: 'Migawka profilu zostanie usunięta; nowe sesje użyją czystej przeglądarki.',
+        failedSave: 'Nie udało się zapisać ustawienia prawdziwego profilu'
+      }
+    }
+  },
+  profiles: {
+    fleet: {
+      allOnGateway: 'Wszystkie profile w tej bramie',
+      gateway: gateway => `Profile w bramie ${gateway}`,
+      gatewayUnreachable: gateway => `${gateway} · nieosiągalna`,
+      onGateway: (name, gateway) => `${name} · ${gateway}`,
+      switchTo: (name, gateway) => `Przełącz na ${name} w bramie ${gateway}`,
+      deleteOn: gateway => ` w bramie ${gateway}`
+    },
+    remoteOverride: {
+      menuItem: 'Połącz ze zdalnym hostem…',
+      badge: host => `Działa na ${host}`,
+      title: profile => `Połącz profil ${profile} ze zdalnym hostem`,
+      description: 'Sesje tego profilu będą działać na wskazanym zdalnym Hermesie zamiast na tym komputerze.',
+      urlLabel: 'Adres zdalny',
+      urlPlaceholder: 'https://hermes.example.com',
+      urlInvalid: 'Wpisz pełny adres zaczynający się od http:// lub https://',
+      tokenLabel: 'Token dostępu',
+      tokenPlaceholder: 'Wklej token zdalnej sesji',
+      tokenSavedHint: 'Token jest już zapisany. Pozostaw pole puste, aby go zachować.',
+      plainTextOptIn:
+        'Ten komputer nie ma bezpiecznego magazynu kluczy, więc token zostanie zapisany na dysku bez szyfrowania. Zapisz go mimo to.',
+      collisionWarning: label =>
+        `Brama o nazwie „${label}” już istnieje w Ustawieniach. To połączenie profilu jest niezależne i jej nie zmieni.`,
+      confirmTitle: 'Połączyć ten profil ze zdalnym hostem?',
+      confirmNote: (profile, host) =>
+        `Nowe czaty w profilu ${profile} będą działać na ${host}. Tamten komputer będzie wykonywać polecenia i odczytywać pliki, a nie ten. Łącz się tylko z zaufanym hostem.`,
+      confirmBack: 'Wstecz',
+      connect: 'Połącz',
+      connecting: 'Łączenie…',
+      disconnect: 'Usuń zdalne połączenie',
+      savedTitle: 'Połączono profil',
+      savedMessage: (profile, host) => `${profile} działa teraz na ${host}`,
+      removedTitle: 'Usunięto zdalne połączenie',
+      removedMessage: profile => `${profile} działa teraz na tym komputerze`,
+      removeFailed: 'Nie udało się usunąć zdalnego połączenia',
+      authFailedTitle: 'Zdalny host odrzucił zapisany token',
+      authFailedMessage: (profile, host) =>
+        `${host} odrzucił token zapisany dla profilu ${profile}. Mógł zostać zmieniony po stronie zdalnej.`,
+      updateToken: 'Wprowadź nowy token…'
+    },
+    exportMenu: 'Eksportuj…'
+  },
+  cron: {
+    modelImpact: {
+      confirmTitle: 'Ostrzeżenie dotyczące wyboru modelu',
+      confirmDetail: 'Potwierdź tylko wtedy, gdy akceptujesz ten kompromis.',
+      confirmAction: 'Potwierdź',
+      declined: 'Anulowano zmianę modelu — odrzucono ostrzeżenie dotyczące trenowania na danych.'
+    }
+  },
+  shell: { statusbar: { gatewayUnavailable: 'wnioskowanie niedostępne' } },
+  preview: { openInExternal: 'Otwórz zewnętrznie', popIn: 'Przenieś do aplikacji', popOut: 'Otwórz w osobnym oknie' },
+  zones: { newTab: 'Nowa karta' },
+  assistant: {
+    thread: {
+      errorLayers: {
+        auth: 'Błąd uwierzytelniania',
+        billing: 'Brak środków',
+        disk: 'Dysk jest pełny',
+        endpoint: 'Błąd własnego endpointu',
+        gateway: 'Błąd bramy',
+        generic: 'Tura nie powiodła się',
+        provider: 'Błąd dostawcy',
+        runtime: 'Błąd lokalnego środowiska uruchomieniowego',
+        streaming: 'Błąd połączenia strumieniowego'
+      },
+      errorRetry: 'Spróbuj ponownie',
+      errorSwitchProvider: 'Zmień dostawcę',
+      errorOpenLogs: 'Otwórz logi',
+      errorOpenLogsFailed: 'Nie udało się otworzyć katalogu logów',
+      errorOpenDesktopLogs: 'Otwórz logi Desktop',
+      errorCopyDiagnostics: 'Kopiuj szczegóły błędu',
+      errorSendDiagnostics: 'Wyślij diagnostykę'
+    }
+  },
+  desktop: {
+    readOnlyTranscriptTitle: 'Otwarto tylko do odczytu',
+    readOnlyTranscriptBody:
+      'Żaden połączony backend nie przejął jeszcze tego starszego czatu, dlatego otwarto go jako transkrypcję tylko do odczytu. Historia jest nienaruszona; wysyłanie pozostaje wyłączone, dopóki backend go nie przejmie.',
+    readOnlyTranscriptSendBlocked: 'Ten czat jest otwarty jako transkrypcja tylko do odczytu — wysyłanie jest wyłączone.',
+    hydrationSyncing: profile => `Synchronizowanie ${profile}…`
+  },
+  tips: {
+    close: 'Nie pokazuj ponownie tej wskazówki',
+    items: {
+      'new-session': { title: 'Zacznij od nowa', text: 'Nowy czat otrzymuje własny kontekst, terminal i katalog roboczy.' },
+      skills: { title: 'Naucz raz', text: 'Umiejętności to katalogi instrukcji, które Hermes wczytuje, gdy wymaga tego zadanie.' },
+      messaging: {
+        title: 'Hermes także poza biurkiem',
+        text: 'Połącz Telegram, Discord, Slack i inne platformy — ten sam agent, ta sama pamięć.'
+      },
+      artifacts: { title: 'Wszystko, co stworzył Hermes', text: 'Obrazy, pliki i linki ze wszystkich sesji, zebrane w jednym miejscu.' },
+      cron: { title: 'Praca, która wykonuje się sama', text: 'Zaplanuj prompt co godzinę, co noc albo za pomocą wyrażenia cron.' },
+      'command-palette': { title: 'Jedno pole do wszystkiego', text: 'Sesje, ustawienia, umiejętności i polecenia są dostępne z palety.' },
+      profiles: { title: 'Profile są odrębne', text: 'Każdy to osobny Hermes — własne klucze, pamięć i sesje.' },
+      'composer-mentions': { title: 'Dołączaj i wydawaj polecenia', text: 'Wpisz @, aby dodać plik do rozmowy, albo /, aby uruchomić polecenie.' },
+      'model-switch': { title: 'Zmieniaj modele w trakcie wątku', text: 'Nazwa modelu jest przyciskiem. Zmień go, gdy zmieni się charakter pracy.' },
+      'right-pane': { title: 'Panel roboczy', text: 'Pliki, terminal, review i wbudowana przeglądarka współdzielą prawą stronę.' }
+    }
+  }
+} satisfies TranslationOverrides
+
+export const plOverrides = mergeLocaleOverrides(
+  plTranslatedOverrides,
+  plMissingOverrides,
+  plCurrentMainOverrides,
+  plRebasedMainOverrides
+)
 
 export const pl = defineLocale(plOverrides)

@@ -71,6 +71,14 @@ gateway:
     usage: "Użycie: /background <prompt>\nPrzykład: /background Podsumuj najważniejsze dzisiejsze wiadomości HN\n\nUruchamia prompt w osobnej sesji. Możesz kontynuować rozmowę — wynik pojawi się tutaj po zakończeniu."
     started: "🔄 Uruchomiono zadanie w tle: \"{preview}\"\nID zadania: {task_id}\nMożesz kontynuować rozmowę — wynik pojawi się po zakończeniu."
 
+  btw:
+    usage: "Użycie: /btw <pytanie>\nPrzykład: /btw w którym pliku wystąpił ten błąd?\n\nOdpowiada na krótkie pytanie poboczne dotyczące tej rozmowy bez przerywania bieżącej pracy. Do niezależnego zadania w tle użyj /bg <prompt>."
+    no_history: "Nie ma jeszcze rozmowy — wyślij pytanie jako zwykłą wiadomość."
+    no_provider: "❌ Nie można odpowiedzieć na pytanie poboczne: nie skonfigurowano danych dostępowych dostawcy."
+    started: "💬 Pytanie poboczne: \"{preview}\"\nOdpowiadam na podstawie migawki tej rozmowy — bieżąca praca trwa dalej."
+    answer: "💬 /btw: \"{preview}\"\n\n{answer}"
+    failed: "❌ /btw nie powiodło się: \"{preview}\"\n{error}"
+
   branch:
     db_unavailable: "Baza danych sesji jest niedostępna."
     no_conversation: "Brak rozmowy, na podstawie której można utworzyć gałąź — najpierw wyślij wiadomość."
@@ -98,6 +106,7 @@ gateway:
     summary_failed: "⚠️ Nie udało się wygenerować podsumowania ({error}). Usunięte wiadomości historyczne: {count}. Zastąpiono je symbolem zastępczym; wcześniejszego kontekstu nie można już odzyskać. Sprawdź konfigurację modelu auxiliary.compression."
     aborted: "⚠️ Przerwano kompresję ({error}). Nie usunięto żadnych wiadomości — rozmowa pozostała bez zmian. Uruchom /compress, aby spróbować ponownie, użyj /reset, aby rozpocząć czystą sesję, albo sprawdź konfigurację modelu auxiliary.compression."
     aux_failed: "ℹ️ Skonfigurowany model kompresji `{model}` zwrócił błąd ({error}). Hermes odzyskał działanie przy użyciu modelu głównego — kontekst pozostał nienaruszony — ale warto sprawdzić `auxiliary.compression.model` w config.yaml."
+    turnhold_deferred: "ℹ️ Odroczono kompresję kontekstu — podsumowanie jest nadal przesyłane strumieniowo. Ta tura będzie kontynuowana bez kompresji."
     failed: "Kompresja nie powiodła się: {error}"
 
   debug:
@@ -166,10 +175,14 @@ gateway:
       crashed: "uległo awarii (wykonawca zakończył działanie); dyspozytor ponowi próbę"
       timed_out: "przekroczyło limit czasu; dyspozytor ponowi próbę"
       blocked: "zostało zablokowane; wymaga uwagi"
+      review_requested: "zostało przekazane do review; implementacja jest ukończona"
+      changes_requested: "otrzymało żądanie zmian w review (BLOCK); implementacja nie została zatwierdzona"
+      block_loop_detected: "zostało przekierowane do wstępnej selekcji po wielokrotnych blokadach; wymaga decyzji"
       status_default: "zmieniło stan"
       status_joiner: ", "
       message: "[kanban] Zadanie {task_id} {status}.\nTytuł: {title}\nWykonawca: @{assignee}\nTablica: {board}\n\nSprawdź wynik lub zdecyduj o kolejnym kroku."
       handoff: "Wynik: {summary}"
+      review_detail: "Uwagi z review: {reason}\nSprawdź istniejącą kartę i jej bieżące uruchomienie review; zwróć pracę do tego samego zadania implementacyjnego. Nie traktuj tego BLOCK jako zatwierdzenia i nie twórz duplikatu zadania."
       guidance: "To jest automatyczne powiadomienie o stanie zadania, a nie prośba o ponowne rozbicie zadania. Przed utworzeniem kolejnych zadań sprawdź bieżącą tablicę; nie twórz ponownie zadań ani grafów, które już istnieją."
 
   personality:
@@ -277,6 +290,8 @@ gateway:
     invalid_number: "Nieprawidłowy numer punktu kontrolnego. Użyj 1-{max}."
     restored: "✅ Przywrócono stan z punktu kontrolnego {hash}: {reason}\nAutomatycznie zapisano migawkę sprzed wycofania zmian."
     kept_user_edits: "↷ Zachowano ręczne zmiany w plikach: {files}\nUżyj /rollback <N> --all, aby przywrócić również je."
+    kept_oversize: "↷ Zachowano (pliki są zbyt duże dla punktów kontrolnych i nie ma zapisanej kopii do przywrócenia): {files}"
+    failed_deletes: "⚠️ Nie udało się usunąć (pozostawiono bez zmian): {files}"
     restore_failed: "❌ {error}"
 
   diff:
