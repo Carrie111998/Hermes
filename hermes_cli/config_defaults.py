@@ -3191,6 +3191,11 @@ DEFAULT_CONFIG = {
         "loop_watchdog_probe_timeout_s": 10.0,
         "loop_watchdog_max_strikes": 3,
 
+        # Seconds allowed for each best-effort synchronous cleanup step after
+        # messaging adapters are down. ``0`` runs cleanup inline without a
+        # deadline; positive values continue shutdown when the deadline expires.
+        "shutdown_cleanup_timeout": 5,
+
         # Whether the gateway keeps writing the legacy sessions.json mirror of
         # its routing index. The primary copy lives in state.db (the
         # gateway_routing table). Default True for backward compatibility with
