@@ -99,6 +99,41 @@ def test_live_codex_native_threshold_applies_on_next_turn(monkeypatch):
     assert session["agent"].codex_responses_compact_threshold == 120_000
 
 
+def test_removing_codex_native_threshold_restores_automatic(monkeypatch):
+    # UNSET semantics (#94724): removing the key must restore the
+    # agent_init default (None = automatic, derived from the local
+    # compression trigger), not stamp a flat 200_000 over it.
+    session, _ = _session_with_compressor()
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"compression": {}},
+    )
+
+    server._sync_agent_compression_with_config("sid-95151", session)
+
+    assert session["agent"].codex_responses_compact_threshold is None
+
+
+def test_invalid_codex_native_threshold_restores_automatic(monkeypatch):
+    # An invalid value must also restore the automatic threshold, matching
+    # agent_init's None-aware fallback for the same key.
+    session, _ = _session_with_compressor()
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "compression": {"codex_responses_compact_threshold": "not-a-number"}
+        },
+    )
+
+    server._sync_agent_compression_with_config("sid-95151", session)
+
+    assert session["agent"].codex_responses_compact_threshold is None
+
+
 def test_unchanged_compression_config_is_noop(monkeypatch):
     session, compressor = _session_with_compressor(threshold_tokens_cap=100_000)
     cfg = {
@@ -280,4 +315,6 @@ def test_removing_codex_native_threshold_restores_default(monkeypatch):
     session, _ = _neutral_session()
     session["agent"].codex_responses_compact_threshold = 120_000
     _sync_with_cfg(monkeypatch, session, {"compression": {}})
-    assert session["agent"].codex_responses_compact_threshold == 200_000
+    # UNSET restores the agent_init default: None = automatic threshold
+    # derived from the local compression trigger (a2af8405d1), not 200_000.
+    assert session["agent"].codex_responses_compact_threshold is None

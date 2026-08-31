@@ -6661,22 +6661,28 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     agent.codex_responses_native_compaction = is_truthy_value(
         compression.get("codex_responses_native", False)
     )
-    native_threshold_raw = compression.get(
-        "codex_responses_compact_threshold", 200_000
-    )
-    try:
-        if isinstance(native_threshold_raw, bool):
-            raise ValueError
-        native_threshold = int(native_threshold_raw)
-        if native_threshold <= 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        logger.warning(
-            "Invalid compression.codex_responses_compact_threshold=%r; "
-            "using 200000.",
-            native_threshold_raw,
-        )
-        native_threshold = 200_000
+    # Mirror agent_init's None-aware semantics (#98426-era a2af8405d1):
+    # an absent or invalid value means "automatic" — the threshold derived
+    # from the local compression trigger in native_compaction — NOT a flat
+    # 200_000 fallback. Stamping a flat 200_000 here would silently override
+    # the automatic threshold (and any model-derived value) on every live
+    # config sync, i.e. every config save on a running desktop session.
+    native_threshold_raw = compression.get("codex_responses_compact_threshold")
+    native_threshold = None
+    if native_threshold_raw is not None:
+        try:
+            if isinstance(native_threshold_raw, (bool, float)):
+                raise ValueError
+            native_threshold = int(native_threshold_raw)
+            if native_threshold <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid compression.codex_responses_compact_threshold=%r; "
+                "using the automatic threshold derived from local compression.",
+                native_threshold_raw,
+            )
+            native_threshold = None
     agent.codex_responses_compact_threshold = native_threshold
 
     # Absence restores the agent_init/config default (0 = disabled).
