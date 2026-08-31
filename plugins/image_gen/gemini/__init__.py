@@ -260,7 +260,8 @@ class GeminiImageGenProvider(ImageGenProvider):
         payload = {
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
-                "responseModalities": ["IMAGE"],
+                "responseModalities": ["TEXT", "IMAGE"],
+                "imageConfig": {"aspectRatio": _ASPECT_RATIOS[aspect]},
                 "imageConfig": {"aspectRatio": _ASPECT_RATIOS[aspect]},
             },
         }
