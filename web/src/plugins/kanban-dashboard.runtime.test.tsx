@@ -6,7 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProfileProvider } from "@/contexts/ProfileProvider";
 import { ProfileContext } from "@/contexts/profile-context";
 
-globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
+  true;
 
 type Task = {
   id: string;
@@ -110,6 +111,7 @@ Object.assign(window, {
 vi.stubGlobal("WebSocket", FakeWebSocket);
 
 // This executes the shipped, hand-authored IIFE and captures its registration.
+// @ts-expect-error TS7016 -- the shipped IIFE intentionally has no TypeScript declarations.
 await import("../../../plugins/kanban/dashboard/dist/index.js");
 
 const defaultTask = task("t_default", "Default task");
