@@ -6,6 +6,7 @@ import type { ContextSuggestion } from '@/app/types'
 import type { HermesConnection } from '@/global'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { activeConnectionScopeSuffix, rescopeConnectionScopedStores } from '@/lib/connection-scoped'
+import { dateRepresentableUnixSeconds, sessionListRecencySeconds } from '@/lib/session-timestamp'
 import { persistBoolean, persistString, readJson, storedBoolean, storedString, writeJson } from '@/lib/storage'
 import { syncCronModelImpactConnection } from '@/store/cron-model-impact-scope'
 import type { SessionInfo, UsageStats } from '@/types/hermes'
@@ -514,7 +515,10 @@ export function mergeSessionPage(
     const prev = prevById.get(identity(session)) ?? prevByLineage.get(lineageIdentity(session))
     // User-send stamps last_active before the DB flushes the user row
     // (last_active = MAX(messages.timestamp)). Keep the fresher of the two.
-    const last_active = Math.max(prev?.last_active ?? 0, session.last_active ?? 0)
+    const last_active = Math.max(
+      dateRepresentableUnixSeconds(prev?.last_active) ?? 0,
+      dateRepresentableUnixSeconds(session.last_active) ?? 0
+    )
     const title = session.title?.trim() ? session.title : prev?.title?.trim() ? prev.title : session.title
     // Carry the owning connection onto a row that arrives untagged. The
     // primary aggregate serves a `local` registry source's rows as plain
@@ -563,7 +567,7 @@ export function mergeSessionPage(
   // rows so a retained session lands where recency puts it instead of the
   // whole set forming a stale block at the top of the sidebar (fixes #47203).
   // Ties keep the survivor first, matching the old prepend behavior.
-  const recency = (session: SessionInfo): number => Math.max(session.last_active || 0, session.started_at || 0)
+  const recency = (session: SessionInfo): number => sessionListRecencySeconds(session)
 
   const sortedSurvivors = [...survivors].sort((a, b) => recency(b) - recency(a))
   const interleaved: SessionInfo[] = []
@@ -611,7 +615,7 @@ export function touchSessionActivity(
         return session
       }
 
-      const last_active = Math.max(session.last_active ?? 0, at)
+      const last_active = Math.max(dateRepresentableUnixSeconds(session.last_active) ?? 0, at)
 
       if (last_active === session.last_active && (!preview || preview === session.preview)) {
         return session
