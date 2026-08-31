@@ -5026,24 +5026,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         convoy on the writer lock instead of opening descriptors — measurably
         slower under a burst, and the alternative is EMFILE, which takes the
         whole process down in a way a restart-on-exit supervisor cannot see.
+
+        A pooled connection whose block raised sqlite3.DatabaseError is closed
+        rather than returned: see the except clause below.
         """
         conn = self._checkout_read_conn()
         if conn is not None:
+            poisoned = False
             try:
                 yield conn
+            except sqlite3.DatabaseError:
+                # The write path already self-heals; the read pool did not.
+                # A connection whose query raised DatabaseError -- "file is
+                # not a database" after the backing file was truncated,
+                # "database disk image is malformed", a repaired/replaced
+                # state.db under a long-lived gateway process -- keeps
+                # failing for every later borrower, and the LifoQueue hands
+                # that same connection straight back to the next checkout.
+                # Discard it instead so the next checkout reopens. The
+                # exception itself is the caller's to handle: re-raised
+                # untouched.
+                poisoned = True
+                raise
             finally:
                 returned = False
-                with self._read_conns_lock:
-                    if not self._read_conns_closed:
-                        try:
-                            self._read_pool.put_nowait(conn)
-                            returned = True
-                        except queue.Full:
-                            pass
+                if not poisoned:
+                    with self._read_conns_lock:
+                        if not self._read_conns_closed:
+                            try:
+                                self._read_pool.put_nowait(conn)
+                                returned = True
+                            except queue.Full:
+                                pass
                 if not returned:
-                    # close() has already drained the pool, so this connection
-                    # is surplus. Close it here — dropping it on the floor is
-                    # what leaked the fd.
+                    # Either the connection is poisoned, or close() has already
+                    # drained the pool and this one is surplus. Close it here —
+                    # dropping it on the floor is what leaked the fd, and
+                    # _close_read_conn is what hands the permit back so the
+                    # discard cannot ratchet the ceiling down.
                     #
                     # queue.Full is now unreachable in practice (permits and
                     # maxsize are both _READ_POOL_MAX, so there can never be a
