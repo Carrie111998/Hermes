@@ -44,7 +44,7 @@ the mixer's output cannot echo back into transcription.
 
 import logging
 import threading
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 import discord
 
@@ -80,6 +80,7 @@ SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_LENGTH_MS // 1000   # 960
 FRAME_SIZE = SAMPLES_PER_FRAME * CHANNELS * SAMPLE_WIDTH    # 3840 bytes
 BYTES_PER_MS = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH // 1000  # 192
 SILENCE_FRAME = b"\x00" * FRAME_SIZE
+STREAMING_BUFFER_FRAME_CAPACITY = 50
 
 
 class MixerChild:
@@ -153,6 +154,117 @@ class MixerChild:
         return samples
 
 
+class StreamingMixerChild:
+    """A bounded, appendable 48 kHz stereo s16le speech source.
+
+    Writers may run on a worker thread while Discord drains frames from its
+    audio sender thread.  The bounded byte buffer applies backpressure without
+    requiring an asyncio primitive, and only a completed stream pads its final
+    partial frame.
+    """
+
+    __slots__ = (
+        "name", "gain", "is_speech", "fade_frames", "_fade_done", "_buffer",
+        "_condition", "_input_finished", "_aborted", "_activated",
+        "_on_first_write",
+    )
+
+    def __init__(
+        self,
+        *,
+        gain: float = 1.0,
+        fade_in_ms: int = 0,
+        on_first_write: Optional[Callable[["StreamingMixerChild"], None]] = None,
+    ):
+        self.name = "streaming-speech"
+        self.gain = float(gain)
+        self.is_speech = True
+        self.fade_frames = max(0, fade_in_ms // FRAME_LENGTH_MS)
+        self._fade_done = 0
+        self._buffer = bytearray()
+        self._condition = threading.Condition()
+        self._input_finished = False
+        self._aborted = False
+        self._activated = False
+        self._on_first_write = on_first_write
+
+    @property
+    def finished(self) -> bool:
+        with self._condition:
+            return (self._input_finished or self._aborted) and not self._buffer
+
+    @property
+    def drained(self) -> bool:
+        return self.finished
+
+    def write(self, pcm: bytes) -> None:
+        """Append PCM, blocking while the fixed frame buffer is full."""
+        if not pcm:
+            return
+
+        pcm_view = memoryview(pcm)
+        offset = 0
+        capacity = STREAMING_BUFFER_FRAME_CAPACITY * FRAME_SIZE
+        while offset < len(pcm_view):
+            activate = False
+            with self._condition:
+                while len(self._buffer) >= capacity:
+                    if self._input_finished or self._aborted:
+                        return
+                    self._condition.wait()
+                if self._input_finished or self._aborted:
+                    return
+
+                size = min(capacity - len(self._buffer), len(pcm_view) - offset)
+                self._buffer.extend(pcm_view[offset:offset + size])
+                offset += size
+                if not self._activated:
+                    self._activated = True
+                    activate = True
+
+            if activate and self._on_first_write is not None:
+                self._on_first_write(self)
+
+    def finish(self) -> None:
+        """Mark input complete so a final partial frame may be zero-padded."""
+        with self._condition:
+            self._input_finished = True
+            self._condition.notify_all()
+
+    def abort(self) -> None:
+        """Drop queued audio and wake all blocked writers."""
+        with self._condition:
+            self._aborted = True
+            self._buffer.clear()
+            self._condition.notify_all()
+
+    def read_frame(self) -> "Optional[np.ndarray]":
+        """Return the next complete frame, or None while awaiting more input."""
+        with self._condition:
+            if self._aborted:
+                return None
+            if len(self._buffer) >= FRAME_SIZE:
+                chunk = bytes(self._buffer[:FRAME_SIZE])
+                del self._buffer[:FRAME_SIZE]
+            elif self._input_finished and self._buffer:
+                chunk = bytes(self._buffer)
+                self._buffer.clear()
+                chunk += b"\x00" * (FRAME_SIZE - len(chunk))
+            else:
+                return None
+            self._condition.notify_all()
+
+        np = _require_numpy()
+        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+        gain = self.gain
+        if self.fade_frames and self._fade_done < self.fade_frames:
+            self._fade_done += 1
+            gain *= self._fade_done / self.fade_frames
+        if gain != 1.0:
+            samples = samples * gain
+        return samples
+
+
 class VoiceMixer(discord.AudioSource):
     """A continuous ``discord.AudioSource`` that mixes N child streams.
 
@@ -176,7 +288,8 @@ class VoiceMixer(discord.AudioSource):
     ):
         self._lock = threading.Lock()
         self._ambient: Optional[MixerChild] = None
-        self._speech: List[MixerChild] = []
+        self._speech: List[MixerChild | StreamingMixerChild] = []
+        self._streaming_speech: List[StreamingMixerChild] = []
         self._ambient_gain = float(ambient_gain)
         self._duck_gain = float(duck_gain)
         self._speech_gain = float(speech_gain)
@@ -230,6 +343,35 @@ class VoiceMixer(discord.AudioSource):
             if self._ambient is not None:
                 self._ambient.gain = self._duck_gain
 
+    def begin_streaming_speech(
+        self, *, gain: Optional[float] = None, fade_in_ms: int = 40
+    ) -> StreamingMixerChild:
+        """Create an appendable speech child that activates on its first write."""
+        child = StreamingMixerChild(
+            gain=self._speech_gain if gain is None else float(gain),
+            fade_in_ms=fade_in_ms,
+            on_first_write=self._start_streaming_speech,
+        )
+        with self._lock:
+            if self._closed:
+                child.abort()
+            else:
+                self._streaming_speech.append(child)
+        return child
+
+    def _start_streaming_speech(self, child: StreamingMixerChild) -> None:
+        with self._lock:
+            if self._closed:
+                child.abort()
+                return
+            if child.finished:
+                return
+            self._speech.append(child)
+            self._speech_active = True
+            self._duck_release_left = 0
+            if self._ambient is not None:
+                self._ambient.gain = self._duck_gain
+
     @property
     def speech_active(self) -> bool:
         with self._lock:
@@ -238,8 +380,19 @@ class VoiceMixer(discord.AudioSource):
     def stop_speech(self) -> None:
         """Drop any in-flight speech immediately and release the duck."""
         with self._lock:
+            for child in self._streaming_speech:
+                child.abort()
+            self._streaming_speech.clear()
             self._speech.clear()
             self._begin_duck_release_locked()
+
+    def _discard_finished_streaming_child_locked(
+        self, child: StreamingMixerChild
+    ) -> None:
+        try:
+            self._streaming_speech.remove(child)
+        except ValueError:
+            pass
 
     def _begin_duck_release_locked(self) -> None:
         self._speech_active = False
@@ -265,10 +418,14 @@ class VoiceMixer(discord.AudioSource):
 
             # Speech children (drop exhausted ones; release duck when last ends)
             if self._speech:
-                still_live: List[MixerChild] = []
+                still_live: List[MixerChild | StreamingMixerChild] = []
                 for child in self._speech:
                     frame = child.read_frame()
                     if frame is None:
+                        if not child.finished:
+                            still_live.append(child)
+                        elif isinstance(child, StreamingMixerChild):
+                            self._discard_finished_streaming_child_locked(child)
                         continue
                     acc = frame if acc is None else acc + frame
                     still_live.append(child)
@@ -301,6 +458,9 @@ class VoiceMixer(discord.AudioSource):
         with self._lock:
             self._closed = True
             self._ambient = None
+            for child in self._streaming_speech:
+                child.abort()
+            self._streaming_speech.clear()
             self._speech.clear()
 
 

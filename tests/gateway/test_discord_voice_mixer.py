@@ -9,6 +9,7 @@ integration (install on join, play routing, ack) is tested with the standard
 
 import os
 import sys
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -50,6 +51,58 @@ class TestVoiceMixerCore:
     def test_is_opus_false(self):
         # discord.py sends raw PCM when is_opus() is False.
         assert vm.VoiceMixer().is_opus() is False
+
+    def test_streaming_child_reads_fifo_and_drains_after_final_padding(self):
+        mixer = vm.VoiceMixer()
+        child = mixer.begin_streaming_speech(fade_in_ms=0)
+        first = b"\x01\x00" * (vm.FRAME_SIZE // 2)
+        second = b"\x02\x00" * (vm.FRAME_SIZE // 2)
+        partial = b"\x03\x00" * 10
+
+        child.write(first + second + partial)
+        child.finish()
+
+        np.testing.assert_array_equal(
+            child.read_frame(), np.frombuffer(first, dtype=np.int16).astype(np.float32)
+        )
+        np.testing.assert_array_equal(
+            child.read_frame(), np.frombuffer(second, dtype=np.int16).astype(np.float32)
+        )
+        np.testing.assert_array_equal(
+            child.read_frame(),
+            np.frombuffer(
+                partial + b"\x00" * (vm.FRAME_SIZE - len(partial)), dtype=np.int16
+            ).astype(np.float32),
+        )
+        assert child.drained is True
+        assert child.read_frame() is None
+
+    def test_streaming_child_abort_wakes_writer_blocked_at_capacity(self):
+        mixer = vm.VoiceMixer()
+        child = mixer.begin_streaming_speech(fade_in_ms=0)
+        child.write(b"\x01\x00" * (
+            vm.STREAMING_BUFFER_FRAME_CAPACITY * vm.FRAME_SIZE // 2
+        ))
+        started = threading.Event()
+        completed = threading.Event()
+
+        def write_one_more_frame():
+            started.set()
+            child.write(b"\x02\x00" * (vm.FRAME_SIZE // 2))
+            completed.set()
+
+        writer = threading.Thread(target=write_one_more_frame)
+        writer.start()
+        assert started.wait(timeout=1)
+        assert not completed.wait(timeout=0.1)
+
+        child.abort()
+
+        writer.join(timeout=1)
+        assert not writer.is_alive()
+        assert completed.is_set()
+        assert child.read_frame() is None
+        assert child.drained is True
 
     def test_ambient_loops_and_is_quiet(self):
         mx = vm.VoiceMixer(ambient_gain=0.2)
