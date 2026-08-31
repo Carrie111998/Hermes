@@ -55,6 +55,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -911,8 +912,12 @@ class CheckpointManager:
 
         abs_dir = str(_normalize_path(working_dir))
 
-        # Skip root, home, and other overly broad directories
-        if abs_dir in {"/", str(Path.home())}:
+        # Skip root, home, and the shared system temp directory.
+        if abs_dir in {
+            "/",
+            str(Path.home()),
+            str(Path(tempfile.gettempdir()).resolve()),
+        }:
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             return False
 
