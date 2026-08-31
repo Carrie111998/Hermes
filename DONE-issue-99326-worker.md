@@ -3,6 +3,7 @@
 goal_completed: true
 issue: https://github.com/NousResearch/hermes-agent/issues/99326
 implementation_commit: b575582f4c64fc30396ab8e4fb490271b1aa9fa2
+verifier_repair_commit: 45f431275c985c6a8cd3a59e8ad510faf12202ed
 
 ## Files
 
@@ -26,6 +27,10 @@ negative_control=RED_CONFIRMED
 ```
 
 The Desktop bundle baseline lacked all three current-reason markers; the candidate contained all three.
+
+Independent verifier RED: initial blocked creation lost its status and reason on
+the first `recompute_ready` / CLI `list` because creation emitted no sticky
+`blocked` event. Two regressions reproduced `blocked -> ready` before repair.
 
 ## GREEN
 
@@ -58,6 +63,9 @@ Candidate control proved:
 - Codex run 118 produced the patch but exhausted 150/150 iterations before tests/commit/report.
 - Another default-profile session stopped the dispatcher during run 116, causing cross-session interference.
 - The current reason must be persisted in `tasks`; event/run history alone is not an authoritative current-state surface.
+- The independent verifier found that initial blocked creation also needs the
+  canonical `blocked` event so `_has_sticky_block()` survives list/dispatcher
+  recomputation. Commit `45f431275` repaired it with red-first DB and process-level CLI tests.
 - SQLite enforcement triggers require rollback to drop the three triggers before reverting to old code.
 
 ## UNTOUCHED
