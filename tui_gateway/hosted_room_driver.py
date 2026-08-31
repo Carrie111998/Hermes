@@ -1022,6 +1022,17 @@ class HostedRoomRuntime:
                 # still ambiguous. Never terminalize it as a proven failure.
                 submit_attempted = True
 
+                bind_artifact_scope = getattr(transport, "bind_artifact_scope", None)
+                if callable(bind_artifact_scope):
+                    bind_artifact_scope(
+                        task=attempt.identity,
+                        execution_generation=attempt.execution_generation,
+                        member_id=str(task["payload"].get("target_member_id") or profile),
+                        authority_gateway_id=binding.gateway_id,
+                        authority_epoch=binding.authority_epoch,
+                        profile=profile,
+                    )
+
                 def on_terminal(receipt: Mapping[str, Any]) -> None:
                     status = receipt.get("status")
                     if status == "cancelled":
@@ -1744,6 +1755,12 @@ def _bounded_terminal_result(receipt: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "message_id": receipt.get("message_id"),
         "text": text,
+        **(
+            {"artifacts": receipt.get("artifacts")}
+            if receipt.get("artifacts")
+            else {}
+        ),
+        **({"run_id": receipt.get("run_id")} if receipt.get("run_id") else {}),
         **({"error": error} if error else {}),
         **({"truncated": True} if truncated or error_truncated else {}),
     }
@@ -1775,6 +1792,8 @@ def _find_terminal_receipt(
                 {
                     "message_id": receipt_id,
                     "text": message.get("content", ""),
+                    "artifacts": message.get("artifacts"),
+                    "run_id": message.get("run_id"),
                 }
             ),
         )

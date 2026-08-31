@@ -474,6 +474,180 @@ def test_attachment_manifest_never_follows_redirect_or_forwards_grant(
         thread.join(timeout=5)
 
 
+def test_artifact_download_rejects_redirect():
+    class RedirectPeer(BaseHTTPRequestHandler):
+        redirected_grants = []
+
+        def do_GET(self):
+            if self.path == "/sink":
+                type(self).redirected_grants.append(
+                    self.headers.get("Authorization")
+                )
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"private bytes")
+                return
+            self.send_response(302)
+            self.send_header("Location", "/sink")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), RedirectPeer)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = PeerRunsHTTPClient(
+            base_url=f"http://127.0.0.1:{server.server_port}",
+            api_key="",
+        )
+        with pytest.raises(PeerRunsHTTPError, match="refused an HTTP redirect"):
+            client.read_artifact(
+                run_id="run-1",
+                artifact_id="rart_0123456789abcdef0123456789abcdef",
+                grant="scoped.room.grant",
+            )
+        assert RedirectPeer.redirected_grants == []
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [(b"", "artifact bytes are invalid"), (b"x" * 15_000_001, "size limit")],
+    ids=["empty", "oversized"],
+)
+def test_artifact_download_rejects_empty_or_oversized_body(
+    monkeypatch, body, error
+):
+    from tui_gateway import hosted_room_peer_http
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    monkeypatch.setattr(
+        hosted_room_peer_http,
+        "_open_roomlink_url",
+        lambda _request, *, timeout, reject_redirects: Response(body),
+    )
+    client = PeerRunsHTTPClient(
+        base_url="https://peer.example.test",
+        api_key="",
+    )
+
+    with pytest.raises(PeerRunsHTTPError, match=error):
+        client.read_artifact(
+            run_id="run-1",
+            artifact_id="rart_0123456789abcdef0123456789abcdef",
+            grant="scoped.room.grant",
+        )
+
+
+def test_artifact_download_bounds_peer_error_body(monkeypatch):
+    from tui_gateway import hosted_room_peer_http
+
+    body = io.BytesIO(b"x" * (hosted_room_peer_http.MAX_PEER_ERROR_RESPONSE_BYTES + 1))
+    error = urllib.error.HTTPError(
+        "https://peer.example.test/v1/runs/run-1/artifacts/a",
+        500,
+        "Internal Server Error",
+        {},
+        body,
+    )
+
+    def reject(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(hosted_room_peer_http, "_open_roomlink_url", reject)
+    client = PeerRunsHTTPClient(
+        base_url="https://peer.example.test",
+        api_key="",
+    )
+
+    with pytest.raises(PeerRunsHTTPError, match="error exceeded.*size limit"):
+        client.read_artifact(
+            run_id="run-1",
+            artifact_id="rart_0123456789abcdef0123456789abcdef",
+            grant="scoped.room.grant",
+        )
+    assert body.tell() == hosted_room_peer_http.MAX_PEER_ERROR_RESPONSE_BYTES + 1
+
+
+def test_artifact_ack_sends_exact_manifest_and_message_commitment():
+    client = PeerRunsHTTPClient(
+        base_url="https://peer.example.test",
+        api_key="",
+    )
+    captured = {}
+
+    def request(path, **kwargs):
+        captured["path"] = path
+        captured.update(kwargs)
+        return {"acknowledged": True, "changed": 1}
+
+    client._request = request
+    result = client.acknowledge_artifacts(
+        run_id="run-1",
+        artifact_ids=(
+            "rart_0123456789abcdef0123456789abcdef",
+            "rart_fedcba9876543210fedcba9876543210",
+        ),
+        manifest_digest="a" * 64,
+        message_event_id="dmessage:commitment",
+        grant="scoped.room.grant",
+    )
+
+    assert result == {"acknowledged": True, "changed": 1}
+    assert captured == {
+        "path": "/v1/runs/run-1/artifacts/ack",
+        "method": "POST",
+        "body": {
+            "artifact_ids": [
+                "rart_0123456789abcdef0123456789abcdef",
+                "rart_fedcba9876543210fedcba9876543210",
+            ],
+            "manifest_digest": "a" * 64,
+            "message_event_id": "dmessage:commitment",
+        },
+        "room_grant": "scoped.room.grant",
+        "reject_redirects": True,
+    }
+
+
+def test_artifact_discard_sends_exact_run_scoped_retirement():
+    client = PeerRunsHTTPClient(
+        base_url="https://peer.example.test",
+        api_key="",
+    )
+    captured = {}
+
+    def request(path, **kwargs):
+        captured["path"] = path
+        captured.update(kwargs)
+        return {"discarded": True, "removed": 1}
+
+    client._request = request
+    result = client.discard_artifacts(
+        run_id="run-1",
+        grant="scoped.room.grant",
+    )
+
+    assert result == {"discarded": True, "removed": 1}
+    assert captured == {
+        "path": "/v1/runs/run-1/artifacts/discard",
+        "method": "POST",
+        "body": {"reason": "verification_failed"},
+        "room_grant": "scoped.room.grant",
+        "reject_redirects": True,
+    }
+
+
 def test_attachment_staging_rejects_broad_fallback_and_corrupt_payload(peer_server):
     from gateway.hosted_room_peer import attachment_manifest_digest
 
