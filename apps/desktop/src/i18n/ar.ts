@@ -1891,6 +1891,17 @@ export const ar = defineLocale({
     queueDelete: 'حذف من الطابور',
     queueStuckTitle: 'لم تُرسل الرسالة في قائمة الانتظار',
     queueStuckBody: 'ظل دور في قائمة الانتظار يفشل في الإرسال. ما زال في قائمة الانتظار — حاول إرساله مرة أخرى.',
+    queueStuckBodyIn: title => `ظل دور في قائمة انتظار «${title}» يفشل في الإرسال. ما زال في قائمة الانتظار.`,
+    queueStuckAction: 'أرسله مرة أخرى',
+    queueLostTitle: 'رسائل في انتظار محادثة لم تعد موجودة',
+    queueLostBody: count =>
+      count === 1
+        ? 'رسالة واحدة تنتظر في محادثة لم تعد موجودة، فلن تُرسل أبداً. هل تستعيدها إلى حقل الكتابة؟'
+        : `${count} رسائل تنتظر في محادثة لم تعد موجودة، فلن تُرسل أبداً. هل تستعيدها إلى حقل الكتابة؟`,
+    queueLostAction: 'استعِد النص',
+    queueRecovered: count =>
+      count === 1 ? 'استُعيدت الرسالة إلى حقل الكتابة.' : `استُعيدت ${count} رسائل إلى حقل الكتابة.`,
+    queueRecoveredNothing: 'لم يبق شيء لاستعادته.',
     previewUnavailable: 'المعاينة غير متاحة',
     previewLabel: label => `معاينة ${label}`,
     couldNotPreview: label => `تعذرت معاينة ${label}`,
@@ -2251,6 +2262,50 @@ export const ar = defineLocale({
       messagingPlatforms: 'منصات المراسلة'
     },
     statusbar: {
+      accountUsagePanel: {
+        empty: 'لا توجد اشتراكات مربوطة',
+        loading: 'جارٍ فحص الخطط…',
+        refresh: 'تحديث',
+        resetsAt: when => `يتصفّر ${when}`,
+        states: {
+          network_error: 'تعذّر الوصول إلى المزوّد',
+          no_usage_endpoint: 'لا توجد بيانات خطة لهذا المزوّد',
+          not_authenticated: 'غير مسجّل الدخول',
+          ok: '',
+          parse_error: 'استجابة غير متوقّعة من المزوّد',
+          rate_limited: 'تجاوزت حد المعدّل — أعد المحاولة بعد قليل',
+          unauthorized: 'انتهت صلاحية تسجيل الدخول'
+        },
+        title: 'استهلاك الخطط',
+        windows: {
+          '5h': 'نافذة 5 ساعات',
+          '7d': 'النافذة الأسبوعية',
+          credits: 'الرصيد',
+          key_limit: 'حد مفتاح الـAPI',
+          period: 'دورة الفوترة'
+        }
+      },
+      accountUsage: 'الخطط',
+      toggleAccountUsage: 'إظهار استهلاك الخطط',
+      contextUsagePanel: {
+        categories: {
+          conversation: 'المحادثة',
+          files: 'الملفات',
+          mcp: 'MCP',
+          memory: 'الذاكرة',
+          rules: 'القواعد',
+          skills: 'المهارات',
+          subagent_definitions: 'تعريفات الوكلاء الفرعيين',
+          system_prompt: 'موجه النظام',
+          tool_definitions: 'تعريفات الأدوات'
+        },
+        categoryCount: count => (count === 1 ? 'ملف واحد' : count === 2 ? 'ملفان' : `${count} ملفات`),
+        empty: 'لا توجد بيانات سياق بعد',
+        loading: 'جارٍ تحميل التفصيل…',
+        percentFull: percent => `ممتلئ ${percent}٪`,
+        title: 'استهلاك السياق',
+        tokenSummary: (used, max) => `${used} / ${max} توكن`
+      },
       unknown: 'غير معروف',
       restart: 'إعادة تشغيل',
       update: 'تحديث',
@@ -2265,6 +2320,8 @@ export const ar = defineLocale({
       closeCommandCenter: 'إغلاق مركز الأوامر',
       openCommandCenter: 'فتح مركز الأوامر',
       showTerminal: 'إظهار الطرفية',
+      showBrowser: 'فتح المتصفح',
+      toggleBrowser: 'المتصفح',
       hideTerminal: 'إخفاء الطرفية',
       gateway: 'البوابة',
       gatewayReady: 'البوابة جاهزة',

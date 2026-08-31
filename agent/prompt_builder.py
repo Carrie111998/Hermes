@@ -7,6 +7,7 @@ assemble pieces, then combines them with memory and ephemeral prompts.
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import contextvars
@@ -902,6 +903,14 @@ PLATFORM_HINTS = {
         "You are chatting inside the Hermes desktop app, a graphical chat "
         "surface. Markdown renders with full GitHub flavor (tables, "
         "syntax-highlighted code, math via $...$, task lists, callouts). "
+        "Fences are routed, not all plain code: ```mermaid ALWAYS draws in "
+        "place (theme-aware, zoomable, copyable as PNG) — reach for it "
+        "whenever a flow, architecture, sequence, state machine, timeline or "
+        "relationship lands better drawn than described; a small ```svg "
+        "renders as sanitised inline SVG; a large graphic, a ```html "
+        "document, and any fence past ~48 lines promote to an artifact card "
+        "in the right rail, so a long file never drowns the chat and you "
+        "should not truncate it for fear that it will. "
         "Deliver files by writing MEDIA:/absolute/path/to/file — any file "
         "type: images/audio/video render inline, everything else becomes a "
         "card with Download and preview buttons. Remote image URLs render "
@@ -1513,7 +1522,16 @@ _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 # v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
 # org-shared skills; older snapshots are discarded and rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 2
+# 3: index entries carry `tags`, so v2 snapshots (which have none) must be
+# discarded rather than silently rendering tagless lines forever.
+# 4: descriptions are stored ALREADY TRUNCATED, so a change to where
+# extract_skill_description cuts does not reach a machine holding a v3
+# snapshot — the manifest validates SKILL.md mtime/size, and those files did
+# not change, only our code did. Any edit to the truncation rule needs a bump
+# here or it silently ships to nobody.
+# 5: entries carry `environments`, so the snapshot path can re-apply the
+# gate the cold path applies at parse time.
+_SKILLS_SNAPSHOT_VERSION = 5
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1613,6 +1631,77 @@ def _write_skills_snapshot(
         logger.debug("Could not write skills prompt snapshot: %s", e)
 
 
+# How many novel tags one index line may carry. The index ships in the cached
+# system prefix, so the cost is a one-time cache write — but it is still real,
+# and tags past the third are consistently the generic ones ("automation",
+# "productivity") that match everything and therefore discriminate nothing.
+# Measured on a 112-skill install: cap 2 = +544 tok, cap 3 = +751, cap 6 =
+# +1073 against a 2,670-token index.
+_MAX_INDEX_TAGS = 3
+
+# Unicode-aware on purpose. `[a-z0-9]+` matched nothing in an Arabic or
+# Chinese tag, so `words` came back empty and the tag was dropped as
+# "contributing nothing" — silently making non-Latin tags unreachable,
+# which is exactly the vocabulary a non-English user types.
+_TAG_WORD_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def _skill_tags(frontmatter: dict) -> list:
+    """The skill's ``metadata.hermes.tags``, normalised to clean strings."""
+    try:
+        tags = ((frontmatter.get("metadata") or {}).get("hermes") or {}).get("tags")
+    except AttributeError:
+        return []
+    if isinstance(tags, str):
+        tags = [tags]
+    if not isinstance(tags, (list, tuple)):
+        return []
+    return [str(tag).strip() for tag in tags if str(tag).strip()]
+
+
+def _index_description(description: str, tags) -> str:
+    """One index line's text: the description plus the tags it does NOT say.
+
+    The index line is the only thing the model sees before deciding whether to
+    load a skill, so the line IS the trigger. Descriptions here are one short
+    sentence (measured: median 56 characters, none over 62), which leaves no
+    room for the user's own vocabulary — someone asks about "AirTag" or
+    "todo" and the line says "Find My devices" or "reminders".
+
+    Every SKILL.md already carries that vocabulary in ``metadata.hermes.tags``
+    and it has never reached the prompt. Tags whose words the description
+    already contains are dropped — repeating them buys nothing and costs
+    tokens on every session — so only genuinely new terms are appended.
+    """
+    if not tags:
+        return description
+
+    said = set(_TAG_WORD_RE.findall(str(description).casefold()))
+    novel = []
+    for tag in tags:
+        # str(): a snapshot is JSON on disk and is not guaranteed to have come
+        # from this build. One int in one cached tag list would otherwise raise
+        # inside the org-labeling loop, which has no per-entry guard — killing
+        # the whole skills prompt, not one line of it.
+        tag = str(tag)
+        # casefold, not lower: it folds ß/İ and the Unicode cases lower() misses.
+        words = set(_TAG_WORD_RE.findall(tag.casefold()))
+        if words and not words <= said:
+            novel.append(tag)
+            # The unit is the WORD, not the tag string: a later tag survives
+            # only if it still introduces something new after this one's words
+            # are absorbed, so ["cms", "CMS"] yields one term while
+            # ["cms", "cms plugin"] yields two — the second carries "plugin".
+            said |= words
+        if len(novel) >= _MAX_INDEX_TAGS:
+            break
+
+    if not novel:
+        return description
+
+    return f"{description} [{', '.join(novel)}]" if description else f"[{', '.join(novel)}]"
+
+
 def _build_snapshot_entry(
     skill_file: Path,
     skills_dir: Path,
@@ -1649,6 +1738,13 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "tags": _skill_tags(frontmatter),
+        # Carried so the snapshot path can re-apply the environment gate.
+        # `_parse_skill_file` applies it on the COLD path only, so an entry
+        # written while kanban was active outlived the environment that
+        # justified it — the index gained a line on snapshot-backed builds
+        # and lost it on cold ones, rewriting the cached system prefix.
+        "environments": frontmatter.get("environments") or [],
     }
     if org_id:
         entry["org_id"] = org_id
@@ -1873,6 +1969,13 @@ def _build_skills_system_prompt_inner(
             platforms = entry.get("platforms") or []
             if not skill_matches_platform_list(platforms):
                 continue
+            # The environment gate is evaluated at PARSE time on the cold path,
+            # so without re-applying it here an entry written while kanban was
+            # active outlives the environment that justified it. The index then
+            # gains a line on snapshot-backed builds and loses it on cold ones,
+            # which rewrites the cached system prefix instead of hitting it.
+            if not skill_matches_environment({"environments": entry.get("environments")}):
+                continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
             if not _skill_should_show(
@@ -1939,7 +2042,10 @@ def _build_skills_system_prompt_inner(
                         continue
                     project_names.add(fm_name)
                     skills_by_category.setdefault(entry["category"], []).append(
-                        (fm_name, f"[project] {entry['description']}".strip())
+                        (
+                            fm_name,
+                            f"[project] {_index_description(entry['description'], entry.get('tags'))}".strip(),
+                        )
                     )
                 except Exception as e:
                     logger.debug("Error reading project skill %s: %s", skill_file, e)
@@ -1969,7 +2075,7 @@ def _build_skills_system_prompt_inner(
         name_owners.setdefault(fm, set()).add(kind)
     for entry in visible_entries:
         fm = entry.get("frontmatter_name") or entry.get("skill_name") or ""
-        desc = entry.get("description", "")
+        desc = _index_description(entry.get("description", ""), entry.get("tags"))
         org_id = entry.get("org_id")
         collided = len(name_owners.get(fm, set())) > 1
         if org_id:
@@ -2039,7 +2145,7 @@ def _build_skills_system_prompt_inner(
                     continue
                 seen_skill_names.add(frontmatter_name)
                 skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
+                    (frontmatter_name, _index_description(entry["description"], entry.get("tags")))
                 )
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)

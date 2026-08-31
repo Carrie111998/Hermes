@@ -7,12 +7,21 @@ import os
 import sys
 
 import pytest
+from unittest.mock import patch
+
+from agent.skill_utils import (
+    SKILL_PROMPT_DESC_LIMIT as _DESC_LIMIT,
+    extract_skill_description as _extract_desc,
+)
 
 from agent.prompt_builder import (
     _scan_context_content,
     _truncate_content,
     _parse_skill_file,
     _skill_should_show,
+    _index_description,
+    _skill_tags,
+    _MAX_INDEX_TAGS,
     _find_hermes_md,
     _find_git_root,
     _strip_yaml_frontmatter,
@@ -1020,3 +1029,247 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 
 
+
+
+class TestIndexTriggerTags:
+    """`metadata.hermes.tags` reaching the index line.
+
+    The line is the only thing the model sees before deciding to load a skill,
+    and descriptions here are one short sentence (median 56 chars). Every
+    SKILL.md already carries the user's vocabulary in tags; before this it
+    never reached the prompt.
+    """
+
+    def test_appends_only_tags_the_description_does_not_already_say(self):
+        line = _index_description(
+            "Find My devices and people.",
+            ["find my", "AirTag", "devices", "location"],
+        )
+
+        assert "AirTag" in line and "location" in line
+        # "devices" and "find my" are already in the sentence — repeating them
+        # buys no recall and costs tokens on every session.
+        assert "devices]" not in line and "find my" not in line
+
+    def test_caps_the_tag_list(self):
+        line = _index_description("Do things.", [f"tag{n}" for n in range(10)])
+
+        assert line.count(",") == _MAX_INDEX_TAGS - 1
+        assert "tag3" not in line
+
+    def test_a_tag_that_adds_no_new_word_is_dropped_but_partial_overlap_is_kept(self):
+        """The unit is the WORD, not the tag string.
+
+        A tag survives when it introduces at least one term the line does not
+        already carry. Dropping it on any overlap would throw away real
+        vocabulary: "word press" still contributes "press".
+        """
+        line = _index_description("Blogging.", ["cms", "CMS", "word press"])
+
+        # "CMS" repeats "cms" exactly — nothing new, so it goes entirely.
+        assert "CMS" not in line
+        assert line.count("cms") == 1
+        # "word press" overlaps nothing yet and stays whole.
+        assert "word press" in line
+        # And overlap alone does not disqualify: "plugin" is still new.
+        assert "cms plugin" in _index_description("Blogging.", ["cms", "cms plugin"])
+
+    def test_untagged_and_malformed_frontmatter_leave_the_line_alone(self):
+        assert _index_description("Plain.", None) == "Plain."
+        assert _index_description("Plain.", []) == "Plain."
+        assert _index_description("Plain.", ["", "   "]) == "Plain."
+        # A single string instead of a list, and a non-list — neither may raise.
+        assert _skill_tags({"metadata": {"hermes": {"tags": "solo"}}}) == ["solo"]
+        assert _skill_tags({"metadata": {"hermes": {"tags": {"a": 1}}}}) == []
+        assert _skill_tags({"metadata": None}) == []
+        assert _skill_tags({}) == []
+
+    def test_tags_reach_the_rendered_index(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "tools" / "finder"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: finder\ndescription: Locate hardware.\n"
+            "metadata:\n  hermes:\n    tags: [AirTag, hardware, GPS]\n---\n"
+        )
+
+        result = build_skills_system_prompt()
+
+        assert "AirTag" in result and "GPS" in result
+        assert "hardware," not in result  # already in the description
+
+    def test_non_latin_tags_reach_the_index(self):
+        """The vocabulary a non-English user types must survive the filter.
+
+        An ASCII-only word regex found nothing inside an Arabic or Chinese tag,
+        so the tag looked like it contributed no new words and was dropped —
+        making every non-Latin tag in the library unreachable.
+        """
+        arabic = _index_description("وثائق", ["عربي", "ترجمة", "وثائق"])
+        assert "عربي" in arabic and "ترجمة" in arabic
+        # ...and dedup still works in that script: the description says it.
+        assert arabic.count("وثائق") == 1
+
+        assert "中文" in _index_description("文档", ["中文", "翻译"])
+
+    def test_a_non_string_tag_cannot_kill_the_whole_index(self):
+        """Snapshots are JSON on disk and need not come from this build.
+
+        The org-labeling loop that renders these lines has no per-entry guard,
+        so one bad cached tag would take out the entire skills prompt rather
+        than one line of it.
+        """
+        assert "123" in _index_description("desc", [123, "ok"])
+
+    def test_a_demoted_category_stays_names_only(self, monkeypatch, tmp_path):
+        """Demotion exists to reclaim tokens; tags must not sneak back in."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "social-media" / "poster"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: poster\ndescription: Post things.\n"
+            "metadata:\n  hermes:\n    tags: [instagram, reels]\n---\n"
+        )
+
+        compact = build_skills_system_prompt(
+            compact_categories=frozenset({"social-media"})
+        )
+
+        assert "poster" in compact
+        assert "instagram" not in compact and "Post things" not in compact
+
+
+class TestDescriptionTruncationBoundary:
+    """WHERE a long description is cut decides how much routing signal lives.
+
+    A hard slice at 57 chars spent the budget on fragments — real skills on a
+    live install rendered as "... Scan...", "... Measu...", and worst of all
+    "Create and review Cloudflare Durable Objects. Use when bu...", cutting off
+    the "use when" clause that is the entire point of the line.
+    """
+
+    def test_prefers_a_complete_sentence_and_drops_the_ellipsis(self):
+        out = _extract_desc(
+            {"description": "Create and review Cloudflare Durable Objects. Use when building apps."}
+        )
+
+        assert out == "Create and review Cloudflare Durable Objects."
+        # A complete first sentence is a real summary, not a cut-off thought.
+        assert not out.endswith("...")
+
+    def test_falls_back_to_a_word_boundary(self):
+        out = _extract_desc(
+            {"description": "Send and receive transactional emails with Cloudflare Email Service."}
+        )
+
+        assert out == "Send and receive transactional emails with Cloudflare..."
+        assert "Cloudflare Ema..." not in out
+
+    def test_slices_mid_word_only_when_there_is_no_boundary(self):
+        out = _extract_desc({"description": "A" * 100})
+
+        assert len(out) <= _DESC_LIMIT
+        assert out.endswith("...")
+
+    def test_an_early_abbreviation_is_not_mistaken_for_a_sentence(self):
+        out = _extract_desc(
+            {"description": "Use e.g. this skill for a long description that runs past the limit."}
+        )
+
+        assert not out.startswith("Use e.g.") or len(out) > 20
+
+    def test_nothing_can_exceed_the_budget(self):
+        """The cap is a token budget in every session — it must hold."""
+        for desc in ("x" * 61, "x" * 60, "Word " * 40, "a. " * 40, "no-spaces-" * 12):
+            assert len(_extract_desc({"description": desc})) <= _DESC_LIMIT, desc
+
+    def test_short_descriptions_are_untouched(self):
+        assert _extract_desc({"description": "Short one."}) == "Short one."
+        assert _extract_desc({"description": ""}) == ""
+        assert _extract_desc({}) == ""
+
+
+def test_a_snapshot_from_an_older_build_cannot_serve_stale_truncations(
+    monkeypatch, tmp_path
+):
+    """Descriptions are cached POST-truncation.
+
+    The disk snapshot is validated against SKILL.md mtime/size, so changing
+    where `extract_skill_description` cuts does not invalidate it — the files
+    did not change, only our code did. Without a version bump the improvement
+    ships to nobody holding a snapshot.
+    """
+    import json
+
+    from agent.prompt_builder import (
+        _SKILLS_PROMPT_CACHE,
+        _SKILLS_SNAPSHOT_VERSION,
+        build_skills_system_prompt,
+        clear_skills_system_prompt_cache,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    d = tmp_path / "skills" / "tools" / "objects"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        "---\nname: objects\ndescription: Create and review Durable Objects. "
+        "Use when building stateful apps.\n---\n"
+    )
+
+    clear_skills_system_prompt_cache(clear_snapshot=True)
+    assert "Use when bu..." not in build_skills_system_prompt()
+
+    snap = tmp_path / ".skills_prompt_snapshot.json"
+    payload = json.loads(snap.read_text())
+    entries = payload.get("skills") or payload.get("entries") or []
+    rows = entries if isinstance(entries, list) else list(entries.values())
+    for row in rows:
+        if isinstance(row, dict) and row.get("frontmatter_name") == "objects":
+            row["description"] = "Create and review Durable Objects. Use when bu..."
+    payload["version"] = _SKILLS_SNAPSHOT_VERSION - 1
+    snap.write_text(json.dumps(payload))
+
+    _SKILLS_PROMPT_CACHE.clear()
+
+    assert "Use when bu..." not in build_skills_system_prompt()
+
+
+def test_the_snapshot_path_reapplies_the_environment_gate(monkeypatch, tmp_path):
+    """A skill gated on an environment must not outlive it in the snapshot.
+
+    `skill_matches_environment` runs at PARSE time, so it only ever ran on the
+    cold path. An entry written while the environment was active kept being
+    served from disk after it went away: the index gained a line on
+    snapshot-backed builds and lost it on cold ones, so the two disagreed and
+    the cached system prefix was rewritten instead of hit.
+    """
+    from agent.prompt_builder import (
+        _SKILLS_PROMPT_CACHE,
+        build_skills_system_prompt,
+        clear_skills_system_prompt_cache,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    d = tmp_path / "skills" / "devops" / "gated"
+    d.mkdir(parents=True)
+    (d / "SKILL.md").write_text(
+        "---\nname: gated\ndescription: Only when the environment is live.\n"
+        "environments:\n  - kanban\n---\n"
+    )
+
+    with patch("agent.skill_utils._detect_environment", return_value=True):
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        assert "gated" in build_skills_system_prompt()
+
+    # Environment goes away; the snapshot written above still holds the entry.
+    with patch("agent.skill_utils._detect_environment", return_value=False):
+        _SKILLS_PROMPT_CACHE.clear()
+        from_snapshot = build_skills_system_prompt()
+
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+        from_cold = build_skills_system_prompt()
+
+    assert "gated" not in from_snapshot
+    # The real cost of the old behaviour: the two paths must agree byte for
+    # byte or every session pays a prompt-cache rewrite.
+    assert from_snapshot == from_cold

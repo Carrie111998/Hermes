@@ -2,18 +2,25 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
+import { sessionTitle } from '@/lib/chat-runtime'
 import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  clearDrainFailure,
   getQueuedPrompts,
+  hasExhaustedDrain,
   MAX_AUTO_DRAIN_ATTEMPTS,
+  noteDrainFailure,
+  noteQueueStuck,
   type QueuedPromptEntry,
+  queueStuckNoticeId,
+  recoverQueuedPrompts,
   removeQueuedPrompt,
   shouldAutoDrain
 } from '@/store/composer-queue'
 import { notify } from '@/store/notifications'
-import { $sessions, idsShareLineage } from '@/store/session'
+import { $sessions, idsShareLineage, sessionMatchesStoredId } from '@/store/session'
 import { $workingSessionIds } from '@/store/session-states'
 
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
@@ -22,12 +29,27 @@ type SubmitQueuedPrompt = (text: string, options?: SubmitTextOptions) => Promise
 
 interface BackgroundQueueDrainOptions {
   enabled: boolean
+  /** Bring a chat to the foreground — the shell owns `navigate`, so the alarm
+   *  for a stuck background queue borrows it rather than routing itself. */
+  onOpenSession?: (storedSessionId: string) => void
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
   submitText: SubmitQueuedPrompt
 }
 
-const BACKGROUND_DRAIN_RETRY_MS = 750
+/**
+ * How long to wait before each retry, by how many attempts have already failed.
+ *
+ * Was a flat 750ms, which spent the whole four-attempt budget in about three
+ * seconds — shorter than a gateway bounce or a session resume, so an ordinary
+ * hiccup was enough to declare the queue stuck and alarm the user. Backing off
+ * gives the common transient time to clear before anyone is interrupted.
+ *
+ * One entry per RETRY, so MAX_AUTO_DRAIN_ATTEMPTS - 1 of them: the last failure
+ * raises the alarm instead of scheduling anything. A fourth entry here would be
+ * dead config that silently ignored every edit made to it.
+ */
+const BACKGROUND_DRAIN_RETRY_MS = [1_000, 4_000, 10_000]
 
 /**
  * Drain queued prompts for sessions that are not currently rendered by ChatBar.
@@ -39,6 +61,7 @@ const BACKGROUND_DRAIN_RETRY_MS = 750
  */
 export function useBackgroundQueueDrain({
   enabled,
+  onOpenSession,
   runtimeIdByStoredSessionIdRef,
   selectedStoredSessionId,
   submitText
@@ -48,25 +71,30 @@ export function useBackgroundQueueDrain({
   const parkedQueueSessions = useStore($parkedQueueSessions)
   const workingSessionIds = useStore($workingSessionIds)
   const submitTextRef = useRef(submitText)
+  const openSessionRef = useRef(onOpenSession)
   const drainingSessionIdsRef = useRef(new Set<string>())
-  const drainFailuresRef = useRef(new Map<string, number>())
   const retryTimersRef = useRef<number[]>([])
   const [retryTick, setRetryTick] = useState(0)
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     submitTextRef.current = submitText
-  }, [submitText])
+    openSessionRef.current = onOpenSession
+  }, [onOpenSession, submitText])
 
-  const scheduleRetry = useCallback(() => {
+  const scheduleRetry = useCallback((failures: number) => {
     if (typeof window === 'undefined') {
       return
     }
 
+    // `failures` is 1-based and never reaches MAX_AUTO_DRAIN_ATTEMPTS here, so
+    // the clamp is belt-and-braces against a future caller, not live logic.
+    const delay = BACKGROUND_DRAIN_RETRY_MS[Math.min(failures, BACKGROUND_DRAIN_RETRY_MS.length) - 1] ?? 1_000
+
     const timer = window.setTimeout(() => {
       retryTimersRef.current = retryTimersRef.current.filter(id => id !== timer)
       setRetryTick(tick => tick + 1)
-    }, BACKGROUND_DRAIN_RETRY_MS)
+    }, delay)
 
     retryTimersRef.current.push(timer)
   }, [])
@@ -91,21 +119,67 @@ export function useBackgroundQueueDrain({
       drainingSessionIdsRef.current.add(sessionKey)
 
       const onFail = () => {
-        const failures = (drainFailuresRef.current.get(entry.id) ?? 0) + 1
-        drainFailuresRef.current.set(entry.id, failures)
+        const failures = noteDrainFailure(entry.id)
 
-        if (failures >= MAX_AUTO_DRAIN_ATTEMPTS) {
+        if (failures < MAX_AUTO_DRAIN_ATTEMPTS) {
+          scheduleRetry(failures)
+
+          return
+        }
+
+        // Classify only now, after four real failures, rather than gating the
+        // drain on it: the sessions list loads asynchronously, so an early
+        // "this chat does not exist" read would condemn perfectly live queues.
+        const sessions = $sessions.get()
+
+        const orphaned =
+          sessions.length > 0 && !sessions.some(session => sessionMatchesStoredId(session, sessionKey))
+
+        const pending = getQueuedPrompts(sessionKey)
+
+        noteQueueStuck(sessionKey, entry.id)
+
+        if (orphaned) {
+          // Nothing will ever deliver these — the chat they were queued in is
+          // gone, and no panel renders them either, so they are invisible as
+          // well as undeliverable. Hand the words back instead of retrying.
           notify({
-            id: `composer-background-queue-stuck-${sessionKey}`,
-            kind: 'error',
-            title: t.composer.queueStuckTitle,
-            message: t.composer.queueStuckBody
+            action: {
+              label: t.composer.queueLostAction,
+              onClick: () => {
+                const recovered = recoverQueuedPrompts(sessionKey)
+
+                notify({
+                  kind: recovered > 0 ? 'success' : 'info',
+                  message: recovered > 0 ? t.composer.queueRecovered(recovered) : t.composer.queueRecoveredNothing
+                })
+              }
+            },
+            id: queueStuckNoticeId(sessionKey),
+            kind: 'warning',
+            message: t.composer.queueLostBody(pending.length),
+            title: t.composer.queueLostTitle
           })
 
           return
         }
 
-        scheduleRetry()
+        const title = sessions.find(session => sessionMatchesStoredId(session, sessionKey))
+
+        notify({
+          ...(openSessionRef.current
+            ? {
+                action: {
+                  label: t.composer.queueStuckAction,
+                  onClick: () => openSessionRef.current?.(sessionKey)
+                }
+              }
+            : {}),
+          id: queueStuckNoticeId(sessionKey),
+          kind: 'error',
+          message: title ? t.composer.queueStuckBodyIn(sessionTitle(title)) : t.composer.queueStuckBody,
+          title: t.composer.queueStuckTitle
+        })
       }
 
       void Promise.resolve()
@@ -131,7 +205,7 @@ export function useBackgroundQueueDrain({
             return false
           }
 
-          drainFailuresRef.current.delete(liveEntry.id)
+          clearDrainFailure(liveEntry.id)
           removeQueuedPrompt(sessionKey, liveEntry.id)
           resetBrowseState(runtimeSessionId)
 
@@ -181,7 +255,7 @@ export function useBackgroundQueueDrain({
 
       const entry = entries[0]
 
-      if (!entry || (drainFailuresRef.current.get(entry.id) ?? 0) >= MAX_AUTO_DRAIN_ATTEMPTS) {
+      if (!entry || hasExhaustedDrain(entry.id)) {
         continue
       }
 

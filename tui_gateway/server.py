@@ -241,7 +241,17 @@ _LONG_HANDLERS = frozenset(
         "subscription.resume",
         "subscription.upgrade",
         "usage.bars",
+        "account.usage",
         "session.usage",
+        # The context breakdown rebuilds the whole system prompt (SOUL.md,
+        # context files, memory, the skills index) off disk and then walks the
+        # transcript twice to size it. Inline that is tens of ms on every turn
+        # end and every session switch, with prompt.submit / session.interrupt
+        # sitting unread behind it — same class as #21123. It is read-only:
+        # build_system_prompt_parts touches the agent only via an idempotent
+        # bot-mode flag, and the skills snapshot it may write goes through
+        # utils.atomic_json_write.
+        "session.context_breakdown",
         "billing.step_up",
         "browser.manage",
         "cli.exec",

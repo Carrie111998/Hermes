@@ -3,13 +3,17 @@ import type { MutableRefObject } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
+import { $composerDraft } from '@/store/composer'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
   enqueueQueuedPrompt,
   getQueuedPrompts,
-  parkQueuedPrompts
+  parkQueuedPrompts,
+  removeQueuedPrompt,
+  resetQueueDrainState
 } from '@/store/composer-queue'
+import { $notifications } from '@/store/notifications'
 import { $sessions, setSessions } from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
@@ -39,17 +43,20 @@ const lineageSession = (over: Partial<SessionInfo>): SessionInfo =>
 
 function Harness({
   enabled = true,
+  onOpenSession,
   runtimeMap,
   selectedStoredSessionId = 'stored-session-b',
   submitText
 }: {
   enabled?: boolean
+  onOpenSession?: (storedSessionId: string) => void
   runtimeMap: MutableRefObject<Map<string, string>>
   selectedStoredSessionId?: string | null
   submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
 }) {
   useBackgroundQueueDrain({
     enabled,
+    onOpenSession,
     runtimeIdByStoredSessionIdRef: runtimeMap,
     selectedStoredSessionId,
     submitText
@@ -59,9 +66,25 @@ function Harness({
 }
 
 describe('useBackgroundQueueDrain', () => {
+  // Each retry needs its own act(): the timer fires, React re-renders, and only
+  // then does the effect start the next attempt — one advance cannot chase a
+  // chain that hops through the scheduler between every link.
+  const exhaustRetries = async () => {
+    for (const ms of [1_000, 4_000, 10_000]) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(ms)
+      })
+    }
+  }
+
   beforeEach(() => {
     vi.useRealTimers()
     clearAllSessionStates()
+    // Failure counts and raised alarms are module state now — deliberately, so
+    // a remount cannot buy an unsendable entry four more attempts — which means
+    // they outlive a test case too unless cleared here.
+    resetQueueDrainState()
+    $notifications.set([])
   })
 
   afterEach(() => {
@@ -72,6 +95,8 @@ describe('useBackgroundQueueDrain', () => {
     $parkedQueueSessions.set({})
     $sessions.set([])
     clearAllSessionStates()
+    resetQueueDrainState()
+    $notifications.set([])
   })
 
   it('drains an idle queued prompt for a non-selected background session', async () => {
@@ -214,12 +239,119 @@ describe('useBackgroundQueueDrain', () => {
     expect(submitText).toHaveBeenCalledTimes(1)
     expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
 
+    // 1s, not the old flat 750ms — the retries back off now.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(750)
+      await vi.advanceTimersByTimeAsync(1_000)
       await Promise.resolve()
     })
 
     expect(submitText).toHaveBeenCalledTimes(2)
     expect(getQueuedPrompts('stored-session-a')).toHaveLength(0)
+  })
+
+  it('backs off between retries, so a gateway bounce outlives the budget instead of alarming', async () => {
+    vi.useFakeTimers()
+
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => false)
+
+    enqueueQueuedPrompt('stored-session-a', { text: 'keeps failing', attachments: [] })
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(submitText).toHaveBeenCalledTimes(1)
+
+    // The second gap is longer than the first: at a flat 750ms the whole budget
+    // was spent in ~3s, which is shorter than a gateway restart.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    expect(submitText).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    expect(submitText).toHaveBeenCalledTimes(2)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000)
+    })
+    expect(submitText).toHaveBeenCalledTimes(3)
+  })
+
+  it('names the chat and offers a way into it when a background queue gives up', async () => {
+    vi.useFakeTimers()
+
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => false)
+    const onOpenSession = vi.fn()
+
+    setSessions([lineageSession({ id: 'stored-session-a', title: 'Sdeira Group site' })])
+    enqueueQueuedPrompt('stored-session-a', { text: 'never sends', attachments: [] })
+
+    render(<Harness onOpenSession={onOpenSession} runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await exhaustRetries()
+
+    const toast = $notifications.get().find(n => n.id === 'composer-queue-stuck-stored-session-a')
+
+    expect(toast?.message).toContain('Sdeira Group site')
+    expect(toast?.action).toBeTruthy()
+
+    toast?.action?.onClick()
+    expect(onOpenSession).toHaveBeenCalledWith('stored-session-a')
+  })
+
+  it('offers the words back when the queue belongs to a chat that no longer exists', async () => {
+    vi.useFakeTimers()
+
+    const runtimeMap = { current: new Map<string, string>() }
+    const submitText = vi.fn(async () => false)
+
+    // A live sessions list that simply does not contain the queue's key: the
+    // signature of a fresh chat whose runtime id died with the process.
+    setSessions([lineageSession({ id: 'stored-session-b', title: 'Something else' })])
+    enqueueQueuedPrompt('dead-runtime-id', { text: 'two days of silence', attachments: [] })
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await exhaustRetries()
+
+    const toast = $notifications.get().find(n => n.id === 'composer-queue-stuck-dead-runtime-id')
+
+    // Not an error telling them to retry — retrying is exactly what can never work.
+    expect(toast?.kind).toBe('warning')
+    expect(toast?.action).toBeTruthy()
+
+    toast?.action?.onClick()
+    expect(getQueuedPrompts('dead-runtime-id')).toHaveLength(0)
+    expect($composerDraft.get()).toContain('two days of silence')
+  })
+
+  it('takes the alarm down once the entry is gone', async () => {
+    vi.useFakeTimers()
+
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => false)
+
+    setSessions([lineageSession({ id: 'stored-session-a', title: 'Still here' })])
+    const entry = enqueueQueuedPrompt('stored-session-a', { text: 'stuck', attachments: [] })!
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await exhaustRetries()
+
+    expect($notifications.get().some(n => n.id === 'composer-queue-stuck-stored-session-a')).toBe(true)
+
+    // The user deletes it from the panel. The alarm described that entry; with
+    // the entry gone it describes nothing, and used to stay on screen forever.
+    act(() => {
+      removeQueuedPrompt('stored-session-a', entry.id)
+    })
+
+    expect($notifications.get().some(n => n.id === 'composer-queue-stuck-stored-session-a')).toBe(false)
   })
 })

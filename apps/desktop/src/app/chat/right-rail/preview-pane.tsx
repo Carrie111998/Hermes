@@ -15,6 +15,7 @@ import { guardGuestPointers } from '@/lib/guest-pointer-guard'
 import { openPreviewTargetInBrowser, remoteHtmlPreviewDocument } from '@/lib/local-preview'
 import { isRemoteGateway } from '@/lib/media'
 import { reachablePreviewUrl } from '@/lib/preview-reach'
+import { toWidgetPoint, type Viewport, viewportFit } from '@/lib/preview-viewport'
 import { rafCoalesce } from '@/lib/raf-coalesce'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
@@ -38,13 +39,15 @@ import {
   isNearConsoleBottom,
   PreviewConsolePanel
 } from './preview-console'
-import { type ConsoleEntry } from './preview-console-state'
+import { type ConsoleEntry, consoleLevel } from './preview-console-state'
 import { previewConsoleState } from './preview-console-store'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
 import { type PreviewInputEvent, registerPreviewInput } from './preview-input'
 import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
+import { PreviewPinPanel } from './preview-pin-panel'
 import { registerPreviewPageReader } from './preview-reader'
 import { registerPreviewScriptRunner } from './preview-script-runner'
+import { PreviewViewportBar } from './preview-viewport-bar'
 
 type PreviewWebview = HTMLElement & {
   canGoBack?: () => boolean
@@ -148,6 +151,24 @@ const LOOPBACK_HOST_RE = /^(localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[?::1\]?)$
  * — where that port is usually nothing, or worse, somebody else's service. The
  * URL isn't wrong, it's just addressed to a different computer.
  */
+/**
+ * This window's zoom factor, guaranteed positive and finite.
+ *
+ * Two callers, and they are NOT the same conversion. The emulated frame's size
+ * genuinely crosses between host CSS pixels and the guest's, and app zoom is
+ * that ratio. The context menu's placement stays inside the host: Chromium
+ * reports the click in window device-independent pixels, and dividing gets back
+ * the host CSS pixels the menu is positioned in. Nothing here converts a point
+ * INTO the guest — see onGuestContextMenu for why that was the bug. One
+ * accessor so the fallback is one decision rather than a `?? 1` in one place
+ * and a `|| 1` in the other.
+ */
+function hostZoomFactor(): number {
+  const zoom = window.hermesDesktop?.zoom?.factor?.()
+
+  return Number.isFinite(zoom) && (zoom ?? 0) > 0 ? (zoom as number) : 1
+}
+
 function isRemoteLoopbackUrl(url: string): boolean {
   if (!isRemoteGateway()) {
     return false
@@ -235,6 +256,19 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const previewServerRestart = useStore($previewServerRestart)
   const consoleHeight = useStore(consoleState.$height)
   const consoleOpen = useStore(consoleState.$open)
+  // Annotation mode is per-pane and deliberately not persisted: a review
+  // session is a thing you start, not a mode you leave on.
+  const [pinPanelOpen, setPinPanelOpen] = useState(false)
+  const [viewportOpen, setViewportOpen] = useState(false)
+  /** null = fill the pane, which is what this did before emulation existed. */
+  const [viewport, setViewport] = useState<null | Viewport>(null)
+  const [viewportScale, setViewportScale] = useState(1)
+  /** Read by the INPUT channel below without re-registering it on every zoom.
+   *  Written during render, like `liveUrlRef` below: mirroring it in an effect
+   *  is what the `no-restricted-syntax` rule here forbids, because it lands a
+   *  render late and the channel would scale by the PREVIOUS viewport. */
+  const viewportScaleRef = useRef(1)
+  viewportScaleRef.current = viewportScale
   const [currentUrl, setCurrentUrl] = useState(target.url)
   const liveUrlRef = useRef(currentUrl)
   liveUrlRef.current = currentUrl
@@ -280,6 +314,114 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     () => (isRemoteHtml ? remoteHtmlPreviewDocument(target.dataUrl!) : null),
     [isRemoteHtml, target.dataUrl]
   )
+
+  // Device emulation: tell the guest it is a different size, and size the
+  // element to `device × scale` so the emulated page fills it exactly rather
+  // than sitting letterboxed in a corner. Both numbers come from one place
+  // because they have to agree — see lib/preview-viewport.ts.
+  useEffect(() => {
+    if (!isWebPreview || isRemoteHtml) {
+      return
+    }
+
+    const host = hostRef.current
+
+    if (!host) {
+      return
+    }
+
+    // What the guest was last told. `apply` runs on three triggers now — pane
+    // resize, navigation, and zoom — and the emulate call is a synchronous
+    // main-process hop, so held Ctrl+ would fire one per key repeat with a
+    // byte-identical payload. Cleared on navigation, which resets the override
+    // in the guest and is the one time re-sending the same metrics is the point.
+    let emulated: null | string = null
+
+    const apply = () => {
+      const webview = webviewRef.current
+
+      if (!webview) {
+        return
+      }
+
+      // The guest attaches after the element does; before that there is no
+      // webContents to emulate and the call would be dropped silently.
+      let webContentsId: number | undefined
+
+      try {
+        webContentsId = webview.getWebContentsId?.()
+      } catch {
+        webContentsId = undefined
+      }
+
+      if (!viewport) {
+        webview.style.width = ''
+        webview.style.height = ''
+        webview.className = 'flex h-full w-full flex-1 bg-transparent'
+        setViewportScale(1)
+
+        if (typeof webContentsId === 'number' && emulated !== 'off') {
+          emulated = 'off'
+          void window.hermesDesktop?.previewEmulateDevice?.({ metrics: null, webContentsId })
+        }
+
+        return
+      }
+
+      const box = host.getBoundingClientRect()
+
+      // The pane measures in host CSS pixels; the guest paints in its own. App
+      // zoom is the ratio, so a zoomed window needs it divided back out or the
+      // frame is bigger than the page painted into it — see preview-viewport.ts.
+      const { frame, scale } = viewportFit(
+        viewport,
+        { height: box.height, width: box.width },
+        hostZoomFactor()
+      )
+
+      webview.className = 'bg-transparent'
+      webview.style.width = `${frame.width}px`
+      webview.style.height = `${frame.height}px`
+      setViewportScale(scale)
+
+      const metrics = { height: viewport.height, mobile: viewport.mobile, scale, width: viewport.width }
+      const sent = `${webContentsId}:${metrics.width}x${metrics.height}:${metrics.mobile}:${scale}`
+
+      if (typeof webContentsId === 'number' && sent !== emulated) {
+        emulated = sent
+        void window.hermesDesktop?.previewEmulateDevice?.({ metrics, webContentsId })
+      }
+    }
+
+    apply()
+
+    // A guest that was not attached yet on the first pass, and any navigation
+    // that might have reset the override, both get another go — from scratch,
+    // because the guest has forgotten what it was told.
+    const reapply = () => {
+      emulated = null
+      apply()
+    }
+
+    const webview = webviewRef.current
+    webview?.addEventListener('dom-ready', reapply)
+    webview?.addEventListener('did-navigate', reapply)
+    // Guarded rather than assumed: this test file unstubs globals between
+    // cases, and jsdom has no ResizeObserver of its own. Same shape as
+    // find-bar.tsx.
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(apply)
+    observer?.observe(host)
+    // Ctrl +/-/0 changes the host's CSS pixel without resizing the pane, so the
+    // ResizeObserver never fires — the frame would keep the old zoom's size.
+    const stopZoom = window.hermesDesktop?.zoom?.onChanged?.(apply)
+
+    return () => {
+      observer?.disconnect()
+      stopZoom?.()
+      webview?.removeEventListener('dom-ready', reapply)
+      webview?.removeEventListener('did-navigate', reapply)
+    }
+  }, [isRemoteHtml, isWebPreview, viewport])
 
   const currentLabel = compactUrl(currentUrl)
 
@@ -482,8 +624,8 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       return
     }
 
-    return registerPreviewNav(tabId, { back: goBack, forward: goForward, reload: reloadPreview })
-  }, [goBack, goForward, isRemoteHtml, isWebPreview, reloadPreview, tabId])
+    return registerPreviewNav(tabId, { back: goBack, forward: goForward, navigate: navigateTo, reload: reloadPreview })
+  }, [goBack, goForward, isRemoteHtml, isWebPreview, navigateTo, reloadPreview, tabId])
 
   // Publish the PAGE reader for this tab (the read_preview tool): extract the
   // rendered page's title + visible text from the webview. innerText (not
@@ -550,7 +692,20 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
           throw new Error('preview webview cannot take input events')
         }
 
-        webview.sendInputEvent(event)
+        // Under device emulation Chromium divides incoming coordinates by the
+        // emulation scale. The agent reads its rects INSIDE the guest, so those
+        // numbers are already in emulated space and have to be pushed back to
+        // widget space or every click lands at 1/scale of where it belongs.
+        // (A real mouse needs nothing: the same division is what makes a click
+        // land where the shrunk page appears.)
+        const point = event as PreviewInputEvent & { x?: number; y?: number }
+
+        const scaled =
+          typeof point.x === 'number' && typeof point.y === 'number'
+            ? { ...event, ...toWidgetPoint({ x: point.x, y: point.y }, viewportScaleRef.current) }
+            : event
+
+        webview.sendInputEvent(scaled)
       }
     })
   }, [isRemoteHtml, isWebPreview, tabId])
@@ -768,22 +923,23 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
 
     const onConsole = (event: Event) => {
       const detail = event as Event & {
-        level?: number
+        level?: number | string
         line?: number
         message?: string
         sourceId?: string
       }
 
       const message = detail.message || ''
+      const level = consoleLevel(detail.level)
 
       appendConsoleEntry({
-        level: detail.level ?? 0,
+        level,
         line: detail.line,
         message,
         source: detail.sourceId
       })
 
-      if ((detail.level ?? 0) >= 3 && isModuleMimeError(message)) {
+      if (level >= 3 && isModuleMimeError(message)) {
         setLoadError({
           description: copy.moduleMimeDescription,
           url: guestPage(webview, target.url).url
@@ -881,8 +1037,23 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     // by the window zoom factor. Measured live (zoom 0.9): a click whose
     // true window CSS point was (901, 272) arrived as params (811, 246) =
     // (901*0.9, 272*0.9). Dividing by the zoom factor recovers CSS
-    // coordinates; adding the webview rect on top double-counted the offset
-    // and dropped the menu far right+below the click.
+    // coordinates for the MENU, which is placed in host CSS pixels; adding
+    // the webview rect on top double-counted the offset and dropped the menu
+    // far right+below the click.
+    //
+    // `inspectElement` wants that same WINDOW pixel, not a point inside the
+    // page — Chromium hit-tests down from the embedder's root view and
+    // subtracts the widget's own origin itself. Measured in a real <webview>
+    // sitting at (137, 89): inspectElement(200, 300) selected the element at
+    // guest CSS (63, 211). So params goes in untouched. Subtracting the rect
+    // put the inspector a whole pane-offset up and left of the click, and the
+    // zoom division moved it again — both at 100% zoom too, since neither
+    // term is the zoom.
+    //
+    // Device emulation needs no `scale` compensation here, unlike injected
+    // input (see preview-viewport.ts): that same root-view transform already
+    // carries it. Verified with Phone L at scale 0.5 AND zoom 134% — a click
+    // landing on guest CSS (200, 240) inspected exactly that element.
     const onGuestContextMenu = (event: Event) => {
       const detail = event as Event & { params?: GuestContextMenuParams }
       const params = detail.params
@@ -891,15 +1062,12 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
         return
       }
 
-      const zoom = window.hermesDesktop?.zoom?.factor?.() || 1
+      const zoom = hostZoomFactor()
       // Window CSS point of the click (the menu anchors here).
       const windowX = params.x / zoom
       const windowY = params.y / zoom
-      // Guest CSS point (inspectElement wants coordinates INSIDE the page):
-      // subtract the webview's own offset from the window point.
-      const rect = webview.getBoundingClientRect()
-      const guestX = Math.max(0, Math.round(windowX - rect.left))
-      const guestY = Math.max(0, Math.round(windowY - rect.top))
+      const inspectX = Math.round(params.x)
+      const inspectY = Math.round(params.y)
 
       openGuestContextMenu(
         windowX,
@@ -939,7 +1107,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             webview.focus()
             webview[command]?.()
           },
-          inspectElement: () => webview.inspectElement?.(guestX, guestY),
+          inspectElement: () => webview.inspectElement?.(inspectX, inspectY),
           replaceMisspelling: (word: string) => webview.replaceMisspelling?.(word)
         }
       )
@@ -1043,8 +1211,25 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             onReload={reloadPreview}
             onToggleConsole={() => consoleState.setOpen(open => !open)}
             onToggleDevTools={toggleDevTools}
+            onTogglePins={() => setPinPanelOpen(open => !open)}
+            onToggleViewport={() => setViewportOpen(open => !open)}
+            pinsOpen={pinPanelOpen}
             url={currentUrl}
+            viewportOpen={viewportOpen}
           />
+        )}
+
+        {isWebPreview && !isRemoteHtml && (
+          <PreviewViewportBar
+            onChange={setViewport}
+            open={viewportOpen}
+            scale={viewportScale}
+            viewport={viewport}
+          />
+        )}
+
+        {isWebPreview && !isRemoteHtml && (
+          <PreviewPinPanel open={pinPanelOpen} url={currentUrl} />
         )}
 
         <div
@@ -1054,6 +1239,9 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
           <div
             className={cn(
               'absolute inset-0 flex bg-transparent',
+              // An emulated frame is smaller than the pane, so it gets centred
+              // on the pane's own background instead of pinned to a corner.
+              viewport && 'items-center justify-center overflow-auto bg-muted/30 p-2',
               (isRemoteHtml || !isWebPreview || loadError) && 'pointer-events-none opacity-0'
             )}
             ref={hostRef}

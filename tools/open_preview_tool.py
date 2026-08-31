@@ -33,7 +33,7 @@ def _normalize_target(raw: str) -> str:
     return v
 
 
-def open_preview_tool(url: str, label: str = "") -> str:
+def open_preview_tool(url: str, label: str = "", new_tab: bool = False) -> str:
     """Ask the desktop GUI to show ``url`` in the preview pane beside the chat."""
     target = _normalize_target(url or "")
     if not target:
@@ -44,25 +44,46 @@ def open_preview_tool(url: str, label: str = "") -> str:
 
     label = (label or "").strip()
     try:
-        ok = desktop_ui.emit("preview.open", {"url": target, "label": label})
+        ok = desktop_ui.emit(
+            "preview.open", {"url": target, "label": label, "new_tab": bool(new_tab)}
+        )
     except Exception as exc:
         return tool_error(f"Failed to open the preview pane: {exc}")
     if not ok:
         return tool_error("The preview pane is only available in the Hermes desktop app.")
 
-    return json.dumps({"success": True, "url": target, "label": label}, ensure_ascii=False)
+    return json.dumps(
+        {"success": True, "url": target, "label": label, "new_tab": bool(new_tab)},
+        ensure_ascii=False,
+    )
 
 
 OPEN_PREVIEW_SCHEMA = {
     "name": "open_preview",
     "description": (
-        "Open something in the preview pane beside the chat in the Hermes desktop "
-        "app. Use this when the user asks to see a page, dev server, or file in the "
-        "preview pane — e.g. \"open cnn.com in the preview pane\" or \"preview "
-        "localhost:3000\". Accepts a web URL (a bare domain like www.cnn.com is fine), "
-        "a localhost dev-server URL, or a file path (HTML renders live; other files "
-        "show their contents). The pane opens for the current window only. To close "
-        "the pane or a tab, use close_preview."
+        "Open a page in the in-app browser beside this chat — YOUR browser in "
+        "the Hermes desktop app, not just a viewer for the user. Reach for it "
+        "whenever a web page would answer the question or finish the job: "
+        "checking your own work on a dev server, reading documentation, "
+        "verifying a fix rendered, following a link the user pasted. You do "
+        "not need to be asked to open it; if you would benefit from looking at "
+        "a page, open one. Of course also use it when the user asks to see "
+        "something — \"open cnn.com\", \"preview localhost:3000\". "
+        "Accepts a web URL (a bare domain like www.cnn.com is fine), a "
+        "localhost dev-server URL, or a file path (HTML renders live; other "
+        "files show their contents). "
+        "You get your OWN browser tab: opening a page never replaces the tab "
+        "the user is reading, and you keep the same tab as you work, so open "
+        "once and then move around with drive_preview action='navigate'. "
+        "Then read_preview reads the page (including its console errors) and "
+        "drive_preview clicks, types and navigates in it. "
+        "Prefer this over the browser_* tools whenever the user could "
+        "reasonably want to watch, or the page is theirs (a local dev server, "
+        "an app they are building): this pane is visible to them and costs no "
+        "extra browser process. The browser_* tools are for bulk, headless or "
+        "background automation that nobody needs to see. "
+        "The pane opens for the current window only. To close the pane or a "
+        "tab, use close_preview."
     ),
     "parameters": {
         "type": "object",
@@ -78,11 +99,22 @@ OPEN_PREVIEW_SCHEMA = {
                 "type": "string",
                 "description": "Optional tab label; defaults to the target's name.",
             },
+            "new_tab": {
+                "type": "boolean",
+                "description": (
+                    "Open in an ADDITIONAL browser tab instead of the one you are "
+                    "already using. Only for when you need two pages side by side "
+                    "— comparing them, or keeping a reference open while you work. "
+                    "Leave it off otherwise: re-using your tab is what keeps the "
+                    "user's tab strip readable."
+                ),
+            },
         },
         "required": ["url"],
     },
 }
 
 
-# Registration removed: consolidated into the `preview` tool (#95681);
-# this module keeps its functions for the preview_tool.
+# Registration removed: consolidated into the `desktop_preview` tool (#95681);
+# this module keeps its functions for preview_tool. `new_tab` is local and
+# rides along there — a second tab is how one conversation holds two pages.

@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $contextMenu, closeContextMenu } from '@/app/context-menu/store'
 import { $connection } from '@/store/session'
 
 import { forgetPreviewConsole, previewConsoleState } from './preview-console-store'
@@ -33,6 +34,7 @@ describe('PreviewPane console state', () => {
 
   afterEach(() => {
     cleanup()
+    closeContextMenu()
     $connection.set(null)
     vi.unstubAllGlobals()
   })
@@ -330,6 +332,98 @@ describe('PreviewPane console state', () => {
 
     expect(rendered.container.textContent).not.toContain('Type an address above')
     expect(rendered.queryByRole('textbox', { name: 'Address' })).not.toBeNull()
+  })
+
+  // The pane, not the arithmetic. `viewportFit` defaults zoom to 1, so dropping
+  // the argument here would leave every lib test green while shipping the white
+  // band back — this is the test that notices.
+  it('sizes an emulated frame with the window zoom, not without it', async () => {
+    const zoomFactor = 1.3445671961657126 // 134%, this machine's saved level
+
+    vi.stubGlobal('window', {
+      ...window,
+      hermesDesktop: { zoom: { factor: () => zoomFactor, onChanged: () => () => {} } }
+    })
+
+    const target = {
+      kind: 'url' as const,
+      label: 'example',
+      source: 'https://example.com',
+      url: 'https://example.com'
+    }
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(<PreviewPane target={target} />)
+    })
+
+    await act(async () => {
+      fireEvent.click(rendered.getByLabelText('Screen size'))
+    })
+    await act(async () => {
+      fireEvent.click(rendered.getByText('Phone L'))
+    })
+
+    const webview = rendered.container.querySelector('webview') as HTMLElement
+
+    // jsdom measures the host at 0x0, so the fit is 1:1 and the whole of the
+    // frame is the zoom division: 430/1.3446 = 320, 932/1.3446 = 693. Without
+    // the zoom it would be a flat 430x932 — which is exactly the bug.
+    expect(webview.style.width).toBe('320px')
+    expect(webview.style.height).toBe('693px')
+  })
+
+  // Two units in one gesture: the MENU is placed in host CSS pixels (params
+  // divided by zoom), while `inspectElement` takes the untouched window pixel
+  // — Chromium subtracts the widget's own origin itself. Measured in a real
+  // <webview>; the arithmetic that looked right (window point minus the
+  // element's rect) inspected a node a whole pane-offset away, at every zoom.
+  it('inspects the window point of the click, and anchors the menu in host pixels', async () => {
+    const zoomFactor = 1.3445671961657126 // 134%, this machine's saved level
+
+    vi.stubGlobal('window', {
+      ...window,
+      hermesDesktop: { zoom: { factor: () => zoomFactor, onChanged: () => () => {} } }
+    })
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          target={{ kind: 'url', label: 'example', source: 'https://example.com', url: 'https://example.com' }}
+        />
+      )
+    })
+
+    const webview = rendered.container.querySelector('webview') as HTMLElement & Record<string, unknown>
+    const inspectElement = vi.fn()
+
+    Object.assign(webview, { inspectElement })
+    // A pane in the right rail sits far from the window's left edge, which is
+    // exactly the offset the old formula subtracted twice over.
+    webview.getBoundingClientRect = () => ({ height: 700, left: 412, top: 96, width: 500 }) as DOMRect
+
+    act(() => {
+      webview.dispatchEvent(
+        Object.assign(new Event('context-menu'), {
+          params: { editFlags: {}, x: 901, y: 272 }
+        })
+      )
+    })
+
+    const open = $contextMenu.get()
+
+    expect(open?.kind).toBe('guest')
+
+    if (open?.kind !== 'guest') {
+      throw new Error('expected a guest menu')
+    }
+
+    open.guest.inspectElement()
+
+    expect(inspectElement).toHaveBeenCalledWith(901, 272)
+    expect(open.x).toBeCloseTo(901 / zoomFactor, 5)
+    expect(open.y).toBeCloseTo(272 / zoomFactor, 5)
   })
 
   it('renders authenticated remote HTML safely and honors source mode', async () => {

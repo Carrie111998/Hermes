@@ -1,3 +1,4 @@
+import type { ThreadMessage } from '@assistant-ui/react'
 import { describe, expect, it } from 'vitest'
 
 import type { ChatMessage, ChatMessagePart } from '@/lib/chat-messages'
@@ -305,5 +306,73 @@ describe('coalesceToolOnlyAssistants toolCallId uniqueness', () => {
       .map(part => (part as { toolCallId: string }).toolCallId)
 
     expect(ids).toEqual(['call-a', 'call-b'])
+  })
+})
+
+describe('toRuntimeMessage tool-call id uniqueness', () => {
+  // Regression contract for "Duplicate key toolCallId-terminal_0 in
+  // useResources": Kimi's anthropic_messages mode numbers tool_use blocks per
+  // API response, so `terminal_0` recurs across the whole session, and any
+  // merge/graft/backfill path can land two of them in ONE rendered message.
+  // assistant-ui keys parts by toolCallId and throws on a duplicate, taking
+  // the workspace pane down. toRuntimeMessage is the last boundary before the
+  // runtime, so uniqueness is enforced there, per message.
+  const toolCall = (toolCallId: string): ChatMessagePart => ({
+    type: 'tool-call',
+    toolCallId,
+    toolName: 'terminal',
+    args: {} as never,
+    argsText: ''
+  })
+
+  const renderedToolCallIds = (runtime: ThreadMessage): string[] =>
+    (runtime.content as ChatMessagePart[])
+      .filter(part => part.type === 'tool-call')
+      .map(part => (part as { toolCallId: string }).toolCallId)
+
+  it('never hands the runtime two parts with the same toolCallId', () => {
+    const runtime = toRuntimeMessage({
+      id: 'a1',
+      role: 'assistant',
+      parts: [toolCall('terminal_0'), { text: 'done', type: 'text' }, toolCall('terminal_0'), toolCall('terminal_0')]
+    })
+
+    const ids = renderedToolCallIds(runtime)
+
+    expect(new Set(ids).size).toBe(ids.length)
+    // The first occurrence keeps the provider id, so keys stay stable across
+    // re-renders for the overwhelmingly common unique case.
+    expect(ids[0]).toBe('terminal_0')
+  })
+
+  it('covers the tool-only coalesce path: two merged bubbles that share an id still render unique', () => {
+    const merged = coalesceToolOnlyAssistants(
+      [
+        { id: 'a1', role: 'assistant', parts: [toolCall('terminal_0')] },
+        { id: 'a2', role: 'assistant', parts: [toolCall('terminal_0'), toolCall('read_file_0')] }
+      ],
+      createToolMergeCache()
+    )
+
+    expect(merged).toHaveLength(1)
+
+    const ids = renderedToolCallIds(toRuntimeMessage(merged[0]))
+
+    // This asserted 3 parts when it was written, because coalescing carried
+    // BOTH copies of terminal_0 through and toRuntimeMessage renamed the
+    // second. Upstream #87857 then taught coalesceToolOnlyAssistants to drop
+    // the copy the predecessor already carries, so only 2 parts reach the
+    // boundary. The end-to-end contract is unchanged and is what this asserts:
+    // whatever coalescing hands over, the runtime never sees a repeated id,
+    // and no distinct tool call is lost on the way.
+    expect(new Set(ids).size).toBe(ids.length)
+    expect(ids).toEqual(['terminal_0', 'read_file_0'])
+  })
+
+  it('preserves parts-array reference identity when every id is already unique', () => {
+    const parts: ChatMessagePart[] = [toolCall('terminal_0'), toolCall('terminal_1')]
+    const runtime = toRuntimeMessage({ id: 'a1', role: 'assistant', parts })
+
+    expect(runtime.content).toBe(parts)
   })
 })

@@ -1,0 +1,6 @@
+{
+  "name": "preview-agent-native-fixture",
+  "private": true,
+  "type": "module",
+  "main": "../preview-agent-native.test.mjs"
+}

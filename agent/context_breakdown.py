@@ -12,9 +12,22 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from utils import safe_json_loads
+
 _SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DOTALL)
 
 _SUBAGENT_TOOL_NAMES = frozenset({"delegate_task"})
+
+# Files carved out of the conversation blob. Names are resolved from the
+# canonical "file" toolset at runtime, never hand-copied — see _file_tool_names.
+_FILE_TOOLSET = "file"
+
+# The subset whose ``path`` argument names ONE file, so it can be counted.
+# ``search_files`` takes a directory (and ``patch`` in V4A mode takes no path
+# at all) — both still cost file tokens, neither is a countable file. The same
+# distinction is drawn in ``agent/context_compressor.py``'s per-tool result
+# summariser; if a file tool gains or loses a path argument, both need editing.
+_FILE_PATH_TOOL_NAMES = frozenset({"read_file", "write_file", "patch"})
 
 _CATEGORY_COLORS = {
     "system_prompt": "var(--context-usage-system)",
@@ -24,6 +37,7 @@ _CATEGORY_COLORS = {
     "mcp": "var(--context-usage-mcp)",
     "subagent_definitions": "var(--context-usage-subagents)",
     "memory": "var(--context-usage-memory)",
+    "files": "var(--context-usage-files)",
     "conversation": "var(--context-usage-conversation)",
 }
 
@@ -78,6 +92,105 @@ def _memory_blocks(agent: Any) -> Tuple[str, str]:
     return memory_block, user_block
 
 
+def _file_tool_names() -> frozenset:
+    """The live "file" toolset's tool names.
+
+    Resolved from the registry — never from a hand-copied literal, which is
+    what actually goes stale when a file tool is added or renamed.
+    ``include_registry=False`` already expands the toolset's static definition
+    and its nested includes, so there is nothing weaker to fall back to.
+    """
+    try:
+        from toolsets import resolve_toolset
+
+        return frozenset(resolve_toolset(_FILE_TOOLSET, include_registry=False) or ())
+    except Exception:
+        return frozenset()
+
+
+def _raw_arguments(call: Any) -> str:
+    """A tool call's ``arguments`` as text, for sizing without re-encoding."""
+    fn = call.get("function") if isinstance(call, dict) else None
+    raw = (fn or {}).get("arguments") if isinstance(fn, dict) else None
+    if isinstance(raw, str):
+        return raw
+    return json.dumps(raw, ensure_ascii=False) if raw else ""
+
+
+def _call_arguments(call: Any) -> Dict[str, Any]:
+    """Best-effort decode of a tool call's ``arguments`` (a JSON string)."""
+    fn = call.get("function") if isinstance(call, dict) else None
+    raw = (fn or {}).get("arguments") if isinstance(fn, dict) else None
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    decoded = safe_json_loads(raw, {})
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _file_context_stats(messages: Sequence[dict]) -> Tuple[int, int]:
+    """Split file I/O out of the conversation blob.
+
+    Returns ``(tokens, distinct_file_count)``. Both halves of a file round-trip
+    are counted: the assistant's ``tool_calls`` entry (which for ``write_file``
+    and ``patch`` carries the whole payload) and the tool result it is answered
+    with.
+
+    A result is identified by its own ``name`` / ``tool_name`` — every producer
+    stamps one (``tool_dispatch_helpers._build_tool_message`` and the four
+    synthetic paths in ``conversation_loop``). That matters: pairing a result to
+    its call by ``tool_call_id`` breaks the moment compaction drops the
+    assistant turn but keeps the result, which is exactly when the window is
+    full and someone opens the panel. ``tool_call_id`` stays as the fallback for
+    transcripts whose results carry no name.
+
+    Estimated with the same memoized per-message pass the conversation total
+    uses, so the two are directly comparable and the caller can subtract.
+    """
+    from agent.model_metadata import estimate_messages_tokens_rough
+
+    names = _file_tool_names()
+    tokens = 0
+    paths: set = set()
+    file_call_ids: set = set()
+
+    for msg in messages or ():
+        if not isinstance(msg, dict):
+            continue
+
+        if msg.get("role") == "tool":
+            result_name = str(msg.get("name") or msg.get("tool_name") or "").strip()
+            call_id = str(msg.get("tool_call_id") or "")
+            claimed = result_name in names if result_name else call_id in file_call_ids
+            if claimed:
+                tokens += estimate_messages_tokens_rough([msg])
+            continue
+
+        for call in msg.get("tool_calls") or ():
+            if not isinstance(call, dict):
+                continue
+            name = _tool_name(call)
+            if name not in names:
+                continue
+
+            call_id = str(call.get("id") or "")
+            if call_id:
+                file_call_ids.add(call_id)
+
+            # Size from the raw argument text rather than re-serialising the
+            # call: json.dumps would re-escape the whole payload (a write_file
+            # body can be 100KB) purely to measure it.
+            tokens += _chars_to_tokens(name) + _chars_to_tokens(_raw_arguments(call))
+
+            if name in _FILE_PATH_TOOL_NAMES:
+                path = str(_call_arguments(call).get("path") or "").strip()
+                if path:
+                    paths.add(path)
+
+    return tokens, len(paths)
+
+
 def _strip_blocks(text: str, *blocks: str) -> str:
     out = text
     for block in blocks:
@@ -114,6 +227,15 @@ def compute_session_context_breakdown(
 
     conversation_tokens = estimate_messages_tokens_rough(messages or [])
 
+    # File I/O is the single biggest thing people want broken out of
+    # "Conversation" — it answers "how much of my window is files, and how
+    # many". Clamped so the two halves can never sum past the transcript: the
+    # file figure adds a per-call JSON estimate to per-message estimates, which
+    # is close but not identical arithmetic.
+    file_tokens, file_count = _file_context_stats(messages or [])
+    file_tokens = max(0, min(file_tokens, conversation_tokens))
+    conversation_tokens -= file_tokens
+
     categories = [
         ("system_prompt", "System prompt", _chars_to_tokens(system_prompt_text)),
         ("tool_definitions", "Tool definitions", _json_tokens(builtin_tools)),
@@ -122,6 +244,7 @@ def compute_session_context_breakdown(
         ("mcp", "MCP", _json_tokens(mcp_tools)),
         ("subagent_definitions", "Subagent definitions", _json_tokens(subagent_tools)),
         ("memory", "Memory", _chars_to_tokens(memory_text)),
+        ("files", "Files", file_tokens),
         ("conversation", "Conversation", conversation_tokens),
     ]
 
@@ -156,6 +279,9 @@ def compute_session_context_breakdown(
                 "id": category_id,
                 "label": label,
                 "tokens": tokens,
+                # Optional per-category extra, so surfaces that don't know
+                # about it keep rendering the category unchanged.
+                **({"count": file_count} if category_id == "files" else {}),
             }
             for category_id, label, tokens in categories
             if tokens > 0
@@ -182,6 +308,7 @@ _CATEGORY_GLYPHS = {
     "mcp": "▥",
     "subagent_definitions": "▦",
     "memory": "▧",
+    "files": "◧",
     "conversation": "▨",
 }
 _FREE_GLYPH = "·"

@@ -126,3 +126,189 @@ def test_details_lines_caps_listing():
     assert any("… and 5 more" in line for line in lines)
 
 
+
+
+# ── Files carved out of the conversation blob ───────────────────────────────
+
+
+def _file_call(call_id: str, name: str, arguments: str):
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": arguments},
+    }
+
+
+def _history_with_file_io():
+    body = "x" * 4_000
+
+    return [
+        {"role": "user", "content": "read the config"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [_file_call("c1", "read_file", '{"path": "/repo/app.py"}')],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": body},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                _file_call("c2", "write_file", '{"path": "/repo/app.py", "content": "%s"}' % body)
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c2", "content": "ok"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [_file_call("c3", "terminal", '{"command": "ls"}')],
+        },
+        {"role": "tool", "tool_call_id": "c3", "content": "app.py"},
+    ]
+
+
+def _breakdown_for(history):
+    agent, parts = _make_agent()
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        return compute_session_context_breakdown(agent, history)
+
+
+def _category(data, category_id):
+    return next((item for item in data["categories"] if item["id"] == category_id), None)
+
+
+def test_files_category_carries_tokens_and_a_distinct_file_count():
+    data = _breakdown_for(_history_with_file_io())
+    files = _category(data, "files")
+
+    assert files is not None
+    assert files["tokens"] > 0
+    # /repo/app.py was read AND written — one distinct file, not two.
+    assert files["count"] == 1
+    assert files["color"] == "var(--context-usage-files)"
+
+
+def test_file_tokens_come_out_of_conversation_not_on_top_of_it():
+    history = _history_with_file_io()
+    with_files = _breakdown_for(history)
+
+    from agent.model_metadata import estimate_messages_tokens_rough
+
+    transcript = estimate_messages_tokens_rough(history)
+    files = _category(with_files, "files")
+    conversation = _category(with_files, "conversation")
+
+    assert files["tokens"] + conversation["tokens"] == transcript
+    # Neither side may be swallowed: an equality that only holds because the
+    # clamp zeroed Conversation would prove nothing.
+    assert 0 < files["tokens"] < transcript
+    assert conversation["tokens"] > 0
+
+
+def test_terminal_results_stay_in_conversation():
+    history = [
+        {"role": "user", "content": "list the files"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [_file_call("t1", "terminal", '{"command": "ls"}')],
+        },
+        {"role": "tool", "tool_call_id": "t1", "content": "x" * 4_000},
+    ]
+
+    data = _breakdown_for(history)
+
+    assert _category(data, "files") is None
+    assert _category(data, "conversation")["tokens"] > 0
+
+
+def test_a_tool_result_is_claimed_by_its_own_call_id_never_by_position():
+    # The file call is never answered (interrupted turn); an unrelated result
+    # follows it. Matching by position would wrongly bill it to Files.
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [_file_call("c1", "read_file", '{"path": "/repo/app.py"}')],
+        },
+        {"role": "tool", "tool_call_id": "other", "content": "y" * 4_000},
+    ]
+
+    data = _breakdown_for(history)
+    files = _category(data, "files")
+
+    # The call itself still costs (it is in the window), but the foreign result
+    # stays in Conversation.
+    assert files["count"] == 1
+    assert files["tokens"] < _category(data, "conversation")["tokens"]
+
+
+def test_search_files_costs_file_tokens_but_is_not_a_countable_file():
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [_file_call("s1", "search_files", '{"pattern": "def", "path": "/repo"}')],
+        },
+        {"role": "tool", "tool_call_id": "s1", "content": "z" * 4_000},
+    ]
+
+    data = _breakdown_for(history)
+    files = _category(data, "files")
+
+    assert files["tokens"] > 0
+    assert files["count"] == 0
+
+
+def test_malformed_tool_call_arguments_never_raise():
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [_file_call("c1", "read_file", "{not json")],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "w" * 2_000},
+        {"role": "assistant", "content": "", "tool_calls": ["not-a-dict"]},
+        "not-a-message",
+    ]
+
+    data = _breakdown_for(history)
+    files = _category(data, "files")
+
+    assert files["tokens"] > 0
+    assert files["count"] == 0
+
+
+def test_orphaned_file_result_is_still_billed_to_files():
+    # Compaction drops the assistant turn but keeps its result. Pairing by
+    # tool_call_id alone would silently bill a 100k read_file to Conversation
+    # exactly when the window is full — the moment the panel gets opened.
+    history = [
+        {"role": "user", "content": "carry on"},
+        {"role": "tool", "name": "read_file", "tool_call_id": "gone", "content": "x" * 8_000},
+    ]
+
+    data = _breakdown_for(history)
+    files = _category(data, "files")
+
+    assert files is not None
+    assert files["tokens"] > 1_000
+    # No call survived, so there is no path to count — tokens without a count
+    # is the honest answer, not a fabricated 1.
+    assert files["count"] == 0
+
+
+def test_result_name_wins_over_a_recycled_call_id():
+    # `tool_name` is the canonical stamp from _build_tool_message; `name` is
+    # what the synthetic conversation_loop paths write. Either identifies the
+    # result on its own.
+    history = [
+        {"role": "tool", "tool_name": "read_file", "tool_call_id": "c1", "content": "x" * 4_000},
+        {"role": "tool", "name": "terminal", "tool_call_id": "c2", "content": "y" * 4_000},
+    ]
+
+    data = _breakdown_for(history)
+
+    assert _category(data, "files")["tokens"] > 0
+    assert _category(data, "conversation")["tokens"] > 0

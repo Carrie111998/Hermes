@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router'
 
 import { ConnectionSwitcher } from '@/app/chat/sidebar/connection-switcher'
 import type { CommandCenterSection } from '@/app/command-center'
+import { AccountUsagePanel } from '@/app/shell/account-usage-panel'
 import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
 import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
@@ -21,6 +22,7 @@ import { cn } from '@/lib/utils'
 import { resolveVersionStatus } from '@/lib/version-status'
 import { copyFilePath, revealFile } from '@/store/file-actions'
 import { revealFileInTree } from '@/store/layout'
+import { openBrowserTab } from '@/store/preview'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree, projectNameForCwd } from '@/store/projects'
 import {
@@ -235,7 +237,12 @@ export function useStatusbarItems({
   // read-only RPC the popover uses, so the readout is right the moment it's on
   // screen. Gated on the gauge being shown — the bar itself is unmounted while
   // toggled off, so this covers the rest.
-  const contextItemHidden = useStore($statusbarHiddenIds).includes('context-usage')
+  const hiddenIds = useStore($statusbarHiddenIds)
+  const contextItemHidden = hiddenIds.includes('context-usage')
+  // The entry stands on its own — the panel fetches and reports its own empty
+  // state, so the statusbar never fires a network call just to decide whether
+  // to render a label.
+  const providerUsageHidden = hiddenIds.includes('account-usage')
 
   const { breakdown: contextBreakdown, loading: contextBreakdownLoading } = useContextBreakdown({
     busy,
@@ -545,6 +552,20 @@ export function useStatusbarItems({
         variant: 'text'
       },
       {
+        // Account-scoped, not session-scoped: it answers "how much of my
+        // subscriptions is left", so it is shown whenever this machine has a
+        // provider that can report one. The panel fetches on open; the backend
+        // caches per provider, so reopening costs nothing.
+        hidden: providerUsageHidden,
+        id: 'account-usage',
+        label: copy.accountUsage,
+        menuAlign: 'end',
+        menuClassName: 'w-auto border-(--ui-stroke-secondary) p-0',
+        menuContent: <AccountUsagePanel />,
+        toggleLabel: copy.toggleAccountUsage,
+        variant: 'menu'
+      },
+      {
         detail: contextBar || undefined,
         hidden: !contextUsage,
         id: 'context-usage',
@@ -581,6 +602,21 @@ export function useStatusbarItems({
         toggleLabel: copy.toggleTerminal,
         variant: 'action'
       },
+      // The Browser had a keybind and a ⌘K row and no button anywhere, so the
+      // only discoverable way in was to ask the agent to open it. Same door the
+      // terminal gets, next to it — and carrying `actionId`, so the tooltip
+      // teaches ⌘⇧L rather than hiding it.
+      {
+        actionId: 'view.showBrowser',
+        className: 'w-7 justify-center px-0',
+        hidden: !chatOpen,
+        icon: <Globe className="size-3.5" />,
+        id: 'browser',
+        onSelect: () => openBrowserTab(),
+        title: copy.showBrowser,
+        toggleLabel: copy.toggleBrowser,
+        variant: 'action'
+      },
       clientVersionItem,
       ...(backendVersionItem ? [backendVersionItem] : [])
     ],
@@ -596,6 +632,7 @@ export function useStatusbarItems({
       contextUsage,
       copy,
       gaugeUsage,
+      providerUsageHidden,
       sessionStartedAt,
       gatewayState,
       terminalShowing,

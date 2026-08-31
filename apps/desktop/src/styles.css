@@ -221,6 +221,9 @@
     --context-usage-mcp: color-mix(in srgb, var(--ui-red) 72%, var(--ui-purple));
     --context-usage-subagents: color-mix(in srgb, var(--ui-blue) 70%, var(--ui-cyan));
     --context-usage-memory: color-mix(in srgb, var(--ui-orange) 80%, var(--ui-yellow));
+    /* Files sits next to Conversation (cyan) and Memory (orange) in the bar,
+       so it has to read apart from both — a violet-blue, not another cyan. */
+    --context-usage-files: color-mix(in srgb, var(--ui-purple) 60%, var(--ui-blue));
     --context-usage-conversation: var(--ui-cyan);
     /* Landed memory-write tool row — gold → purple, never amber warning. */
     --tool-memory-legendary-from: color-mix(in srgb, var(--ui-yellow) 72%, #f5d08a);

@@ -80,11 +80,21 @@ export interface PreviewActAction {
   submit?: boolean
   text?: string
   to?: 'bottom' | 'top'
+  /** navigate: the address to go to. Like the history verbs, `navigate` is
+   *  answered by the PANE and never reaches the in-page engine — but it
+   *  arrives on the same wire, so it is declared here rather than cast for at
+   *  the one place that reads it. */
+  url?: string
 }
 
 export interface PreviewActResult {
   /** What the action landed on, for the agent's own log. */
   acted?: string
+  /** Errors and warnings the page logged since the last action, when there
+   *  were any. A breadcrumb, not the messages: it rides along on a result the
+   *  agent already receives, and a non-zero count is the cue to call
+   *  read_preview for the detail. See preview-console-digest.ts. */
+  console_since_last_call?: { errors: number; warnings: number }
   /** What moved since the last look. Present INSTEAD of `elements` once the
    *  agent holds a baseline for this page. */
   delta?: PreviewActDelta

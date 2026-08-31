@@ -34,6 +34,7 @@ from tools.registry import registry, tool_error
 
 ACTIONS = (
     "elements",
+    "navigate",
     "click",
     "hover",
     "type",
@@ -56,6 +57,7 @@ def drive_preview_tool(
     ref: Optional[str] = None,
     selector: Optional[str] = None,
     text: Optional[str] = None,
+    url: Optional[str] = None,
     key: Optional[str] = None,
     submit: Optional[bool] = None,
     amount: Optional[int] = None,
@@ -83,6 +85,9 @@ def drive_preview_tool(
     if verb == "press" and not key:
         return tool_error("press needs a key, e.g. 'Enter' or 'Escape'.")
 
+    if verb == "navigate" and not url:
+        return tool_error("navigate needs a url, e.g. 'https://example.com'.")
+
     if to is not None and to not in SCROLL_TO:
         return tool_error(f"to must be one of: {', '.join(SCROLL_TO)}.")
 
@@ -94,6 +99,7 @@ def drive_preview_tool(
                 ("ref", ref),
                 ("selector", selector),
                 ("text", text),
+                ("url", url),
                 ("key", key),
                 ("submit", submit),
                 ("full", full),
@@ -146,7 +152,9 @@ ACT_PREVIEW_SCHEMA = {
         "pointer — opens dropdowns before clicking in), type (submit=true "
         "also presses Enter), scroll, press, strobe (visual flourish only — "
         "one call runs a multi-second burst; never loop it), back/forward/"
-        "reload. Moves draw live and fade; annotate_preview leaves a lasting "
+        "reload, navigate (go to a url in the tab you are ALREADY driving — for "
+        "moving between pages mid-task; desktop_preview action=open is for "
+        "opening a browser in the first place). Moves draw live and fade; annotate_preview leaves a lasting "
         "mark. Page text only: desktop_preview action=read. Separate automated "
         "browser: browser_* tools."
     ),
@@ -167,6 +175,7 @@ ACT_PREVIEW_SCHEMA = {
                 "description": "CSS selector fallback. Prefer ref.",
             },
             "text": {"type": "string", "description": "type: the text."},
+            "url": {"type": "string", "description": "navigate: the address, in the tab you drive."},
             "submit": {
                 "type": "boolean",
                 "description": "type: press Enter + submit the form after.",
@@ -207,6 +216,7 @@ registry.register(
         ref=args.get("ref"),
         selector=args.get("selector"),
         text=args.get("text"),
+        url=args.get("url"),
         key=args.get("key"),
         submit=args.get("submit"),
         amount=args.get("amount"),

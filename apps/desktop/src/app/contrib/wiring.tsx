@@ -647,6 +647,9 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // sessions continue once those sessions are idle.
   useBackgroundQueueDrain({
     enabled: gatewayState === 'open',
+    // So the "queue is stuck" alarm can take the user to the chat it means —
+    // it fires for a session that is by definition not the one on screen.
+    onOpenSession: sessionId => openSession(sessionId, navigate),
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionId,
     submitText

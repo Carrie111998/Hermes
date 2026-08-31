@@ -6,6 +6,8 @@ import { openSession } from '@/app/open-session'
 import { resolveDeepLinkAction } from '@/lib/deeplink-routes'
 import { pathFromHermesDeepLink, resolveHermesOpenPath } from '@/lib/hermes-open-target'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
+import { addComposerAttachment } from '@/store/composer'
+import { onRelayedComposerAttachment } from '@/store/composer-relay'
 import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
 import { startMcpHealthChecker, stopMcpHealthChecker } from '@/store/mcp-health'
 import {
@@ -338,4 +340,14 @@ export function useDesktopIntegrations({
 
     return onSessionsChanged(() => void refreshSessions())
   }, [refreshSessions])
+
+  // A window with no composer of its own — a popped-out Browser — attached
+  // something. This window owns the composer, so it takes delivery.
+  useEffect(() => {
+    if (isSecondaryWindow() || isBrowserWindow()) {
+      return
+    }
+
+    return onRelayedComposerAttachment(attachment => addComposerAttachment(attachment))
+  }, [])
 }

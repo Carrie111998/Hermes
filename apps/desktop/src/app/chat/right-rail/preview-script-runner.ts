@@ -11,7 +11,7 @@
  */
 
 import { $rightRailActiveTabId } from '@/store/layout'
-import { $previewTabs } from '@/store/preview'
+import { $previewTabs, agentPreviewTabId } from '@/store/preview'
 
 /** Runs JS source in the pane's guest page, resolving its completion value. */
 export type PreviewScriptRunner = (code: string) => Promise<unknown>
@@ -27,6 +27,13 @@ export function registerPreviewScriptRunner(tabId: string, runner: PreviewScript
       runners.delete(tabId)
     }
   }
+}
+
+/** The AGENT's tab's script runner — where its engine and handle book live. */
+export function agentPreviewScriptRunner(sessionId: null | string): PreviewScriptRunner | null {
+  const id = agentPreviewTabId(sessionId)
+
+  return (id && runners.get(id)) || null
 }
 
 /** The ACTIVE preview tab's script runner. Null = no live page behind it. */

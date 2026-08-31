@@ -74,9 +74,21 @@ import {
 } from './utils'
 
 // Manual compression is LLM-bound and routinely outlives the desktop's 30s
-// default WS request timeout on large sessions — give it the TUI client's
-// 120s RPC budget (HERMES_TUI_RPC_TIMEOUT_MS default) instead.
-const SESSION_COMPRESS_TIMEOUT_MS = 120_000
+// default WS request timeout on large sessions.
+//
+// The budget must track the SERVER's ceiling, not its first progress deadline.
+// agent/conversation_compression.py holds two numbers: a 120s
+// DEFAULT_CONTEXT_TIMEOUT_SECONDS after which it logs "still streaming —
+// extending wait" and keeps going, and a 600s
+// DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS that actually bounds it. This used to
+// be the first one, so a compression that legitimately ran past 120s made the
+// desktop print "request timed out" while the server went on to finish and
+// commit — a success reported as a failure, with the transcript silently
+// compacted underneath. Observed at 133s on a 181-message session.
+//
+// Ceiling plus one commit-overrun slice (_COMMIT_OVERRUN_WAIT_SLICE_SECONDS),
+// so the client outlives the server's own bound instead of racing it.
+const SESSION_COMPRESS_TIMEOUT_MS = 630_000
 const WAKE_START_TIMEOUT_MS = 180_000
 
 const wakeDeviceLabel = (device?: WakeInputDeviceStatus): string => {

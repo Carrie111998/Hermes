@@ -3,9 +3,10 @@ import { type MutableRefObject, useCallback } from 'react'
 import { PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import type { Translations } from '@/i18n'
 import { type ChatMessage, textPart } from '@/lib/chat-messages'
-import { optimisticAttachmentRef } from '@/lib/chat-runtime'
+import { optimisticAttachmentRef, reviewCommentBlock } from '@/lib/chat-runtime'
 import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { pinCommentBlock } from '@/lib/preview-pins/pin-block'
 import {
   isVoicePlaybackActive,
   markVoicePlaybackInterrupted,
@@ -147,8 +148,27 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // before touching a.refText / a.kind.
         const present = atts.filter((a): a is ComposerAttachment => Boolean(a))
 
+        // Preview pins and PR review comments are CHIPS in the composer and
+        // payloads on the wire: the chip says "1 preview comment", the payload
+        // is the page, the element and the sentence. Sending the chip text is
+        // sending the label instead of the thing — the model receives the
+        // string "1 preview comment" and can only ask what was meant, which is
+        // exactly what happened. Every other kind stays on its refText: an
+        // image has no refText here (it travels as real image content, and a
+        // duplicate `@image:` ref would be noise), and a terminal attachment's
+        // block is already assembled from the draft above.
         const contextRefs = present
-          .map(a => a.refText)
+          .map(a => {
+            if (a.kind === 'pins' && a.detail) {
+              return pinCommentBlock(a.detail) ?? a.refText
+            }
+
+            if (a.kind === 'review' && a.detail) {
+              return reviewCommentBlock(a.detail) ?? a.refText
+            }
+
+            return a.refText
+          })
           .filter(Boolean)
           .join('\n')
 

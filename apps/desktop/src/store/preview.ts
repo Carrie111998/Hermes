@@ -58,7 +58,39 @@ export interface PreviewServerRestart {
 export type PreviewRecordSource = 'explicit-link' | 'file-browser' | 'manual' | 'tool-result'
 
 export interface PreviewTab {
+  /** Opened by the agent, and so the tab it browses in. The agent re-uses this
+   *  tab across a whole task instead of stacking one per navigation, and never
+   *  reaches for a tab without it — see `browserTabId`. */
+  agent?: boolean
   id: RightRailTabId
+  /** RUNTIME session id of the agent that opened this tab, when one did.
+   *
+   *  Runtime, never the stored id. A session-keyed preview registry existed
+   *  once and was removed in 96999b116 because it was keyed on the STORED id,
+   *  which lands late: an `open_preview` from a session whose stored id had not
+   *  arrived was written and then immediately reconciled away, so the pane
+   *  flashed and vanished. The runtime id is in hand at the moment the tool
+   *  runs. This is also why ownership is a field on the one tab list rather
+   *  than a second registry beside it — two lists under two id rules is the
+   *  shape that failed.
+   *
+   *  Absent = nobody's: a file-browser click, an artifact, a link you opened.
+   *  Those stay visible to everyone. */
+  owner?: string
+  /** STORED session id of the conversation that owns this tab — the same claim
+   *  as `owner`, in the one form that survives a restart.
+   *
+   *  `owner` is a runtime id and is dropped on the way out, so without this
+   *  every restored tab came back belonging to nobody and showed in EVERY
+   *  conversation: reopen the app and the other chat's page is sitting in
+   *  yours again.
+   *
+   *  Safe where the deleted registry was not, because this id decides only what
+   *  the strip DRAWS — nothing routes a write through it. The registry removed
+   *  in 96999b116 keyed the WRITE path on the stored id and lost races against
+   *  its own arrival; a late id here can only leave a tab visible a moment
+   *  longer. */
+  ownerKey?: string
   target: PreviewTarget
 }
 
@@ -131,6 +163,11 @@ export const $previewTabs = persistentAtom<PreviewTab[]>(TABS_STORAGE_KEY, [], {
   decode: decodePreviewTabs,
   // Inline bytes are not restorable. Strip them from images, and skip remote
   // HTML and artifact tabs that cannot render without their in-memory payload.
+  // `agent` is dropped on the way out. Ownership is a claim by the session that
+  // is running, not a property of the tab: persisted, it never expires, and a
+  // tab the user adopted as their own weeks ago would still answer to the next
+  // session's agent — the #93190 clobber, deferred rather than removed. Losing
+  // it across a restart costs one extra tab and cannot cost a page.
   encode: tabs =>
     JSON.stringify(
       tabs.filter(
@@ -139,7 +176,12 @@ export const $previewTabs = persistentAtom<PreviewTab[]>(TABS_STORAGE_KEY, [], {
           !tab.target.transient &&
           !(tab.target.previewKind === 'html' && tab.target.dataUrl)
       ),
-      (key, value) => (key === 'dataUrl' ? undefined : value)
+      // `owner` goes out with `agent`, and for the same reason plus one: it
+      // names a RUNTIME session, and no runtime survives the restart. A
+      // restored owner would bind the tab to a dead id — invisible to every
+      // live session and reachable by none.
+      // `ownerKey` deliberately survives — it is the restart-durable half.
+      (key, value) => (key === 'agent' || key === 'dataUrl' || key === 'owner' ? undefined : value)
     )
 })
 
@@ -160,6 +202,74 @@ function resolveActiveTab(tabs: PreviewTab[], activeTabId: RightRailTabId | null
 
 function activePreviewTab(): PreviewTab | null {
   return resolveActiveTab($previewTabs.get(), $rightRailActiveTabId.get())
+}
+
+/** Which of its own tabs each RUNTIME session's agent is working in. Module
+ *  state, not persisted: it is a property of the turn in flight, and a restored
+ *  one would point the agent at a tab it has no memory of opening.
+ *
+ *  Keyed, because it used to be one variable for the whole app. Two chats
+ *  browsing at once both resolved to it, so the second `open_preview` landed in
+ *  the first one's tab and every later click, read and navigation went to
+ *  whichever page won last — one shared browser wearing N conversations. */
+const agentTabBySession = new Map<string, RightRailTabId>()
+
+/** Key for agent opens that arrive with no session id. */
+const UNSCOPED = '\u0000unscoped'
+
+/** Is `tab` the browsing tab of the agent in `sessionId`?
+ *
+ *  One predicate for both lookups below — they must agree, or "go back to the
+ *  tab already holding this page" resolves to a different tab than "keep
+ *  working where I was", and `new_tab` becomes one-way again.
+ *
+ *  A null session matches the agent tabs nobody has claimed rather than
+ *  nothing: an event that arrives unscoped must still browse beside the user,
+ *  never fall through to the page they are reading. */
+function agentOwns(tab: PreviewTab, sessionId: null | string): boolean {
+  return Boolean(isBrowserTab(tab) && tab.agent && (sessionId ? tab.owner === sessionId : !tab.owner))
+}
+
+/** The tab an AGENT ACTION operates on — clicking, typing, navigating, reading.
+ *
+ *  Not the active tab. Resolving a write by "what's on screen" means the agent
+ *  clicks around the page you just switched to, which is the same mistake as
+ *  #93190 one layer down: the agent's tab is where it opened its page, and
+ *  focus is yours to move while it works.
+ *
+ *  And not ANY agent tab: `sessionId` is which conversation is asking. Without
+ *  it, session A's `read_preview` answers from session B's page.
+ *
+ *  Falls back to the active tab only when this session has no tab of its own —
+ *  "click the button on this page" about the page you are looking at. READS
+ *  resolve through here too: `read_preview` answering from a different tab than
+ *  `drive_preview` acted on let the agent click one page and report another. */
+export function agentPreviewTabId(sessionId: null | string): RightRailTabId | null {
+  const tabs = $previewTabs.get()
+
+  // The fallback is "the page you are looking at", for a conversation that has
+  // opened nothing of its own — but only among pages it is ALLOWED to look at.
+  // Unfiltered, a session that had never called `open_preview` fell through to
+  // whatever was active, which can be ANOTHER conversation's owned tab: it
+  // would then read, reason about and report a page it never opened, one chat
+  // over. That is the failure `readActivePreview`'s own header forbids.
+  const visible = tabs.filter(tab => previewTabBelongsToSession(tab, sessionId))
+
+  return (agentTab(tabs, sessionId) ?? resolveActiveTab(visible, $rightRailActiveTabId.get()))?.id ?? null
+}
+
+/** This session's CURRENT tab, or the newest it owns if that one has been
+ *  closed.
+ *
+ *  Tracked rather than derived: resolving by "the newest agent tab" alone made
+ *  `new_tab` one-way — once the agent opened a second tab, every later action
+ *  went there and the first was unreachable for the rest of the session, since
+ *  no tool selects a browser tab. */
+function agentTab(tabs: PreviewTab[], sessionId: null | string): PreviewTab | undefined {
+  const owned = (tab: PreviewTab) => agentOwns(tab, sessionId)
+  const current = tabs.find(tab => tab.id === agentTabBySession.get(sessionId ?? UNSCOPED) && owned(tab))
+
+  return current ?? tabs.findLast(owned)
 }
 
 // A restored active id whose tab didn't survive validation would leave the rail
@@ -321,7 +431,53 @@ export function markBrowserTabPopped(tabId: string, popped: boolean) {
   $poppedBrowserTabIds.set(next)
 }
 
-/** Preview tabs that still belong in the layout tree (not popped out). */
+/** WHOSE browser the rail is showing — the conversation the tabs belong to.
+ *
+ *  Lives here, with the rail it describes; `session-states` owns the RULE for
+ *  moving it, because that rule is about panes and focus. Keeping the atom on
+ *  this side of the line means the preview store still knows nothing about
+ *  sessions, which is what lets it be mocked and tested on its own. */
+export const $browserSessionId = atom<null | string>(null)
+
+/** Is this tab part of the browser the conversation `sessionId` is showing?
+ *
+ *  UNOWNED TABS ALWAYS ARE, and that arm is not a nicety — it is the whole
+ *  reason the last attempt at scoping this pane broke. Filtering the mirror by
+ *  workspace mode once dropped the pane out of Bot Mode entirely, so
+ *  `openPreview` ran and a clicked link looked like a no-op (see the note on
+ *  `watchPreviewTileMirror`). Everything a person opens themselves — a file
+ *  from the tree, an artifact card, a link in any chat — is unowned and belongs
+ *  to no conversation, so it stays visible from all of them. Only an agent's
+ *  own browser tabs are scoped, which is exactly what "this chat's browser"
+ *  means. */
+export function previewTabBelongsToSession(
+  tab: PreviewTab,
+  sessionId: null | string,
+  storedSessionId?: null | string
+): boolean {
+  // A RESTORED tab has only `ownerKey` — its runtime died with the last run.
+  // Matching the conversation's stored id is what keeps a browser with its own
+  // chat across a restart instead of spilling into all of them.
+  if (!tab.owner && tab.ownerKey) {
+    return !sessionId || (Boolean(storedSessionId) && tab.ownerKey === storedSessionId)
+  }
+
+  // No conversation established yet (first paint, a window with no chat
+  // focused): show everything. An empty rail is a worse answer than an
+  // unscoped one, and this is the state the Bot Mode regression lived in.
+  return !sessionId || !tab.owner || tab.owner === sessionId
+}
+
+/** Preview tabs that still belong in the layout tree (not popped out).
+ *
+ *  NOT scoped to a conversation, deliberately. This is what the pane mirror
+ *  registers from, and dropping a tab out of it calls `removeTreePane` — which
+ *  destroys the pane and the live page inside it. Scoping HERE would mean that
+ *  glancing at another chat tore down the page the first chat's agent was in
+ *  the middle of driving, losing its scroll, its form, its login, and then
+ *  reloading it on the way back. Every preview tab therefore stays registered;
+ *  which ones the STRIP shows is a visibility question, answered by hiding
+ *  panes (`syncBrowserSessionPanes`), which keeps them mounted. */
 export const $dockedPreviewTabs = computed([$previewTabs, $poppedBrowserTabIds], (tabs, popped) =>
   popped.size === 0 ? tabs : tabs.filter(tab => !popped.has(tab.id))
 )
@@ -354,15 +510,48 @@ function mintBrowserTabId(): RightRailTabId {
 /** The Browser a URL should open in: the one you're looking at, else the one
  *  you used last. A link from chat navigates the browser you already have
  *  rather than stacking another identical tab — new tabs are something you
- *  ask for (the strip's "+"), the way they are in a real browser. */
-function browserTabId(tabs: PreviewTab[]): RightRailTabId {
-  const active = tabs.find(tab => tab.id === $rightRailActiveTabId.get())
+ *  ask for (the strip's "+"), the way they are in a real browser.
+ *
+ *  THE AGENT IS NOT YOU. Re-using "the tab you're looking at" is right for a
+ *  link you clicked and wrong for a tool call: it silently replaced the page
+ *  the person was reading with wherever the agent went next (#93190). So an
+ *  agent open resolves against the agent's OWN tab and mints one when it has
+ *  none — it browses beside you rather than over you. It still re-uses that
+ *  one tab across a task, because a tab per navigation would bury the strip.
+ *
+ *  AND ANOTHER AGENT IS NOT THIS AGENT. "Its own tab" is per SESSION. Both
+ *  lookups below used to match any agent tab, so the second conversation to
+ *  open a page inherited the first one's tab — and because a browser tab id
+ *  once derived from the url, two chats opening the SAME address collided by
+ *  construction. Scoped to `sessionId`, a session with no tab of its own mints
+ *  one, which is what makes two conversations two browsers. */
+function browserTabId(
+  tabs: PreviewTab[],
+  source: PreviewRecordSource,
+  url?: string,
+  sessionId?: null | string
+): RightRailTabId {
+  if (source === 'tool-result') {
+    // Opening a page one of its own tabs already shows means "go back to that
+    // one" — the only way the agent can re-target a tab, and the reason
+    // `new_tab` is no longer a one-way door.
+    const holding = url
+      ? tabs.find(tab => agentOwns(tab, sessionId ?? null) && tab.target.url === url)
+      : undefined
+
+    return (holding ?? agentTab(tabs, sessionId ?? null))?.id ?? mintBrowserTabId()
+  }
+
+  // Only tabs this conversation can actually see. Navigating a browser that is
+  // filtered out of the strip is navigating a page nobody is looking at.
+  const visible = tabs.filter(tab => previewTabBelongsToSession(tab, sessionId ?? null))
+  const active = visible.find(tab => tab.id === $rightRailActiveTabId.get())
 
   if (active && isBrowserTab(active)) {
     return active.id
   }
 
-  return tabs.findLast(isBrowserTab)?.id ?? mintBrowserTabId()
+  return visible.findLast(isBrowserTab)?.id ?? mintBrowserTabId()
 }
 
 // Browsing files is "peek at the source"; a tool or an explicit link handing
@@ -382,15 +571,53 @@ function previewTargetForSource(target: PreviewTarget, source: PreviewRecordSour
 /** Open (or re-front) the tab for `target`. Re-opening an existing tab refreshes
  *  its target so a stale label/path can't outlive the thing it points at. The
  *  only way anything reaches a preview. */
-export function openPreview(target: PreviewTarget, source: PreviewRecordSource = 'manual') {
+export function openPreview(
+  target: PreviewTarget,
+  source: PreviewRecordSource = 'manual',
+  options: { newTab?: boolean; ownerKey?: null | string; reveal?: boolean; sessionId?: null | string } = {}
+) {
   const resolved = previewTargetForSource(target, source)
   const current = $previewTabs.get()
-  const id = resolved.kind === 'url' ? browserTabId(current) : previewTabId(resolved)
+  // `newTab` only means anything for a browser: file and artifact tabs are
+  // addressed by their content, so a second tab on the same file would be the
+  // same tab twice.
+  const fresh = options.newTab && resolved.kind === 'url'
+  const sessionId = options.sessionId ?? null
+
+  const id = fresh
+    ? mintBrowserTabId()
+    : resolved.kind === 'url'
+      ? browserTabId(current, source, resolved.url, sessionId)
+      : previewTabId(resolved)
+
   const index = current.findIndex(tab => tab.id === id)
-  const tab: PreviewTab = { id, target: resolved }
+  // Ownership is the tab's, not the target's: it decides who may navigate this
+  // tab later, so it has to outlive the open that created it. Sticky, because a
+  // person opening a link in the agent's tab is visiting, not taking it over.
+  const owned = current[index]?.agent || (resolved.kind === 'url' && source === 'tool-result')
+  // Which agent, not just "an agent". Sticky the same way: a person visiting
+  // the tab does not re-assign it, and an existing owner is not displaced by a
+  // later session — `browserTabId` only returns a tab this session already
+  // owns, so reaching here with a different owner means the user opened it.
+  const owner = owned ? (current[index]?.owner ?? sessionId ?? undefined) : undefined
+  const ownerKey = owned ? (current[index]?.ownerKey ?? options.ownerKey ?? undefined) : undefined
+  const tab: PreviewTab = owned
+    ? { agent: true, id, owner, ownerKey, target: resolved }
+    : { id, target: resolved }
+
+  if (owned) {
+    agentTabBySession.set(owner ?? UNSCOPED, id)
+  }
 
   $previewTabs.set(index === -1 ? [...current, tab] : current.map((item, i) => (i === index ? tab : item)))
-  selectRightRailTab(id)
+
+  // Selecting is a claim on the rail, and the rail is one surface. A background
+  // conversation opening a page must not yank you off the page you are reading
+  // — the caller knows whether its session is on screen, so it says. Anything
+  // the person did themselves (default) still fronts, as it always has.
+  if (options.reveal !== false) {
+    selectRightRailTab(id)
+  }
 }
 
 const blankPage = (): PreviewTarget => ({ kind: 'url', label: 'Browser', source: 'about:blank', url: 'about:blank' })
@@ -399,18 +626,37 @@ const blankPage = (): PreviewTarget => ({ kind: 'url', label: 'Browser', source:
  *  showing so the hotkey re-fronts your page instead of wiping it; with no
  *  browser open it lands on `about:blank`, where the pane's empty state
  *  invites an address. */
-export function openBrowserTab() {
-  const tabs = $previewTabs.get()
-  const current = tabs.find(tab => tab.id === browserTabId(tabs))
+export function openBrowserTab(sessionId: null | string = $browserSessionId.get()) {
+  // Point the rail at this conversation's browser BEFORE choosing a tab, or the
+  // tab we front is one the strip is about to filter away.
+  if (sessionId) {
+    $browserSessionId.set(sessionId)
+  }
 
-  openPreview(current?.target ?? blankPage())
+  const tabs = $previewTabs.get()
+  // This conversation's own tab first, then any browser it can see (a page you
+  // opened yourself is everyone's). Selected directly rather than routed back
+  // through `openPreview`: re-deriving the target's tab there resolved against
+  // the WHOLE list, so asking for an empty conversation's browser navigated
+  // whichever tab happened to be active — another chat's page — to about:blank.
+  const current = agentTab(tabs, sessionId) ?? tabs.filter(tab => previewTabBelongsToSession(tab, sessionId)).findLast(isBrowserTab)
+
+  if (current) {
+    selectRightRailTab(current.id)
+
+    return
+  }
+
+  newBrowserTab(sessionId)
 }
 
-/** Another Browser, always — the strip's "+". */
-export function newBrowserTab() {
+/** Another Browser, always — the strip's "+". It joins the browser you are
+ *  looking at, which is a conversation's, so it belongs to that conversation
+ *  rather than becoming a stray shared tab. */
+export function newBrowserTab(sessionId: null | string = $browserSessionId.get()) {
   const id = mintBrowserTabId()
 
-  $previewTabs.set([...$previewTabs.get(), { id, target: blankPage() }])
+  $previewTabs.set([...$previewTabs.get(), { agent: true, id, owner: sessionId ?? undefined, target: blankPage() }])
   selectRightRailTab(id)
 }
 

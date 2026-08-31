@@ -16376,6 +16376,68 @@ ipcMain.handle('hermes:context-menu:guest-add-word', (_event, payload) => {
   }
 })
 
+/**
+ * Tell one preview guest it is a different size.
+ *
+ * `scale` shrinks the emulated view into the space the pane actually has; the
+ * renderer sizes the element to match so nothing is letterboxed. Note that
+ * Chromium divides INJECTED input coordinates by this same scale — see
+ * `src/lib/preview-viewport.ts`, which is where the compensation lives.
+ */
+ipcMain.handle('hermes:preview:emulate-device', (event, payload) => {
+  const guest = electronWebContents.fromId(Number(payload?.webContentsId))
+
+  if (!guest || guest.isDestroyed()) {
+    return false
+  }
+
+  // A renderer may only resize a guest it actually hosts. The id arrives from
+  // the caller, so without this any window could letterbox another window's
+  // preview — or the main renderer itself — by guessing a number.
+  if (guest.hostWebContents?.id !== event.sender.id) {
+    return false
+  }
+
+  const metrics = payload?.metrics
+
+  try {
+    if (!metrics) {
+      guest.disableDeviceEmulation()
+
+      return true
+    }
+
+    const width = Math.max(1, Math.round(Number(metrics.width) || 0))
+    const height = Math.max(1, Math.round(Number(metrics.height) || 0))
+
+    // Deliberately NOT setZoomLevel(0) here. Pinning the guest to 1:1 looks
+    // like the obvious way to make "430px" honest, but Chromium keeps zoom
+    // PER ORIGIN, not per webContents: measured with two panes on one origin,
+    // pinning the emulated one dropped the untouched one to zoomLevel 0 too
+    // and its page jumped from 341 to 458 CSS px. It is also unnecessary —
+    // `deviceScaleFactor: 0` already resets the guest to the screen's own
+    // scale, so emulation lands correctly on its own once the frame is sized
+    // in the right unit (see preview-viewport.ts).
+    guest.enableDeviceEmulation({
+      // 0 keeps the real device pixel ratio: this emulates a viewport, not a
+      // screen density, and overriding DPR would change how sharp the preview
+      // looks for no reason the user asked for.
+      deviceScaleFactor: 0,
+      screenPosition: metrics.mobile ? 'mobile' : 'desktop',
+      screenSize: { height, width },
+      scale: Number(metrics.scale) > 0 ? Number(metrics.scale) : 1,
+      viewPosition: { x: 0, y: 0 },
+      viewSize: { height, width }
+    })
+
+    return true
+  } catch {
+    // A guest that went away mid-call is not an error worth surfacing; the
+    // next navigation re-applies from the renderer.
+    return false
+  }
+})
+
 ipcMain.handle('hermes:saveImageBuffer', async (_event, payload) => {
   const data = payload?.data
 

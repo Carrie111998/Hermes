@@ -479,11 +479,18 @@ def _(rid, params: dict) -> dict:
                                 "stored_session_id": str(live.get("session_key") or ""),
                                 "message_count": len(history),
                                 "messages": [] if omit_messages else _history_to_messages(history),
-                                "info": {
-                                    "model": _resolve_model(),
-                                    "lazy": True,
-                                    "profile_name": profile or "",
-                                },
+                                # Built, not hand-rolled: this is the same
+                                # not-yet-built shape the other lazy paths
+                                # return, and a partial one costs more than the
+                                # missing fields suggest. The desktop reads a
+                                # missing `desktop_contract` as "too old to
+                                # report it" — that is how it detects a genuinely
+                                # stale backend — so an info dict without it
+                                # raises "Backend out of date" on a backend that
+                                # is perfectly current.
+                                "info": _lazy_resume_info(
+                                    _session_cwd(live), profile=profile
+                                ),
                             },
                             live,
                         ),
@@ -2486,6 +2493,32 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, _serialize_usage_model(build_usage_model()))
     except Exception:
         return _ok(rid, {"ok": True, "available": False})
+
+
+@method("account.usage")
+def _(rid, params: dict) -> dict:
+    """Subscription usage across every authenticated provider.
+
+    Fans out over the providers this machine holds credentials for — Claude,
+    Codex, Kimi, OpenRouter, and anything a plugin adds — rather than
+    the one provider this session happens to use. Cached per provider with a
+    stale-while-revalidate read, and credential detection is memoized, so
+    reopening the panel costs a dict lookup; ``refresh: true`` is the manual
+    button and skips the cache.
+
+    Fail-open like its billing siblings, and no scope required — same as
+    ``billing.state`` / ``usage.bars`` / ``subscription.state``. Not quite
+    read-only, though: resolving a credential goes through ``load_pool()``,
+    which for some providers refreshes a token and writes it back. Detection
+    never does that (see ``agent.provider_usage``); only a provider that is
+    actually being fetched pays it.
+    """
+    try:
+        from agent.provider_usage import usage_payload
+
+        return _ok(rid, usage_payload(refresh=bool(params.get("refresh"))))
+    except Exception:
+        return _ok(rid, {"ok": True, "available": False, "providers": []})
 
 
 @method("subscription.state")

@@ -1188,14 +1188,50 @@ def _normalize_skill_description(frontmatter: Dict[str, Any]) -> str:
     return str(raw_desc).strip().strip("'\"") if raw_desc else ""
 
 
+# A truncated line should end where a thought ends. Below this many characters
+# a "sentence" is an abbreviation ("e.g.", "vs.") or a stub, not a summary, so
+# the word-boundary path handles it instead.
+_DESC_MIN_SENTENCE = 30
+
+_SENTENCE_ENDS = (". ", "! ", "? ", "; ")
+
+
 def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
-    """Extract a system-prompt-length description from parsed frontmatter."""
+    """Extract a system-prompt-length description from parsed frontmatter.
+
+    Long descriptions are cut to fit the index line, but WHERE they are cut
+    decides how much routing signal survives. A hard slice lands mid-word and
+    spends the budget on a fragment: skills on this machine rendered as
+    ``"... Scan..."``, ``"... Measu..."``, and — worst — ``"Create and review
+    Cloudflare Durable Objects. Use when bu..."``, cutting off the "use when"
+    clause that is the whole reason the line exists.
+
+    So: end on the last complete sentence that fits, else on the last whole
+    word, and only slice mid-word when the text offers neither. The sentence
+    case is usually SHORTER than the hard cut as well as more useful — a
+    complete first sentence is a legitimate summary, so it carries no ellipsis;
+    a mid-thought cut still does.
+    """
     desc = _normalize_skill_description(frontmatter)
     if not desc:
         return ""
-    if len(desc) > SKILL_PROMPT_DESC_LIMIT:
-        return desc[:SKILL_PROMPT_DESC_LIMIT - 3] + "..."
-    return desc
+    if len(desc) <= SKILL_PROMPT_DESC_LIMIT:
+        return desc
+
+    # +1 so a sentence whose terminator lands exactly on the limit still counts
+    # (the space after it is what we search for, and it may sit past the edge).
+    head = desc[: SKILL_PROMPT_DESC_LIMIT + 1]
+
+    cut = max((head.rfind(end) for end in _SENTENCE_ENDS), default=-1)
+    if cut >= _DESC_MIN_SENTENCE:
+        return desc[: cut + 1]
+
+    body = desc[: SKILL_PROMPT_DESC_LIMIT - 3]
+    space = body.rfind(" ")
+    if space >= _DESC_MIN_SENTENCE:
+        return body[:space].rstrip(" ,;:-") + "..."
+
+    return body + "..."
 
 
 def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bool:

@@ -205,4 +205,60 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
     expect($sessionTiles.get()[0]?.runtimeId).toBe(RECOVERED_SESSION_ID)
     expect($activeSessionId.get()).toBe('foreground-runtime')
   })
+
+  /**
+   * The chip is a summary; the payload is the thing.
+   *
+   * `pinCommentBlock` and `reviewCommentBlock` were unit-tested and green
+   * while the send path joined `a.refText` raw, so the model received the
+   * literal string "1 preview comment" and could only ask what was meant.
+   * This asserts the WIRE text, which is the only place that failure was
+   * visible — a pure-function test cannot see it.
+   */
+  it('sends a preview-pin attachment as its comments block, not its chip text', async () => {
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+
+    requestGatewayMock.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      return {}
+    })
+
+    const pins = [
+      {
+        anchor: { label: 'Capacity and reach', path: 'body>main>h1', role: 'heading', selector: 'h1.hero-title' },
+        comment: 'this heading is too close to the top bar',
+        createdAt: 1,
+        id: 'pin-1',
+        kind: 'element',
+        pageUrl: 'http://127.0.0.1:8080/en/about/numbers/',
+        resolved: false
+      }
+    ]
+
+    const { result } = renderTileActions()
+
+    await act(async () => {
+      await result.current.submitText('', {
+        attachments: [
+          {
+            detail: JSON.stringify(pins),
+            id: 'pins:pin-1',
+            kind: 'pins',
+            label: '1 comment',
+            refText: '1 preview comment'
+          }
+        ]
+      } as never)
+    })
+
+    const text = String(calls.find(c => c.method === 'prompt.submit')?.params?.text ?? '')
+
+    expect(text).toContain('```preview-comments')
+    // The three things the user could not act without: which page, which
+    // element, and what they said about it.
+    expect(text).toContain('http://127.0.0.1:8080/en/about/numbers/')
+    expect(text).toContain('h1.hero-title')
+    expect(text).toContain('this heading is too close to the top bar')
+  })
 })

@@ -2,7 +2,7 @@ import { createContext, type ReactNode, useCallback, useContext, useEffect, useM
 
 import { getHermesConfigRecord, type HermesConfigRecord, saveHermesConfig } from '@/hermes'
 
-import { TRANSLATIONS } from './catalog'
+import { DEFAULT_TRANSLATIONS, loadTranslations, translationsFor } from './catalog'
 import { DEFAULT_LOCALE, localeConfigValue, normalizeLocale } from './languages'
 import { setRuntimeI18nLocale } from './runtime'
 import type { Locale, Translations } from './types'
@@ -83,7 +83,7 @@ const I18nContext = createContext<I18nContextValue>({
   locale: DEFAULT_LOCALE,
   saveError: null,
   setLocale: async () => {},
-  t: TRANSLATIONS[DEFAULT_LOCALE]
+  t: DEFAULT_TRANSLATIONS
 })
 
 export interface I18nProviderProps {
@@ -100,11 +100,68 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
   const [saveError, setSaveError] = useState<Error | null>(null)
   const localeRef = useRef(locale)
 
+  // Non-English message trees are separate chunks (see catalog.ts), so the
+  // tree for a locale can arrive an import after the locale itself is chosen.
+  // Locale and messages are therefore held TOGETHER: `dir`/`lang` and the copy
+  // on screen must never disagree.
+  //
+  // Splitting them is a real bug in RTL, not a cosmetic one. `ar` sets
+  // `dir="rtl"`; if direction followed `locale` while the copy waited on the
+  // chunk, the whole layout would mirror around English text and then swap
+  // again — a visible flip, not the invisible late-text swap LTR locales get.
+  //
+  // `applied` therefore only advances once a tree is in hand. Until then the
+  // previous locale keeps rendering, so a switch reads as one transition
+  // rather than a bounce through English.
+  // An already-loaded tree resolves DURING render, not in an effect. English
+  // is always loaded, so falling back to it (a failed config read, an
+  // unsupported `display.language`) stays a single synchronous commit — going
+  // through state there would leave one frame of the previous language on
+  // screen after the app had already decided on English.
+  //
+  // State only carries trees that arrive asynchronously; once `loadTranslations`
+  // caches one, `translationsFor` sees it on the very next render and this
+  // fallback stops being consulted.
+  const [asyncLoaded, setAsyncLoaded] = useState<{ locale: Locale; messages: Translations }>(() => ({
+    locale: DEFAULT_LOCALE,
+    messages: DEFAULT_TRANSLATIONS
+  }))
+
+  const readyMessages = translationsFor(locale)
+  const applied = readyMessages ? { locale, messages: readyMessages } : asyncLoaded
+
+  useEffect(() => {
+    if (translationsFor(locale)) {
+      return
+    }
+
+    let cancelled = false
+
+    void loadTranslations(locale).then(loadedMessages => {
+      if (!cancelled && loadedMessages) {
+        setAsyncLoaded({ locale, messages: loadedMessages })
+      }
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [locale])
+
+  // Document direction follows `applied`, not `locale`, for the reason above.
+  // `runtimeLocale` too: translateNow resolves against the loaded catalog, so
+  // pointing it at a locale whose chunk has not landed would just return
+  // English while the surrounding UI already claimed that locale.
+  useEffect(() => {
+    setRuntimeI18nLocale(applied.locale)
+    applyDocumentLocale(applied.locale)
+  }, [applied.locale])
+
+  // The rollback target in `setLocale` is the user's SELECTION, so this ref
+  // tracks `locale` — not `applied.locale`, which may still be a tick behind.
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     localeRef.current = locale
-    setRuntimeI18nLocale(locale)
-    applyDocumentLocale(locale)
   }, [locale])
 
   useEffect(() => {
@@ -183,9 +240,9 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
       locale,
       saveError,
       setLocale,
-      t: TRANSLATIONS[locale]
+      t: applied.messages
     }),
-    [configLoadError, isLoadingConfig, isSavingLocale, locale, saveError, setLocale]
+    [applied.messages, configLoadError, isLoadingConfig, isSavingLocale, locale, saveError, setLocale]
   )
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>

@@ -12,19 +12,27 @@
  * directly (read_file / the conversation's artifact).
  */
 
-import { $rightRailActiveTabId } from '@/store/layout'
-import { $previewTabs } from '@/store/preview'
+import { $previewTabs, agentPreviewTabId } from '@/store/preview'
 
+import { type ConsoleDigest, consoleDigest } from './preview-console-digest'
 import { nudgeOverlay } from './preview-nudge'
 
 export interface PreviewReadOptions {
   /** Characters to return from `start` (capped at PREVIEW_READ_MAX_CHARS). */
   count?: number
+  /** Runtime session doing the reading. Without it a read resolves to any
+   *  agent tab, so one conversation answers from another's page — the same
+   *  cross-tab silence described below, one conversation over. */
+  sessionId?: null | string
   /** 0-indexed character offset into the page text. */
   start?: number
 }
 
 export interface PreviewReadResult {
+  /** The page's console. Present for live web pages; a file peek has none.
+   *  Carried on every read because an error the agent never asked about is an
+   *  error it never finds — see preview-console-digest.ts. */
+  console?: ConsoleDigest
   end: number
   kind: string
   note?: string
@@ -75,10 +83,24 @@ function windowText(
   return { ...base, end: to, start: from, text: text.slice(from, to), total_chars: total }
 }
 
-/** Read the ACTIVE preview tab. Null only when no tab is open at all. */
+/**
+ * Read the tab the agent is working in. Null only when no tab is open at all.
+ *
+ * NOT the active tab. Reads used to follow focus, which was right while the
+ * agent had no tab of its own — "what does this page say?" meant the one on
+ * screen. Once it got its own tab that stopped being true and started being
+ * dangerous: `drive_preview` acted on the agent's tab while `read_preview`
+ * answered from whichever tab the user had clicked, so the agent could click
+ * in one page and then read, reason about and report on another, silently.
+ *
+ * `agentPreviewTabId` still falls back to the active tab when the agent owns
+ * none, so the focus-following behaviour survives for exactly the case it was
+ * written for.
+ */
 export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<PreviewReadResult | null> {
   const tabs = $previewTabs.get()
-  const tab = tabs.find(t => t.id === $rightRailActiveTabId.get()) ?? tabs[0]
+  const tabId = agentPreviewTabId(opts.sessionId ?? null)
+  const tab = tabs.find(t => t.id === tabId) ?? tabs[0]
 
   if (!tab) {
     return null
@@ -96,10 +118,16 @@ export async function readActivePreview(opts: PreviewReadOptions = {}): Promise<
       // side of it — so a run of reads used to leave the pane dark for the
       // twenty seconds it took to page through a document, immediately after
       // the one moment that showed anything.
-      nudgeOverlay('read')
+      nudgeOverlay('read', opts.sessionId ?? null)
 
       return windowText(
-        { kind: target.kind, path: target.path, title: page.title || target.label, url: page.url || target.url },
+        {
+          console: consoleDigest(tab.id),
+          kind: target.kind,
+          path: target.path,
+          title: page.title || target.label,
+          url: page.url || target.url
+        },
         page.text,
         opts
       )

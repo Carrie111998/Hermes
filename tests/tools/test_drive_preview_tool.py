@@ -34,6 +34,34 @@ def test_interaction_verbs_need_a_target():
         assert "ref" in result["error"], verb
 
 
+def test_navigate_needs_a_url():
+    """Going nowhere is a mistake worth naming before the bridge round-trips."""
+    result = json.loads(ap.drive_preview_tool(action="navigate", callback=lambda _p: "{}"))
+    assert "url" in result["error"]
+
+
+def test_navigate_carries_the_address_through():
+    """The verb is only useful if the address survives to the renderer."""
+    calls = []
+
+    result = json.loads(
+        ap.drive_preview_tool(
+            action="navigate",
+            url="https://example.com",
+            callback=lambda payload: calls.append(payload) or '{"success": true}',
+        )
+    )
+
+    assert calls == [{"action": "navigate", "url": "https://example.com"}]
+    assert result["success"] is True
+
+
+def test_navigate_is_offered_to_the_model():
+    """An action the schema does not list is one the model never calls."""
+    assert "navigate" in ap.ACT_PREVIEW_SCHEMA["parameters"]["properties"]["action"]["enum"]
+    assert "url" in ap.ACT_PREVIEW_SCHEMA["parameters"]["properties"]
+
+
 def test_type_needs_text_and_press_needs_a_key():
     calls = []
 

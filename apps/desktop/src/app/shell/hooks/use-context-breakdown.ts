@@ -1,16 +1,23 @@
-import { useEffect, useState } from 'react'
+import { useStore } from '@nanostores/react'
+import { useEffect } from 'react'
 
+import {
+  $contextBreakdownBySession,
+  contextBreakdownFor,
+  type GatewayRequest,
+  refreshContextBreakdown
+} from '@/store/context-breakdown'
 import type { ContextBreakdown } from '@/types/hermes'
 
 interface ContextBreakdownOptions {
   busy: boolean
   enabled: boolean
-  requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
+  requestGateway: GatewayRequest
   sessionId: null | string
 }
 
-/** The focused session's context breakdown, fetched as soon as the statusbar
- *  gauge is on screen rather than when its popover opens.
+/** The focused session's context breakdown, fetched as soon as a surface that
+ *  shows the gauge is on screen rather than when its popover opens.
  *
  *  The backend only reports measured context occupancy (`last_prompt_tokens`)
  *  once a turn has run in THIS process, so a resumed session reports none —
@@ -21,12 +28,14 @@ interface ContextBreakdownOptions {
  *  prompt-cache impact.
  *
  *  Refetches when the focused session changes and when a turn ends (the
- *  transcript just grew). Held keyed by the session it describes so switching
- *  sessions drops the previous numbers instead of painting them under the new
- *  session's name. */
-export function useContextBreakdown({ busy, enabled, requestGateway, sessionId }: ContextBreakdownOptions) {
-  const [fetched, setFetched] = useState<{ breakdown: ContextBreakdown; sessionId: string } | null>(null)
-  const [loading, setLoading] = useState(false)
+ *  transcript just grew). The result lives in a shared per-session store, so
+ *  a second gauge on screen reads the same answer instead of issuing its own
+ *  request, and the numbers survive a remount. */
+export function useContextBreakdown({ busy, enabled, requestGateway, sessionId }: ContextBreakdownOptions): {
+  breakdown: ContextBreakdown | null
+  loading: boolean
+} {
+  const bySession = useStore($contextBreakdownBySession)
 
   useEffect(() => {
     // Mid-turn the transcript changes on every delta and the gateway already
@@ -35,29 +44,10 @@ export function useContextBreakdown({ busy, enabled, requestGateway, sessionId }
       return
     }
 
-    let cancelled = false
-    setLoading(true)
-
-    void requestGateway<ContextBreakdown>('session.context_breakdown', { session_id: sessionId })
-      .then(breakdown => {
-        if (!cancelled && breakdown) {
-          setFetched({ breakdown, sessionId })
-        }
-      })
-      .catch(() => undefined)
-      .finally(() => {
-        if (!cancelled) {
-          setLoading(false)
-        }
-      })
-
-    return () => {
-      cancelled = true
-    }
+    void refreshContextBreakdown(sessionId, requestGateway)
   }, [busy, enabled, requestGateway, sessionId])
 
-  return {
-    breakdown: fetched && fetched.sessionId === sessionId ? fetched.breakdown : null,
-    loading
-  }
+  const { breakdown, loading } = contextBreakdownFor(sessionId, bySession)
+
+  return { breakdown, loading }
 }

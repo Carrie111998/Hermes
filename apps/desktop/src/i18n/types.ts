@@ -6,6 +6,7 @@
 // fall back to English while new keys remain type-checked.
 
 import type { TipId } from '@/lib/tips/catalog'
+import type { ProviderUsageState } from '@/types/hermes'
 
 export type Locale = 'en' | 'zh' | 'zh-hant' | 'ja' | 'ar'
 
@@ -2065,6 +2066,13 @@ export interface Translations {
     queueResumeTip: string
     queueStuckTitle: string
     queueStuckBody: string
+    queueStuckBodyIn: (title: string) => string
+    queueStuckAction: string
+    queueLostTitle: string
+    queueLostBody: (count: number) => string
+    queueLostAction: string
+    queueRecovered: (count: number) => string
+    queueRecoveredNothing: string
     previewUnavailable: string
     previewLabel: (label: string) => string
     couldNotPreview: (label: string) => string
@@ -2472,6 +2480,7 @@ export interface Translations {
       openCommandCenter: string
       showTerminal: string
       hideTerminal: string
+      showBrowser: string
       gateway: string
       gatewayReady: string
       gatewayNeedsSetup: string
@@ -2490,6 +2499,7 @@ export interface Translations {
       toggleContextUsage: string
       toggleRunningTimer: string
       toggleSessionTimer: string
+      toggleBrowser: string
       toggleTerminal: string
       toggleVersion: string
       toggleWorkspace: string
@@ -2507,9 +2517,24 @@ export interface Translations {
       openStarmap: string
       turnRunning: string
       contextUsage: string
+      accountUsagePanel: {
+        empty: string
+        loading: string
+        refresh: string
+        resetsAt: (when: string) => string
+        // Exhaustive on purpose: the panel renders `states[snapshot.state]`
+        // with no fallback, so a state added on the Python side would paint a
+        // blank line in three locales. This turns that into a build failure.
+        states: Record<ProviderUsageState, string>
+        title: string
+        windows: Record<string, string>
+      }
+      accountUsage: string
+      toggleAccountUsage: string
       contextUsagePanel: {
         categories: {
           conversation: string
+          files: string
           mcp: string
           memory: string
           rules: string
@@ -2518,6 +2543,7 @@ export interface Translations {
           system_prompt: string
           tool_definitions: string
         }
+        categoryCount: (count: number) => string
         empty: string
         loading: string
         percentFull: (percent: number) => string

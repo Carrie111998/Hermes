@@ -1,23 +1,34 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import type { ComposerAttachment } from './composer'
+import { $composerAttachments, $composerDraft, type ComposerAttachment } from './composer'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  $stuckQueueEntries,
+  clearDrainFailure,
   clearQueuedPrompts,
   dequeueQueuedPrompt,
   enqueueQueuedPrompt,
   getQueuedPrompts,
+  hasExhaustedDrain,
   isQueueParked,
+  MAX_AUTO_DRAIN_ATTEMPTS,
   migrateQueuedPrompts,
+  noteDrainFailure,
+  noteQueueStuck,
   parkQueuedPrompts,
   promoteQueuedPrompt,
+  queueStuckNoticeId,
+  recoverQueuedPrompts,
   removeQueuedPrompt,
+  resetQueueDrainState,
+  resolveQueueStuck,
   shouldAutoDrain,
   unparkQueuedPrompts,
   updateQueuedPrompt,
   updateQueuedPromptText
 } from './composer-queue'
+import { $notifications, notify } from './notifications'
 
 const SESSION_KEY = 'session-abc'
 const QUEUE_STORAGE_KEY = 'hermes.desktop.composerQueue.v1'
@@ -35,6 +46,10 @@ describe('composer queue store', () => {
   beforeEach(() => {
     window.localStorage.removeItem(QUEUE_STORAGE_KEY)
     $queuedPromptsBySession.set({})
+    resetQueueDrainState()
+    $notifications.set([])
+    $composerDraft.set('')
+    $composerAttachments.set([])
   })
 
   it('queues prompts in FIFO order', () => {
@@ -258,5 +273,155 @@ describe('parked queue sessions', () => {
     migrateQueuedPrompts('rt-old', 'rt-new')
 
     expect(isQueueParked('rt-new')).toBe(false)
+  })
+})
+
+describe('the stuck-queue alarm', () => {
+  beforeEach(() => {
+    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+    $queuedPromptsBySession.set({})
+    resetQueueDrainState()
+    $notifications.set([])
+    $composerDraft.set('')
+    $composerAttachments.set([])
+  })
+
+  const raise = (sessionKey: string, entryId: string) => {
+    noteQueueStuck(sessionKey, entryId)
+    notify({ id: queueStuckNoticeId(sessionKey), kind: 'error', message: 'stuck' })
+  }
+
+  it('comes down when the entry it named is sent', () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'eventually sends' })!
+    raise(SESSION_KEY, entry.id)
+
+    removeQueuedPrompt(SESSION_KEY, entry.id)
+
+    // The old alarm was an error toast, so its duration was 0 and nothing ever
+    // dismissed it: it outlived the problem and sat there for the rest of the
+    // session with no way to act on it.
+    expect($notifications.get()).toHaveLength(0)
+    expect($stuckQueueEntries.get()[SESSION_KEY]).toBeUndefined()
+  })
+
+  it('comes down when the queue is cleared out from under it', () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'deleted instead' })!
+    raise(SESSION_KEY, entry.id)
+
+    clearQueuedPrompts(SESSION_KEY)
+
+    expect($notifications.get()).toHaveLength(0)
+  })
+
+  it('stays up while its own entry is still queued behind a newer one', () => {
+    const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'still stuck' })!
+    raise(SESSION_KEY, entry.id)
+
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'queued after' })
+
+    expect($notifications.get()).toHaveLength(1)
+  })
+
+  it('is per session, so two stuck chats do not collapse into one nameless alarm', () => {
+    expect(queueStuckNoticeId('a')).not.toBe(queueStuckNoticeId('b'))
+  })
+
+  it('resolving a session that never alarmed is a no-op', () => {
+    notify({ id: 'unrelated', kind: 'info', message: 'keep me' })
+
+    resolveQueueStuck(SESSION_KEY)
+
+    expect($notifications.get()).toHaveLength(1)
+  })
+})
+
+describe('drain failure bookkeeping', () => {
+  beforeEach(() => resetQueueDrainState())
+
+  it('gives up only after the full budget', () => {
+    for (let attempt = 1; attempt < MAX_AUTO_DRAIN_ATTEMPTS; attempt += 1) {
+      expect(noteDrainFailure('entry-1')).toBe(attempt)
+      expect(hasExhaustedDrain('entry-1')).toBe(false)
+    }
+
+    expect(noteDrainFailure('entry-1')).toBe(MAX_AUTO_DRAIN_ATTEMPTS)
+    expect(hasExhaustedDrain('entry-1')).toBe(true)
+  })
+
+  it('survives what a component does not', () => {
+    // The counter used to be a ref on ChatBar. A session switch, a reconnect or
+    // a restart remounted it and wiped the count while the queue itself lives
+    // in localStorage — so every remount bought four more attempts and one more
+    // identical toast, forever. Module scope is the whole fix.
+    for (let attempt = 0; attempt < MAX_AUTO_DRAIN_ATTEMPTS; attempt += 1) {
+      noteDrainFailure('entry-2')
+    }
+
+    expect(hasExhaustedDrain('entry-2')).toBe(true)
+  })
+
+  it('a manual send buys a fresh budget', () => {
+    for (let attempt = 0; attempt < MAX_AUTO_DRAIN_ATTEMPTS; attempt += 1) {
+      noteDrainFailure('entry-3')
+    }
+
+    clearDrainFailure('entry-3')
+
+    expect(hasExhaustedDrain('entry-3')).toBe(false)
+  })
+
+  it('counts each entry separately', () => {
+    noteDrainFailure('entry-4')
+
+    expect(hasExhaustedDrain('entry-5')).toBe(false)
+  })
+})
+
+describe('recovering an undeliverable queue', () => {
+  beforeEach(() => {
+    window.localStorage.removeItem(QUEUE_STORAGE_KEY)
+    $queuedPromptsBySession.set({})
+    resetQueueDrainState()
+    $composerDraft.set('')
+    $composerAttachments.set([])
+  })
+
+  it('hands the text and its attachments back to the composer', () => {
+    enqueueQueuedPrompt('dead-key', { attachments: [attachment('shot.png', 'image')], text: 'fix the card corner' })
+    enqueueQueuedPrompt('dead-key', { attachments: [], text: 'and the section below' })
+
+    expect(recoverQueuedPrompts('dead-key')).toBe(2)
+
+    expect($composerDraft.get()).toContain('fix the card corner')
+    expect($composerDraft.get()).toContain('and the section below')
+    expect($composerAttachments.get().map(a => a.id)).toEqual(['shot.png'])
+  })
+
+  it('empties the bucket, so the words are not recovered twice', () => {
+    enqueueQueuedPrompt('dead-key', { attachments: [], text: 'once only' })
+
+    recoverQueuedPrompts('dead-key')
+
+    expect(getQueuedPrompts('dead-key')).toHaveLength(0)
+    expect(recoverQueuedPrompts('dead-key')).toBe(0)
+  })
+
+  it('recovers what the user wrote, not the expansion that would have been sent', () => {
+    // A queued `/skill` carries its whole expanded body as `text`; dropping
+    // that into a composer is not handing anyone their message back.
+    enqueueQueuedPrompt('dead-key', {
+      attachments: [],
+      displayText: '/review',
+      text: 'the entire expanded skill body'
+    })
+
+    recoverQueuedPrompts('dead-key')
+
+    expect($composerDraft.get()).toBe('/review')
+  })
+
+  it('is a no-op for a key with nothing queued', () => {
+    expect(recoverQueuedPrompts('nothing-here')).toBe(0)
+    expect(recoverQueuedPrompts(null)).toBe(0)
   })
 })

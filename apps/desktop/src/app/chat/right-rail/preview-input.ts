@@ -12,13 +12,15 @@
  * webContents does not reach a guest (electron/electron#20333), which is why
  * this is a per-pane registry rather than something main could do.
  *
- * Coordinates are relative to the webview, and the webview IS the guest
- * viewport — so a rect the act engine measured inside the page needs no
- * conversion on the way back out.
+ * Coordinates are relative to the webview and are the GUEST's own pixels, so a
+ * rect the act engine measured inside the page needs no conversion for app
+ * zoom on the way back out. It does need one for device emulation: Chromium
+ * divides injected coordinates by the emulation scale, which is what
+ * `toWidgetPoint` puts back (see lib/preview-viewport.ts).
  */
 
 import { $rightRailActiveTabId } from '@/store/layout'
-import { $previewTabs } from '@/store/preview'
+import { $previewTabs, agentPreviewTabId } from '@/store/preview'
 
 /** The subset of Electron's input events the agent needs to drive a page. */
 export type PreviewInputEvent =
@@ -46,8 +48,16 @@ export function registerPreviewInput(tabId: string, handle: PreviewInputHandle):
   }
 }
 
-/** The ACTIVE preview tab's input channel. Null = nothing real to drive, and
- *  the caller falls back to synthesizing events inside the page. */
+/** The AGENT's tab's input channel — its own, so real Chromium input never
+ *  lands on the page you are reading. Null = nothing real to drive, and the
+ *  caller falls back to synthesizing events inside the page. */
+export function agentPreviewInput(sessionId: null | string): PreviewInputHandle | null {
+  const id = agentPreviewTabId(sessionId)
+
+  return (id && handles.get(id)) || null
+}
+
+/** The ACTIVE preview tab's input channel. */
 export function activePreviewInput(): PreviewInputHandle | null {
   const tabs = $previewTabs.get()
   const tab = tabs.find(t => t.id === $rightRailActiveTabId.get()) ?? tabs[0]

@@ -273,6 +273,13 @@ declare global {
       /** Add a word to the spell-check dictionary of a webview guest's
        *  session (the tag exposes no session API). */
       contextMenuGuestAddWord?: (payload: { webContentsId: number; word: string }) => Promise<void>
+      /** Device emulation for a preview webview guest. `metrics: null` clears
+       *  it. Only the main process can reach a guest's webContents, and the
+       *  <webview> tag exposes no emulation API of its own. */
+      previewEmulateDevice?: (payload: {
+        metrics: null | { height: number; mobile: boolean; scale: number; width: number }
+        webContentsId: number
+      }) => Promise<boolean>
       /** Spell-check facts for the gesture that opened the current menu;
        *  fires shortly after the DOM contextmenu event. */
       onContextMenuSpellcheck?: (

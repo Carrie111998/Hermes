@@ -99,6 +99,11 @@ class ProviderProfile:
     )
     # empty = use main model
 
+    # How long a usage snapshot from ``fetch_usage`` stays fresh, in seconds.
+    # Match it to how fast the provider's own numbers move: a 5-hour rolling
+    # window does not need minute polling, a credit balance moves per request.
+    usage_ttl: int = 300
+
     # ── Hooks (override in subclass for complex providers) ───
 
     def resolve_aux_model(self, *, vision: bool = False) -> str:
@@ -193,6 +198,37 @@ class ProviderProfile:
         per-model.
         """
         return self.default_max_tokens
+
+    def fetch_usage(
+        self,
+        *,
+        credential: Any = None,
+        base_url: str | None = None,
+        timeout: float = 8.0,
+    ) -> Any:
+        """Fetch subscription/plan usage, or None when there is nothing to fetch.
+
+        Returns an ``agent.provider_usage_types.ProviderUsage``. Returning None
+        (the default) means this provider exposes no usage endpoint — the
+        normal answer for most of the registry, and NOT an error.
+
+        ``credential`` is a resolved ``agent.credential_pool.PooledCredential``,
+        supplied by the aggregator. It is deliberately not a bare ``api_key``:
+        Anthropic's usage endpoint needs an OAuth token specifically, Codex
+        needs its own runtime credentials, and Copilot needs the *exchanged*
+        token — so a bare key would force every plugin to call ``load_pool()``
+        itself. ``load_pool()`` is not side-effect free (it can trigger the
+        Copilot token exchange and write state), so credential resolution
+        happens exactly once, in the aggregator. **Implementations must not
+        call it.**
+
+        Implementations should raise on transport/HTTP failures and let the
+        aggregator classify them into a typed state; they only need to return
+        the happy-path snapshot.
+
+        See ``plugins/model-providers/README.md`` for a worked example.
+        """
+        return None
 
     def supported_reasoning_efforts(
         self, model: str | None

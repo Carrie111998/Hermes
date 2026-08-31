@@ -97,10 +97,13 @@ describe('preview store', () => {
     expect($previewTabs.get()[0].target.label).toBe('Item')
   })
 
+  // Opened the way a person opens pages. An agent open deliberately does NOT
+  // land in the tab you just added — it keeps to its own; see
+  // preview-agent-tab.test.ts.
   it('opens more than one Browser on request, each holding its own page', () => {
-    openPreview(urlTarget('https://news.ycombinator.com'), 'tool-result')
+    openPreview(urlTarget('https://news.ycombinator.com'), 'explicit-link')
     newBrowserTab()
-    openPreview(urlTarget('https://www.reddit.com'), 'tool-result')
+    openPreview(urlTarget('https://www.reddit.com'), 'explicit-link')
 
     const urlTabs = $previewTabs.get().filter(tab => tab.target.kind === 'url')
 

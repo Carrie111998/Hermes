@@ -2613,6 +2613,13 @@ export const zh: Translations = {
     queueResumeTip: '已被停止操作暂停 — 继续发送排队的回合',
     queueStuckTitle: '排队消息未发送',
     queueStuckBody: '排队的对话多次发送失败。它仍在队列中，请重试发送。',
+    queueStuckBodyIn: title => `“${title}”中排队的对话多次发送失败。它仍在队列中。`,
+    queueStuckAction: '重新发送',
+    queueLostTitle: '来自已消失聊天的排队消息',
+    queueLostBody: count => `有 ${count} 条消息排队在一个已不存在的聊天中，永远无法发送。要恢复到输入框吗？`,
+    queueLostAction: '恢复文本',
+    queueRecovered: count => `已将 ${count} 条消息恢复到输入框。`,
+    queueRecoveredNothing: '没有可恢复的内容。',
     previewUnavailable: '预览不可用',
     previewLabel: label => `预览 ${label}`,
     couldNotPreview: label => `无法预览 ${label}`,
@@ -3068,6 +3075,7 @@ export const zh: Translations = {
       closeCommandCenter: '关闭命令中心',
       openCommandCenter: '打开命令中心',
       showTerminal: '显示终端',
+      showBrowser: '打开浏览器',
       hideTerminal: '隐藏终端',
       gateway: '网关',
       gatewayReady: '就绪',
@@ -3087,6 +3095,7 @@ export const zh: Translations = {
       toggleContextUsage: '上下文用量',
       toggleRunningTimer: '回合计时',
       toggleSessionTimer: '会话计时',
+      toggleBrowser: '浏览器',
       toggleTerminal: '终端',
       toggleVersion: '版本与更新',
       toggleWorkspace: '工作区',
@@ -3104,9 +3113,35 @@ export const zh: Translations = {
       openStarmap: '打开记忆图谱',
       turnRunning: '运行中',
       contextUsage: '上下文用量',
+      accountUsagePanel: {
+        empty: '没有已连接的订阅',
+        loading: '正在检查套餐…',
+        refresh: '刷新',
+        resetsAt: when => `${when} 重置`,
+        states: {
+          network_error: '无法连接到该提供方',
+          no_usage_endpoint: '该提供方没有套餐数据',
+          not_authenticated: '未登录',
+          ok: '',
+          parse_error: '提供方返回了意外响应',
+          rate_limited: '已限流 — 请稍后再试',
+          unauthorized: '登录已过期'
+        },
+        title: '套餐用量',
+        windows: {
+          '5h': '5 小时窗口',
+          '7d': '每周窗口',
+          credits: '额度',
+          key_limit: 'API 密钥额度',
+          period: '账单周期'
+        }
+      },
+      accountUsage: '套餐',
+      toggleAccountUsage: '显示套餐用量',
       contextUsagePanel: {
         categories: {
           conversation: '对话',
+          files: '文件',
           mcp: 'MCP',
           memory: '记忆',
           rules: '规则',
@@ -3115,6 +3150,7 @@ export const zh: Translations = {
           system_prompt: '系统提示词',
           tool_definitions: '工具定义'
         },
+        categoryCount: count => `${count} 个文件`,
         empty: '暂无上下文数据',
         loading: '正在加载明细…',
         percentFull: percent => `已用 ${percent}%`,

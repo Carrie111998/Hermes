@@ -49,7 +49,10 @@ describe('I18nProvider', () => {
     )
 
     expect(screen.getByTestId('locale').textContent).toBe('zh')
-    expect(screen.getByTestId('label').textContent).toBe('语言')
+    // The locale applies immediately; its message tree is a separate chunk
+    // (catalog.ts) and lands a tick later, so assert on the rendered text
+    // rather than on the same tick as the locale switch.
+    await waitFor(() => expect(screen.getByTestId('label').textContent).toBe('语言'))
 
     fireEvent.click(screen.getByRole('button', { name: 'switch' }))
 
@@ -72,7 +75,7 @@ describe('I18nProvider', () => {
     await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
 
     expect(screen.getByTestId('locale').textContent).toBe('zh')
-    expect(screen.getByTestId('label').textContent).toBe('语言')
+    await waitFor(() => expect(screen.getByTestId('label').textContent).toBe('语言'))
     expect(configClient.saveConfig).not.toHaveBeenCalled()
   })
 
@@ -110,7 +113,7 @@ describe('I18nProvider', () => {
     await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
 
     expect(screen.getByTestId('locale').textContent).toBe('zh-hant')
-    expect(screen.getByTestId('save').textContent).toBe('儲存')
+    await waitFor(() => expect(screen.getByTestId('save').textContent).toBe('儲存'))
     expect(configClient.saveConfig).not.toHaveBeenCalled()
   })
 
@@ -129,7 +132,7 @@ describe('I18nProvider', () => {
     await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
 
     expect(screen.getByTestId('locale').textContent).toBe('ja')
-    expect(screen.getByTestId('save').textContent).toBe('保存')
+    await waitFor(() => expect(screen.getByTestId('save').textContent).toBe('保存'))
     expect(configClient.saveConfig).not.toHaveBeenCalled()
   })
 
@@ -209,6 +212,20 @@ describe('I18nProvider', () => {
     expect(screen.getByTestId('locale').textContent).toBe('ja')
   })
 
+  // Direction and copy must never disagree. Arabic's message tree is a
+  // separate chunk (catalog.ts), so if `dir` followed the SELECTED locale
+  // while the copy waited on that import, the layout would mirror around
+  // English text and then swap again — a visible flip, not the invisible
+  // late-text swap an LTR locale gets. Asserting only the settled state
+  // (waitFor on the final text) cannot see that window; this checks the
+  // invariant holds at every step through it.
+  function directionMatchesCopy(): boolean {
+    const isRtl = document.documentElement.dir === 'rtl'
+    const isArabic = screen.getByTestId('label').textContent !== 'Language'
+
+    return isRtl === isArabic
+  }
+
   it('applies RTL direction for Arabic and restores LTR on switch back', async () => {
     render(
       <I18nProvider configClient={null} initialLocale="ar">
@@ -216,15 +233,20 @@ describe('I18nProvider', () => {
       </I18nProvider>
     )
 
+    // The selection is visible immediately; direction waits for the copy.
     expect(screen.getByTestId('locale').textContent).toBe('ar')
-    expect(document.documentElement.dir).toBe('rtl')
+    expect(directionMatchesCopy()).toBe(true)
+
+    await waitFor(() => expect(document.documentElement.dir).toBe('rtl'))
     expect(document.documentElement.lang).toBe('ar')
+    expect(directionMatchesCopy()).toBe(true)
 
     fireEvent.click(screen.getByRole('button', { name: 'switch' }))
 
     await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('en'))
-    expect(document.documentElement.dir).toBe('ltr')
+    await waitFor(() => expect(document.documentElement.dir).toBe('ltr'))
     expect(document.documentElement.lang).toBe('en')
+    expect(directionMatchesCopy()).toBe(true)
   })
 
   it('rolls back the visible locale when saving fails', async () => {

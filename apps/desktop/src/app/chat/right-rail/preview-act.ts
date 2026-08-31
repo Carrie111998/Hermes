@@ -29,14 +29,17 @@
 
 import { actEngineSource, type PreviewActAction, type PreviewActResult } from '@/lib/preview-act/act-in-page'
 import { watchInPage } from '@/lib/preview-act/watch-in-page'
+import { agentPreviewTabId } from '@/store/preview'
 
+import { consoleSince } from './preview-console-digest'
 import { clickAt, glideTo, pointerPlaced, pressKey, selectAll, typeText, wheelBy } from './preview-drive'
-import { activePreviewInput, type PreviewInputHandle } from './preview-input'
-import { activePreviewNav, type PreviewNavHandle } from './preview-nav'
-import { activePreviewScriptRunner, type PreviewScriptRunner } from './preview-script-runner'
+import { agentPreviewInput, type PreviewInputHandle } from './preview-input'
+import { agentPreviewNav } from './preview-nav'
+import { agentPreviewScriptRunner, type PreviewScriptRunner } from './preview-script-runner'
 
-/** Verbs the pane owns; a guest page cannot drive its own history. */
-const NAV_ACTIONS: readonly (keyof PreviewNavHandle)[] = ['back', 'forward', 'reload']
+/** Verbs the pane owns; a guest page cannot drive its own history. `navigate`
+ *  is handled separately — it is the one that carries an argument. */
+const NAV_ACTIONS: readonly ('back' | 'forward' | 'reload')[] = ['back', 'forward', 'reload']
 
 /** How long a click/type is given to land before the page is re-inventoried.
  *  Long enough for a framework re-render, short enough not to stall the turn.
@@ -62,6 +65,10 @@ const DRIVEN: readonly string[] = ['click', 'hover', 'press', 'type']
 const CLICKS: readonly string[] = ['click', 'type']
 
 const NOTHING_OPEN = 'No live page is open in the in-app browser — open one with open_preview first.'
+
+/** Every address change lands here: the new document has its own refs, so the
+ *  agent has to re-inventory whatever it thought it was holding. */
+const NAVIGATED_NOTE = 'Page is loading — call elements to see what is on it.'
 
 const NAVIGATED =
   'The page stopped answering right after — it is probably navigating. Call elements to see where you landed.'
@@ -485,12 +492,59 @@ async function driveScroll(
  *  string: the verb arrives off the wire, and the history ones never reach
  *  the in-page engine. */
 export async function actOnActivePreview(
-  action: Omit<PreviewActAction, 'kind'> & { kind: string }
+  action: Omit<PreviewActAction, 'kind'> & { kind: string },
+  sessionId: null | string = null
 ): Promise<PreviewActResult> {
+  const result = await runPreviewAction(action, sessionId)
+  // Stamped here rather than at each return: the agent should learn that the
+  // page started throwing no matter WHICH action provoked it, and a single
+  // seam cannot be forgotten by a future verb.
+  const since = consoleSinceForAgentTab(sessionId)
+
+  return since ? { ...result, console_since_last_call: since } : result
+}
+
+/** The agent's tab, for the console breadcrumb. Resolved the same way the act
+ *  path resolves everything else, so the counts always describe the page that
+ *  was just acted on. */
+function consoleSinceForAgentTab(sessionId: null | string) {
+  const id = agentPreviewTabId(sessionId)
+
+  return id ? consoleSince(id) : null
+}
+
+async function runPreviewAction(
+  action: Omit<PreviewActAction, 'kind'> & { kind: string },
+  sessionId: null | string
+): Promise<PreviewActResult> {
+  if (action.kind === 'navigate') {
+    const handle = agentPreviewNav(sessionId)
+
+    if (!handle) {
+      return { error: NOTHING_OPEN, success: false }
+    }
+
+    // A file peek or an artifact has no address to go to. Say which, rather
+    // than silently doing nothing to a pane that isn't a browser.
+    if (!handle.navigate) {
+      return { error: 'That preview tab is not a browser — open a page with open_preview first.', success: false }
+    }
+
+    const url = String(action.url ?? '').trim()
+
+    if (!url) {
+      return { error: 'navigate needs a url.', success: false }
+    }
+
+    handle.navigate(url)
+
+    return { acted: 'navigate', note: NAVIGATED_NOTE, success: true }
+  }
+
   const nav = NAV_ACTIONS.find(verb => verb === action.kind)
 
   if (nav) {
-    const handle = activePreviewNav()
+    const handle = agentPreviewNav(sessionId)
 
     if (!handle) {
       return { error: NOTHING_OPEN, success: false }
@@ -500,10 +554,10 @@ export async function actOnActivePreview(
 
     // Navigation is fire-and-forget through the webview; the new document has
     // its own refs, so the agent has to re-inventory either way.
-    return { acted: nav, note: 'Page is loading — call elements to see what is on it.', success: true }
+    return { acted: nav, note: NAVIGATED_NOTE, success: true }
   }
 
-  const run = activePreviewScriptRunner()
+  const run = agentPreviewScriptRunner(sessionId)
 
   if (!run) {
     return { error: NOTHING_OPEN, success: false }
@@ -532,7 +586,7 @@ export async function actOnActivePreview(
     return trip.kind === 'answered' ? trip.result : { acted: typed.kind, note: NAVIGATED, success: true }
   }
 
-  const input = activePreviewInput()
+  const input = agentPreviewInput(sessionId)
 
   if (input && DRIVEN.indexOf(typed.kind) !== -1) {
     return driveAction(run, input, typed)

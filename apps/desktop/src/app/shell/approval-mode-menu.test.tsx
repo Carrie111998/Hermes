@@ -3,11 +3,19 @@ import { MemoryRouter } from 'react-router'
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { StatusbarControls } from '@/app/shell/statusbar-controls'
-import { I18nProvider } from '@/i18n'
+import { I18nProvider, loadTranslations } from '@/i18n'
 import { $approvalModes } from '@/store/approval-mode'
 import { stubMenuDomApis, stubResizeObserver } from '@/test/jsdom'
 
 import { useApprovalModeStatusbarItem } from './approval-mode-menu'
+
+// Non-English message trees are separate chunks (i18n/catalog.ts). These
+// assertions are about the rendered copy, not about load timing, so warm the
+// locale once up front and keep them synchronous.
+beforeAll(async () => {
+  await loadTranslations('ja')
+})
+
 
 beforeAll(() => {
   stubResizeObserver()

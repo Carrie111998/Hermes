@@ -34,6 +34,34 @@ def _is_confirmed_kimi_coding_url(base_url: str) -> bool:
     )
 
 
+
+KIMI_CODE_USAGE_BASE_URL = "https://api.kimi.com/coding/v1"
+
+_KIMI_TIME_UNIT_SECONDS = {
+    "TIME_UNIT_SECOND": 1,
+    "TIME_UNIT_MINUTE": 60,
+    "TIME_UNIT_HOUR": 3600,
+    "TIME_UNIT_DAY": 86400,
+}
+
+
+def _kimi_window_label(window: dict) -> str:
+    """Name a window from its declared length, not from a guessed period."""
+    try:
+        duration = int(window.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    seconds = duration * _KIMI_TIME_UNIT_SECONDS.get(str(window.get("timeUnit") or ""), 0)
+    if seconds <= 0:
+        return "window"
+    if seconds % 86400 == 0:
+        return f"{seconds // 86400}d"
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    return f"{max(1, seconds // 60)}m"
+
+
+
 class KimiProfile(ProviderProfile):
     """Kimi/Moonshot — temperature omitted, thinking xor reasoning_effort."""
 
@@ -110,6 +138,91 @@ class KimiProfile(ProviderProfile):
         return extra_body, top_level
 
 
+    def fetch_usage(
+        self,
+        *,
+        credential=None,
+        base_url: str | None = None,
+        timeout: float = 8.0,
+    ):
+        """Kimi Code plan quotas: a rolling window plus a longer one.
+
+        ``GET {coding}/v1/usages``. The response labels a field ``used`` whose
+        value tracks what is LEFT, while the sibling window calls the same
+        quantity ``remaining`` — so nothing here derives a percentage from
+        ``used``. Both figures are stored verbatim and the shared model derives
+        a percentage only from ``limit`` + ``remaining``, which is unambiguous.
+
+        Window length comes from the payload (``window.duration`` +
+        ``timeUnit``), never from a guessed name: the second window's
+        ``resetTime`` lands ~a day out, not a week, despite third-party docs
+        calling it "weekly".
+        """
+        import httpx
+
+        from agent.provider_usage_types import (
+            UNIT_COUNT,
+            ProviderUsage,
+            UsageWindow,
+            to_datetime,
+            to_decimal,
+        )
+
+        token = str(getattr(credential, "access_token", "") or "").strip()
+        if not token:
+            return None
+
+        base = str(base_url or getattr(credential, "base_url", "") or KIMI_CODE_USAGE_BASE_URL)
+        base = base.rstrip("/")
+        if not base.endswith("/v1"):
+            base = base + "/v1"
+
+        with httpx.Client(timeout=timeout) as client:
+            response = client.get(
+                f"{base}/usages",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json() or {}
+
+        windows = []
+        for entry in payload.get("limits") or ():
+            if not isinstance(entry, dict):
+                continue
+            detail = entry.get("detail") or {}
+            windows.append(
+                UsageWindow(
+                    label=_kimi_window_label(entry.get("window") or {}),
+                    unit=UNIT_COUNT,
+                    limit=to_decimal(detail.get("limit")),
+                    remaining=to_decimal(detail.get("remaining")),
+                    reset_at=to_datetime(detail.get("resetTime")),
+                )
+            )
+
+        rolling = payload.get("usage")
+        if isinstance(rolling, dict) and rolling:
+            windows.append(
+                UsageWindow(
+                    label="period",
+                    unit=UNIT_COUNT,
+                    limit=to_decimal(rolling.get("limit")),
+                    remaining=to_decimal(rolling.get("used")),
+                    reset_at=to_datetime(rolling.get("resetTime")),
+                )
+            )
+
+        membership = ((payload.get("user") or {}).get("membership") or {}).get("level")
+        plan = str(membership or "").replace("LEVEL_", "").title() or None
+
+        return ProviderUsage(
+            provider="kimi-coding",
+            display_name="Kimi Code",
+            plan=plan,
+            windows=tuple(windows),
+        )
+
+
 kimi = KimiProfile(
     name="kimi-coding",
     aliases=("kimi", "moonshot", "kimi-for-coding"),
@@ -123,6 +236,9 @@ kimi = KimiProfile(
         "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
     },
     default_aux_model="kimi-k2-turbo-preview",
+    # The short window is 5 hours; a minute of cache costs nothing and keeps
+    # a burst of panel opens off the endpoint.
+    usage_ttl=60,
 )
 
 kimi_cn = KimiProfile(

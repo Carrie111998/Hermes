@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -107,7 +108,9 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
+    # Unresolved: resolving a venv's `bin/python` symlink would name the base
+    # interpreter, which has none of Hermes' packages.
+    interpreter = os.path.abspath(sys.executable)
     assert exec_line.split(" ")[0].strip('"') == interpreter
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
@@ -135,7 +138,9 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     root = _make_project(tmp_path)
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
-    interpreter = str(Path(sys.executable).resolve())
+    # pip writes the venv's own `bin/python` into a console script's shebang,
+    # not the base interpreter it links to.
+    interpreter = os.path.abspath(sys.executable)
     hermes_bin.write_text(f"#!{interpreter}\nimport hermes_cli\n", encoding="utf-8")
     hermes_bin.chmod(0o755)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
@@ -264,3 +269,31 @@ def test_exec_arg_quoting_handles_spaces(tmp_path, xdg_home, monkeypatch):
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
     assert exec_line == f'"{spaced}" desktop'
+
+
+def test_exec_keeps_the_venv_interpreter_unresolved(tmp_path, xdg_home, monkeypatch):
+    """`venv/bin/python` is a symlink to the base interpreter, and the venv
+    exists only by way of that path. Resolving it writes an Exec that runs a
+    Python without Hermes' packages — the launcher then dies on
+    ModuleNotFoundError, silently, because Terminal=false swallows it."""
+    root = _make_project(tmp_path)
+    base = tmp_path / "base" / "bin" / "python3"
+    base.parent.mkdir(parents=True)
+    base.write_text("", encoding="utf-8")
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base)
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+
+    # A repo entry script: `/usr/bin/env python3` escapes the venv, so the
+    # interpreter gets prefixed — and it must be the venv one.
+    hermes_bin = tmp_path / "hermes"
+    hermes_bin.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line.split(" ")[0] == str(venv_python)

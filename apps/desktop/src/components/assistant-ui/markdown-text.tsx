@@ -17,7 +17,6 @@ import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { detectArtifact } from '@/lib/artifact-detect'
 import { normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
-import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { parseMarkdownIntoBlocksCached } from '@/lib/markdown-blocks'
 import { preprocessMarkdown } from '@/lib/markdown-preprocess'
 import {
@@ -35,6 +34,7 @@ import {
 } from '@/lib/media'
 import { previewTargetFromMarkdownHref } from '@/lib/preview-targets'
 import { sessionRefFromMarkdownHref } from '@/lib/session-refs'
+import { useMathPlugin } from '@/lib/use-math-plugin'
 import { cn } from '@/lib/utils'
 
 import { ArtifactCard } from './artifact-card'
@@ -43,19 +43,12 @@ import { detectEmbed, extractAlert, MarkdownAlert, RichCodeBlock, UrlEmbed } fro
 import { ResizableMarkdownTable, ResizableMarkdownTh } from './markdown-table'
 import { paragraphPlainText, TranscriptDirectiveLeaf, useIsClaimedDirective } from './transcript-directive'
 
-// Math rendering plugin (KaTeX). Configured once at module scope — the
-// plugin is stateless beyond its internal cache so re-creating per-render
-// would needlessly thrash. We use a memoizing wrapper around rehype-katex
-// (see lib/katex-memo.ts) so that during streaming we re-katex only the
-// equations whose source actually changed since the last token. With the
-// stock @streamdown/math plugin every equation re-renders on every token,
-// which throttles UI updates badly for math-heavy responses; the memoized
-// plugin keeps the steady-state work proportional to "new equations
-// arriving" rather than "equations × tokens-per-second".
-//
-// `singleDollarTextMath: true` enables `$x^2$` for inline math (de-facto
-// LLM convention). The default false-setting only accepts `$$...$$`.
-const mathPlugin = createMemoizedMathPlugin({ singleDollarTextMath: true })
+// Math rendering (KaTeX) arrives async via `useMathPlugin` for the same
+// reason the code plugin below does: `@/lib/katex-memo` statically imports
+// `katex`, and that put 253 KB — the slowest single chunk — on the cold boot
+// graph. See lib/use-math-plugin.ts for the full rationale and the memoizing
+// rehype-katex wrapper that keeps streaming re-renders proportional to "new
+// equations arriving" rather than "equations × tokens-per-second".
 
 // `@streamdown/code` statically imports ALL of shiki (every grammar + theme —
 // the single largest chunk in the renderer), so it must never sit on the
@@ -547,7 +540,21 @@ function MarkdownTextSurface({
   // `SyntaxHighlighter` below when `isStreaming` is true, and the code plugin
   // itself arrives async (useCodePlugin) so shiki never blocks cold start.
   const code = useCodePlugin()
-  const plugins = useMemo(() => (code ? { math: mathPlugin, code } : { math: mathPlugin }), [code])
+  const math = useMathPlugin()
+
+  const plugins = useMemo(() => {
+    const table: { code?: NonNullable<typeof code>; math?: NonNullable<typeof math> } = {}
+
+    if (code) {
+      table.code = code
+    }
+
+    if (math) {
+      table.math = math
+    }
+
+    return table
+  }, [code, math])
 
   const components = useMemo(
     () =>

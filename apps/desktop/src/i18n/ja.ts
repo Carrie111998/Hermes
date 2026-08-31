@@ -2108,6 +2108,14 @@ export const ja = defineLocale({
     queueStuckTitle: 'キュー内のメッセージを送信できません',
     queueStuckBody:
       'キューに入れたターンの送信が繰り返し失敗しました。まだキューに残っています。もう一度送信してください。',
+    queueStuckBodyIn: title => `「${title}」のキューに入れたターンの送信が繰り返し失敗しました。まだキューに残っています。`,
+    queueStuckAction: 'もう一度送信',
+    queueLostTitle: '存在しないチャットのキュー済みメッセージ',
+    queueLostBody: count =>
+      `既に存在しないチャットにメッセージが ${count} 件キューされているため、送信できません。入力欄に復元しますか？`,
+    queueLostAction: 'テキストを復元',
+    queueRecovered: count => `${count} 件のメッセージを入力欄に復元しました。`,
+    queueRecoveredNothing: '復元するものはありません。',
     previewUnavailable: 'プレビューは利用できません',
     previewLabel: label => `${label} のプレビュー`,
     couldNotPreview: label => `${label} をプレビューできませんでした`,
@@ -2547,6 +2555,7 @@ export const ja = defineLocale({
       closeCommandCenter: 'コマンドセンターを閉じる',
       openCommandCenter: 'コマンドセンターを開く',
       showTerminal: 'ターミナルを表示',
+      showBrowser: 'ブラウザを開く',
       hideTerminal: 'ターミナルを非表示',
       gateway: 'ゲートウェイ',
       gatewayReady: '準備完了',

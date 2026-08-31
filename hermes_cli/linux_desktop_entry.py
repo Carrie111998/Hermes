@@ -77,13 +77,27 @@ def resolve_exec_command() -> str:
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # venv one), so prefix it explicitly. Absolute but NEVER resolved:
+            # `venv/bin/python` is a symlink to the base interpreter, and
+            # following it drops the venv — the same missing-dependency death
+            # this branch exists to prevent.
+            argv = [_interpreter(), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [_interpreter(), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
+
+
+def _interpreter() -> str:
+    """The running interpreter, absolute and with its symlink intact.
+
+    ``os.path.abspath`` rather than ``Path.resolve()``: a venv's ``bin/python``
+    is a symlink to the base interpreter, and the venv only exists by way of
+    that path (``pyvenv.cfg`` sits beside it). Resolving it writes an ``Exec``
+    that runs the base Python, which has none of Hermes' packages.
+    """
+    return os.path.abspath(sys.executable)
 
 
 def _needs_interpreter(bin_path: Path) -> bool:
@@ -106,7 +120,7 @@ def _needs_interpreter(bin_path: Path) -> bool:
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
     # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
+    exe_dir = os.path.dirname(_interpreter())
     return exe_dir not in shebang
 
 

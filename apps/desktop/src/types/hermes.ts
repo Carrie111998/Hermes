@@ -769,9 +769,55 @@ export interface StarmapGraph {
 
 export interface ContextUsageCategory {
   color: string
+  /** Per-category extra, emitted only where it means something — today just
+   *  `files`, where it is the number of distinct files in the window. */
+  count?: number
   id: string
   label: string
   tokens: number
+}
+
+/** How a usage window is measured. Providers genuinely disagree: Anthropic and
+ *  Codex report percent of a rolling window, OpenRouter dollars, Copilot counts
+ *  of interactions, MiniMax tokens. The renderer branches on this rather than
+ *  forcing everything into a percentage. */
+export type UsageUnit = 'count' | 'currency' | 'percent' | 'tokens'
+
+/** Typed reason a provider has no numbers. `no_usage_endpoint` is not an
+ *  error — it is the normal answer for most of the provider registry. */
+export type ProviderUsageState =
+  | 'network_error'
+  | 'no_usage_endpoint'
+  | 'not_authenticated'
+  | 'ok'
+  | 'parse_error'
+  | 'rate_limited'
+  | 'unauthorized'
+
+export interface ProviderUsageWindow {
+  currency?: null | string
+  detail?: null | string
+  label: string
+  /** Decimal strings, not numbers — JSON floats lose cents. */
+  limit?: null | string
+  remaining?: null | string
+  reset_at?: null | string
+  unit: UsageUnit
+  used?: null | string
+  /** Derived by the backend, and only when the arithmetic is unambiguous. */
+  used_percent?: null | number
+}
+
+export interface ProviderUsageSnapshot {
+  available: boolean
+  display_name: string
+  fetched_at?: null | string
+  message?: null | string
+  plan?: null | string
+  provider: string
+  stale: boolean
+  state: ProviderUsageState
+  windows: ProviderUsageWindow[]
 }
 
 export interface ContextBreakdown {

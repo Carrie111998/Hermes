@@ -2434,6 +2434,16 @@ export const en: Translations = {
     queueResumeTip: 'Paused by Stop — resume sending the queued turns',
     queueStuckTitle: 'Queued message not sent',
     queueStuckBody: 'A queued turn kept failing to send. It is still in the queue — try sending it again.',
+    queueStuckBodyIn: title => `A queued turn in “${title}” kept failing to send. It is still in the queue.`,
+    queueStuckAction: 'Send it again',
+    queueLostTitle: 'Queued messages from a chat that is gone',
+    queueLostBody: count =>
+      count === 1
+        ? 'One message was queued in a chat that no longer exists, so it can never be sent. Recover it into the composer?'
+        : `${count} messages were queued in a chat that no longer exists, so they can never be sent. Recover them into the composer?`,
+    queueLostAction: 'Recover the text',
+    queueRecovered: count => (count === 1 ? 'Message recovered into the composer.' : `${count} messages recovered into the composer.`),
+    queueRecoveredNothing: 'Nothing left to recover.',
     previewUnavailable: 'Preview unavailable',
     previewLabel: label => `Preview ${label}`,
     couldNotPreview: label => `Could not preview ${label}`,
@@ -2906,6 +2916,7 @@ export const en: Translations = {
       openCommandCenter: 'Open Command Center',
       showTerminal: 'Show terminal',
       hideTerminal: 'Hide terminal',
+      showBrowser: 'Open browser',
       gateway: 'Gateway',
       gatewayReady: 'ready',
       gatewayNeedsSetup: 'needs setup',
@@ -2924,6 +2935,7 @@ export const en: Translations = {
       toggleContextUsage: 'Context meter',
       toggleRunningTimer: 'Turn timer',
       toggleSessionTimer: 'Session timer',
+      toggleBrowser: 'Browser',
       toggleTerminal: 'Terminal',
       toggleVersion: 'Version & updates',
       toggleWorkspace: 'Workspace',
@@ -2941,9 +2953,35 @@ export const en: Translations = {
       openStarmap: 'Open memory graph',
       turnRunning: 'Running',
       contextUsage: 'Context usage',
+      accountUsagePanel: {
+        empty: 'No connected subscriptions',
+        loading: 'Checking plans…',
+        refresh: 'Refresh',
+        resetsAt: when => `resets ${when}`,
+        states: {
+          network_error: 'Could not reach the provider',
+          no_usage_endpoint: 'No plan data for this provider',
+          not_authenticated: 'Not signed in',
+          ok: '',
+          parse_error: 'Unexpected response from the provider',
+          rate_limited: 'Rate limited — try again shortly',
+          unauthorized: 'Sign-in expired'
+        },
+        title: 'Plan Usage',
+        windows: {
+          '5h': '5-hour window',
+          '7d': 'Weekly window',
+          credits: 'Credits',
+          key_limit: 'API key limit',
+          period: 'Billing period'
+        }
+      },
+      accountUsage: 'Plans',
+      toggleAccountUsage: 'Show plan usage',
       contextUsagePanel: {
         categories: {
           conversation: 'Conversation',
+          files: 'Files',
           mcp: 'MCP',
           memory: 'Memory',
           rules: 'Rules',
@@ -2952,6 +2990,7 @@ export const en: Translations = {
           system_prompt: 'System prompt',
           tool_definitions: 'Tool definitions'
         },
+        categoryCount: count => `${count} file${count === 1 ? '' : 's'}`,
         empty: 'No context data yet',
         loading: 'Loading breakdown…',
         percentFull: percent => `${percent}% Full`,

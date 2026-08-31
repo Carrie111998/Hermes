@@ -12,6 +12,7 @@
  */
 
 import { $busy } from '@/store/session'
+import { $focusedRuntimeId } from '@/store/session-states'
 
 import { nudgeOverlay } from './preview-nudge'
 
@@ -25,5 +26,6 @@ $busy.subscribe(busy => {
   }
 
   running = busy
-  nudgeOverlay(busy ? 'think' : 'rest')
+  // `$busy` is the chat you are in, so the pulse belongs to that chat's pane.
+  nudgeOverlay(busy ? 'think' : 'rest', $focusedRuntimeId.get())
 })

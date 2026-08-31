@@ -17,8 +17,11 @@ from tools.open_preview_tool import _normalize_target, open_preview_tool
 from tools.registry import registry, tool_error
 
 
-def preview_open(url: str, label: str = "") -> str:
-    return open_preview_tool(url=url, label=label)
+def preview_open(url: str, label: str = "", new_tab: bool = False) -> str:
+    # `new_tab` is local: one conversation holding two pages side by side is
+    # what the agent's own browser is for, and consolidating the tools must not
+    # quietly drop the capability.
+    return open_preview_tool(url=url, label=label, new_tab=new_tab)
 
 
 def preview_close(url: str = "") -> str:
@@ -37,7 +40,11 @@ def _handle_preview(args, **kw):
     (needs the GUI callback), mirroring the old read_preview special path."""
     action = (args.get("action") or "").strip()
     if action == "open":
-        return preview_open(url=args.get("url", ""), label=args.get("label", ""))
+        return preview_open(
+            url=args.get("url", ""),
+            label=args.get("label", ""),
+            new_tab=bool(args.get("new_tab", False)),
+        )
     if action == "close":
         return preview_close(url=args.get("url", ""))
     if action == "read":
@@ -68,6 +75,10 @@ PREVIEW_SCHEMA = {
                 "description": "open: the target. close: one tab (omit for the whole pane).",
             },
             "label": {"type": "string", "description": "open: optional tab label."},
+            "new_tab": {
+                "type": "boolean",
+                "description": "open: a SECOND tab, to hold two pages at once (default: reuse yours).",
+            },
             "start": {"type": "integer", "description": "read: 0-indexed char offset."},
             "count": {"type": "integer", "description": "read: chars to return (capped per read)."},
         },
