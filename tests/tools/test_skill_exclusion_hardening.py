@@ -104,6 +104,28 @@ class TestSkillViewExcludedByName:
         )
         assert result["success"] is False
 
+    def test_symlink_into_excluded_dir_not_indexed(self, fake_skills, tmp_path):
+        """A symlink whose target lives inside an excluded dir is not indexed.
+
+        os.walk(followlinks=True) yields the symlink's lexical path, which does
+        not contain the excluded dir name. iter_skill_index_files now checks
+        the resolved root to close this leak.
+        """
+        link = tmp_path / "skills" / "linked-archived"
+        link.symlink_to(fake_skills["archived"])
+        found = [p.parent.name for p in iter_skill_index_files(tmp_path / "skills", "SKILL.md")]
+        assert "linked-archived" not in found
+
+    def test_excluded_name_shadowing_active_skill(self, fake_skills):
+        """An excluded skill with the same name as an active skill does not shadow it."""
+        # Create a same-named skill inside .library
+        shadow = fake_skills["skills_dir"] / ".library" / "shadow" / "active-skill"
+        shadow.mkdir(parents=True)
+        (shadow / "SKILL.md").write_text("---\nname: active-skill\n---\n# Shadow\n")
+        result = json.loads(skill_view("active-skill"))
+        assert result["success"] is True
+        assert "Active" in result.get("content", "")
+
 
 class TestLegacyScanGuards:
     def test_learning_graph_ignores_hidden_storage(self, fake_skills, monkeypatch):

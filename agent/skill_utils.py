@@ -1233,6 +1233,16 @@ def iter_skill_index_files(skills_dir: Path, filename: str):
             if d not in EXCLUDED_SKILL_DIRS
             and not (has_skill_md and d in SKILL_SUPPORT_DIRS)
         ]
+        # Symlink-aware exclusion: os.walk(followlinks=True) yields the
+        # symlink's lexical path, not the target's. A symlink whose target
+        # lives inside .archive/.library passes the lexical filter above.
+        # Check the resolved root to close this leak.
+        try:
+            resolved = Path(root).resolve()
+            if any(part in EXCLUDED_SKILL_DIRS for part in resolved.parts):
+                continue
+        except OSError:
+            pass
         if filename in files:
             matches.append(os.path.join(root, filename))
     for path in sorted(matches):
