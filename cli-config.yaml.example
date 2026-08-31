@@ -688,6 +688,18 @@ compression:
   # summarization on a short idle thread. Example: 1800 = compact after 30 min idle.
   idle_compact_after_seconds: 0
 
+  # Background splice-merge compaction (default: false). When enabled for the
+  # built-in in-place compressor, start a full summary on a stable transcript
+  # snapshot before the foreground threshold. User turns continue immediately;
+  # rows appended while the summary runs are spliced after the compacted handoff
+  # atomically, and the live agent adopts it at the next turn boundary.
+  # Suppressed for legacy rotation and checkpoint-required configurations.
+  background_compact: false
+
+  # Fraction of the normal compression threshold at which background work
+  # starts (default: 0.80, clamped to 0.10 - 0.99).
+  background_compact_start_ratio: 0.80
+
   # Proactive tool-result prune (default: 0 = disabled). Opt-in token trigger
   # for a deterministic, no-LLM prune of OLD tool-result payloads, run
   # independently of `threshold` above. On large-window models (512K/1M) the
