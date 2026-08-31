@@ -149,13 +149,9 @@ class HostedRoomService:
         return self.db_path.parent
 
     def local_profiles(self) -> tuple[str, ...]:
-        profiles = {"default"}
-        profiles_dir = self.root / "profiles"
-        if profiles_dir.is_dir():
-            profiles.update(
-                path.name for path in profiles_dir.iterdir() if path.is_dir()
-            )
-        return tuple(sorted(profiles))
+        from hermes_cli.profiles import list_profile_names
+
+        return tuple(list_profile_names(profiles_root=self.root / "profiles"))
 
     def bindings(self) -> tuple[HostedRoomBinding, ...]:
         local_gateway_id = hosted_rooms.local_authority_gateway_id()

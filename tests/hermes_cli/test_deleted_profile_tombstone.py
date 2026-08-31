@@ -18,6 +18,7 @@ from hermes_cli.profiles import (
     backfill_profile_envs,
     create_profile,
     delete_profile,
+    list_profile_names,
     list_profiles,
     profile_exists,
     profiles_to_serve,
@@ -67,7 +68,7 @@ class TestDeletedProfileTombstone:
         monkeypatch.setenv("HERMES_HOME", str(profile_env / ".hermes"))
         assert "worker" not in _named_homes(profile_env)
 
-    def test_empty_shell_after_delete_is_not_listed_or_served(self, profile_env):
+    def test_empty_shell_after_delete_is_not_enumerated_or_served(self, profile_env):
         profile_dir = create_profile("worker", no_alias=True, no_skills=True)
         with patch("hermes_cli.profiles._cleanup_gateway_service"), patch(
             "hermes_cli.profiles._stop_profile_backends"
@@ -79,8 +80,14 @@ class TestDeletedProfileTombstone:
         (profile_dir / "state.db").write_bytes(b"")
 
         assert "worker" not in _named_homes(profile_env)
+        assert "worker" not in list_profile_names()
         served = [name for name, _ in profiles_to_serve(True)]
         assert "worker" not in served
+
+        from cron.scheduler import cron_delivery_targets
+
+        target_ids = {target["id"] for target in cron_delivery_targets()}
+        assert "bot-chat:worker" not in target_ids
 
     def test_tombstoned_home_is_not_bootstrapped(self, profile_env, monkeypatch):
         profile_dir = create_profile("worker", no_alias=True, no_skills=True)

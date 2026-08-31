@@ -23,6 +23,7 @@ from gateway.hosted_room_peer import (
     catalog_mapping,
     issue_room_grant,
 )
+from hermes_constants import mark_named_profile_deleted
 from tui_gateway.hosted_room_service import (
     HostedRoomService,
     _RouteStatusPeerClient,
@@ -392,6 +393,31 @@ def test_create_send_drive_publish_and_replay_without_client_transport(tmp_path:
     ]
     assert events[1]["payload"]["text"] == "reply from ops"
     assert service.status("room-1")["working"] is False
+
+
+def test_local_profiles_hide_reserved_and_tombstoned_directories(tmp_path: Path):
+    profiles_dir = tmp_path / "profiles"
+    (profiles_dir / "ops").mkdir(parents=True)
+    worker = profiles_dir / "worker"
+    worker.mkdir()
+    mark_named_profile_deleted(worker)
+    service = HostedRoomService(_server(), db_path=tmp_path / "state.db")
+
+    assert service.local_profiles() == ("default", "ops")
+    room = service.create_room(
+        room_id="room-1",
+        name="Valid room",
+        members=[
+            {
+                "member_id": "default",
+                "profile": "default",
+                "handle": "hermes",
+            },
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+
+    assert room["room_id"] == "room-1"
 
 
 def test_restart_republishes_terminal_task_before_admitting_more(tmp_path: Path):
