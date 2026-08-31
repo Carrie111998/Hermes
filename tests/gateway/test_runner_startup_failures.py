@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock
 
+import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
@@ -97,6 +98,115 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
     ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=1)
 
     assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_passes_live_profile_adapters_to_builtin_cron(
+    monkeypatch, tmp_path
+):
+    """The production gateway door forwards both live adapter registries.
+
+    This deliberately captures the built-in provider's real ``start`` call
+    instead of calling the scheduler directly.  The profile homes/config files
+    make the multiplex startup branch resolve its normal served-profile set.
+    """
+    hermes_home = tmp_path / "hermes-home"
+    profile_home = hermes_home / "profiles" / "worker"
+    hermes_home.mkdir()
+    profile_home.mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        "gateway:\n  multiplex_profiles: true\n", encoding="utf-8"
+    )
+    (profile_home / "config.yaml").write_text(
+        "gateway:\n  multiplex_profiles: true\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+    secondary_adapters = {Platform.DISCORD: object()}
+    started_runners = []
+    waited_runners = []
+
+    async def fake_runner_start(runner):
+        started_runners.append(runner)
+        runner._profile_adapters["worker"] = secondary_adapters
+        runner._running = True
+        return True
+
+    async def fake_wait_for_shutdown(runner):
+        waited_runners.append(runner)
+        runner._running = False
+
+    monkeypatch.setattr(GatewayRunner, "start", fake_runner_start)
+    monkeypatch.setattr(GatewayRunner, "wait_for_shutdown", fake_wait_for_shutdown)
+    monkeypatch.setattr(GatewayRunner, "_start_systemd_watchdog", lambda self: None)
+
+    cron_starts = []
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    def capture_builtin_start(provider, stop_event, **kwargs):
+        cron_starts.append((provider, stop_event, kwargs))
+
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: InProcessCronScheduler(),
+    )
+    monkeypatch.setattr(
+        "cron.scheduler_provider.InProcessCronScheduler.start",
+        capture_builtin_start,
+    )
+    monkeypatch.setattr(
+        gateway_run, "_start_gateway_housekeeping", lambda *a, **kw: None
+    )
+
+    class NoControlSocket:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def start(self):
+            return False
+
+    monkeypatch.setattr("gateway.control_socket.GatewayControlServer", NoControlSocket)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("gateway.status.acquire_gateway_runtime_lock", lambda: True)
+    monkeypatch.setattr("gateway.status.write_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.release_gateway_runtime_lock", lambda: None)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: None)
+    monkeypatch.setattr("tools.mcp_tool.discover_mcp_tools", lambda: None)
+    monkeypatch.setattr("tools.mcp_tool.shutdown_mcp_servers", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.nous_auth_keepalive.start_nous_auth_keepalive",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.nous_auth_keepalive.stop_nous_auth_keepalive",
+        lambda: None,
+    )
+
+    config = GatewayConfig(
+        multiplex_profiles=True,
+        sessions_dir=hermes_home / "sessions",
+    )
+    result = await gateway_run.start_gateway(config=config, verbosity=None)
+
+    assert result is True
+    assert len(started_runners) == 1
+    assert waited_runners == started_runners
+    assert len(cron_starts) == 1
+    _provider, _stop_event, cron_kwargs = cron_starts[0]
+    runner = started_runners[0]
+    assert cron_kwargs["adapters"] is runner.adapters
+    assert cron_kwargs["profile_adapters"]["default"] is runner.adapters
+    assert (
+        cron_kwargs["profile_adapters"]["worker"]
+        is runner._profile_adapters["worker"]
+    )
+    assert cron_kwargs["profile_homes"] == [
+        ("default", hermes_home),
+        ("worker", profile_home),
+    ]
 
 
 @pytest.mark.asyncio

@@ -640,6 +640,64 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_ticker_selects_each_profile_adapter_map(tmp_path):
+    """Each multiplex profile tick uses its live adapter map.
+
+    A profile without an entry in ``profile_adapters`` keeps the legacy
+    default-adapters behavior, while a mapped profile gets its own transport
+    registry.
+    """
+    import cron.jobs as jobs
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    default_home = tmp_path / "default"
+    muse_home = tmp_path / "muse"
+    for home in (default_home, muse_home):
+        (home / "cron").mkdir(parents=True)
+
+    default_adapters = {"mattermost": object()}
+    muse_adapters = {"mattermost": object()}
+    profile_homes = [("default", default_home), ("muse", muse_home)]
+    profile_adapters = {"muse": muse_adapters}
+    calls = []
+    stop = threading.Event()
+
+    def _tracking_tick(*args, **kwargs):
+        calls.append(
+            (
+                jobs._current_cron_store().cron_dir.parent.resolve(),
+                kwargs.get("adapters"),
+            )
+        )
+        if len(calls) >= len(profile_homes):
+            stop.set()
+        return 0
+
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        thread = threading.Thread(
+            target=InProcessCronScheduler().start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "adapters": default_adapters,
+                "profile_adapters": profile_adapters,
+                "profile_homes": profile_homes,
+            },
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert [home for home, _adapters in calls] == [
+        default_home.resolve(),
+        muse_home.resolve(),
+    ]
+    assert calls[0][1] is default_adapters
+    assert calls[1][1] is muse_adapters
+
+
 def test_multiplex_ticker_skips_deleted_profile_from_startup_snapshot(tmp_path):
     """A stale profile_homes entry must not recreate a deleted profile."""
     import cron.jobs as jobs
