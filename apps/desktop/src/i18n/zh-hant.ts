@@ -2439,6 +2439,8 @@ export const zhHant = defineLocale({
     profileStatus: current => `設定檔：${current}。使用 /profile <name> 或「新工作階段」選擇器在其他設定檔中開始聊天。`,
     unknownProfile: '未知設定檔',
     noProfileNamed: (target, available) => `沒有名為「${target}」的設定檔。可用的：${available}`,
+    profileScopeMissingTitle: '找不到設定檔',
+    profileScopeMissingMessage: profile => `名為「${profile}」的設定檔已不存在——已改為顯示所有設定檔。`,
     newChatsProfile: name => `新聊天將使用設定檔 ${name}。`,
     setProfileFailed: '設定設定檔失敗',
     sttDisabled: '設定中已停用語音轉文字。',

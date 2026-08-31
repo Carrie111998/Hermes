@@ -2600,6 +2600,9 @@ export const en: Translations = {
       `Profile: ${current}. Use /profile <name> or the "New session" picker to start a chat in another profile.`,
     unknownProfile: 'Unknown profile',
     noProfileNamed: (target, available) => `No profile named "${target}". Available: ${available}`,
+    profileScopeMissingTitle: 'Profile not found',
+    profileScopeMissingMessage: profile =>
+      `No profile named “${profile}” exists anymore — showing all profiles instead.`,
     newChatsProfile: name => `New chats will use profile ${name}.`,
     setProfileFailed: 'Failed to set profile',
     sttDisabled: 'Speech-to-text is disabled in settings.',

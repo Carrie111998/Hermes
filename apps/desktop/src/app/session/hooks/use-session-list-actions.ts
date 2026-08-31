@@ -1,6 +1,7 @@
 import { useCallback, useRef } from 'react'
 
 import { getCronJobs, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
+import { translateNow } from '@/i18n'
 import { sameCronSignature } from '@/lib/session-signatures'
 import {
   isMessagingSource,
@@ -16,7 +17,8 @@ import {
   SIDEBAR_SESSIONS_INITIAL_LIMIT,
   SIDEBAR_SESSIONS_PAGE_SIZE
 } from '@/store/layout'
-import { ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
+import { notify } from '@/store/notifications'
+import { ALL_PROFILES, normalizeProfileKey, setShowAllProfiles } from '@/store/profile'
 import {
   $messagingSessions,
   $selectedStoredSessionId,
@@ -81,6 +83,9 @@ interface UseSessionListActionsArgs {
 export function useSessionListActions({ profileScope }: UseSessionListActionsArgs) {
   const refreshSessionsRequestRef = useRef(0)
   const hydratedProfileTotalsRef = useRef<Map<string, number>>(new Map())
+  // Ghost scope we already told the user about, so the fallback notice fires
+  // once per scope value rather than once per refresh tick.
+  const ghostScopeNotifiedRef = useRef<null | string>(null)
 
   // Messaging-platform sessions as their own slice, fetched separately from
   // local recents so each platform renders a self-managed section and never
@@ -196,6 +201,28 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       const result = await listSidebarSessions(sidebarRequest)
 
       if (refreshSessionsRequestRef.current === requestId) {
+        // A concrete scope the backend doesn't recognize (profile deleted on
+        // disk, or a stray stored preference adopted at boot) matches zero
+        // profile DBs and comes back as an empty recents slice with no error —
+        // left alone, the sidebar renders permanently empty. Fall back to the
+        // all-profiles view (the scope change re-runs this refresh) and tell
+        // the user once. `=== false` keeps older backends and the legacy
+        // per-slice fallback (no indicator) on today's behavior.
+        if (sessionProfile !== 'all' && result.recents.profile_matched === false) {
+          if (ghostScopeNotifiedRef.current !== sessionProfile) {
+            ghostScopeNotifiedRef.current = sessionProfile
+            notify({
+              kind: 'info',
+              title: translateNow('desktop.profileScopeMissingTitle'),
+              message: translateNow('desktop.profileScopeMissingMessage', sessionProfile)
+            })
+          }
+
+          setShowAllProfiles(true)
+
+          return
+        }
+
         const recents = result.recents
 
         // The bounded first page is only additive information. Keep every

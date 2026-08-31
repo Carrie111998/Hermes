@@ -4760,6 +4760,14 @@ def get_profiles_sessions_sidebar(
         targets.append(("default", profiles_mod.get_profile_dir("default")))
 
     recents_scope = (recents_profile or "all").strip() or "all"
+    # A scope naming no known profile matches zero DBs below and would return
+    # total 0 with empty errors — byte-identical to a genuinely empty profile.
+    # Echo the scope and whether it matched so clients can tell a ghost scope
+    # (deleted profile, stray stored preference) from an empty one and fall
+    # back instead of rendering a permanently empty sidebar.
+    recents_scope_matched = recents_scope == "all" or any(
+        name == recents_scope for name, _home in targets
+    )
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
     messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
 
@@ -4848,6 +4856,8 @@ def get_profiles_sessions_sidebar(
             "sessions": _window(recents_rows, recents_cap),
             "total": recents_total,
             "profile_totals": recents_profile_totals,
+            "profile": recents_scope,
+            "profile_matched": recents_scope_matched,
         },
         "cron": {"sessions": _window(cron_rows, cron_cap)},
         "messaging": {

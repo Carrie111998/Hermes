@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo, SidebarSessionsRequest, SidebarSessionsResponse } from '@/hermes'
 import { $sessionsLimit, resetSessionsLimit, SIDEBAR_SESSIONS_INITIAL_LIMIT } from '@/store/layout'
+import { $showAllProfiles, setShowAllProfiles } from '@/store/profile'
 import {
   $cronSessions,
   $messagingSessions,
@@ -55,6 +56,7 @@ const sidebar = (
 
 const listSidebarSessions = vi.fn()
 const listAllProfileSessions = vi.fn()
+const notify = vi.fn()
 
 vi.mock('@/hermes', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -63,9 +65,16 @@ vi.mock('@/hermes', async importOriginal => ({
   listSidebarSessions: (...args: unknown[]) => listSidebarSessions(...args)
 }))
 
+vi.mock('@/store/notifications', () => ({
+  notify: (...args: unknown[]) => notify(...args),
+  notifyError: vi.fn()
+}))
+
 beforeEach(() => {
   listSidebarSessions.mockReset()
   listAllProfileSessions.mockReset()
+  notify.mockReset()
+  setShowAllProfiles(false)
   $sessionsLimit.set(SIDEBAR_SESSIONS_INITIAL_LIMIT)
   setSessions([])
   setCronSessions([])
@@ -79,6 +88,73 @@ afterEach(() => {
   setCronSessions([])
   setMessagingSessions([])
   setSessionsLoading(false)
+  setShowAllProfiles(false)
+})
+
+// A concrete scope the backend doesn't recognize (profile deleted on disk, or
+// a stray stored preference adopted at boot) used to come back as an empty
+// recents slice with no error — the sidebar rendered permanently empty
+// (observed 2026-08-31 with a ghost "diego" scope against 7,184 real
+// sessions). The batched endpoint now echoes profile_matched; the hook must
+// fall back to the all-profiles view and say so, once per ghost scope.
+describe('ghost profile scope fallback', () => {
+  const ghostResponse = (profile: string): SidebarSessionsResponse => ({
+    recents: { sessions: [], total: 0, profile_totals: {}, profile, profile_matched: false },
+    cron: { sessions: [] },
+    messaging: { sessions: [], total: 0 }
+  })
+
+  it('flips to the all-profiles view and notifies once when the scope matches no profile', async () => {
+    listSidebarSessions.mockResolvedValue(ghostResponse('diego'))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'diego' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($showAllProfiles.get()).toBe(true)
+    expect(notify).toHaveBeenCalledTimes(1)
+    expect($sessionsLoading.get()).toBe(false)
+
+    // A repeat refresh against the same ghost scope re-asserts the fallback
+    // without stacking another notification.
+    setShowAllProfiles(false)
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($showAllProfiles.get()).toBe(true)
+    expect(notify).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves a matched-but-empty scope and an indicator-less backend alone', async () => {
+    listSidebarSessions.mockResolvedValue({
+      recents: { sessions: [], total: 0, profile_totals: { work: 0 }, profile: 'work', profile_matched: true },
+      cron: { sessions: [] },
+      messaging: { sessions: [], total: 0 }
+    } satisfies SidebarSessionsResponse)
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'work' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($showAllProfiles.get()).toBe(false)
+    expect(notify).not.toHaveBeenCalled()
+
+    // Older backend / legacy per-slice fallback: no indicator field at all.
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [], total: 0 }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($showAllProfiles.get()).toBe(false)
+    expect(notify).not.toHaveBeenCalled()
+  })
 })
 
 describe('refreshSessions identity + loading hygiene', () => {

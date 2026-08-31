@@ -1916,6 +1916,47 @@ class TestWebServerEndpoints:
         assert isinstance(data.get("errors"), list)
         assert data["recents"]["total"] >= 1
 
+    def test_profiles_sessions_sidebar_flags_unmatched_recents_scope(self):
+        """A recents_profile naming no known profile matches zero DBs and used
+        to come back as total 0 with empty errors — byte-identical to a
+        genuinely empty profile, so a desktop stuck on a deleted/ghost profile
+        scope rendered a permanently empty sidebar with nothing to detect. The
+        recents slice now echoes the requested scope and says whether it
+        matched, so clients can fall back instead."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="sb-scope", source="desktop")
+            db.append_message(session_id="sb-scope", role="user", content="hi")
+        finally:
+            db.close()
+
+        ghost = self.client.get(
+            "/api/profiles/sessions/sidebar?recents_profile=ghost-profile"
+        )
+        assert ghost.status_code == 200
+        recents = ghost.json()["recents"]
+        assert recents["profile"] == "ghost-profile"
+        assert recents["profile_matched"] is False
+        assert recents["sessions"] == []
+        assert recents["total"] == 0
+        assert ghost.json()["errors"] == []
+
+        matched = self.client.get(
+            "/api/profiles/sessions/sidebar?recents_profile=default"
+        )
+        assert matched.status_code == 200
+        assert matched.json()["recents"]["profile"] == "default"
+        assert matched.json()["recents"]["profile_matched"] is True
+
+        all_scope = self.client.get(
+            "/api/profiles/sessions/sidebar?recents_profile=all"
+        )
+        assert all_scope.status_code == 200
+        assert all_scope.json()["recents"]["profile"] == "all"
+        assert all_scope.json()["recents"]["profile_matched"] is True
+
     def test_profiles_sessions_catalog_routes_cap_pages_at_500(self):
         """Catalog responses stay bounded even when the caller asks for more."""
         from hermes_state import SessionDB

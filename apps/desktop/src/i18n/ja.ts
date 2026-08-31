@@ -2537,6 +2537,9 @@ export const ja = defineLocale({
       `プロファイル: ${current}。/profile <name> または「新しいセッション」ピッカーを使って別のプロファイルでチャットを始めてください。`,
     unknownProfile: '不明なプロファイル',
     noProfileNamed: (target, available) => `"${target}" という名前のプロファイルはありません。利用可能: ${available}`,
+    profileScopeMissingTitle: 'プロファイルが見つかりません',
+    profileScopeMissingMessage: profile =>
+      `"${profile}" という名前のプロファイルはもう存在しません。すべてのプロファイルを表示します。`,
     newChatsProfile: name => `新しいチャットはプロファイル ${name} を使用します。`,
     setProfileFailed: 'プロファイルの設定に失敗しました',
     sttDisabled: '音声認識は設定で無効になっています。',

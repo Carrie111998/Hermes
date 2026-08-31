@@ -2751,6 +2751,8 @@ export const zh: Translations = {
     profileStatus: current => `配置档案：${current}。使用 /profile <name> 或“新建会话”选择器在其他配置档案中开始对话。`,
     unknownProfile: '未知配置档案',
     noProfileNamed: (target, available) => `没有名为“${target}”的配置档案。可用：${available}`,
+    profileScopeMissingTitle: '未找到配置档案',
+    profileScopeMissingMessage: profile => `名为“${profile}”的配置档案已不存在——已改为显示所有配置档案。`,
     newChatsProfile: name => `新对话将使用配置档案 ${name}。`,
     setProfileFailed: '设置配置档案失败',
     sttDisabled: '设置中已禁用语音转文字。',

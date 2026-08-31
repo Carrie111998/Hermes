@@ -2183,6 +2183,8 @@ export interface Translations {
     profileStatus: (current: string) => string
     unknownProfile: string
     noProfileNamed: (target: string, available: string) => string
+    profileScopeMissingTitle: string
+    profileScopeMissingMessage: (profile: string) => string
     newChatsProfile: (name: string) => string
     setProfileFailed: string
     sttDisabled: string

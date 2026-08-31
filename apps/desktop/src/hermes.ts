@@ -406,6 +406,13 @@ export interface SidebarSessionSlice {
   sessions: SessionInfo[]
   total?: number
   profile_totals?: Record<string, number>
+  /** Recents only: the recents_profile scope the backend applied, echoed back. */
+  profile?: string
+  /** Recents only: false when that scope named no profile the backend knows —
+   *  a ghost scope (deleted profile / stray stored preference) that matches
+   *  zero DBs and would otherwise be indistinguishable from an empty profile.
+   *  Absent on older backends and on the legacy per-slice fallback. */
+  profile_matched?: boolean
 }
 
 export interface SidebarSessionsResponse {
