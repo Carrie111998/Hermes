@@ -487,6 +487,33 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "hy3",
         "hy3-preview",
     ],
+    # WorkBuddy — Tencent's consumer AI assistant (www.workbuddy.ai).
+    # Tier aliases resolve server-side to the current model behind each
+    # slot, so the concrete model behind "default-model" can change without
+    # a Hermes release. Named models are advertised by /v3/config and are
+    # stable within a session. Only agentic (tool-calling) entries are
+    # listed — see workbuddy-openai `models` for the live catalog.
+    "workbuddy": [
+        "default-model",
+        "fast-model",
+        "balanced-model",
+        "primary-model",
+        "deep-model",
+        "hy4-preview",
+        "hy3",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.3-codex",
+        "gemini-3.5-flash",
+        "glm-5.3",
+        "glm-5.2",
+        "kimi-k3",
+        "kimi-k2.6",
+        "minimax-m3",
+    ],
     "arcee": [
         "trinity-large-thinking",
         "trinity-large-preview",
@@ -1319,6 +1346,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("xiaomi",         "Xiaomi MiMo",              "Xiaomi MiMo (MiMo-V2.5 and V2 models: pro, omni, flash)"),
     ProviderEntry("tencent-tokenhub", "Tencent TokenHub",       "Tencent TokenHub (Hy4 preview via tokenhub.tencentmaas.com)"),
     ProviderEntry("tencent-tokenplan", "Tencent TokenPlan",     "Tencent TokenPlan (Hy4 preview via api.lkeap.cloud.tencent.com, Anthropic Messages)"),
+    ProviderEntry("workbuddy",         "WorkBuddy",             "WorkBuddy (Tencent consumer plan — multi-model via www.workbuddy.ai; browser sign-in)"),
     ProviderEntry("nvidia",         "NVIDIA NIM",               "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
@@ -1551,6 +1579,9 @@ _PROVIDER_ALIASES = {
     "tencentmaas": "tencent-tokenhub",
     "tokenplan": "tencent-tokenplan",
     "tencent-lkeap": "tencent-tokenplan",
+    "workbuddy": "workbuddy",
+    "workbuddy-ai": "workbuddy",
+    "wb": "workbuddy",
     "aws": "bedrock",
     "aws-bedrock": "bedrock",
     "amazon-bedrock": "bedrock",

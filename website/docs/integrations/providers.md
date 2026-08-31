@@ -42,6 +42,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **Xiaomi MiMo** | `XIAOMI_API_KEY` in `~/.hermes/.env` (provider: `xiaomi`, aliases: `mimo`, `xiaomi-mimo`) |
 | **Tencent TokenHub** | `TOKENHUB_API_KEY` in `~/.hermes/.env` (provider: `tencent-tokenhub`, aliases: `tencent`, `tokenhub`, `tencentmaas`) |
 | **Tencent TokenPlan** | `TOKENPLAN_API_KEY` in `~/.hermes/.env` (provider: `tencent-tokenplan`, aliases: `tokenplan`, `tencent-lkeap`; Anthropic Messages endpoint) |
+| **WorkBuddy** | `WORKBUDDY_ACCESS_TOKEN` in `~/.hermes/.env` (provider: `workbuddy`, aliases: `workbuddy-ai`, `wb`; stream-only endpoint) |
 | **OpenCode Zen** | `OPENCODE_ZEN_API_KEY` in `~/.hermes/.env` (provider: `opencode-zen`) |
 | **CommandCode** | `COMMANDCODE_API_KEY` in `~/.hermes/.env` (provider: `commandcode`, alias: `commandcode-chat`; Claude models via `commandcode-anthropic`, alias: `commandcode-claude`). Works with GOAT/Pro/Max/Provider plans (not the $1 Go plan — no API access). |
 | **OpenCode Go** | `OPENCODE_GO_API_KEY` in `~/.hermes/.env` (provider: `opencode-go`) |
@@ -296,6 +297,10 @@ hermes chat --provider tencent-tokenhub --model hy4-preview
 # Tencent TokenPlan (Hy4 preview via Anthropic Messages endpoint)
 hermes chat --provider tencent-tokenplan --model hy4-preview
 # Requires: TOKENPLAN_API_KEY in ~/.hermes/.env
+
+# WorkBuddy (Tencent consumer plan; stream-only endpoint)
+hermes chat --provider workbuddy --model default-model
+# Requires: WORKBUDDY_ACCESS_TOKEN in ~/.hermes/.env
 
 # Arcee AI (Trinity models)
 hermes chat --provider arcee --model trinity-large-thinking

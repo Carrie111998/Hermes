@@ -727,6 +727,9 @@ _PROVIDER_ALIASES = {
     "tencentmaas": "tencent-tokenhub",
     "tokenplan": "tencent-tokenplan",
     "tencent-lkeap": "tencent-tokenplan",
+    "workbuddy": "workbuddy",
+    "workbuddy-ai": "workbuddy",
+    "wb": "workbuddy",
 }
 
 
@@ -1099,6 +1102,10 @@ _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: Dict[str, str] = {
     "ollama-cloud": "nemotron-3-nano:30b",
     "tencent-tokenhub": "hy4-preview",
     "tencent-tokenplan": "hy4-preview",
+    # WorkBuddy — cheapest tier slot. Without an entry here, auxiliary
+    # tasks (title generation, compression, vision) fall back to the
+    # session default provider instead of WorkBuddy.
+    "workbuddy": "fast-model",
     # NB: no "deepinfra" entry — its aux model lives on the ProviderProfile
     # (plugins/model-providers/deepinfra: default_aux_model), which
     # _get_aux_model_for_provider() reads first. Duplicating it here would be
@@ -9519,6 +9526,10 @@ def _provider_requires_stream(provider: str, base_url: Optional[str]) -> bool:
         return False
     # Tencent Copilot — "Non-stream chat request is currently not supported"
     if base_url_host_matches(_url, "copilot.tencent.com"):
+        return True
+    # WorkBuddy — same 11101 envelope as Tencent Copilot; the endpoint
+    # only accepts streamed chat completions.
+    if base_url_host_matches(_url, "workbuddy.ai"):
         return True
     try:
         from hermes_cli.config import load_config

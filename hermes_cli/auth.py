@@ -534,6 +534,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("TOKENPLAN_API_KEY",),
         base_url_env_var="TOKENPLAN_BASE_URL",
     ),
+    "workbuddy": ProviderConfig(
+        id="workbuddy",
+        name="WorkBuddy",
+        auth_type="api_key",
+        inference_base_url="https://www.workbuddy.ai/v2",
+        api_key_env_vars=("WORKBUDDY_ACCESS_TOKEN",),
+        base_url_env_var="WORKBUDDY_BASE_URL",
+    ),
     "ollama-cloud": ProviderConfig(
         id="ollama-cloud",
         name="Ollama Cloud",
@@ -2258,6 +2266,7 @@ def resolve_provider(
         "tencent": "tencent-tokenhub", "tokenhub": "tencent-tokenhub",
         "tencent-cloud": "tencent-tokenhub", "tencentmaas": "tencent-tokenhub",
         "tokenplan": "tencent-tokenplan", "tencent-lkeap": "tencent-tokenplan",
+        "workbuddy": "workbuddy", "workbuddy-ai": "workbuddy", "wb": "workbuddy",
         "aws": "bedrock", "aws-bedrock": "bedrock", "amazon-bedrock": "bedrock", "amazon": "bedrock",
         "go": "opencode-go", "opencode-go-sub": "opencode-go",
         "kilo": "kilocode", "kilo-code": "kilocode", "kilo-gateway": "kilocode",

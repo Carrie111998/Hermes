@@ -201,6 +201,17 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="https://api.lkeap.cloud.tencent.com/plan/anthropic",
         base_url_env_var="TOKENPLAN_BASE_URL",
     ),
+    "workbuddy": HermesOverlay(
+        transport="openai_chat",
+        # Endpoint is stream-only: a non-streaming chat request returns
+        # HTTP 400 {"code": 11101, "msg": "Non-stream chat request ... not
+        # supported"}. Same failure class as Tencent Copilot — see
+        # auxiliary_client._provider_requires_stream(). Model catalog lives
+        # in _PROVIDER_MODELS (the /v2/models route is not exposed); users
+        # with a session can list live ids via workbuddy-openai.
+        base_url_override="https://www.workbuddy.ai/v2",
+        base_url_env_var="WORKBUDDY_BASE_URL",
+    ),
     "arcee": HermesOverlay(
         transport="openai_chat",
         base_url_override="https://api.arcee.ai/api/v1",
@@ -391,6 +402,11 @@ ALIASES: Dict[str, str] = {
     "tencentmaas": "tencent-tokenhub",
     "tokenplan": "tencent-tokenplan",
     "tencent-lkeap": "tencent-tokenplan",
+
+    # workbuddy
+    "workbuddy": "workbuddy",
+    "workbuddy-ai": "workbuddy",
+    "wb": "workbuddy",
 
     # bedrock
     "aws": "bedrock",
