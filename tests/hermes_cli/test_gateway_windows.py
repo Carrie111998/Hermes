@@ -174,6 +174,131 @@ def test_spawn_detached_warns_and_marks_no_breakaway_fallback(
     assert str(tmp_path) not in warnings[0].getMessage()
 
 
+@pytest.mark.windows_only
+def test_restart_arms_relaunch_before_stopping_gateway(monkeypatch):
+    """The replacement must survive the gateway tearing down its CLI child."""
+    events = []
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 4242)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_arm_gateway_restart",
+        lambda pid: events.append(("arm", pid)) or True,
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "stop",
+        lambda *, replacement_armed=False: events.append(
+            ("stop", replacement_armed)
+        ),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_gateway_replacement",
+        lambda pid, timeout_s=45.0: events.append(("wait", pid, timeout_s))
+        or [5252],
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "start",
+        lambda: pytest.fail("an armed watcher owns the replacement start"),
+    )
+
+    gateway_windows.restart()
+
+    assert events == [
+        ("arm", 4242),
+        ("stop", True),
+        ("wait", 4242, 45.0),
+    ]
+
+
+@pytest.mark.windows_only
+def test_arm_restart_reuses_detached_gateway_watcher(monkeypatch):
+    run_argv = ["python.exe", "-m", "hermes_cli.main", "gateway", "run"]
+    calls = []
+
+    monkeypatch.setattr(
+        gateway_windows,
+        "_build_gateway_argv",
+        lambda: (run_argv, r"C:\Hermes", {"HERMES_HOME": r"C:\Hermes"}),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "launch_detached_gateway_restart_by_cmdline",
+        lambda pid, argv: calls.append((pid, argv)) or True,
+    )
+
+    assert gateway_windows._arm_gateway_restart(4242) is True
+    assert calls == [(4242, run_argv)]
+
+
+@pytest.mark.windows_only
+def test_restart_falls_back_to_synchronous_start_when_watcher_cannot_arm(
+    monkeypatch,
+):
+    events = []
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 4242)
+    monkeypatch.setattr(gateway_windows, "_arm_gateway_restart", lambda pid: False)
+    monkeypatch.setattr(
+        gateway_windows,
+        "stop",
+        lambda *, replacement_armed=False: events.append(
+            ("stop", replacement_armed)
+        ),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_gateway_absent",
+        lambda timeout_s=30.0: events.append(("absent", timeout_s)) or True,
+    )
+    monkeypatch.setattr(gateway_windows.time, "sleep", lambda delay: events.append(("sleep", delay)))
+    monkeypatch.setattr(gateway_windows, "start", lambda: events.append(("start",)))
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_gateway_ready",
+        lambda timeout_s=15.0: events.append(("ready", timeout_s)) or [5252],
+    )
+
+    gateway_windows.restart()
+
+    assert events == [
+        ("stop", False),
+        ("absent", 30.0),
+        ("sleep", 1.0),
+        ("start",),
+        ("ready", 15.0),
+    ]
+
+
+@pytest.mark.windows_only
+def test_stop_does_not_kill_replacement_armed_during_clean_drain(monkeypatch):
+    collect_calls = []
+    killed = []
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 4242)
+    monkeypatch.setattr(gateway_windows, "_drain_gateway_pid", lambda *_args: True)
+    monkeypatch.setattr(gateway_windows, "_windows_stop_drain_timeout", lambda: 5.0)
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: False)
+
+    def collect(primary_pid=None):
+        collect_calls.append(primary_pid)
+        return [4242] if primary_pid else [5252]
+
+    monkeypatch.setattr(gateway_windows, "_collect_gateway_stop_pids", collect)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_force_terminate_known_gateway_pids",
+        lambda pids: killed.extend(pids) or 0,
+    )
+
+    gateway_windows.stop(replacement_armed=True)
+
+    assert collect_calls == [4242]
+    assert killed == [4242]
+
+
 class TestStableWindowsGatewayWorkingDir:
     def test_stable_gateway_working_dir_uses_hermes_home(self, tmp_path, monkeypatch):
         home = tmp_path / ".hermes"

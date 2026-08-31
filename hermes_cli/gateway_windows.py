@@ -1609,7 +1609,7 @@ def _collect_gateway_stop_pids(primary_pid: int | None = None) -> list[int]:
     return pids
 
 
-def stop() -> None:
+def stop(*, replacement_armed: bool = False) -> None:
     """Stop the gateway.
 
     Writes the planned-stop marker first so the gateway can drain
@@ -1644,7 +1644,13 @@ def stop() -> None:
     # Phase 3: hard-kill any still-known gateway processes. Avoid the generic
     # process sweep here: Windows direct-spawn starts are profile-scoped, and a
     # stop command must be bounded even if the scanner or shutdown path is wedged.
-    stop_pids.extend(pid for pid in _collect_gateway_stop_pids() if pid not in stop_pids)
+    # A restart watcher may already have observed the clean exit and spawned the
+    # replacement. In that case a fresh scan would mistake the new gateway for a
+    # straggler and kill it, recreating the outage the watcher prevents.
+    if not replacement_armed:
+        stop_pids.extend(
+            pid for pid in _collect_gateway_stop_pids() if pid not in stop_pids
+        )
     killed = _force_terminate_known_gateway_pids(stop_pids)
     if killed:
         stopped_any = True
@@ -1677,6 +1683,37 @@ def _wait_for_gateway_absent(timeout_s: float = 30.0, interval_s: float = 0.5) -
     return get_running_pid() is None and not _gateway_pids()
 
 
+def _arm_gateway_restart(old_pid: int) -> bool:
+    """Detach a watcher that relaunches this profile after ``old_pid`` exits."""
+    if old_pid <= 0:
+        return False
+    try:
+        from hermes_cli.gateway import launch_detached_gateway_restart_by_cmdline
+
+        run_argv, _working_dir, _env_overlay = _build_gateway_argv()
+        return launch_detached_gateway_restart_by_cmdline(old_pid, run_argv)
+    except Exception as exc:
+        logger.warning(
+            "Could not arm detached gateway restart watcher (%s); falling back "
+            "to synchronous relaunch",
+            type(exc).__name__,
+        )
+        return False
+
+
+def _wait_for_gateway_replacement(
+    old_pid: int, timeout_s: float = 45.0, interval_s: float = 0.4
+) -> list[int]:
+    """Wait until a gateway PID other than ``old_pid`` is running."""
+    deadline = time.monotonic() + max(timeout_s, interval_s)
+    while time.monotonic() < deadline:
+        replacements = [pid for pid in _gateway_pids() if pid != old_pid]
+        if replacements:
+            return replacements
+        time.sleep(interval_s)
+    return [pid for pid in _gateway_pids() if pid != old_pid]
+
+
 def restart() -> None:
     """Stop the gateway then start it again.
 
@@ -1688,7 +1725,29 @@ def restart() -> None:
     """
     _assert_windows()
 
-    stop()
+    from gateway.status import get_running_pid
+
+    old_pid = get_running_pid()
+    replacement_armed = old_pid is not None and _arm_gateway_restart(old_pid)
+
+    # Arm before requesting shutdown. A gateway-hosted agent executes this CLI
+    # as a child of the gateway being drained; that child can be terminated with
+    # its parent before synchronous code below ever reaches start(). The detached
+    # watcher is therefore the owner of relaunch whenever a live PID is known.
+    stop(replacement_armed=replacement_armed)
+
+    if replacement_armed:
+        replacements = _wait_for_gateway_replacement(old_pid, timeout_s=45.0)
+        if replacements:
+            print(
+                "✓ Gateway restarted via detached watcher "
+                f"(PID: {', '.join(map(str, replacements))})"
+            )
+            return
+        raise RuntimeError(
+            "Gateway restart watcher did not produce a replacement process. "
+            "Check logs/gateway.log and run `hermes gateway status`."
+        )
 
     if not _wait_for_gateway_absent(timeout_s=30.0):
         print("⚠ Gateway still present after stop; forcing termination before restart...")
