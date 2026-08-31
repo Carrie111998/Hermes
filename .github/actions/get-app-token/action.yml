@@ -51,6 +51,10 @@ inputs:
     description: Pull request permission requested for the token (read or write).
     required: false
     default: ''
+  permission-statuses:
+    description: Commit status permission requested for the token (read or write).
+    required: false
+    default: ''
 
 outputs:
   token:
@@ -86,6 +90,7 @@ runs:
         permission-contents: ${{ inputs.permission-contents }}
         permission-issues: ${{ inputs.permission-issues }}
         permission-pull-requests: ${{ inputs.permission-pull-requests }}
+        permission-statuses: ${{ inputs.permission-statuses }}
 
     - name: Fall back to GITHUB_TOKEN
       id: fallback
