@@ -415,7 +415,9 @@ _SHELL_RC_FILES = (
 )
 _CREDENTIAL_FILES = (
     r'(?:~|\$home|\$\{home\})/\.'
-    r'(?:netrc|pgpass|npmrc|pypirc)\b'
+    # git-credentials stores `https://user:token@host` in cleartext, so a write
+    # to it plants usable push credentials — same class as ~/.netrc.
+    r'(?:netrc|pgpass|npmrc|pypirc|git-credentials)\b'
 )
 # macOS: /etc, /var, /tmp, /home are symlinks to /private/{etc,var,tmp,home}.
 # A command written to target /private/etc/sudoers works identically to
