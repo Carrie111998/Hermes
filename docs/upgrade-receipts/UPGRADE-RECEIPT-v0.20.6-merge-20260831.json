@@ -1,0 +1,52 @@
+{
+  "schema": 1,
+  "status": "OK_WITH_WARNINGS",
+  "operation": "stable_upgrade_merge",
+  "completed_at": "2026-08-31T16:19:25Z",
+  "release": "v0.20.6",
+  "release_tag": "v2026.8.27",
+  "target_branch": "main",
+  "merge_commit": "502d10bf142b2117fc0aea72ace60a981a634426",
+  "stable_release_commit": "5fc308a70719a83cccdbba4c0e39c23f5a8239d5",
+  "carried_local_shutdown_commit": "c61aa0294bb1268e10d83b524e770fea1056441f",
+  "checks": {
+    "py_compile_core_modules": 0,
+    "uv_pip_check": 0,
+    "config_check": 0,
+    "doctor": 0,
+    "import_smoke": 0,
+    "systemd_active": 0,
+    "gateway_state": "running",
+    "gateway_code_sha": "502d10bf142b2117fc0aea72ace60a981a634426",
+    "gateway_code_version": "0.20.6",
+    "session_store": "ok",
+    "feishu_state": "connected",
+    "working_tree_clean": true,
+    "merge_conflicts": 0,
+    "temporary_update_branch_deleted": true
+  },
+  "tests": {
+    "targeted_result": "90 passed, 1 skipped",
+    "scope": [
+      "LSP lifecycle and e2e",
+      "Feishu adapter, lazy import, prompts, markdown and voice",
+      "gateway shutdown marker, bounded teardown and cgroup cleanup"
+    ],
+    "pytest_asyncio": "ephemeral test environment only; production venv unchanged"
+  },
+  "rollback": {
+    "backup_receipt": "~/.hermes/backups/pre-update-20260831-234739/UPGRADE-RECEIPT.json",
+    "git_bundle": "~/.hermes/backups/pre-update-20260831-234739/hermes-agent.bundle",
+    "git_bundle_verified": true,
+    "rollback_venv": "~/.hermes/venv-pre-v0.16.0-20260831-235522",
+    "rollback_venv_verified": true,
+    "local_changes_stash": "stash@{0}",
+    "local_safety_commit": "e4d6da3c858ec498f10525eb321c198811e46451"
+  },
+  "warnings": [
+    "SQLite 3.45.1 WAL-reset corruption risk remains; upgrade separately.",
+    "User config is legacy version 27; current release reports migration target 39. hermes doctor --fix was not run automatically.",
+    "OpenAI credit exhaustion prevented model end-to-end validation.",
+    "The stable release is intentionally 710 commits behind upstream main."
+  ]
+}
