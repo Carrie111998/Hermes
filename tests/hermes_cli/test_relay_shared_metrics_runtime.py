@@ -1385,6 +1385,98 @@ def test_real_binding_drains_orphaned_scope_before_session_pop(
     assert failure is None, failure
 
 
+def test_finish_task_is_no_op_when_teardown_already_drained_the_scope(
+    direct_runtime,
+    caplog,
+):
+    """Regression guard for the shared-metrics finalizer (#81521).
+
+    When the streaming worker is interrupted mid-flight,
+    ``chat_completion_helpers`` best-effort drains the physical LLM
+    scope ahead of the shared-metrics finalizer. The task handle that
+    ``_finish_task`` is then asked to pop is no longer at the top of
+    the captured scope stack — the native binding raises
+    RuntimeError("scope handle is not at the top of the stack"). The
+    finalizer must treat this as already-closed (log at info, do not
+    re-raise) rather than escalate it as a close failure.
+    """
+    caplog.set_level("INFO", logger="hermes_cli.observability.relay_shared_metrics")
+    base = {
+        "session_id": "orphan-already-drained",
+        "task_id": "orphan-task",
+        "turn_id": "orphan-turn",
+        "platform": "cli",
+    }
+    lifecycle.invoke_hook("on_session_start", **base)
+    lifecycle.invoke_hook("pre_llm_call", **base)
+
+    runtime = next(iter(relay_shared_metrics._RUNTIMES.values()))
+    session = runtime._task_sessions[(base["session_id"], base["task_id"])]
+    task = session.tasks[base["task_id"]]
+    orphan_handle = task.handle
+    assert orphan_handle is not None
+
+    # Simulate the streaming-abort teardown having popped the task
+    # scope ahead of the shared-metrics finalizer (#81521). The stack
+    # lives in the task's captured context (push ran there), so the
+    # drain must run there too — otherwise the fake's ContextVar is
+    # None from the test's root context.
+    def drain() -> None:
+        direct_runtime._scope_pop(orphan_handle)
+
+    task.context.copy().run(drain)
+
+    # Capture the post-drain pop count (includes the teardown's pop)
+    # so we can prove the finalizer never invoked ``relay.scope.pop``
+    # again on the orphaned handle beyond the teardown's pre-drain.
+    drain_pop_count = sum(
+        1 for event in direct_runtime.events if event[0] == "scope.pop"
+    )
+
+    with caplog.at_level(
+        "INFO", logger="hermes_cli.observability.relay_shared_metrics"
+    ):
+        relay_shared_metrics.finish_task_run(
+            session_id=base["session_id"],
+            task_id=base["task_id"],
+            platform="cli",
+            result={"completed": True},
+        )
+
+    # The pre-check or the RuntimeError branch must absorb the stale
+    # handle: no rejected pop, no warning with the close-failed text,
+    # and no extra scope.pop beyond the teardown's pre-drain.
+    rejected = [
+        event
+        for event in direct_runtime.events
+        if event[0] == "scope.pop.rejected"
+    ]
+    assert not rejected, rejected
+    failure_warnings = [
+        record
+        for record in caplog.records
+        if "shared-metrics task close failed" in record.message
+    ]
+    assert not failure_warnings, [r.message for r in failure_warnings]
+    post_pop_count = sum(
+        1 for event in direct_runtime.events if event[0] == "scope.pop"
+    )
+    assert post_pop_count == drain_pop_count, (
+        f"finalizer must not pop after teardown drained "
+        f"(drain={drain_pop_count}, post={post_pop_count})"
+    )
+    info_records = [
+        record
+        for record in caplog.records
+        if "already drained by Relay teardown" in record.message
+    ]
+    assert info_records, "expected info log for already-drained task"
+
+    # The task must still be cleared from the runtime even though the
+    # pop was suppressed — otherwise the next event would re-attach.
+    assert base["task_id"] not in session.tasks
+
+
 def test_concurrent_turn_skips_relay_before_scope_stack_can_interleave(
     direct_runtime,
 ):

@@ -1023,15 +1023,41 @@ class _Runtime:
             tool_call_count=len(task.tool_call_ids) + task.unidentified_tool_calls,
             retry_count=task.retry_count,
         )
+        # Relay teardown may have already drained the task scope (streaming
+        # worker interrupted mid-flight, then the best-effort orphan drain
+        # from chat_completion_helpers popped it ahead of the shared-metrics
+        # finalizer — see #81521). When the push context still references
+        # that handle but the live native stack has already moved on, the
+        # native pop raises RuntimeError("scope handle is not at the top of
+        # the stack"). Detect both shapes (top mismatch pre-check and the
+        # native RuntimeError) and treat them as already-closed: log once
+        # at info, do not re-raise, and let session-close reconcile the
+        # rest of the stack.
         try:
-            self._run_in_task(
-                task,
-                relay_runtime.pop_relay_scope,
-                self.relay,
-                task.handle,
-                output=fields,
-                metadata=self._event_metadata(),
-            )
+            if not self._task_handle_still_on_top(task):
+                logger.info(
+                    "Hermes shared-metrics task %s already drained by Relay teardown",
+                    task_id,
+                )
+            else:
+                self._run_in_task(
+                    task,
+                    relay_runtime.pop_relay_scope,
+                    self.relay,
+                    task.handle,
+                    output=fields,
+                    metadata=self._event_metadata(),
+                )
+        except RuntimeError as exc:
+            if "not at the top of the stack" in str(exc):
+                logger.info(
+                    "Hermes shared-metrics task %s already drained by Relay teardown",
+                    task_id,
+                )
+            else:
+                logger.warning(
+                    "Hermes shared-metrics task close failed", exc_info=True
+                )
         except Exception:
             logger.warning("Hermes shared-metrics task close failed", exc_info=True)
         finally:
@@ -1046,6 +1072,56 @@ class _Runtime:
                     if self._turn_sessions.get(turn_key) is session:
                         self._turn_sessions.pop(turn_key, None)
         return True
+
+    def _task_handle_still_on_top(self, task: _TaskRun) -> bool:
+        """Return True when ``task.handle`` is still at the top of the
+        task's captured scope stack.
+
+        Used by ``_finish_task`` to skip a redundant pop when Relay
+        teardown (#81521) already drained the task scope ahead of the
+        shared-metrics finalizer. Mirrors the version-correct accessor
+        used by ``agent.relay_runtime._close_scope_handle`` so the
+        task-context view and the session-context view agree on which
+        binding build exposes what.
+        """
+        if task.handle is None:
+            return False
+        result: dict[str, Any] = {"on_top": False}
+
+        def probe() -> None:
+            relay_scope = getattr(self.relay, "scope", None)
+            get_handle = getattr(relay_scope, "get_handle", None)
+            top: Any = None
+            if callable(get_handle):
+                try:
+                    top = get_handle()
+                except Exception:
+                    top = None
+            if top is None:
+                top = self.relay.get_scope_stack()
+                if isinstance(top, list):
+                    top = top[-1] if top else None
+            handle = task.handle
+            if top is handle or top == handle:
+                result["on_top"] = True
+                return
+            top_uuid = getattr(top, "uuid", None)
+            handle_uuid = getattr(handle, "uuid", None)
+            if (
+                top_uuid is not None
+                and handle_uuid is not None
+                and top_uuid == handle_uuid
+            ):
+                result["on_top"] = True
+
+        try:
+            task.context.copy().run(probe)
+        except Exception:
+            # If the probe itself fails (broken binding, missing context),
+            # fall through to attempting the pop and let the existing
+            # RuntimeError branch handle it.
+            return True
+        return result["on_top"]
 
     def _export(self) -> None:
         self._safe(self.subscriber.store.create_and_export_package_if_due)
