@@ -193,16 +193,25 @@ class TestWebhookRouteLevelOverride:
         assert ov is not None
         assert ov.model == "delivery/model"
 
-    def test_non_webhook_ids_gain_no_extra_keys(self):
+    def test_webhook_shaped_non_webhook_id_gains_no_route_key(self):
         config = GatewayConfig(
             platforms={
                 Platform.DISCORD: PlatformConfig(
                     enabled=True,
-                    channel_overrides={"chan": ChannelOverride(model="m")},
+                    channel_overrides={
+                        "webhook:mission-complete": ChannelOverride(model="m")
+                    },
                 ),
             },
         )
-        assert _get_channel_override(config, Platform.DISCORD, "chan:sub:42") is None
+        assert (
+            _get_channel_override(
+                config,
+                Platform.DISCORD,
+                "webhook:mission-complete:delivery-42",
+            )
+            is None
+        )
 
 
 class TestGetSystemPromptForChannel:
