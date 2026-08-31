@@ -143,6 +143,7 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    system_message=None,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -475,7 +476,7 @@ def finalize_turn(
                 maybe_start_background_compression(
                     agent,
                     messages,
-                    getattr(agent, "_cached_system_prompt", "") or "",
+                    system_message,
                 )
             except Exception:
                 logger.warning(

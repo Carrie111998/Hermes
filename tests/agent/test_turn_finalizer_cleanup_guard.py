@@ -8,6 +8,8 @@ for must still be returned.  Previously any of those raised straight out of
 traceback and lost the whole turn.
 """
 
+from unittest.mock import patch
+
 import pytest
 
 from agent.turn_finalizer import finalize_turn
@@ -106,6 +108,7 @@ def _run(
     final_response=None,
     api_call_count=3,
     turn_exit_reason="unknown",
+    system_message=None,
 ):
     messages = [
         {"role": "user", "content": "do a thing"},
@@ -132,6 +135,7 @@ def _run(
         original_user_message="do a thing",
         _should_review_memory=False,
         _turn_exit_reason=turn_exit_reason,
+        system_message=system_message,
     )
 
 
@@ -162,5 +166,23 @@ def test_clean_turn_has_no_cleanup_errors_key():
     assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
     assert result["completed"] is False
     assert "cleanup_errors" not in result
+
+
+def test_background_compression_receives_raw_system_message():
+    agent = _StubAgent(raise_in=())
+    agent._cached_system_prompt = "fully rendered cached prompt"
+
+    with patch(
+        "agent.background_compression.maybe_start_background_compression"
+    ) as schedule:
+        _run(
+            agent,
+            final_response="done",
+            api_call_count=1,
+            turn_exit_reason="completed",
+            system_message="raw caller context",
+        )
+
+    assert schedule.call_args.args[2] == "raw caller context"
 
 

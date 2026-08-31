@@ -370,6 +370,41 @@ def test_adoption_rebuilds_prompt_and_tools_from_live_runtime_after_model_switch
     assert db.get_session(session_id)["system_prompt"] == "PROMPT:model-b"
 
 
+def test_adoption_does_not_embed_rendered_prompt_in_real_builder(tmp_path: Path) -> None:
+    from agent.background_compression import (
+        adopt_completed_background_compression,
+        maybe_start_background_compression,
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "BACKGROUND_REAL_PROMPT_REBUILD"
+    db.create_session(session_id, source="test")
+    history = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    db.append_messages_batch(session_id, history)
+    started = threading.Event()
+    release = threading.Event()
+    agent = _agent_with_blocking_compressor(db, session_id, started, release)
+    previous_prompt = agent._build_system_prompt("UNIQUE RAW CALLER CONTEXT")
+    agent._cached_system_prompt = previous_prompt
+
+    assert maybe_start_background_compression(agent, history, None) is True
+    assert started.wait(3.0)
+    release.set()
+    assert agent._background_compression_job.done.wait(3.0)
+
+    adopted = adopt_completed_background_compression(agent, history)
+    rebuilt_prompt = agent._cached_system_prompt
+
+    assert adopted is not history
+    assert "UNIQUE RAW CALLER CONTEXT" not in rebuilt_prompt
+    assert previous_prompt not in rebuilt_prompt
+    assert rebuilt_prompt.count("You are Hermes Agent") == 1
+    assert len(rebuilt_prompt) < len(previous_prompt) * 1.5
+
+
 def test_external_memory_provider_disables_background_compaction(tmp_path: Path) -> None:
     from agent.background_compression import maybe_start_background_compression
 

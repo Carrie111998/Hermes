@@ -28,7 +28,7 @@ _POST_COMPACTION_STATE_FIELDS = (
 @dataclass
 class BackgroundCompressionJob:
     session_id: str
-    system_message: str = ""
+    system_message: Optional[str] = None
     done: threading.Event = field(default_factory=threading.Event)
     error: Optional[BaseException] = None
     committed: bool = False
@@ -84,7 +84,7 @@ def _run_background_compression(
     agent: Any,
     job: BackgroundCompressionJob,
     snapshot: list[dict[str, Any]],
-    system_message: str,
+    system_message: Optional[str],
     approx_tokens: int,
 ) -> None:
     try:
@@ -143,7 +143,7 @@ def _run_background_compression(
 def maybe_start_background_compression(
     agent: Any,
     messages: list[dict[str, Any]],
-    system_message: str = "",
+    system_message: Optional[str] = None,
 ) -> bool:
     """Start one eligible background compaction without blocking the caller."""
     if getattr(agent, "_background_compression_enabled", False) is not True:
@@ -204,12 +204,12 @@ def maybe_start_background_compression(
     snapshot = copy.deepcopy(messages)
     job = BackgroundCompressionJob(
         session_id=str(agent.session_id),
-        system_message=system_message or "",
+        system_message=system_message,
     )
     agent._background_compression_job = job
     thread = threading.Thread(
         target=_run_background_compression,
-        args=(agent, job, snapshot, system_message or "", pressure),
+        args=(agent, job, snapshot, system_message, pressure),
         name=f"hermes-bg-compress-{str(agent.session_id)[:16]}",
         daemon=True,
     )
