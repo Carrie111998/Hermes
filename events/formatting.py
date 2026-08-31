@@ -188,6 +188,15 @@ def format_header(
     icon = event_icon(event)
     ts = _short_time(event.timestamp)
 
+    # A user's own inbound message mirrored to the feed is an acknowledgement,
+    # not an operation with an outcome. "🟡 UNKNOWN 💬 USER_INBOUND_MESSAGE"
+    # read as Hermes failing to recognise the message (2026-08-31, Diego
+    # replying to APPLICATION_BLOCKED prompts), when the reply had in fact been
+    # dispatched and routed. Same one-type reasoning as _label_is_noise for
+    # AGENT_NOTE: a statement has no outcome to report, so no dot/label at all.
+    if event.event_type is EventType.USER_INBOUND_MESSAGE:
+        return f"📥 RECEIVED — {event.source} · {ts}"
+
     if event.event_type == EventType.MAILBOX_MESSAGE:
         p = event.payload or {}
         inner_type = p.get("message_type", "MAILBOX_MESSAGE")

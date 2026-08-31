@@ -181,6 +181,22 @@ def test_format_header_for_agent_error():
     assert format_header(e) == "🟠 ⚠️ AGENT_ERROR — mailbox:sentinel · 05:02 UTC"
 
 
+def test_format_header_user_inbound_message_is_received_ack():
+    """The user's own mirrored message renders as an acknowledgement.
+
+    '🟡 UNKNOWN 💬 USER_INBOUND_MESSAGE' read as Hermes failing to recognise
+    the reply (2026-08-31) when it had in fact been dispatched and routed.
+    No dot, no outcome label: a statement has no operation behind it.
+    """
+    e = _make_event(EventType.USER_INBOUND_MESSAGE, source="telegram")
+    expected = "📥 RECEIVED — telegram · 05:02 UTC"
+    assert format_header(e) == expected
+    # The verdict-carrying path (telegram_notifier passes one) must not
+    # resurrect the UNKNOWN label.
+    route = classify(e)
+    assert format_header(e, verdict=route.verdict) == expected
+
+
 def test_format_header_gateway_health_up_is_green():
     """A GATEWAY_HEALTH recovery ('up'/back-running) reads as green (🟢), not
     the amber HIGH dot it shares with the 'down' outage. Operator request
