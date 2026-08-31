@@ -80,6 +80,12 @@ apps/shared/src/**/*.js
 apps/shared/src/**/*.js.map
 apps/shared/src/**/*.d.ts
 apps/desktop/release/
+# Staging dir consumed by session-bridge/deploy_staged_desktop.py. Ignoring it
+# also keeps codegraph's file watcher out (its chokidar `ignored` predicate
+# reuses the project .gitignore): un-ignored, codegraph holds per-directory
+# watch handles on fresh build trees, which block the deploy's staged->LIVE
+# rename (WinError 5) and force the robocopy fallback. Proven 2026-08-31.
+apps/desktop/release-fixed/
 *.tsbuildinfo
 
 # Web UI assets — synced from @nous-research/ui at build time via
