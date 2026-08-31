@@ -1135,6 +1135,18 @@ class TestPruneSessions:
         assert db.get_session("active") is not None
         assert db.count_open_prune_matches(older_than_days=90) == 1
 
+    def test_export_filters_include_active_sessions(self, db):
+        db.create_session(session_id="active", source="telegram")
+        db.create_session(session_id="ended", source="telegram")
+        db.end_session("ended", end_reason="done")
+
+        exported = db.list_export_candidates(source="telegram")
+
+        assert {row["id"] for row in exported} == {"active", "ended"}
+        assert {row["id"] for row in db.list_prune_candidates(source="telegram")} == {
+            "ended"
+        }
+
     def test_open_prune_match_count_applies_other_filters(self, db):
         db.create_session(session_id="matching-open", source="cron")
         db.create_session(session_id="other-source", source="cli")

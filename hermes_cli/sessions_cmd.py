@@ -445,7 +445,7 @@ def cmd_sessions(args, sessions_parser=None):
                     return None
                 return [data]
             if filters:
-                candidates = db.list_prune_candidates(**filters)
+                candidates = db.list_export_candidates(**filters)
                 if args.dry_run:
                     print(
                         f"Would export {len(candidates)} session(s) "
@@ -577,7 +577,7 @@ def cmd_sessions(args, sessions_parser=None):
             def _trace_ids():
                 if session_id:
                     return [db.resolve_session_id(session_id)]
-                candidates = db.list_prune_candidates(**filters)
+                candidates = db.list_export_candidates(**filters)
                 if args.dry_run:
                     print(
                         f"Would export {len(candidates)} session(s) "
@@ -666,7 +666,7 @@ def cmd_sessions(args, sessions_parser=None):
                     print(f"Exported 1 session to {args.output}")
             else:
                 if filters:
-                    candidates = db.list_prune_candidates(**filters)
+                    candidates = db.list_export_candidates(**filters)
                     if args.dry_run:
                         print(
                             f"Would export {len(candidates)} session(s) "
@@ -841,7 +841,7 @@ def cmd_sessions(args, sessions_parser=None):
             )
             db.close()
             return
-        candidates = db.list_prune_candidates(**filters)
+        candidates = db.list_export_candidates(**filters)
         if args.dry_run:
             print(
                 f"Would export {len(candidates)} session(s) "
@@ -988,7 +988,7 @@ def cmd_sessions(args, sessions_parser=None):
                     f"flag). {_optin}"
                 )
 
-        candidates = db.list_prune_candidates(**filters)
+        candidates = db.list_export_candidates(**filters)
         # Archive expands each selected row to its compression lineage, which
         # can include open continuations; a direct-open count would therefore
         # describe the eventual archive effect inaccurately.

@@ -14054,6 +14054,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         self._apply_prune_age_filter(older_than_days, filters)
         where, params = self._prune_filter_where(source=source, **filters)
+        return self._list_filtered_session_rows(where, params)
+
+    def list_export_candidates(
+        self,
+        older_than_days: Optional[float] = None,
+        source: str = None,
+        **filters,
+    ) -> List[Dict[str, Any]]:
+        """Return matching sessions for non-destructive bulk export.
+
+        Export shares prune's filters but includes open sessions. The ended
+        guard stays mandatory in every destructive prune/archive caller.
+        """
+        self._apply_prune_age_filter(older_than_days, filters)
+        where, params = self._prune_filter_where(source=source, **filters)
+        ended_guard = "s.ended_at IS NOT NULL"
+        if not where.startswith(ended_guard):
+            raise RuntimeError("prune filter lost its ended-session safety guard")
+        where = where[len(ended_guard):].removeprefix(" AND ") or "1 = 1"
+        return self._list_filtered_session_rows(where, params)
+
+    def _list_filtered_session_rows(
+        self, where: str, params: list
+    ) -> List[Dict[str, Any]]:
         with self._read_ctx() as conn:
             cursor = conn.execute(
                 f"""SELECT s.id, s.source, s.title, s.model, s.started_at,
