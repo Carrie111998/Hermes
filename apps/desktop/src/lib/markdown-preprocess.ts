@@ -10,7 +10,7 @@ import { linkifySessionRefs } from '@/lib/session-refs'
 const REASONING_BLOCK_RE = /<(think|thinking|reasoning|scratchpad|analysis)>[\s\S]*?<\/\1>\s*/gi
 const PREVIEW_MARKER_RE = /\[Preview:[^\]]+\]\(#preview[:/][^)]+\)/gi
 
-const FENCE_LINE_RE = /^([ \t]*(?:>[ \t]*)*(?:(?:[-+*]|\d+[.)])[ \t]+)?[ \t]*)(`{3,}|~{3,})([^\n]*)$/
+const FENCE_LINE_RE = /^([ \t]*(?:(?:>[ \t]*)|(?:(?:[-+*]|\d+[.)])[ \t]+))*)(`{3,}|~{3,})([^\n]*)$/
 const EMPTY_FENCE_BLOCK_RE = /(^|\n)[ \t]*(?:`{3,}|~{3,})[^\n]*\n[ \t]*(?:`{3,}|~{3,})[ \t]*(?=\n|$)/g
 const CODE_FENCE_SPLIT_RE = /((?:```|~~~)[\s\S]*?(?:```|~~~))/g
 const INLINE_CODE_SPLIT_RE = /(`[^`\n]+`)/g
@@ -91,7 +91,7 @@ function hasCloseFenceLine(body: string, marker: string): boolean {
 
 function scrubBacktickNoise(text: string): string {
   const balancedFenceRe =
-    /(^|\n)([ \t]*(?:>[ \t]*)*(?:(?:[-+*]|\d+[.)])[ \t]+)?[ \t]*)(`{3,}|~{3,})([^\n]*)\n([\s\S]*?)\n[ \t]*(?:>[ \t]*)*(?:(?:[-+*]|\d+[.)])[ \t]+)?[ \t]*\3[ \t]*(?=\n|$)/g
+    /(^|\n)([ \t]*(?:(?:>[ \t]*)|(?:(?:[-+*]|\d+[.)])[ \t]+))*)(`{3,}|~{3,})([^\n]*)\n([\s\S]*?)\n[ \t]*(?:(?:>[ \t]*)|(?:(?:[-+*]|\d+[.)])[ \t]+))*\3[ \t]*(?=\n|$)/g
 
   const protectedRanges: { end: number; start: number }[] = []
   let match: RegExpExecArray | null
@@ -103,7 +103,7 @@ function scrubBacktickNoise(text: string): string {
   }
 
   const danglingCodeFenceRe =
-    /(^|\n)[ \t]*(?:>[ \t]*)*(?:(?:[-+*]|\d+[.)])[ \t]+)?[ \t]*(`{3,}|~{3,})([a-z0-9][a-z0-9+#-]{0,15})[ \t]*\n([\s\S]*)$/gi
+    /(^|\n)[ \t]*(?:(?:>[ \t]*)|(?:(?:[-+*]|\d+[.)])[ \t]+))*(`{3,}|~{3,})([a-z0-9][a-z0-9+#-]{0,15})[ \t]*\n([\s\S]*)$/gi
 
   while ((match = danglingCodeFenceRe.exec(text)) !== null) {
     const start = match.index + match[1].length

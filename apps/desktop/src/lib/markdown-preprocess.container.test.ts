@@ -14,4 +14,24 @@ describe('preprocessMarkdown container fences', () => {
     expect(output).toContain('const value = 1;')
     expect(output).toContain('```')
   })
+
+  it.each([
+    [
+      'list then blockquote',
+      ['- > ```ts', '  > const value = 1;', '  > ```'].join('\n'),
+      ['- > ```ts', '  > const value = 1;', '- > ```'].join('\n')
+    ],
+    [
+      'blockquote then list',
+      ['> - ```ts', '>   const value = 1;', '>   ```'].join('\n'),
+      ['> - ```ts', '>   const value = 1;', '> - ```'].join('\n')
+    ],
+    [
+      'deeply nested containers',
+      ['> - > 1. ```ts', '>   >   1. const value = 1;', '>   >   1. ```'].join('\n'),
+      ['> - > 1. ```ts', '>   >   1. const value = 1;', '> - > 1. ```'].join('\n')
+    ]
+  ])('preserves %s fence marker and language', (_label, input, expected) => {
+    expect(preprocessMarkdown(input)).toBe(expected)
+  })
 })
