@@ -810,10 +810,12 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
     """Force a fresh OAuth flow for one server. Returns True on success.
 
     Snapshots existing credentials before wiping them, then restores on
-    failure so a cancelled/interrupted/timed-out flow does not destroy
-    working access.  The dashboard OAuth re-auth path already used this
-    pattern (web_server.py:13690-13721); the CLI path now matches it
-    exactly, closing the destructive-before-success gap in #98759.
+    any abort — including Ctrl-C (KeyboardInterrupt) during the browser
+    callback wait — so a cancelled/interrupted/timed-out flow does not
+    destroy working access.  Uses a ``finally`` guard with a ``committed``
+    flag so BaseException (KeyboardInterrupt, SystemExit) is caught
+    uniformly with Exception; earlier ``except Exception`` left the
+    manual-abort path that motivated #98759 open (#98765 review).
 
     Wipes cached OAuth state (disk + in-process MCPOAuthManager cache),
     re-probes to trigger the browser flow, and verifies a token actually
@@ -829,13 +831,16 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         _info("Use `hermes mcp remove` + `hermes mcp add` to reconfigure auth.")
         return False
 
-    # Snapshot prior credentials so we can restore them if the flow fails.
-    # The dashboard path (web_server.py HermesTokenStorage.snapshot) does
-    # the same thing — the CLI path was the only one missing this safety net.
+    # Snapshot prior credentials so we can restore them on any abort.
+    # The committed flag gates the finally block so Ctrl-C during the
+    # OAuth callback wait (KeyboardInterrupt, a BaseException not caught by
+    # except Exception) restores credentials cleanly — the original issue's
+    # primary repro step (#98759).
     from tools.mcp_oauth import HermesTokenStorage
     storage = HermesTokenStorage(name)
     credential_backup = storage.snapshot()
     previous_entry = None
+    committed = False
 
     # Wipe both disk and in-memory cache so the next probe forces a fresh
     # OAuth flow.
@@ -848,17 +853,6 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
     print()
     _info(f"Starting OAuth flow for '{name}'...")
 
-    # Probe triggers the OAuth flow (browser redirect + callback capture).
-    # Honor the server's configured connect_timeout so a human has enough
-    # time to complete the browser sign-in; the 30s default is too tight for
-    # an interactive OAuth round-trip. Floor at 315s — the OAuth callback
-    # window (300s in mcp_oauth) plus headroom — matching the GUI re-auth
-    # path in web_server.py so CLI and dashboard behave identically.
-    #
-    # force_interactive_oauth: `hermes mcp login` is *explicitly* user-
-    # initiated even when stdin isn't a TTY (Hermes desktop / agent-
-    # spawned terminals). Without this, OAuth refuses before opening a
-    # browser because _is_interactive() only checks sys.stdin.isatty().
     try:
         from tools.mcp_oauth import force_interactive_oauth
 
@@ -885,13 +879,6 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
                 "Server responded, but no OAuth token was obtained — "
                 "authentication did not complete."
             )
-            # Restore prior working credentials so the server remains usable.
-            storage.restore(credential_backup, only_if_absent=True)
-            try:
-                from tools.mcp_oauth_manager import get_manager as _get_mgr
-                _get_mgr().restore_entry(name, previous_entry)
-            except Exception:
-                pass
             print()
             _info(
                 "Some providers (e.g. Google Drive, Atlassian) do not support "
@@ -913,15 +900,9 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
             _success(f"Authenticated — {len(tools)} tool(s) available")
         else:
             _success("Authenticated (server reported no tools)")
+        committed = True
         return True
     except Exception as exc:
-        # Restore prior credentials on any failure so the server stays usable.
-        storage.restore(credential_backup, only_if_absent=True)
-        try:
-            from tools.mcp_oauth_manager import get_manager as _get_mgr
-            _get_mgr().restore_entry(name, previous_entry)
-        except Exception:
-            pass
         try:
             from tools.mcp_oauth import humanize_oauth_registration_error
 
@@ -937,6 +918,14 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
             "when ready to retry."
         )
         return False
+    finally:
+        if not committed:
+            storage.restore(credential_backup, only_if_absent=True)
+            try:
+                from tools.mcp_oauth_manager import get_manager as _get_mgr
+                _get_mgr().restore_entry(name, previous_entry)
+            except Exception:
+                pass
 
 
 def cmd_mcp_login(args):
