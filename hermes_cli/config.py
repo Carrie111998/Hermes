@@ -2080,10 +2080,14 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     # intentionally absent from DEFAULT_CONFIG:
     "image_gen",         # image-generation provider config (agent/image_gen_registry.py)
     "video_gen",         # video-generation provider config (agent/video_gen_registry.py)
-    "plugins",           # plugin enable/disable lists (hermes_cli/plugins_cmd.py)
-    "smart_model_routing",   # written by the setup wizard (hermes_cli/setup.py)
-    "platform_toolsets",     # written by the setup wizard (hermes_cli/setup.py)
-    "known_plugin_toolsets", # written/read by hermes_cli/tools_config.py toolset-save flow
+     "plugins",           # plugin enable/disable lists (hermes_cli/plugins_cmd.py)
+     # smart_model_routing: key is preserved in the schema for forward-compat
+     # but has no runtime consumer yet — no code reads smart_model_routing.enabled
+     # (#98835). The setup wizard no longer writes it to avoid creating a silent
+     # no-op entry in user configs. Wire up the consumer before re-enabling.
+     "smart_model_routing",
+     "platform_toolsets",     # written by the setup wizard (hermes_cli/setup.py)
+     "known_plugin_toolsets", # written/read by hermes_cli/tools_config.py toolset-save flow
     "known_builtin_toolsets",  # ditto — which builtin toolsets a platform's checklist has offered
     "tool_gateway_declined_tools",  # per-tool Tool Gateway offer declines (hermes_cli/nous_subscription.py, #92647)
     "session_reset",         # top-level form read by gateway/config.py + setup
