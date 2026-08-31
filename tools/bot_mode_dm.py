@@ -304,7 +304,17 @@ def message_agent_tool(
         dm_target = f"{peer_name}/{peer_profile}" if peer_profile else peer_name
         label = f"@{peer_profile or peer_name} on peer '{peer_name}'"
         return _start_delivery(
-            ["hermes", "peer", "dm", dm_target],
+            # Pin the DEFAULT profile for the peer registry lookup. The
+            # `hermes peer` CLI resolves its registry (bot_peers / peers
+            # store) from the CURRENT profile's config, but peers are
+            # registered in the default profile's config.yaml. Without -p,
+            # a session running under a non-default profile (e.g. a
+            # reviewer bot) executes `hermes peer dm` in that profile's
+            # context, finds an empty registry, and fails with "No peer
+            # named '<peer>'" even though the peer is registered and works
+            # from the default profile (#93935). The local-teammate path
+            # below already pins its profile the same way.
+            ["hermes", "-p", "default", "peer", "dm", dm_target],
             prefix + body,
             label,
             stdin_file=True,
