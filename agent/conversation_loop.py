@@ -8146,6 +8146,53 @@ def run_conversation(
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
+                # ── TBS artifact-QA continuation guard ─────────────────
+                # TBS client/CFO finance XLSX outputs must not be called
+                # complete unless a mechanical workbook validator pass is
+                # visible in the turn context. The byte-level workbook check
+                # stays in the external validator; this finalization seam only
+                # guards completion claims that lack validator evidence.
+                try:
+                    from agent.tbs_artifact_qa_guard import (
+                        SYNTHETIC_FLAG as _TBS_ARTIFACT_QA_GUARD_FLAG,
+                        build_artifact_qa_nudge as _build_tbs_artifact_qa_nudge,
+                    )
+
+                    _tbs_artifact_qa_nudge = _build_tbs_artifact_qa_nudge(
+                        final_response,
+                        user_message=original_user_message,
+                        recent_messages=messages,
+                    )
+                except Exception:
+                    logger.debug("TBS artifact-QA guard check failed", exc_info=True)
+                    _tbs_artifact_qa_nudge = None
+                    _TBS_ARTIFACT_QA_GUARD_FLAG = "_tbs_artifact_qa_guard_synthetic"
+
+                if _tbs_artifact_qa_nudge:
+                    final_msg["finish_reason"] = "tbs_artifact_qa_continuation_required"
+                    final_msg[_TBS_ARTIFACT_QA_GUARD_FLAG] = True
+                    append_message(messages, final_msg)
+                    append_message(messages, {
+                        "role": "user",
+                        "content": _tbs_artifact_qa_nudge,
+                        _TBS_ARTIFACT_QA_GUARD_FLAG: True,
+                    })
+                    agent._session_messages = messages
+                    logger.info(
+                        "TBS artifact-QA guard issued continuation nudge "
+                        "(session=%s)",
+                        getattr(agent, "session_id", None) or "none",
+                    )
+                    agent._emit_status(
+                        "↻ TBS workbook completion needs validator evidence — continuing QA"
+                    )
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    continue
+
                 # ── Dropped tool-call recovery (copilot/Claude) ────────
                 # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
                 # on GitHub Copilot, ~2026-07) return finish_reason="tool_calls"

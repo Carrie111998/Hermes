@@ -244,6 +244,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # persisted and emitted as an interim message (#65919).
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    # TBS artifact QA continuation guard: client/CFO workbook completion claims
+    # need mechanical validator evidence before they become durable transcript
+    # content.
+    "_tbs_artifact_qa_guard_synthetic",
     # kanban worker stop-guard: narrated exit without kanban_complete/block
     "_kanban_stop_synthetic",
     # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
