@@ -2248,6 +2248,32 @@ class TestBuzzAdapterSend:
         assert mention_values == [OTHER_PUBKEY]
 
     @pytest.mark.asyncio
+    async def test_configured_handoff_suppresses_unicode_compatibility_collision(self):
+        adapter = _make_adapter(
+            {"outbound_mention_pubkeys": {"Ｒｅｖｉｅｗｅｒ": OTHER_PUBKEY}}
+        )
+        adapter._channel_member_pubkeys = AsyncMock(return_value=[AGENT_PUBKEY])
+        adapter._profile_display_name = AsyncMock(return_value="Reviewer")
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": True, "event_id": "evt-exact-unicode", "message": ""},
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "@Reviewer please check this")
+
+        assert result.success is True
+        args, _text = cli.calls[0]
+        mention_values = [
+            args[index + 1]
+            for index, value in enumerate(args)
+            if value == "--mention"
+        ]
+        assert mention_values == [OTHER_PUBKEY]
+
+    @pytest.mark.asyncio
     async def test_send_configured_handoff_fails_instead_of_downgrading(self):
         adapter = _make_adapter(
             {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}

@@ -221,7 +221,9 @@ def _escape_unresolved_presentation_mention(
     name = match.group("name")
     if not name:
         return None
-    if name.casefold() in (protected_names or set()):
+    if unicodedata.normalize("NFKC", name).casefold() in (
+        protected_names or set()
+    ):
         return None
     token = re.compile(
         rf"(?<!\S)@{re.escape(name)}(?=$|[^A-Za-z0-9._-])",
@@ -243,7 +245,10 @@ def _parse_outbound_mention_pubkeys(value: Any) -> Dict[str, Tuple[str, str]]:
 
     parsed: Dict[str, Tuple[str, str]] = {}
     for raw_name, raw_pubkey in value.items():
-        name = str(raw_name or "").strip().lstrip("@").strip()
+        name = unicodedata.normalize(
+            "NFKC",
+            str(raw_name or "").strip().lstrip("@").strip(),
+        )
         pubkey = _normalize_user_ref(str(raw_pubkey or "").strip())
         if not name or not pubkey:
             raise ValueError(
