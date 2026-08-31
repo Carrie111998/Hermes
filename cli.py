@@ -22096,10 +22096,15 @@ def main(
                 # The fully-quiet ``-Q`` / ``--quiet`` machine-readable path
                 # above was already banner-free; this brings the human-
                 # facing single-query path in line so all non-interactive
-                # invocations are fast.
-                _query_label = query or ("[image attached]" if single_query_images else "")
-                if _query_label:
-                    cli.console.print(f"[bold blue]Query:[/] {_query_label}")
+                 # invocations are fast.
+                 _query_label = query or ("[image attached]" if single_query_images else "")
+                 if _query_label:
+                     # Escape markup so query-file content containing
+                     # Rich-style tags (e.g. pytest params like
+                     # [/fb-images/path] or regex patterns) is rendered
+                     # literally rather than crashing with MarkupError (#98789).
+                     from rich.markup import escape as _re
+                     cli.console.print(f"[bold blue]Query:[/] {_re(_query_label)}")
                 # Surface security advisories before the agent runs — short
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
