@@ -661,13 +661,24 @@ def _run_agent_tool_execution_middleware(
                         final_args = modified_args
                         state["args"] = modified_args
                     return block_msg
-                except Exception:
+                except Exception as exc:
+                    from ashare.harness.errors import RepairableRuntimeFault
+                    if isinstance(exc, RepairableRuntimeFault):
+                        raise
                     return None
 
-            block_message = (
-                _resolve_pre_tool_block()
-                if authorization_gate is None
-                else authorization_gate.run(_resolve_pre_tool_block)
+            def _pre_tool_operation():
+                return (_resolve_pre_tool_block() if authorization_gate is None
+                        else authorization_gate.run(_resolve_pre_tool_block))
+
+            from agent.runtime_fault_repair import retry_after_runtime_repair
+            block_message = retry_after_runtime_repair(
+                _pre_tool_operation, phase="pre_tool_call",
+                session_id=getattr(agent, "session_id", "") or "",
+                task_id=effective_task_id or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                project_root=os.getenv("TERMINAL_CWD") or os.getcwd(),
+                fault={"tool_name": function_name},
             )
 
         guardrail_decision = None

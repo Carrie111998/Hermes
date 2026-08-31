@@ -60,6 +60,20 @@ def test_retry_failure_is_not_repaired_twice(monkeypatch):
     assert repairs == 1
 
 
+def test_pre_tool_fault_uses_the_same_one_shot_recovery_path(monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: name == "runtime_fault_repair")
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_required_hook", lambda name, **kwargs: (
+        calls.append(kwargs["phase"]) or {"action": "RETRY", "module_prefixes": []}
+    ))
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda force=False: None)
+    assert retry_after_runtime_repair(
+        lambda: "ok" if calls else (_ for _ in ()).throw(RuntimeError("binding mismatch")),
+        phase="pre_tool_call", session_id="s", task_id="t", turn_id="v",
+    ) == "ok"
+    assert calls == ["pre_tool_call"]
+
+
 def test_core_module_prefix_cannot_be_evicted(monkeypatch):
     monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
     monkeypatch.setattr(
