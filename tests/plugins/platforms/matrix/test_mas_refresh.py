@@ -259,6 +259,43 @@ async def test_refresh_attempts_bounded(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_success_resets_attempt_counter_chain_survives(monkeypatch):
+    """32h live repro (#94096 review): MAS rotates tokens every ~4h, so a
+    LIFETIME cap of 8 attempts exhausts a perfectly valid refresh chain
+    after ~32h and the adapter gives up forever. The counter must reset
+    on every successful refresh — only consecutive failures trip it."""
+    a = _make_adapter()
+    api = _FakeApi()
+
+    async def ok_req(method, path, body):
+        return {"access_token": "acc-1", "refresh_token": "rt-1"}
+
+    api.request = ok_req
+
+    # Simulate many success/fail cycles spanning days of runtime: each
+    # success must reset the counter so the next failure sequence starts
+    # from zero.
+    async def fail_req(method, path, body):
+        raise RuntimeError("M_UNKNOWN_TOKEN Invalid refresh token")
+
+    for cycle in range(matrix_adapter._MAX_REFRESH_ATTEMPTS + 2):
+        # Successful refresh (rotation happens every ~4h in production).
+        assert await a._refresh_access_token(api, reason="cycle") is True
+        assert a._refresh_attempts == 0, (
+            "success must reset the consecutive-failure counter"
+        )
+        # One transient failure (network blip) before the next success.
+        api.request = fail_req
+        assert await a._refresh_access_token(api, reason="blip") is False
+        assert a._refresh_attempts == 1
+        api.request = ok_req
+
+    # After all cycles the chain is still alive — a lifetime cap would
+    # have given up around cycle 8.
+    assert await a._refresh_access_token(api, reason="still-alive") is True
+
+
+@pytest.mark.asyncio
 async def test_mas_path_requires_client_id(monkeypatch):
     import urllib.request as _ureq
 

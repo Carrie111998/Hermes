@@ -1199,9 +1199,12 @@ class _CryptoStateStore:
         return list(self._joined_rooms)
 
 
-# Total access-token refresh attempts per adapter lifetime. MAS refresh
-# tokens are single-use; a server that keeps rejecting freshly-issued
+# Consecutive access-token refresh failures before the adapter gives up. MAS
+# refresh tokens are single-use; a server that keeps rejecting freshly-issued
 # tokens must never drive an unbounded refresh/rotate loop (#94096 review).
+# A SUCCESSFUL refresh resets the counter, so a healthy chain rotating every
+# ~4h never trips the cap (32h live repro showed a lifetime cap exhausting
+# a valid chain).
 _MAX_REFRESH_ATTEMPTS = 8
 
 
@@ -1452,9 +1455,10 @@ class MatrixAdapter(BasePlatformAdapter):
 
         On success updates ``api.token``, ``self._access_token`` and rotates
         ``self._refresh_token`` in memory (best-effort). Attempts are
-        bounded: after ``_MAX_REFRESH_ATTEMPTS`` total tries the helper
-        gives up so a rejecting server can never drive an endless
-        refresh/rotate loop. Returns True on success.
+        bounded: after ``_MAX_REFRESH_ATTEMPTS`` consecutive failures the
+        helper gives up so a rejecting server can never drive an endless
+        refresh/rotate loop; a successful refresh resets the counter, so a
+        healthy chain rotating every few hours never trips the cap.
         """
         if not self._refresh_token or not self._homeserver:
             return False
@@ -1464,8 +1468,8 @@ class MatrixAdapter(BasePlatformAdapter):
                 return False
             if self._refresh_attempts >= _MAX_REFRESH_ATTEMPTS:
                 logger.error(
-                    "Matrix: giving up token refresh after %d attempts "
-                    "(server keeps rejecting); restart required.",
+                    "Matrix: giving up token refresh after %d consecutive "
+                    "failures (server keeps rejecting); restart required.",
                     self._refresh_attempts,
                 )
                 return False
@@ -1513,6 +1517,12 @@ class MatrixAdapter(BasePlatformAdapter):
         if not new_access:
             return False
         self._access_token = new_access
+        # A successful refresh proves the chain is valid: reset the
+        # consecutive-failure counter so the cap measures a BROKEN chain,
+        # not the process lifetime. MAS rotates tokens every ~4h — a
+        # lifetime cap would exhaust in ~32h and permanently kill a
+        # healthy refresh chain (live 32h repro in #94096 review).
+        self._refresh_attempts = 0
         try:
             api.token = new_access
         except Exception:
