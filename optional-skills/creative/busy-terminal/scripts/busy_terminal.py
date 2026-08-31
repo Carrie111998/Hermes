@@ -2,13 +2,18 @@
 """Fake a busy coding session in the terminal.
 
 Four scenes cycle in random order: an editor typing source, a build, a test
-run, and git activity. Every byte is invented — no file is read or written, no
-command runs, nothing touches the network. This is a joke screensaver in the
-`cmatrix` tradition, not a tool.
+run, and git activity. Every byte the scenes print is invented — no file is
+read or written, no command runs, nothing touches the network. This is a joke
+screensaver in the `cmatrix` tradition, not a tool.
 
     python3 busy_terminal.py                 # until Ctrl-C
     python3 busy_terminal.py --duration 120  # two minutes, then exit
     python3 busy_terminal.py --scene tests   # one scene on repeat
+    python3 busy_terminal.py --window        # open a new terminal, return now
+
+`--window` is the one thing here that starts a process: it re-launches this
+script inside a fresh terminal window and exits. An agent needs it, because a
+captured pipe has no TTY to animate and an unbounded run would never return.
 """
 
 from __future__ import annotations
@@ -17,9 +22,12 @@ import argparse
 import os
 import random
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Callable, Sequence, TextIO
 
 SCENES = ("code", "build", "tests", "git")
@@ -587,6 +595,85 @@ def run(
             return played
 
 
+# ── Launching a visible window ───────────────────────────────────────────────
+
+LINUX_TERMINALS = (
+    ("x-terminal-emulator", ("-e",)),
+    ("gnome-terminal", ("--",)),
+    ("konsole", ("-e",)),
+    ("xfce4-terminal", ("-e",)),
+    ("alacritty", ("-e",)),
+    ("kitty", ("--",)),
+    ("xterm", ("-e",)),
+)
+
+
+class NoTerminalError(RuntimeError):
+    """No terminal emulator on this machine can host the screensaver."""
+
+
+def applescript_string(text: str) -> str:
+    """Quote text as an AppleScript string literal."""
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def window_argv(
+    command: str,
+    platform: str,
+    which: Callable[[str], str | None] = shutil.which,
+) -> list[str]:
+    """Build the argv that runs `command` in a NEW visible terminal window.
+
+    Takes the platform as data rather than reading `sys.platform`, so all three
+    branches are checkable from one host.
+    """
+    if platform == "darwin":
+        return [
+            "osascript",
+            "-e", f"tell application \"Terminal\" to do script {applescript_string(command)}",
+            "-e", 'tell application "Terminal" to activate',
+        ]
+
+    if platform == "win32":
+        return ["cmd", "/c", "start", "", "cmd", "/k", command]
+
+    for emulator, flags in LINUX_TERMINALS:
+        if which(emulator):
+            # `sh -c` normalises the argument shape across emulators.
+            return [emulator, *flags, "sh", "-c", command]
+
+    raise NoTerminalError(
+        "no terminal emulator found (tried: "
+        + ", ".join(name for name, _ in LINUX_TERMINALS)
+        + ")"
+    )
+
+
+def relaunch_command(argv: Sequence[str], script: str = "", python: str = "") -> str:
+    """The shell command that re-runs this script without `--window`."""
+    parts = [
+        python or sys.executable,
+        script or str(Path(__file__).resolve()),
+        *[arg for arg in argv if arg != "--window"],
+    ]
+
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def open_in_window(
+    argv: Sequence[str],
+    *,
+    platform: str = sys.platform,
+    spawn: Callable[..., object] = subprocess.Popen,
+    which: Callable[[str], str | None] = shutil.which,
+) -> int:
+    """Start the screensaver in its own window and return immediately."""
+    command = window_argv(relaunch_command(argv), platform, which)
+    spawn(command)
+
+    return 0
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -632,12 +719,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--seed", type=int, default=None, help="Seed for a reproducible run.")
     parser.add_argument("--no-color", action="store_true", help="Plain text, no ANSI escapes.")
+    parser.add_argument(
+        "--window", action="store_true",
+        help="Open a new terminal window running this, then exit. Use this from an agent.",
+    )
 
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(raw)
+
+    if args.window:
+        return open_in_window(raw)
+
     _enable_windows_ansi()
 
     size = shutil.get_terminal_size(fallback=(100, 30))

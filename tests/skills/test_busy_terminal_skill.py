@@ -275,6 +275,97 @@ class TestRunLoop:
         assert all(a != b for a, b in zip(seen, seen[1:]))
 
 
+# ── Launching a visible window ───────────────────────────────────────────────
+
+
+class TestApplescriptString:
+    def test_wraps_in_quotes(self):
+        assert busy_terminal.applescript_string("hi") == '"hi"'
+
+    def test_escapes_quotes_and_backslashes_so_the_literal_cannot_break_out(self):
+        quoted = busy_terminal.applescript_string('a "b" c\\d')
+        assert quoted == '"a \\"b\\" c\\\\d"'
+        assert quoted.startswith('"') and quoted.endswith('"')
+        assert '\\"b\\"' in quoted
+
+
+class TestWindowArgv:
+    def test_macos_drives_terminal_app_and_brings_it_forward(self):
+        argv = busy_terminal.window_argv("run me", "darwin")
+        assert argv[0] == "osascript"
+        assert any("do script" in part for part in argv)
+        assert any("activate" in part for part in argv)
+
+    def test_macos_embeds_the_command_as_an_escaped_applescript_literal(self):
+        argv = busy_terminal.window_argv('say "hi"', "darwin")
+        assert any('\\"hi\\"' in part for part in argv)
+
+    def test_windows_starts_a_detached_console(self):
+        argv = busy_terminal.window_argv("run me", "win32")
+        assert argv[:3] == ["cmd", "/c", "start"]
+        assert argv[-1] == "run me"
+
+    def test_linux_uses_the_first_emulator_that_exists(self):
+        installed = {"konsole": "/usr/bin/konsole", "xterm": "/usr/bin/xterm"}
+        argv = busy_terminal.window_argv("run me", "linux", which=installed.get)
+        assert argv[0] == "konsole"
+
+    def test_linux_normalises_every_emulator_through_sh_c(self):
+        for emulator, _ in busy_terminal.LINUX_TERMINALS:
+            argv = busy_terminal.window_argv(
+                "run me", "linux", which=lambda name, e=emulator: "/bin/x" if name == e else None
+            )
+            assert argv[0] == emulator
+            assert argv[-3:] == ["sh", "-c", "run me"]
+
+    def test_linux_without_any_emulator_says_so(self):
+        with pytest.raises(busy_terminal.NoTerminalError) as excinfo:
+            busy_terminal.window_argv("run me", "linux", which=lambda _name: None)
+        assert "xterm" in str(excinfo.value)
+
+
+class TestRelaunchCommand:
+    def test_drops_the_window_flag_so_the_child_actually_animates(self):
+        command = busy_terminal.relaunch_command(
+            ["--window", "--duration", "60"], script="/s/busy.py", python="/py"
+        )
+        assert "--window" not in command
+        assert command == "/py /s/busy.py --duration 60"
+
+    def test_quotes_paths_with_spaces(self):
+        command = busy_terminal.relaunch_command([], script="/a b/busy.py", python="/py")
+        assert "'/a b/busy.py'" in command
+
+    def test_other_flags_survive_the_round_trip(self):
+        command = busy_terminal.relaunch_command(
+            ["--window", "--scene", "git", "--seed", "3"], script="/s.py", python="/py"
+        )
+        assert command.endswith("--scene git --seed 3")
+
+
+class TestOpenInWindow:
+    def test_spawns_the_window_and_returns_without_animating(self):
+        spawned: list[list[str]] = []
+        code = busy_terminal.open_in_window(
+            ["--window", "--duration", "30"],
+            platform="darwin",
+            spawn=lambda argv: spawned.append(argv),
+        )
+        assert code == 0
+        assert len(spawned) == 1
+        assert spawned[0][0] == "osascript"
+
+    def test_the_command_it_hands_off_still_carries_the_options(self):
+        spawned: list[list[str]] = []
+        busy_terminal.open_in_window(
+            ["--window", "--scene", "build"],
+            platform="win32",
+            spawn=lambda argv: spawned.append(argv),
+        )
+        assert "--scene build" in spawned[0][-1]
+        assert "--window" not in spawned[0][-1]
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
@@ -315,6 +406,17 @@ class TestCli:
         assert code == 0
         assert out.strip()
         assert not ANSI.search(out)
+
+    def test_window_hands_off_and_returns_instead_of_animating(self):
+        """An agent calls this; it must come back immediately, not block the turn."""
+        with (
+            mock.patch.object(busy_terminal, "open_in_window", return_value=0) as handoff,
+            mock.patch.object(busy_terminal, "run") as animate,
+        ):
+            assert busy_terminal.main(["--window", "--duration", "60"]) == 0
+
+        handoff.assert_called_once()
+        animate.assert_not_called()
 
     def test_interrupting_restores_the_cursor_and_exits_cleanly(self):
         with mock.patch.object(busy_terminal, "run", side_effect=KeyboardInterrupt):

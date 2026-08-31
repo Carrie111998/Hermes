@@ -23,13 +23,15 @@ about the user's actual work and should never be presented as if it did.
 
 ## When to Use
 
-- The user asks for a terminal screensaver, an idle animation, or "make this
-  terminal look busy"
+Trigger on any of these, without asking a follow-up question:
+
+- "pretend I'm working" / "make it look like I'm working" / "look busy"
+- "start the fake work screensaver" / "busy terminal" / "fake coding"
 - The user wants an ambient background pane during a stream, demo, or recording
-- The user names it directly ("busy terminal", "fake work screensaver")
 
 Do not reach for this when the user wants real build, test, or git output —
-run the real thing with `terminal` instead.
+run the real thing with `terminal` instead. Never describe its output as if it
+reflected real work; it is invented and reports nothing about the repository.
 
 ## Prerequisites
 
@@ -40,20 +42,29 @@ redirected degrades to plain text automatically, as does setting `NO_COLOR`.
 
 ## How to Run
 
-Use the `terminal` tool. It runs until Ctrl-C unless given a `--duration`.
+Always pass `--window`. Run it through the `terminal` tool:
 
 ```bash
-python3 ~/.hermes/skills/creative/busy-terminal/scripts/busy_terminal.py
+python3 ~/.hermes/skills/creative/busy-terminal/scripts/busy_terminal.py \
+  --window --duration 600
 ```
 
-Prefer a bounded run when starting it on the user's behalf, so it cannot
-outlive their attention:
+`--window` opens a fresh terminal window on the user's screen, then returns
+immediately. Without it the animation writes into the agent's captured pipe,
+where there is no TTY to animate and — at the default unbounded duration — the
+turn never ends.
+
+Pick a `--duration` so the window cannot outlive the user's attention. Ten
+minutes is a good default; they can Ctrl-C sooner.
+
+Variants worth offering:
 
 ```bash
-python3 .../busy_terminal.py --duration 300        # five minutes
-python3 .../busy_terminal.py --scene tests --speed 2
-python3 .../busy_terminal.py --seed 7 --no-color   # reproducible, plain
+... --window --scene tests --speed 2   # one scene, faster
+... --window --duration 300            # five minutes
 ```
+
+The user can also run it themselves in any terminal, without `--window`.
 
 ## Quick Reference
 
@@ -64,6 +75,7 @@ python3 .../busy_terminal.py --seed 7 --no-color   # reproducible, plain
 | `--scene` | cycle | Pin one of `code`, `build`, `tests`, `git` |
 | `--seed` | random | Reproducible run |
 | `--no-color` | off | Plain text, no ANSI escapes |
+| `--window` | off | Open a new terminal window and return — use this from an agent |
 
 | Scene | What it shows |
 |-------|---------------|
@@ -74,20 +86,25 @@ python3 .../busy_terminal.py --seed 7 --no-color   # reproducible, plain
 
 ## Procedure
 
-1. Confirm the terminal is one the user can watch and interrupt — this takes
-   over the pane it runs in.
-2. Pick a `--duration` unless the user explicitly wants it open-ended.
-3. Launch it with `terminal`. Tell the user Ctrl-C stops it.
+1. Run the script with `--window` and a `--duration` via `terminal`.
+2. Tell the user a new window opened and that Ctrl-C in it stops the show.
+3. Suggest full screen and a larger font if they want it to fill the display.
 
 Scenes never repeat back to back; `next_scene` excludes the one that just
 played, so the cycle reads as varied rather than random-looking.
 
 ## Pitfalls
 
-- It owns the pane. Start it in a terminal the user is not working in, or they
-  will have to Ctrl-C to get their prompt back.
-- Backgrounding it (`terminal(background=True)`) is pointless — the output is
-  the entire feature and a background process writes it nowhere visible.
+- **Forgetting `--window` hangs the turn.** The default duration is unbounded,
+  so a captured run never returns and the user sees nothing.
+- It owns the pane it runs in. `--window` gives it its own, which is why that
+  is the agent's path.
+- Backgrounding it (`terminal(background=True)`) is not a substitute — the
+  output is the entire feature and a background process writes it nowhere
+  visible.
+- On Linux `--window` needs a terminal emulator on PATH; it raises
+  `NoTerminalError` naming the ones it tried. Over plain SSH with no emulator,
+  fall back to telling the user to run it without `--window`.
 - Under 40 columns the editor pane and artifact table wrap badly. `Console`
   floors the width at 40, but a genuinely tiny terminal still looks cramped.
 - `--speed` scales pauses, not content. Very high values (>10) reduce it to a
