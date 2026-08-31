@@ -46,8 +46,10 @@ import base64
 import datetime
 import logging
 import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
@@ -344,6 +346,47 @@ def save_url_image(
     return path
 
 
+# Per-request base URL of the API server's static /images/ mount (e.g.
+# "http://127.0.0.1:8199"). Bound by the api_server platform adapter around
+# each agent run so success_response() can hand back a URL the client can
+# actually fetch, instead of a bare local path that only exists on the
+# server host. ContextVar (not a module global) because the gateway serves
+# concurrent runs from one process — each run must see its own bind.
+_IMAGE_SERVE_BASE_URL: ContextVar[Optional[str]] = ContextVar(
+    "image_serve_base_url", default=None
+)
+
+
+def set_image_serve_base_url(url: str):
+    """Bind the image-serve base URL for this context; returns a reset token."""
+    return _IMAGE_SERVE_BASE_URL.set(url)
+
+
+def reset_image_serve_base_url(token) -> None:
+    """Restore the previous image-serve binding captured by ``set_*``."""
+    _IMAGE_SERVE_BASE_URL.reset(token)
+
+
+def _maybe_rewrite_image_url(image: Any) -> Any:
+    """Rewrite an absolute local image path into a servable /images/ URL.
+
+    Only fires when an api-server base URL is bound AND ``image`` is an
+    absolute local path (POSIX leading slash, Windows drive letter, or UNC).
+    Relative paths and http(s) URLs pass through untouched.
+    """
+    base = _IMAGE_SERVE_BASE_URL.get()
+    if not base or not isinstance(image, str) or not image:
+        return image
+    if image.startswith(("http://", "https://")):
+        return image
+    try:
+        if not Path(image).is_absolute():
+            return image
+    except (OSError, ValueError):
+        return image
+    return f"{base.rstrip('/')}/images/{quote(Path(image).name)}"
+
+
 def success_response(
     *,
     image: str,
@@ -357,14 +400,18 @@ def success_response(
     """Build a uniform success response dict.
 
     ``image`` may be an HTTP URL or an absolute filesystem path (for b64
-    providers like OpenAI). ``modality`` is ``"text"`` (text-to-image) or
+    providers like OpenAI). Absolute local paths are rewritten to the
+    api-server's static ``/images/`` URL when a base URL is bound for this
+    context (see :func:`set_image_serve_base_url`), so remote clients can
+    fetch the file instead of receiving a path that only exists on the
+    server host. ``modality`` is ``"text"`` (text-to-image) or
     ``"image"`` (image-to-image / editing) — indicates which endpoint was
     actually hit, useful for diagnostics. Callers that need to pass through
     additional backend-specific fields can supply ``extra``.
     """
     payload: Dict[str, Any] = {
         "success": True,
-        "image": image,
+        "image": _maybe_rewrite_image_url(image),
         "model": model,
         "prompt": prompt,
         "aspect_ratio": aspect_ratio,

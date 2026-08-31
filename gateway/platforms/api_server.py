@@ -144,6 +144,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
     validate_media_delivery_path,
+    IMAGE_CACHE_DIR,
 )
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
@@ -7284,6 +7285,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _run():
             from gateway.session_context import clear_session_vars
+            from agent.image_gen_provider import (
+                reset_image_serve_base_url,
+                set_image_serve_base_url,
+            )
 
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
@@ -7294,6 +7299,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     browser_control_transport_family=(
                         request_browser_control_transport_family
                     ),
+                )
+                img_token = set_image_serve_base_url(
+                    getattr(self, "image_serve_base_url", None)
                 )
                 agent = None
                 try:
@@ -7466,7 +7474,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         # shutdown.  pop() is a no-op when _create_agent
                         # succeeded but the turn never reached registration.
                         self._shutdown_interruptible_agents.pop(id(agent), None)
-                    clear_session_vars(tokens)
+                    try:
+                        reset_image_serve_base_url(img_token)
+                    finally:
+                        clear_session_vars(tokens)
 
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
@@ -7801,10 +7812,17 @@ class APIServerAdapter(BasePlatformAdapter):
                         set_current_session_key,
                         unregister_gateway_notify,
                     )
+                    from agent.image_gen_provider import (
+                        reset_image_serve_base_url,
+                        set_image_serve_base_url,
+                    )
 
                     effective_task_id = session_id or run_id
                     approval_token = None
                     session_tokens = []
+                    img_token = set_image_serve_base_url(
+                        getattr(self, "image_serve_base_url", None)
+                    )
                     with self._profile_scope(request_profile):
                         try:
                             # Bind approval/session identity for this API run via
@@ -7849,18 +7867,21 @@ class APIServerAdapter(BasePlatformAdapter):
                             # guard as gateway/run.py and _run_agent above).
                             _clear_turn_process_ownership(agent)
                             try:
-                                unregister_gateway_notify(approval_session_key)
+                                reset_image_serve_base_url(img_token)
                             finally:
-                                if approval_token is not None:
-                                    try:
-                                        reset_current_session_key(approval_token)
-                                    except Exception:
-                                        pass
-                                if session_tokens:
-                                    try:
-                                        clear_session_vars(session_tokens)
-                                    except Exception:
-                                        pass
+                                try:
+                                    unregister_gateway_notify(approval_session_key)
+                                finally:
+                                    if approval_token is not None:
+                                        try:
+                                            reset_current_session_key(approval_token)
+                                        except Exception:
+                                            pass
+                                    if session_tokens:
+                                        try:
+                                            clear_session_vars(session_tokens)
+                                        except Exception:
+                                            pass
                         u = {
                             "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
                             "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
@@ -8409,6 +8430,15 @@ class APIServerAdapter(BasePlatformAdapter):
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
                 self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+
+            # Serve cached generated images over HTTP so API clients can fetch
+            # them by URL instead of a server-local filesystem path.
+            # aiohttp >=3.9 raises ValueError from add_static() when the
+            # directory is missing, so create it first — a fresh install (or
+            # a fresh HERMES_HOME) has never generated an image.
+            if IMAGE_CACHE_DIR:
+                IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                self._app.router.add_static("/images/", str(IMAGE_CACHE_DIR), show_index=False)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the
@@ -8509,6 +8539,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     self.name, self._host, self._port, exc,
                 )
                 return False
+
+            # Remember the serving URL so image-generation responses can
+            # rewrite absolute local cache paths into /images/ URLs the API
+            # client can actually fetch. A wildcard bind serves from loopback.
+            serving_host = "127.0.0.1" if self._host in ("", "0.0.0.0", "::") else self._host
+            self.image_serve_base_url = f"http://{serving_host}:{self._port}"
 
             self._mark_connected()
             logger.info(
