@@ -10,18 +10,51 @@ It does not call Qwen or `/v1/chat/completions` directly.
 
 ## Configuration
 
-Set these on the media server:
+The recommended server-side path is the normal Hermes setup wizard:
+
+```bash
+hermes gateway setup
+```
+
+Choose **Voice session**. The wizard generates or saves the bearer token in
+the active profile's private `.env`, writes listener settings and the client
+allowlist to `config.yaml`, and prints the endpoint and client details to use
+with `hermes-relay setup` on the client computer. Run it again to change the
+listener or allowlist.
+
+The equivalent editable YAML shape is:
+
+```yaml
+platforms:
+  voice_session:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      port: 8790
+      path: /voice-session
+      allowed_users:
+        - hermes-relay
+```
+
+Keep only the bearer token in `.env`:
 
 ```text
 VOICE_SESSION_TOKEN=<long-random-token>
+```
+
+For a client on another computer, the listener host must be reachable from
+that computer (for example, the server's Tailscale address or a deliberately
+firewalled interface). The default loopback bind is local-only.
+
+Legacy environment overrides remain supported:
+
+```text
 VOICE_SESSION_ALLOWED_USERS=amanda-laptop
 VOICE_SESSION_HOST=127.0.0.1
 VOICE_SESSION_PORT=8790
 ```
 
-The default loopback bind is intentional. Bind to a Tailscale/private address
-only when the device network path and firewall are ready. Token authentication
-and the client allowlist are independent gates.
+The token authentication and client allowlist are independent gates.
 
 When enabled, the listener exposes:
 

@@ -929,6 +929,127 @@ class VoiceSessionAdapter(BasePlatformAdapter):
 # ----------------------------------------------------------------------
 
 
+def interactive_setup() -> None:
+    """Configure the voice-session listener through the Hermes setup flow."""
+    import secrets
+
+    from hermes_cli.cli_output import (
+        print_header,
+        print_info,
+        print_success,
+        print_warning,
+        prompt,
+        prompt_yes_no,
+    )
+    from hermes_cli.config import get_env_value, load_config, save_config, save_env_value
+
+    print_header("Voice session")
+    existing_token = (get_env_value("VOICE_SESSION_TOKEN") or "").strip()
+    if existing_token:
+        print_info("Voice session: already configured")
+        if not prompt_yes_no("Reconfigure voice session?", False):
+            return
+
+    print_info("This listener accepts authenticated WebSocket connections from relay clients.")
+    print_info("For a remote client, use a LAN or Tailscale-reachable bind host instead of 127.0.0.1.")
+    token = prompt("Bearer token (leave empty to generate one)", password=True).strip()
+    generated = not token
+    token = token or secrets.token_urlsafe(32)
+    save_env_value("VOICE_SESSION_TOKEN", token)
+    if generated:
+        print_success("Generated a new bearer token. Copy it to the client setup now:")
+        print_info(f"  {token}")
+    else:
+        print_success("Bearer token saved")
+
+    existing_config = load_config()
+    existing_platform = existing_config.get("platforms", {}).get("voice_session", {})
+    existing_extra = (
+        existing_platform.get("extra", {})
+        if isinstance(existing_platform, dict)
+        else {}
+    )
+    allowed_default = existing_extra.get("allowed_users") or "hermes-relay"
+    if isinstance(allowed_default, (list, tuple, set)):
+        allowed_default = ",".join(str(value) for value in allowed_default)
+    allowed = prompt("Allowed client IDs (comma-separated)", default=str(allowed_default))
+    allowed_users = [value.strip() for value in allowed.split(",") if value.strip()]
+    if not allowed_users:
+        print_warning("No client IDs allowed; the listener will reject every client.")
+
+    host = prompt(
+        "Listener bind host",
+        default=str(existing_extra.get("host") or DEFAULT_HOST),
+    )
+    port_text = prompt(
+        "Listener port",
+        default=str(existing_extra.get("port") or DEFAULT_PORT),
+    )
+    port = _int_setting(port_text, DEFAULT_PORT)
+    path = prompt(
+        "WebSocket path",
+        default=str(existing_extra.get("path") or DEFAULT_PATH),
+    )
+    path = "/" + path.strip().lstrip("/").rstrip("/")
+
+    config = load_config()
+    platforms = config.setdefault("platforms", {})
+    if not isinstance(platforms, dict):
+        platforms = {}
+        config["platforms"] = platforms
+    platform_config = platforms.setdefault("voice_session", {})
+    if not isinstance(platform_config, dict):
+        platform_config = {}
+        platforms["voice_session"] = platform_config
+    platform_config["enabled"] = True
+    platform_config["extra"] = {
+        "host": host,
+        "port": port,
+        "path": path,
+        "allowed_users": allowed_users,
+    }
+    save_config(config)
+
+    display_host = host if host not in {"0.0.0.0", "::"} else "<server-hostname>"
+    print_success("Voice-session listener configuration saved")
+    print_info(f"Client endpoint: ws://{display_host}:{port}{path}")
+    print_info("On the client computer, run `hermes-relay setup` and enter this endpoint and token.")
+
+
+def _apply_yaml_config(yaml_cfg: dict, platform_cfg: dict) -> Optional[dict]:
+    """Expose listener settings from config.yaml to the adapter."""
+    if not isinstance(platform_cfg, dict):
+        return None
+    extra = platform_cfg.get("extra")
+    values = dict(extra) if isinstance(extra, dict) else {}
+    values.update(
+        {
+            key: platform_cfg[key]
+            for key in (
+                "host",
+                "port",
+                "path",
+                "hello_timeout",
+                "allowed_users",
+                "allow_all_users",
+            )
+            if key in platform_cfg
+        }
+    )
+    return {
+        key: values[key]
+        for key in (
+            "host",
+            "port",
+            "path",
+            "hello_timeout",
+            "allowed_users",
+            "allow_all_users",
+        )
+        if key in values
+    } or None
+
+
 def check_requirements() -> bool:
     return AIOHTTP_AVAILABLE and bool(_get_scoped_secret("VOICE_SESSION_TOKEN").strip())
 
@@ -982,6 +1103,8 @@ def register(ctx) -> None:
         is_connected=is_connected,
         required_env=["VOICE_SESSION_TOKEN"],
         install_hint="pip install aiohttp",
+        setup_fn=interactive_setup,
+        apply_yaml_config_fn=_apply_yaml_config,
         env_enablement_fn=_env_enablement,
         allowed_users_env="VOICE_SESSION_ALLOWED_USERS",
         allow_all_env="VOICE_SESSION_ALLOW_ALL_USERS",

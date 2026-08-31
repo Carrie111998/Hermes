@@ -8,7 +8,10 @@ from plugins.platforms.voice_session.adapter import (
     PROTOCOL_VERSION,
     VoiceSessionAdapter,
     _Connection,
+    _apply_yaml_config,
     _bearer_token,
+    interactive_setup,
+    register,
 )
 
 
@@ -55,6 +58,88 @@ def test_bearer_token_requires_bearer_scheme():
     assert _bearer_token({"Authorization": "Bearer abc"}) == "abc"
     assert _bearer_token({"Authorization": "Basic abc"}) == ""
     assert _bearer_token({}) == ""
+
+
+def test_yaml_config_supplies_voice_session_listener_settings():
+    assert _apply_yaml_config(
+        {},
+        {
+            "host": "0.0.0.0",
+            "port": 8792,
+            "path": "/voice-session",
+            "allowed_users": ["jensen-laptop"],
+        },
+    ) == {
+        "host": "0.0.0.0",
+        "port": 8792,
+        "path": "/voice-session",
+        "allowed_users": ["jensen-laptop"],
+    }
+
+
+def test_interactive_setup_generates_token_and_saves_listener_config(monkeypatch):
+    saved_env = {}
+    saved_configs = []
+    answers = {
+        "Allowed client IDs": "jensen-laptop",
+        "Listener bind host": "0.0.0.0",
+        "Listener port": "8790",
+        "WebSocket path": "/voice-session",
+    }
+
+    def prompt(question, default=None, password=False):
+        if "Bearer token" in question:
+            return ""
+        for label, answer in answers.items():
+            if label in question:
+                return answer
+        raise AssertionError(f"unexpected prompt: {question}")
+
+    monkeypatch.setattr("hermes_cli.config.get_env_value", saved_env.get)
+    monkeypatch.setattr(
+        "hermes_cli.config.save_env_value",
+        lambda key, value: saved_env.__setitem__(key, value),
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.config.save_config",
+        lambda value, **kwargs: saved_configs.append(value),
+    )
+    monkeypatch.setattr("hermes_cli.cli_output.prompt", prompt)
+    monkeypatch.setattr("hermes_cli.cli_output.prompt_yes_no", lambda *args, **kwargs: True)
+    monkeypatch.setattr("hermes_cli.cli_output.print_header", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.cli_output.print_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.cli_output.print_success", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.cli_output.print_warning", lambda *args, **kwargs: None)
+    monkeypatch.setattr("secrets.token_urlsafe", lambda length: "generated-token")
+
+    interactive_setup()
+
+    assert saved_env["VOICE_SESSION_TOKEN"] == "generated-token"
+    assert saved_configs[0]["platforms"]["voice_session"] == {
+        "enabled": True,
+        "extra": {
+            "host": "0.0.0.0",
+            "port": 8790,
+            "path": "/voice-session",
+            "allowed_users": ["jensen-laptop"],
+        },
+    }
+
+
+def test_register_exposes_setup_and_yaml_config_hooks():
+    class Context:
+        def __init__(self):
+            self.kwargs = None
+
+        def register_platform(self, **kwargs):
+            self.kwargs = kwargs
+
+    context = Context()
+    register(context)
+
+    assert context.kwargs["setup_fn"] is interactive_setup
+    assert context.kwargs["apply_yaml_config_fn"] is _apply_yaml_config
 
 
 @pytest.mark.asyncio
