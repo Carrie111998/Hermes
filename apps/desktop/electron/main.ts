@@ -16402,9 +16402,6 @@ ipcMain.handle('hermes:preview:emulate-device', (event, payload) => {
   try {
     if (!metrics) {
       guest.disableDeviceEmulation()
-      // Back to inheriting the window's zoom, which is what a preview that is
-      // not pretending to be a device should do.
-      guest.setZoomLevel(event.sender.getZoomLevel())
 
       return true
     }
@@ -16412,13 +16409,14 @@ ipcMain.handle('hermes:preview:emulate-device', (event, payload) => {
     const width = Math.max(1, Math.round(Number(metrics.width) || 0))
     const height = Math.max(1, Math.round(Number(metrics.height) || 0))
 
-    // A guest inherits the window's zoom, and Chromium also REMEMBERS a zoom
-    // per origin for the session — so a page could arrive already zoomed even
-    // at 100%. Either way the emulated viewport would be measured in pixels the
-    // wrong size, and "430px wide" would be a lie. A device preview is only
-    // honest at the device's own scale, so pin it before emulating.
-    guest.setZoomLevel(0)
-
+    // Deliberately NOT setZoomLevel(0) here. Pinning the guest to 1:1 looks
+    // like the obvious way to make "430px" honest, but Chromium keeps zoom
+    // PER ORIGIN, not per webContents: measured with two panes on one origin,
+    // pinning the emulated one dropped the untouched one to zoomLevel 0 too
+    // and its page jumped from 341 to 458 CSS px. It is also unnecessary —
+    // `deviceScaleFactor: 0` already resets the guest to the screen's own
+    // scale, so emulation lands correctly on its own once the frame is sized
+    // in the right unit (see preview-viewport.ts).
     guest.enableDeviceEmulation({
       // 0 keeps the real device pixel ratio: this emulates a viewport, not a
       // screen density, and overriding DPR would change how sharp the preview
