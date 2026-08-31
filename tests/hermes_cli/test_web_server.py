@@ -4384,6 +4384,75 @@ class TestPluginAPIRuntimeReload:
         resp = self.client.post("/api/plugins/example/reload")
         assert resp.status_code == 404
 
+    def test_reload_prefix_boundary_spares_sibling_prefix_plugins(self, _install_example_plugin):
+        """Stale-route removal matches the plugin's exact prefix: reloading
+        ``example`` must not touch another plugin whose path prefix merely
+        extends it (``example2``), nor its own deeper paths
+        (``/api/plugins/example/...`` must keep the ``==``/``prefix + '/'``
+        boundary)."""
+        import json as _json
+
+        from hermes_constants import get_hermes_home
+        from hermes_cli import web_server
+
+        # Install a sibling fixture plugin named example2 (its prefix
+        # /api/plugins/example2 extends /api/plugins/example).
+        home = get_hermes_home()
+        sib_src = _EXAMPLE_PLUGIN_FIXTURE
+        sib_dst = home / "plugins" / "example2-dashboard"
+        if sib_dst.exists():
+            shutil.rmtree(sib_dst)
+        shutil.copytree(sib_src, sib_dst)
+        manifest_path = sib_dst / "dashboard" / "manifest.json"
+        manifest = _json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["name"] = "example2"
+        manifest_path.write_text(_json.dumps(manifest), encoding="utf-8")
+
+        from hermes_cli.config import load_config, save_config
+        cfg = load_config()
+        enabled = cfg.setdefault("plugins", {}).get("enabled")
+        if not isinstance(enabled, list):
+            enabled = []
+        if "example2" not in enabled:
+            enabled.append("example2")
+        cfg["plugins"]["enabled"] = enabled
+        save_config(cfg)
+
+        web_server._dashboard_plugins_cache = None
+        web_server._get_dashboard_plugins(force_rescan=True)
+        web_server._mount_plugin_api_routes()
+
+        # Both plugins serve before the reload.
+        assert self.client.get("/api/plugins/example/hello").status_code == 200
+        assert self.client.get("/api/plugins/example2/hello").status_code == 200
+
+        # Reload example with a rewritten api file (new route set).
+        self._write_plugin_api(
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n"
+            "@router.get('/only')\n"
+            "async def only():\n"
+            "    return {'v': 'reloaded'}\n"
+        )
+        result = web_server._reload_plugin_api_routes("example")
+        assert result["ok"] is True
+        assert result["routes"] == 1
+
+        # Sibling prefix plugin untouched; reloaded plugin swapped.
+        assert self.client.get("/api/plugins/example2/hello").status_code == 200
+        assert self.client.get("/api/plugins/example/hello").status_code == 404
+        resp = self.client.get("/api/plugins/example/only")
+        assert resp.status_code == 200
+        assert resp.json() == {"v": "reloaded"}
+
+        # Teardown: drop the sibling mount so it can't leak into later tests.
+        sib_prefix = "/api/plugins/example2"
+        web_server.app.router.routes[:] = [
+            r for r in web_server.app.router.routes
+            if not (getattr(r, "path", "") == sib_prefix
+                    or getattr(r, "path", "").startswith(sib_prefix + "/"))
+        ]
+
 
 class TestDashboardPluginManifestExtensions:
     """Tests for the extended plugin manifest fields (tab.override,
