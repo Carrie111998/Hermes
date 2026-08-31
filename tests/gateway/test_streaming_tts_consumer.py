@@ -406,6 +406,49 @@ class TestAbortAndCancellation:
 class TestFallbackSafety:
     """Pre-audio failure falls back; post-audio failure does not replay."""
 
+    def test_explicit_false_write_result_keeps_whole_file_fallback_eligible(self):
+        class NoAcceptanceAdapter(FakeVoiceAdapter):
+            async def write_streaming_tts(self, handle, chunk):
+                self.written_chunks.append(chunk)
+                return False
+
+        async def run(loop):
+            adapter = NoAcceptanceAdapter()
+            streamer = FakeStreamer(chunks_per_clause=1)
+            consumer = _make_consumer(adapter, "chat1", loop, streamer)
+
+            consumer.start()
+            consumer.on_delta("A sentence whose PCM is not accepted. ")
+            consumer.finish()
+
+            completed = await consumer.wait_complete(timeout=5.0)
+            assert completed is False
+            assert consumer.audible is False
+            assert consumer.suppress_whole_file is False
+
+        _run_test(run)
+
+    def test_none_write_result_preserves_legacy_acceptance(self):
+        class LegacyNoneAdapter(FakeVoiceAdapter):
+            async def write_streaming_tts(self, handle, chunk):
+                self.written_chunks.append(chunk)
+
+        async def run(loop):
+            adapter = LegacyNoneAdapter()
+            streamer = FakeStreamer(chunks_per_clause=1)
+            consumer = _make_consumer(adapter, "chat1", loop, streamer)
+
+            consumer.start()
+            consumer.on_delta("A sentence whose adapter uses the legacy result. ")
+            consumer.finish()
+
+            completed = await consumer.wait_complete(timeout=5.0)
+            assert completed is True
+            assert consumer.audible is True
+            assert consumer.suppress_whole_file is True
+
+        _run_test(run)
+
     def test_pre_audio_failure_falls_back(self):
         async def run(loop):
             adapter = FakeVoiceAdapter()

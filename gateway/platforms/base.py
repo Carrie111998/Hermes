@@ -4832,8 +4832,12 @@ class BasePlatformAdapter(ABC):
         """
         return None
 
-    async def write_streaming_tts(self, handle: StreamingTTSHandle, chunk: bytes) -> None:
-        """Write one PCM chunk to the adapter's outbound audio track."""
+    async def write_streaming_tts(self, handle: StreamingTTSHandle, chunk: bytes) -> Optional[bool]:
+        """Write one PCM chunk and optionally report whether audio was accepted.
+
+        Return ``False`` only when no PCM was accepted. ``None`` preserves
+        the legacy success contract, while truthy returns also mean accepted.
+        """
         pass
 
     async def finish_streaming_tts(self, handle: StreamingTTSHandle, *, interrupted: bool = False) -> None:

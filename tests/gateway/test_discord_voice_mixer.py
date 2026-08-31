@@ -314,6 +314,115 @@ class TestDiscordStreamingTTS:
         )
 
     @pytest.mark.asyncio
+    async def test_carry_only_pcm_keeps_consumer_fallback_eligible(self):
+        """A split int16 prefix is not accepted audio until its second byte arrives."""
+        from gateway.streaming_tts_consumer import StreamingTTSConsumer
+        from plugins.platforms.discord.adapter import _DiscordStreamingTTSHandle
+
+        class CarryOnlyStreamer:
+            sample_rate = 24000
+            channels = 1
+            sample_width = 2
+
+            def stream(self, text):
+                del text
+                yield b"\x01"
+
+        adapter = _make_adapter()
+        mixer = vm.VoiceMixer()
+        vc = _VoiceClientState(mixer)
+        adapter._voice_clients[111] = vc
+        adapter._voice_text_channels[111] = 222
+        adapter._voice_mixers[111] = mixer
+        adapter._cancel_voice_timeout = MagicMock()
+
+        with patch("tools.tts_streaming.resolve_streaming_provider", return_value=CarryOnlyStreamer()):
+            consumer = StreamingTTSConsumer(adapter, "222", {}, asyncio.get_running_loop())
+            consumer.start()
+            for _ in range(100):
+                if consumer.started:
+                    break
+                await asyncio.sleep(0.01)
+            assert consumer.started is True
+            assert isinstance(consumer._handle, _DiscordStreamingTTSHandle)
+            child = consumer._handle.child
+
+            consumer.on_delta("A complete answer that reaches the streaming provider.")
+            consumer.finish()
+            completed = await consumer.wait_complete(timeout=1.0)
+
+        assert completed is False
+        assert consumer.completed is False
+        assert consumer.audible is False
+        assert consumer.suppress_whole_file is False
+        assert consumer._handle.carry == b"\x01"
+        assert child._activated is False
+        assert mixer.speech_active is False
+
+    @pytest.mark.asyncio
+    async def test_split_sample_activates_child_only_after_second_byte(self):
+        """The completed int16 sample is accepted after a carry-only prefix."""
+        from gateway.streaming_tts_consumer import StreamingTTSConsumer
+        from plugins.platforms.discord.adapter import _DiscordStreamingTTSHandle
+
+        class SplitSampleStreamer:
+            sample_rate = 24000
+            channels = 1
+            sample_width = 2
+
+            def __init__(self):
+                self.first_yielded = threading.Event()
+                self.release_second = threading.Event()
+
+            def stream(self, text):
+                del text
+                self.first_yielded.set()
+                yield b"\x01"
+                assert self.release_second.wait(timeout=1.0)
+                yield b"\x00"
+
+        streamer = SplitSampleStreamer()
+        adapter = _make_adapter()
+        mixer = vm.VoiceMixer()
+        vc = _VoiceClientState(mixer)
+        adapter._voice_clients[111] = vc
+        adapter._voice_text_channels[111] = 222
+        adapter._voice_mixers[111] = mixer
+        adapter._cancel_voice_timeout = MagicMock()
+
+        with patch("tools.tts_streaming.resolve_streaming_provider", return_value=streamer):
+            consumer = StreamingTTSConsumer(adapter, "222", {}, asyncio.get_running_loop())
+            consumer.start()
+            for _ in range(100):
+                if consumer.started:
+                    break
+                await asyncio.sleep(0.01)
+            assert consumer.started is True
+            assert isinstance(consumer._handle, _DiscordStreamingTTSHandle)
+            child = consumer._handle.child
+
+            consumer.on_delta("A complete answer that reaches the streaming provider.")
+            consumer.finish()
+            assert await asyncio.to_thread(streamer.first_yielded.wait, 1.0)
+            for _ in range(100):
+                if consumer._handle.carry:
+                    break
+                await asyncio.sleep(0.01)
+            assert consumer._handle.carry == b"\x01"
+            assert consumer.audible is False
+            assert consumer.suppress_whole_file is False
+            assert child._activated is False
+
+            streamer.release_second.set()
+            completed = await consumer.wait_complete(timeout=1.0)
+
+        assert completed is True
+        assert consumer.completed is True
+        assert consumer.audible is True
+        assert consumer.suppress_whole_file is True
+        assert child._activated is True
+
+    @pytest.mark.asyncio
     async def test_stale_after_begin_fails_consumer_before_audio_for_fallback(self):
         from gateway.streaming_tts_consumer import StreamingTTSConsumer
         from plugins.platforms.discord.adapter import _DiscordStreamingTTSHandle

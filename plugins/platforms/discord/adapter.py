@@ -4290,19 +4290,19 @@ class DiscordAdapter(BasePlatformAdapter):
         samples = np.frombuffer(data, dtype="<i2")
         return np.repeat(samples, 4).astype("<i2", copy=False).tobytes()
 
-    async def write_streaming_tts(self, handle: StreamingTTSHandle, chunk: bytes) -> None:
+    async def write_streaming_tts(self, handle: StreamingTTSHandle, chunk: bytes) -> bool:
         if not isinstance(handle, _DiscordStreamingTTSHandle) or handle.aborted or not chunk:
-            return
+            return False
         current = self._resolve_streaming_voice_mixer(handle.chat_id)
         if current is None or current[0] != handle.guild_id or current[1] is not handle.mixer:
             await self.abort_streaming_tts(handle, error="Discord voice mixer is no longer active")
             raise RuntimeError("Discord voice mixer is no longer active")
         pcm = self._discord_streaming_pcm(handle, chunk)
         if not pcm:
-            return
+            return False
         accepted = await asyncio.to_thread(handle.child.write, pcm)
         if not accepted:
-            raise RuntimeError("Discord streaming TTS write accepted no PCM")
+            return False
         # A successful child write may already have been consumed by Discord;
         # suppress whole-file fallback before detecting any later abort/staleness.
         handle.audible = True
@@ -4312,6 +4312,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if current is None or current[0] != handle.guild_id or current[1] is not handle.mixer:
             await self.abort_streaming_tts(handle, error="Discord voice mixer is no longer active")
             raise RuntimeError("Discord voice mixer is no longer active")
+        return True
 
     async def finish_streaming_tts(
         self, handle: StreamingTTSHandle, *, interrupted: bool = False,

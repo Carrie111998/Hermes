@@ -332,8 +332,8 @@ class StreamingTTSConsumer:
             if not chunk:
                 continue
             was_audible = self._handle.audible
-            await self._adapter.write_streaming_tts(self._handle, chunk)
-            if not was_audible:
+            accepted = await self._adapter.write_streaming_tts(self._handle, chunk)
+            if not was_audible and accepted is not False:
                 self._handle.audible = True
                 self._suppress_whole_file = True
 
