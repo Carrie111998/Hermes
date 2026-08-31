@@ -2,6 +2,7 @@
 
 import json
 import os
+import plistlib
 import sys
 import time
 from pathlib import Path
@@ -1139,14 +1140,32 @@ class TestRespawnStormBreaker:
 
 
 class TestLaunchdPlistRespawnGovernance:
-    def test_plist_has_throttle_interval(self, tmp_path, monkeypatch):
+    def test_plist_has_runtime_governance(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         from hermes_cli.gateway import generate_launchd_plist
 
         plist = generate_launchd_plist()
+        parsed = plistlib.loads(plist.encode("utf-8"))
         assert "<key>ThrottleInterval</key>" in plist
         assert "<key>ExitTimeOut</key>" in plist
         assert "<key>KeepAlive</key>" in plist
+        assert parsed["ProcessType"] == "Interactive"
+
+    def test_plist_without_interactive_process_type_is_stale(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from hermes_cli import gateway as gateway_cli
+
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        expected = gateway_cli.generate_launchd_plist()
+        legacy = expected.replace(
+            "    <key>ProcessType</key>\n    <string>Interactive</string>\n", ""
+        )
+        plist_path.write_text(legacy, encoding="utf-8")
+
+        assert gateway_cli.launchd_plist_is_current() is False
 
 
 class TestPermissionErrorOnLockFile:
