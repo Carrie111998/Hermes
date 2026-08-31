@@ -4693,6 +4693,15 @@ def _write_provider_config(provider: dict, config: dict, *, managed_feature) -> 
                 stale_tiers = web_cfg.get("provider_tier")
                 if isinstance(stale_tiers, dict):
                     stale_tiers.pop(provider["web_backend"], None)
+            # ``web.search_backend`` / ``web.extract_backend`` are the
+            # per-capability overrides the runtime prefers over
+            # ``web.backend`` (agent.web_search_registry reads
+            # ``<capability>_backend or backend``). A fresh provider pick
+            # must clear them, otherwise the wizard reports the new
+            # backend while search/extract silently keep serving from the
+            # stale per-capability selection.
+            web_cfg.pop("search_backend", None)
+            web_cfg.pop("extract_backend", None)
 
     # Set computer_use backend in config if applicable
     if provider.get("computer_use_backend"):
@@ -5419,6 +5428,14 @@ def _reconfigure_provider(
             NOUS_MANAGED_PROVIDER if managed_feature else provider["web_backend"]
         )
         web_cfg.pop("use_gateway", None)
+        # ``web.search_backend`` / ``web.extract_backend`` are the
+        # per-capability overrides the runtime prefers over ``web.backend``
+        # (agent.web_search_registry reads ``<capability>_backend or
+        # backend``). A fresh provider pick must clear them, otherwise the
+        # wizard reports the new backend while search/extract silently keep
+        # serving from the stale per-capability selection.
+        web_cfg.pop("search_backend", None)
+        web_cfg.pop("extract_backend", None)
         if provider.get("web_tier"):
             tiers = web_cfg.setdefault("provider_tier", {})
             if isinstance(tiers, dict):

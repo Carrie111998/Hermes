@@ -358,3 +358,34 @@ class TestWriteProviderConfig:
         _write_provider_config(provider, config, managed_feature=None)
         assert config["stt"]["provider"] == "groq"
         assert "use_gateway" not in config["stt"]
+
+    def test_web_pick_clears_stale_per_capability_backends(self):
+        """A fresh web provider pick must clear ``web.search_backend`` /
+        ``web.extract_backend``: the runtime resolves
+        ``<capability>_backend or backend``, so stale per-capability keys
+        would keep serving the old provider after the wizard reports the
+        new one (web.backend) as active."""
+        from hermes_cli.tools_config import _write_provider_config
+
+        config = {
+            "web": {
+                "backend": "firecrawl",
+                "search_backend": "firecrawl",
+                "extract_backend": "firecrawl",
+            }
+        }
+        provider = {"name": "Keenable Free", "web_backend": "keenable"}
+        _write_provider_config(provider, config, managed_feature=None)
+        assert config["web"]["backend"] == "keenable"
+        assert "search_backend" not in config["web"]
+        assert "extract_backend" not in config["web"]
+
+    def test_web_pick_without_tier_still_clears_per_capability_backends(self):
+        from hermes_cli.tools_config import _write_provider_config
+
+        config = {"web": {"backend": "ddgs", "search_backend": "exa"}}
+        provider = {"name": "SearXNG", "web_backend": "searxng"}
+        _write_provider_config(provider, config, managed_feature=None)
+        assert config["web"]["backend"] == "searxng"
+        assert "search_backend" not in config["web"]
+        assert "extract_backend" not in config["web"]
