@@ -332,6 +332,55 @@ describe('PreviewPane console state', () => {
     expect(rendered.queryByRole('textbox', { name: 'Address' })).not.toBeNull()
   })
 
+  // The pane, not the arithmetic. `viewportFit` defaults zoom to 1, so dropping
+  // the argument here would leave every lib test green while shipping the white
+  // band back — this is the test that notices.
+  it('sizes an emulated frame with the window zoom, not without it', async () => {
+    const emulate = vi.fn(async () => true)
+    const zoomFactor = 1.3445671961657126 // 134%, this machine's saved level
+
+    vi.stubGlobal('ResizeObserver', class {
+      disconnect() {}
+      observe() {}
+      unobserve() {}
+    })
+    vi.stubGlobal('window', {
+      ...window,
+      hermesDesktop: {
+        previewEmulateDevice: emulate,
+        zoom: { factor: () => zoomFactor, onChanged: () => () => {} }
+      }
+    })
+
+    const target = {
+      kind: 'url' as const,
+      label: 'example',
+      source: 'https://example.com',
+      url: 'https://example.com'
+    }
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(<PreviewPane target={target as never} />)
+    })
+
+    await act(async () => {
+      fireEvent.click(rendered.getByLabelText('Screen size'))
+    })
+    await act(async () => {
+      fireEvent.click(rendered.getByText('Phone L'))
+    })
+
+    const webview = rendered.container.querySelector('webview') as HTMLElement
+
+    // jsdom measures the host at 0x0, so the fit is 1:1 and the whole of the
+    // frame is the zoom division: 430/1.3446 = 320, 932/1.3446 = 693. Without
+    // the zoom it would be a flat 430x932 — which is exactly the bug.
+    expect(webview.style.width).toBe('320px')
+    expect(webview.style.height).toBe('693px')
+    expect(webview.style.width).not.toBe('430px')
+  })
+
   it('renders authenticated remote HTML safely and honors source mode', async () => {
     const dataUrl = `data:text/html;base64,${btoa('<h1>remote</h1>')}`
 
