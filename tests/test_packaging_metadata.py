@@ -286,6 +286,22 @@ def test_build_system_requires_exempt_from_exclude_newer():
     )
 
 
+def test_hindsight_client_pin_is_exempt_from_exclude_newer():
+    """The reviewed Hindsight bridge release must be resolvable immediately.
+
+    The relative cutoff previously hid 0.9.2, causing ``hermes update`` to
+    retain the obsolete 0.6.1 lock entry even after the bridge pin was bumped.
+    An exact dependency pin cannot float, so excluding it from the cutoff adds
+    no supply-chain risk and prevents an update-time rollback (#86992).
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    hindsight = data["project"]["optional-dependencies"]["hindsight"]
+    assert hindsight == ["hindsight-client==0.9.2"]
+    uv_cfg = data["tool"]["uv"]
+    assert uv_cfg["exclude-newer-package"].get("hindsight-client") is False
+    assert _locked_versions("hindsight-client") == {"0.9.2"}
+
+
 
 
 def _lazy_deps_by_feature():
