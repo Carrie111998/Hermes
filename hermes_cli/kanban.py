@@ -1336,7 +1336,7 @@ def _board_task_counts(slug: str) -> dict[str, int]:
             return {}
         with kb.connect_closing(board=slug) as conn:
             rows = conn.execute(
-                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+                "SELECT CAST(status AS TEXT) AS status, COUNT(*) AS n FROM tasks GROUP BY CAST(status AS TEXT)"
             ).fetchall()
         return {r["status"]: int(r["n"]) for r in rows}
     except Exception:

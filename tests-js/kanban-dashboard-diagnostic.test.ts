@@ -378,4 +378,61 @@ describe('DiagnosticCard visible picker parity and rerender synchronization', ()
     const body = JSON.parse(postCalls[0].opts.body)
     assert.equal(body.profile, 'devops', `POST payload profile must be 'devops'`)
   })
+
+  it('disables reassign action button when unassigned or no profile is selected', async () => {
+    const harness = setupDiagnosticCardHarness()
+    const { container, root, DiagnosticCard } = harness
+
+    const diag: DiagnosticItem = {
+      kind: 'role_assignee_mismatch',
+      severity: 'warning',
+      title: 'Title role prefix mismatches assignee',
+      detail: 'Mismatch detail',
+      actions: [
+        {
+          kind: 'reassign',
+          label: 'Reassign',
+          payload: {},
+        },
+      ],
+    }
+
+    const task: TaskItem = { id: 't_unassigned_1', title: 'Task without assignee' }
+
+    await React.act(async () => {
+      root.render(
+        React.createElement(DiagnosticCard, {
+          key: 'diag-card-stable-key',
+          diag,
+          task,
+          boardSlug: 'default',
+          assignees: ['coder', 'reviewer'],
+          onRefresh: () => {},
+        }),
+      )
+    })
+
+    const selectEl = container.querySelector('select') as HTMLSelectElement
+    assert.equal(selectEl.value, '', "Initial select value must be empty '' when unassigned")
+
+    const buttons = Array.from(container.querySelectorAll('button')) as HTMLButtonElement[]
+    const reassignBtn = buttons.find((b) => b.textContent?.includes('Reassign'))
+    assert.ok(reassignBtn, 'Reassign button must exist')
+    assert.equal(reassignBtn.disabled, true, 'Reassign button must be disabled when unassigned')
+
+    // Selecting an option enables the button
+    await React.act(async () => {
+      selectEl.value = 'coder'
+      selectEl.dispatchEvent(new harness.win.Event('change', { bubbles: true }))
+    })
+    assert.equal(reassignBtn.disabled, false, 'Reassign button must be enabled when a profile is selected')
+
+    // Changing back to unassigned disables the button again
+    await React.act(async () => {
+      selectEl.value = ''
+      selectEl.dispatchEvent(new harness.win.Event('change', { bubbles: true }))
+    })
+    assert.equal(reassignBtn.disabled, true, 'Reassign button must be disabled when select is changed back to unassigned')
+    assert.equal(selectEl.value, '', "Select value must return to '' when changed back to unassigned")
+  })
 })

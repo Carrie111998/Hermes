@@ -1147,11 +1147,7 @@ class Task:
         keys = set(row.keys())
 
         def _str_val(v: Any) -> Optional[str]:
-            if v is None:
-                return None
-            if isinstance(v, bytes):
-                return v.decode("utf-8", errors="replace")
-            return str(v)
+            return _text_value(v)
 
         def _int_val(v: Any, default: Optional[int] = None) -> Optional[int]:
             if v is None:
@@ -3676,6 +3672,15 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     return Task.from_row(row) if row else None
 
 
+def _text_value(value: Any) -> Optional[str]:
+    """Return a stable text representation for weakly typed SQLite cells."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
 # Each value is a raw SQL fragment appended after ``ORDER BY``.
 VALID_SORT_ORDERS: dict[str, str] = {
@@ -3706,27 +3711,27 @@ def list_tasks(
     query = "SELECT * FROM tasks WHERE 1=1"
     params: list[Any] = []
     if assignee is not None:
-        query += " AND assignee = ?"
+        query += " AND CAST(assignee AS TEXT) = ?"
         params.append(_canonical_assignee(assignee))
     if status is not None:
         if status not in VALID_STATUSES:
             raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
-        query += " AND status = ?"
+        query += " AND CAST(status AS TEXT) = ?"
         params.append(status)
     if tenant is not None:
-        query += " AND tenant = ?"
+        query += " AND CAST(tenant AS TEXT) = ?"
         params.append(tenant)
     if session_id is not None:
-        query += " AND session_id = ?"
+        query += " AND CAST(session_id AS TEXT) = ?"
         params.append(session_id)
     if workflow_template_id is not None:
-        query += " AND workflow_template_id = ?"
+        query += " AND CAST(workflow_template_id AS TEXT) = ?"
         params.append(workflow_template_id)
     if current_step_key is not None:
-        query += " AND current_step_key = ?"
+        query += " AND CAST(current_step_key AS TEXT) = ?"
         params.append(current_step_key)
     if not include_archived and status != "archived":
-        query += " AND status != 'archived'"
+        query += " AND CAST(status AS TEXT) != 'archived'"
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -9774,7 +9779,7 @@ def count_running_tasks(conn: sqlite3.Connection) -> int:
     try:
         return int(
             conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+                "SELECT COUNT(*) FROM tasks WHERE CAST(status AS TEXT) = 'running'"
             ).fetchone()[0]
         )
     except Exception:
@@ -11302,21 +11307,23 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     """
     by_status: dict[str, int] = {}
     for row in conn.execute(
-        "SELECT status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' GROUP BY status"
+        "SELECT CAST(status AS TEXT) AS status, COUNT(*) AS n FROM tasks "
+        "WHERE CAST(status AS TEXT) != 'archived' GROUP BY CAST(status AS TEXT)"
     ):
-        by_status[row["status"]] = int(row["n"])
+        by_status[_text_value(row["status"]) or ""] = int(row["n"])
 
     by_assignee: dict[str, dict[str, int]] = {}
     for row in conn.execute(
-        "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' AND assignee IS NOT NULL "
-        "GROUP BY assignee, status"
+        "SELECT CAST(assignee AS TEXT) AS assignee, CAST(status AS TEXT) AS status, COUNT(*) AS n FROM tasks "
+        "WHERE CAST(status AS TEXT) != 'archived' AND assignee IS NOT NULL "
+        "GROUP BY CAST(assignee AS TEXT), CAST(status AS TEXT)"
     ):
-        by_assignee.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
+        a_key = _text_value(row["assignee"]) or ""
+        s_key = _text_value(row["status"]) or ""
+        by_assignee.setdefault(a_key, {})[s_key] = int(row["n"])
 
     oldest_row = conn.execute(
-        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
+        "SELECT MIN(created_at) AS ts FROM tasks WHERE CAST(status AS TEXT) = 'ready'"
     ).fetchone()
     now = int(time.time())
     oldest_ready_age = (
