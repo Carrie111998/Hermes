@@ -488,3 +488,25 @@ class TestSearchThenBindLogin:
         p = self.make(bind_dn="", bind_password="")
         s = p.complete_password_login(username="alice", password="s3cret")
         assert s.user_id == "alice"
+
+    def test_multiple_matches_rejected(self):
+        # A filter matching several entries must never let a bind against
+        # ANY of them succeed. This filter matches both alice and bob
+        # whichever username is supplied, so BOTH logins must be rejected
+        # even though each password is correct.
+        #
+        # Both directions are asserted on purpose: ldap3's mock returns
+        # matched entries in an unspecified order, so a test that tried
+        # only one user would pass spuriously whenever the *other* entry
+        # sorted first (its password wouldn't match, hiding the fact that
+        # the multi-match guard was gone). Checking both pins the guard
+        # regardless of ordering. The filter keeps the {username}
+        # placeholder because the constructor requires it.
+        p = self.make(
+            user_search_filter="(|(uid={username})(uid=alice)(uid=bob))"
+        )
+        assert p._search_user("alice") == (None, {})
+        with pytest.raises(InvalidCredentialsError):
+            p.complete_password_login(username="alice", password="s3cret")
+        with pytest.raises(InvalidCredentialsError):
+            p.complete_password_login(username="bob", password="hunter2")
