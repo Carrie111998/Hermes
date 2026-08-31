@@ -166,6 +166,7 @@ import {
   resolveSessionProfile,
   resolveStoredSession,
   restoreListedSession,
+  runningProjectionStreamId,
   selectBranchMessages,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
@@ -822,9 +823,7 @@ export function useSessionActions({
       const resumeStartMessages = resumedSameSelectedSession ? $messages.get() : []
       const ownerRoute = capturedOwner || getSessionOwnerHint(storedSessionId)
 
-      let requestedBinding = ownerRoute
-        ? normalizeSessionBinding({ ownerRoute, storedSessionId })
-        : null
+      let requestedBinding = ownerRoute ? normalizeSessionBinding({ ownerRoute, storedSessionId }) : null
 
       if (!requestedBinding && runtimeIdByStoredSessionIdRef.current.has(storedSessionId)) {
         requestedBinding = normalizeSessionBinding({
@@ -901,7 +900,8 @@ export function useSessionActions({
         }
 
         const exactRuntimeId = runtimeForExactSessionBinding(requestedBinding)
-        const state = runtimeId && runtimeId === exactRuntimeId ? sessionStateByRuntimeIdRef.current.get(runtimeId) : undefined
+        const state =
+          runtimeId && runtimeId === exactRuntimeId ? sessionStateByRuntimeIdRef.current.get(runtimeId) : undefined
 
         if (!runtimeId || !state) {
           return null
@@ -1367,6 +1367,9 @@ export function useSessionActions({
                 state => ({
                   ...state,
                   messages: visibleActivatedMessages,
+                  streamId: running
+                    ? (runningProjectionStreamId(visibleActivatedMessages, true) ?? state.streamId)
+                    : null,
                   transcriptProvenance:
                     acceptedPersistedDisplayTranscript || hasValidProvenance
                       ? (expectedProvenance ?? undefined)
@@ -1763,6 +1766,9 @@ export function useSessionActions({
             ...(runtimeInfo ?? {}),
             messages: visibleMessagesForView,
             busy: resumedRunning,
+            streamId: resumedRunning
+              ? (runningProjectionStreamId(visibleMessagesForView, true) ?? state.streamId)
+              : null,
             awaitingResponse: resumedRunning && !recoveredInFlightTail,
             // Backend reported this turn running at resume time — live proof.
             turnLive: state.turnLive || resumedRunning,
@@ -1789,7 +1795,11 @@ export function useSessionActions({
               : {}),
             ...(clearedClarifyProjection
               ? {
-                  streamId: resumedRunning ? (clearedClarifyProjection.streamId ?? state.streamId) : null
+                  streamId: resumedRunning
+                    ? (clearedClarifyProjection.streamId ??
+                      runningProjectionStreamId(visibleMessagesForView, true) ??
+                      state.streamId)
+                    : null
                 }
               : {})
           }),
