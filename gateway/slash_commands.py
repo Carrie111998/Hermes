@@ -200,6 +200,36 @@ class GatewaySlashCommandsMixin:
                         "reset: %s (#35994)",
                         session_key, cleanup_exc,
                     )
+            else:
+                # The cached agent is gone — the idle-TTL sweep soft-evicted it
+                # (a mode="none" session never gets an expiry-watcher finalize,
+                # so nothing else will fire the memory chain later). /new is
+                # still a real session boundary: rebuild the transcript from
+                # the session DB and fire on_session_end on a throwaway
+                # manager scoped to the old session id, so end-of-session
+                # extraction does not silently lose the session (#99402).
+                # Same off-loop + bounded-timeout shape as the branch above.
+                try:
+                    await asyncio.wait_for(
+                        self._run_in_executor_with_context(
+                            self._commit_memory_for_evicted_session,
+                            session_key, old_entry, source,
+                        ),
+                        timeout=_RESET_CLEANUP_TIMEOUT_S,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "Memory commit for evicted session %s exceeded %ss during "
+                        "/new reset; proceeding with reset (the worker thread is "
+                        "left to finish on its own). (#99402)",
+                        session_key, _RESET_CLEANUP_TIMEOUT_S,
+                    )
+                except Exception as mem_exc:
+                    logger.warning(
+                        "Memory commit for evicted session %s failed during /new "
+                        "reset: %s (#99402)",
+                        session_key, mem_exc,
+                    )
         self._evict_cached_agent(session_key)
 
         # Conversation boundary: clear ALL conversation-scoped per-session
