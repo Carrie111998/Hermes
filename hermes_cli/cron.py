@@ -183,6 +183,19 @@ def cron_list(show_all: bool = False):
             status = color("[paused]", Colors.YELLOW)
         elif state == "completed":
             status = color("[completed]", Colors.BLUE)
+        elif job.get("last_status") == "error":
+            # Job is armed but its last run failed — surface that in the
+            # header instead of a misleading green [active] (#99583).
+            # Edge case: a disabled job (enabled=False) with last_status==error
+            # also lands here. That is rare (you'd have to disable after a
+            # failure) and the header still wins over [disabled] because the
+            # failure is the more actionable signal right now. If this ever
+            # becomes a problem, reorder: check enabled before last_status.
+            streak = int(job.get("failure_streak") or 0)
+            if streak >= 2:
+                status = color(f"[active! {streak} fails]", Colors.YELLOW)
+            else:
+                status = color("[active!]", Colors.YELLOW)
         elif job.get("enabled", True):
             status = color("[active]", Colors.GREEN)
         else:

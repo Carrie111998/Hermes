@@ -446,3 +446,80 @@ class TestCronRunBackgroundDispatch:
         assert rc == 0
         assert "Running in background (delegation del-xyz)." in out
         assert "failed" not in out.lower()
+
+
+class TestCronListErroredHeader:
+    """#99583 C: cron list must surface last_status=error in the header
+    instead of a misleading green [active]."""
+
+    def test_active_job_with_failed_last_run_shows_warning(self, tmp_cron_dir, capsys, monkeypatch):
+        from cron.jobs import create_job
+
+        job = create_job(prompt="x", schedule="0 11 * * *")
+        # Simulate a job whose last run failed: list_jobs must report
+        # last_status=error and failure_streak so cron_list can surface it.
+        monkeypatch.setattr(
+            "cron.jobs.list_jobs",
+            lambda include_disabled=False: [
+                {
+                    **job,
+                    "last_status": "error",
+                    "last_error": "Script not found: /tmp/x.py",
+                    "failure_streak": 1,
+                }
+            ],
+        )
+        cron_cli.cron_list()
+        out = capsys.readouterr().out
+        assert "[active!]" in out
+        assert "[active]" not in out.replace("[active!]", "")
+
+    def test_active_job_with_repeated_failures_shows_streak(self, tmp_cron_dir, capsys, monkeypatch):
+        from cron.jobs import create_job
+
+        job = create_job(prompt="x", schedule="0 11 * * *")
+        monkeypatch.setattr(
+            "cron.jobs.list_jobs",
+            lambda include_disabled=False: [
+                {
+                    **job,
+                    "last_status": "error",
+                    "last_error": "Script not found",
+                    "failure_streak": 4,
+                }
+            ],
+        )
+        cron_cli.cron_list()
+        out = capsys.readouterr().out
+        assert "[active! 4 fails]" in out
+
+    def test_active_job_with_ok_last_run_stays_green(self, tmp_cron_dir, capsys, monkeypatch):
+        from cron.jobs import create_job
+
+        job = create_job(prompt="x", schedule="0 11 * * *")
+        monkeypatch.setattr(
+            "cron.jobs.list_jobs",
+            lambda include_disabled=False: [
+                {**job, "last_status": "ok", "failure_streak": 0}
+            ],
+        )
+        cron_cli.cron_list()
+        out = capsys.readouterr().out
+        assert "[active]" in out
+        assert "[active!]" not in out
+
+    def test_job_that_never_ran_stays_green(self, tmp_cron_dir, capsys, monkeypatch):
+        # last_status is None (never fired) — must NOT trigger the error branch.
+        from cron.jobs import create_job
+
+        job = create_job(prompt="x", schedule="0 11 * * *")
+        monkeypatch.setattr(
+            "cron.jobs.list_jobs",
+            lambda include_disabled=False: [
+                {**job, "last_status": None, "failure_streak": 0}
+            ],
+        )
+        cron_cli.cron_list()
+        out = capsys.readouterr().out
+        assert "[active]" in out
+        assert "[active!]" not in out
