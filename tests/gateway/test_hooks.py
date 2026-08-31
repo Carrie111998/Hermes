@@ -59,6 +59,30 @@ class TestDiscoverAndLoad:
         assert len(reg.loaded_hooks) == 0
 
 
+    @pytest.mark.parametrize(
+        "events_yaml",
+        [
+            "agent:start",
+            "[agent:start, 42]",
+            "['agent:start', '   ']",
+        ],
+    )
+    def test_skips_invalid_events_manifest(self, tmp_path, events_yaml, capsys):
+        _create_hook(
+            tmp_path,
+            "invalid-events",
+            events_yaml,
+            "def handle(event_type, context):\n    pass\n",
+        )
+
+        reg = HookRegistry()
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(reg):
+            reg.discover_and_load()
+
+        assert reg.loaded_hooks == []
+        assert "events must be a non-empty list of non-empty strings" in capsys.readouterr().out
+
+
 class TestEmit:
 
     @pytest.mark.asyncio
@@ -138,5 +162,4 @@ class TestEmitCollect:
         results = await reg.emit_collect("command:x", {})
 
         assert results == [{"decision": "deny"}]
-
 
