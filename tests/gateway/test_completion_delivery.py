@@ -132,6 +132,35 @@ def test_unroutable_async_event_is_not_requeued_forever(
     assert isolated.empty()
 
 
+def test_unroutable_durable_async_event_is_terminally_dropped(
+    isolated_registry,
+):
+    """Restart recovery must not replay a delegation with no verified target."""
+    event = _async_event("deleg_unroutable_durable")
+    event["session_key"] = "raw-but-unverified-session"
+    event["origin_session_id"] = ""
+    _persist_pending_completion(event)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    result = asyncio.run(
+        runner._deliver_completion_notification("completion", dict(event))
+    )
+
+    from tools import async_delegation
+
+    row = async_delegation.get_durable_delegation(event["delegation_id"])
+    assert result is None
+    assert row is not None
+    assert row["delivery_state"] == "dropped"
+    adapter.handle_message.assert_not_awaited()
+
+    restored = queue.Queue()
+    assert async_delegation.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+
+
 def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     """Concurrent consumers in one runner cannot both enter the adapter."""
     entered = asyncio.Event()

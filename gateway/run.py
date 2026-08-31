@@ -25920,6 +25920,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 exc_info=True,
                             )
                     return False
+            if (
+                durable_claim_id
+                and not str(evt.get("origin_session_id") or "").strip()
+                and await asyncio.to_thread(self._build_process_event_source, evt) is None
+            ):
+                # A delegation without either its dispatch-captured API session
+                # or a structured gateway route can never acquire a delivery
+                # target.  Release would make restart recovery replay the same
+                # permanently unroutable row forever, so give the held durable
+                # claim the same honest terminal disposition as a gone parent.
+                logger.warning(
+                    "Async delegation %s has no verified wake target; "
+                    "terminally dropping delivery (result remains in the "
+                    "delegation records).",
+                    durable_delegation_id,
+                )
+                try:
+                    from tools.async_delegation import drop_completion_delivery
+
+                    drop_completion_delivery(
+                        durable_delegation_id, durable_claim_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not drop unroutable durable completion claim",
+                        exc_info=True,
+                    )
+                return None
         elif evt.get("type") == "completion":
             # Background-process completions carry only session_key (chat/
             # thread routing), so after /new the notification from the OLD
