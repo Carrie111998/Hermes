@@ -356,12 +356,14 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str], model: Optional[str] = None,
                     provider: Optional[str] = None) -> None:
     try:
+        from tools.delegation_model_evidence import sanitize_model_identifier
+
         manifest = {
             "delegation_id": delegation_id,
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "task_count": len(task_list),
-            "model": model,
-            "provider": provider,
+            "model": sanitize_model_identifier(model),
+            "provider": sanitize_model_identifier(provider),
             "tasks": [
                 {
                     "index": i,
@@ -399,11 +401,39 @@ def update_manifest_statuses(delegation_id: Optional[str],
                 task["status"] = r.get("status", task.get("status"))
                 if r.get("exit_reason"):
                     task["exit_reason"] = r["exit_reason"]
+                if r.get("model_evidence"):
+                    from tools.delegation_model_evidence import sanitize_model_evidence
+
+                    task["model_evidence"] = sanitize_model_evidence(
+                        r["model_evidence"]
+                    )
         manifest["completed"] = time.strftime("%Y-%m-%d %H:%M:%S")
         mp.write_text(json.dumps(manifest, indent=2, ensure_ascii=False),
                       encoding="utf-8")
     except Exception as exc:
         logger.debug("Live transcript manifest update failed: %s", exc)
+
+
+def update_manifest_model_evidence(
+    delegation_id: Optional[str], evidence: List[Dict[str, Any]]
+) -> None:
+    """Persist per-task resolved routes immediately after child construction."""
+    if not delegation_id:
+        return
+    try:
+        from tools.delegation_model_evidence import sanitize_model_evidence
+
+        mp = _manifest_path(delegation_id)
+        manifest = json.loads(mp.read_text(encoding="utf-8"))
+        for task in manifest.get("tasks", []):
+            index = task.get("index")
+            if isinstance(index, int) and 0 <= index < len(evidence):
+                task["model_evidence"] = sanitize_model_evidence(evidence[index])
+        mp.write_text(
+            json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as exc:
+        logger.debug("Live transcript model evidence update failed: %s", exc)
 
 
 def prune_stale_live_dirs(max_age_days: int = LIVE_RETENTION_DAYS) -> int:

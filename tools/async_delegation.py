@@ -252,6 +252,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         key: record.get(key)
         for key in (
             "goal", "goals", "context", "toolsets", "role", "model", "is_batch",
+            "model_evidence",
             # Routing origin (scope_id/user_id/user_name): persisted so a
             # restart-recovered completion can reconstruct a full
             # SessionSource — see _capture_routing_origin.
@@ -332,6 +333,31 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
         )
 
 
+def _sanitize_result_payload(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy result diagnostics and model evidence through the durable boundary."""
+    from tools.delegation_model_evidence import (
+        sanitize_diagnostic,
+        sanitize_model_evidence,
+        sanitize_model_identifier,
+    )
+
+    clean = dict(result or {})
+    if "model" in clean:
+        clean["model"] = sanitize_model_identifier(clean.get("model"))
+    if clean.get("model_evidence"):
+        clean["model_evidence"] = sanitize_model_evidence(
+            clean["model_evidence"]
+        )
+    if clean.get("error"):
+        clean["error"] = sanitize_diagnostic(clean["error"])
+    if isinstance(clean.get("results"), list):
+        clean["results"] = [
+            _sanitize_result_payload(item) if isinstance(item, dict) else item
+            for item in clean["results"]
+        ]
+    return clean
+
+
 def _note_delivery_attempt(delegation_id: str) -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
@@ -376,6 +402,7 @@ def recover_abandoned_delegations() -> int:
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
                 "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
+                "model_evidence": task.get("model_evidence"),
                 "status": "unknown", "summary": None,
                 "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
                 "dispatched_at": dispatched_at, "completed_at": now,
@@ -773,6 +800,7 @@ def dispatch_async_delegation(
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    model_evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Spawn ``runner`` on the daemon executor and return a handle immediately.
 
@@ -816,6 +844,11 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    from tools.delegation_model_evidence import (
+        sanitize_model_evidence,
+        sanitize_model_identifier,
+    )
+
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -824,7 +857,10 @@ def dispatch_async_delegation(
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
-        "model": model,
+        "model": sanitize_model_identifier(model),
+        "model_evidence": (
+            sanitize_model_evidence(model_evidence) if model_evidence else None
+        ),
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
@@ -963,10 +999,17 @@ def _push_completion_event(
         )
         return
 
+    result = _sanitize_result_payload(result)
     summary = result.get("summary")
     error = result.get("error")
     dispatched_at = record.get("dispatched_at") or time.time()
     completed_at = record.get("completed_at") or time.time()
+
+    from tools.delegation_model_evidence import sanitize_model_evidence
+
+    _raw_model_evidence = (
+        result.get("model_evidence") or record.get("model_evidence")
+    )
 
     evt = {
         "type": "async_delegation",
@@ -982,6 +1025,10 @@ def _push_completion_event(
         "toolsets": record.get("toolsets"),
         "role": record.get("role"),
         "model": result.get("model") or record.get("model"),
+        "model_evidence": (
+            sanitize_model_evidence(_raw_model_evidence)
+            if _raw_model_evidence else None
+        ),
         "status": status,
         "summary": summary,
         "error": error,
@@ -1036,6 +1083,7 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    model_evidence: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1057,6 +1105,11 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    from tools.delegation_model_evidence import (
+        sanitize_model_evidence,
+        sanitize_model_identifier,
+    )
+
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -1071,7 +1124,11 @@ def dispatch_async_delegation_batch(
         "context": context,
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
-        "model": model,
+        "model": sanitize_model_identifier(model),
+        "model_evidence": (
+            [sanitize_model_evidence(item) for item in model_evidence]
+            if model_evidence else None
+        ),
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
@@ -1180,8 +1237,17 @@ def _push_batch_completion_event(
         )
         return
 
+    combined = _sanitize_result_payload(combined)
     dispatched_at = event_record.get("dispatched_at") or time.time()
     completed_at = event_record.get("completed_at") or time.time()
+    from tools.delegation_model_evidence import sanitize_model_evidence
+
+    _result_evidence = [
+        result.get("model_evidence")
+        for result in (combined.get("results") or [])
+        if isinstance(result, dict) and result.get("model_evidence")
+    ]
+    _raw_model_evidence = _result_evidence or event_record.get("model_evidence")
     evt = {
         "type": "async_delegation",
         "delegation_id": event_record.get("delegation_id"),
@@ -1195,6 +1261,10 @@ def _push_batch_completion_event(
         "toolsets": event_record.get("toolsets"),
         "role": event_record.get("role"),
         "model": event_record.get("model"),
+        "model_evidence": (
+            [sanitize_model_evidence(item) for item in _raw_model_evidence]
+            if _raw_model_evidence else None
+        ),
         "status": status,
         "is_batch": True,
         # The full per-task results list — the formatter renders a

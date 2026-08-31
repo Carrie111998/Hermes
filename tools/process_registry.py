@@ -2977,7 +2977,23 @@ def _format_async_delegation(evt: dict) -> str:
     context = evt.get("context")
     toolsets = evt.get("toolsets")
     role = evt.get("role") or "leaf"
-    model = evt.get("model") or "?"
+    from tools.delegation_model_evidence import (
+        format_model_evidence,
+        make_model_evidence,
+        sanitize_model_evidence,
+    )
+
+    model = evt.get("model")
+    raw_evidence = evt.get("model_evidence")
+
+    def _legacy_evidence():
+        return make_model_evidence(
+            requested_provider=None,
+            requested_model=model,
+            resolved_provider=None,
+            resolved_model=model,
+            selection_source="legacy-record",
+        )
     status = evt.get("status") or "completed"
     summary = evt.get("summary")
     error = evt.get("error")
@@ -3013,8 +3029,21 @@ def _format_async_delegation(evt: dict) -> str:
             lines.append(f"Context you provided: {context}")
         if toolsets:
             lines.append(f"Toolsets: {', '.join(toolsets)}")
-        lines.append(f"Role: {role}   Model: {model}   Total duration: {total_dur}s")
+        lines.append(f"Role: {role}   Total duration: {total_dur}s")
         if error and not results:
+            if isinstance(raw_evidence, list):
+                for idx, item_evidence in enumerate(raw_evidence):
+                    lines.append(
+                        f"Task {idx + 1} model evidence: "
+                        + format_model_evidence(
+                            sanitize_model_evidence(item_evidence)
+                        )
+                    )
+            else:
+                lines.append(
+                    "Model evidence: "
+                    + format_model_evidence(_legacy_evidence())
+                )
             lines.append("--- ERROR ---")
             lines.append(f"The batch did not complete successfully: {error}")
             return "\n".join(lines)
@@ -3039,6 +3068,16 @@ def _format_async_delegation(evt: dict) -> str:
                 header += ", TRUNCATED: hit max_iterations — work may be incomplete"
             header += ") ---"
             lines.append(header)
+            item_evidence = r.get("model_evidence")
+            if not item_evidence and isinstance(raw_evidence, list) and idx < len(raw_evidence):
+                item_evidence = raw_evidence[idx]
+            lines.append(
+                "Model evidence: "
+                + format_model_evidence(
+                    sanitize_model_evidence(item_evidence)
+                    if item_evidence else _legacy_evidence()
+                )
+            )
             if r_status in ("completed", "success") and r_summary:
                 if r_truncated:
                     lines.append(
@@ -3084,7 +3123,17 @@ def _format_async_delegation(evt: dict) -> str:
         lines.append(f"Context you provided: {context}")
     if toolsets:
         lines.append(f"Toolsets: {', '.join(toolsets)}")
-    lines.append(f"Role: {role}   Model: {model}")
+    lines.append(f"Role: {role}")
+    single_evidence = raw_evidence
+    if isinstance(single_evidence, list):
+        single_evidence = single_evidence[0] if single_evidence else None
+    lines.append(
+        "Model evidence: "
+        + format_model_evidence(
+            sanitize_model_evidence(single_evidence)
+            if single_evidence else _legacy_evidence()
+        )
+    )
     _trunc = " [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""
     lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s{_trunc}")
     lines.append("--- RESULT ---")

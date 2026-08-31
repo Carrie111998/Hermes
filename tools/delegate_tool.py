@@ -2637,6 +2637,8 @@ def _run_single_child(
     _raw_sid = getattr(child, "_subagent_id", None)
     _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
     if _subagent_id:
+        from tools.delegation_model_evidence import sanitize_model_identifier
+
         if owner_session_id is None:
             try:
                 from gateway.session_context import get_session_env
@@ -2671,10 +2673,9 @@ def _run_single_child(
                 "delegation_id": (
                     _delegation_id if isinstance(_delegation_id, str) else None
                 ),
-                "model": (
-                    getattr(child, "model", None)
-                    if isinstance(getattr(child, "model", None), str)
-                    else None
+                "model": sanitize_model_identifier(getattr(child, "model", None)),
+                "model_evidence": getattr(
+                    child, "_delegation_model_evidence", None
                 ),
                 "started_at": time.time(),
                 "status": "running",
@@ -2979,6 +2980,9 @@ def _run_single_child(
                 ),
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                "model_evidence": getattr(
+                    child, "_delegation_model_evidence", None
+                ),
             }
             if _late_pending_steer:
                 _error_entry["missed_steer"] = _late_pending_steer
@@ -3150,6 +3154,9 @@ def _run_single_child(
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
+        from tools.delegation_model_evidence import sanitize_model_identifier
+
+        _reported_model = sanitize_model_identifier(_model)
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
@@ -3157,7 +3164,10 @@ def _run_single_child(
             "summary": summary,
             "api_calls": api_calls,
             "duration_seconds": duration,
-            "model": _model if isinstance(_model, str) else None,
+            "model": _reported_model,
+            "model_evidence": getattr(
+                child, "_delegation_model_evidence", None
+            ),
             "exit_reason": exit_reason,
             # Explicit, parent-visible truncation flag. A subagent that
             # exhausts its per-child iteration budget still returns a summary,
@@ -3312,6 +3322,7 @@ def _run_single_child(
             "files_read": _files_read,
             "files_written": _files_written,
             "output_tail": _output_tail,
+            "model_evidence": entry.get("model_evidence"),
         }
         if _cost_usd is not None:
             try:
@@ -3674,6 +3685,8 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
@@ -3778,13 +3791,13 @@ def delegate_task(
     # ({provider, model, base_url, api_key, api_mode}); the /review engine
     # uses it to route its reviewer subagent onto ``auxiliary.review``
     # without touching the global delegation pin.
-    try:
-        creds = _resolve_delegation_credentials(
-            credentials_cfg if credentials_cfg else cfg, parent_agent
-        )
-    except ValueError as exc:
-        return tool_error(str(exc))
-
+    if provider and not model:
+        return tool_error("'provider' requires 'model' to be set as well.")
+    _base_credentials_cfg = dict(credentials_cfg if credentials_cfg else cfg)
+    if model:
+        _base_credentials_cfg["model"] = model
+    if provider:
+        _base_credentials_cfg["provider"] = provider
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3833,6 +3846,10 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+        if task.get("provider") and not task.get("model"):
+            return tool_error(
+                f"Task {i} 'provider' requires 'model' to be set as well."
+            )
 
     # Batch-only quality gate: catch malformed fan-outs (placeholder goals,
     # unexpanded multi-word template markers, 1-task batches) before any
@@ -3861,6 +3878,36 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    # Resolve each task independently: one fan-out may mix inherited routes
+    # with per-task model/provider overrides.
+    task_creds: List[Dict[str, Any]] = []
+    task_selection_sources: List[str] = []
+    for task in task_list:
+        task_cfg = dict(_base_credentials_cfg)
+        if task.get("model"):
+            task_cfg["model"] = task["model"]
+        if task.get("provider"):
+            task_cfg["provider"] = task["provider"]
+        try:
+            task_creds.append(
+                _resolve_delegation_credentials(task_cfg, parent_agent)
+            )
+        except ValueError as exc:
+            return tool_error(str(exc))
+        if task.get("model") or task.get("provider"):
+            source = "task"
+        elif model or provider:
+            source = "top_level"
+        elif any(
+            _base_credentials_cfg.get(key)
+            for key in ("model", "provider", "base_url", "command")
+        ):
+            source = "delegation_config"
+        else:
+            source = "parent"
+        task_selection_sources.append(source)
+    creds = task_creds[0]
+
     overall_start = time.monotonic()
     results = []
 
@@ -3875,6 +3922,7 @@ def delegate_task(
     # live_paths is empty and delegation proceeds exactly as before.
     from tools.delegation_live_log import (
         create_live_transcripts,
+        update_manifest_model_evidence,
         update_manifest_statuses,
         wrap_progress_callback,
     )
@@ -3911,6 +3959,7 @@ def delegate_task(
     # subagent-lifecycle API).
     children = []
     for i, t in enumerate(task_list):
+        task_cred = task_creds[i]
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -3930,18 +3979,18 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=task_cred["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_cred["provider"],
+                override_base_url=task_cred["base_url"],
+                override_api_key=task_cred["api_key"],
+                override_api_mode=task_cred["api_mode"],
+                override_request_overrides=task_cred.get("request_overrides"),
+                override_max_tokens=task_cred.get("max_output_tokens"),
+                override_acp_command=task_cred.get("command"),
+                override_acp_args=task_cred.get("args"),
                 role=effective_role,
             )
         except ValueError as exc:
@@ -3955,6 +4004,25 @@ def delegate_task(
                 child._delegate_output_schema = _task_schema
             except Exception:
                 logger.debug("Could not attach output schema to child %d", i)
+        from tools.delegation_model_evidence import make_model_evidence
+
+        child._delegation_model_evidence = make_model_evidence(
+            requested_provider=(
+                t.get("provider")
+                or provider
+                or _base_credentials_cfg.get("provider")
+                or getattr(parent_agent, "provider", None)
+            ),
+            requested_model=(
+                t.get("model")
+                or model
+                or _base_credentials_cfg.get("model")
+                or getattr(parent_agent, "model", None)
+            ),
+            resolved_provider=getattr(child, "provider", None),
+            resolved_model=getattr(child, "model", None),
+            selection_source=task_selection_sources[i],
+        )
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures
@@ -3971,6 +4039,14 @@ def delegate_task(
         if live_deleg_id:
             setattr(child, "_delegation_id", live_deleg_id)
         children.append((i, t, child))
+
+    update_manifest_model_evidence(
+        live_deleg_id,
+        [
+            getattr(child, "_delegation_model_evidence", {})
+            for _, _, child in children
+        ],
+    )
 
     def _execute_and_aggregate(*, honor_parent_interrupt: bool = True) -> dict:
         """Run all built children (1 or N), join on them, aggregate results,
@@ -4326,6 +4402,10 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        _model_evidence = [
+            getattr(_c, "_delegation_model_evidence", None)
+            for _c in _child_agents
+        ]
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -4334,6 +4414,7 @@ def delegate_task(
             toolsets=None,
             role=top_role,
             model=creds["model"],
+            model_evidence=_model_evidence,
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -4977,6 +5058,20 @@ DELEGATE_TASK_SCHEMA = {
                                 "error messages, constraints. Each child "
                                 "sees only its own context — repeat shared "
                                 "background in every task that needs it."
+                            ),
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": (
+                                "Optional model override for this task. When it "
+                                "belongs to a different provider, set provider."
+                            ),
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": (
+                                "Optional provider override for this task; "
+                                "requires model."
                             ),
                         },
                         "output_schema": {
