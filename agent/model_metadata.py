@@ -1908,9 +1908,15 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5.3-codex-spark": 128_000,
     "gpt-5.2-codex": 272_000,
     "gpt-5.4-mini": 272_000,
-    "gpt-5.6-sol": 272_000,
-    "gpt-5.6-terra": 272_000,
-    "gpt-5.6-luna": 272_000,
+    # GPT-5.6 aliases are absent from the Codex /models catalog, and the route
+    # serves the documented 1.05M window: measured 2026-08-31 on Sol via the
+    # subscription backend — 900,017 input tokens accepted, 950,017 rejected
+    # (ceiling = the documented 922K max input). The old blanket 272_000 here
+    # was a guess that leaked into context_length_cache.yaml and was then
+    # misread system-wide as a measured route limit.
+    "gpt-5.6-sol": 1_050_000,
+    "gpt-5.6-terra": 1_050_000,
+    "gpt-5.6-luna": 1_050_000,
     "gpt-5.5": 272_000,
     "gpt-5.4": 272_000,
     "gpt-5.2": 272_000,
