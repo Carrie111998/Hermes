@@ -149,7 +149,7 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
             return f"Security scan blocked this skill ({reason}):\n{report}"
         if allowed is None:
             report = format_scan_report(result)
-            if _skill_gate_bypass.get():
+            if _skill_approval_bypass.get():
                 # Human-approval replay: the operator just reviewed and
                 # approved this exact write. The "ask" decision has been
                 # made; record what was overridden for the audit trail.
@@ -1437,11 +1437,24 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
 # Main entry point
 # =============================================================================
 
-# ContextVar bypass: set while replaying an already-approved staged skill write
-# so skill_manage() does not re-gate (and re-stage) it.
+# ContextVar bypass: "skip the write gate" — set while replaying an
+# already-approved staged skill write so skill_manage() does not re-gate
+# (and re-stage) it. The batch executor added by #97295 sets the same var
+# around its per-op loop, for loop prevention — no human involved.
 import contextvars as _ctxvars
 _skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
     "skill_gate_bypass", default=False
+)
+# Distinct meaning from _skill_gate_bypass: that var means "skip the
+# staging/anti-reentry gate" (set by BOTH apply_skill_pending and the
+# operations[] batch executor, for different reasons). This var means
+# "a HUMAN approved this exact write" — set only inside apply_skill_pending,
+# the /skills approve replay. _security_scan_skill's ask-verdict override
+# keys off THIS var, so an agent-driven operations[] batch (gate bypass set
+# by the batch executor, no human anywhere) can never satisfy an "ask"
+# verdict or mint a human-approval audit line. #94353
+_skill_approval_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
+    "skill_approval_bypass", default=False
 )
 
 
@@ -1489,6 +1502,7 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
     JSON string. Called by the /skills approve handler.
     """
     token = _skill_gate_bypass.set(True)
+    approval_token = _skill_approval_bypass.set(True)
     try:
         return skill_manage(
             action=payload.get("action", ""),
@@ -1503,6 +1517,7 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
             absorbed_into=payload.get("absorbed_into"),
         )
     finally:
+        _skill_approval_bypass.reset(approval_token)
         _skill_gate_bypass.reset(token)
 
 

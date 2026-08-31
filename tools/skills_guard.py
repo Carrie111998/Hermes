@@ -60,8 +60,10 @@ INSTALL_POLICY = {
     # Agent-created: "ask" on dangerous surfaces as an error to the agent,
     # which can retry without the flagged content. Exception: during an
     # operator's replayed ``/skills approve`` write (``apply_skill_pending``
-    # with the approval-gate bypass set) the "ask" verdict is satisfied by
-    # the human approval instead of deadlocking the write — see
+    # with ``_skill_approval_bypass`` set — the "a human approved this exact
+    # write" var, distinct from the staging-gate ``_skill_gate_bypass`` also
+    # set by the operations[] batch executor) the "ask" verdict is satisfied
+    # by the human approval instead of deadlocking the write — see
     # ``skill_manager_tool.py::apply_skill_pending`` (#94353); outside that
     # replay the error-and-retry behavior is unchanged. This gate only runs
     # when skills.guard_agent_created is enabled (off by default) — see

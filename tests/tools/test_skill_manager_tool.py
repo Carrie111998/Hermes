@@ -537,9 +537,31 @@ class TestSecurityScanGate:
 
         with patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
              patch("tools.skill_manager_tool.scan_skill", return_value=self._ask_result()), \
-             patch("tools.skill_manager_tool._skill_gate_bypass") as bypass:
+             patch("tools.skill_manager_tool._skill_approval_bypass") as bypass:
             bypass.get.return_value = False
             result = _security_scan_skill(tmp_path)
+
+        assert result is not None
+        assert "Security scan blocked" in result
+
+    def test_ask_verdict_blocks_when_only_staging_bypass_set(self, tmp_path):
+        """Regression (#94358 review): the operations[] batch executor
+        (#97295) sets _skill_gate_bypass — "skip the staging gate" loop
+        prevention, no human involved. The ask-override must key off
+        _skill_approval_bypass ("a human approved this exact write") instead,
+        so an agent-driven batch can never satisfy an "ask" verdict."""
+        from tools.skill_manager_tool import (
+            _security_scan_skill,
+            _skill_gate_bypass,
+        )
+
+        with patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
+             patch("tools.skill_manager_tool.scan_skill", return_value=self._ask_result()):
+            token = _skill_gate_bypass.set(True)
+            try:
+                result = _security_scan_skill(tmp_path)
+            finally:
+                _skill_gate_bypass.reset(token)
 
         assert result is not None
         assert "Security scan blocked" in result
@@ -548,14 +570,16 @@ class TestSecurityScanGate:
         """The reported deadlock (#94353): /skills approve replays the exact
         write a human just reviewed. An "ask" verdict means "needs a human
         decision" — the approval IS that decision, so the replay proceeds
-        with the findings logged for the audit trail."""
+        with the findings logged for the audit trail. The override keys off
+        _skill_approval_bypass, the human-decision var, not the staging-gate
+        _skill_gate_bypass."""
         import logging
 
         from tools.skill_manager_tool import _security_scan_skill
 
         with patch("tools.skill_manager_tool._guard_agent_created_enabled", return_value=True), \
              patch("tools.skill_manager_tool.scan_skill", return_value=self._ask_result()), \
-             patch("tools.skill_manager_tool._skill_gate_bypass") as bypass, \
+             patch("tools.skill_manager_tool._skill_approval_bypass") as bypass, \
              caplog.at_level(logging.WARNING, logger="tools.skill_manager_tool"):
             bypass.get.return_value = True
             result = _security_scan_skill(tmp_path)
@@ -576,7 +600,7 @@ class TestSecurityScanGate:
                  "tools.skill_manager_tool.should_allow_install",
                  return_value=(False, "hard denial (blocklist)"),
              ), \
-             patch("tools.skill_manager_tool._skill_gate_bypass") as bypass:
+             patch("tools.skill_manager_tool._skill_approval_bypass") as bypass:
             bypass.get.return_value = True
             result = _security_scan_skill(tmp_path)
 
