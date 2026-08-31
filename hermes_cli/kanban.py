@@ -81,6 +81,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "wait_kind": t.wait_kind,
+        "wait_ref": t.wait_ref,
     }
 
 
@@ -369,6 +371,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
+    p_create.add_argument(
+        "--external-assignee", action="store_true",
+        help="Allow a non-profile assignee intentionally claimed by an external lane",
+    )
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
     p_create.add_argument("--workspace", default="scratch",
@@ -394,6 +400,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "and re-queues the task.")
     p_create.add_argument("--created-by", default="user",
                           help="Author name recorded on the task (default: user)")
+    p_create.add_argument("--owner-kind", choices=("agent", "external", "no_agent"), default=None)
+    p_create.add_argument("--task-kind", default="ordinary")
+    p_create.add_argument("--purpose", default=None)
+    p_create.add_argument("--created-by-task-id", default=None)
+    p_create.add_argument("--created-by-run-id", type=int, default=None)
+    p_create.add_argument("--creation-authority", default=None)
+    p_create.add_argument("--gate-candidate-sha", default=None)
+    p_create.add_argument("--gate-manifest-hash", default=None)
     p_create.add_argument("--skill", action="append", default=[], dest="skills",
                           help="Skill to force-load into the worker "
                                "(repeatable). The kanban lifecycle is already "
@@ -515,6 +529,55 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
+    p_assign.add_argument("--owner-kind", choices=("agent", "external", "no_agent"), default=None)
+    p_assign.add_argument(
+        "--activate-agent", action="store_true",
+        help="Explicitly reactivate an implicit unassigned lane as agent-owned",
+    )
+
+    # Durable external executions are DB-owned so they outlive the initiating agent.
+    p = sub.add_parser("external-run-start", help="Start a durable external run")
+    p.add_argument("task_id"); p.add_argument("--owner", required=True); p.add_argument("--external-id", required=True); p.add_argument("--pid", type=int); p.add_argument("--phase"); p.add_argument("--current", type=int); p.add_argument("--total", type=int); p.add_argument("--log-ref"); p.add_argument("--result-ref"); p.add_argument("--max-retries", type=int); p.add_argument("--on-success", choices=("complete", "resume"), default="complete"); p.add_argument("--on-failure", choices=("retry", "block"), default="block"); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("external-run-show", help="Show a durable external run")
+    p.add_argument("run_id", type=int); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("external-run-list", help="List durable external runs")
+    p.add_argument("--task-id"); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("external-run-heartbeat", help="Heartbeat an owned external run")
+    p.add_argument("run_id", type=int); p.add_argument("--owner", required=True); p.add_argument("--phase"); p.add_argument("--current", type=int); p.add_argument("--total", type=int); p.add_argument("--log-ref"); p.add_argument("--result-ref"); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("external-run-transfer", help="Transfer a live external run owner")
+    p.add_argument("run_id", type=int); p.add_argument("--from-owner", required=True); p.add_argument("--to-owner", required=True); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("external-run-finish", help="Finish an owned external run exactly once")
+    p.add_argument("run_id", type=int); p.add_argument("--owner", required=True); p.add_argument("--outcome", required=True, choices=("completed", "failed", "lost", "cancelled")); p.add_argument("--result-ref"); p.add_argument("--json", action="store_true")
+    p = sub.add_parser("external-run-reconcile", help="Reconcile heartbeat-stale external runs")
+    p.add_argument("--stale-after", type=int, default=300); p.add_argument("--json", action="store_true")
+
+    p_wait_set = sub.add_parser("wait-set", help="Set a strict typed durable wait")
+    p_wait_set.add_argument("task_id"); p_wait_set.add_argument("kind", choices=sorted(kb.WAIT_AUTHORITIES)); p_wait_set.add_argument("ref")
+    p_wait_show = sub.add_parser("wait-show", help="Show a task's typed wait")
+    p_wait_show.add_argument("task_id"); p_wait_show.add_argument("--json", action="store_true")
+    p_wait_resume = sub.add_parser("wait-resume", help="Resume a wait with its exact authority receipt")
+    p_wait_resume.add_argument("task_id"); p_wait_resume.add_argument("--authority", required=True); p_wait_resume.add_argument("--receipt", required=True); p_wait_resume.add_argument("--verdict", default=None)
+
+    p_candidate_create = sub.add_parser("candidate-create", help="Create an immutable exact-SHA candidate")
+    p_candidate_create.add_argument("task_id"); p_candidate_create.add_argument("sha"); p_candidate_create.add_argument("--source-receipt", dest="source_receipt_file", default=None, help="Immutable JSON attestation file for scratch/dir candidates"); p_candidate_create.add_argument("--json", action="store_true")
+    p_candidate_show = sub.add_parser("candidate-show", help="Show a task candidate")
+    p_candidate_show.add_argument("task_id"); p_candidate_show.add_argument("sha"); p_candidate_show.add_argument("--json", action="store_true")
+    p_manifest_freeze = sub.add_parser("evidence-manifest-freeze", help="Freeze evidence manifest from JSON file")
+    p_manifest_freeze.add_argument("task_id"); p_manifest_freeze.add_argument("sha"); p_manifest_freeze.add_argument("manifest_file"); p_manifest_freeze.add_argument("--verdict", required=True); p_manifest_freeze.add_argument("--authority", required=True); p_manifest_freeze.add_argument("--json", action="store_true")
+    p_manifest_show = sub.add_parser("evidence-manifest-show", help="Show frozen evidence manifest")
+    p_manifest_show.add_argument("task_id"); p_manifest_show.add_argument("--json", action="store_true")
+    p_verdict_record = sub.add_parser("gate-verdict-record", help="Record candidate-bound gate verdict")
+    p_verdict_record.add_argument("task_id"); p_verdict_record.add_argument("gate_task_id"); p_verdict_record.add_argument("sha"); p_verdict_record.add_argument("manifest_hash"); p_verdict_record.add_argument("verdict"); p_verdict_record.add_argument("--authority"); p_verdict_record.add_argument("--json", action="store_true")
+    p_verdict_show = sub.add_parser("gate-verdict-show", help="Show gate verdict")
+    p_verdict_show.add_argument("task_id"); p_verdict_show.add_argument("gate_task_id"); p_verdict_show.add_argument("--json", action="store_true")
+    for name in ("release-barrier-show", "release-barrier-acquire", "release-barrier-renew", "release-barrier-release", "release-barrier-reconcile", "release-barrier-prepare", "release-barrier-delivery", "release-barrier-readback"):
+        p = sub.add_parser(name); p.add_argument("task_id"); p.add_argument("--barrier", default="publish"); p.add_argument("--json", action="store_true")
+        if name in {"release-barrier-acquire", "release-barrier-renew", "release-barrier-release", "release-barrier-reconcile", "release-barrier-prepare", "release-barrier-delivery", "release-barrier-readback"}: p.add_argument("--owner-token", required=True)
+        if name in {"release-barrier-acquire", "release-barrier-renew"}: p.add_argument("--ttl", type=int, default=60)
+        if name == "release-barrier-prepare": p.add_argument("--target", required=True); p.add_argument("--sha", required=True); p.add_argument("--idempotency-key")
+        if name == "release-barrier-delivery": p.add_argument("--target", required=True); p.add_argument("--sha", required=True); p.add_argument("--idempotency-key", required=True)
+        if name == "release-barrier-readback": p.add_argument("--sha", required=True)
+    p = sub.add_parser("release-barrier-create"); p.add_argument("task_id"); p.add_argument("--sha", required=True); p.add_argument("--manifest-hash", required=True); p.add_argument("--gate", action="append", required=True); p.add_argument("--authority", required=True); p.add_argument("--barrier", default="publish"); p.add_argument("--json", action="store_true")
 
     # --- set-model (per-task model/provider override) ---
     p_set_model = sub.add_parser(
@@ -556,6 +619,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reassign.add_argument(
         "--reclaim", action="store_true",
         help="Release any active claim before reassigning (required if task is running)",
+    )
+    p_reassign.add_argument(
+        "--activate-agent", action="store_true",
+        help="Explicitly reactivate an implicit unassigned lane as agent-owned",
     )
     p_reassign.add_argument(
         "--reason", default=None,
@@ -1151,6 +1218,31 @@ def kanban_command(args: argparse.Namespace) -> int:
             "ls":       _cmd_list,
             "show":     _cmd_show,
             "assign":   _cmd_assign,
+            "external-run-start": _cmd_external_run_start,
+            "external-run-show": _cmd_external_run_show,
+            "external-run-list": _cmd_external_run_list,
+            "external-run-heartbeat": _cmd_external_run_heartbeat,
+            "external-run-transfer": _cmd_external_run_transfer,
+            "external-run-finish": _cmd_external_run_finish,
+            "external-run-reconcile": _cmd_external_run_reconcile,
+            "wait-set": _cmd_wait_set,
+            "wait-show": _cmd_wait_show,
+            "wait-resume": _cmd_wait_resume,
+            "candidate-create": _cmd_candidate_create,
+            "candidate-show": _cmd_candidate_show,
+            "evidence-manifest-freeze": _cmd_evidence_manifest_freeze,
+            "evidence-manifest-show": _cmd_evidence_manifest_show,
+            "gate-verdict-record": _cmd_gate_verdict_record,
+            "gate-verdict-show": _cmd_gate_verdict_show,
+            "release-barrier-create": _cmd_release_barrier,
+            "release-barrier-show": _cmd_release_barrier,
+            "release-barrier-acquire": _cmd_release_barrier,
+            "release-barrier-renew": _cmd_release_barrier,
+            "release-barrier-release": _cmd_release_barrier,
+            "release-barrier-reconcile": _cmd_release_barrier,
+            "release-barrier-prepare": _cmd_release_barrier,
+            "release-barrier-delivery": _cmd_release_barrier,
+            "release-barrier-readback": _cmd_release_barrier,
             "set-model": _cmd_set_model,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
@@ -1662,6 +1754,29 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Keep omission distinct from an explicit owner choice: create_task owns
+    # legacy inference (assigned -> agent; unassigned -> implicit no_agent).
+    # The legacy external flag is itself an explicit external-lane choice.
+    owner_kind = getattr(args, "owner_kind", None)
+    if owner_kind is None and getattr(args, "external_assignee", False):
+        owner_kind = "external"
+    effective_owner_kind = owner_kind or ("agent" if args.assignee else "no_agent")
+    if args.assignee and effective_owner_kind == "agent":
+        from hermes_cli import profiles as profiles_mod
+
+        canonical = profiles_mod.normalize_profile_name(args.assignee)
+        if not profiles_mod.profile_exists(canonical):
+            available = ", ".join(
+                sorted(p.name for p in profiles_mod.list_profiles())
+            ) or "(none)"
+            print(
+                f"kanban: assignee profile {canonical!r} does not exist. "
+                f"Available profiles: {available}. Create it first, choose an "
+                "existing profile, or pass --external-assignee/--owner-kind external "
+                "only for an intentionally human-pulled external lane.",
+                file=sys.stderr,
+            )
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1686,6 +1801,14 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            owner_kind=owner_kind,
+            task_kind=getattr(args, "task_kind", "ordinary"),
+            purpose=getattr(args, "purpose", None),
+            created_by_task_id=getattr(args, "created_by_task_id", None),
+            created_by_run_id=getattr(args, "created_by_run_id", None),
+            creation_authority=getattr(args, "creation_authority", None),
+            gate_candidate_sha=getattr(args, "gate_candidate_sha", None),
+            gate_manifest_hash=getattr(args, "gate_manifest_hash", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1851,6 +1974,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
     print(f"  assignee:  {task.assignee or '-'}")
+    if task.wait_kind:
+        print(f"  wait:      {task.wait_kind} @ {task.wait_ref}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +
@@ -1960,13 +2085,258 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
-    with kb.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.assign_task(
+                conn, args.task_id, profile,
+                owner_kind=getattr(args, "owner_kind", None),
+                activate_agent=bool(getattr(args, "activate_agent", False)),
+            )
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
     print(f"Assigned {args.task_id} to {profile or '(unassigned)'}")
     return 0
+
+
+def _external_run_dict(run: kb.Run) -> dict[str, Any]:
+    """Return the credential-safe external-run JSON contract shared by CLI verbs."""
+    policy = run.metadata or {}
+    return {
+        "id": run.id, "task_id": run.task_id, "status": run.status,
+        "outcome": run.outcome, "owner": run.owner, "external_id": run.external_id,
+        "pid": run.worker_pid, "phase": run.phase, "current": run.progress_current,
+        "total": run.progress_total, "last_heartbeat_at": run.last_heartbeat_at,
+        "started_at": run.started_at, "ended_at": run.ended_at,
+        "log_ref": run.log_ref, "result_ref": run.result_ref,
+        "retry_policy": {"max_retries": policy.get("max_retries")},
+        "success_failure_policy": {
+            "on_success": policy.get("on_success"), "on_failure": policy.get("on_failure"),
+        },
+    }
+
+
+def _external_run_error() -> int:
+    print("external run not found or not owned by this board/owner", file=sys.stderr)
+    return 1
+
+
+def _cmd_external_run_start(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            run = kb.start_external_run(conn, args.task_id, owner=args.owner,
+                external_id=args.external_id, pid=args.pid, phase=args.phase,
+                current=args.current, total=args.total, log_ref=args.log_ref,
+                result_ref=args.result_ref, max_retries=args.max_retries,
+                on_success=args.on_success, on_failure=args.on_failure)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    return _print_receipt(_external_run_dict(run), args.json)
+
+
+def _cmd_external_run_show(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        run = kb.get_external_run(conn, args.run_id)
+    return _print_receipt(_external_run_dict(run), args.json) if run else _external_run_error()
+
+
+def _cmd_external_run_list(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        if args.task_id is not None and kb.get_task(conn, args.task_id) is None:
+            return _external_run_error()
+        sql = "SELECT * FROM task_runs WHERE owner_kind='external'"
+        params: tuple = ()
+        if args.task_id:
+            sql += " AND task_id=?"
+            params = (args.task_id,)
+        rows = conn.execute(sql + " ORDER BY id", params).fetchall()
+    return _print_receipt({"runs": [_external_run_dict(kb.Run.from_row(row)) for row in rows]}, args.json)
+
+
+def _cmd_external_run_heartbeat(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.heartbeat_external_run(conn, args.run_id, owner=args.owner,
+                phase=args.phase, current=args.current, total=args.total,
+                log_ref=args.log_ref, result_ref=args.result_ref)
+            run = kb.get_external_run(conn, args.run_id) if ok else None
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    return _print_receipt(_external_run_dict(run), args.json) if run else _external_run_error()
+
+
+def _cmd_external_run_transfer(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.transfer_external_run_owner(conn, args.run_id,
+                from_owner=args.from_owner, to_owner=args.to_owner)
+            run = kb.get_external_run(conn, args.run_id) if ok else None
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    return _print_receipt(_external_run_dict(run), args.json) if run else _external_run_error()
+
+
+def _cmd_external_run_finish(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.finish_external_run(conn, args.run_id, owner=args.owner,
+                outcome=args.outcome, result_ref=args.result_ref)
+            run = kb.get_external_run(conn, args.run_id) if ok else None
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    return _print_receipt(_external_run_dict(run), args.json) if run else _external_run_error()
+
+
+def _cmd_external_run_reconcile(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            count = kb.reconcile_stale_external_runs(conn, stale_after_seconds=args.stale_after)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    return _print_receipt({"reconciled": count}, args.json)
+
+
+def _cmd_wait_set(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            kb.set_task_wait(conn, args.task_id, kind=args.kind, ref=args.ref)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    print(f"Wait set: {args.task_id} {args.kind} {args.ref}")
+    return 0
+
+
+def _cmd_wait_show(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, args.task_id)
+    if not task:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if not task.wait_kind:
+        print("no typed wait", file=sys.stderr)
+        return 1
+    value = {"task_id": task.id, "kind": task.wait_kind, "ref": task.wait_ref}
+    print(json.dumps(value, sort_keys=True) if args.json else f"{value['kind']} {value['ref']}")
+    return 0
+
+
+def _cmd_wait_resume(args: argparse.Namespace) -> int:
+    try:
+        with kb.connect_closing() as conn:
+            task = kb.get_task(conn, args.task_id)
+            if task is None:
+                print(f"no such task: {args.task_id}", file=sys.stderr)
+                return 1
+            if args.verdict is not None:
+                if not task.wait_kind:
+                    print("kanban: task has no typed wait", file=sys.stderr)
+                    return 2
+                kb.record_wait_receipt(conn, kind=task.wait_kind, ref=args.receipt, authority=args.authority, verdict=args.verdict)
+            ok = kb.resume_task_wait(conn, args.task_id, authority=args.authority, receipt=args.receipt)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print("wait not satisfied by this authority and receipt", file=sys.stderr)
+        return 1
+    print(f"Wait resumed: {args.task_id}")
+    return 0
+
+
+def _print_receipt(value: dict, as_json: bool) -> int:
+    print(json.dumps(value, sort_keys=True) if as_json else json.dumps(value, indent=2, sort_keys=True))
+    return 0
+
+
+def _bound_cli_control_authority(supplied: Optional[str] = None) -> str:
+    """Bind privileged CLI writes to HERMES_PROFILE plus configured principal."""
+    configured = kb._configured_coordinator_principal()
+    caller = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if not configured or caller != configured:
+        raise ValueError("CLI requires runtime HERMES_PROFILE to be the configured coordinator principal")
+    if supplied is not None and str(supplied).strip() != caller:
+        raise ValueError("--authority is only an assertion of runtime HERMES_PROFILE")
+    return caller
+
+
+def _cmd_candidate_create(args: argparse.Namespace) -> int:
+    try:
+        receipt = (json.loads(Path(args.source_receipt_file).read_text(encoding="utf-8"))
+                   if args.source_receipt_file else None)
+        if receipt is not None and not isinstance(receipt, dict):
+            raise ValueError("source receipt file must contain a JSON object")
+        with kb.connect_closing() as conn:
+            return _print_receipt(kb.create_candidate(conn, args.task_id, sha=args.sha, source_receipt=receipt), args.json)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"kanban: invalid source receipt: {exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_candidate_show(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        value = kb.get_candidate(conn, args.task_id, sha=args.sha)
+    if value is None:
+        print("candidate not found", file=sys.stderr); return 1
+    return _print_receipt(value, args.json)
+
+
+def _cmd_evidence_manifest_freeze(args: argparse.Namespace) -> int:
+    try:
+        manifest = json.loads(Path(args.manifest_file).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"kanban: invalid manifest file: {exc}", file=sys.stderr); return 2
+    with kb.connect_closing() as conn:
+        authority = kb._bound_evidence_authority(conn, args.task_id, args.authority)
+        return _print_receipt(kb.freeze_evidence_manifest(conn, args.task_id, sha=args.sha, manifest=manifest, verdict=args.verdict, authority=authority), args.json)
+
+
+def _cmd_evidence_manifest_show(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn: value = kb.get_frozen_evidence_manifest(conn, args.task_id)
+    if value is None: print("evidence manifest not found", file=sys.stderr); return 1
+    return _print_receipt(value, args.json)
+
+
+def _cmd_gate_verdict_record(args: argparse.Namespace) -> int:
+    authority = _bound_cli_control_authority(getattr(args, "authority", None))
+    with kb.connect_closing() as conn:
+        return _print_receipt(kb.record_gate_verdict(conn, args.task_id, gate_task_id=args.gate_task_id, sha=args.sha, manifest_hash=args.manifest_hash, verdict=args.verdict, authority=authority), args.json)
+
+
+def _cmd_gate_verdict_show(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn: value = kb.get_gate_verdict(conn, args.task_id, gate_task_id=args.gate_task_id)
+    if value is None: print("gate verdict not found", file=sys.stderr); return 1
+    return _print_receipt(value, args.json)
+
+
+def _cmd_release_barrier(args: argparse.Namespace) -> int:
+    action = args.kanban_action
+    authority = None if action == "release-barrier-show" else _bound_cli_control_authority(getattr(args, "authority", None))
+    with kb.connect_closing() as conn:
+        if action == "release-barrier-create":
+            authority = _bound_cli_control_authority(args.authority)
+            value = kb.create_release_barrier(conn, args.task_id, sha=args.sha, manifest_hash=args.manifest_hash, required_gates=args.gate, authority=authority, barrier=args.barrier)
+        elif action == "release-barrier-show": value = kb.get_release_barrier(conn, args.task_id, barrier=args.barrier)
+        elif action == "release-barrier-acquire": value = {"acquired": kb.acquire_release_barrier_lease(conn, args.task_id, barrier=args.barrier, owner_token=args.owner_token, ttl_seconds=args.ttl, authority=authority)}
+        elif action == "release-barrier-renew": value = {"renewed": kb.renew_release_barrier_lease(conn, args.task_id, barrier=args.barrier, owner_token=args.owner_token, ttl_seconds=args.ttl, authority=authority)}
+        elif action == "release-barrier-release": value = {"released": kb.release_release_barrier_lease(conn, args.task_id, barrier=args.barrier, owner_token=args.owner_token, authority=authority)}
+        elif action == "release-barrier-reconcile": value = {"status": kb.reconcile_release_barrier(conn, args.task_id, barrier=args.barrier, owner_token=args.owner_token, authority=authority)}
+        elif action == "release-barrier-prepare": value = kb.prepare_release_delivery_intent(conn, args.task_id, barrier=args.barrier, owner_token=args.owner_token, target_identity=args.target, candidate_sha=args.sha, idempotency_key=args.idempotency_key, authority=authority)
+        elif action == "release-barrier-delivery": kb.record_release_delivery(conn, args.task_id, barrier=args.barrier, owner_token=args.owner_token, target_identity=args.target, delivered_sha=args.sha, idempotency_key=args.idempotency_key, authority=authority); value = kb.get_release_barrier(conn, args.task_id, barrier=args.barrier)
+        else: kb.record_release_readback(conn, args.task_id, barrier=args.barrier, owner_token=args.owner_token, readback_sha=args.sha, authority=authority); value = kb.get_release_barrier(conn, args.task_id, barrier=args.barrier)
+    if value is None: print("release barrier not found", file=sys.stderr); return 1
+    return _print_receipt(value, args.json)
 
 
 def _cmd_set_model(args: argparse.Namespace) -> int:
@@ -2011,12 +2381,17 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
-    with kb.connect_closing() as conn:
-        ok = kb.reassign_task(
-            conn, args.task_id, profile,
-            reclaim_first=bool(getattr(args, "reclaim", False)),
-            reason=getattr(args, "reason", None),
-        )
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.reassign_task(
+                conn, args.task_id, profile,
+                reclaim_first=bool(getattr(args, "reclaim", False)),
+                reason=getattr(args, "reason", None),
+                activate_agent=bool(getattr(args, "activate_agent", False)),
+            )
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
     if not ok:
         print(
             f"cannot reassign {args.task_id} "

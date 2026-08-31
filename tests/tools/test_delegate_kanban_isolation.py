@@ -28,6 +28,7 @@ def _python_with_repo_path(code: str) -> str:
 def _make_running_kanban_task(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
+    (home / "profiles" / "parent-worker").mkdir(parents=True)
     attachments_root = tmp_path / "attachments"
     workspace = tmp_path / "parent-workspace"
     workspace.mkdir()

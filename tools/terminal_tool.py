@@ -3323,6 +3323,18 @@ def terminal_tool(
                         session_key=session_key,
                     )
 
+                try:
+                    from tools.kanban_tools import record_background_process_event_from_env
+
+                    record_background_process_event_from_env(
+                        "started", proc_session.id, command
+                    )
+                except Exception:
+                    logger.debug(
+                        "kanban background-process start bridge failed",
+                        exc_info=True,
+                    )
+
                 result_data = {
                     "output": "Background process started",
                     "session_id": proc_session.id,

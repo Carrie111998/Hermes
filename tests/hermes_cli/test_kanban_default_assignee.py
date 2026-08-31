@@ -93,3 +93,18 @@ def test_explicitly_assigned_task_untouched_by_default_assignee(isolated_kanban_
     assert any(s[0] == task_id and s[1] == "default" for s in res.spawned)
 
 
+def test_explicit_no_agent_task_is_never_promoted_by_default_assignee(isolated_kanban_home):
+    """An explicit no_agent routing decision must survive dispatcher fallback."""
+    kb, _home = isolated_kanban_home
+    with kb.connect_closing() as conn:
+        kb.create_board(slug="default", name="Test")
+        task_id = kb.create_task(conn, title="manual lane", owner_kind="no_agent")
+        res = kb.dispatch_once(
+            conn, spawn_fn=_fake_spawn, dry_run=False, default_assignee="default",
+        )
+        task = kb.get_task(conn, task_id)
+    assert res.auto_assigned_default == []
+    assert task.assignee is None
+    assert task.owner_kind == "no_agent"
+
+

@@ -31,6 +31,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import subprocess
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -119,19 +122,32 @@ def _check_kanban_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
-def _check_kanban_orchestrator_mode() -> bool:
-    """Board-routing tools (kanban_list, kanban_unblock) are intentionally
-    hidden from task workers.
+def _dispatcher_worker_is_orchestrator() -> bool:
+    """Whether this scoped worker is the configured board orchestrator."""
+    if not os.environ.get("HERMES_KANBAN_TASK") or not _is_dispatcher_owned_worker():
+        return False
+    try:
+        from hermes_cli import profiles as profiles_mod
 
-    Dispatcher-spawned workers should close their own task via the
-    lifecycle tools (complete/block/heartbeat), not enumerate or unblock
-    board state. Profiles that explicitly opt into the kanban toolset
-    and are NOT scoped to a single task are the orchestrator surface.
-    """
+        cfg = load_config() or {}
+        configured = str(
+            (cfg.get("kanban") or {}).get("orchestrator_profile") or "default"
+        )
+        configured = profiles_mod.normalize_profile_name(configured)
+        current = profiles_mod.normalize_profile_name(
+            os.environ.get("HERMES_PROFILE") or "default"
+        )
+        return current == configured
+    except Exception:
+        return False
+
+
+def _check_kanban_orchestrator_mode() -> bool:
+    """Expose board-routing tools only to explicit orchestrator contexts."""
     if _is_delegated_child_context():
         return False
     if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
-        return False
+        return _dispatcher_worker_is_orchestrator()
     return _profile_has_kanban_toolset()
 
 
@@ -296,6 +312,65 @@ def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
 
 _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 _auto_heartbeat_last_attempt: float = 0.0
+
+
+def record_background_process_event_from_env(
+    state: str,
+    session_id: str,
+    command: str,
+    *,
+    exit_code: Optional[int] = None,
+) -> bool:
+    """Mirror managed-process lifecycle into the owning Kanban task heartbeat."""
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid or not _is_dispatcher_owned_worker():
+        return False
+    state = str(state).strip().lower()
+    if state not in {"started", "completed", "lost", "killed"}:
+        return False
+    safe_command = redact_sensitive_text(str(command), force=True)[:200]
+    note = f"background process {session_id} {state}"
+    if exit_code is not None:
+        note += f" exit={int(exit_code)}"
+    if safe_command:
+        note += f": {safe_command}"
+    try:
+        kb, conn = _connect()
+        try:
+            prior_notes = [
+                (event.payload or {}).get("note", "")
+                for event in kb.list_events(conn, tid)
+                if event.kind == "heartbeat"
+            ]
+            state_prefix = f"background process {session_id} {state}"
+            if any(value.startswith(state_prefix) for value in prior_notes):
+                return True
+            expected_run_id = _worker_run_id(tid)
+            start_prefix = f"background process {session_id} started"
+            if state != "started" and not any(
+                value.startswith(start_prefix) for value in prior_notes
+            ):
+                start_note = start_prefix
+                if safe_command:
+                    start_note += f": {safe_command}"
+                kb.heartbeat_worker(
+                    conn,
+                    tid,
+                    note=start_note,
+                    expected_run_id=expected_run_id,
+                )
+            kb.heartbeat_worker(
+                conn,
+                tid,
+                note=note,
+                expected_run_id=expected_run_id,
+            )
+        finally:
+            conn.close()
+        return True
+    except Exception:
+        logger.debug("background process event bridge failed", exc_info=True)
+        return False
 
 
 def heartbeat_current_worker_from_env() -> bool:
@@ -473,13 +548,87 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     structured tool_error so the model gets a clear refusal instead of
     silently mutating board state from a worker context.
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if os.environ.get("HERMES_KANBAN_TASK") and not _dispatcher_worker_is_orchestrator():
         return tool_error(
-            f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
-            "must use kanban_complete, kanban_block, kanban_heartbeat, or "
-            "kanban_comment for their assigned task."
+            f"{tool_name} is orchestrator-only; dispatcher-spawned implementation "
+            "workers must use kanban_request_review for independent review or "
+            "their own lifecycle tools. Only kanban.orchestrator_profile may "
+            "fan out or route board work from a scoped task."
         )
     return None
+
+
+def _reject_live_background_handoff(tool_name: str) -> Optional[str]:
+    """Keep a one-shot worker alive until its background commands finish."""
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        return None
+    try:
+        from tools.process_registry import process_registry
+
+        running = [
+            process
+            for process in process_registry.list_sessions()
+            if process.get("status") == "running"
+            and process.get("kanban_task_id") == tid
+        ]
+    except Exception:
+        # Registry inspection is advisory; never brick lifecycle operations.
+        logger.debug("background handoff guard failed open", exc_info=True)
+        return None
+    if not running:
+        return None
+    handles = ", ".join(str(p.get("session_id")) for p in running[:5])
+    return tool_error(
+        f"{tool_name} refused while worker-owned background process(es) are "
+        f"still running: {handles}. Use process wait (or process kill for an "
+        "intentional cancellation), record the real exit result, then retry "
+        "the Kanban handoff. Ending the worker now would terminate the child "
+        "and lose its verdict."
+    )
+
+
+def _bind_worktree_review_metadata(task: Any, metadata: Optional[dict]):
+    """Bind a code-review handoff to one clean immutable Git commit."""
+    metadata = dict(metadata or {})
+    if not task or task.workspace_kind != "worktree":
+        return metadata, None
+    workspace = Path(task.workspace_path or "")
+    if not workspace.is_absolute() or not workspace.is_dir():
+        return metadata, "worktree workspace is missing or not absolute"
+    try:
+        head = subprocess.check_output(
+            ["git", "-C", str(workspace), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        ).strip()
+        dirty = subprocess.check_output(
+            [
+                "git", "-C", str(workspace), "status", "--porcelain=v1",
+                "--untracked-files=all",
+            ],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        return metadata, f"could not inspect worktree candidate: {exc}"
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        return metadata, f"worktree HEAD is not an exact 40-character commit: {head!r}"
+    if dirty.strip():
+        return metadata, (
+            "worktree is dirty; commit or remove every tracked/untracked change "
+            "before review"
+        )
+    claimed = metadata.get("candidate_sha")
+    if claimed is not None and str(claimed) != head:
+        return metadata, (
+            f"metadata candidate_sha {claimed!r} does not match worktree HEAD {head}"
+        )
+    metadata["candidate_sha"] = head
+    metadata["worktree_clean"] = True
+    return metadata, None
 
 
 def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
@@ -657,6 +806,9 @@ def _handle_complete(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
     if delegated_err:
         return delegated_err
+    background_err = _reject_live_background_handoff("kanban_complete")
+    if background_err:
+        return background_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -819,6 +971,9 @@ def _handle_block(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_block")
     if delegated_err:
         return delegated_err
+    background_err = _reject_live_background_handoff("kanban_block")
+    if background_err:
+        return background_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -900,6 +1055,9 @@ def _handle_request_review(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_request_review")
     if delegated_err:
         return delegated_err
+    background_err = _reject_live_background_handoff("kanban_request_review")
+    if background_err:
+        return background_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -928,7 +1086,31 @@ def _handle_request_review(args: dict, **kw) -> str:
             return tool_error("metadata could not be safely serialized")
     metadata = _stamp_worker_session_metadata(tid, metadata)
     reviewer = args.get("reviewer") or None
+    if not reviewer:
+        return tool_error(
+            "an explicit independent reviewer is required; choose an installed "
+            "profile different from the implementer"
+        )
     if reviewer:
+        from hermes_cli import profiles as profiles_mod
+
+        reviewer = profiles_mod.normalize_profile_name(str(reviewer))
+        current_profile = profiles_mod.normalize_profile_name(
+            os.environ.get("HERMES_PROFILE") or "default"
+        )
+        if reviewer == current_profile:
+            return tool_error(
+                f"reviewer profile {reviewer!r} cannot review its own "
+                "implementation; choose an independent installed profile"
+            )
+        if not profiles_mod.profile_exists(reviewer):
+            available = ", ".join(
+                sorted(p.name for p in profiles_mod.list_profiles())
+            ) or "(none)"
+            return tool_error(
+                f"reviewer profile {reviewer!r} does not exist. "
+                f"Available profiles: {available}."
+            )
         # Model-supplied free text stored durably on the event payload —
         # redact like summary / kanban_block's reason.
         reviewer = redact_sensitive_text(str(reviewer), force=True)
@@ -937,6 +1119,25 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
+            if task is not None:
+                from hermes_cli import profiles as profiles_mod
+
+                implementation_assignee = profiles_mod.normalize_profile_name(
+                    task.assignee
+                )
+                if reviewer == implementation_assignee:
+                    return tool_error(
+                        f"reviewer profile {reviewer!r} is the task's implementation "
+                        "assignee; choose an independent installed profile"
+                    )
+            metadata, provenance_error = _bind_worktree_review_metadata(
+                task, metadata
+            )
+            if provenance_error is not None:
+                return tool_error(
+                    f"Review handoff rejected: {provenance_error}. "
+                    "The task remains in-flight."
+                )
             rejection = _goal_mode_handoff_rejection(task, summary)
             if rejection is not None:
                 return tool_error(
@@ -1349,6 +1550,9 @@ def _handle_create(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_create")
     if delegated_err:
         return delegated_err
+    guard = _require_orchestrator_tool("kanban_create")
+    if guard:
+        return guard
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -1358,6 +1562,50 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    external_assignee, external_bool_error = _parse_bool_arg(
+        args, "external_assignee"
+    )
+    if external_bool_error:
+        return tool_error(external_bool_error)
+    # Preserve an omitted owner_kind as None for DB-side legacy inference.
+    # external_assignee remains an explicit alias for the external lane.
+    owner_kind = args.get("owner_kind")
+    if owner_kind is not None:
+        owner_kind = str(owner_kind).strip().lower()
+        if owner_kind not in {"agent", "external", "no_agent"}:
+            return tool_error("owner_kind must be agent, external, or no_agent")
+    if owner_kind is None and external_assignee:
+        owner_kind = "external"
+    effective_owner_kind = owner_kind or "agent"
+    # Explicit external ownership is the same deliberate human-pulled lane as
+    # external_assignee. Never make a caller provide both spellings.
+    if effective_owner_kind == "agent" and not external_assignee:
+        from hermes_cli import profiles as profiles_mod
+
+        canonical_assignee = profiles_mod.normalize_profile_name(str(assignee))
+        if not profiles_mod.profile_exists(canonical_assignee):
+            available = ", ".join(
+                sorted(p.name for p in profiles_mod.list_profiles())
+            ) or "(none)"
+            return tool_error(
+                f"assignee profile {canonical_assignee!r} does not exist. "
+                f"Available profiles: {available}. Create that profile first, "
+                "choose an existing profile, or set owner_kind=external "
+                "(or external_assignee=true) only for an intentionally human-pulled external lane."
+            )
+    task_kind = str(args.get("task_kind") or "ordinary").strip().lower()
+    caller_authority = os.environ.get("HERMES_PROFILE") or "worker"
+    supplied_authority = args.get("creation_authority")
+    if task_kind in {"reviewer", "visualqa", "release"}:
+        if supplied_authority and str(supplied_authority) != caller_authority:
+            return tool_error("mandatory gate creation_authority must match the calling profile")
+        try:
+            configured = (load_config() or {}).get("kanban") or {}
+            trusted_authority = configured.get("coordinator_profile") or configured.get("orchestrator_profile")
+        except Exception:
+            trusted_authority = None
+        if not trusted_authority or str(trusted_authority) != caller_authority:
+            return tool_error("mandatory gates require the configured trusted orchestrator authority")
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -1461,6 +1709,14 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                owner_kind=owner_kind,
+                task_kind=task_kind,
+                purpose=args.get("purpose"),
+                created_by_task_id=(args.get("created_by_task_id") or os.environ.get("HERMES_KANBAN_TASK")),
+                created_by_run_id=args.get("created_by_run_id"),
+                creation_authority=(args.get("creation_authority") or os.environ.get("HERMES_PROFILE") or "worker"),
+                gate_candidate_sha=args.get("gate_candidate_sha"),
+                gate_manifest_hash=args.get("gate_manifest_hash"),
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1646,6 +1902,9 @@ def _handle_link(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_link")
     if delegated_err:
         return delegated_err
+    guard = _require_orchestrator_tool("kanban_link")
+    if guard:
+        return guard
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:
@@ -1930,8 +2189,8 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
             "reviewer": {
                 "type": "string",
                 "description": (
-                    "Optional reviewer profile. When provided, the task is "
-                    "reassigned to that profile before review dispatch."
+                    "Required installed independent reviewer profile. It must "
+                    "differ from the implementation profile."
                 ),
             },
             "metadata": {
@@ -1944,7 +2203,7 @@ KANBAN_REQUEST_REVIEW_SCHEMA = {
             },
             "board": _board_schema_prop(),
         },
-        "required": ["summary"],
+        "required": ["summary", "reviewer"],
     },
 }
 
@@ -2149,12 +2408,36 @@ KANBAN_CREATE_SCHEMA = {
             "assignee": {
                 "type": "string",
                 "description": (
-                    "Profile name that should execute this task "
-                    "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                    "Required — tasks without an assignee are never "
-                    "dispatched."
+                    "Installed Hermes profile that should execute this task "
+                    "(e.g. 'researcher-a', 'reviewer', 'writer'). Required — "
+                    "creation fails immediately if the profile does not exist, "
+                    "unless external_assignee is explicitly true."
                 ),
             },
+            "external_assignee": {
+                "type": "boolean",
+                "description": (
+                    "Explicitly allow an assignee that is not an installed "
+                    "Hermes profile because a human or external terminal lane "
+                    "will claim it. Defaults to false; never use this to bypass "
+                    "a misspelled or missing profile."
+                ),
+            },
+            "owner_kind": {
+                "type": "string",
+                "enum": ["agent", "external", "no_agent"],
+                "description": "Optional durable execution owner. Omit it to preserve DB inference (assigned tasks become agent-owned; unassigned cards are implicit no_agent). Use external only for a deliberate human-pulled lane, or no_agent for a non-dispatchable card.",
+            },
+            "task_kind": {
+                "type": "string",
+                "description": "Immutable task category. reviewer, visualqa, and release require the configured trusted orchestrator authority.",
+            },
+            "purpose": {"type": "string", "description": "Immutable creation-purpose provenance."},
+            "created_by_task_id": {"type": "string", "description": "Immutable creating task id; defaults to this worker's task."},
+            "created_by_run_id": {"type": "integer", "description": "Immutable creating run id when known."},
+            "creation_authority": {"type": "string", "description": "Immutable authority; defaults to the caller profile and must match configured coordinator/orchestrator for mandatory gates."},
+            "gate_candidate_sha": {"type": "string", "description": "Required for reviewer/visualqa: exact frozen source candidate SHA."},
+            "gate_manifest_hash": {"type": "string", "description": "Required for reviewer/visualqa: exact frozen source evidence manifest hash."},
             "body": {
                 "type": "string",
                 "description": (
@@ -2457,7 +2740,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_orchestrator_mode,
     emoji="➕",
 )
 
@@ -2475,6 +2758,6 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
     handler=_handle_link,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_orchestrator_mode,
     emoji="🔗",
 )

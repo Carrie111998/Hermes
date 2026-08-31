@@ -19,7 +19,7 @@ from types import SimpleNamespace
 
 def _run_apply_profile_override(
     tmp_path, monkeypatch, *, hermes_home: str | None, active_profile: str | None,
-    argv: list[str] | None = None,
+    argv: list[str] | None = None, hermes_profile: str | None = None,
 ):
     """Run _apply_profile_override in isolation.
 
@@ -40,6 +40,10 @@ def _run_apply_profile_override(
         monkeypatch.setenv("HERMES_HOME", hermes_home)
     else:
         monkeypatch.delenv("HERMES_HOME", raising=False)
+    if hermes_profile is None:
+        monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_PROFILE", hermes_profile)
 
     monkeypatch.setattr(sys, "argv", argv or ["hermes", "gateway", "start"])
 
@@ -84,6 +88,7 @@ class TestApplyProfileOverrideHermesHomeGuard:
         assert result.endswith("coder"), (
             f"Expected HERMES_HOME to end with 'coder', got: {result!r}"
         )
+        assert os.environ.get("HERMES_PROFILE") == "coder"
 
 
     def test_sudo_explicit_profile_resolves_invoking_users_profile(self, tmp_path, monkeypatch):
@@ -108,6 +113,7 @@ class TestApplyProfileOverrideHermesHomeGuard:
         _apply_profile_override()
 
         assert os.environ.get("HERMES_HOME") == str(profile_dir)
+        assert os.environ.get("HERMES_PROFILE") == "elias"
         assert sys.argv == ["hermes", "gateway", "install", "--system"]
 
 
@@ -141,6 +147,20 @@ class TestSupervisedChildIgnoresStickyProfile:
 
         assert result is not None
         assert result.endswith("briefer")
+        assert os.environ.get("HERMES_PROFILE") == "briefer"
+
+    def test_inherited_profile_home_sets_runtime_profile(self, tmp_path, monkeypatch):
+        profile = tmp_path / ".hermes" / "profiles" / "reviewer"
+        profile.mkdir(parents=True)
+        result = _run_apply_profile_override(
+            tmp_path,
+            monkeypatch,
+            hermes_home=str(profile),
+            active_profile=None,
+            hermes_profile="coordinator",
+        )
+        assert result == str(profile)
+        assert os.environ.get("HERMES_PROFILE") == "reviewer"
 
     def test_supervised_named_profile_flag_still_wins(self, tmp_path, monkeypatch):
         """A supervised named-profile slot passes ``-p <name>`` explicitly;

@@ -37,6 +37,7 @@ import platform
 import shlex
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -362,6 +363,17 @@ def _stop_systemd_unit(unit_name: str) -> bool:
         return False
 
 
+def _ignore_sighup_before_exec() -> None:
+    """Close the PTY parent-death race before the sidecar Python starts.
+
+    The outer PTY is created before exec. If its registry parent dies during
+    sidecar startup, the kernel sends SIGHUP before Python can install the
+    durable wrapper's handler. SIG_IGN survives exec, so this child-side hook
+    makes transfer durability effective from the instant of spawn.
+    """
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
     if s < 60:
@@ -379,6 +391,16 @@ class ProcessSession:
     id: str                                     # Unique session ID ("proc_xxxxxxxxxxxx")
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
+    kanban_task_id: str = ""                    # Owning Kanban card, when scoped
+    # A transferred process is no longer owned by the session that started it.
+    # Its durable Kanban external run is the sole lifecycle authority.
+    kanban_external_run_id: Optional[int] = None
+    kanban_board: str = "default"
+    kanban_external_owner: str = ""
+    external_run_owned: bool = False
+    # A terminal transferred session remains durable until its external run has
+    # accepted the matching terminal CAS settlement.
+    settlement_pending: bool = False
     session_key: str = ""                       # Gateway session key (for reset protection)
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
@@ -386,6 +408,7 @@ class ProcessSession:
     cwd: Optional[str] = None                   # Working directory
     started_at: float = 0.0                     # time.time() of spawn (wall clock)
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
+    durable_result_path: str = ""              # Safe exit-code sidecar under HERMES_HOME
     exited: bool = False                        # Whether the process has finished
     exit_code: Optional[int] = None             # Exit code (None if still running)
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
@@ -453,6 +476,14 @@ class ProcessRegistry:
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        # Serialize snapshot + replace + directory barrier without holding the
+        # registry lock over I/O. A later writer snapshots only after the prior
+        # writer's durable checkpoint is fully published, so older ownership
+        # state can never land after a newer external-run transfer.
+        self._checkpoint_write_lock = threading.Lock()
+        # At most one bounded daemon recovery loop per terminal external run.
+        self._settlement_retry_lock = threading.Lock()
+        self._settlement_retry_sessions: set[str] = set()
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -512,6 +543,37 @@ class ProcessRegistry:
         while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
             lines.pop(0)
         return "\n".join(lines)
+
+    @staticmethod
+    def _durable_result_path(session_id: str) -> Path:
+        """Return the only valid durable result location for a session."""
+        return get_hermes_home() / "process-results" / f"{session_id}.json"
+
+    @classmethod
+    def _sidecar_argv(cls, session: ProcessSession, command_argv: List[str]) -> List[str]:
+        """Wrap a local command so its exact exit code survives parent death."""
+        sidecar = Path(__file__).with_name("process_sidecar.py").resolve()
+        return [
+            sys.executable, str(sidecar),
+            "--result", session.durable_result_path,
+            "--session-id", session.id, "--", *command_argv,
+        ]
+
+    @classmethod
+    def _read_durable_result(cls, session_id: str, result_path: str) -> Optional[int]:
+        """Read only an exact, safe sidecar payload; malformed data is unknown."""
+        try:
+            expected = cls._durable_result_path(session_id).resolve()
+            actual = Path(result_path).resolve()
+            if actual != expected:
+                return None
+            payload = json.loads(actual.read_text(encoding="utf-8"))
+            if set(payload) != {"session_id", "exit_code"} or payload["session_id"] != session_id:
+                return None
+            exit_code = payload["exit_code"]
+            return exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
 
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a freshly-read chunk to the live-output sink, if one is set.
@@ -848,9 +910,16 @@ class ProcessRegistry:
             if session.exited:
                 return session
             session.exited = True
-            # Recovered sessions no longer have a waitable handle, so the real
-            # exit code is unavailable once the original process object is gone.
-            session.exit_code = None
+            # The durable wrapper publishes the exact exit code before its host
+            # PID disappears, so a registry recovered while the process was
+            # still live can settle it correctly after the original Popen
+            # handle is gone. Missing/corrupt receipts remain an unknown loss.
+            session.exit_code = self._read_durable_result(
+                session.id, session.durable_result_path,
+            )
+            session.completion_reason = (
+                "exited" if session.exit_code is not None else "lost"
+            )
 
         self._move_to_finished(session)
         return session
@@ -1062,10 +1131,12 @@ class ProcessRegistry:
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
+            kanban_task_id=os.environ.get("HERMES_KANBAN_TASK", ""),
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
+        session.durable_result_path = str(self._durable_result_path(session.id))
 
         pty_scope_attempted = False
         if use_pty:
@@ -1083,7 +1154,10 @@ class ProcessRegistry:
                 # cat, honoring any pager the user already exported.
                 pty_env.setdefault("GIT_PAGER", "cat")
                 pty_env.setdefault("PAGER", "cat")
-                pty_argv = [user_shell, "-lic", f"set +m; {safe_command}"]
+                pty_argv = self._sidecar_argv(
+                    session, [user_shell, "-lic", f"set +m; {safe_command}"],
+                )
+                pty_argv.insert(2, "--pty")
 
                 # Cgroup isolation for PTY mode (#70716, reviewer gap #1):
                 # Wrap the PTY command in a systemd scope so interactive
@@ -1109,12 +1183,27 @@ class ProcessRegistry:
                         "worker shares the gateway cgroup."
                     )
 
-                pty_proc = _PtyProcessCls.spawn(
-                    pty_argv,
-                    cwd=session.cwd,
-                    env=pty_env,
-                    dimensions=(30, 120),
-                )
+                pty_spawn_kwargs = {
+                    "cwd": session.cwd,
+                    "env": pty_env,
+                    "dimensions": (30, 120),
+                }
+                if not _IS_WINDOWS:
+                    pty_spawn_kwargs["preexec_fn"] = _ignore_sighup_before_exec
+                pty_proc = _PtyProcessCls.spawn(pty_argv, **pty_spawn_kwargs)
+                if not _IS_WINDOWS:
+                    # The durable sidecar owns the one canonical inner line
+                    # discipline. Make the outer transport raw before this
+                    # session becomes visible so an immediate write cannot be
+                    # echoed/buffered once here and again by the child PTY.
+                    # Test doubles and alternate PTY adapters may not expose a
+                    # real integer fd; the sidecar still configures real POSIX
+                    # terminals on its own startup path.
+                    outer_fd = getattr(pty_proc, "fd", None)
+                    if isinstance(outer_fd, int):
+                        import termios
+                        import tty
+                        tty.setraw(outer_fd, termios.TCSANOW)
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
                 # Store the pty handle on the session for read/write
@@ -1166,7 +1255,9 @@ class ProcessRegistry:
         # kills only the worker instead of taking down the whole gateway
         # cgroup (and the messaging control plane with it). This applies to
         # both pipe mode and the PTY path above.
-        shell_argv = [user_shell, "-lic", f"set +m; {safe_command}"]
+        shell_argv = self._sidecar_argv(
+            session, [user_shell, "-lic", f"set +m; {safe_command}"],
+        )
         in_supervised_gateway = not _IS_WINDOWS and _is_supervised_gateway_process()
         use_systemd_scope = (
             in_supervised_gateway and _systemd_run_user_scope_available()
@@ -1297,6 +1388,7 @@ class ProcessRegistry:
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
+            kanban_task_id=os.environ.get("HERMES_KANBAN_TASK", ""),
             session_key=session_key,
             cwd=cwd,
             started_at=time.time(),
@@ -1503,7 +1595,14 @@ class ProcessRegistry:
                 logger.debug("Process wait timed out or failed: %s", e)
             session.exited = True
             if session.completion_reason != "killed":
-                session.exit_code = session.process.returncode
+                durable_exit = self._read_durable_result(
+                    session.id, session.durable_result_path,
+                )
+                session.exit_code = (
+                    durable_exit
+                    if durable_exit is not None
+                    else session.process.returncode
+                )
                 session.completion_reason = "exited"
             self._move_to_finished(session)
 
@@ -1612,9 +1711,73 @@ class ProcessRegistry:
             logger.debug("PTY wait timed out or failed: %s", e)
         session.exited = True
         if session.completion_reason != "killed":
-            session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
+            durable_exit = self._read_durable_result(
+                session.id, session.durable_result_path,
+            )
+            session.exit_code = (
+                durable_exit
+                if durable_exit is not None
+                else pty.exitstatus if hasattr(pty, 'exitstatus') else -1
+            )
             session.completion_reason = "exited"
         self._move_to_finished(session)
+
+    def _settle_external_session(self, session: ProcessSession) -> bool:
+        """Attempt the one durable terminal CAS; retain ownership on failure."""
+        if not (session.external_run_owned and session.kanban_external_run_id
+                and session.kanban_external_owner):
+            return True
+        try:
+            from hermes_cli import kanban_db
+            with kanban_db.connect_closing(board=session.kanban_board) as conn:
+                run = kanban_db.get_external_run(conn, session.kanban_external_run_id)
+                if run is None or not run.owner:
+                    raise RuntimeError("durable external run or owner is unavailable")
+                # An operator may transfer the durable run while the local
+                # process is alive. The DB run is authoritative; retain its
+                # current owner in the session so a retry checkpoints B, not a
+                # stale transfer-time owner A.
+                session.kanban_external_owner = run.owner
+                outcome = (
+                    "completed" if session.exit_code == 0
+                    else "lost" if session.exit_code is None else "failed"
+                )
+                finished = kanban_db.finish_external_run(
+                    conn, session.kanban_external_run_id,
+                    owner=run.owner, outcome=outcome,
+                )
+                if not finished:
+                    observed = kanban_db.get_external_run(conn, session.kanban_external_run_id)
+                    if observed is None or observed.ended_at is None:
+                        raise RuntimeError("external run remains active after rejected settlement")
+            session.settlement_pending = False
+            return True
+        except Exception:
+            session.settlement_pending = True
+            logger.debug("external process settlement failed", exc_info=True)
+            return False
+
+    def _schedule_external_settlement_retry(self, session: ProcessSession) -> None:
+        """Retry a transient terminal DB failure in this live gateway once."""
+        with self._settlement_retry_lock:
+            if session.id in self._settlement_retry_sessions:
+                return
+            self._settlement_retry_sessions.add(session.id)
+
+        def _retry() -> None:
+            try:
+                for delay in (0.05, 0.1, 0.2, 0.4, 0.8):
+                    time.sleep(delay)
+                    if self._settle_external_session(session):
+                        self._move_to_finished(session)
+                        return
+            finally:
+                with self._settlement_retry_lock:
+                    self._settlement_retry_sessions.discard(session.id)
+
+        threading.Thread(
+            target=_retry, name=f"hermes-external-settle-{session.id}", daemon=True,
+        ).start()
 
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished.
@@ -1623,11 +1786,43 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        # Do not discard the only board/run/owner binding before its external
+        # terminal transition survives. The checkpoint retains this terminal
+        # record across transient database/open failures for startup retry.
+        if session.external_run_owned and not self._settle_external_session(session):
+            self._write_checkpoint()
+            self._schedule_external_settlement_retry(session)
+            return
+        # Publish removal of this terminal record before exposing ``finished``.
+        # A consumer may restart immediately after observing that state; it
+        # must not race the durable replacement and recover stale ownership.
+        self._write_checkpoint()
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
-        session._completion_event.set()
-        self._write_checkpoint()
+
+        # Only emit lifecycle signals on the FIRST move. Without this guard,
+        # kill_process() and the reader thread can both report the same exit.
+        if was_running:
+            try:
+                from tools.kanban_tools import record_background_process_event_from_env
+
+                state = (
+                    "killed" if session.completion_reason == "killed"
+                    else "lost" if session.completion_reason == "lost"
+                    else "completed"
+                )
+                record_background_process_event_from_env(
+                    state,
+                    session.id,
+                    session.command,
+                    exit_code=session.exit_code,
+                )
+            except Exception:
+                logger.debug(
+                    "kanban background-process completion bridge failed",
+                    exc_info=True,
+                )
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
@@ -1652,6 +1847,7 @@ class ProcessRegistry:
             }
             _redact_process_result(notification)
             self.completion_queue.put(notification)
+        session._completion_event.set()
 
     # ----- Query Methods -----
 
@@ -2589,6 +2785,8 @@ class ProcessRegistry:
                 "status": "exited" if s.exited else "running",
                 "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
             }
+            if s.kanban_task_id:
+                entry["kanban_task_id"] = s.kanban_task_id
             # Flag processes surfaced only because they share the gateway
             # session (not the current task) — these are the long-lived
             # background processes a user may have forgotten about (#29177).
@@ -2716,6 +2914,7 @@ class ProcessRegistry:
         exclude_ids: frozenset = frozenset(),
         source: str = "kill_all",
         consume_output: bool = False,
+        include_external_owned: bool = False,
     ) -> int:
         """Kill all running processes, optionally filtered by task_id. Returns count killed."""
         with self._lock:
@@ -2724,6 +2923,7 @@ class ProcessRegistry:
                 if (task_id is None or s.task_id == task_id)
                 and s.id not in exclude_ids
                 and not s.exited
+                and (include_external_owned or not s.external_run_owned)
             ]
 
         killed = 0
@@ -2736,6 +2936,104 @@ class ProcessRegistry:
             if result.get("status") in {"killed", "already_exited"}:
                 killed += 1
         return killed
+
+    def external_transfer_target(self, session_id: str, *, expected_session_task_id: Optional[str] = None) -> Optional[dict]:
+        """Return a live session's immutable transfer identity, or ``None``."""
+        with self._lock:
+            session = self._running.get(session_id)
+            if session is None or session.exited:
+                return None
+            if expected_session_task_id is not None and session.task_id != expected_session_task_id:
+                return None
+            if session.pid_scope != "host" or not session.pid:
+                return None
+            if session.host_start_time is None:
+                session.host_start_time = self._safe_host_start_time(session.pid)
+            if session.host_start_time is None:
+                return None
+            return {
+                "session_id": session.id,
+                "pid": session.pid,
+                "host_start_time": session.host_start_time,
+                "pid_scope": session.pid_scope,
+                # The DB must retain the canonical receipt path itself; a
+                # registry checkpoint is only a secondary recovery record.
+                "durable_result_path": str(self._durable_result_path(session.id)),
+            }
+
+    def transfer_to_external_run(self, session_id: str, *, task_id: str, run_id: int, board: str = "default", owner: str = "", expected_session_task_id: Optional[str] = None) -> bool:
+        """Transfer one live managed process to a durable Kanban external run.
+
+        This explicit operation is the only way a process escapes an
+        AIAgent.close() task sweep; ordinary children remain session-owned.
+        """
+        with self._lock:
+            session = self._running.get(session_id)
+            if session is None or session.exited:
+                return False
+            if expected_session_task_id is not None and session.task_id != expected_session_task_id:
+                return False
+            previous = (
+                session.kanban_task_id, session.kanban_external_run_id,
+                session.kanban_board, session.kanban_external_owner,
+                session.external_run_owned, session.settlement_pending,
+            )
+            # Persist pending settlement before the ownership checkpoint: if
+            # the child exits while that write races, it remains recoverable.
+            session.settlement_pending = True
+            session.kanban_task_id = str(task_id)
+            session.kanban_external_run_id = int(run_id)
+            session.kanban_board = str(board or "default")
+            session.kanban_external_owner = str(owner or "")
+            session.external_run_owned = True
+        checkpoint_ok, checkpoint_replaced = self._write_checkpoint_result()
+        if checkpoint_ok:
+            return True
+        # The DB handoff is not recoverable unless this session->board->run
+        # binding is already durable. Restore ownership atomically so the
+        # caller can compensate the external run through its normal CAS path.
+        with self._lock:
+            session.kanban_task_id, session.kanban_external_run_id, session.kanban_board, \
+                session.kanban_external_owner, session.external_run_owned, session.settlement_pending = previous
+        # A failed directory fsync happens after atomic_replace, so the first
+        # attempt may already have exposed the external snapshot. Publish the
+        # restored ownership as a compensating checkpoint before the caller
+        # rolls the DB handoff back to the agent run. Earlier-stage failures
+        # leave the previous safe checkpoint intact; this retry is harmless.
+        compensation_ok, _ = self._write_checkpoint_result()
+        if checkpoint_replaced and not compensation_ok:
+            # We cannot prove the external snapshot was durably replaced by
+            # the restored one. Keep live ownership aligned with the durable
+            # DB external claim and let its canonical receipt settle it; the
+            # caller must not roll that claim back or make the task runnable.
+            with self._lock:
+                session.kanban_task_id = str(task_id)
+                session.kanban_external_run_id = int(run_id)
+                session.kanban_board = str(board or "default")
+                session.kanban_external_owner = str(owner or "")
+                session.external_run_owned = True
+                session.settlement_pending = True
+            raise RuntimeError(
+                "failed to durably compensate external ownership checkpoint"
+            )
+        return False
+
+    def reconcile_external_completion(self, conn, session_id: str, *, owner: str) -> bool:
+        """Settle a finished transferred process through the DB's CAS endpoint."""
+        with self._lock:
+            session = self._finished.get(session_id) or self._running.get(session_id)
+            if not session or not session.external_run_owned or session.kanban_external_run_id is None:
+                return False
+            if not session.exited:
+                return False
+            run_id = session.kanban_external_run_id
+        from hermes_cli import kanban_db
+        outcome = (
+            "completed" if session.exit_code == 0
+            else "lost" if session.exit_code is None
+            else "failed"
+        )
+        return kanban_db.finish_external_run(conn, run_id, owner=owner, outcome=outcome)
 
     # ----- Cleanup / Pruning -----
 
@@ -2777,60 +3075,89 @@ class ProcessRegistry:
     def _write_checkpoint(
         self,
         extra_entries: Optional[List[Dict[str, Any]]] = None,
-    ):
-        """Write running process metadata to checkpoint file atomically."""
+    ) -> bool:
+        return self._write_checkpoint_result(extra_entries)[0]
+
+    def _write_checkpoint_result(
+        self,
+        extra_entries: Optional[List[Dict[str, Any]]] = None,
+    ) -> tuple[bool, bool]:
+        """Serialize snapshot, replacement, and fsync for crash recovery.
+
+        The registry lock protects live session state, while this separate lock
+        protects checkpoint order. Keeping them distinct prevents slow storage
+        from blocking ordinary registry operations without allowing an old
+        snapshot to overwrite a newer ownership transfer.
+        """
+        replaced = False
         try:
-            with self._lock:
-                entries = []
-                for s in self._running.values():
-                    if not s.exited:
-                        # Lazily backfill the kernel start time for host PIDs so
-                        # recovery after restart can detect PID recycling even
-                        # for sessions spawned before this field existed.
-                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
-                            s.host_start_time = self._safe_host_start_time(s.pid)
-                        entries.append({
-                            "session_id": s.id,
-                            # Redact inline credentials before persisting to
-                            # disk — the checkpoint file lives under
-                            # ~/.hermes/processes.json with the raw command
-                            # (issue #77484). Recovery only uses command for
-                            # display/logging (the process is already running;
-                            # adoption re-validates the PID, never re-runs the
-                            # command), so masking is lossless.
-                            "command": redact_sensitive_text(s.command, code_file=True),
-                            "pid": s.pid,
-                            "pid_scope": s.pid_scope,
-                            "host_start_time": s.host_start_time,
-                            "systemd_unit": s.systemd_unit,
-                            "cwd": s.cwd,
-                            "started_at": s.started_at,
-                            "task_id": s.task_id,
-                            "session_key": s.session_key,
-                            "watcher_platform": s.watcher_platform,
-                            "watcher_chat_id": s.watcher_chat_id,
-                            "watcher_user_id": s.watcher_user_id,
-                            "watcher_user_name": s.watcher_user_name,
-                            "watcher_thread_id": s.watcher_thread_id,
-                            "watcher_message_id": s.watcher_message_id,
-                            "watcher_interval": s.watcher_interval,
-                            "parent_session_id": s.parent_session_id,
-                            "notify_on_complete": s.notify_on_complete,
-                            "watch_patterns": s.watch_patterns,
-                        })
-                if extra_entries:
-                    tracked_ids = {item.get("session_id") for item in entries}
-                    entries.extend(
-                        item
-                        for item in extra_entries
-                        if item.get("session_id") not in tracked_ids
+            with self._checkpoint_write_lock:
+                with self._lock:
+                    entries = []
+                    for s in self._running.values():
+                        if not s.exited or s.settlement_pending:
+                            # Lazily backfill the kernel start time for host PIDs so
+                            # recovery after restart can detect PID recycling even
+                            # for sessions spawned before this field existed.
+                            if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+                                s.host_start_time = self._safe_host_start_time(s.pid)
+                            entries.append({
+                                "session_id": s.id,
+                                # Recovery only displays the command; it never reruns it.
+                                "command": redact_sensitive_text(s.command, code_file=True),
+                                "pid": s.pid,
+                                "exit_code": s.exit_code,
+                                "exited": s.exited,
+                                "pid_scope": s.pid_scope,
+                                "host_start_time": s.host_start_time,
+                                "durable_result_path": s.durable_result_path,
+                                "systemd_unit": s.systemd_unit,
+                                "cwd": s.cwd,
+                                "started_at": s.started_at,
+                                "task_id": s.task_id,
+                                "kanban_task_id": s.kanban_task_id,
+                                "kanban_external_run_id": s.kanban_external_run_id,
+                                "kanban_board": s.kanban_board,
+                                "kanban_external_owner": s.kanban_external_owner,
+                                "external_run_owned": s.external_run_owned,
+                                "settlement_pending": s.settlement_pending,
+                                "session_key": s.session_key,
+                                "watcher_platform": s.watcher_platform,
+                                "watcher_chat_id": s.watcher_chat_id,
+                                "watcher_user_id": s.watcher_user_id,
+                                "watcher_user_name": s.watcher_user_name,
+                                "watcher_thread_id": s.watcher_thread_id,
+                                "watcher_message_id": s.watcher_message_id,
+                                "watcher_interval": s.watcher_interval,
+                                "parent_session_id": s.parent_session_id,
+                                "notify_on_complete": s.notify_on_complete,
+                                "watch_patterns": s.watch_patterns,
+                            })
+                    if extra_entries:
+                        tracked_ids = {item.get("session_id") for item in entries}
+                        entries.extend(
+                            item for item in extra_entries
+                            if item.get("session_id") not in tracked_ids
+                        )
+
+                # Atomic write to avoid corruption on crash; directory fsync makes
+                # the replacement itself durable before a later snapshot can start.
+                from utils import atomic_json_write
+                atomic_json_write(CHECKPOINT_PATH, entries)
+                replaced = True
+                if os.name != "nt":
+                    directory_fd = os.open(
+                        CHECKPOINT_PATH.parent,
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
                     )
-            
-            # Atomic write to avoid corruption on crash
-            from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                return True, replaced
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+            return False, replaced
 
     def recover_from_checkpoint(self) -> int:
         """
@@ -2849,6 +3176,24 @@ class ProcessRegistry:
         recovered = 0
         unresolved_scope_entries: List[Dict[str, Any]] = []
         for entry in entries:
+            # A failed terminal settlement has no live process to recover, but
+            # its immutable board/run/owner tuple must be retried before the
+            # checkpoint can be discarded.
+            if (entry.get("settlement_pending") and entry.get("external_run_owned")
+                    and entry.get("exited")):
+                session = ProcessSession(
+                    id=entry["session_id"], command=entry.get("command", "unknown"),
+                    task_id=entry.get("task_id", ""), kanban_task_id=entry.get("kanban_task_id", ""),
+                    kanban_external_run_id=entry.get("kanban_external_run_id"),
+                    kanban_board=entry.get("kanban_board", "default"),
+                    kanban_external_owner=entry.get("kanban_external_owner", ""),
+                    external_run_owned=True, settlement_pending=True, exited=True,
+                    exit_code=entry.get("exit_code"),
+                    durable_result_path=entry.get("durable_result_path", ""),
+                )
+                if not self._settle_external_session(session):
+                    unresolved_scope_entries.append(entry)
+                continue
             pid = entry.get("pid")
             if not pid:
                 continue
@@ -2890,15 +3235,40 @@ class ProcessRegistry:
                         pid,
                     )
                     unresolved_scope_entries.append(entry)
+                elif entry.get("external_run_owned"):
+                    session = ProcessSession(
+                        id=entry["session_id"], command=entry.get("command", "unknown"),
+                        task_id=entry.get("task_id", ""),
+                        kanban_task_id=entry.get("kanban_task_id", ""),
+                        kanban_external_run_id=entry.get("kanban_external_run_id"),
+                        kanban_board=entry.get("kanban_board", "default"),
+                        kanban_external_owner=entry.get("kanban_external_owner", ""),
+                        external_run_owned=True, settlement_pending=True, exited=True,
+                        exit_code=self._read_durable_result(
+                            entry["session_id"], entry.get("durable_result_path", ""),
+                        ),
+                        durable_result_path=entry.get("durable_result_path", ""),
+                    )
+                    session.completion_reason = (
+                        "exited" if session.exit_code is not None else "lost"
+                    )
+                    if not self._settle_external_session(session):
+                        unresolved_scope_entries.append(entry)
                 continue
 
             session = ProcessSession(
                 id=entry["session_id"],
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
+                kanban_task_id=entry.get("kanban_task_id", ""),
+                kanban_external_run_id=entry.get("kanban_external_run_id"),
+                kanban_board=entry.get("kanban_board", "default"),
+                kanban_external_owner=entry.get("kanban_external_owner", ""),
+                external_run_owned=bool(entry.get("external_run_owned", False)),
                 session_key=entry.get("session_key", ""),
                 pid=pid,
                 host_start_time=recorded_start,
+                durable_result_path=entry.get("durable_result_path", ""),
                 pid_scope=pid_scope,
                 systemd_unit=entry.get("systemd_unit", ""),
                 cwd=entry.get("cwd"),
@@ -3252,14 +3622,15 @@ PROCESS_SCHEMA = {
         "poll: status + new output. log: full output, paged. wait: block "
         "until exit or timeout (partial output on timeout). write vs "
         "submit: submit appends Enter — use it to answer prompts; write "
-        "sends raw bytes, no newline. close: EOF stdin. kill: terminate."
+        "sends raw bytes, no newline. close: EOF stdin. kill: terminate. "
+        "transfer: dispatcher Kanban workers hand a live child to a durable external run."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close"]
+                "enum": ["list", "poll", "log", "wait", "kill", "write", "submit", "close", "transfer"]
             },
             "session_id": {
                 "type": "string",
@@ -3282,7 +3653,17 @@ PROCESS_SCHEMA = {
                 "type": "integer",
                 "description": "Max log lines.",
                 "minimum": 1
-            }
+            },
+            "external_id": {"type": "string", "description": "Stable external execution identifier for transfer."},
+            "owner": {"type": "string", "description": "External lifecycle owner for transfer."},
+            "phase": {"type": "string", "description": "Optional external progress phase."},
+            "current": {"type": "integer", "minimum": 0, "description": "Progress numerator; provide with total."},
+            "total": {"type": "integer", "minimum": 0, "description": "Progress denominator; provide with current."},
+            "log_ref": {"type": "string", "description": "Credential-safe log reference."},
+            "result_ref": {"type": "string", "description": "Credential-safe result reference."},
+            "max_retries": {"type": "integer", "minimum": 1, "description": "External failure retry limit."},
+            "on_success": {"type": "string", "enum": ["complete", "resume"], "description": "Task policy after successful exit."},
+            "on_failure": {"type": "string", "enum": ["retry", "block"], "description": "Task policy after failed exit."}
         },
         "required": ["action"]
     }
@@ -3320,6 +3701,72 @@ def _handle_process(args, **kw):
     # Coerce to string — some models send session_id as an integer
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
 
+    if action == "transfer":
+        if not session_id:
+            return tool_error("session_id is required for transfer")
+        try:
+            from agent.delegation_context import is_dispatcher_owned_worker_context
+            if not is_dispatcher_owned_worker_context():
+                return tool_error("process transfer is available only to a dispatcher-owned Kanban worker")
+            trusted_task_id = str(os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+            trusted_board = str(os.environ.get("HERMES_KANBAN_BOARD") or "default").strip() or "default"
+            trusted_claim = str(os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+            trusted_run_id = int(str(os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip())
+            if not trusted_task_id or not trusted_claim:
+                return tool_error("process transfer requires trusted dispatcher task, run, and claim context")
+        except (ImportError, ValueError):
+            return tool_error("process transfer requires trusted dispatcher task, run, and claim context")
+
+        live_process = process_registry.external_transfer_target(
+            session_id, expected_session_task_id=task_id,
+        )
+        if live_process is None:
+            return tool_error("process transfer refused: process is not a live session-owned child")
+        try:
+            from hermes_cli import kanban_db as kb
+            with kb.connect(board=trusted_board) as conn:
+                run = kb.handoff_agent_run_to_external(
+                    conn, trusted_task_id, expected_run_id=trusted_run_id,
+                    expected_claim_lock=trusted_claim, owner=str(args.get("owner") or ""),
+                    external_id=str(args.get("external_id") or ""), pid=live_process["pid"],
+                    managed_process_session_id=live_process["session_id"],
+                    durable_result_path=live_process["durable_result_path"],
+                    host_start_time=live_process.get("host_start_time"),
+                    phase=args.get("phase"), current=args.get("current"), total=args.get("total"),
+                    log_ref=args.get("log_ref"), result_ref=args.get("result_ref"),
+                    max_retries=args.get("max_retries"),
+                    on_success=str(args.get("on_success") or "complete"),
+                    on_failure=str(args.get("on_failure") or "block"),
+                )
+                if run is None:
+                    return tool_error("process transfer refused: current worker run ownership no longer matches")
+                if not process_registry.transfer_to_external_run(
+                    session_id, task_id=trusted_task_id, run_id=run.id, board=trusted_board,
+                    owner=run.owner or "", expected_session_task_id=task_id,
+                ):
+                    # Registry/checkpoint transfer failed, so the live worker
+                    # still owns the child. Restoring only the in-memory owner
+                    # while applying external retry policy would make a second
+                    # worker dispatchable beside it.
+                    if not kb.rollback_external_handoff_to_agent(
+                        conn,
+                        trusted_task_id,
+                        external_run_id=run.id,
+                        agent_run_id=trusted_run_id,
+                        external_owner=run.owner or "",
+                        expected_claim_lock=trusted_claim,
+                    ):
+                        raise RuntimeError(
+                            "external handoff rollback failed; durable claim left active"
+                        )
+                    return tool_error("process transfer failed: process is no longer a live session-owned child")
+        except (ValueError, RuntimeError) as exc:
+            return tool_error(f"process transfer refused: {exc}")
+        return json.dumps({
+            "status": "transferred", "session_id": session_id, "task_id": trusted_task_id,
+            "run_id": run.id, "board": trusted_board, "owner": run.owner,
+            "phase": run.phase, "current": run.progress_current, "total": run.progress_total,
+        }, ensure_ascii=False)
     if action == "list":
         # Surface session-scoped background processes (e.g. a forgotten
         # preview server) in addition to this task's own — they share the
@@ -3359,7 +3806,10 @@ def _handle_process(args, **kw):
             return json.dumps(process_registry.submit_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
         elif action == "close":
             return json.dumps(process_registry.close_stdin(session_id), ensure_ascii=False)
-    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close")
+    return tool_error(
+        f"Unknown process action: {action}. Use: list, poll, log, wait, kill, "
+        "write, submit, close, transfer"
+    )
 
 
 registry.register(

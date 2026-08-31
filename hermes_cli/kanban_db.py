@@ -71,7 +71,9 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import hashlib
+import io
 import json
 import os
 import re
@@ -89,7 +91,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from PIL import Image, UnidentifiedImageError
+
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.config import get_hermes_home
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -133,6 +138,97 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+VALID_OWNER_KINDS = {"agent", "external", "no_agent"}
+WAIT_AUTHORITIES = {
+    "dependency": "dispatcher", "capability": "human", "human": "human",
+    "external_process": "external", "timer": "scheduler", "review": "reviewer",
+}
+
+
+def validate_owner_kind(owner_kind: str, owner: Optional[str] = None) -> tuple[str, Optional[str]]:
+    """Validate the durable execution owner at the DB boundary.
+
+    ``no_agent`` is deliberately ownerless.  Agent and external executions
+    must name their immutable owner; accepting a blank owner would create a
+    run that no reconciler can safely resume or terminate.
+    """
+    kind = str(owner_kind or "").strip().lower()
+    if kind not in VALID_OWNER_KINDS:
+        raise ValueError("owner_kind must be one of agent, external, no_agent")
+    normalized = str(owner).strip() if owner is not None else None
+    if kind == "no_agent":
+        # A no-agent task may still carry an assignee as a human/external lane
+        # label; it is not an execution identity and stays non-dispatchable.
+        return kind, normalized
+    if not normalized:
+        raise ValueError(f"{kind} execution requires a non-empty owner")
+    return kind, normalized
+
+
+def _redact_durable_ref(value: Optional[str]) -> Optional[str]:
+    """Store references, never credentials, in durable Kanban state."""
+    if value is None:
+        return None
+    from agent.redact import redact_sensitive_text
+
+    text = redact_sensitive_text(str(value), force=True)
+    # Redactors intentionally avoid over-masking ordinary prose. Durable refs
+    # have a stricter contract: URL userinfo and bearer credentials are never
+    # useful after persistence, so erase them even when they are synthetic.
+    text = re.sub(r"(https?://)[^/@\s]+@", r"\1[REDACTED]@", text)
+    text = re.sub(r"\b(Bearer|Basic)\s+\S+", r"\1 [REDACTED]", text, flags=re.I)
+    return text[:1000]
+
+
+def _configured_coordinator_principal() -> Optional[str]:
+    """Return the single configured control-plane principal, if any."""
+    try:
+        from hermes_cli.config import load_config
+        kanban = (load_config() or {}).get("kanban") or {}
+    except Exception:
+        return None
+    principal = kanban.get("coordinator_profile") or kanban.get("orchestrator_profile")
+    return str(principal).strip() or None
+
+
+def _require_control_authority(authority: Optional[str] = None) -> str:
+    """Bind a control-plane write to the configured runtime coordinator.
+
+    Authority is derived from this process's ``HERMES_PROFILE``; an input
+    value is only a consistency assertion.  In particular, public callers
+    cannot authenticate by supplying a coordinator name (or the old literal
+    ``system`` escape hatch).
+    """
+    principal = _configured_coordinator_principal()
+    runtime = str(os.environ.get("HERMES_PROFILE") or "").strip()
+    supplied = str(authority or "").strip()
+    if not principal or runtime != principal:
+        raise ValueError("operation requires runtime HERMES_PROFILE to be the configured coordinator")
+    if supplied and supplied != runtime:
+        raise ValueError("authority assertion must equal runtime HERMES_PROFILE")
+    return runtime
+
+
+def _decode_image_evidence(payload: bytes) -> Optional[dict[str, Any]]:
+    """Return canonical image facts only after Pillow fully decodes stored bytes.
+
+    ``None`` is deliberately reserved for ordinary non-image blobs. A payload
+    claimed to be an image is rejected by the caller when this returns None.
+    """
+    try:
+        with Image.open(io.BytesIO(payload)) as image:
+            image.verify()
+        with Image.open(io.BytesIO(payload)) as image:
+            image.load()
+            image_format = str(image.format or "").upper()
+            mime = Image.MIME.get(image_format)
+            width, height = image.size
+    except (UnidentifiedImageError, OSError, ValueError, SyntaxError):
+        return None
+    if not mime or width <= 0 or height <= 0:
+        raise ValueError("decoded image has no canonical MIME or dimensions")
+    return {"content_type": mime.lower(), "dimensions": [width, height],
+            "decoder_metadata": {"format": image_format, "width": width, "height": height}}
 
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
@@ -1141,6 +1237,19 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    wait_kind: Optional[str] = None
+    wait_ref: Optional[str] = None
+    owner_kind: str = "no_agent"
+    # True only when the creator explicitly selected an ownership lane. This
+    # distinguishes an intentional no_agent card from a pre-routing legacy row.
+    owner_kind_explicit: bool = False
+    task_kind: str = "ordinary"
+    purpose: Optional[str] = None
+    created_by_task_id: Optional[str] = None
+    created_by_run_id: Optional[int] = None
+    creation_authority: Optional[str] = None
+    gate_candidate_sha: Optional[str] = None
+    gate_manifest_hash: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1235,6 +1344,20 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            wait_kind=(row["wait_kind"] if "wait_kind" in keys else None),
+            wait_ref=(row["wait_ref"] if "wait_ref" in keys else None),
+            owner_kind=(row["owner_kind"] if "owner_kind" in keys else "no_agent"),
+            owner_kind_explicit=(
+                bool(row["owner_kind_explicit"])
+                if "owner_kind_explicit" in keys else False
+            ),
+            task_kind=(row["task_kind"] if "task_kind" in keys else "ordinary"),
+            purpose=(row["purpose"] if "purpose" in keys else None),
+            created_by_task_id=(row["created_by_task_id"] if "created_by_task_id" in keys else None),
+            created_by_run_id=(row["created_by_run_id"] if "created_by_run_id" in keys else None),
+            creation_authority=(row["creation_authority"] if "creation_authority" in keys else None),
+            gate_candidate_sha=(row["gate_candidate_sha"] if "gate_candidate_sha" in keys else None),
+            gate_manifest_hash=(row["gate_manifest_hash"] if "gate_manifest_hash" in keys else None),
         )
 
 
@@ -1265,6 +1388,17 @@ class Run:
     summary: Optional[str]
     metadata: Optional[dict]
     error: Optional[str]
+    owner_kind: str = "agent"
+    owner: Optional[str] = None
+    external_id: Optional[str] = None
+    phase: Optional[str] = None
+    progress_current: Optional[int] = None
+    progress_total: Optional[int] = None
+    log_ref: Optional[str] = None
+    result_ref: Optional[str] = None
+    # Only trusted ProcessRegistry transfers may use host PID liveness.
+    pid_scope: str = "external"
+    host_start_time: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
@@ -1289,6 +1423,16 @@ class Run:
             summary=row["summary"],
             metadata=meta,
             error=row["error"],
+            owner_kind=(row["owner_kind"] if "owner_kind" in row.keys() else "agent"),
+            owner=(row["owner"] if "owner" in row.keys() else None),
+            external_id=(row["external_id"] if "external_id" in row.keys() else None),
+            phase=(row["phase"] if "phase" in row.keys() else None),
+            progress_current=(row["progress_current"] if "progress_current" in row.keys() else None),
+            progress_total=(row["progress_total"] if "progress_total" in row.keys() else None),
+            log_ref=(row["log_ref"] if "log_ref" in row.keys() else None),
+            result_ref=(row["result_ref"] if "result_ref" in row.keys() else None),
+            pid_scope=(row["pid_scope"] if "pid_scope" in row.keys() else "external"),
+            host_start_time=(row["host_start_time"] if "host_start_time" in row.keys() else None),
         )
 
 
@@ -1422,7 +1566,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- A typed durable wait has exactly one permitted resumer.
+    wait_kind            TEXT,
+    wait_ref             TEXT,
+    owner_kind           TEXT NOT NULL DEFAULT 'no_agent',
+    owner_kind_explicit  INTEGER NOT NULL DEFAULT 0,
+    task_kind            TEXT NOT NULL DEFAULT 'ordinary',
+    purpose              TEXT,
+    created_by_task_id   TEXT,
+    created_by_run_id    INTEGER,
+    creation_authority   TEXT,
+    gate_candidate_sha   TEXT,
+    gate_manifest_hash   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1474,7 +1630,89 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Durable owner identity. External runs are intentionally independent of
+    -- an AIAgent process and survive its close/restart.
+    owner_kind          TEXT NOT NULL DEFAULT 'agent',
+    owner               TEXT,
+    external_id         TEXT,
+    phase               TEXT,
+    progress_current    INTEGER,
+    progress_total      INTEGER,
+    log_ref             TEXT,
+    result_ref          TEXT,
+    pid_scope           TEXT NOT NULL DEFAULT 'external',
+    host_start_time     INTEGER,
+    -- Durable identity of a ProcessRegistry child handed into this external
+    -- lane. These trusted values bridge the crash window before its registry
+    -- checkpoint reaches disk.
+    managed_process_session_id TEXT,
+    durable_result_path TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_candidates (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    sha TEXT NOT NULL,
+    implementer TEXT NOT NULL DEFAULT '',
+    source_kind TEXT NOT NULL DEFAULT 'legacy',
+    source_provenance_json TEXT,
+    source_hash TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (task_id, sha)
+);
+
+CREATE TABLE IF NOT EXISTS task_gate_verdicts (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    gate TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    authority TEXT NOT NULL,
+    gate_run_id INTEGER,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (task_id, gate)
+);
+
+-- Immutable audit receipt for a reviewed evidence set.  Evidence must not be
+-- silently rewritten after a gate authority has rendered its verdict.
+CREATE TABLE IF NOT EXISTS task_evidence_receipts (
+    task_id       TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    sha            TEXT NOT NULL,
+    manifest_json  TEXT NOT NULL,
+    manifest_hash  TEXT NOT NULL,
+    verdict        TEXT NOT NULL,
+    authority      TEXT NOT NULL,
+    created_at     INTEGER NOT NULL
+);
+
+-- CAS release barriers turn a once-only orchestration transition into a
+-- durable readback receipt, including under competing dispatcher processes.
+CREATE TABLE IF NOT EXISTS task_release_barriers (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    barrier TEXT NOT NULL DEFAULT 'publish',
+    sha TEXT NOT NULL, manifest_hash TEXT NOT NULL, required_gates_json TEXT NOT NULL,
+    authority TEXT NOT NULL, lease_owner TEXT, lease_expires_at INTEGER,
+    target_identity TEXT, delivery_idempotency_key TEXT, delivered_sha TEXT, readback_sha TEXT, completed_at INTEGER,
+    PRIMARY KEY (task_id, barrier)
+);
+
+CREATE TABLE IF NOT EXISTS task_release_receipts (
+    task_id       TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    barrier       TEXT NOT NULL,
+    authority     TEXT NOT NULL,
+    released_at   INTEGER NOT NULL,
+    PRIMARY KEY (task_id, barrier)
+);
+
+-- Explicit, immutable authority receipts for waits that are not backed by a
+-- task run or gate verdict. A plain authority string is never a receipt.
+CREATE TABLE IF NOT EXISTS task_wait_receipts (
+    kind        TEXT NOT NULL,
+    ref         TEXT NOT NULL,
+    authority   TEXT NOT NULL,
+    verdict     TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (kind, ref, authority)
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2689,6 +2927,91 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "wait_kind" not in cols:
+        _add_column_if_missing(conn, "tasks", "wait_kind", "wait_kind TEXT")
+    if "wait_ref" not in cols:
+        _add_column_if_missing(conn, "tasks", "wait_ref", "wait_ref TEXT")
+    # Ownership provenance did not exist on legacy boards. Infer executable
+    # agent intent from a named assignee for every legacy lifecycle state,
+    # including terminal states: an operator can later reopen named completed
+    # or archived work and it must remain dispatchable. Do not consult today's
+    # installed profiles here: profile admission belongs to the future dispatch
+    # mutation boundary, which prevents migration from inventing a profile.
+    if "owner_kind" not in cols:
+        added_owner_kind = _add_column_if_missing(
+            conn, "tasks", "owner_kind", "owner_kind TEXT NOT NULL DEFAULT 'no_agent'"
+        )
+        # Pared-down ancient task tables can lack all three legacy facts used
+        # by the inference. Never manufacture those facts just to backfill an
+        # ownership lane: leave such rows at the safe no_agent default.
+        owner_backfill_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+        if added_owner_kind and {"assignee", "status", "current_run_id"} <= owner_backfill_cols:
+            conn.execute(
+                """
+                UPDATE tasks SET owner_kind = 'agent'
+                 WHERE NULLIF(TRIM(assignee), '') IS NOT NULL
+                   AND status IN ('todo', 'scheduled', 'ready', 'running', 'blocked', 'review', 'triage', 'done', 'archived')
+                """
+            )
+    # Existing rows predate an explicit ownership choice. Keep the additive
+    # default false even where owner_kind above was inferred from legacy facts.
+    if "owner_kind_explicit" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "owner_kind_explicit",
+            "owner_kind_explicit INTEGER NOT NULL DEFAULT 0",
+        )
+    for name, declaration in (
+        ("task_kind", "task_kind TEXT NOT NULL DEFAULT 'ordinary'"),
+        ("purpose", "purpose TEXT"), ("created_by_task_id", "created_by_task_id TEXT"),
+        ("created_by_run_id", "created_by_run_id INTEGER"),
+        ("creation_authority", "creation_authority TEXT"),
+        ("gate_candidate_sha", "gate_candidate_sha TEXT"),
+        ("gate_manifest_hash", "gate_manifest_hash TEXT"),
+    ):
+        if name not in cols:
+            _add_column_if_missing(conn, "tasks", name, declaration)
+
+    candidate_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_candidates'"
+    ).fetchone() is not None
+    if candidate_table_exists:
+        candidate_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_candidates)")
+        }
+        for name, declaration in (
+            ("implementer", "implementer TEXT NOT NULL DEFAULT ''"),
+            ("source_kind", "source_kind TEXT NOT NULL DEFAULT 'legacy'"),
+            ("source_provenance_json", "source_provenance_json TEXT"),
+            ("source_hash", "source_hash TEXT"),
+        ):
+            if name not in candidate_cols:
+                _add_column_if_missing(conn, "task_candidates", name, declaration)
+
+    verdict_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_gate_verdicts'"
+    ).fetchone() is not None
+    if verdict_table_exists:
+        verdict_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_gate_verdicts)")
+        }
+        if "gate_run_id" not in verdict_cols:
+            _add_column_if_missing(
+                conn, "task_gate_verdicts", "gate_run_id", "gate_run_id INTEGER"
+            )
+
+    barrier_table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_release_barriers'"
+    ).fetchone() is not None
+    if barrier_table_exists:
+        barrier_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_release_barriers)")
+        }
+        if "delivery_idempotency_key" not in barrier_cols:
+            _add_column_if_missing(
+                conn, "task_release_barriers", "delivery_idempotency_key", "delivery_idempotency_key TEXT"
+            )
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -2786,6 +3109,23 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        for name, declaration in (
+            ("owner_kind", "owner_kind TEXT NOT NULL DEFAULT 'agent'"),
+            ("owner", "owner TEXT"),
+            ("external_id", "external_id TEXT"),
+            ("phase", "phase TEXT"),
+            ("progress_current", "progress_current INTEGER"),
+            ("progress_total", "progress_total INTEGER"),
+            ("log_ref", "log_ref TEXT"),
+            ("result_ref", "result_ref TEXT"),
+            ("pid_scope", "pid_scope TEXT NOT NULL DEFAULT 'external'"),
+            ("host_start_time", "host_start_time INTEGER"),
+            ("managed_process_session_id", "managed_process_session_id TEXT"),
+            ("durable_result_path", "durable_result_path TEXT"),
+        ):
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, declaration)
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
@@ -2887,7 +3227,11 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, owner_kind TEXT NOT NULL DEFAULT 'agent', owner TEXT,"
+        " external_id TEXT, phase TEXT, progress_current INTEGER,"
+        " progress_total INTEGER, log_ref TEXT, result_ref TEXT,"
+        " pid_scope TEXT NOT NULL DEFAULT 'external', host_start_time INTEGER,"
+        " managed_process_session_id TEXT, durable_result_path TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -2949,6 +3293,12 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
         for table in drifted:
             create_sql, index_sqls = _REBUILD_SPECS[table]
             old_cols = [c["name"] for c in conn.execute(f"PRAGMA table_info({table})")]
+            if table == "task_runs":
+                conn.execute("CREATE TEMP TABLE _task_runs_id_map (old_id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL)")
+                conn.execute(
+                    "INSERT INTO _task_runs_id_map (old_id, ordinal) "
+                    "SELECT CAST(id AS TEXT), ROW_NUMBER() OVER (ORDER BY rowid) FROM task_runs"
+                )
             _log.info("kanban migration: rebuilding %s to match current schema", table)
             conn.execute(f"ALTER TABLE {table} RENAME TO {table}_legacy")
             conn.execute(create_sql)
@@ -2968,8 +3318,27 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
                 cols_csv = ", ".join(shared)
                 conn.execute(
                     f"INSERT INTO {table} ({cols_csv}) "
-                    f"SELECT {cols_csv} FROM {table}_legacy"
+                    f"SELECT {cols_csv} FROM {table}_legacy ORDER BY rowid"
                 )
+            if table == "task_runs":
+                # Remap every durable provenance reference.  Keep NULL and
+                # unmapped legacy values intact: only identifiers that appear
+                # in the authoritative old→new map may change.
+                for ref_table, column in (
+                    ("tasks", "current_run_id"),
+                    ("tasks", "created_by_run_id"),
+                    ("task_events", "run_id"),
+                    ("task_gate_verdicts", "gate_run_id"),
+                ):
+                    if any(c["name"] == column for c in conn.execute(f"PRAGMA table_info({ref_table})")):
+                        conn.execute(
+                            f"UPDATE {ref_table} SET {column}=(SELECT r.id FROM task_runs r "
+                            f"JOIN _task_runs_id_map m ON m.ordinal=r.id "
+                            f"WHERE m.old_id=CAST({ref_table}.{column} AS TEXT)) "
+                            f"WHERE {column} IS NOT NULL AND CAST({column} AS TEXT) IN "
+                            f"(SELECT old_id FROM _task_runs_id_map)"
+                        )
+                conn.execute("DROP TABLE _task_runs_id_map")
             conn.execute(f"DROP TABLE {table}_legacy")
             for index_sql in index_sqls:
                 conn.execute(index_sql)
@@ -3194,6 +3563,14 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    owner_kind: Optional[str] = None,
+    task_kind: str = "ordinary",
+    purpose: Optional[str] = None,
+    created_by_task_id: Optional[str] = None,
+    created_by_run_id: Optional[int] = None,
+    creation_authority: Optional[str] = None,
+    gate_candidate_sha: Optional[str] = None,
+    gate_manifest_hash: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3240,6 +3617,48 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    # Preserve the established direct-DB API: an assigned task is an agent
+    # task unless its creator explicitly selects a non-agent execution lane.
+    # Unassigned cards remain deliberately non-dispatchable.
+    explicit_owner_kind = owner_kind is not None
+    if owner_kind is None:
+        owner_kind = "agent" if assignee else "no_agent"
+    owner_kind, _ = validate_owner_kind(owner_kind, assignee)
+    # Every agent-owned task is dispatcher-executable, including the legacy
+    # owner_kind-omitted shape inferred above. Admit it only when its resolved
+    # assignee is an installed profile; explicit external/no_agent lanes remain
+    # the deliberate opt-in for non-profile owners.
+    if owner_kind == "agent":
+        from hermes_cli.profiles import profile_exists
+        if not profile_exists(assignee or ""):
+            raise ValueError("agent owner assignee must be an installed profile")
+    if not str(task_kind or "").strip():
+        raise ValueError("task_kind is required")
+    task_kind = str(task_kind).strip().lower()
+    if task_kind in {"reviewer", "visualqa", "release"}:
+        # Gate creation is control-plane authority, never an implementation
+        # worker convenience.  The supplied value is merely an assertion.
+        creation_authority = _require_control_authority(creation_authority)
+    if task_kind in {"reviewer", "visualqa"}:
+        gate_candidate_sha = str(gate_candidate_sha or "").strip().lower()
+        gate_manifest_hash = str(gate_manifest_hash or "").strip().lower()
+        if owner_kind != "agent":
+            raise ValueError("mandatory gate owner_kind must be agent")
+        if not created_by_task_id:
+            raise ValueError("mandatory gate requires created_by_task_id source")
+        if not re.fullmatch(r"[0-9a-f]{40}", gate_candidate_sha) or not re.fullmatch(r"[0-9a-f]{64}", gate_manifest_hash):
+            raise ValueError("mandatory gate requires exact candidate SHA and manifest hash")
+        source = get_task(conn, str(created_by_task_id))
+        receipt = get_frozen_evidence_manifest(conn, str(created_by_task_id))
+        candidate = get_candidate(conn, str(created_by_task_id), sha=gate_candidate_sha)
+        if source is None or receipt is None or receipt["verdict"] != "pass" or candidate is None or receipt["sha"] != gate_candidate_sha or receipt["manifest_hash"] != gate_manifest_hash:
+            raise ValueError("mandatory gate source candidate and passing frozen manifest must match")
+        if not candidate["implementer"] or assignee == candidate["implementer"]:
+            raise ValueError("mandatory gate assignee must differ from frozen source implementer")
+    elif gate_candidate_sha is not None or gate_manifest_hash is not None:
+        raise ValueError("gate bindings are only valid for reviewer or visualqa tasks")
+    if not str(creation_authority or "").strip():
+        creation_authority = created_by or "legacy"
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -3508,8 +3927,10 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, owner_kind, owner_kind_explicit, task_kind,
+                        purpose, created_by_task_id, created_by_run_id, creation_authority,
+                        gate_candidate_sha, gate_manifest_hash
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3535,6 +3956,9 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        owner_kind, 1 if explicit_owner_kind else 0, task_kind, purpose,
+                        created_by_task_id, created_by_run_id, creation_authority,
+                        gate_candidate_sha, gate_manifest_hash,
                     ),
                 )
                 for pid in parents:
@@ -3710,39 +4134,77 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
-    """Assign or reassign a task.  Returns True on success.
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    owner_kind: Optional[str] = None,
+    activate_agent: bool = False,
+) -> bool:
+    """Assign, unassign, or explicitly reactivate an implicit agent lane.
 
-    Refuses to reassign a task that's currently running (claim_lock set).
-    Reassign after the current run completes if needed.
+    Public unassignment is safe: an agent card becomes ``no_agent`` in the
+    same transaction, retaining whether its ownership was explicit.  The only
+    reverse transition is a trusted, explicit ``activate_agent`` routing action
+    for a previously implicit, unassigned manual lane.
     """
-    profile = _canonical_assignee(profile)
+    profile = None if profile is None or not str(profile).strip() else _canonical_assignee(profile)
+    changed_fields = ["assignee"]
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, owner_kind, owner_kind_explicit "
+            "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if not row:
             return False
+        persisted_kind = row["owner_kind"]
+        explicit = bool(row["owner_kind_explicit"])
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
-        if row["assignee"] != profile:
+
+        if not profile:
+            if owner_kind is not None and owner_kind != persisted_kind:
+                raise ValueError("owner_kind is immutable after task creation")
+            if persisted_kind == "external":
+                raise ValueError("external owner assignee cannot be unassigned")
+            effective_kind = "no_agent" if persisted_kind == "agent" else persisted_kind
+        else:
+            effective_kind = persisted_kind
+            if persisted_kind == "no_agent" and activate_agent:
+                if explicit or row["assignee"] is not None:
+                    raise ValueError("only an intentionally unassigned implicit lane may activate an agent")
+                effective_kind = "agent"
+            if owner_kind is not None:
+                requested, _ = validate_owner_kind(owner_kind, profile)
+                if requested != effective_kind:
+                    raise ValueError("owner_kind is immutable after task creation")
+            if effective_kind == "agent":
+                from hermes_cli.profiles import profile_exists
+                if not profile_exists(profile):
+                    raise ValueError("agent owner assignee must be an installed profile")
+
+        if effective_kind != persisted_kind:
+            changed_fields.append("owner_kind")
+        if row["assignee"] != profile or effective_kind != persisted_kind:
             # The retry guard is scoped to the task/profile combination. A
             # human reassigning the task is an explicit recovery action, so the
             # new profile should not inherit the previous profile's streak.
             conn.execute(
-                "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?",
-                (profile, task_id),
+                "UPDATE tasks SET assignee=?, owner_kind=?, consecutive_failures=0, "
+                "last_failure_error=NULL WHERE id=?",
+                (profile, effective_kind, task_id),
             )
         else:
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        _append_event(conn, task_id, "assigned", {"assignee": profile})
-    # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
-    # has committed so subscribers always observe durable board state.
-    notify_task_updated(conn, task_id, ("assignee",))
+            conn.execute("UPDATE tasks SET assignee=? WHERE id=?", (profile, task_id))
+        _append_event(
+            conn, task_id, "assigned",
+            {"assignee": profile, "owner_kind": effective_kind},
+        )
+    notify_task_updated(conn, task_id, tuple(changed_fields))
     return True
 
 
@@ -4555,11 +5017,15 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, wait_kind "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
+            # Typed waits have their own exact reconciliation contract; the
+            # legacy parent promotion path must never bypass it.
+            if row["wait_kind"]:
+                continue
             cur_status = row["status"]
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for explicit human intervention — do not
@@ -4614,6 +5080,1285 @@ def recompute_ready(
 # Claim / complete / block
 # ---------------------------------------------------------------------------
 
+def handoff_agent_run_to_external(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: int,
+    expected_claim_lock: str,
+    owner: str,
+    external_id: str,
+    pid: Optional[int] = None,
+    managed_process_session_id: Optional[str] = None,
+    durable_result_path: Optional[str] = None,
+    host_start_time: Optional[int] = None,
+    phase: Optional[str] = None,
+    current: Optional[int] = None,
+    total: Optional[int] = None,
+    log_ref: Optional[str] = None,
+    result_ref: Optional[str] = None,
+    max_retries: Optional[int] = None,
+    on_success: str = "complete",
+    on_failure: str = "block",
+) -> Optional[Run]:
+    """CAS-transfer one live dispatcher worker run to a durable external run.
+
+    The caller supplies only values independently bound to the worker's trusted
+    dispatcher context.  Any stale task/run/claim ownership fails closed, so a
+    worker cannot replace another worker's current run.
+    """
+    _, owner = validate_owner_kind("external", owner)
+    ext = str(external_id or "").strip()
+    if not ext:
+        raise ValueError("external_id is required")
+    if (current is None) != (total is None):
+        raise ValueError("progress current and total must be provided together")
+    if total is not None and (int(total) < 0 or int(current) < 0 or int(current) > int(total)):
+        raise ValueError("progress must satisfy 0 <= current <= total")
+    if max_retries is not None and int(max_retries) < 1:
+        raise ValueError("max_retries must be >= 1")
+    if on_success not in {"complete", "resume"} or on_failure not in {"retry", "block"}:
+        raise ValueError("external policies must be complete/resume and retry/block")
+    expected_claim_lock = str(expected_claim_lock or "")
+    if not expected_claim_lock:
+        raise ValueError("expected claim ownership is required")
+    session_id = str(managed_process_session_id or "").strip() or None
+    receipt_path = str(durable_result_path or "").strip() or None
+    if (session_id is None) != (receipt_path is None):
+        raise ValueError("managed process session and durable receipt must be provided together")
+    if session_id is not None:
+        assert receipt_path is not None
+        expected_receipt = (get_hermes_home() / "process-results" / f"{session_id}.json").resolve()
+        try:
+            if Path(receipt_path).resolve() != expected_receipt:
+                raise ValueError("durable receipt path must be canonical for managed process session")
+        except OSError as exc:
+            raise ValueError("durable receipt path is invalid") from exc
+    now = int(time.time())
+    lock = f"external:{ext}"
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT id FROM tasks WHERE id=? AND status='running' AND current_run_id=? AND claim_lock=? AND owner_kind='agent'",
+            (task_id, int(expected_run_id), expected_claim_lock),
+        ).fetchone()
+        if task is None:
+            return None
+        active = conn.execute(
+            "SELECT id, profile, claim_expires, worker_pid, last_heartbeat_at "
+            "FROM task_runs WHERE id=? AND task_id=? AND ended_at IS NULL "
+            "AND owner_kind != 'external' AND claim_lock=?",
+            (int(expected_run_id), task_id, expected_claim_lock),
+        ).fetchone()
+        if active is None:
+            return None
+        changed = conn.execute(
+            "UPDATE task_runs SET status='external_handoff', outcome='external_handoff', "
+            "ended_at=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+            "WHERE id=? AND ended_at IS NULL",
+            (now, int(expected_run_id)),
+        )
+        if changed.rowcount != 1:
+            return None
+        cur = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, worker_pid, "
+            "last_heartbeat_at, started_at, owner_kind, owner, external_id, phase, "
+            "progress_current, progress_total, log_ref, result_ref, pid_scope, host_start_time, "
+            "managed_process_session_id, durable_result_path, metadata) "
+            "VALUES (?, ?, 'running', ?, ?, ?, ?, 'external', ?, ?, ?, ?, ?, ?, ?, 'host', ?, ?, ?, ?)",
+            (task_id, owner, lock, pid, now, now, owner, ext, phase, current, total,
+             _redact_durable_ref(log_ref), _redact_durable_ref(result_ref), host_start_time,
+             session_id, receipt_path,
+             json.dumps({
+                 "max_retries": max_retries,
+                 "on_success": on_success,
+                 "on_failure": on_failure,
+                 "agent_handoff": {
+                     "run_id": int(expected_run_id),
+                     "profile": active["profile"],
+                     "claim_lock": expected_claim_lock,
+                     "claim_expires": active["claim_expires"],
+                     "worker_pid": active["worker_pid"],
+                     "last_heartbeat_at": active["last_heartbeat_at"],
+                 },
+             })),
+        )
+        run_id = int(cur.lastrowid)
+        changed = conn.execute(
+            "UPDATE tasks SET claim_lock=?, claim_expires=NULL, worker_pid=?, "
+            "last_heartbeat_at=?, current_run_id=? WHERE id=? AND status='running' "
+            "AND current_run_id=? AND claim_lock=?",
+            (lock, pid, now, run_id, task_id, int(expected_run_id), expected_claim_lock),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError("agent run no longer owns its task")
+        _append_event(conn, task_id, "external_handoff", {
+            "agent_run_id": int(expected_run_id), "run_id": run_id, "external_id": ext,
+        }, run_id=run_id)
+        row = conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+    return Run.from_row(row)
+
+
+def rollback_external_handoff_to_agent(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    external_run_id: int,
+    agent_run_id: int,
+    external_owner: str,
+    expected_claim_lock: str,
+) -> bool:
+    """Restore the live agent claim when registry checkpoint transfer fails."""
+    _, owner = validate_owner_kind("external", external_owner)
+    now = int(time.time())
+    with write_txn(conn):
+        external = conn.execute(
+            "SELECT metadata, claim_lock FROM task_runs WHERE id=? AND task_id=? "
+            "AND owner_kind='external' AND owner=? AND ended_at IS NULL",
+            (int(external_run_id), task_id, owner),
+        ).fetchone()
+        if external is None:
+            return False
+        task = conn.execute(
+            "SELECT id FROM tasks WHERE id=? AND status='running' AND current_run_id=? "
+            "AND claim_lock=?",
+            (task_id, int(external_run_id), external["claim_lock"]),
+        ).fetchone()
+        if task is None:
+            return False
+        metadata = json.loads(external["metadata"] or "{}")
+        handoff = metadata.get("agent_handoff") or {}
+        if (
+            int(handoff.get("run_id") or 0) != int(agent_run_id)
+            or str(handoff.get("claim_lock") or "") != str(expected_claim_lock)
+        ):
+            return False
+        heartbeat = handoff.get("last_heartbeat_at") or now
+        restored = conn.execute(
+            "UPDATE task_runs SET status='running', outcome=NULL, ended_at=NULL, "
+            "claim_lock=?, claim_expires=?, worker_pid=?, last_heartbeat_at=? "
+            "WHERE id=? AND task_id=? AND owner_kind!='external'",
+            (
+                expected_claim_lock,
+                handoff.get("claim_expires"),
+                handoff.get("worker_pid"),
+                heartbeat,
+                int(agent_run_id),
+                task_id,
+            ),
+        )
+        if restored.rowcount != 1:
+            raise RuntimeError("agent handoff run is unavailable for rollback")
+        ended = conn.execute(
+            "UPDATE task_runs SET status='handoff_rolled_back', "
+            "outcome='handoff_rolled_back', ended_at=?, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=? AND ended_at IS NULL",
+            (now, int(external_run_id)),
+        )
+        if ended.rowcount != 1:
+            raise RuntimeError("external handoff no longer owns rollback")
+        changed = conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
+            "worker_pid=?, last_heartbeat_at=?, current_run_id=? "
+            "WHERE id=? AND current_run_id=?",
+            (
+                expected_claim_lock,
+                handoff.get("claim_expires"),
+                handoff.get("worker_pid"),
+                heartbeat,
+                int(agent_run_id),
+                task_id,
+                int(external_run_id),
+            ),
+        )
+        if changed.rowcount != 1:
+            raise RuntimeError("external handoff task is unavailable for rollback")
+        _append_event(
+            conn,
+            task_id,
+            "external_handoff_rolled_back",
+            {"external_run_id": int(external_run_id), "agent_run_id": int(agent_run_id)},
+            run_id=int(agent_run_id),
+        )
+    return True
+
+
+def start_external_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    owner: str,
+    external_id: str,
+    pid: Optional[int] = None,
+    phase: Optional[str] = None,
+    current: Optional[int] = None,
+    total: Optional[int] = None,
+    log_ref: Optional[str] = None,
+    result_ref: Optional[str] = None,
+    max_retries: Optional[int] = None,
+    on_success: str = "complete",
+    on_failure: str = "block",
+) -> Run:
+    """Durably claim a task for an independently managed external execution.
+
+    This is deliberately DB-owned, rather than a ProcessRegistry annotation:
+    the external identity is stable through registry restarts and no AIAgent
+    close path owns or kills the external process.
+    """
+    _, owner = validate_owner_kind("external", owner)
+    ext = str(external_id or "").strip()
+    if not ext:
+        raise ValueError("external_id is required")
+    if (current is None) != (total is None):
+        raise ValueError("progress current and total must be provided together")
+    if total is not None and (int(total) < 0 or int(current) < 0 or int(current) > int(total)):
+        raise ValueError("progress must satisfy 0 <= current <= total")
+    if max_retries is not None and int(max_retries) < 1:
+        raise ValueError("max_retries must be >= 1")
+    if on_success not in {"complete", "resume"} or on_failure not in {"retry", "block"}:
+        raise ValueError("external policies must be complete/resume and retry/block")
+    now = int(time.time())
+    lock = f"external:{ext}"
+    with write_txn(conn):
+        duplicate = conn.execute(
+            "SELECT * FROM task_runs WHERE task_id = ? AND external_id = ?",
+            (task_id, ext),
+        ).fetchone()
+        if duplicate is not None:
+            return Run.from_row(duplicate)
+        changed = conn.execute(
+            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=NULL, "
+            "worker_pid=?, last_heartbeat_at=? WHERE id=? AND status='ready' AND claim_lock IS NULL "
+            "AND owner_kind='external' AND assignee=?",
+            (lock, pid, now, task_id, owner),
+        )
+        if changed.rowcount != 1:
+            raise ValueError("external run requires an unclaimed ready task")
+        cur = conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, claim_lock, worker_pid, "
+            "last_heartbeat_at, started_at, owner_kind, owner, external_id, phase, "
+            "progress_current, progress_total, log_ref, result_ref, metadata) "
+            "VALUES (?, ?, 'running', ?, ?, ?, ?, 'external', ?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, owner, lock, pid, now, now, owner, ext, phase, current, total,
+             _redact_durable_ref(log_ref), _redact_durable_ref(result_ref),
+             json.dumps({"max_retries": max_retries, "on_success": on_success, "on_failure": on_failure})),
+        )
+        run_id = int(cur.lastrowid)
+        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id))
+        _append_event(conn, task_id, "external_started", {"run_id": run_id, "external_id": ext}, run_id=run_id)
+        row = conn.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+    return Run.from_row(row)
+
+
+def get_external_run(conn: sqlite3.Connection, run_id: int) -> Optional[Run]:
+    row = conn.execute(
+        "SELECT * FROM task_runs WHERE id = ? AND owner_kind = 'external'", (int(run_id),)
+    ).fetchone()
+    return Run.from_row(row) if row else None
+
+
+def transfer_external_run_owner(
+    conn: sqlite3.Connection, run_id: int, *, from_owner: str, to_owner: str,
+) -> bool:
+    """Atomically move a live external run to another durable lane owner."""
+    _, from_owner = validate_owner_kind("external", from_owner)
+    _, to_owner = validate_owner_kind("external", to_owner)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT task_id FROM task_runs WHERE id=? AND owner_kind='external' "
+            "AND owner=? AND ended_at IS NULL", (int(run_id), from_owner),
+        ).fetchone()
+        if row is None:
+            return False
+        changed = conn.execute(
+            "UPDATE task_runs SET owner=? WHERE id=? AND owner_kind='external' "
+            "AND owner=? AND ended_at IS NULL", (to_owner, int(run_id), from_owner),
+        )
+        if changed.rowcount != 1:
+            return False
+        _append_event(conn, row["task_id"], "external_owner_transferred", {
+            "from_owner": from_owner, "to_owner": to_owner,
+        }, run_id=int(run_id))
+    return True
+
+
+def heartbeat_external_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    owner: str,
+    phase: Optional[str] = None,
+    current: Optional[int] = None,
+    total: Optional[int] = None,
+    log_ref: Optional[str] = None,
+    result_ref: Optional[str] = None,
+) -> bool:
+    """CAS heartbeat for the named external owner; never revives a terminal run."""
+    _, owner = validate_owner_kind("external", owner)
+    if (current is None) != (total is None):
+        raise ValueError("progress current and total must be provided together")
+    if total is not None and (int(total) < 0 or int(current) < 0 or int(current) > int(total)):
+        raise ValueError("progress must satisfy 0 <= current <= total")
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute("SELECT task_id FROM task_runs WHERE id=? AND owner_kind='external' AND owner=? AND ended_at IS NULL", (int(run_id), owner)).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "UPDATE task_runs SET last_heartbeat_at=?, phase=COALESCE(?, phase), "
+            "progress_current=COALESCE(?, progress_current), progress_total=COALESCE(?, progress_total), "
+            "log_ref=COALESCE(?, log_ref), result_ref=COALESCE(?, result_ref) WHERE id=?",
+            (now, phase, current, total, _redact_durable_ref(log_ref), _redact_durable_ref(result_ref), int(run_id)),
+        )
+        conn.execute("UPDATE tasks SET last_heartbeat_at=? WHERE id=? AND current_run_id=?", (now, row["task_id"], int(run_id)))
+        _append_event(conn, row["task_id"], "external_heartbeat", {"phase": phase, "current": current, "total": total}, run_id=int(run_id))
+    return True
+
+
+def finish_external_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    owner: str,
+    outcome: str,
+    result_ref: Optional[str] = None,
+) -> bool:
+    """Finalize an external run exactly once and atomically settle its task."""
+    _, owner = validate_owner_kind("external", owner)
+    normalized = str(outcome).strip().lower()
+    if normalized not in {"completed", "failed", "lost", "cancelled"}:
+        raise ValueError("external outcome must be completed, failed, lost, or cancelled")
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute("SELECT task_id, metadata FROM task_runs WHERE id=? AND owner_kind='external' AND owner=? AND ended_at IS NULL", (int(run_id), owner)).fetchone()
+        if row is None:
+            return False
+        policy = json.loads(row["metadata"] or "{}")
+        retrying = normalized != "completed" and policy.get("on_failure") == "retry"
+        max_retries = max(1, int(
+            policy.get("max_retries")
+            if policy.get("max_retries") is not None else DEFAULT_FAILURE_LIMIT
+        ))
+        prior_failures = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND owner_kind='external' "
+            "AND outcome IN ('lost', 'failed', 'cancelled')",
+            (row["task_id"],),
+        ).fetchone()[0]
+        exhausted = retrying and int(prior_failures) + 1 >= max_retries
+        task_status = (
+            "ready" if normalized == "completed" and policy.get("on_success") == "resume"
+            else "done" if normalized == "completed"
+            else "ready" if retrying and not exhausted else "blocked"
+        )
+        run_status = "done" if normalized == "completed" else "failed"
+        conn.execute("UPDATE task_runs SET status=?, outcome=?, ended_at=?, result_ref=COALESCE(?, result_ref) WHERE id=?", (run_status, normalized, now, _redact_durable_ref(result_ref), int(run_id)))
+        changed = conn.execute("UPDATE tasks SET status=?, completed_at=CASE WHEN ?='done' THEN ? ELSE completed_at END, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL WHERE id=? AND current_run_id=?", (task_status, task_status, now, row["task_id"], int(run_id)))
+        if changed.rowcount != 1:
+            raise RuntimeError("external run no longer owns its task")
+        _append_event(
+            conn, row["task_id"],
+            "external_resumed" if normalized == "completed" and task_status == "ready" else (
+                "completed" if normalized == "completed" else (
+                    "external_retry_exhausted" if exhausted else "external_failed"
+                )
+            ),
+            {"outcome": normalized, "max_retries": max_retries} if exhausted else {"outcome": normalized},
+            run_id=int(run_id),
+        )
+    if normalized == "completed":
+        recompute_ready(conn)
+    return True
+
+
+def _read_canonical_managed_process_receipt(
+    session_id: object, durable_result_path: object,
+) -> Optional[int]:
+    """Return an exact managed-process receipt exit code, never a caller path."""
+    sid = str(session_id or "").strip()
+    path_text = str(durable_result_path or "").strip()
+    if not sid or not path_text:
+        return None
+    try:
+        expected = (get_hermes_home() / "process-results" / f"{sid}.json").resolve()
+        if Path(path_text).resolve() != expected:
+            return None
+        payload = json.loads(expected.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    exit_code = payload.get("exit_code") if isinstance(payload, dict) and payload.get("session_id") == sid else None
+    return exit_code if isinstance(exit_code, int) and not isinstance(exit_code, bool) else None
+
+
+def reconcile_stale_external_runs(
+    conn: sqlite3.Connection, *, stale_after_seconds: int = 300,
+) -> int:
+    """CAS-settle heartbeat-stale external work, once per durable run.
+
+    External lanes have no local PID to probe.  A stale run is marked ``lost``;
+    its configured retry ceiling is evaluated from durable terminal history, so
+    concurrent reconcilers cannot emit duplicate exhaustion events.
+    """
+    if int(stale_after_seconds) < 1:
+        raise ValueError("stale_after_seconds must be >= 1")
+    cutoff = int(time.time()) - int(stale_after_seconds)
+    stale = conn.execute(
+        "SELECT id FROM task_runs WHERE owner_kind='external' AND ended_at IS NULL "
+        "AND COALESCE(last_heartbeat_at, started_at, 0) < ?", (cutoff,),
+    ).fetchall()
+    reconciled = 0
+    for candidate in stale:
+        with write_txn(conn):
+            row = conn.execute(
+                "SELECT id, task_id, metadata, worker_pid, pid_scope, host_start_time, owner, "
+                "managed_process_session_id, durable_result_path FROM task_runs WHERE id=? "
+                "AND owner_kind='external' AND ended_at IS NULL "
+                "AND COALESCE(last_heartbeat_at, started_at, 0) < ?",
+                (candidate["id"], cutoff),
+            ).fetchone()
+            if row is None:
+                continue
+            # A transferred ProcessRegistry worker has no independent external
+            # heartbeat while it is alive. Its host PID is the authoritative
+            # liveness signal; refresh both records rather than racing it into
+            # a false lost/retry transition after the normal 300s lease.
+            if (
+                row["pid_scope"] == "host" and row["worker_pid"]
+                and row["host_start_time"] is not None
+                and _host_pid_identity_matches(int(row["worker_pid"]), int(row["host_start_time"]))
+            ):
+                now = int(time.time())
+                conn.execute(
+                    "UPDATE task_runs SET last_heartbeat_at=? WHERE id=? AND ended_at IS NULL",
+                    (now, row["id"]),
+                )
+                conn.execute(
+                    "UPDATE tasks SET last_heartbeat_at=? WHERE id=? AND current_run_id=?",
+                    (now, row["task_id"], row["id"]),
+                )
+                continue
+            try:
+                policy = json.loads(row["metadata"] or "{}") or {}
+                retrying = policy.get("on_failure") == "retry"
+                max_retries = int(
+                    policy.get("max_retries")
+                    if policy.get("max_retries") is not None else DEFAULT_FAILURE_LIMIT
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                policy = {}
+                retrying = False
+                max_retries = 1
+            max_retries = max(1, max_retries)
+            receipt_exit_code = _read_canonical_managed_process_receipt(
+                row["managed_process_session_id"], row["durable_result_path"],
+            )
+            if receipt_exit_code is not None:
+                normalized = "completed" if receipt_exit_code == 0 else "failed"
+                retrying = normalized != "completed" and retrying
+                prior = conn.execute(
+                    "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND owner_kind='external' "
+                    "AND outcome IN ('lost', 'failed', 'cancelled')", (row["task_id"],),
+                ).fetchone()[0]
+                exhausted = retrying and int(prior) + 1 >= max_retries
+                task_status = (
+                    "ready" if normalized == "completed" and policy.get("on_success") == "resume" else
+                    "done" if normalized == "completed" else
+                    "ready" if retrying and not exhausted else "blocked"
+                )
+                changed = conn.execute(
+                    "UPDATE task_runs SET status=?, outcome=?, ended_at=? WHERE id=? AND ended_at IS NULL",
+                    ("done" if normalized == "completed" else "failed", normalized, int(time.time()), row["id"]),
+                )
+                if changed.rowcount:
+                    conn.execute(
+                        "UPDATE tasks SET status=?, completed_at=CASE WHEN ?='done' THEN ? ELSE completed_at END, "
+                        "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL "
+                        "WHERE id=? AND current_run_id=?",
+                        (task_status, task_status, int(time.time()), row["task_id"], row["id"]),
+                    )
+                    _append_event(
+                        conn, row["task_id"],
+                        "external_resumed" if normalized == "completed" and task_status == "ready" else (
+                            "completed" if normalized == "completed" else (
+                                "external_retry_exhausted" if exhausted else "external_failed"
+                            )
+                        ),
+                        {"outcome": normalized, "receipt": "managed_process"}, run_id=row["id"],
+                    )
+                    reconciled += 1
+                continue
+            prior = conn.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE task_id=? AND owner_kind='external' "
+                "AND outcome IN ('lost', 'failed', 'cancelled')", (row["task_id"],),
+            ).fetchone()[0]
+            exhausted = retrying and int(prior) + 1 >= max_retries
+            now = int(time.time())
+            changed = conn.execute(
+                "UPDATE task_runs SET status='failed', outcome='lost', ended_at=? "
+                "WHERE id=? AND ended_at IS NULL", (now, row["id"]),
+            )
+            if changed.rowcount != 1:
+                continue
+            status = "ready" if retrying and not exhausted else "blocked"
+            conn.execute(
+                "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+                "worker_pid=NULL, current_run_id=NULL WHERE id=? AND current_run_id=?",
+                (status, row["task_id"], row["id"]),
+            )
+            _append_event(conn, row["task_id"], "external_retry_exhausted" if exhausted else "external_lost", {
+                "run_id": row["id"], "max_retries": max_retries,
+            }, run_id=row["id"])
+            reconciled += 1
+    return reconciled
+
+
+def _canonical_json(value: dict) -> tuple[str, str]:
+    """Return canonical JSON and its content address for immutable receipts."""
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return canonical, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _git_candidate_provenance(task: Task, sha: str) -> dict:
+    """Prove a task's supplied commit is the clean, exact worktree HEAD."""
+    raw_path = str(task.workspace_path or "")
+    path = Path(raw_path)
+    if not raw_path or not path.is_absolute() or not path.is_dir():
+        raise ValueError("worktree candidate requires an absolute existing Git worktree")
+    canonical_path = str(path.resolve())
+    try:
+        root = subprocess.check_output(["git", "-C", canonical_path, "rev-parse", "--show-toplevel"], text=True, stderr=subprocess.DEVNULL).strip()
+        head = subprocess.check_output(["git", "-C", canonical_path, "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip().lower()
+        dirty = subprocess.check_output(["git", "-C", canonical_path, "status", "--porcelain"], text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("worktree candidate requires an absolute existing Git worktree") from exc
+    if str(Path(root).resolve()) != canonical_path:
+        raise ValueError("worktree candidate workspace_path must name the Git worktree root")
+    if dirty.strip():
+        raise ValueError("worktree candidate requires a clean Git worktree")
+    if head != sha:
+        raise ValueError("worktree candidate SHA must exactly match Git HEAD")
+    return {"head": head, "workspace_path": canonical_path}
+
+
+def create_candidate(
+    conn: sqlite3.Connection, task_id: str, *, sha: str, source_receipt: Optional[dict] = None,
+) -> dict:
+    """Persist a proven candidate, never a caller-asserted scratch SHA."""
+    sha = str(sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("sha must be an exact 40-character hexadecimal SHA")
+    task = get_task(conn, task_id)
+    if task is None:
+        raise ValueError("task not found")
+    if task.workspace_kind == "worktree":
+        if source_receipt is not None:
+            raise ValueError("worktree candidate provenance is derived from Git, not source_receipt")
+        source_kind = "git"
+        provenance = _git_candidate_provenance(task, sha)
+    else:
+        _require_control_authority()
+        if not isinstance(source_receipt, dict):
+            raise ValueError("non-worktree candidate requires an immutable JSON source_receipt")
+        if str(source_receipt.get("candidate_sha") or "").strip().lower() != sha:
+            raise ValueError("source_receipt candidate_sha must exactly match candidate SHA")
+        if (
+            not str(source_receipt.get("subject") or "").strip()
+            or not str(source_receipt.get("provenance") or "").strip()
+            or not str(source_receipt.get("producer_profile") or "").strip()
+        ):
+            raise ValueError("source_receipt subject, provenance, and producer_profile are required")
+        source_kind = "attested"
+        provenance = json.loads(_canonical_json(source_receipt)[0])
+    canonical, source_hash = _canonical_json(provenance)
+    if source_kind == "git":
+        # The producing run is immutable lifecycle evidence.  Neither the
+        # latest run nor the mutable task assignee proves who produced this
+        # exact worktree HEAD.
+        producing_run = conn.execute(
+            "SELECT profile, metadata FROM task_runs WHERE task_id=? "
+            "AND ended_at IS NOT NULL AND outcome='completed' "
+            "AND TRIM(COALESCE(profile, '')) != '' ORDER BY id DESC",
+            (task_id,),
+        ).fetchall()
+        implementer = ""
+        for run in producing_run:
+            try:
+                metadata = json.loads(run["metadata"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if metadata.get("candidate_sha") == sha:
+                implementer = str(run["profile"]).strip()
+                break
+        if not implementer:
+            raise ValueError("worktree candidate requires a completed producing run with exact candidate_sha")
+    else:
+        # The coordinator-authenticated immutable receipt is the only valid
+        # producer identity when no Git lifecycle run is available.
+        implementer = str(provenance["producer_profile"]).strip()
+    value = {"task_id": task_id, "sha": sha, "implementer": implementer, "source_kind": source_kind, "source_provenance": provenance, "source_hash": source_hash}
+    with write_txn(conn):
+        existing = conn.execute("SELECT implementer, source_kind, source_provenance_json, source_hash FROM task_candidates WHERE task_id=? AND sha=?", (task_id, sha)).fetchone()
+        if existing is not None:
+            prior = {"task_id": task_id, "sha": sha, "implementer": existing["implementer"], "source_kind": existing["source_kind"], "source_provenance": json.loads(existing["source_provenance_json"] or "{}"), "source_hash": existing["source_hash"]}
+            if prior != value:
+                raise ValueError("candidate provenance is immutable")
+            return prior
+        conn.execute("INSERT INTO task_candidates (task_id, sha, implementer, source_kind, source_provenance_json, source_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)", (task_id, sha, implementer, source_kind, canonical, source_hash, int(time.time())))
+    return value
+
+
+def get_candidate(conn: sqlite3.Connection, task_id: str, *, sha: str) -> Optional[dict]:
+    row = conn.execute("SELECT sha, implementer, source_kind, source_provenance_json, source_hash FROM task_candidates WHERE task_id=? AND sha=?", (task_id, str(sha).lower())).fetchone()
+    return ({"task_id": task_id, "sha": row["sha"], "implementer": row["implementer"], "source_kind": row["source_kind"], "source_provenance": json.loads(row["source_provenance_json"] or "{}"), "source_hash": row["source_hash"]} if row else None)
+
+
+def _bound_evidence_authority(conn: sqlite3.Connection, task_id: str, supplied: Optional[str]) -> str:
+    """Bind an evidence receipt to its runtime producer or coordinator."""
+    runtime = str(os.environ.get("HERMES_PROFILE") or "").strip()
+    asserted = str(supplied or "").strip()
+    if not runtime:
+        raise ValueError("evidence freeze requires runtime HERMES_PROFILE")
+    if asserted != runtime:
+        raise ValueError("authority is only an assertion of runtime HERMES_PROFILE")
+    task = get_task(conn, task_id)
+    coordinator = _configured_coordinator_principal()
+    is_source_agent = task is not None and task.owner_kind == "agent" and task.assignee == runtime
+    if runtime != coordinator and not is_source_agent:
+        raise ValueError("evidence freeze requires the source agent assignee or configured coordinator")
+    return runtime
+
+
+def freeze_evidence_manifest(
+    conn: sqlite3.Connection, task_id: str, *, sha: str, manifest: dict,
+    verdict: str, authority: str,
+) -> dict:
+    """Write the one immutable, content-addressed gate receipt for a task."""
+    sha = str(sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise ValueError("sha must be an exact 40-character hexadecimal SHA")
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be an object")
+    if get_candidate(conn, task_id, sha=sha) is None:
+        raise ValueError("candidate is missing or belongs to another task")
+    entries = manifest.get("entries")
+    required_slots = manifest.get("required_slots", [])
+    if not isinstance(entries, list) or not entries or not isinstance(required_slots, list):
+        raise ValueError("manifest requires non-empty entries and required_slots")
+    slots: set[str] = set()
+    canonical_entries: list[dict] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("manifest entries must be objects")
+        entry = dict(entry)
+        attachment_id = entry.get("attachment_id")
+        row = conn.execute("SELECT task_id, stored_path, content_type FROM task_attachments WHERE id=?", (attachment_id,)).fetchone()
+        if row is None or row["task_id"] != task_id:
+            raise ValueError("manifest attachment is missing or belongs to another task")
+        path = Path(row["stored_path"])
+        if not path.is_file():
+            raise ValueError("manifest attachment bytes are missing")
+        payload = path.read_bytes()
+        actual_hash = hashlib.sha256(payload).hexdigest()
+        if entry.get("sha256") != actual_hash:
+            raise ValueError("manifest attachment hash mismatch")
+        content_type = entry.get("content_type")
+        if not isinstance(content_type, str) or "/" not in content_type or content_type != row["content_type"]:
+            raise ValueError("manifest content_type declaration is invalid")
+        if not isinstance(entry.get("cardinality"), int) or entry["cardinality"] <= 0:
+            raise ValueError("manifest cardinality must be positive")
+        slot, mode = entry.get("slot"), entry.get("mode")
+        if not isinstance(slot, str) or not slot.strip() or not isinstance(mode, str) or not mode.strip():
+            raise ValueError("manifest slot and mode are required")
+        decoded = _decode_image_evidence(payload)
+        # Decoder declarations are untrusted caller metadata. Preserve neither
+        # the boolean nor its claimed facts; images below receive canonical
+        # facts derived from bytes, non-images retain only generic integrity data.
+        entry.pop("decoder_valid", None)
+        entry.pop("decoder_metadata", None)
+        declared_image = content_type.lower().startswith("image/")
+        if decoded is None:
+            if declared_image:
+                raise ValueError("manifest image bytes fail Pillow decode")
+            if entry.get("dimensions") is not None:
+                raise ValueError("manifest dimensions require decoded image bytes")
+        else:
+            if not declared_image or content_type.lower() != decoded["content_type"]:
+                raise ValueError("manifest declared MIME does not match decoded image MIME")
+            dimensions = entry.get("dimensions")
+            if dimensions != decoded["dimensions"]:
+                raise ValueError("manifest declared dimensions do not match decoded image dimensions")
+            # The stored receipt is derived facts, not caller-controlled decoder claims.
+            entry["content_type"] = decoded["content_type"]
+            entry["dimensions"] = decoded["dimensions"]
+            entry["decoder_metadata"] = decoded["decoder_metadata"]
+            entry.pop("decoder_valid", None)
+        slots.add(slot)
+        canonical_entries.append(entry)
+    if any(not isinstance(slot, str) or not slot.strip() or slot not in slots for slot in required_slots):
+        raise ValueError("manifest is missing a required slot")
+    manifest = {**manifest, "entries": canonical_entries}
+    verdict = str(verdict or "").strip().lower()
+    authority = _bound_evidence_authority(conn, task_id, authority)
+    if verdict not in {"pass", "fail"}:
+        raise ValueError("verdict must be pass or fail")
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    receipt = {"task_id": task_id, "sha": sha, "manifest": manifest,
+               "manifest_hash": hashlib.sha256(canonical.encode()).hexdigest(),
+               "verdict": verdict, "authority": authority}
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT sha, manifest_json, manifest_hash, verdict, authority "
+            "FROM task_evidence_receipts WHERE task_id=?", (task_id,),
+        ).fetchone()
+        if existing:
+            prior = {"task_id": task_id, "sha": existing["sha"], "manifest": json.loads(existing["manifest_json"]),
+                     "manifest_hash": existing["manifest_hash"], "verdict": existing["verdict"],
+                     "authority": existing["authority"]}
+            if prior != receipt:
+                raise ValueError("evidence receipt is immutable")
+            return prior
+        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
+            raise ValueError("task not found")
+        conn.execute(
+            "INSERT INTO task_evidence_receipts "
+            "(task_id, sha, manifest_json, manifest_hash, verdict, authority, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (task_id, sha, canonical, receipt["manifest_hash"], verdict, authority, int(time.time())),
+        )
+        _append_event(conn, task_id, "evidence_frozen", receipt)
+    return receipt
+
+
+def get_frozen_evidence_manifest(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT sha, manifest_json, manifest_hash, verdict, authority "
+        "FROM task_evidence_receipts WHERE task_id=?", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"task_id": task_id, "sha": row["sha"], "manifest": json.loads(row["manifest_json"]),
+            "manifest_hash": row["manifest_hash"], "verdict": row["verdict"],
+            "authority": row["authority"]}
+
+
+def _validate_gate_task(
+    conn: sqlite3.Connection, source_task_id: str, gate_task_id: str,
+    *, require_terminal_result: bool = True,
+) -> Task:
+    """Resolve independent reviewer/visualqa provenance for one source task."""
+    gate = get_task(conn, str(gate_task_id or ""))
+    source = get_task(conn, source_task_id)
+    if gate is None:
+        raise ValueError("gate task ID does not name an existing task")
+    if source is None:
+        raise ValueError("source task not found")
+    if gate.task_kind not in {"reviewer", "visualqa"}:
+        raise ValueError("gate task must have reviewer or visualqa task_kind")
+    if gate.created_by_task_id != source_task_id:
+        raise ValueError("gate task was not created by the source task")
+    principal = _configured_coordinator_principal()
+    if not principal or gate.creation_authority != principal:
+        raise ValueError("gate task creation authority is not the configured coordinator")
+    receipt = get_frozen_evidence_manifest(conn, source_task_id)
+    candidate = get_candidate(conn, source_task_id, sha=gate.gate_candidate_sha or "")
+    if receipt is None or receipt["verdict"] != "pass" or candidate is None or gate.gate_candidate_sha != receipt["sha"] or gate.gate_manifest_hash != receipt["manifest_hash"]:
+        raise ValueError("gate task frozen candidate and passing manifest bindings do not match source")
+    if gate.owner_kind != "agent":
+        raise ValueError("gate task owner_kind must be agent")
+    if not gate.assignee or not candidate["implementer"] or gate.assignee == candidate["implementer"]:
+        raise ValueError("gate task assignee must differ from frozen source implementer")
+    if require_terminal_result:
+        row = conn.execute("SELECT status, result FROM tasks WHERE id=?", (gate_task_id,)).fetchone()
+        # A reopened task gets a new lifecycle run. Only its authoritative
+        # latest terminal attempt may authorize this gate; an earlier passing
+        # attempt cannot survive a later failed, reclaimed, or mismatched one.
+        run = conn.execute(
+            "SELECT profile, outcome, summary, metadata FROM task_runs "
+            "WHERE task_id=? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (gate_task_id,),
+        ).fetchone()
+        try:
+            metadata = json.loads(run["metadata"] or "{}") if run else {}
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        if (
+            row is None
+            or row["status"] != "done"
+            or not str(row["result"] or "").strip()
+            or run is None
+            or run["profile"] != gate.assignee
+            or run["profile"] == candidate["implementer"]
+            or run["outcome"] != "completed"
+            or not str(run["summary"] or "").strip()
+            or metadata.get("candidate_sha") != gate.gate_candidate_sha
+            or metadata.get("manifest_hash") != gate.gate_manifest_hash
+        ):
+            raise ValueError("gate task requires terminal result and exact bound run metadata")
+    return gate
+
+
+def record_gate_verdict(
+    conn: sqlite3.Connection, task_id: str, *, gate_task_id: str, sha: str,
+    manifest_hash: str, verdict: str, authority: str,
+) -> dict:
+    """Record a coordinator-aggregated verdict bound to an immutable gate task."""
+    authority = _require_control_authority(authority)
+    receipt = get_frozen_evidence_manifest(conn, task_id)
+    if not receipt or receipt["sha"] != sha or receipt["manifest_hash"] != manifest_hash:
+        raise ValueError("gate verdict candidate SHA or manifest hash is stale")
+    gate_task_id = str(gate_task_id or "").strip()
+    if str(verdict or "").strip().lower() not in {"pass", "fail"}:
+        raise ValueError("pass/fail verdict is required")
+    with write_txn(conn):
+        _validate_gate_task(conn, task_id, gate_task_id)
+        gate_run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1", (gate_task_id,),
+        ).fetchone()
+        if gate_run is None:
+            raise ValueError("gate task requires an authoritative terminal run")
+        value = {"task_id": task_id, "gate_task_id": gate_task_id, "sha": sha,
+                 "manifest_hash": manifest_hash, "verdict": str(verdict).lower(),
+                 "authority": str(authority), "gate_run_id": gate_run["id"]}
+        row = conn.execute("SELECT sha, manifest_hash, verdict, authority, gate_run_id FROM task_gate_verdicts WHERE task_id=? AND gate=?", (task_id, gate_task_id)).fetchone()
+        if row:
+            prior = {"task_id": task_id, "gate_task_id": gate_task_id, "sha": row["sha"], "manifest_hash": row["manifest_hash"], "verdict": row["verdict"], "authority": row["authority"], "gate_run_id": row["gate_run_id"]}
+            if prior != value:
+                raise ValueError("gate verdict is immutable")
+            return prior
+        conn.execute("INSERT INTO task_gate_verdicts (task_id, gate, sha, manifest_hash, verdict, authority, gate_run_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (task_id, gate_task_id, sha, manifest_hash, value["verdict"], value["authority"], value["gate_run_id"], int(time.time())))
+    return value
+
+
+def get_gate_verdict(conn: sqlite3.Connection, task_id: str, *, gate_task_id: str) -> Optional[dict]:
+    row = conn.execute("SELECT sha, manifest_hash, verdict, authority, gate_run_id FROM task_gate_verdicts WHERE task_id=? AND gate=?", (task_id, gate_task_id)).fetchone()
+    return {"task_id": task_id, "gate_task_id": gate_task_id, "sha": row["sha"], "manifest_hash": row["manifest_hash"], "verdict": row["verdict"], "authority": row["authority"], "gate_run_id": row["gate_run_id"]} if row else None
+
+
+def create_release_barrier(conn: sqlite3.Connection, task_id: str, *, sha: str, manifest_hash: str, required_gates: list[str], authority: str, barrier: str = "publish") -> dict:
+    authority = _require_control_authority(authority)
+    receipt = get_frozen_evidence_manifest(conn, task_id)
+    gates = sorted({str(g).strip() for g in required_gates if str(g).strip()})
+    if not receipt or receipt["verdict"] != "pass" or receipt["sha"] != sha or receipt["manifest_hash"] != manifest_hash or not gates: raise ValueError("release barrier candidate, passing manifest, and required gates must be frozen")
+    for gate_task_id in gates:
+        _validate_gate_task(conn, task_id, gate_task_id)
+    value = {"task_id": task_id, "barrier": barrier, "sha": sha, "manifest_hash": manifest_hash, "required_gates": gates, "authority": authority}
+    with write_txn(conn):
+        row = conn.execute("SELECT sha, manifest_hash, required_gates_json, authority FROM task_release_barriers WHERE task_id=? AND barrier=?", (task_id, barrier)).fetchone()
+        if row:
+            old = {**value, "sha": row["sha"], "manifest_hash": row["manifest_hash"], "required_gates": json.loads(row["required_gates_json"]), "authority": row["authority"]}
+            if old != value: raise ValueError("release barrier is immutable")
+            return value
+        conn.execute("INSERT INTO task_release_barriers (task_id, barrier, sha, manifest_hash, required_gates_json, authority) VALUES (?, ?, ?, ?, ?, ?)", (task_id, barrier, sha, manifest_hash, json.dumps(gates, separators=(",", ":")), authority))
+    return value
+
+
+def get_release_barrier(conn, task_id: str, *, barrier: str = "publish") -> Optional[dict]:
+    row = conn.execute("SELECT * FROM task_release_barriers WHERE task_id=? AND barrier=?", (task_id, barrier)).fetchone()
+    if not row: return None
+    return {"task_id": task_id, "barrier": barrier, "sha": row["sha"], "manifest_hash": row["manifest_hash"], "required_gates": json.loads(row["required_gates_json"]), "authority": row["authority"], "lease_owner": row["lease_owner"], "lease_expires_at": row["lease_expires_at"], "target_identity": row["target_identity"], "delivery_idempotency_key": row["delivery_idempotency_key"], "delivered_sha": row["delivered_sha"], "readback_sha": row["readback_sha"], "completed_at": row["completed_at"]}
+
+
+def _barrier_control_authority(conn, task_id: str, barrier: str, authority: Optional[str]) -> str:
+    row = conn.execute("SELECT authority FROM task_release_barriers WHERE task_id=? AND barrier=?", (task_id, barrier)).fetchone()
+    if row is None:
+        raise ValueError("release barrier not found")
+    effective = row["authority"] if authority is None else authority
+    _require_control_authority(effective)
+    if effective != row["authority"]:
+        raise ValueError("release barrier authority does not match its immutable creator")
+    return effective
+
+
+def renew_release_barrier_lease(conn, task_id: str, *, barrier: str, owner_token: str, ttl_seconds: int, authority: Optional[str] = None) -> bool:
+    _barrier_control_authority(conn, task_id, barrier, authority)
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute("UPDATE task_release_barriers SET lease_expires_at=? WHERE task_id=? AND barrier=? AND completed_at IS NULL AND lease_owner=? AND lease_expires_at>=?", (now + max(1, int(ttl_seconds)), task_id, barrier, owner_token, now))
+        return cur.rowcount == 1
+
+
+def release_release_barrier_lease(conn, task_id: str, *, barrier: str, owner_token: str, authority: Optional[str] = None) -> bool:
+    _barrier_control_authority(conn, task_id, barrier, authority)
+    with write_txn(conn):
+        cur = conn.execute("UPDATE task_release_barriers SET lease_owner=NULL, lease_expires_at=NULL WHERE task_id=? AND barrier=? AND completed_at IS NULL AND lease_owner=?", (task_id, barrier, owner_token))
+        return cur.rowcount == 1
+
+
+def acquire_release_barrier_lease(conn: sqlite3.Connection, task_id: str, *, barrier: str, owner_token: str, ttl_seconds: int, authority: Optional[str] = None) -> bool:
+    _barrier_control_authority(conn, task_id, barrier, authority)
+    now = int(time.time()); expiry = now + max(1, int(ttl_seconds))
+    with write_txn(conn):
+        cur = conn.execute("UPDATE task_release_barriers SET lease_owner=?, lease_expires_at=? WHERE task_id=? AND barrier=? AND completed_at IS NULL AND (lease_owner IS NULL OR lease_owner=? OR lease_expires_at<?)", (owner_token, expiry, task_id, barrier, owner_token, now))
+        return cur.rowcount == 1
+
+
+def _owned_barrier(conn, task_id, barrier, owner_token, authority: Optional[str] = None):
+    row = conn.execute("SELECT * FROM task_release_barriers WHERE task_id=? AND barrier=?", (task_id, barrier)).fetchone()
+    if row is None: raise ValueError("release barrier not found")
+    # Legacy internal callers omit authority; their immutable barrier authority
+    # is revalidated rather than accepting a free-form caller label.
+    effective_authority = row["authority"] if authority is None else authority
+    _require_control_authority(effective_authority)
+    if effective_authority != row["authority"]:
+        raise ValueError("release barrier authority does not match its immutable creator")
+    if row["completed_at"] is not None:
+        if row["lease_owner"] != owner_token:
+            raise ValueError("completed release barrier is not owned by this token")
+        return row
+    if row["lease_owner"] != owner_token or int(row["lease_expires_at"] or 0) < int(time.time()): raise ValueError("release barrier lease is not owned")
+    return row
+
+
+def prepare_release_delivery_intent(conn, task_id: str, *, barrier: str, owner_token: str, target_identity: str, candidate_sha: str, idempotency_key: Optional[str] = None, authority: Optional[str] = None) -> dict:
+    """Durably reserve the one external publish identity before it is invoked."""
+    with write_txn(conn):
+        row = _owned_barrier(conn, task_id, barrier, owner_token, authority)
+        target_identity = str(target_identity or "").strip()
+        candidate_sha = str(candidate_sha or "").strip().lower()
+        supplied_key = str(idempotency_key or "").strip()
+        if candidate_sha != row["sha"] or not target_identity:
+            raise ValueError("delivery intent target and exact candidate SHA are required")
+        if _release_gate_state(conn, task_id, row) != "passed":
+            raise ValueError("release delivery requires every current required gate verdict to pass")
+        existing_target = row["target_identity"]
+        existing_key = row["delivery_idempotency_key"]
+        if existing_target is not None or existing_key is not None:
+            if existing_target != target_identity or (supplied_key and existing_key != supplied_key):
+                raise ValueError("release delivery intent is immutable")
+            return {"task_id": task_id, "barrier": barrier, "sha": row["sha"], "target_identity": existing_target, "idempotency_key": existing_key}
+        key = supplied_key or f"release-{secrets.token_hex(16)}"
+        conn.execute(
+            "UPDATE task_release_barriers SET target_identity=?, delivery_idempotency_key=? WHERE task_id=? AND barrier=?",
+            (target_identity, key, task_id, barrier),
+        )
+        return {"task_id": task_id, "barrier": barrier, "sha": row["sha"], "target_identity": target_identity, "idempotency_key": key}
+
+
+def record_release_delivery(conn, task_id: str, *, barrier: str, owner_token: str, target_identity: str, delivered_sha: str, idempotency_key: str, authority: Optional[str] = None) -> None:
+    with write_txn(conn):
+        row = _owned_barrier(conn, task_id, barrier, owner_token, authority)
+        if (
+            delivered_sha != row["sha"]
+            or not str(target_identity).strip()
+            or row["target_identity"] != target_identity
+            or not str(idempotency_key).strip()
+            or row["delivery_idempotency_key"] != idempotency_key
+        ):
+            raise ValueError("release delivery requires its prepared intent, idempotency key, target, and exact candidate SHA")
+        # Delivery is irreversible in the target system.  Do not merely trust
+        # a historical verdict row: every required gate must still be bound to
+        # this exact candidate/manifest and its current terminal run must PASS.
+        if _release_gate_state(conn, task_id, row) != "passed":
+            raise ValueError("release delivery requires every current required gate verdict to pass")
+        if row["delivered_sha"] is not None:
+            if row["delivered_sha"] == delivered_sha:
+                return
+            raise ValueError("release barrier delivery is immutable")
+        if row["completed_at"] is not None:
+            raise ValueError("completed release barrier delivery is immutable")
+        conn.execute("UPDATE task_release_barriers SET delivered_sha=? WHERE task_id=? AND barrier=?", (delivered_sha, task_id, barrier))
+
+
+def _release_gate_state(conn: sqlite3.Connection, task_id: str, row: sqlite3.Row) -> str:
+    """Return passed, rejected, or waiting using the release gate invariants."""
+    required = json.loads(row["required_gates_json"])
+    for gate_task_id in required:
+        try:
+            gate = _validate_gate_task(conn, task_id, gate_task_id)
+        except ValueError:
+            return "waiting"
+        if gate.gate_candidate_sha != row["sha"] or gate.gate_manifest_hash != row["manifest_hash"]:
+            return "waiting"
+    verdicts = {r["gate"]: r for r in conn.execute("SELECT gate, sha, manifest_hash, verdict, gate_run_id FROM task_gate_verdicts WHERE task_id=?", (task_id,))}
+    for gate_task_id in required:
+        verdict = verdicts.get(gate_task_id)
+        latest = conn.execute("SELECT id FROM task_runs WHERE task_id=? AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1", (gate_task_id,)).fetchone()
+        current = bool(verdict) and verdict["sha"] == row["sha"] and verdict["manifest_hash"] == row["manifest_hash"] and verdict["gate_run_id"] == (latest["id"] if latest else None)
+        if current and verdict["verdict"] == "fail":
+            return "rejected"
+        if not current or verdict["verdict"] != "pass":
+            return "waiting"
+    return "passed"
+
+
+def record_release_readback(conn, task_id: str, *, barrier: str, owner_token: str, readback_sha: str, authority: Optional[str] = None) -> None:
+    with write_txn(conn):
+        row = _owned_barrier(conn, task_id, barrier, owner_token, authority)
+        if readback_sha != row["sha"]: raise ValueError("readback SHA does not match candidate")
+        if not row["target_identity"] or row["delivered_sha"] != row["sha"]:
+            raise ValueError("release readback requires a recorded delivery")
+        if row["completed_at"] is not None:
+            # Exact replay is idempotent; no post-completion row is ever changed.
+            if row["readback_sha"] == readback_sha:
+                return
+            raise ValueError("completed release barrier readback is immutable")
+        conn.execute("UPDATE task_release_barriers SET readback_sha=? WHERE task_id=? AND barrier=?", (readback_sha, task_id, barrier))
+
+
+def reconcile_release_barrier(conn, task_id: str, *, barrier: str, owner_token: str, authority: Optional[str] = None) -> str:
+    with write_txn(conn):
+        row = _owned_barrier(conn, task_id, barrier, owner_token, authority)
+        gate_state = _release_gate_state(conn, task_id, row)
+        if row["completed_at"] is not None:
+            return "released"
+        if gate_state == "rejected": return "rejected"
+        if gate_state != "passed": return "waiting"
+        if not row["target_identity"] or row["delivered_sha"] != row["sha"]: return "awaiting_receipt"
+        if row["readback_sha"] != row["sha"]: return "awaiting_readback"
+        # A release barrier proves delivery of a candidate, not that an unrelated
+        # live execution has settled.  Do not overwrite its lifecycle state.
+        if conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id=? AND ended_at IS NULL LIMIT 1", (task_id,)
+        ).fetchone() is not None:
+            return "waiting"
+        now = int(time.time())
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=?, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL, "
+            "wait_kind=NULL, wait_ref=NULL, block_kind=NULL, block_recurrences=0 "
+            "WHERE id=? AND status NOT IN ('done', 'archived')",
+            (now, task_id),
+        )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id IN (SELECT child_id FROM task_links WHERE parent_id=?) AND status IN ('blocked', 'todo') AND NOT EXISTS (SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id WHERE l.child_id=tasks.id AND p.status!='done')", (task_id,))
+        conn.execute("UPDATE task_release_barriers SET completed_at=? WHERE task_id=? AND barrier=? AND completed_at IS NULL", (now, task_id, barrier))
+        _append_event(conn, task_id, "release_barrier_completed", {"barrier": barrier, "sha": row["sha"]})
+        return "released"
+
+
+def release_barrier(
+    conn: sqlite3.Connection, task_id: str, *, barrier: str, authority: str,
+) -> dict:
+    """Acquire a durable once-only barrier and return its canonical receipt."""
+    barrier = str(barrier or "").strip()
+    authority = str(authority or "").strip()
+    authority = _require_control_authority(authority)
+    if not barrier:
+        raise ValueError("barrier is required")
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT authority, released_at FROM task_release_receipts WHERE task_id=? AND barrier=?",
+            (task_id, barrier),
+        ).fetchone()
+        if row:
+            if row["authority"] != authority:
+                raise ValueError("release barrier authority is immutable")
+            return {"task_id": task_id, "barrier": barrier, "authority": authority,
+                    "released_at": row["released_at"]}
+        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
+            raise ValueError("task not found")
+        released_at = int(time.time())
+        conn.execute(
+            "INSERT INTO task_release_receipts (task_id, barrier, authority, released_at) "
+            "VALUES (?, ?, ?, ?)", (task_id, barrier, authority, released_at),
+        )
+        receipt = {"task_id": task_id, "barrier": barrier, "authority": authority,
+                   "released_at": released_at}
+        _append_event(conn, task_id, "release_barrier", receipt)
+        return receipt
+
+
+def read_release_barrier(
+    conn: sqlite3.Connection, task_id: str, *, barrier: str,
+) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT authority, released_at FROM task_release_receipts WHERE task_id=? AND barrier=?",
+        (task_id, str(barrier or "").strip()),
+    ).fetchone()
+    return ({"task_id": task_id, "barrier": barrier, "authority": row["authority"],
+             "released_at": row["released_at"]} if row else None)
+
+
+def _canonical_wait_ref(conn: sqlite3.Connection, task_id: str, kind: str, ref: str) -> str:
+    """Validate the exact durable target permitted to satisfy a typed wait."""
+    if kind == "dependency":
+        linked = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+            "WHERE l.child_id=? AND l.parent_id=? AND p.status NOT IN ('done', 'archived')",
+            (task_id, ref),
+        ).fetchone()
+        if linked is None:
+            raise ValueError("dependency wait_ref must name a linked unfinished parent task")
+    elif kind == "timer":
+        try:
+            parsed = _dt.datetime.fromisoformat(ref.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("timer wait_ref must be a canonical timezone-aware ISO timestamp") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None or parsed.isoformat().replace("+00:00", "Z") != ref:
+            raise ValueError("timer wait_ref must be a canonical timezone-aware ISO timestamp")
+    elif kind == "external_process":
+        match = re.fullmatch(r"run:([1-9][0-9]*)", ref)
+        if not match or conn.execute("SELECT 1 FROM task_runs WHERE id=? AND owner_kind='external'", (int(match.group(1)),)).fetchone() is None:
+            raise ValueError("external_process wait_ref must be run:<existing external run id>")
+    elif kind == "capability":
+        if not re.fullmatch(r"cap:[a-z][a-z0-9_.-]*", ref): raise ValueError("capability wait_ref must be cap:<name>")
+    elif kind == "human":
+        if not re.fullmatch(r"decision:[a-z][a-z0-9_.-]*", ref): raise ValueError("human wait_ref must be decision:<id>")
+    else:
+        match = re.fullmatch(r"gate:([^:]+)", ref)
+        if not match:
+            raise ValueError("review wait_ref must be gate:<gate-task-id>")
+        _validate_gate_task(
+            conn, task_id, match.group(1), require_terminal_result=False,
+        )
+    return ref
+
+
+def record_wait_receipt(conn: sqlite3.Connection, *, kind: str, ref: str, authority: str, verdict: str) -> bool:
+    """Persist an explicit capability-probe or human-decision receipt once."""
+    kind, ref, authority, verdict = str(kind or "").strip().lower(), str(ref or "").strip(), str(authority or "").strip(), str(verdict or "").strip().lower()
+    if kind not in {"capability", "human"} or not authority:
+        raise ValueError("only capability or human waits accept a named authority receipt")
+    # The dashboard/CLI's label is merely an assertion; only the configured
+    # coordinator process may mint a receipt that resumes work.
+    authority = _require_control_authority(authority)
+    _canonical_wait_ref(conn, "", kind, ref)
+    expected = "available" if kind == "capability" else "approved"
+    if verdict != expected: raise ValueError(f"{kind} receipt verdict must be {expected}")
+    with write_txn(conn):
+        cur = conn.execute("INSERT OR IGNORE INTO task_wait_receipts (kind, ref, authority, verdict, created_at) VALUES (?, ?, ?, ?, ?)", (kind, ref, authority, verdict, int(time.time())))
+    return cur.rowcount == 1
+
+
+def set_task_wait(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    kind: str,
+    ref: str,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Park a task only after binding a kind-specific durable wait target.
+
+    An active attempt is terminally closed in the same transaction before the
+    task is blocked.  ``expected_run_id`` is an optional worker-side CAS guard:
+    a stale worker cannot park a later attempt it no longer owns.
+    """
+    wait_kind, wait_ref = str(kind or "").strip().lower(), str(ref or "").strip()
+    if wait_kind not in WAIT_AUTHORITIES: raise ValueError("wait_kind must be dependency, capability, human, external_process, timer, or review")
+    if not wait_ref: raise ValueError("wait_ref is required")
+    metadata = {"wait_kind": wait_kind, "wait_ref": wait_ref}
+    summary = f"wait set: {wait_kind} {wait_ref}"
+    with write_txn(conn):
+        _canonical_wait_ref(conn, task_id, wait_kind, wait_ref)
+        task = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        if task is None or task["status"] not in {"ready", "running", "review"}:
+            raise ValueError("task is not waitable")
+        current_run_id = task["current_run_id"]
+        if expected_run_id is not None and current_run_id != expected_run_id:
+            return False
+        if current_run_id is not None:
+            closed = conn.execute(
+                """
+                UPDATE task_runs
+                   SET status='blocked', outcome='blocked', summary=?, metadata=?,
+                       ended_at=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL
+                 WHERE id=? AND task_id=? AND ended_at IS NULL
+                """,
+                (summary, json.dumps(metadata, ensure_ascii=False), int(time.time()), current_run_id, task_id),
+            )
+            if closed.rowcount != 1:
+                return False
+            run_id = int(current_run_id)
+        else:
+            run_id = _synthesize_ended_run(
+                conn, task_id, outcome="blocked", summary=summary, metadata=metadata,
+            )
+        changed = conn.execute(
+            """
+            UPDATE tasks
+               SET status='blocked', wait_kind=?, wait_ref=?, block_kind=NULL,
+                   claim_lock=NULL, claim_expires=NULL, worker_pid=NULL,
+                   current_run_id=NULL
+             WHERE id=? AND status=? AND current_run_id IS ?
+            """,
+            (wait_kind, wait_ref, task_id, task["status"], current_run_id),
+        )
+        if changed.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "wait_set", {"kind": wait_kind, "ref": wait_ref}, run_id=run_id,
+        )
+    return True
+
+
+def _wait_is_satisfied(conn: sqlite3.Connection, task_id: str, kind: str, ref: str, authority: Optional[str]) -> bool:
+    if kind == "dependency":
+        return conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (ref, task_id)).fetchone() is not None and _parents_satisfied(conn, task_id)
+    if kind == "timer": return _dt.datetime.fromisoformat(ref.replace("Z", "+00:00")).timestamp() <= time.time()
+    if kind == "external_process": return conn.execute("SELECT 1 FROM task_runs WHERE id=? AND owner_kind='external' AND outcome='completed' AND ended_at IS NOT NULL", (int(ref.split(":", 1)[1]),)).fetchone() is not None
+    if kind == "review":
+        match = re.fullmatch(r"gate:([^:]+)", ref)
+        if not match:
+            return False
+        gate_task_id = match.group(1)
+        try:
+            _validate_gate_task(conn, task_id, gate_task_id)
+        except ValueError:
+            return False
+        receipt = get_frozen_evidence_manifest(conn, task_id)
+        if receipt is None:
+            return False
+        row = conn.execute(
+            "SELECT authority FROM task_gate_verdicts "
+            "WHERE task_id=? AND gate=? AND sha=? AND manifest_hash=? AND verdict='pass' "
+            "AND gate_run_id=(SELECT id FROM task_runs WHERE task_id=? "
+            "AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1)",
+            (task_id, gate_task_id, receipt["sha"], receipt["manifest_hash"], gate_task_id),
+        ).fetchone()
+        return row is not None and (authority is None or row["authority"] == authority)
+    expected = "available" if kind == "capability" else "approved"
+    return conn.execute("SELECT 1 FROM task_wait_receipts WHERE kind=? AND ref=? AND authority=? AND verdict=?", (kind, ref, authority, expected)).fetchone() is not None
+
+
+def resume_task_wait(conn: sqlite3.Connection, task_id: str, *, authority: str, receipt: Optional[str] = None) -> bool:
+    """Resume only from the exact bound fact and its authority, never a label."""
+    with write_txn(conn):
+        row = conn.execute("SELECT wait_kind, wait_ref FROM tasks WHERE id=? AND status='blocked'", (task_id,)).fetchone()
+        if not row or row["wait_kind"] not in WAIT_AUTHORITIES: return False
+        kind, ref, supplied = row["wait_kind"], row["wait_ref"], str(authority or "").strip()
+        if str(receipt or "").strip() != ref: return False
+        if kind in {"dependency", "timer", "external_process"} and supplied.lower() != WAIT_AUTHORITIES[kind]: return False
+        if kind in {"capability", "human"}:
+            try:
+                supplied = _require_control_authority(supplied)
+            except ValueError:
+                return False
+        if not _wait_is_satisfied(conn, task_id, kind, ref, supplied): return False
+        changed = conn.execute("UPDATE tasks SET status='ready', wait_kind=NULL, wait_ref=NULL WHERE id=? AND status='blocked' AND wait_kind=? AND wait_ref=?", (task_id, kind, ref))
+        if changed.rowcount != 1: return False
+        _append_event(conn, task_id, "wait_resumed", {"kind": kind, "ref": ref, "authority": supplied})
+        return True
+
+
+def reconcile_task_waits(conn: sqlite3.Connection) -> int:
+    """Auto-resume dispatcher-owned waits only after their exact fact is true."""
+    resumed = 0
+    for row in conn.execute("SELECT id, wait_kind, wait_ref FROM tasks WHERE status='blocked' AND wait_kind IS NOT NULL").fetchall():
+        kind, ref = row["wait_kind"], row["wait_ref"]
+        if kind == "human": continue
+        authority = WAIT_AUTHORITIES.get(kind)
+        if kind == "capability":
+            receipt = conn.execute("SELECT authority FROM task_wait_receipts WHERE kind='capability' AND ref=? AND verdict='available' ORDER BY created_at, authority LIMIT 1", (ref,)).fetchone()
+            authority = receipt["authority"] if receipt else None
+        elif kind == "review":
+            match = re.fullmatch(r"gate:([^:]+)", ref)
+            if not match:
+                continue
+            manifest = get_frozen_evidence_manifest(conn, row["id"])
+            if manifest is None:
+                continue
+            receipt = conn.execute(
+                "SELECT authority FROM task_gate_verdicts "
+                "WHERE task_id=? AND gate=? AND sha=? AND manifest_hash=? AND verdict='pass' "
+                "AND gate_run_id=(SELECT id FROM task_runs WHERE task_id=? "
+                "AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 1)",
+                (row["id"], match.group(1), manifest["sha"], manifest["manifest_hash"], match.group(1)),
+            ).fetchone()
+            authority = receipt["authority"] if receipt else None
+        if authority and resume_task_wait(conn, row["id"], authority=authority, receipt=ref): resumed += 1
+    return resumed
+
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
     return conn.execute(
@@ -4641,6 +6386,12 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        owner = conn.execute(
+            "SELECT owner_kind FROM tasks WHERE id = ? AND status = 'ready' AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        if owner is None or owner["owner_kind"] != "agent":
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4696,6 +6447,7 @@ def claim_task(
              WHERE id = ?
                AND status = 'ready'
                AND claim_lock IS NULL
+               AND owner_kind = 'agent'
             """,
             (lock, expires, now, task_id),
         )
@@ -4769,6 +6521,12 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        owner = conn.execute(
+            "SELECT owner_kind FROM tasks WHERE id = ? AND status = 'review' AND claim_lock IS NULL",
+            (task_id,),
+        ).fetchone()
+        if owner is None or owner["owner_kind"] != "agent":
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -4796,6 +6554,7 @@ def claim_review_task(
              WHERE id = ?
                AND status = 'review'
                AND claim_lock IS NULL
+               AND owner_kind = 'agent'
             """,
             (lock, expires, now, task_id),
         )
@@ -5200,6 +6959,8 @@ def reassign_task(
     *,
     reclaim_first: bool = False,
     reason: Optional[str] = None,
+    owner_kind: Optional[str] = None,
+    activate_agent: bool = False,
 ) -> bool:
     """Reassign a task, optionally reclaiming a stuck running worker first.
 
@@ -5217,7 +6978,10 @@ def reassign_task(
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile)
+        return assign_task(
+            conn, task_id, profile, owner_kind=owner_kind,
+            activate_agent=activate_agent,
+        )
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
@@ -5446,9 +7210,29 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT t.status, t.task_kind, t.assignee, t.current_run_id, "
+            "r.owner_kind, r.profile AS run_profile FROM tasks t "
+            "LEFT JOIN task_runs r ON r.id=t.current_run_id "
+            "WHERE t.id=?",
             (task_id,),
         ).fetchone()
+        # Mandatory reviewer/visual QA gates are worker-only transitions.
+        # Caller metadata is evidence, not authority: bind the exact active
+        # run and its immutable dispatcher profile at the DB boundary.
+        if prior is not None and prior["task_kind"] in {"reviewer", "visualqa"}:
+            runtime_profile = str(os.environ.get("HERMES_PROFILE") or "").strip()
+            if (
+                expected_run_id is None
+                or prior["current_run_id"] != int(expected_run_id)
+                or not runtime_profile
+                or runtime_profile != prior["assignee"]
+                or runtime_profile != prior["run_profile"]
+            ):
+                return False
+        # A live external run has an owner-CAS completion protocol.  Direct
+        # completion must never forge its terminal state or bypass that owner.
+        if prior is not None and prior["owner_kind"] == "external":
+            return False
         prior_status = prior["status"] if prior else None
         if expected_run_id is None:
             cur = conn.execute(
@@ -6326,7 +8110,9 @@ def block_task(
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
-                       block_kind    = ?
+                       block_kind    = ?,
+                       wait_kind     = NULL,
+                       wait_ref      = NULL
                  WHERE id = ?
                    AND status IN ('running', 'ready')
                 """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
@@ -6384,6 +8170,8 @@ def block_task(
                        claim_expires = NULL,
                        worker_pid    = NULL,
                        block_kind    = ?,
+                       wait_kind     = NULL,
+                       wait_ref      = NULL,
                        block_recurrences = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
@@ -6423,6 +8211,8 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
+                           wait_kind     = NULL,
+                           wait_ref      = NULL,
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
@@ -6438,6 +8228,8 @@ def block_task(
                            claim_expires = NULL,
                            worker_pid    = NULL,
                            block_kind    = ?,
+                           wait_kind     = NULL,
+                           wait_ref      = NULL,
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
@@ -8197,6 +9989,15 @@ def reap_worker_zombies() -> "list[int]":
     return reaped
 
 
+def _host_pid_identity_matches(pid: int, start_ticks: int) -> bool:
+    """True only for the same live host process, never an arbitrary PID."""
+    try:
+        from gateway.status import get_process_start_time
+        return _pid_alive(pid) and get_process_start_time(pid) == start_ticks
+    except Exception:
+        return False
+
+
 def _pid_alive(pid: Optional[int]) -> bool:
     """Return True if ``pid`` is still running on this host.
 
@@ -8715,9 +10516,11 @@ def reconcile_orphaned_running(
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
-        "WHERE status = 'running' "
-        "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
+        "SELECT t.id, t.claim_lock, t.claim_expires, t.worker_pid FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' "
+        "  AND (t.claim_lock IS NULL OR t.claim_expires IS NULL) "
+        "  AND (r.owner_kind IS NULL OR r.owner_kind != 'external')"
     ).fetchall()
     for row in rows:
         tid = row["id"]
@@ -9980,6 +11783,12 @@ def _dispatch_once_locked(
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
+    # External lanes have no local worker PID; reconcile their heartbeat lease
+    # while holding this board's dispatch lock before eligible tasks are promoted.
+    reconcile_stale_external_runs(conn)
+    # Typed waits are reconciled under the same board-scoped dispatch lock as
+    # every other automatic state transition.
+    reconcile_task_waits(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
@@ -10045,8 +11854,10 @@ def _dispatch_once_locked(
             spawn_budget = 1
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
-        "WHERE status = 'ready' AND claim_lock IS NULL "
+        "SELECT id, assignee, owner_kind, owner_kind_explicit FROM tasks "
+        "WHERE status = 'ready' AND claim_lock IS NULL AND "
+        "(owner_kind='agent' OR (owner_kind='no_agent' AND owner_kind_explicit=0 "
+        "AND (assignee IS NULL OR assignee=''))) "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Review rows are enumerated up front (not after the ready loop) so the
@@ -10055,7 +11866,7 @@ def _dispatch_once_locked(
     if review_dispatch_enabled():
         review_rows = conn.execute(
             "SELECT id, assignee FROM tasks "
-            "WHERE status = 'review' AND claim_lock IS NULL "
+            "WHERE status = 'review' AND claim_lock IS NULL AND owner_kind='agent' "
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
     # Review-lane reservation (OOF-30 review finding): the ready loop runs
@@ -10144,11 +11955,15 @@ def _dispatch_once_locked(
                 if not dry_run:
                     try:
                         with write_txn(conn):
-                            conn.execute(
-                                "UPDATE tasks SET assignee = ? WHERE id = ? "
-                                "AND (assignee IS NULL OR assignee = '')",
+                            changed = conn.execute(
+                                "UPDATE tasks SET assignee=?, owner_kind='agent' WHERE id=? "
+                                "AND status='ready' AND claim_lock IS NULL AND owner_kind='no_agent' "
+                                "AND owner_kind_explicit=0 AND (assignee IS NULL OR assignee='')",
                                 (_default_assignee, row["id"]),
                             )
+                            if changed.rowcount != 1:
+                                result.skipped_unassigned.append(row["id"])
+                                continue
                             _append_event(
                                 conn, row["id"], "assigned",
                                 {

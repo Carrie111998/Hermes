@@ -14,7 +14,7 @@ Hermes Kanban is a durable task board, shared across all your Hermes profiles, t
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
-- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
+- **Agents drive the board through a dedicated `kanban_*` toolset.** Dispatcher-spawned implementation workers receive only their own lifecycle surface (`kanban_show`, `kanban_complete`, `kanban_request_review`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, and attachments). Board-routing tools (`kanban_list`, `kanban_create`, `kanban_link`, `kanban_unblock`) are reserved for orchestrator profiles that explicitly enable the `kanban` toolset outside a scoped worker run. This prevents an implementer from constructing and approving its own downstream gate graph. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
@@ -68,6 +68,76 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
+
+## Durable external runs, typed waits, and release gates
+
+An **external run** is work performed by a human-operated lane, CI provider, or process that is not owned by the initiating Hermes worker. It is a durable `task_runs` record: its identity, owner, PID/provider ID, phase, progress, heartbeat, retry policy, completion policy, and credential-safe references live in the board database. It survives worker exit, registry restart, and dashboard reload. It is deliberately a CLI/dashboard control-plane surface — **no new model tool is added**.
+
+Choose the task `owner_kind` explicitly:
+
+- `agent` — a named installed Hermes profile owns executable work (the normal dispatcher lane).
+- `external` — a named external owner controls the run through the commands below; it is never implicitly killed by the initiating agent.
+- `no_agent` — a non-dispatchable card, optionally with an assignee label for a human lane.
+
+External run operations are board-scoped. The exact same numeric run ID on another board is not visible or mutable. An operator start is allowed only for an unclaimed `ready` task whose durable `owner_kind` is `external` and whose immutable assignee exactly equals `--owner`; installed-profile names do not relax that rule. `agent` and `no_agent` cards cannot be directly claimed, spawned, or review-dispatched. A running dispatcher worker instead transfers an already-started managed child with the existing `process` tool's `transfer` action; Hermes binds the task, current run, and board from trusted worker context, atomically ends the agent run as `external_handoff`, and exempts only that transferred child from worker-close cleanup. The external `task_runs` row itself records the exact managed process session ID and canonical `$HERMES_HOME/process-results/<session>.json` receipt path before the registry checkpoint is attempted. The transfer is acknowledged only after that session/board/run/result-path checkpoint is atomically durable; if checkpoint or registry transfer fails, Hermes atomically rolls the external handoff back to the same live agent run and claim before returning an error, so retry policy cannot dispatch a duplicate beside the still-owned child. A terminal settlement that temporarily cannot open or write the DB retains its checkpoint and receives one bounded in-process daemon retry; it settles before stale reconciliation can label a valid sidecar exit code `0` as lost. Managed process wrappers own and drain the child descriptors and persist a safe exit-code receipt, allowing both pipe and PTY children to survive the initiating worker OS process and settle after registry recovery. If PID identity is gone, reconciliation validates that canonical receipt and settles exit code `0` as completed or any nonzero code as failed; only a missing or invalid receipt follows the lost policy. Successful transfer counts as the worker's terminal protocol action, so the stop nudge and crash reconciler do not requeue it.
+
+```bash
+# Operator-owned start. `--external-id` is idempotent per task.
+hermes kanban external-run-start t_abc --owner ci --external-id build-42 \
+  --pid 4242 --phase validation --current 3 --total 10 \
+  --log-ref 'https://ci.example/job/42' --max-retries 2 \
+  --on-success complete --on-failure block --json
+
+hermes kanban external-run-show 17 --json
+hermes kanban external-run-list --task-id t_abc --json
+hermes kanban external-run-heartbeat 17 --owner ci --phase validation --current 4 --total 10 --json
+hermes kanban external-run-transfer 17 --from-owner ci --to-owner release-operator --json
+hermes kanban external-run-finish 17 --owner release-operator --outcome completed --result-ref 'artifact:build-42' --json
+hermes kanban external-run-reconcile --stale-after 300 --json
+```
+
+`on_success` is `complete` or `resume`; `on_failure` is `block` or `retry`. Finishing and stale reconciliation are compare-and-swap transitions: terminal completion is recorded once, duplicate provider callbacks do not re-complete the task, and stale work is marked lost then either re-queued or blocked according to its durable retry policy. `log_ref` and `result_ref` are redacted before persistence; pass a stable reference, never credentials. The dashboard exposes the active external run on cards and task detail (identity, owner, phase, `current/total`, heartbeat age/status, policies, and safe refs), plus matching board-scoped start/show/list/heartbeat/transfer/finish/reconcile endpoints.
+
+### Typed waits
+
+A wait is not free-form text. Set a typed wait only with a kind-specific canonical reference, then resume it with the matching authority receipt:
+
+```bash
+hermes kanban wait-set t_abc human decision:ship
+hermes kanban wait-show t_abc --json
+hermes kanban wait-resume t_abc --authority release-manager \
+  --receipt decision:ship --verdict approved
+```
+
+Kinds are `dependency`, `capability`, `human`, `external_process`, `timer`, and `review`. For example, `external_process` must name an existing external run as `run:<id>`; it cannot be satisfied by an arbitrary text label. A review wait names the independent gate task itself as `gate:<gate-task-id>` (never a free-form gate label); the gate must be a reviewer or visual-QA task created by the waiting source task under the configured coordinator and assigned independently. It may be waiting for its verdict when the wait is set. Dispatcher reconciliation resumes a review wait only when that exact gate records a candidate-and-manifest-bound `pass` verdict for the source task; a different gate or `fail` verdict never resumes it. All other dispatcher reconciliation resumes only waits whose durable authority and receipt match exactly.
+
+### Immutable candidate, evidence, and release contracts
+
+Release gates bind to an exact lowercase 40-character commit SHA, a frozen evidence manifest built from stored attachment bytes, and independent terminal reviewer/visual-QA task IDs. They are immutable: a later SHA, attachment mutation, free-form gate name, self-review, or spoofed coordinator cannot replace a prior receipt. For a `worktree` task, candidate creation reads a clean Git worktree, requires the supplied SHA to equal its real `HEAD`, and binds the producer to a completed lifecycle run whose metadata names that exact candidate SHA. A non-worktree candidate instead requires a JSON source receipt attested by the configured runtime coordinator; it must include `candidate_sha`, `subject`, `provenance`, and `producer_profile`, so a syntactically plausible SHA or mutable task assignment is insufficient. Reviewer and VisualQA tasks must be agent-owned and are frozen at creation to the source task, candidate SHA, and manifest hash. At the DB boundary, completing either gate requires its active expected run ID and a runtime `HERMES_PROFILE` exactly equal to its immutable assignee and active worker-run profile; metadata supplied by a generic CLI or dashboard caller is evidence only, never completion authority. Their completed run metadata must carry the same SHA and hash before the coordinator can record a verdict.
+
+```bash
+# Worktree task: HEAD and cleanliness are verified directly.
+hermes kanban candidate-create t_abc <40-char-sha> --json
+# Non-worktree task: immutable coordinator attestation is required.
+hermes kanban candidate-create t_abc <40-char-sha> --source-receipt candidate-source.json --json
+hermes kanban evidence-manifest-freeze t_abc <40-char-sha> manifest.json \
+  --verdict pass --authority coordinator --json
+hermes kanban gate-verdict-record t_abc <gate-task-id> <40-char-sha> \
+  <manifest-hash> pass --json
+hermes kanban release-barrier-create t_abc --sha <40-char-sha> \
+  --manifest-hash <manifest-hash> --gate <gate-task-id> --authority coordinator --json
+hermes kanban release-barrier-acquire t_abc --owner-token publish-1 --json
+# Prepare an immutable intent before the irreversible external publish. Reuse
+# the returned key after coordinator crash/lease takeover.
+hermes kanban release-barrier-prepare t_abc --owner-token publish-1 \
+  --target production --sha <40-char-sha> --idempotency-key stable-publish-key --json
+hermes kanban release-barrier-delivery t_abc --owner-token publish-1 \
+  --target production --sha <40-char-sha> --idempotency-key stable-publish-key --json
+hermes kanban release-barrier-readback t_abc --owner-token publish-1 --sha <40-char-sha> --json
+hermes kanban release-barrier-reconcile t_abc --owner-token publish-1 --json
+```
+
+A release barrier has a leased owner token and can release only after every required gate passes for that exact candidate/manifest. Before invoking an irreversible publisher, the lease owner persists an immutable target plus idempotency key with `release-barrier-prepare`; after a crash or lease takeover, the next coordinator must read and reuse that same intent rather than minting a second publication. Delivery is then recorded with the matching target, key, and candidate, followed by an exact-SHA target readback. `release-barrier-show`, `renew`, `release`, and `reconcile` expose deterministic receipts; repeated reconciliation is idempotent. Evidence freezing binds its stored authority to the process's `HERMES_PROFILE`: it must be the source implementation task's agent assignee or the configured coordinator, and `--authority` is only an equal-value assertion. Privileged gate and barrier writes require the configured coordinator runtime profile; a CLI or dashboard `authority` field is likewise only an equal-value assertion. The literal `system` is never public authority, and the dashboard binds its actual runtime profile rather than a caller-controlled `dashboard` label.
 
 ## Boards (multi-project)
 
@@ -205,6 +275,11 @@ hermes gateway start
 # 3. Create a task (you — or an orchestrator agent via kanban_create)
 hermes kanban create "research AI funding landscape" --assignee researcher
 
+# Assignees must be installed Hermes profiles. For a deliberately human-pulled
+# terminal lane, opt out explicitly instead of silently accepting a typo:
+hermes kanban create "manual legal review" \
+    --assignee outside-counsel --external-assignee
+
 # 4. Watch activity live (you)
 hermes kanban watch
 
@@ -297,7 +372,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_show` | Read the current task (title, body, prior attempts, parent handoffs, comments, full pre-formatted `worker_context`). Defaults to the env's task id. | — |
 | `kanban_list` | List task summaries with filters for `assignee`, `status`, `tenant`, archived visibility, and limit. Intended for orchestrators discovering board work. | — |
 | `kanban_complete` | Finish with `summary` + `metadata` structured handoff. | at least one of `summary` / `result` |
-| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and optional reviewer profile. The task moves to `review`; this is not a block. | `summary` |
+| `kanban_request_review` | Start same-card review with a durable `summary`, optional `metadata`, and an independent installed reviewer profile. For worktree tasks, Hermes rejects dirty trees and binds the handoff metadata to the exact 40-character `HEAD`. The task moves to `review`; this is not a block. | `summary`, `reviewer` |
 | `kanban_request_changes` | Reviewer verdict from an active review run. Closes that run, reapplies parent gating, and routes the task to its original implementer without block-loop accounting. | `reason` |
 | `kanban_block` | Stop work and route by why: `kind=dependency` (waits in `todo`, auto-resumes), `needs_input`/`capability`/`transient` (surface to a human). Repeated same-kind re-blocks auto-escalate to `triage`. | `reason` |
 | `kanban_heartbeat` | Signal liveness during long operations. Pure side-effect. | — |
@@ -323,7 +398,9 @@ kanban_complete(
 )
 ```
 
-An **orchestrator** worker fans out instead:
+Managed background commands are part of the task lifecycle, not detached side work. Their start and completion are mirrored into task heartbeat events, so the board shows real progress. A worker cannot complete, block, or request review while one of its managed background processes is still running; it must use `process wait` (or intentionally cancel it), record the exit result, and only then hand off. This prevents worker teardown from killing a long build/test and losing its verdict.
+
+A configured **orchestrator** worker fans out instead:
 
 ```
 kanban_show()
@@ -344,7 +421,7 @@ kanban_create(
 kanban_complete(summary="decomposed into 2 research tasks + 1 writer; linked dependencies")
 ```
 
-The "(Orchestrators)" tools — `kanban_list`, `kanban_create`, `kanban_link`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are available through the same toolset; the convention (encoded in the auto-injected kanban guidance) is that worker profiles don't fan out or route unrelated work, and orchestrator profiles don't execute implementation work. Dispatcher-spawned workers are still task-scoped for destructive lifecycle operations and cannot mutate unrelated tasks.
+The orchestrator tools — `kanban_list`, `kanban_create`, `kanban_link`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are exposed only to an unscoped profile with the `kanban` toolset or to the dispatcher worker named by `kanban.orchestrator_profile`. Other task workers cannot fan out or route their own gate graph; they use the first-class same-card `kanban_request_review` handoff. Destructive lifecycle operations remain task-scoped.
 
 ### Why tools instead of shelling to `hermes kanban`
 
@@ -736,8 +813,10 @@ hermes kanban list [--mine] [--assignee P] [--status S] [--tenant T] [--archived
         [--sort created|created-desc|priority|priority-desc|status|assignee|title|updated]
         [--json]
 hermes kanban show <id> [--json]
-hermes kanban assign <id> <profile>                    # or 'none' to unassign
-hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to a profile
+hermes kanban assign <id> <profile>                    # or 'none' to safely unassign
+        [--activate-agent]                            # explicit reactivation of an implicit unassigned lane
+hermes kanban reassign <id> <profile> [--reclaim]      # use 'none' to safely unassign
+        [--activate-agent]                            # explicit reactivation only
 hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
         [--priority N]
 hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)

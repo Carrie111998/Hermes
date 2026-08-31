@@ -115,6 +115,20 @@ class TestReconcileOrphanedRunning:
             "SELECT status FROM tasks WHERE id=?", (tid,)
         ).fetchone()["status"] == "running"
 
+    def test_external_running_task_with_null_expiry_is_not_an_orphan(self, conn):
+        """External claims intentionally have no lease expiry."""
+        tid = kb.create_task(
+            conn, title="external", assignee="ci", owner_kind="external",
+        )
+        run = kb.start_external_run(
+            conn, tid, owner="ci", external_id="build-1",
+        )
+
+        assert kb.reconcile_orphaned_running(conn) == []
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.status == "running"
+        assert task.current_run_id == run.id
+
     def test_live_worker_pid_defers_reconcile(self, conn):
         """If the orphan row still records a live PID on this host, don't
         requeue beside a possibly-alive worker — defer to the next tick."""

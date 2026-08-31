@@ -61,8 +61,20 @@ def client(kanban_home):
     return TestClient(app)
 
 
-# ---------------------------------------------------------------------------
-# GET /board on an empty DB
+def test_dashboard_done_routes_cannot_bypass_live_external_owner(client):
+    task_id = client.post("/api/plugins/kanban/tasks", json={
+        "title": "external", "assignee": "lane", "owner_kind": "external",
+    }).json()["task"]["id"]
+    started = client.post(f"/api/plugins/kanban/tasks/{task_id}/external-runs", json={
+        "owner": "lane", "external_id": "dashboard-bypass",
+    })
+    assert started.status_code == 200
+    patched = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"status": "done"})
+    assert patched.status_code == 409
+    bulk = client.post("/api/plugins/kanban/tasks/bulk", json={"ids": [task_id], "status": "done"})
+    assert bulk.status_code == 200 and bulk.json()["results"] == [{"id": task_id, "ok": False, "error": "transition to 'done' refused"}]
+    assert client.get(f"/api/plugins/kanban/tasks/{task_id}").json()["task"]["status"] == "running"
+
 # ---------------------------------------------------------------------------
 
 
@@ -114,6 +126,212 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_dashboard_create_omission_preserves_db_inference_and_explicit_no_agent_lane(client, kanban_home):
+    """Shipped UI payloads omit owner_kind, leaving inference to the DB."""
+    (kanban_home / "profiles" / "researcher").mkdir(parents=True, exist_ok=True)
+    assigned = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "assigned implicit", "assignee": "researcher"},
+    )
+    unassigned = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "unassigned implicit"},
+    )
+    manual = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "manual explicit", "owner_kind": "no_agent"},
+    )
+    assert assigned.status_code == unassigned.status_code == manual.status_code == 200
+    with kb.connect_closing() as conn:
+        tasks = {
+            task.title: task for task in kb.list_tasks(conn)
+            if task.title in {"assigned implicit", "unassigned implicit", "manual explicit"}
+        }
+        assert (tasks["assigned implicit"].owner_kind, tasks["assigned implicit"].owner_kind_explicit) == ("agent", False)
+        assert (tasks["unassigned implicit"].owner_kind, tasks["unassigned implicit"].owner_kind_explicit) == ("no_agent", False)
+        assert (tasks["manual explicit"].owner_kind, tasks["manual explicit"].owner_kind_explicit) == ("no_agent", True)
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args, **_kwargs: 123, default_assignee="researcher")
+        explicit = kb.get_task(conn, tasks["manual explicit"].id)
+    assert tasks["unassigned implicit"].id in result.auto_assigned_default
+    assert explicit is not None and explicit.assignee is None
+
+
+def test_dashboard_create_omission_rejects_unknown_inferred_agent_profile(client, monkeypatch):
+    """A public payload cannot bypass profile admission by omitting owner_kind."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: False)
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "missing implicit agent", "assignee": "not-installed"},
+    )
+    assert response.status_code == 400
+    assert "installed profile" in response.json()["detail"]
+    assert client.get("/api/plugins/kanban/board").json()["assignees"] == []
+
+
+def test_dashboard_external_run_identity_progress_and_redacted_refs_survive_initiator(client):
+    """Board and detail reads expose a durable external validation run safely."""
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "long validation", "assignee": "operator", "owner_kind": "external"},
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["task"]["id"]
+    started = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/external-runs",
+        json={
+            "owner": "operator", "external_id": "validation-42", "pid": 4242,
+            "phase": "validation", "current": 3, "total": 10,
+            "log_ref": "https://token:secret@example.test/log", "result_ref": "Bearer result-secret",
+            "max_retries": 2, "on_success": "complete", "on_failure": "block",
+        },
+    )
+    assert started.status_code == 200, started.text
+    run_id = started.json()["run"]["id"]
+    board = client.get("/api/plugins/kanban/board")
+    card = next(c for c in board.json()["columns"] if c["name"] == "running")["tasks"][0]
+    assert {key: card["external_run"][key] for key in (
+        "id", "owner", "external_id", "phase", "current", "total", "heartbeat_status",
+    )} == {
+        "id": run_id, "owner": "operator", "external_id": "validation-42",
+        "phase": "validation", "current": 3, "total": 10,
+        "heartbeat_status": "healthy",
+    }
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}")
+    assert detail.status_code == 200
+    external = detail.json()["task"]["external_run"]
+    assert external["heartbeat_age_seconds"] is not None
+    assert (external["phase"], external["current"], external["total"]) == ("validation", 3, 10)
+    assert "secret" not in json.dumps(detail.json())
+    assert detail.json()["runs"][0]["external_id"] == "validation-42"
+    assert "token:" not in detail.json()["runs"][0]["log_ref"]
+
+
+
+
+def test_dashboard_external_run_api_fixture_has_shipped_visibility_contract(client):
+    """The API fixture supplies every fact the distributed dashboard renders."""
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "UI external run", "assignee": "operator", "owner_kind": "external"},
+    )
+    task_id = created.json()["task"]["id"]
+    started = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/external-runs",
+        json={
+            "owner": "operator", "external_id": "ui-run-42", "phase": "validation",
+            "current": 3, "total": 10, "log_ref": "https://example.test/log",
+            "result_ref": "result://safe-reference",
+        },
+    )
+    assert started.status_code == 200, started.text
+    card = next(
+        item for column in client.get("/api/plugins/kanban/board").json()["columns"]
+        for item in column["tasks"] if item["id"] == task_id
+    )
+    assert card["external_run"] == {
+        **card["external_run"],
+        "owner": "operator", "external_id": "ui-run-42", "phase": "validation",
+        "current": 3, "total": 10, "heartbeat_status": "healthy",
+        "log_ref": "https://example.test/log", "result_ref": "result://safe-reference",
+    }
+    detail_run = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()["runs"][0]["external_run"]
+    assert detail_run is not None
+    assert {
+        key: detail_run[key]
+        for key in ("owner", "external_id", "phase", "current", "total", "heartbeat_status", "log_ref", "result_ref")
+    } == {
+        "owner": "operator", "external_id": "ui-run-42", "phase": "validation",
+        "current": 3, "total": 10, "heartbeat_status": "healthy",
+        "log_ref": "https://example.test/log", "result_ref": "result://safe-reference",
+    }
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = (repo_root / "plugins/kanban/dashboard/dist/index.js").read_text(encoding="utf-8")
+    css = (repo_root / "plugins/kanban/dashboard/dist/style.css").read_text(encoding="utf-8")
+    for token in (
+        "hermes-kanban-external-run-card", "External run", "external_id", "heartbeat_status",
+        "hermes-kanban-external-run-detail", "Log reference", "Result reference",
+    ):
+        assert token in bundle
+    for selector in (
+        ".hermes-kanban-external-run-card", ".hermes-kanban-external-run-detail",
+        ".hermes-kanban-external-run--healthy", ".hermes-kanban-external-run--stale",
+    ):
+        assert selector in css
+
+
+def test_dashboard_external_run_controls_enforce_board_owner_and_exactly_once_completion(client):
+    """Dashboard control routes use the DB CAS boundary for every external mutation."""
+    task_id = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "control", "assignee": "operator", "owner_kind": "external"},
+    ).json()["task"]["id"]
+    run_id = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/external-runs",
+        json={"owner": "operator", "external_id": "control-42"},
+    ).json()["run"]["id"]
+    heartbeat = client.post(
+        f"/api/plugins/kanban/external-runs/{run_id}/heartbeat",
+        json={"owner": "operator", "phase": "validation", "current": 3, "total": 10},
+    )
+    assert heartbeat.status_code == 200 and heartbeat.json()["run"]["current"] == 3
+    assert client.post(
+        f"/api/plugins/kanban/external-runs/{run_id}/transfer",
+        json={"from_owner": "operator", "to_owner": "reviewer"},
+    ).json()["run"]["owner"] == "reviewer"
+    kb.create_board("external-other")
+    denied = client.post(
+        f"/api/plugins/kanban/external-runs/{run_id}/heartbeat?board=external-other",
+        json={"owner": "reviewer", "phase": "spoof"},
+    )
+    assert denied.status_code == 404 and "external run not found" in denied.json()["detail"]
+    finished = client.post(
+        f"/api/plugins/kanban/external-runs/{run_id}/finish",
+        json={"owner": "reviewer", "outcome": "completed"},
+    )
+    assert finished.status_code == 200 and finished.json()["run"]["heartbeat_status"] == "finished"
+    duplicate = client.post(
+        f"/api/plugins/kanban/external-runs/{run_id}/finish",
+        json={"owner": "reviewer", "outcome": "completed"},
+    )
+    assert duplicate.status_code == 409
+    with kb.connect() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='completed'", (task_id,)
+        ).fetchone()[0] == 1
+
+
+def test_dashboard_create_persists_explicit_external_owner_and_provenance(client, monkeypatch):
+    """The API can deliberately create a durable external execution lane."""
+    monkeypatch.setenv("HERMES_PROFILE", "dashboard")
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "human publish handoff",
+            "assignee": "release-operator",
+            "owner_kind": "external",
+            "task_kind": "ordinary",
+            "purpose": "manual publish",
+            "created_by_task_id": "t_creator",
+            "created_by_run_id": 17,
+            "creation_authority": "dashboard",
+        },
+    )
+    assert r.status_code == 200, r.text
+    task_id = r.json()["task"]["id"]
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+    finally:
+        conn.close()
+    assert task is not None
+    assert task.owner_kind == "external"
+    assert task.task_kind == "ordinary"
+    assert task.purpose == "manual publish"
+    assert task.created_by_task_id == "t_creator"
+    assert task.created_by_run_id == 17
+    assert task.creation_authority == "dashboard"
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):
@@ -312,18 +530,18 @@ def test_reopening_parent_demotes_ready_child(client):
 
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kb.connect() as conn:
-        parent_id = kb.create_task(conn, title="parent", assignee="planner")
+        parent_id = kb.create_task(conn, title="parent", assignee="default")
         assert kb.complete_task(conn, parent_id)
         child_id = kb.create_task(
             conn,
             title="child in review",
-            assignee="reviewer",
+            assignee="default",
             parents=[parent_id],
         )
         grandchild_id = kb.create_task(
             conn,
             title="downstream",
-            assignee="writer",
+            assignee="default",
             parents=[child_id],
         )
         implementation = kb.claim_task(conn, child_id)
@@ -381,19 +599,19 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
 
 def test_reopening_parent_recursively_retracts_done_and_running_descendants(client):
     with kb.connect() as conn:
-        parent_id = kb.create_task(conn, title="root", assignee="planner")
+        parent_id = kb.create_task(conn, title="root", assignee="default")
         assert kb.complete_task(conn, parent_id)
         child_id = kb.create_task(
             conn,
             title="accepted child",
-            assignee="builder",
+            assignee="default",
             parents=[parent_id],
         )
         assert kb.complete_task(conn, child_id)
         grandchild_id = kb.create_task(
             conn,
             title="running grandchild",
-            assignee="writer",
+            assignee="default",
             parents=[child_id],
         )
         grandchild_run = kb.claim_task(conn, grandchild_id)
@@ -430,7 +648,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
 
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="active review", assignee="reviewer")
+        task_id = kb.create_task(conn, title="active review", assignee="default")
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
         assert kb.request_review(
@@ -448,7 +666,7 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
     )
     assert response.status_code == 200, response.text
     assert response.json()["task"]["status"] == "review"
-    assert response.json()["task"]["assignee"] == "reviewer"
+    assert response.json()["task"]["assignee"] == "default"
     with kb.connect() as conn:
         run = kb.latest_run(conn, task_id)
         assert run is not None
@@ -621,7 +839,9 @@ def test_bulk_status_ready(client):
     assert {a["id"], b["id"], c2["id"]}.issubset(ids)
 
 
-def test_bulk_review_assignment_preserves_implementer_provenance(client):
+def test_bulk_review_assignment_preserves_implementer_provenance(client, kanban_home):
+    for profile in ("builder", "reviewer"):
+        (kanban_home / "profiles" / profile).mkdir(parents=True, exist_ok=True)
     tasks = [
         client.post(
             "/api/plugins/kanban/tasks",
@@ -890,7 +1110,9 @@ def test_bulk_archive(client):
     assert b["id"] not in ids
 
 
-def test_bulk_reassign(client):
+def test_bulk_reassign(client, kanban_home):
+    for profile in ("old", "new"):
+        (kanban_home / "profiles" / profile).mkdir(parents=True, exist_ok=True)
     a = client.post("/api/plugins/kanban/tasks",
                     json={"title": "a", "assignee": "old"}).json()["task"]
     b = client.post("/api/plugins/kanban/tasks",
@@ -903,14 +1125,17 @@ def test_bulk_reassign(client):
         assert t["assignee"] == "new"
 
 
-def test_bulk_unassign_via_empty_string(client):
+def test_bulk_unassign_via_empty_string_demotes_implicit_agent_to_safe_manual_lane(client, kanban_home):
+    """Public unassign must not leave a dispatchable agent task ownerless."""
+    (kanban_home / "profiles" / "x").mkdir(parents=True, exist_ok=True)
     a = client.post("/api/plugins/kanban/tasks",
                     json={"title": "a", "assignee": "x"}).json()["task"]
     r = client.post("/api/plugins/kanban/tasks/bulk",
                     json={"ids": [a["id"]], "assignee": ""})
     assert r.status_code == 200
+    assert r.json()["results"] == [{"id": a["id"], "ok": True}]
     t = client.get(f"/api/plugins/kanban/tasks/{a['id']}").json()["task"]
-    assert t["assignee"] is None
+    assert (t["assignee"], t["owner_kind"], t["owner_kind_explicit"]) == (None, "no_agent", False)
 
 
 def test_bulk_partial_failure_doesnt_abort_siblings(client):
@@ -974,7 +1199,10 @@ def test_config_reads_dashboard_kanban_section(tmp_path, monkeypatch, client):
 
 def test_event_dict_includes_run_id(client):
     """GET /tasks/:id returns events with run_id populated."""
-    r = client.post("/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker"})
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "e", "assignee": "default", "owner_kind": "agent"},
+    )
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
@@ -1077,7 +1305,7 @@ def test_reclaim_endpoint_releases_running_claim(client):
     import secrets
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="running", assignee="x")
+        t = kb.create_task(conn, title="running", assignee="x", owner_kind="no_agent")
         lock = secrets.token_hex(8)
         future = int(time.time()) + 3600
         conn.execute(
@@ -1117,11 +1345,170 @@ def test_reclaim_endpoint_releases_running_claim(client):
         conn2.close()
 
 
+@pytest.mark.parametrize("task_kind", ["reviewer", "visualqa", "release"])
+def test_dashboard_rejects_gate_without_configured_authority(client, task_kind):
+    """Every mandatory gate kind fails closed without a coordinator."""
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "review gate", "assignee": "manual-reviewer", "task_kind": task_kind},
+    )
+    assert response.status_code == 400
+    assert "runtime HERMES_PROFILE" in response.json()["detail"]
+
+
+def test_dashboard_configured_coordinator_creates_gate(client, monkeypatch):
+    """The dashboard may create a gate only when it is the configured authority."""
+    Path(os.environ["HERMES_HOME"], "config.yaml").write_text(
+        "kanban:\n  coordinator_profile: dashboard\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_PROFILE", "dashboard")
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "release gate", "assignee": "release-operator", "task_kind": "release"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["task"]["id"]
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, response.json()["task"]["id"])
+    finally:
+        conn.close()
+    assert task is not None and task.task_kind == "release"
+    assert task.creation_authority == "dashboard"
+
+
+def test_dashboard_rejects_unknown_explicit_agent_owner(client, monkeypatch):
+    """Agent ownership cannot queue a nonexistent profile through the API."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: False)
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "missing worker", "assignee": "not-installed", "owner_kind": "agent"},
+    )
+    assert response.status_code == 400
+    assert "installed profile" in response.json()["detail"]
+
+
+def test_dashboard_creates_intentional_no_agent_lane(client):
+    """A manual dashboard card may be explicitly non-dispatchable."""
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "manual signoff", "assignee": "release-manager", "owner_kind": "no_agent"},
+    )
+    assert response.status_code == 200, response.text
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, response.json()["task"]["id"])
+    finally:
+        conn.close()
+    assert task is not None and task.owner_kind == "no_agent"
+    assert task.assignee == "release-manager"
+
+
+def test_dashboard_rejects_gate_authority_spoofing(client):
+    """The dashboard cannot claim another authority while creating a gate."""
+    Path(os.environ["HERMES_HOME"], "config.yaml").write_text(
+        "kanban:\n  coordinator_profile: dashboard\n", encoding="utf-8"
+    )
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "review gate",
+            "assignee": "manual-reviewer",
+            "task_kind": "reviewer",
+            "creation_authority": "spoofed-authority",
+        },
+    )
+    assert response.status_code == 400
+    assert "must equal dashboard" in response.json()["detail"]
+
+
+def test_dashboard_patch_rejects_owner_kind_only_mutation(client):
+    """An owner-kind field alone cannot be silently ignored by PATCH."""
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "manual lane", "assignee": "operator", "owner_kind": "external"},
+    )
+    task_id = created.json()["task"]["id"]
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}", json={"owner_kind": "agent"}
+    )
+    assert response.status_code == 400
+    assert "owner_kind is immutable" in response.json()["detail"]
+
+
+def test_dashboard_patch_rejects_owner_kind_mutation(client):
+    """PATCH assignment cannot bypass immutable execution ownership."""
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "manual lane", "assignee": "operator", "owner_kind": "external"},
+    )
+    task_id = created.json()["task"]["id"]
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={"assignee": "operator", "owner_kind": "agent"},
+    )
+    assert response.status_code == 400
+    assert "owner_kind is immutable" in response.json()["detail"]
+
+
+def test_dashboard_reassign_rejects_owner_kind_mutation(client):
+    """The API cannot turn a durable external lane into an agent-owned task."""
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "manual lane", "assignee": "operator", "owner_kind": "external"},
+    )
+    task_id = created.json()["task"]["id"]
+    response = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/reassign",
+        json={"profile": "operator", "owner_kind": "agent"},
+    )
+    assert response.status_code == 400
+    assert "owner_kind is immutable" in response.json()["detail"]
+
+
+def test_dashboard_single_unassign_demotes_explicit_agent_without_losing_explicitness(client, kanban_home):
+    """Explicit agent ownership becomes explicit no_agent, never ownerless work."""
+    (kanban_home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "explicit", "assignee": "worker", "owner_kind": "agent"},
+    )
+    task_id = created.json()["task"]["id"]
+    response = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"assignee": ""})
+    assert response.status_code == 200, response.text
+    task = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()["task"]
+    assert (task["assignee"], task["owner_kind"], task["owner_kind_explicit"]) == (None, "no_agent", True)
+    blocked = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/reassign",
+        json={"profile": "worker", "activate_agent": True},
+    )
+    assert blocked.status_code == 400
+    assert "implicit lane" in blocked.json()["detail"]
+
+
+def test_reassign_endpoint_can_explicitly_reactivate_only_implicit_unassigned_lane(client, kanban_home):
+    """A trusted routing action is required to turn a manual lane into agent work."""
+    (kanban_home / "profiles" / "worker").mkdir(parents=True, exist_ok=True)
+    created = client.post("/api/plugins/kanban/tasks", json={"title": "implicit", "assignee": "worker"})
+    task_id = created.json()["task"]["id"]
+    unassigned = client.post(f"/api/plugins/kanban/tasks/{task_id}/reassign", json={})
+    assert unassigned.status_code == 200, unassigned.text
+    activated = client.post(
+        f"/api/plugins/kanban/tasks/{task_id}/reassign",
+        json={"profile": "worker", "activate_agent": True},
+    )
+    assert activated.status_code == 200, activated.text
+    task = client.get(f"/api/plugins/kanban/tasks/{task_id}").json()["task"]
+    assert (task["assignee"], task["owner_kind"], task["owner_kind_explicit"]) == ("worker", "agent", False)
+
+
 def test_reassign_endpoint_switches_profile(client):
     """POST /tasks/<id>/reassign changes the assignee field."""
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="task", assignee="orig")
+        t = kb.create_task(conn, title="task", assignee="orig", owner_kind="no_agent")
     finally:
         conn.close()
 
@@ -1150,8 +1537,8 @@ def test_reassign_endpoint_switches_profile(client):
 def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="parent", assignee="alice")
-        real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
+        parent = kb.create_task(conn, title="parent", assignee="alice", owner_kind="no_agent")
+        real = kb.create_task(conn, title="real", assignee="x", owner_kind="no_agent", created_by="alice")
         import pytest as _pytest
         with _pytest.raises(kb.HallucinatedCardsError):
             kb.complete_task(

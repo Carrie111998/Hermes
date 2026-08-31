@@ -13,6 +13,7 @@ loop continues instead of exiting.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterable, Optional
 
@@ -47,6 +48,17 @@ def _tool_call_name(tc: Any) -> str:
     return str(getattr(tc, "name", "") or "")
 
 
+def _successful_process_transfer(msg: dict) -> bool:
+    """Whether a tool result records the process tool's durable handoff receipt."""
+    if str(msg.get("name") or "") != "process":
+        return False
+    try:
+        receipt = json.loads(str(msg.get("content") or ""))
+    except (TypeError, ValueError):
+        return False
+    return isinstance(receipt, dict) and receipt.get("status") == "transferred" and bool(receipt.get("run_id"))
+
+
 def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     """True if this conversation already invoked a terminal kanban tool."""
     if not messages:
@@ -60,6 +72,8 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
                 if _tool_call_name(tc) in _TERMINAL_KANBAN_TOOLS:
                     return True
         elif role == "tool":
+            if _successful_process_transfer(msg):
+                return True
             name = str(msg.get("name") or "")
             if name in _TERMINAL_KANBAN_TOOLS:
                 return True

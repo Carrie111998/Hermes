@@ -54,6 +54,17 @@ def test_nudge_when_no_terminal_tool(clear_kanban_env):
     assert "protocol violation" in nudge.lower() or "protocol" in nudge.lower()
 
 
+def test_no_nudge_after_successful_process_transfer(clear_kanban_env):
+    """A durable process transfer is an intentional terminal worker handoff."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {"role": "assistant", "tool_calls": [{"function": {"name": "process"}}]},
+        {"role": "tool", "name": "process", "content": '{"status":"transferred","run_id":9}'},
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+
+
 def test_no_nudge_after_kanban_complete(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
     messages = [

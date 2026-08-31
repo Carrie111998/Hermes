@@ -280,6 +280,41 @@
   gap: 0.55rem;
 }
 
+/* Durable external execution status is read-only visibility, not a control. */
+.hermes-kanban-external-run-card,
+.hermes-kanban-external-run-detail {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm, 0.25rem);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+.hermes-kanban-external-run-card {
+  padding: 0.1rem 0.3rem;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.hermes-kanban-external-run-detail {
+  padding: 0.45rem 0.55rem;
+  flex-direction: column;
+  align-items: stretch;
+}
+.hermes-kanban-external-run-head { font-weight: 600; }
+.hermes-kanban-external-run-phase,
+.hermes-kanban-external-run-progress { color: var(--color-foreground); }
+.hermes-kanban-external-run-heartbeat { text-transform: uppercase; font-size: 0.62rem; }
+.hermes-kanban-external-run--healthy {
+  border-color: color-mix(in srgb, #3fb97d 55%, var(--color-border));
+  background: color-mix(in srgb, #3fb97d 10%, transparent);
+}
+.hermes-kanban-external-run--stale {
+  border-color: color-mix(in srgb, var(--color-warning, #d4b348) 60%, var(--color-border));
+  background: color-mix(in srgb, var(--color-warning, #d4b348) 12%, transparent);
+}
+.hermes-kanban-external-run--finished { opacity: 0.75; }
+
 .hermes-kanban-priority {
   font-size: 0.6rem !important;
   padding: 0.05rem 0.3rem !important;

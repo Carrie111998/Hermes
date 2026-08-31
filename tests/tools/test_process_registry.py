@@ -1,12 +1,15 @@
 """Tests for tools/process_registry.py — ProcessRegistry query methods, pruning, checkpoint."""
 
 import json
+import io
 import os
 import signal
+import shlex
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -142,6 +145,340 @@ def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool
             return True
         time.sleep(interval)
     return False
+
+
+@pytest.mark.linux_only
+def test_sidecar_survives_sigkilled_parent_drains_output_and_publishes_receipt(tmp_path):
+    """The wrapper, not a killed registry parent, owns the output pipe."""
+    from tools import process_registry as pr
+    result, marker = tmp_path / "result.json", tmp_path / "marker"
+    sidecar = str(Path(pr.__file__).with_name("process_sidecar.py").resolve())
+    child = "import pathlib,time; print('delayed output',flush=True); time.sleep(.25); pathlib.Path(%r).write_text('done')" % str(marker)
+    argv = [sys.executable, sidecar, "--result", str(result), "--session-id", "proc-parent-death", "--", sys.executable, "-c", child]
+    helper = "import subprocess,time; p=subprocess.Popen(%r); print(p.pid,flush=True); time.sleep(30)" % argv
+    parent = subprocess.Popen([sys.executable, "-c", helper], stdout=subprocess.PIPE, text=True)
+    assert parent.stdout is not None and parent.stdout.readline().strip().isdigit()
+    os.kill(parent.pid, signal.SIGKILL); parent.wait(timeout=5)
+    assert _wait_until(marker.exists) and _wait_until(result.exists)
+    assert json.loads(result.read_text()) == {"exit_code": 0, "session_id": "proc-parent-death"}
+
+
+@pytest.mark.linux_only
+def test_sidecar_preserves_signal_receipt_and_uses_shell_signal_status(tmp_path):
+    """The transport status is conventional while its receipt stays lossless."""
+    from tools import process_registry as pr
+
+    result = tmp_path / "signal-result.json"
+    sidecar = str(Path(pr.__file__).with_name("process_sidecar.py").resolve())
+    child = "import os,signal; os.kill(os.getpid(), signal.SIGTERM)"
+    completed = subprocess.run(
+        [sys.executable, sidecar, "--result", str(result), "--session-id", "proc-signal", "--", sys.executable, "-c", child],
+        check=False,
+    )
+
+    assert completed.returncode == 128 + signal.SIGTERM
+    assert json.loads(result.read_text()) == {
+        "exit_code": -signal.SIGTERM,
+        "session_id": "proc-signal",
+    }
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("use_pty", [False, True])
+def test_live_registry_prefers_lossless_sidecar_signal_receipt(tmp_path, use_pty):
+    """Normal live completion reports the child's signal, not wrapper status."""
+    from tools import process_registry as pr
+
+    child = "import os,signal; os.kill(os.getpid(), signal.SIGTERM)"
+    registry = pr.ProcessRegistry()
+    session = registry.spawn_local(
+        f"{sys.executable} -c {shlex.quote(child)}", cwd=str(tmp_path),
+        use_pty=use_pty,
+    )
+    assert _wait_until(lambda: session.exited)
+
+    assert session.exit_code == -signal.SIGTERM
+
+
+@pytest.mark.linux_only
+def test_posix_sidecar_pty_preserves_outer_geometry_and_single_line_discipline(tmp_path):
+    """The durable wrapper must not insert a second independent PTY layer."""
+    from ptyprocess import PtyProcess
+    from tools import process_registry as pr
+
+    result = tmp_path / "pty-result.json"
+    sidecar = str(Path(pr.__file__).with_name("process_sidecar.py").resolve())
+    child = "stty size; IFS= read -r line; stty size; printf 'got:%s\\n' \"$line\""
+    proc = PtyProcess.spawn(
+        [sys.executable, sidecar, "--pty", "--result", str(result),
+         "--session-id", "proc-pty-fidelity", "--", "sh", "-c", child],
+        dimensions=(30, 120),
+    )
+    output = bytearray(proc.read(4096))
+    proc.setwinsize(40, 100)
+    proc.write(b"alpha\n")
+    while True:
+        try:
+            output.extend(proc.read(4096))
+        except EOFError:
+            break
+    proc.wait()
+
+    text = output.decode("utf-8", "replace")
+    assert "30 120\r\n" in text
+    assert "40 100\r\n" in text
+    assert "\r\r\n" not in text
+    assert text.count("alpha") == 2  # one terminal echo plus got:alpha
+    assert json.loads(result.read_text()) == {
+        "exit_code": 0,
+        "session_id": "proc-pty-fidelity",
+    }
+
+
+def test_checkpoint_serializes_snapshot_through_durable_write_and_preserves_newer_transfer(tmp_path, monkeypatch):
+    """A writer which snapshots first cannot land after a newer transfer."""
+    from tools import process_registry as pr
+    import utils
+
+    registry = pr.ProcessRegistry()
+    checkpoint = tmp_path / "processes.json"
+    session = _make_session(sid="proc-transfer-order", task_id="kanban-task")
+    session.pid = 1234
+    registry._running[session.id] = session
+    first_write_started = threading.Event()
+    second_writer_started = threading.Event()
+    release_first_write = threading.Event()
+    writes = []
+    real_write = utils.atomic_json_write
+
+    def controlled_write(path, entries):
+        writes.append(entries)
+        if len(writes) == 1:
+            first_write_started.set()
+            assert release_first_write.wait(5)
+        real_write(path, entries)
+
+    monkeypatch.setattr(pr, "CHECKPOINT_PATH", checkpoint)
+    monkeypatch.setattr(utils, "atomic_json_write", controlled_write)
+    older = threading.Thread(target=registry._write_checkpoint)
+    older.start()
+    assert first_write_started.wait(5)
+    with registry._lock:
+        session.external_run_owned = True
+        session.kanban_external_run_id = 77
+        session.kanban_board = "board-b"
+        session.kanban_external_owner = "owner-b"
+    def newer_writer():
+        second_writer_started.set()
+        registry._write_checkpoint()
+
+    newer = threading.Thread(target=newer_writer)
+    newer.start()
+    assert second_writer_started.wait(5)
+    assert len(writes) == 1
+    release_first_write.set()
+    older.join(5)
+    newer.join(5)
+    assert not older.is_alive() and not newer.is_alive()
+    final = json.loads(checkpoint.read_text())
+    assert final[0]["external_run_owned"] is True
+    assert final[0]["kanban_external_run_id"] == 77
+    assert final[0]["kanban_external_owner"] == "owner-b"
+
+
+def test_windows_conpty_relay_forwards_input_and_drains_pty_output_on_any_host():
+    """The platform-independent relay gives a real Windows child a TTY path."""
+    from tools import process_sidecar
+
+    writes = []
+    spawned = []
+    payload = "Yé日🚀"
+
+    class _FakeConPty:
+        exitstatus = 7
+
+        @classmethod
+        def spawn(cls, command):
+            spawned.append(command)
+            return cls()
+
+        def __init__(self):
+            self.chunks = ["prompt> ", "done\r\n"]
+
+        def isalive(self):
+            return bool(self.chunks)
+
+        def read(self, _size):
+            return self.chunks.pop(0)
+
+        def write(self, value):
+            writes.append(value)
+
+        def wait(self):
+            return self.exitstatus
+
+    class _Input:
+        def __init__(self):
+            self.stream = io.BytesIO(payload.encode("utf-8"))
+
+        def read(self, size):
+            return self.stream.read(size)
+
+    class _Output:
+        def __init__(self):
+            self.value = b""
+
+        def write(self, value):
+            self.value += value
+
+        def flush(self):
+            pass
+
+    output = _Output()
+    proc, threads, _ = process_sidecar._spawn_conpty(
+        ["interactive-command"], _FakeConPty, input_stream=_Input(), output_stream=output,
+    )
+    assert proc.exitstatus == 7
+    for thread in threads:
+        thread.join(timeout=2)
+    assert spawned == [["interactive-command"]]
+    assert "".join(writes[:-1]) == payload
+    assert writes[-1] == "\x04"
+    assert output.value == b"prompt> done\r\n"
+
+
+def test_sidecar_receipt_writer_tolerates_platform_without_fchmod(tmp_path, monkeypatch):
+    """The mandatory wrapper must write receipts on Windows-like platforms."""
+    from tools import process_sidecar
+
+    monkeypatch.delattr(process_sidecar.os, "fchmod", raising=False)
+    result = tmp_path / "result.json"
+    process_sidecar._write_result(result, "proc-win", 0)
+    assert json.loads(result.read_text()) == {"session_id": "proc-win", "exit_code": 0}
+
+
+def test_sidecar_module_does_not_require_posix_pty_on_windows():
+    """Importing the pipe-mode wrapper must not require Unix-only ``pty``."""
+    from tools import process_sidecar
+
+    script = "\n".join((
+        "import argparse, builtins, json, os, pathlib, runpy, signal, subprocess, sys, tempfile, threading",
+        "real_import = builtins.__import__",
+        "def reject_pty(name, *args, **kwargs):",
+        "    if name == 'pty': raise ImportError('pty unavailable')",
+        "    return real_import(name, *args, **kwargs)",
+        "os.name = 'nt'",
+        "builtins.__import__ = reject_pty",
+        "runpy.run_path(sys.argv[1], run_name='sidecar_windows_import_test')",
+    ))
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(Path(process_sidecar.__file__))],
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_sidecar_receipt_reader_rejects_missing_corrupt_and_accepts_nonzero(tmp_path, monkeypatch):
+    """Only exact receipt payloads can settle a recovered process."""
+    import tools.process_registry as pr
+    monkeypatch.setattr(pr.ProcessRegistry, "_durable_result_path", staticmethod(lambda _sid: tmp_path / "receipt.json"))
+    assert pr.ProcessRegistry._read_durable_result("proc-x", str(tmp_path / "receipt.json")) is None
+    (tmp_path / "receipt.json").write_text("not json")
+    assert pr.ProcessRegistry._read_durable_result("proc-x", str(tmp_path / "receipt.json")) is None
+    (tmp_path / "receipt.json").write_text(json.dumps({"session_id": "proc-x", "exit_code": 7}))
+    assert pr.ProcessRegistry._read_durable_result("proc-x", str(tmp_path / "receipt.json")) == 7
+
+
+@pytest.mark.linux_only
+def test_sidecar_pty_resolves_from_arbitrary_cwd_and_preserves_isatty(tmp_path):
+    """An absolute sidecar path and inner PTY preserve interactive semantics."""
+    from tools import process_registry as pr
+    registry = pr.ProcessRegistry()
+    session = registry.spawn_local(f"{sys.executable} -c 'import sys; print(sys.stdout.isatty())'", cwd=str(tmp_path), use_pty=True)
+    assert session._completion_event.wait(5)
+    assert "True" in session.output_buffer
+
+
+@pytest.mark.linux_only
+def test_registry_pty_immediate_input_keeps_geometry_and_single_echo(tmp_path):
+    """The public spawn return is a readiness boundary for the raw outer PTY."""
+    from tools import process_registry as pr
+
+    registry = pr.ProcessRegistry()
+    command = "stty size; IFS= read -r line; printf 'got:%s\\n' \"$line\""
+    session = registry.spawn_local(command, cwd=str(tmp_path), use_pty=True)
+    assert registry.submit_stdin(session.id, "alpha")["status"] == "ok"
+    assert session._completion_event.wait(5)
+
+    assert "30 120\r\n" in session.output_buffer
+    assert "\r\r\n" not in session.output_buffer
+    assert session.output_buffer.count("alpha") == 2
+
+
+@pytest.mark.windows_only
+def test_windows_sidecar_pty_preserves_isatty_and_publishes_durable_exit_receipt(tmp_path):
+    """Native Windows uses nested ConPTY, never the noninteractive pipe path."""
+    from tools import process_registry as pr
+
+    registry = pr.ProcessRegistry()
+    session = registry.spawn_local(
+        f'{sys.executable} -c "import sys; print(sys.stdin.isatty(), sys.stdout.isatty())"',
+        cwd=str(tmp_path), use_pty=True,
+    )
+    assert session._completion_event.wait(10)
+    assert "True True" in session.output_buffer
+    receipt = json.loads(Path(session.durable_result_path).read_text())
+    assert receipt == {"exit_code": 0, "session_id": session.id}
+
+
+@pytest.mark.linux_only
+def test_sidecar_pty_survives_parent_death_without_forwarding_hangup(tmp_path):
+    """Closing the outer PTY must not kill the durable inner process tree."""
+    from tools import process_registry as pr
+
+    sidecar_home = tmp_path / "hermes-home"
+    marker = tmp_path / "pty-survived"
+    child = (
+        "import pathlib,time; time.sleep(.5); print('after-parent',flush=True); "
+        f"pathlib.Path({str(marker)!r}).write_text('ok')"
+    )
+    command = f"{sys.executable} -c {shlex.quote(child)}"
+    helper_code = "\n".join((
+        "import sys, time",
+        "from tools.process_registry import ProcessRegistry",
+        "session = ProcessRegistry().spawn_local(sys.argv[1], cwd=sys.argv[2], use_pty=True)",
+        "print(session.durable_result_path, flush=True)",
+        "time.sleep(30)",
+    ))
+    helper = subprocess.Popen(
+        [sys.executable, "-c", helper_code, command, str(tmp_path)],
+        cwd=str(Path(pr.__file__).parents[1]), text=True, stdout=subprocess.PIPE,
+        env={**os.environ, "HERMES_HOME": str(sidecar_home)},
+    )
+    assert helper.stdout is not None
+    result = Path(helper.stdout.readline().strip())
+    assert result.parent == sidecar_home / "process-results"
+    os.kill(helper.pid, signal.SIGKILL)
+    helper.wait(timeout=5)
+    assert _wait_until(marker.exists) and _wait_until(result.exists)
+    assert json.loads(result.read_text())["exit_code"] == 0
+
+
+@pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("use_pty", [False, True])
+def test_sidecar_signal_forwarding_kills_child_tree_in_pipe_and_pty(tmp_path, use_pty):
+    """Killing the managed wrapper reaches its separate-session descendants."""
+    from tools import process_registry as pr
+    descendant = tmp_path / ("pty-child" if use_pty else "pipe-child")
+    child = "import pathlib,subprocess,sys,time; p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)']); pathlib.Path(%r).write_text(str(p.pid)); time.sleep(30)" % str(descendant)
+    registry = pr.ProcessRegistry()
+    session = registry.spawn_local(f"{sys.executable} -c {shlex.quote(child)}", cwd=str(tmp_path), use_pty=use_pty)
+    assert _wait_until(lambda: descendant.exists() and descendant.read_text().strip())
+    pid = int(descendant.read_text())
+    result = registry.kill_process(session.id, source="test_cleanup")
+    assert result["status"] == "killed", result
+    assert _wait_until(lambda: not pr.ProcessRegistry._is_host_pid_alive(pid))
 
 
 @pytest.mark.windows_only
@@ -886,9 +1223,8 @@ class TestSpawnRewriteCompoundBackground:
             registry.spawn_local("cd /app && node server.js &>/tmp/srv.log &", cwd="/tmp")
 
         assert len(captured_cmd) == 1
-        shell_cmd = captured_cmd[0]
-        # The command passed to Popen should be the REWRITTEN version
-        assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd[2]
+        # The wrapper's child shell receives the rewritten command.
+        assert "&& { node server.js &>/tmp/srv.log & }" in captured_cmd[0][-1]
 
     def test_simple_background_preserved(self, registry):
         """Simple cmd & (no &&) must NOT be rewritten — no subshell bug."""
@@ -911,9 +1247,8 @@ class TestSpawnRewriteCompoundBackground:
             registry.spawn_local("sleep 5 &", cwd="/tmp")
 
         assert len(captured_cmd) == 1
-        shell_cmd = captured_cmd[0][2]
-        # Simple background must remain as-is
-        assert "sleep 5 &" in shell_cmd
+        # Simple background must remain as-is in the wrapper's child shell.
+        assert "sleep 5 &" in captured_cmd[0][-1]
 
     def test_pty_path_uses_rewritten_command(self, registry):
         """PTY spawn path must also use the rewritten command (issue #68915)."""
@@ -939,8 +1274,8 @@ class TestSpawnRewriteCompoundBackground:
         assert mock_pty_module.PtyProcess.spawn.called, \
             "PTY spawn should have been attempted"
         pty_args = mock_pty_module.PtyProcess.spawn.call_args[0][0]
-        assert "&& { node server.js & }" in pty_args[2], \
-            f"PTY path should use rewritten command, got: {pty_args[2]}"
+        assert "&& { node server.js & }" in pty_args[-1], \
+            f"PTY path should use rewritten command, got: {pty_args[-1]}"
         assert session.command == "cd /app && node server.js &"
 
 
@@ -1831,8 +2166,9 @@ class TestSystemdCgroupIsolation:
             registry.spawn_local("echo hello", cwd="/tmp")
 
         argv = captured["argv"]
-        # No systemd-run wrapping — direct shell invocation.
-        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        # No systemd scope; the durable sidecar still invokes the exact shell.
+        assert "systemd-run" not in argv
+        assert argv[-3:] == ["/bin/bash", "-lic", "set +m; echo hello"], argv
         assert captured["start_new_session"] is True
 
     def test_falls_back_when_not_under_supervisor(self, registry, monkeypatch):
@@ -1858,7 +2194,8 @@ class TestSystemdCgroupIsolation:
             registry.spawn_local("echo hello", cwd="/tmp")
 
         argv = captured["argv"]
-        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert "systemd-run" not in argv
+        assert argv[-3:] == ["/bin/bash", "-lic", "set +m; echo hello"], argv
         assert captured["start_new_session"] is True
 
     @pytest.mark.parametrize("use_pty", [False, True])
@@ -1889,7 +2226,7 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
-            assert pty_spawn.call_args.args[0] == [
+            assert pty_spawn.call_args.args[0][-3:] == [
                 "/bin/bash", "-lic", "set +m; codex",
             ]
         else:
@@ -1900,7 +2237,7 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"] == [
+            assert captured["argv"][-3:] == [
                 "/bin/bash", "-lic", "set +m; echo hello",
             ]
             assert captured["start_new_session"] is True
@@ -1940,7 +2277,7 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("codex", cwd="/tmp", use_pty=True)
-            assert pty_spawn.call_args.args[0] == [
+            assert pty_spawn.call_args.args[0][-3:] == [
                 "/bin/bash", "-lic", "set +m; codex",
             ]
         else:
@@ -1951,7 +2288,7 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"] == [
+            assert captured["argv"][-3:] == [
                 "/bin/bash", "-lic", "set +m; echo hello",
             ]
             assert captured["start_new_session"] is True
