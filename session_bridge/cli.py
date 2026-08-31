@@ -174,10 +174,14 @@ _CHARACTERIZATION_PROVIDER_SELECTIONS: dict[str, tuple[str, ...]] = {
 # window, with the whole visibility lane dying at cli.py raise ProviderDegraded
 # BEFORE discovery. A stale pin does not announce itself: the status blob kept
 # serving a 21-hour-old degraded/bridge_conflict, which reads as a registrar
-# fault. 2.1.246 is what claude_registrar's screen model was actually measured
+# fault. Bumped again 2026-08-31 to 2.1.247: both Desktop harnesses replaced
+# their 2.1.246 runtime with 2.1.247, so the old pin could only refuse (the
+# lane was 100% dead on version_unpinned). The registrar's fail-closed screen
+# checks remain the guard against 2.1.247 TUI drift.
+# 2.1.246 is what claude_registrar's screen model was originally measured
 # against -- the two live TUI frames it was built on were captured 2026-08-25
 # and 2026-08-26 through this repo's own isolation argv on this CLI.
-_CLAUDE_VISIBILITY_PINNED_VERSION = "2.1.246"
+_CLAUDE_VISIBILITY_PINNED_VERSION = "2.1.247"
 _CLAUDE_VISIBILITY_VERSION_OUTPUTS = frozenset({
     _CLAUDE_VISIBILITY_PINNED_VERSION,
     f"{_CLAUDE_VISIBILITY_PINNED_VERSION} (Claude Code)",
