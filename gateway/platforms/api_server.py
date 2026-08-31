@@ -990,6 +990,8 @@ class APIServerAdapter(BasePlatformAdapter):
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
         max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+        agent_cfg = user_config.get("agent") or {}
+        max_tokens = agent_cfg.get("max_tokens") or None
 
         # Load fallback provider chain so the API server platform has the
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
@@ -999,6 +1001,7 @@ class APIServerAdapter(BasePlatformAdapter):
             model=model,
             **runtime_kwargs,
             max_iterations=max_iterations,
+            max_tokens=max_tokens,
             quiet_mode=True,
             verbose_logging=False,
             ephemeral_system_prompt=ephemeral_system_prompt or None,

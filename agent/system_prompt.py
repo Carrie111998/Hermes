@@ -198,14 +198,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # so the agent can correctly report which model it is (workaround for API bug).
     # Stable for the lifetime of an agent instance — model and provider are fixed
     # at construction time.
-    if agent.provider == "alibaba":
-        _model_short = agent.model.split("/")[-1] if "/" in agent.model else agent.model
-        stable_parts.append(
-            f"You are powered by the model named {_model_short}. "
-            f"The exact model ID is {agent.model}. "
-            f"When asked what model you are, always answer based on this information, "
-            f"not on any model name returned by the API."
-        )
+    _model_short = agent.model.split("/")[-1] if "/" in agent.model else agent.model
+    stable_parts.append(
+        f"You are powered by the model named {_model_short}. "
+        f"The exact model ID is {agent.model}. "
+        f"When asked what model you are, always answer based on this information, "
+        f"not on any model name returned by the API."
+    )
 
     # Environment hints (WSL, Termux, etc.) — tell the agent about the
     # execution environment so it can translate paths and adapt behavior.

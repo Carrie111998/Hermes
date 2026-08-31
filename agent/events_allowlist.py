@@ -1,6 +1,5 @@
 # GENERATED — do not edit
 # Source: packages/hermes-events/src/allowlist.ts
-# Regenerate: npm run sync:events-allowlist  (or python scripts/sync_events_allowlist.py)
 
 EVENT_ALLOWLIST = [
     "hermes.identity.bootstrap",
@@ -19,10 +18,6 @@ EVENT_ALLOWLIST = [
     "write.payload.created",
     "write.payload.updated",
     "write.payload.published",
-    "write.medusa.created",
-    "write.medusa.updated",
-    "write.twenty.created",
-    "write.twenty.updated",
     "approval.requested",
     "approval.granted",
     "approval.denied",

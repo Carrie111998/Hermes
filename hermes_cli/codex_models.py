@@ -12,9 +12,22 @@ import os
 logger = logging.getLogger(__name__)
 
 DEFAULT_CODEX_MODELS: List[str] = [
+    # gpt-5.6-sol/terra/luna added 2026-08-31 — the current GPT-5.6
+    # generation (GA since 2026-07-09 across ChatGPT/API/Codex/GitHub
+    # Copilot; confirmed live against this account's own
+    # ~/.codex/models_cache.json, priority 1/2/3 respectively). Operator
+    # calibration the same day: gpt-5.6-sol is reserved for design-tier
+    # work only (never a general default — OpenAI's own positioning names
+    # design as one of Sol's target domains); gpt-5.6-luna is the
+    # standard/default tier everywhere else for token efficiency;
+    # gpt-5.6-terra is the escalation tier for a task that genuinely needs
+    # more than Luna. See scripts/dispatch-codex.sh and
+    # docs/skills/platform/codex-agent/SKILL.md for the same calibration
+    # applied to the CLI dispatch path.
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-5.5",
-    "gpt-5.4-mini",
-    "gpt-5.4",
     "gpt-5.3-codex",
     # gpt-5.3-codex-spark is in research preview and is exposed *only* via
     # the Codex CLI / OAuth backend (chatgpt.com/backend-api/codex/models)
@@ -41,17 +54,33 @@ DEFAULT_CODEX_MODELS: List[str] = [
     # describe the public OpenAI API, not the OAuth-backed Codex backend
     # Hermes uses. Removed here. If OpenAI re-enables them on Codex backend,
     # live discovery will pick them up automatically via _fetch_models_from_api.
+    #
+    # NOTE 2026-08-31: gpt-5.4 and gpt-5.4-mini removed for the exact same
+    # reason as the paragraph above, this time confirmed by OpenAI itself —
+    # both retire from Codex on 2026-08-31T19:00:00Z (the `upgrade` field on
+    # each entry in ~/.codex/models_cache.json states this directly, and
+    # OpenAI's public migration guidance is explicit: replace gpt-5.4 with
+    # gpt-5.6-terra and gpt-5.4-mini with gpt-5.6-luna in saved
+    # configurations, custom agents, and scheduled tasks). Their official
+    # successors are already first-class entries above. Leaving the retiring
+    # slugs in this curated fallback would repeat the identical dead-slug
+    # bug this file already fixed once.
 ]
 
 _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
-    ("gpt-5.5", ("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex")),
-    ("gpt-5.4-mini", ("gpt-5.3-codex",)),
-    ("gpt-5.4", ("gpt-5.3-codex",)),
+    ("gpt-5.5", ("gpt-5.3-codex",)),
     # Surface Spark whenever any compatible Codex template is present so
     # accounts hitting the live endpoint with an older lineup still see
     # Spark in the picker. Backend gates real availability by ChatGPT Pro
     # entitlement; Hermes does not.
     ("gpt-5.3-codex-spark", ("gpt-5.3-codex",)),
+    # gpt-5.4 / gpt-5.4-mini template chains removed 2026-08-31 (see the
+    # DEFAULT_CODEX_MODELS note above) — both templates retire from Codex
+    # the same day, so synthesizing forward-compat entries off them would
+    # surface a dead slug that 400s on selection. gpt-5.6-sol/terra/luna
+    # need no synthetic chain: they are GA and already returned by live
+    # discovery / the local cache, which is what forward-compat synthesis
+    # exists to approximate when those are unavailable.
 ]
 
 
