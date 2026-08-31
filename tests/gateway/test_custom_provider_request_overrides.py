@@ -169,6 +169,102 @@ def test_turn_route_merges_fast_mode_with_provider_request_overrides():
     }
 
 
+@pytest.mark.parametrize("configured", [True, False])
+def test_resolve_runtime_agent_kwargs_preserves_parallel_tool_calls(
+    monkeypatch, configured
+):
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda: {
+            "api_key": "***",
+            "base_url": "https://example.test/v1",
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+            "request_overrides": {
+                "extra_body": {"include_reasoning": True},
+                "parallel_tool_calls": configured,
+            },
+        },
+    )
+
+    result = gateway_run._resolve_runtime_agent_kwargs()
+
+    assert result["request_overrides"] == {
+        "extra_body": {"include_reasoning": True},
+        "parallel_tool_calls": configured,
+    }
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_turn_route_preserves_parallel_tool_calls_without_fast_mode(configured):
+    runner = _make_runner()
+    runner._service_tier = None
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "https://example.test/v1",
+        "provider": "custom",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+        "request_overrides": {
+            "extra_body": {"include_reasoning": True},
+            "parallel_tool_calls": configured,
+        },
+    }
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner,
+        "hi",
+        "gpt-5.4",
+        runtime_kwargs,
+    )
+
+    assert route["request_overrides"] == {
+        "extra_body": {"include_reasoning": True},
+        "parallel_tool_calls": configured,
+    }
+
+
+@pytest.mark.parametrize("configured", [True, False])
+def test_turn_route_merges_fast_mode_with_parallel_tool_calls(configured):
+    runner = _make_runner()
+    runner._service_tier = "priority"
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "https://example.test/v1",
+        "provider": "custom",
+        "api_mode": "chat_completions",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+        "request_overrides": {
+            "extra_body": {"include_reasoning": True},
+            "parallel_tool_calls": configured,
+        },
+    }
+
+    with patch(
+        "hermes_cli.models.resolve_fast_mode_overrides",
+        return_value={"service_tier": "priority"},
+    ):
+        route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+            runner,
+            "hi",
+            "gpt-5.4",
+            runtime_kwargs,
+        )
+
+    assert route["request_overrides"] == {
+        "extra_body": {"include_reasoning": True},
+        "parallel_tool_calls": configured,
+        "service_tier": "priority",
+    }
+
+
 @pytest.mark.asyncio
 async def test_run_agent_preserves_provider_request_overrides_on_gateway_path(monkeypatch):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
