@@ -4064,6 +4064,25 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             agent._stream_diag_capture_response(_diag, response)
             agent._check_openrouter_cache_status(response)
             _writer_token["value"] = claim_stream_writer(agent)
+            if _stream_attempt_was_cancelled(stream_attempt_id):
+                # #98974: the interrupt/stale abort is a one-shot snapshot.
+                # When it fired during create()'s connect/TLS window the pool
+                # had no sockets yet (tcp_force_closed=0), so nothing stopped
+                # this request once the connection came up — on slow
+                # first-token providers the serve kept an inference lane busy
+                # until it finished generating into a dropped consumer.
+                # Response headers prove the socket now exists, so re-run the
+                # shutdown here. It is shutdown-only (never a cross-thread
+                # close), the worker unwinds exactly like it does after a
+                # stale_stream_kill, and a cancel arriving after this check is
+                # still covered by the original abort — the socket is now in
+                # the pool it scans.
+                request_client = attempt_request_client["value"]
+                if request_client is not None:
+                    agent._abort_request_openai_client(
+                        request_client,
+                        reason="cancelled_attempt_late_connect",
+                    )
 
         def _accept_stream_chunk(_chunk: Any) -> bool:
             # A stale-attempt fence can win while Relay is handing an

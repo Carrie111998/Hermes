@@ -406,3 +406,97 @@ def test_codex_stream_close_failure_on_primary_client_does_not_abort():
     assert final.output_text == "hello"
     assert stream.close_calls == 1
     abort_mock.assert_not_called()
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_cancelled_attempt_reaborts_when_stream_created(monkeypatch):
+    """#98974: the stranger-thread abort is a one-shot snapshot.
+
+    When the interrupt/stale abort fires while ``create()`` is still inside
+    its connect/TLS window, the pool has no sockets yet and the abort is a
+    no-op (``tcp_force_closed=0``). Nothing stops the request once the
+    connection comes up, so a slow-first-token provider keeps an inference
+    lane busy generating into a dropped consumer. When the response headers
+    finally arrive, ``_stream_created`` must re-run the socket shutdown on
+    the owning worker thread.
+    """
+    monkeypatch.setenv("HERMES_STREAM_STALE_TIMEOUT", "0.05")
+    agent = _make_agent()
+
+    def chunks():
+        yield _chunk(content="hello")
+        yield _chunk(finish_reason="stop")
+
+    stream = _FakeStream(chunks)
+    wire = _mock_wire_client(stream)
+    create_calls = {"n": 0}
+    abort_calls = []
+
+    def slow_first_create(**kwargs):
+        create_calls["n"] += 1
+        if create_calls["n"] == 1:
+            # Attempt 1 parks "inside connect": no socket exists in the pool
+            # yet, so the stale detector's abort below finds nothing to shut
+            # down — the exact window from #98974. Park well past two poll
+            # iterations (t.join(timeout=0.3)) so the detector fires while
+            # create() is still pending, deterministically.
+            time.sleep(1.0)
+        return stream
+
+    wire.chat.completions.create.side_effect = slow_first_create
+
+    with patch.object(
+        agent, "_create_request_openai_client", return_value=wire
+    ), patch.object(
+        agent, "_close_request_openai_client"
+    ), patch.object(
+        agent,
+        "_abort_request_openai_client",
+        side_effect=lambda client, *, reason: abort_calls.append(reason),
+    ), patch.object(agent, "_replace_primary_openai_client"):
+        response = agent._interruptible_streaming_api_call(
+            {
+                "model": "test/model",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        )
+
+    # The late abort fired once the cancelled attempt's stream was created,
+    # after the stale detector's no-op abort had already missed the window.
+    assert "cancelled_attempt_late_connect" in abort_calls
+    assert abort_calls.index("cancelled_attempt_late_connect") > abort_calls.index(
+        "stale_stream_kill"
+    )
+    # The retry attempt still succeeds — the late abort is scoped to the
+    # cancelled attempt, not to the follow-up request.
+    assert response is not None
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_active_attempt_is_not_aborted_when_stream_created():
+    """Fail-safe: a healthy stream must not be socket-aborted at creation."""
+    agent = _make_agent()
+
+    def chunks():
+        yield _chunk(content="hello")
+        yield _chunk(finish_reason="stop")
+
+    stream = _FakeStream(chunks)
+    wire = _mock_wire_client(stream)
+
+    with patch.object(
+        agent, "_create_request_openai_client", return_value=wire
+    ), patch.object(
+        agent, "_close_request_openai_client"
+    ), patch.object(
+        agent, "_abort_request_openai_client"
+    ) as abort_mock:
+        response = agent._interruptible_streaming_api_call(
+            {
+                "model": "test/model",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        )
+
+    abort_mock.assert_not_called()
+    assert response is not None
