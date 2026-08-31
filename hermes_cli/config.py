@@ -5579,6 +5579,112 @@ def _coerce_float(value: str):
     return f
 
 
+def _resolve_catalog_check_provider(key: str, user_config: dict) -> str:
+    """Best-effort static provider for a model-routing key's catalog check.
+
+    Mirrors the runtime resolution shapes (``_resolve_delegation_credentials``
+    in tools/delegate_tool.py, ``agent/auxiliary_client.py``) closely enough
+    for a typo warning, and returns "" whenever the provider cannot be
+    determined statically — direct endpoints (``base_url``), the auxiliary
+    ``auto`` chain (a runtime 6-level fallback), bare/legacy scalar sections,
+    and unknown shapes all bail out so the caller fails open.
+    """
+    k = key.strip().lower()
+    model_cfg = user_config.get("model")
+    model_provider = (
+        str(model_cfg.get("provider") or "").strip()
+        if isinstance(model_cfg, dict)
+        else ""
+    )
+    if k == "model.default":
+        if isinstance(model_cfg, dict) and str(model_cfg.get("base_url") or "").strip():
+            return ""
+        return model_provider
+    if k == "delegation.model":
+        dele = user_config.get("delegation")
+        if not isinstance(dele, dict):
+            # No delegation section yet (first write): fall through to the
+            # global provider — the runtime inherits the parent's provider.
+            dele = {}
+        if str(dele.get("base_url") or "").strip():
+            return ""
+        return str(dele.get("provider") or "").strip() or model_provider
+    m = re.fullmatch(r"auxiliary\.([a-z0-9_-]+)\.model", k)
+    if m:
+        aux_cfg = user_config.get("auxiliary")
+        task_cfg = aux_cfg.get(m.group(1)) if isinstance(aux_cfg, dict) else None
+        if not isinstance(task_cfg, dict):
+            return ""
+        p = str(task_cfg.get("provider") or "").strip()
+        if not p or p.lower() == "auto":
+            # "auto" resolves through a runtime fallback chain; a static
+            # catalog guess would misfire on legitimately-routed models.
+            return ""
+        return p
+    return ""
+
+
+def _maybe_warn_unknown_model_slug(
+    key: str, value: Any, user_config: dict, force: bool
+) -> None:
+    """Write-time typo guard for model-routing keys (#97656).
+
+    Warn (and confirm on an interactive TTY) when the value is absent from
+    the resolved provider's cached model catalog. Fail-open by design:
+    unknown/custom providers, catalog fetch errors, and empty catalogs never
+    block the write — the guard only fires when a non-empty catalog exists
+    and the slug (in full or first-segment-stripped form) is absent from it.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return
+    provider = _resolve_catalog_check_provider(key, user_config)
+    if not provider:
+        return
+    try:
+        from hermes_cli.providers import get_provider, normalize_provider
+
+        canonical = normalize_provider(provider)
+        if not canonical or get_provider(canonical, allow_network=False) is None:
+            # Custom/user-defined providers keep their own model namespaces.
+            return
+        from hermes_cli.models import cached_provider_model_ids
+
+        catalog_ids = cached_provider_model_ids(canonical)
+    except Exception as e:
+        # Fail-open by design; debug-level so a broken catalog path stays
+        # distinguishable from the expected unknown-provider bail-outs.
+        logger.debug("model catalog guard skipped for %s/%s: %s", key, provider, e)
+        return
+    if not catalog_ids:
+        return
+    slug = value.strip()
+    candidates = [slug]
+    if "/" in slug:
+        stripped = slug.split("/", 1)[1].strip()
+        if stripped:
+            candidates.append(stripped)
+    if any(c in catalog_ids for c in candidates):
+        return
+    print(
+        f'⚠ "{slug}" is not in provider "{canonical}"\'s model catalog '
+        f"({len(catalog_ids)} known models).",
+        file=sys.stderr,
+    )
+    if force or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    try:
+        answer = input(f"  Set {key} = {slug!r} anyway? [y/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt, OSError):
+        answer = ""
+    if answer not in ("y", "yes"):
+        print(
+            "✗ Skipped — value is not in the provider catalog "
+            "(use --force to write it anyway).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def set_config_value(key: str, value: str, force: bool = False):
     """Set a configuration value.
 
@@ -5784,6 +5890,11 @@ def set_config_value(key: str, value: str, force: bool = False):
                     file=sys.stderr,
                 )
                 sys.exit(1)
+    # Write-time typo guard for model-routing keys (#97656): warn + confirm
+    # when the slug is absent from the resolved provider's catalog. Runs after
+    # the bare-model redirect so ``config set model <slug>`` is covered too,
+    # and before _set_nested so a declined confirmation skips the write.
+    _maybe_warn_unknown_model_slug(key, value, user_config, force)
     _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
