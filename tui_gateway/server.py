@@ -4898,18 +4898,37 @@ def _cron_sig():
 
 
 def _sessions_sig():
-    """Newest mtime across state.db and its WAL — the cross-process change
-    signal. Messaging-gateway turns and cron runs are written by OTHER
-    processes that never touch this gateway's transports; the shared SQLite
-    file is the one thing they all move (#58671)."""
+    """Newest session-store mtime across every multiplexed profile.
+
+    Messaging-gateway turns, cron runs and bot-to-bot deliveries are written
+    by OTHER processes that never touch this gateway's transports. In a
+    multiplexed install each profile owns a separate SQLite store, so watching
+    only the active home leaves every sibling Bot Chat without a
+    ``sessions.changed`` signal.
+    """
     home = _watcher_home()
     sig = None
-    for name in ("state.db", "state.db-wal"):
-        try:
-            mtime = (home / name).stat().st_mtime_ns
-        except OSError:
-            continue
-        sig = mtime if sig is None else max(sig, mtime)
+    profiles_dir = home.parent if home.parent.name == "profiles" else home / "profiles"
+    roots = [home]
+    try:
+        resolved_profiles_dir = profiles_dir.resolve()
+        roots.extend(
+            path
+            for path in profiles_dir.iterdir()
+            if not path.is_symlink()
+            and path.is_dir()
+            and path.resolve().parent == resolved_profiles_dir
+        )
+    except OSError:
+        pass
+
+    for root in roots:
+        for name in ("state.db", "state.db-wal"):
+            try:
+                mtime = (root / name).stat().st_mtime_ns
+            except OSError:
+                continue
+            sig = mtime if sig is None else max(sig, mtime)
     return sig
 
 

@@ -66,6 +66,30 @@ export interface ActiveTranscriptRefreshDeps {
   ) => ClientSessionState
 }
 
+function sameSessionProfileRoute(left?: SessionProfileRoute, right?: SessionProfileRoute): boolean {
+  return (
+    left?.connectionId === right?.connectionId &&
+    left?.mode === right?.mode &&
+    left?.profile === right?.profile &&
+    left?.targetProfile === right?.targetProfile
+  )
+}
+
+function tileTranscriptSignatureKey(tile: {
+  ownerRoute?: SessionProfileRoute
+  storedSessionId: string
+  runtimeId?: string
+}): string {
+  return `tile:${JSON.stringify([
+    tile.storedSessionId,
+    tile.runtimeId ?? '',
+    tile.ownerRoute?.connectionId ?? '',
+    tile.ownerRoute?.profile ?? '',
+    tile.ownerRoute?.targetProfile ?? '',
+    tile.ownerRoute?.mode ?? ''
+  ])}`
+}
+
 /**
  * Reconcile the persisted transcripts of every open WORKSPACE TILE (#93942
  * slice 1). Bot canonical chats live here — never in $sessions /
@@ -92,7 +116,7 @@ export async function reconcileTileTranscripts({
   busyRef: MutableRefObject<boolean>
   requestSequenceRef: MutableRefObject<number>
   signatureRef: MutableRefObject<Map<string, string>>
-  tiles?: Array<{ storedSessionId: string; runtimeId?: string }>
+  tiles?: Array<{ ownerRoute?: SessionProfileRoute; storedSessionId: string; runtimeId?: string }>
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
@@ -100,6 +124,13 @@ export async function reconcileTileTranscripts({
   ) => ClientSessionState
 }): Promise<void> {
   const tiles = tilesOverride ?? $sessionTiles.get()
+  const liveSignatureKeys = new Set(tiles.filter(tile => tile.runtimeId).map(tileTranscriptSignatureKey))
+
+  for (const signatureKey of signatureRef.current.keys()) {
+    if (signatureKey.startsWith('tile:') && !liveSignatureKeys.has(signatureKey)) {
+      signatureRef.current.delete(signatureKey)
+    }
+  }
 
   for (const tile of tiles) {
     const storedSessionId = tile.storedSessionId
@@ -114,6 +145,14 @@ export async function reconcileTileTranscripts({
       continue
     }
 
+    const tileState = $sessionStates.get()[runtimeSessionId]
+
+    if (tileState?.busy || tileState?.awaitingResponse) {
+      // Tile submits keep their busy state local; never replace an optimistic
+      // prompt with an older durable snapshot while that turn is in flight.
+      continue
+    }
+
     if ($activeSessionId.get() === runtimeSessionId) {
       // The main pane reconcile already owns this surface.
       continue
@@ -121,25 +160,42 @@ export async function reconcileTileTranscripts({
 
     const requestId = ++requestSequenceRef.current
 
-    // With a tiles override (test path), the live $sessionTiles check can't
-    // see the synthetic tile — treat override tiles as present.
-    const stillPresent = tilesOverride
-      ? tilesOverride.some(t => t.storedSessionId === storedSessionId && t.runtimeId === runtimeSessionId)
-      : $sessionTiles.get().some(t => t.storedSessionId === storedSessionId && t.runtimeId === runtimeSessionId)
-
     try {
-      const latest = await getLatestSessionMessages(storedSessionId)
+      const profileScope: ProfileScope = tile.ownerRoute
+        ? {
+            connectionId: tile.ownerRoute.connectionId,
+            profile: tile.ownerRoute.targetProfile ?? tile.ownerRoute.profile
+          }
+        : undefined
 
-      if (requestId !== requestSequenceRef.current || busyRef.current || !stillPresent) {
+      const latest = await getLatestSessionMessages(storedSessionId, profileScope)
+
+      const currentTiles = tilesOverride ?? $sessionTiles.get()
+      const currentTileState = $sessionStates.get()[runtimeSessionId]
+
+      const stillPresent = currentTiles.some(
+        current =>
+          current.storedSessionId === storedSessionId &&
+          current.runtimeId === runtimeSessionId &&
+          sameSessionProfileRoute(current.ownerRoute, tile.ownerRoute)
+      )
+
+      if (
+        requestId !== requestSequenceRef.current ||
+        busyRef.current ||
+        currentTileState?.busy ||
+        currentTileState?.awaitingResponse ||
+        !stillPresent
+      ) {
         // Tile closed or superseded mid-read — discard AND prune its
         // signature so the map doesn't grow one entry per ever-opened tile
         // for the app's lifetime (#94255 review point 3).
-        signatureRef.current.delete(`tile:${storedSessionId}`)
+        signatureRef.current.delete(tileTranscriptSignatureKey(tile))
 
         continue
       }
 
-      const signatureKey = `tile:${storedSessionId}`
+      const signatureKey = tileTranscriptSignatureKey(tile)
       const signature = sessionMessagesSignature(latest.messages)
 
       if (signatureRef.current.get(signatureKey) === signature) {
