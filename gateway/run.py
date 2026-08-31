@@ -25906,6 +25906,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "3. Restore from a backup in ~/.hermes/backups/\n"
                 "Run `hermes doctor` for sanitized diagnostics."
             )
+        elif cause == "fts_index":
+            # FTS5 shadow-table failure with canonical tables verified
+            # healthy (#97794): the message store is intact — do NOT
+            # recommend .recover / backup restore on a healthy file.
+            message = (
+                "⚠️ Session search index (FTS5) reported corruption, but the "
+                "message database itself verified healthy. Messages are "
+                "persisted normally; search degrades to slower substring "
+                "matching until the index is rebuilt. Run `hermes doctor` "
+                "for diagnostics."
+            )
         else:
             message = (
                 f"⚠️ Session database unavailable — messages may not be persisted. "

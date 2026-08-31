@@ -154,6 +154,26 @@ def test_explanation_persistence_corrupt_cause_never_says_free_space():
     assert "full disk" not in lower
 
 
+def test_explanation_persistence_fts_index_cause_never_says_recover():
+    """An FTS-only failure must NOT recommend .recover / backup restore on
+    a healthy database — the #97794 false-alarm message. It must say the
+    transcript is safe and search degrades."""
+    out = AIAgent._format_turn_completion_explanation(
+        "session_persistence_failed", "fts_index"
+    )
+    lower = out.lower()
+    assert out.strip() != ""
+    assert "fts5" in lower or "search index" in lower
+    assert "transcript is safe" in lower
+    # Must NOT recommend the destructive recovery path on a healthy file:
+    # no numbered recovery options, no .recover, no "restore from backup".
+    assert "recovery options" not in lower
+    assert ".recover" not in lower
+    assert "restore from a backup" not in lower
+    assert "hermes doctor --fix" not in lower
+    assert "again" in lower
+
+
 def test_explanation_persistence_unknown_cause_is_neutral():
     """None/'unknown' cause must not claim disk-full — point at diagnostics."""
     for cause in (None, "unknown"):
@@ -305,12 +325,129 @@ def test_persistence_error_causes_tuple_matches_classifier():
         "Session 'abc' is being compressed by another writer",
         "Session turn lease lost; refusing transcript write for 'abc'",
         "database disk image is malformed",
+        'fts5: corrupt structure record for table "messages_fts"',
         "database or disk is full",
         "something else entirely",
         None,
     )
     for probe in probes:
         assert classify_persistence_error(probe) in PERSISTENCE_ERROR_CAUSES
+
+
+def test_classify_fts5_self_identifying_corruption_is_index_scoped():
+    """'fts5: corrupt structure record for table \"messages_fts\"' (and the
+    'fts5: corruption found reading blob ... from table \"messages_fts\"'
+    shape from #97794's evidence logs) names the FTS module and table, so it
+    is inherently index-scoped — never whole-file corruption."""
+    import sqlite3
+
+    from hermes_state import classify_persistence_error
+
+    assert (
+        classify_persistence_error(
+            sqlite3.DatabaseError(
+                'fts5: corrupt structure record for table "messages_fts"'
+            )
+        )
+        == "fts_index"
+    )
+    assert (
+        classify_persistence_error(
+            "fts5: corruption found reading blob 2061584302081 from table "
+            '"messages_fts"'
+        )
+        == "fts_index"
+    )
+    # The generic marker shape WITHOUT a db path stays conservative.
+    assert classify_persistence_error(
+        sqlite3.DatabaseError("database disk image is malformed")
+    ) == "corrupt"
+
+
+def test_classify_generic_marker_with_healthy_db_is_index_scoped(tmp_path):
+    """A generic corruption-marker error ('database disk image is malformed')
+    raised against a database whose canonical tables verify healthy is an
+    FTS-only failure: the classifier must fail open to 'fts_index' instead
+    of declaring whole-file corruption (#97794)."""
+    import sqlite3
+
+    from hermes_state import SessionDB, classify_persistence_error
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    try:
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="hello world")
+    finally:
+        db.close()
+
+    exc = sqlite3.DatabaseError("database disk image is malformed")
+    exc.db_path = str(db_path)
+    assert classify_persistence_error(exc) == "fts_index"
+
+
+def test_classify_generic_marker_with_structural_damage_stays_corrupt(tmp_path):
+    """When integrity_check damage maps to a canonical (non-FTS) object, the
+    generic marker must keep classifying as whole-file 'corrupt' — the
+    verification probe must never downgrade real structural damage."""
+    import sqlite3
+
+    from hermes_state import SessionDB, classify_persistence_error
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    try:
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="hello world")
+    finally:
+        db.close()
+
+    # Make a canonical index genuinely stale (empty b-tree under a full
+    # definition) so integrity_check reports structural damage.
+    raw = sqlite3.connect(str(db_path))
+    orig_sql = raw.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_messages_session_id'"
+    ).fetchone()[0]
+
+    def _set_index_sql(conn, sql):
+        conn.execute("PRAGMA writable_schema=ON")
+        conn.execute(
+            "UPDATE sqlite_master SET sql=? WHERE type='index' "
+            "AND name='idx_messages_session_id'",
+            (sql,),
+        )
+        ver = conn.execute("PRAGMA schema_version").fetchone()[0]
+        conn.execute(f"PRAGMA schema_version={ver + 1}")
+        conn.execute("PRAGMA writable_schema=OFF")
+        conn.commit()
+
+    _set_index_sql(raw, orig_sql + " WHERE 0")
+    raw.close()
+    raw = sqlite3.connect(str(db_path))
+    raw.execute("REINDEX idx_messages_session_id")
+    raw.commit()
+    _set_index_sql(raw, orig_sql)
+    raw.close()
+
+    exc = sqlite3.DatabaseError("database disk image is malformed")
+    exc.db_path = str(db_path)
+    assert classify_persistence_error(exc) == "corrupt"
+
+
+def test_classify_generic_marker_without_db_path_stays_corrupt():
+    """Without a resolvable db path the classifier cannot verify scope and
+    must keep the conservative 'corrupt' verdict — never worse than before."""
+    import sqlite3
+
+    from hermes_state import classify_persistence_error
+
+    assert classify_persistence_error(
+        sqlite3.DatabaseError("database disk image is malformed")
+    ) == "corrupt"
+    assert classify_persistence_error(
+        "database disk image is malformed"
+    ) == "corrupt"
 
 
 # --------------------------------------------------------------------------

@@ -29,6 +29,7 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.parse
 import weakref
 from collections import deque
 from contextlib import contextmanager
@@ -1855,6 +1856,7 @@ PERSISTENCE_ERROR_CAUSES = (
     "compression_closed",
     "turn_lease",
     "corrupt",
+    "fts_index",
     "disk",
     "unknown",
 )
@@ -1900,6 +1902,12 @@ def classify_persistence_error(exc_or_str) -> str:
       (``database disk image is malformed`` / SQLITE_NOTADB).  Distinct from
       ``"disk"``: freeing space cannot help, the user needs the repair path
       (``hermes doctor`` / automatic schema surgery).
+    * ``"fts_index"`` — the corruption markers came from the FTS5 shadow
+      tables (``messages_fts*``) while the canonical tables verify healthy
+      (``PRAGMA integrity_check`` + ``sqlite_master`` mapping, the #88587
+      pattern). The index layer is broken, not the database file: search
+      degrades to LIKE and the turn must NOT fail closed with destructive
+      recovery advice (#97794).
     * ``"disk"``    — disk full / read-only / permission-shaped failures
       (delegates the disk-full patterns to :func:`is_disk_full_error` so the
       two classifiers can never drift apart — e.g. ENOSPC).
@@ -1925,11 +1933,32 @@ def classify_persistence_error(exc_or_str) -> str:
         return "compression_closed"
     if "being compressed" in text or "compression lease" in text:
         return "compression"
+    # FTS5 self-identifying corruption: "fts5: corrupt structure record for
+    # table \"messages_fts\"" / "fts5: corruption found reading blob ... from
+    # table \"messages_fts\"" (the exact shapes in #97794's evidence logs).
+    # The message names the FTS module and table, so it is inherently
+    # index-scoped — no whole-file verification needed, and the turn must
+    # fail open (search degrades to LIKE) rather than recommend .recover /
+    # backup restore on a healthy file.
+    if "fts5" in text and "corrupt" in text:
+        return "fts_index"
     # Structural corruption BEFORE the lock and disk buckets: "database disk
     # image is malformed" contains "disk" (and some wrapped corruption
     # strings mention "locked" recovery attempts), so later buckets would
     # steal it and misdiagnose damage as space/contention.
     if any(marker in text for marker in _DB_CORRUPTION_MARKERS):
+        # The markers also fire for FTS5 shadow-table failures
+        # (SQLITE_NOTADB / "malformed" from messages_fts*), which are NOT
+        # structural damage to the canonical tables. Verify against the
+        # database before declaring whole-file corruption: when the
+        # canonical tables check out, the failure is index-scoped and the
+        # turn must fail open (search degrades to LIKE) instead of
+        # recommending .recover / backup restore on a healthy file
+        # (#97794). The probe is best-effort and read-only; any probe
+        # failure keeps the conservative "corrupt" verdict.
+        if _db_path_from_error(exc_or_str) is not None:
+            if _db_has_only_fts_damage(_db_path_from_error(exc_or_str)):
+                return "fts_index"
         return "corrupt"
     if (
         "locked" in text
@@ -1944,6 +1973,124 @@ def classify_persistence_error(exc_or_str) -> str:
     ):
         return "disk"
     return "unknown"
+
+
+# FTS5 shadow-table names (virtual table + its shadow b-trees).  Used to
+# decide whether integrity_check damage is index-scoped or structural: a
+# damaged object whose name is NOT in this set (or is not a canonical
+# table/index) means the database file itself is damaged.
+_FTS_OBJECT_NAMES = frozenset({
+    "messages_fts",
+    "messages_fts_data",
+    "messages_fts_idx",
+    "messages_fts_content",
+    "messages_fts_docsize",
+    "messages_fts_config",
+    "messages_fts_trigram",
+    "messages_fts_trigram_data",
+    "messages_fts_trigram_idx",
+    "messages_fts_trigram_content",
+    "messages_fts_trigram_docsize",
+    "messages_fts_trigram_config",
+    "messages_fts_cjk",
+    "messages_fts_cjk_data",
+    "messages_fts_cjk_idx",
+    "messages_fts_cjk_content",
+    "messages_fts_cjk_docsize",
+    "messages_fts_cjk_config",
+})
+
+# integrity_check damage-line shapes (the #88587 pattern):
+#   "fts5: corrupt structure record for table \"messages_fts\"" — FTS5
+#     corruption names its table directly (observed on this box's SQLite).
+#   "row N missing from index <name>" / "wrong # of entries in index <name>"
+#   "Page N: ..." / "tree N is ..." / "freelist ..." — b-tree damage lines
+#     whose object is resolved through sqlite_master.rootpage.
+_TABLE_DAMAGE_RE = re.compile(r'for table "([^"]+)"', re.IGNORECASE)
+_TREE_DAMAGE_RE = re.compile(r"\btree (\d+)", re.IGNORECASE)
+_PAGE_DAMAGE_RE = re.compile(r"\bpage (\d+)", re.IGNORECASE)
+_MISSING_INDEX_RE = re.compile(
+    r"(?:row \d+ missing from index|wrong # of entries in index)\s+(\S+)",
+    re.IGNORECASE,
+)
+
+
+def _db_path_from_error(exc_or_str) -> Optional[Path]:
+    """Best-effort state.db path from a persistence error.
+
+    The classifier receives exceptions raised by SessionDB methods, which
+    carry the resolved ``db_path`` attribute; RPC-wrapped strings and
+    foreign exceptions have no path and keep the conservative ``corrupt``
+    verdict (the probe is an optimization, never a requirement).
+    """
+    path = getattr(exc_or_str, "db_path", None)
+    if path is None:
+        return None
+    try:
+        return Path(path)
+    except (TypeError, ValueError):
+        return None
+
+
+def _db_has_only_fts_damage(db_path: Path) -> bool:
+    """True when integrity_check damage is confined to the FTS5 shadow set.
+
+    Read-only, best-effort probe (the #88587 pattern): runs
+    ``PRAGMA integrity_check`` on a fresh connection and maps every damaged
+    b-tree through ``sqlite_master.rootpage`` (and parses
+    ``row N missing from index <name>`` lines).  Returns True when the
+    canonical tables verify healthy — either no damage at all (the
+    corruption marker came from an FTS operation on a healthy file) or
+    damage confined to FTS shadow tables/indexes.  Any probe failure
+    (unreadable file, unparseable damage, unmapped tree id) returns False
+    so callers keep the conservative ``corrupt`` verdict — never worse
+    than before.
+    """
+    try:
+        conn = sqlite3.connect(
+            f"file:{urllib.parse.quote(str(db_path))}?mode=ro", uri=True
+        )
+        try:
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+            problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+            if not problems:
+                return True
+            master = {
+                int(row[0]): str(row[1])
+                for row in conn.execute(
+                    "SELECT rootpage, name FROM sqlite_master WHERE rootpage > 0"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+
+    for line in problems:
+        table_match = _TABLE_DAMAGE_RE.search(line)
+        if table_match:
+            if table_match.group(1) not in _FTS_OBJECT_NAMES:
+                return False
+            continue
+        tree_match = _TREE_DAMAGE_RE.search(line)
+        if tree_match:
+            name = master.get(int(tree_match.group(1)))
+            if name is None or name not in _FTS_OBJECT_NAMES:
+                return False
+            continue
+        page_match = _PAGE_DAMAGE_RE.search(line)
+        if page_match:
+            # Page-level damage cannot be attributed to an object without
+            # walking the page map — treat it as structural (conservative).
+            return False
+        index_match = _MISSING_INDEX_RE.search(line)
+        if index_match:
+            if index_match.group(1) not in _FTS_OBJECT_NAMES:
+                return False
+            continue
+        # Unparseable damage line — fail closed toward "corrupt".
+        return False
+    return True
 
 
 def _claim_repair_attempt(db_path: Path) -> bool:
@@ -11220,9 +11367,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # a sibling process legitimately holding the write lock for seconds
         # (VACUUM, TRUNCATE checkpoint at close, an older pre-bounded-merge
         # process's FTS optimize) can't destroy a healthy turn (#74478).
-        return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
-        )
+        try:
+            return self._execute_write(
+                _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+            )
+        except sqlite3.Error as exc:
+            # Attach the resolved db path so classify_persistence_error can
+            # verify whether corruption markers came from the FTS shadow
+            # tables or the canonical file before declaring whole-file
+            # corruption (#97794). Best-effort: sqlite3.Error instances
+            # accept attributes, but never let the annotation itself mask
+            # the original failure.
+            try:
+                exc.db_path = str(self.db_path)
+            except Exception:
+                pass
+            raise
 
     def append_messages_batch(
         self,
@@ -11314,9 +11474,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
-        return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
-        )
+        try:
+            return self._execute_write(
+                _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+            )
+        except sqlite3.Error as exc:
+            # Same db_path annotation as append_message (#97794).
+            try:
+                exc.db_path = str(self.db_path)
+            except Exception:
+                pass
+            raise
 
     def set_latest_matching_message_display_kind(
         self, session_id: str, *, role: str, content: str, display_kind: str,

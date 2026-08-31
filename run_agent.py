@@ -4055,6 +4055,16 @@ class AIAgent:
                     "3. Restore from a backup in ~/.hermes/backups/\n"
                     "Then send your message again."
                 )
+            if cause == "fts_index":
+                return (
+                    prefix + "the turn was stopped because the session search "
+                    "index (FTS5) reported corruption while the message "
+                    "database itself verified healthy. Your transcript is "
+                    "safe — no recovery or backup restore is needed. "
+                    "Search temporarily degrades to slower substring "
+                    "matching until the index is rebuilt; send your "
+                    "message again."
+                )
             if cause == "disk":
                 return (
                     prefix
