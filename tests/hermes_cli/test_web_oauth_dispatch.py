@@ -37,6 +37,17 @@ client = TestClient(app)
 HEADERS = {"X-Hermes-Session-Token": _SESSION_TOKEN}
 
 
+class _ResponseStream:
+    def __init__(self, response):
+        self.response = response
+
+    def __enter__(self):
+        return self.response
+
+    def __exit__(self, *args):
+        return False
+
+
 def _make_profile_home(tmp_path, monkeypatch, profile="coder"):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     profile_home = tmp_path / "profiles" / profile
@@ -217,13 +228,15 @@ def test_oauth_session_cannot_be_polled_or_cancelled_from_another_profile(
 
 
 
-def test_codex_dashboard_start_rewords_device_authorization_error(monkeypatch):
+@pytest.mark.parametrize("provider_status", [400, 429])
+def test_codex_dashboard_start_rewords_device_authorization_error(monkeypatch, provider_status):
     from hermes_cli import web_server as ws
 
     before_sessions = set(ws._oauth_sessions)
 
     class _Resp:
-        status_code = 400
+        status_code = provider_status
+        headers = {}
         text = "Enable device code authorization"
 
         def json(self):
@@ -233,6 +246,9 @@ def test_codex_dashboard_start_rewords_device_authorization_error(monkeypatch):
                     "code": "device_authorization_not_enabled",
                 }
             }
+
+        def iter_bytes(self):
+            yield json.dumps(self.json()).encode()
 
     class _Client:
         def __init__(self, *args, **kwargs):
@@ -244,9 +260,12 @@ def test_codex_dashboard_start_rewords_device_authorization_error(monkeypatch):
         def __exit__(self, *args):
             return False
 
-        def post(self, url, **kwargs):
+        def stream(self, method, url, **kwargs):
             assert url.endswith("/deviceauth/usercode")
-            return _Resp()
+            return _ResponseStream(_Resp())
+
+        def post(self, url, **kwargs):
+            return self.stream("POST", url, **kwargs).response
 
     monkeypatch.setattr(httpx, "Client", _Client)
 
@@ -265,6 +284,66 @@ def test_codex_dashboard_start_rewords_device_authorization_error(monkeypatch):
     finally:
         for sid in set(ws._oauth_sessions) - before_sessions:
             ws._oauth_sessions.pop(sid, None)
+
+
+@pytest.mark.parametrize(
+    ("responses", "label"),
+    [
+        ([{"user_code": "code", "device_auth_id": "dev", "pad": "x" * 300}], "dashboard device code"),
+        (
+            [
+                {"user_code": "code", "device_auth_id": "dev", "interval": 0},
+                {"authorization_code": "code", "code_verifier": "verifier", "pad": "x" * 300},
+            ],
+            "dashboard device auth poll",
+        ),
+        (
+            [
+                {"user_code": "code", "device_auth_id": "dev", "interval": 0},
+                {"authorization_code": "code", "code_verifier": "verifier"},
+                {"access_token": "at", "refresh_token": "rt", "pad": "x" * 300},
+            ],
+            "dashboard token exchange",
+        ),
+    ],
+)
+def test_codex_dashboard_worker_bounds_each_json_response(tmp_path, monkeypatch, responses, label):
+    from hermes_cli import auth as auth_mod
+    from hermes_cli import web_server as ws
+
+    class _Resp:
+        status_code = 200
+        headers = {}
+
+        def __init__(self, payload):
+            self.body = json.dumps(payload).encode()
+
+        def iter_bytes(self):
+            yield self.body
+
+        def json(self):
+            return json.loads(self.body)
+
+    queued = iter(_Resp(payload) for payload in responses)
+
+    class _Client:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def post(self, *args, **kwargs): return next(queued)
+        def stream(self, *args, **kwargs): return _ResponseStream(next(queued))
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(httpx, "Client", lambda *args, **kwargs: _Client())
+    monkeypatch.setattr(ws.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(auth_mod, "CODEX_AUTH_JSON_BODY_MAX_BYTES", 256, raising=False)
+    monkeypatch.setattr(auth_mod, "_save_codex_tokens", lambda _tokens: None)
+
+    sid, _ = ws._new_oauth_session("openai-codex", "device_code")
+    try:
+        ws._codex_full_login_worker(sid)
+        assert f"{label} response exceeded 256 bytes" in ws._oauth_sessions[sid]["error_message"]
+    finally:
+        ws._oauth_sessions.pop(sid, None)
 
 
 def test_codex_dashboard_worker_stops_polling_after_cancel(tmp_path, monkeypatch):
@@ -289,9 +368,13 @@ def test_codex_dashboard_worker_stops_polling_after_cancel(tmp_path, monkeypatch
         def __init__(self, status_code, payload):
             self.status_code = status_code
             self._payload = payload
+            self.headers = {}
 
         def json(self):
             return self._payload
+
+        def iter_bytes(self):
+            yield json.dumps(self._payload).encode()
 
     class _Client:
         def __init__(self, *args, **kwargs):
@@ -303,16 +386,19 @@ def test_codex_dashboard_worker_stops_polling_after_cancel(tmp_path, monkeypatch
         def __exit__(self, *args):
             return False
 
-        def post(self, url, **kwargs):
+        def stream(self, method, url, **kwargs):
             if url.endswith("/deviceauth/usercode"):
-                return _Resp(200, {
+                return _ResponseStream(_Resp(200, {
                     "device_auth_id": "device-auth-id",
                     "interval": 3,
                     "user_code": "CODEX-1234",
-                })
+                }))
             raise AssertionError(
                 f"worker must stop before calling {url} once cancelled"
             )
+
+        def post(self, url, **kwargs):
+            return self.stream("POST", url, **kwargs).response
 
     saved = []
     _make_profile_home(tmp_path, monkeypatch, profile="coder")
@@ -362,9 +448,13 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
         def __init__(self, status_code, payload):
             self.status_code = status_code
             self._payload = payload
+            self.headers = {}
 
         def json(self):
             return self._payload
+
+        def iter_bytes(self):
+            yield json.dumps(self._payload).encode()
 
     class _Client:
         def __init__(self, *args, **kwargs):
@@ -376,21 +466,31 @@ def test_codex_worker_final_save_is_atomic_with_cancel_delete(tmp_path, monkeypa
         def __exit__(self, *args):
             return False
 
-        def post(self, url, **kwargs):
+        def stream(self, method, url, **kwargs):
             if url.endswith("/deviceauth/usercode"):
-                return _Resp(200, {
+                response = _Resp(200, {
                     "device_auth_id": "device-auth-id",
                     "interval": 0,
                     "user_code": "CODEX-1234",
                 })
-            return _Resp(200, {
-                "authorization_code": "auth-code",
-                "code_verifier": "verifier",
-            })
+            else:
+                response = _Resp(200, {
+                    "authorization_code": "auth-code",
+                    "code_verifier": "verifier",
+                })
+            return _ResponseStream(response)
+
+        def post(self, url, **kwargs):
+            return self.stream("POST", url, **kwargs).response
 
     class _TokenClient(_Client):
+        def stream(self, method, url, **kwargs):
+            return _ResponseStream(
+                _Resp(200, {"access_token": "at", "refresh_token": "rt"})
+            )
+
         def post(self, url, **kwargs):
-            return _Resp(200, {"access_token": "at", "refresh_token": "rt"})
+            return self.stream("POST", url, **kwargs).response
 
     clients = iter([_Client, _Client, _TokenClient])
     _make_profile_home(tmp_path, monkeypatch, profile="coder")
