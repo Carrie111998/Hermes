@@ -44,6 +44,7 @@ _cron_default_profile = late("_cron_default_profile")
 _cron_profile_home = late("_cron_profile_home")
 _import_sessions_for_profile = late("_import_sessions_for_profile")
 _maybe_auto_archive_for_profile = late("_maybe_auto_archive_for_profile")
+_open_matching_session_store = late("_open_matching_session_store")
 _open_session_db_for_profile = late("_open_session_db_for_profile")
 _prune_sessions = late("_prune_sessions")
 _read_session_import_body = late("_read_session_import_body")
@@ -560,22 +561,21 @@ async def get_session_stats(profile: Optional[str] = None):
 
 @manage_router.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str, profile: Optional[str] = None):
-    db = _open_session_db_for_profile(profile, read_only=True)
+    # Bot chats live in ``profiles/<bot>/state.db``. Desktop resume often
+    # omits ``?profile=``, so the historical single-store open 404'd while
+    # the sibling /messages path (and the sidebar list) still found the
+    # row. Search the requested/current store first, then every other
+    # local profile, and stamp the profile that actually held the row
+    # (#94609).
+    sid, db, owning = _open_matching_session_store(session_id, profile)
+    if db is None:
+        raise HTTPException(status_code=404, detail="Session not found")
     try:
-        sid = db.resolve_session_id(session_id)
-        session = db.get_session(sid) if sid else None
+        session = db.get_session(sid)
         if not session:
             raise HTTPException(status_code=404, detail="Session not found")
-        # Always stamp the owning profile — the serving profile is known even
-        # when the request carries no ``?profile=`` (it's this process's own
-        # profile). Stamping only on explicit ``?profile=`` left rows for the
-        # default/primary profile systematically unowned, so multi-profile
-        # clients resolved them to whichever gateway happened to be active
-        # (cross-profile open asymmetry, #67603 family).
-        session["profile"] = (
-            _cron_profile_home(profile)[0] if profile else _cron_default_profile()
-        )
-        session["is_default_profile"] = session["profile"] == "default"
+        session["profile"] = owning
+        session["is_default_profile"] = owning == "default"
         return session
     finally:
         db.close()
@@ -587,7 +587,9 @@ async def get_session_latest_descendant(
     profile: Optional[str] = None,
 ):
     def _lookup():
-        db = _open_session_db_for_profile(profile, read_only=True)
+        _sid, db, _owning = _open_matching_session_store(session_id, profile)
+        if db is None:
+            return None, []
         try:
             return _session_latest_descendant(session_id, db)
         finally:
@@ -620,12 +622,16 @@ async def get_session_messages(
         )
 
     def _read():
-        db = _open_session_db_for_profile(profile, read_only=True)
+        # Same cross-profile fallback as get_session_detail: a bot transcript
+        # must resolve even when the client omitted the owning profile.
+        # On current main this endpoint was still single-store (the issue
+        # text assumed otherwise); keep the two GET-by-id reads aligned.
+        sid, db, _owning = _open_matching_session_store(
+            session_id, profile, resolve_resume=True
+        )
+        if db is None:
+            return None
         try:
-            sid = db.resolve_session_id(session_id)
-            if not sid:
-                return None
-            sid = db.resolve_resume_session_id(sid)
             # Always page this endpoint. An omitted limit used to load an
             # entire transcript, which can be hundreds of thousands of rows
             # for a runaway session and exhaust the dashboard process. Keep

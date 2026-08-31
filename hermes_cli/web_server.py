@@ -12427,6 +12427,88 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
     return _open_session_db_at_path(db_path, read_only=read_only)
 
 
+def _session_lookup_targets(
+    profile: Optional[str],
+) -> List[Tuple[Optional[str], Path, bool]]:
+    """Ordered ``(profile_key, db_path, allow_bootstrap)`` stores for an id lookup.
+
+    Desktop Bot Mode resumes often omit ``?profile=`` even though the row
+    lives in ``profiles/<bot>/state.db`` (#94609). Try the requested (or
+    this process's) store first — that path is allowed to bootstrap a
+    missing file, matching the historical single-store open. Every other
+    local profile is a fallback and is opened only when ``state.db``
+    already exists, so a miss does not mint empty databases across the
+    profile tree.
+    """
+    from hermes_cli.profiles import get_profile_dir, list_profile_names
+    from hermes_state import _default_db_path
+
+    targets: List[Tuple[Optional[str], Path, bool]] = []
+    seen: set[str] = set()
+
+    def _add(key: Optional[str], db_path: Path, allow_bootstrap: bool) -> None:
+        try:
+            resolved = str(db_path.expanduser().resolve())
+        except OSError:
+            return
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        targets.append((key, db_path, allow_bootstrap))
+
+    if profile:
+        name, home = _cron_profile_home(profile)
+        _add(name, Path(home) / "state.db", True)
+    else:
+        _add(None, Path(_default_db_path()), True)
+
+    for name in list_profile_names():
+        try:
+            home = get_profile_dir(name)
+        except Exception:
+            continue
+        _add(name, Path(home) / "state.db", False)
+
+    return targets
+
+
+def _open_matching_session_store(
+    session_id: str,
+    profile: Optional[str],
+    *,
+    resolve_resume: bool = False,
+):
+    """Open the first local profile store that actually contains ``session_id``.
+
+    Returns ``(sid, db, owning_profile)``. The caller must close ``db``.
+    Returns ``(None, None, None)`` when no store has the row.
+
+    ``resolve_resume`` follows compression-chain ids the same way
+    ``GET /api/sessions/{id}/messages`` historically did on a single store.
+    """
+    db = None
+    try:
+        for key, db_path, allow_bootstrap in _session_lookup_targets(profile):
+            if not allow_bootstrap and not db_path.is_file():
+                continue
+            db = _open_session_db_at_path(db_path, read_only=True)
+            sid = db.resolve_session_id(session_id)
+            if not sid:
+                db.close()
+                db = None
+                continue
+            if resolve_resume:
+                sid = db.resolve_resume_session_id(sid) or sid
+            owning = key if key is not None else _cron_default_profile()
+            found = db
+            db = None
+            return sid, found, owning
+        return None, None, None
+    finally:
+        if db is not None:
+            db.close()
+
+
 # In-process throttle for the opportunistic auto-archive trigger, keyed by
 # profile. Bounds the config.yaml read to at most once per this window per
 # profile; the actual sweep is throttled far more coarsely by state_meta

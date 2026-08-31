@@ -61,13 +61,17 @@ def test_sessiondb_handlers_open_connections_inside_executor_helpers():
             for arg in node.args[:1]
             if isinstance(arg, ast.Name)
         }
+        session_db_openers = {
+            "_open_session_db_for_profile",
+            "_open_matching_session_store",
+        }
         db_open_owners = {
             helper_name
             for helper_name, helper in helpers.items()
             if helper_name in offloaded
             and any(
                 isinstance(node, ast.Call)
-                and _call_name(node) == "_open_session_db_for_profile"
+                and _call_name(node) in session_db_openers
                 for node in ast.walk(helper)
             )
         }
