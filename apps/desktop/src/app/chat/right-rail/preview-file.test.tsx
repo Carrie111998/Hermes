@@ -13,6 +13,14 @@ describe('MarkdownPreview', () => {
     cleanup()
   })
 
+  it('does not paint raw math delimiters before the deferred plugin is ready', () => {
+    const { container } = render(
+      <MarkdownPreview text="The formula $x^2 + y^2$ should never flash its source." />
+    )
+
+    expect(container.textContent).not.toContain('$x^2 + y^2$')
+  })
+
   it('renders block and inline math through KaTeX after the deferred plugin loads', async () => {
     // KaTeX marks its output; raw "$" delimiters must be gone.
     const { container } = render(

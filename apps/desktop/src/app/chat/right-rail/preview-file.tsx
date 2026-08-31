@@ -31,7 +31,7 @@ import {
 } from '@/lib/desktop-fs'
 import { Check, Pencil, X } from '@/lib/icons'
 import { isComposerChord } from '@/lib/keybinds/chords'
-import { useLazyMathPlugin } from '@/lib/lazy-math-plugin'
+import { hasRenderableMath, useLazyMathPluginState } from '@/lib/lazy-math-plugin'
 import { shikiLanguageForFilename } from '@/lib/markdown-code'
 import { normalizeFilePreviewMath } from '@/lib/markdown-preprocess'
 import { cn } from '@/lib/utils'
@@ -425,8 +425,24 @@ const MARKDOWN_COMPONENTS = {
 
 export function MarkdownPreview({ text }: { text: string }) {
   const mathText = useMemo(() => normalizeFilePreviewMath(text), [text])
-  const math = useLazyMathPlugin(mathText)
+  const mathState = useLazyMathPluginState(mathText)
+  const math = mathState.plugin
+  const needsMath = useMemo(() => hasRenderableMath(mathText), [mathText])
   const plugins = useMemo(() => (math ? { math } : {}), [math])
+
+  if (needsMath && mathState.loading) {
+    // Do not let the static renderer paint raw `$`/custom delimiters while the
+    // deferred KaTeX chunk is loading. The source view remains available if the
+    // import fails, while the rendered view never flashes an intermediate form.
+    return (
+      <div
+        aria-busy="true"
+        className="preview-markdown mx-auto grid h-full max-w-3xl place-items-center px-4 py-3 text-sm text-foreground"
+      >
+        <PageLoader label={translateNow('preview.loading')} />
+      </div>
+    )
+  }
 
   return (
     <div className="preview-markdown mx-auto max-w-3xl px-4 py-3 text-sm text-foreground" data-selectable-text="true">

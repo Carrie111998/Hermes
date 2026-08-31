@@ -1,7 +1,13 @@
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 
-import { createLazyMathPluginLoader, hasRenderableMath, type MathPlugin, useLazyMathPlugin } from './lazy-math-plugin'
+import {
+  createLazyMathPluginLoader,
+  hasRenderableMath,
+  type MathPlugin,
+  useLazyMathPlugin,
+  useLazyMathPluginState
+} from './lazy-math-plugin'
 
 const plugin = { name: 'katex' as const, type: 'math' as const } as MathPlugin
 
@@ -59,6 +65,35 @@ describe('createLazyMathPluginLoader', () => {
 })
 
 describe('useLazyMathPlugin', () => {
+  it('loads the plugin using delimiters after math preprocessing', async () => {
+    const load = vi.fn(async () => plugin)
+
+    const loader = {
+      load,
+      peek: () => undefined
+    }
+
+    const { result } = renderHook(() => useLazyMathPlugin('[/inline]x + y[/inline]', loader))
+
+    await waitFor(() => expect(result.current).toBe(plugin))
+    expect(load).toHaveBeenCalledWith('$x + y$')
+  })
+
+  it('publishes a failed state so poisoned imports can use the renderer fallback', async () => {
+    const failure = new Error('chunk failed')
+
+    const loader = {
+      load: vi.fn().mockRejectedValue(failure),
+      peek: () => undefined
+    }
+
+    const { result } = renderHook(() => useLazyMathPluginState('$x$', loader))
+
+    await waitFor(() => expect(result.current.failed).toBe(true))
+    expect(result.current.loading).toBe(false)
+    expect(result.current.plugin).toBeUndefined()
+  })
+
   it('publishes the plugin after eligible markdown loads it', async () => {
     const importer = vi.fn(async () => ({ createMemoizedMathPlugin: () => plugin }))
     const loader = createLazyMathPluginLoader(importer)
