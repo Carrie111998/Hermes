@@ -150,6 +150,7 @@ from gateway.platforms.base import (
 )
 # Re-exported here for existing imports and constructor monkeypatches.
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+from agent.message_metadata import PERSISTENCE_ONLY_MESSAGE_FIELDS
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
@@ -7051,10 +7052,9 @@ class APIServerAdapter(BasePlatformAdapter):
     # side of the store round-trip. None of them change what a message *says*,
     # so none of them may decide whether a transcript already contains the
     # prior history -- see _messages_semantically_equal.
-    _TRANSCRIPT_BOOKKEEPING_FIELDS = frozenset({
+    _TRANSCRIPT_BOOKKEEPING_FIELDS = PERSISTENCE_ONLY_MESSAGE_FIELDS | frozenset({
         "_db_persisted",
         "_row_id",
-        "timestamp",
         "reasoning",
         "reasoning_content",
         "finish_reason",
