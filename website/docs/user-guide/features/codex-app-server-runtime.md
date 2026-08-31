@@ -195,7 +195,44 @@ You can also set it manually in `~/.hermes/config.yaml`:
 ```yaml
 model:
   openai_runtime: codex_app_server   # default is "auto" (= Hermes runtime)
+
+agent:
+  codex_app_server_turn_timeout: 3600  # default 600 seconds
+  codex_app_server_require_explicit_cwd: true
+  codex_app_server_workspace_roots:
+    - /home/user/projects
 ```
+
+`agent.codex_app_server_turn_timeout` is the absolute deadline for the
+Codex-owned turn, including its inner command and patch loop. It is independent
+of `terminal.timeout`, which only applies to Hermes terminal-tool calls. The
+value must be a positive number; invalid, zero, negative, or non-finite values
+fall back to 600 seconds. If the deadline expires before the matching
+`turn/completed` notification, Hermes interrupts and retires the app-server
+session and reports a timeout instead of treating the last streamed assistant
+message as a completed answer.
+
+For repository-scoped handoffs, put this structured marker in the first 1 KiB
+of the message:
+
+```text
+[HERMES_RUNTIME_CWD=/home/user/projects/example]
+```
+
+Hermes resolves the path, requires an existing directory inside one of
+`agent.codex_app_server_workspace_roots`, removes only the marker from the text
+sent to Codex, and uses that repository as the Codex thread cwd. An empty roots
+list makes the normally resolved agent cwd the sole root. Invalid, relative,
+missing, or out-of-root paths fail before Codex is spawned. Set
+`agent.codex_app_server_require_explicit_cwd: true` when every handoff must use
+this contract; its default is `false` for backward compatibility.
+
+Codex continuity is stored per Hermes session and canonical repository cwd, so
+one long-lived Bot Chat can switch repositories without mixing their Codex
+threads. A new or reset Hermes session starts with no such mappings. If a
+stored Codex thread is missing, stale, or incompatible, Hermes starts one fresh
+thread and replaces that workspace's mapping without displaying its internal
+identifier.
 
 ## Self-improvement loop (memory + skill nudges)
 
@@ -431,7 +468,7 @@ If you find a bug, [open an issue](https://github.com/NousResearch/hermes-agent/
              ▼                                            │
         ┌──────────────────────────────────┐              │
         │  codex app-server (subprocess)    │──────────────┘
-        │   thread/start, turn/start        │
+        │   thread/start|resume, turn/start  │
         │   item/* notifications            │
         │   shell + apply_patch + update_plan│
         │   view_image + sandbox            │

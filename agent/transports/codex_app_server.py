@@ -2,8 +2,9 @@
 
 Speaks the protocol documented in codex-rs/app-server/README.md (codex 0.125+).
 Transport is newline-delimited JSON-RPC 2.0 over stdio: spawn `codex app-server`,
-do an `initialize` handshake, then drive `thread/start` + `turn/start` and
-consume streaming `item/*` notifications until `turn/completed`.
+do an `initialize` handshake, then drive `thread/start` or `thread/resume`
+plus `turn/start` and consume streaming `item/*` notifications until
+`turn/completed`.
 
 This module is the wire-level speaker only. Higher-level concerns (event
 projection into Hermes' display, approval bridging, transcript projection into
@@ -72,10 +73,12 @@ class CodexAppServerClient:
         self,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
+        cwd: Optional[str] = None,
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
     ) -> None:
         self._codex_bin = codex_bin
+        self._cwd = cwd
         # codex app-server is a model-driving CLI executor: it runs a
         # model-chosen agentic loop that executes shell commands, so it
         # legitimately needs LLM provider credentials (inherit_credentials=True)
@@ -138,16 +141,19 @@ class CodexAppServerClient:
             stderr=subprocess.PIPE,
             bufsize=0,
             env=spawn_env,
+            cwd=cwd,
             creationflags=windows_hide_flags(),
         )
         self._next_id = 1
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._notifications: queue.Queue = queue.Queue()
         self._server_requests: queue.Queue = queue.Queue()
         self._stderr_lines: list[str] = []
         self._stderr_lock = threading.Lock()
         self._closed = False
+        self._poisoned = False
         self._initialized = False
 
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
@@ -177,23 +183,38 @@ class CodexAppServerClient:
             },
             "capabilities": capabilities or {},
         }
+        deadline = time.monotonic() + timeout
         result = self.request("initialize", params, timeout=timeout)
-        self.notify("initialized")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("codex app-server initialize deadline expired")
+        self.notify("initialized", timeout=remaining)
         self._initialized = True
         return result
 
     def close(self, timeout: float = 3.0) -> None:
         """Close stdin and wait for the subprocess to exit, escalating to kill."""
         if self._closed:
-            return
+            try:
+                if self._proc.poll() is not None:
+                    return
+            except Exception:
+                return
         self._closed = True
+        self._shutdown_process(timeout=timeout, force=False)
+
+    def _shutdown_process(self, *, timeout: float, force: bool) -> None:
+        """Stop and reap the child without leaving blocked pipe writers behind."""
+        # Terminate first so any daemon writer blocked in stdin.write() is
+        # released before close() touches the file object.
         try:
-            if self._proc.stdin and not self._proc.stdin.closed:
-                self._proc.stdin.close()
+            if force:
+                self._proc.kill()
+            else:
+                self._proc.terminate()
         except Exception:
             pass
         try:
-            self._proc.terminate()
             self._proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             try:
@@ -201,6 +222,37 @@ class CodexAppServerClient:
                 self._proc.wait(timeout=1.0)
             except Exception:
                 pass
+        except Exception:
+            pass
+        try:
+            if self._proc.stdin and not self._proc.stdin.closed:
+                self._proc.stdin.close()
+        except Exception:
+            pass
+
+    def _poison_transport(self) -> None:
+        """Make an indeterminate write connection permanently unusable."""
+        self._poisoned = True
+        self._closed = True
+        with self._pending_lock:
+            stranded = list(self._pending.values())
+            self._pending.clear()
+        for pending in stranded:
+            try:
+                pending.queue.put_nowait(
+                    {
+                        "error": {
+                            "code": -32098,
+                            "message": (
+                                "codex app-server transport closed after "
+                                "an indeterminate stdin write"
+                            ),
+                        }
+                    }
+                )
+            except queue.Full:
+                pass
+        self._shutdown_process(timeout=0.5, force=True)
 
     def __enter__(self) -> "CodexAppServerClient":
         return self
@@ -218,19 +270,32 @@ class CodexAppServerClient:
     ) -> dict:
         """Send a JSON-RPC request and block on the response. Returns `result`,
         raises CodexAppServerError on `error`."""
+        deadline = time.monotonic() + timeout
         rid = self._take_id()
         q: queue.Queue = queue.Queue(maxsize=1)
         with self._pending_lock:
             self._pending[rid] = _Pending(queue=q, method=method)
-        self._send({"id": rid, "method": method, "params": params or {}})
         try:
-            msg = q.get(timeout=timeout)
+            self._send(
+                {"id": rid, "method": method, "params": params or {}},
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"codex app-server method {method!r} timed out after {timeout}s"
+                )
+            msg = q.get(timeout=remaining)
         except queue.Empty:
             with self._pending_lock:
                 self._pending.pop(rid, None)
             raise TimeoutError(
                 f"codex app-server method {method!r} timed out after {timeout}s"
             )
+        except BaseException:
+            with self._pending_lock:
+                self._pending.pop(rid, None)
+            raise
         if "error" in msg:
             err = msg["error"]
             raise CodexAppServerError(
@@ -240,22 +305,36 @@ class CodexAppServerClient:
             )
         return msg.get("result", {})
 
-    def notify(self, method: str, params: Optional[dict] = None) -> None:
+    def notify(
+        self,
+        method: str,
+        params: Optional[dict] = None,
+        *,
+        timeout: float = 5.0,
+    ) -> None:
         """Send a JSON-RPC notification (no id, no response expected)."""
-        self._send({"method": method, "params": params or {}})
+        self._send({"method": method, "params": params or {}}, timeout=timeout)
 
-    def respond(self, request_id: Any, result: dict) -> None:
+    def respond(
+        self, request_id: Any, result: dict, *, timeout: float = 5.0
+    ) -> None:
         """Reply to a server-initiated request (e.g. approval prompts)."""
-        self._send({"id": request_id, "result": result})
+        self._send({"id": request_id, "result": result}, timeout=timeout)
 
     def respond_error(
-        self, request_id: Any, code: int, message: str, data: Optional[Any] = None
+        self,
+        request_id: Any,
+        code: int,
+        message: str,
+        data: Optional[Any] = None,
+        *,
+        timeout: float = 5.0,
     ) -> None:
         """Reply to a server-initiated request with an error."""
         err: dict[str, Any] = {"code": code, "message": message}
         if data is not None:
             err["data"] = data
-        self._send({"id": request_id, "error": err})
+        self._send({"id": request_id, "error": err}, timeout=timeout)
 
     def take_notification(self, timeout: float = 0.0) -> Optional[dict]:
         """Pop the next streaming notification, or return None on timeout.
@@ -286,7 +365,11 @@ class CodexAppServerClient:
             return list(self._stderr_lines[-n:])
 
     def is_alive(self) -> bool:
-        return self._proc.poll() is None
+        return not self._closed and not self._poisoned and self._proc.poll() is None
+
+    @property
+    def poisoned(self) -> bool:
+        return self._poisoned
 
     # ---------- internals ----------
 
@@ -298,18 +381,60 @@ class CodexAppServerClient:
         self._next_id += 1
         return rid
 
-    def _send(self, obj: dict) -> None:
+    def _send(self, obj: dict, *, timeout: float = 5.0) -> None:
+        """Write one JSON-RPC frame without letting a full pipe block forever."""
         if self._closed:
             raise RuntimeError("codex app-server client is closed")
         if self._proc.stdin is None:
             raise RuntimeError("codex app-server stdin not available")
+        if timeout <= 0:
+            raise TimeoutError("codex app-server stdin write deadline expired")
+
+        payload = (json.dumps(obj) + "\n").encode("utf-8")
+        outcome: queue.Queue = queue.Queue(maxsize=1)
+
+        def _write() -> None:
+            try:
+                with self._send_lock:
+                    if self._closed:
+                        raise RuntimeError("codex app-server client is closed")
+                    if self._proc.stdin is None:
+                        raise RuntimeError("codex app-server stdin not available")
+                    self._proc.stdin.write(payload)
+                    self._proc.stdin.flush()
+            except (BrokenPipeError, ValueError) as exc:
+                outcome.put(
+                    (
+                        False,
+                        RuntimeError(
+                            f"codex app-server stdin closed unexpectedly: {exc}"
+                        ),
+                    )
+                )
+            except BaseException as exc:  # pragma: no cover - defensive relay
+                outcome.put((False, exc))
+            else:
+                outcome.put((True, None))
+
+        writer = threading.Thread(target=_write, daemon=True)
+        writer.start()
         try:
-            self._proc.stdin.write((json.dumps(obj) + "\n").encode("utf-8"))
-            self._proc.stdin.flush()
-        except (BrokenPipeError, ValueError) as exc:
-            raise RuntimeError(
-                f"codex app-server stdin closed unexpectedly: {exc}"
-            ) from exc
+            ok, error = outcome.get(timeout=timeout)
+        except queue.Empty:
+            # Once a write has outlived its caller's deadline we no longer know
+            # whether any prefix (or the whole frame) reached Codex. Reusing
+            # this connection could therefore execute a stale request later.
+            # Poison the transport immediately; the owning session will retire
+            # it and create a fresh app-server client for the next turn.
+            self._poison_transport()
+            writer.join(timeout=0.2)
+            raise TimeoutError(
+                f"codex app-server stdin write timed out after {timeout}s"
+            )
+        if not ok:
+            if isinstance(error, BaseException):
+                raise error
+            raise RuntimeError("codex app-server stdin write failed")
 
     def _read_stdout(self) -> None:
         if self._proc.stdout is None:

@@ -191,3 +191,36 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
 
 
+@pytest.mark.asyncio
+async def test_partial_agent_flush_recovers_only_unpersisted_suffix(
+    monkeypatch, tmp_path
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Hello!",
+            "messages": [
+                {"role": "user", "content": "hello world", "_db_persisted": True},
+                {"role": "assistant", "content": "Hello!"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "agent_persisted": False,
+        }
+    )
+
+    await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    role_to_skip = {
+        call.args[1].get("role"): call.kwargs.get("skip_db", False)
+        for call in runner.session_store.append_to_transcript.call_args_list
+        if len(call.args) >= 2
+        and isinstance(call.args[1], dict)
+        and call.args[1].get("role") in {"user", "assistant"}
+    }
+    assert role_to_skip == {"user": True, "assistant": False}
+
+

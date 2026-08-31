@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -506,6 +507,26 @@ def _normalize_run_budget_seconds(value) -> Optional[float]:
         return None
     if seconds != seconds or seconds <= 0:  # NaN or non-positive
         return None
+    return seconds
+
+
+def _normalize_codex_app_server_turn_timeout(value: Any) -> float:
+    """Coerce the configured Codex app-server turn deadline.
+
+    The historical hardcoded deadline was 600 seconds, so missing or invalid
+    values retain that behavior. Booleans are rejected even though ``bool`` is
+    numeric in Python, and non-finite/non-positive values cannot disable or
+    wedge the outer deadline accidentally.
+    """
+    default = 600.0
+    if isinstance(value, bool):
+        return default
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(seconds) or seconds <= 0:
+        return default
     return seconds
 
 
@@ -2012,6 +2033,31 @@ def init_agent(
         agent.run_budget_seconds = _normalize_run_budget_seconds(
             _agent_section.get("run_budget_seconds")
         )
+
+    # Codex app-server owns the entire inner tool loop, so terminal.timeout
+    # cannot bound a turn on this runtime. Keep the historical 600-second
+    # deadline by default while allowing long-running profiles to raise it.
+    agent.codex_app_server_turn_timeout = (
+        _normalize_codex_app_server_turn_timeout(
+            _agent_section.get("codex_app_server_turn_timeout", 600)
+        )
+    )
+    _require_codex_cwd = _agent_section.get(
+        "codex_app_server_require_explicit_cwd", False
+    )
+    agent.codex_app_server_require_explicit_cwd = (
+        _require_codex_cwd if isinstance(_require_codex_cwd, bool) else False
+    )
+    _codex_workspace_roots = _agent_section.get(
+        "codex_app_server_workspace_roots", []
+    )
+    if _codex_workspace_roots is None:
+        _codex_workspace_roots = []
+    agent.codex_app_server_workspace_roots = (
+        list(_codex_workspace_roots)
+        if isinstance(_codex_workspace_roots, list)
+        else _codex_workspace_roots
+    )
 
     # Empty-response retry guard config (NS-503): additive
     # ``agent.empty_response_guard`` subsection. Resolution is tolerant —

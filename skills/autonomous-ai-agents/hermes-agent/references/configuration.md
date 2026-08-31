@@ -7,8 +7,8 @@ Full reference: https://hermes-agent.nousresearch.com/docs/user-guide/configurat
 
 | Section | Key options |
 |---------|-------------|
-| `model` | `default`, `provider`, `base_url`, `api_key`, `context_length`, `aliases` |
-| `agent` | `max_turns` (90), `tool_use_enforcement`, `service_tier`, `verify_on_stop` |
+| `model` | `default`, `provider`, `base_url`, `api_key`, `context_length`, `aliases`, `openai_runtime` (`auto` or `codex_app_server`) |
+| `agent` | `max_turns` (90), `tool_use_enforcement`, `service_tier`, `verify_on_stop`, `coding_context` (`auto`, `focus`, `on`, `off`), `codex_app_server_turn_timeout` (600), `codex_app_server_require_explicit_cwd` (false), `codex_app_server_workspace_roots` ([]) |
 | `terminal` | `backend` (local/docker/ssh/modal/daytona/singularity), `cwd`, `timeout` (180) |
 | `compression` | `enabled`, `threshold` (0.50), `target_ratio` (0.20) |
 | `display` | `skin`, `interface` (cli/tui), `language`, `show_reasoning`, `show_cost`, `pet` |
@@ -22,6 +22,29 @@ Full reference: https://hermes-agent.nousresearch.com/docs/user-guide/configurat
 | `curator` | `enabled`, `consolidate` (false, opt-in aux-model consolidation), `interval_hours`, `stale_after_days` |
 
 `hermes config check` reports sections missing from an older config.
+
+### Coding runtime and posture
+
+`model.openai_runtime` selects who owns OpenAI/Codex turns: `auto` keeps the
+normal Hermes provider/runtime loop; `codex_app_server` hands the inner coding
+loop to Codex while Hermes retains the session shell.
+`agent.codex_app_server_turn_timeout` sets that runtime's absolute per-turn
+deadline in seconds (default 600) and is independent of `terminal.timeout`.
+Use a positive number such as `3600` for longer coding turns. Structured
+handoffs may include `[HERMES_RUNTIME_CWD=/absolute/path]` in the first 1 KiB;
+the path must resolve inside `agent.codex_app_server_workspace_roots` (an empty
+list means the normal agent cwd only). Set
+`agent.codex_app_server_require_explicit_cwd: true` to reject unmarked
+handoffs. Codex continuity is per Hermes session and canonical cwd; resets do
+not inherit it, and unavailable stored threads are replaced once.
+`agent.coding_context`
+is an independent coding posture: `auto` activates in code workspaces on
+interactive CLI/TUI/ACP/Desktop surfaces, `focus` also selects the lean coding
+toolset, `on` forces the posture, and `off` disables it. Messaging surfaces do
+not enter auto pair-programming posture. Runtime or posture/tool changes take
+effect only in a new session. See
+[`coding-runtime-selection.md`](coding-runtime-selection.md) for the complete
+matrix and auth boundaries.
 
 ### Toolsets
 

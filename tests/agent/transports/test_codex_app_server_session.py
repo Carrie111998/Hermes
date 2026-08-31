@@ -7,15 +7,18 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import threading
 import time
 from unittest.mock import patch
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import pytest
 
 import agent.transports.codex_app_server_session as session_mod
+from agent.transports.codex_app_server import CodexAppServerError
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
+    _INITIAL_USER_ECHO_MARKER,
     _ServerRequestRouting,
     _approval_choice_to_codex_decision,
     _coerce_turn_input_text,
@@ -37,7 +40,7 @@ class FakeClient:
         self._closed = False
         self._notifications: list[dict] = []
         self._server_requests: list[dict] = []
-        self._request_handler = None  # Optional[Callable[[str, dict], dict]]
+        self._request_handler: Optional[Callable[[str, dict], dict]] = None
 
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
@@ -53,6 +56,9 @@ class FakeClient:
         if method == "thread/start":
             return {"thread": {"id": "thread-fake-001"},
                     "activePermissionProfile": {"id": "workspace-write"}}
+        if method == "thread/resume":
+            return {"thread": {"id": (params or {}).get("threadId")},
+                    "activePermissionProfile": {"id": "workspace-write"}}
         if method == "turn/start":
             return {"turn": {"id": "turn-fake-001"}}
         if method == "turn/interrupt":
@@ -64,10 +70,12 @@ class FakeClient:
     def notify(self, method: str, params=None):
         pass
 
-    def respond(self, request_id, result):
+    def respond(self, request_id, result, *, timeout=5.0):
         self.responses.append((request_id, result))
 
-    def respond_error(self, request_id, code, message, data=None):
+    def respond_error(
+        self, request_id, code, message, data=None, *, timeout=5.0
+    ):
         self.error_responses.append((request_id, code, message))
 
     def take_notification(self, timeout: float = 0.0):
@@ -174,6 +182,120 @@ class TestLifecycle:
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
 
+    def test_prior_thread_uses_resume_with_current_cwd(self):
+        client = FakeClient()
+        s = make_session(client, prior_thread_id="opaque-prior")
+
+        s.ensure_started()
+
+        method, params = client.requests[-1]
+        assert method == "thread/resume"
+        assert params["cwd"] == "/tmp"
+        assert "threadId" in params
+        assert "permissions" not in params
+
+    def test_stale_resume_starts_fresh_once_without_logging_id(
+        self, caplog
+    ):
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        client = FakeClient()
+        prior = "opaque-prior-not-for-logs"
+
+        def handle(method, params):
+            if method == "thread/resume":
+                raise CodexAppServerError(
+                    code=-32600,
+                    message=f"thread not found: {prior}",
+                )
+            if method == "thread/start":
+                return {"thread": {"id": "opaque-replacement"}}
+            return {}
+
+        client._request_handler = handle
+        s = make_session(client, prior_thread_id=prior)
+
+        s.ensure_started()
+
+        methods = [method for method, _ in client.requests]
+        assert methods == ["thread/resume", "thread/start"]
+        assert prior not in caplog.text
+
+    def test_explicit_no_rollout_found_starts_fresh_once(self):
+        client = FakeClient()
+
+        def handle(method, params):
+            if method == "thread/resume":
+                raise CodexAppServerError(
+                    code=-32600,
+                    message="no rollout found for thread id opaque-prior",
+                )
+            if method == "thread/start":
+                return {"thread": {"id": "opaque-replacement"}}
+            return {}
+
+        client._request_handler = handle
+        session = make_session(client, prior_thread_id="opaque-prior")
+
+        assert session.ensure_started() == "opaque-replacement"
+        assert [method for method, _ in client.requests] == [
+            "thread/resume",
+            "thread/start",
+        ]
+
+    def test_non_stale_resume_error_does_not_start_fresh(self):
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        client = FakeClient()
+
+        def handle(method, params):
+            if method == "thread/resume":
+                raise CodexAppServerError(
+                    code=-32600,
+                    message="another process currently owns this thread",
+                )
+            return {"thread": {"id": "unexpected"}}
+
+        client._request_handler = handle
+        s = make_session(client, prior_thread_id="opaque-prior")
+
+        with pytest.raises(CodexAppServerError):
+            s.ensure_started()
+
+        assert [method for method, _ in client.requests] == ["thread/resume"]
+
+    @pytest.mark.parametrize(
+        "code,message",
+        [
+            (-32602, "Invalid params: required MCP field missing"),
+            (-32603, "Internal error while loading runtime configuration"),
+            (-32601, "Method not found: thread/resume"),
+            (-32600, "Authentication session expired while resuming thread"),
+            (-32600, "Required MCP server config not found for thread/resume"),
+            (-32600, "Session not found for the active authentication profile"),
+            (-32600, "No rollout directory configured for this profile"),
+        ],
+    )
+    def test_generic_json_rpc_errors_do_not_discard_continuity(
+        self, code, message
+    ):
+        from agent.transports.codex_app_server import CodexAppServerError
+
+        client = FakeClient()
+
+        def handle(method, params):
+            if method == "thread/resume":
+                raise CodexAppServerError(code=code, message=message)
+            return {"thread": {"id": "unexpected"}}
+
+        client._request_handler = handle
+        session = make_session(client, prior_thread_id="opaque-prior")
+
+        with pytest.raises(CodexAppServerError):
+            session.ensure_started()
+
+        assert [method for method, _ in client.requests] == ["thread/resume"]
+
     def test_close_idempotent(self):
         client = FakeClient()
         s = make_session(client)
@@ -203,11 +325,385 @@ class TestRunTurn:
         r = s.run_turn("hi", turn_timeout=2.0)
         assert r.final_text == "hello world"
         assert r.interrupted is False
+        assert r.timed_out is False
         assert r.error is None
+        assert r.should_retire is False
         assert any(m["role"] == "assistant" and m.get("content") == "hello world"
                    for m in r.projected_messages)
         # turn_id propagated for downstream session-DB linkage
         assert r.turn_id == "turn-fake-001"
+
+    def test_unscoped_and_foreign_completions_cannot_finish_parent_turn(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-child-001",
+            turn={"id": "turn-child-001", "status": "completed", "error": None},
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="tu1",
+            item={"type": "agentMessage", "id": "m-final", "text": "real final"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.error is None
+        assert result.final_text == "real final"
+        # A permissive implementation would stop on the first unscoped event
+        # and leave the real parent completion queued.
+        assert not client._notifications
+
+    @pytest.mark.parametrize(
+        "status,expect_interrupted",
+        [("interrupted", True), ("failed", False), (None, False)],
+    )
+    def test_non_completed_terminal_status_is_never_success(
+        self, status, expect_interrupted
+    ):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="tu1",
+            item={"type": "agentMessage", "id": "m1", "text": "interim text"},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": status, "error": None},
+        )
+
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.final_text == "interim text"
+        assert result.error and "turn ended status=" in result.error
+        assert result.interrupted is expect_interrupted
+        assert result.timed_out is False
+
+    def test_initial_user_projection_is_explicitly_marked(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="tu1",
+            item={
+                "type": "userMessage",
+                "id": "u-initial",
+                "content": [{"type": "text", "text": "same text"}],
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        result = make_session(client).run_turn("same text", turn_timeout=2.0)
+
+        assert result.projected_messages == [
+            {
+                "role": "user",
+                "content": "same text",
+                _INITIAL_USER_ECHO_MARKER: True,
+            }
+        ]
+
+    def test_same_text_steer_after_model_output_is_not_marked_as_echo(self):
+        class SteeringClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.session: Optional[CodexAppServerSession] = None
+                self.notification_count = 0
+
+            def take_notification(self, timeout: float = 0.0):
+                self.notification_count += 1
+                if self.notification_count == 2:
+                    assert self.session is not None
+                    assert self.session.request_steer("same text") is True
+                return super().take_notification(timeout)
+
+        client = SteeringClient()
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="tu1",
+            item={"type": "agentMessage", "id": "m1", "text": "working"},
+        )
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="tu1",
+            item={
+                "type": "userMessage",
+                "id": "u-steer",
+                "content": [{"type": "text", "text": "same text"}],
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        session = make_session(client)
+        client.session = session
+        result = session.run_turn("same text", turn_timeout=2.0)
+
+        steer = next(
+            message
+            for message in result.projected_messages
+            if message.get("role") == "user"
+        )
+        assert _INITIAL_USER_ECHO_MARKER not in steer
+
+    def test_immediate_same_text_steer_without_initial_echo_is_preserved(self):
+        class SteeringClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.session: Optional[CodexAppServerSession] = None
+                self.steered = False
+
+            def take_notification(self, timeout: float = 0.0):
+                if not self.steered:
+                    self.steered = True
+                    assert self.session is not None
+                    assert self.session.request_steer("same text") is True
+                return super().take_notification(timeout)
+
+        client = SteeringClient()
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="tu1",
+            item={
+                "type": "userMessage",
+                "id": "u-immediate-steer",
+                "content": [{"type": "text", "text": "same text"}],
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+        client.session = session
+
+        result = session.run_turn("same text", turn_timeout=2.0)
+
+        assert result.projected_messages == [
+            {"role": "user", "content": "same text"}
+        ]
+
+    def test_initial_echo_is_suppressed_when_same_text_steer_also_exists(self):
+        class SteeringClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.session: Optional[CodexAppServerSession] = None
+                self.steered = False
+
+            def take_notification(self, timeout: float = 0.0):
+                if not self.steered:
+                    self.steered = True
+                    assert self.session is not None
+                    assert self.session.request_steer("same text") is True
+                return super().take_notification(timeout)
+
+        client = SteeringClient()
+        for item_id in ("u-initial", "u-steer"):
+            client.queue_notification(
+                "item/completed",
+                threadId="t",
+                turnId="tu1",
+                item={
+                    "type": "userMessage",
+                    "id": item_id,
+                    "content": [{"type": "text", "text": "same text"}],
+                },
+            )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+        client.session = session
+
+        result = session.run_turn("same text", turn_timeout=2.0)
+
+        assert result.projected_messages[0][_INITIAL_USER_ECHO_MARKER] is True
+        assert _INITIAL_USER_ECHO_MARKER not in result.projected_messages[1]
+
+    def test_rejected_same_text_steer_after_completion_does_not_hide_echo(self):
+        class RaceClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.notification_count = 0
+                self.ready_for_steer = threading.Event()
+                self.steer_started = threading.Event()
+                self.release_steer = threading.Event()
+                self.completion_returned = threading.Event()
+
+            def request(self, method, params=None, timeout=30.0):
+                if method == "turn/steer":
+                    self.steer_started.set()
+                    assert self.release_steer.wait(timeout=1.0)
+                    return {"turnId": "different-turn"}
+                return super().request(method, params, timeout)
+
+            def take_notification(self, timeout: float = 0.0):
+                self.notification_count += 1
+                if self.notification_count == 2:
+                    self.ready_for_steer.set()
+                    assert self.steer_started.wait(timeout=1.0)
+                    self.completion_returned.set()
+                return super().take_notification(timeout)
+
+        client = RaceClient()
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="tu1",
+            item={
+                "type": "userMessage",
+                "id": "u-initial",
+                "content": [{"type": "text", "text": "same text"}],
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+        turn_result = {}
+        steer_result = {}
+
+        turn_thread = threading.Thread(
+            target=lambda: turn_result.setdefault(
+                "value", session.run_turn("same text", turn_timeout=2.0)
+            )
+        )
+        turn_thread.start()
+        assert client.ready_for_steer.wait(timeout=1.0)
+        steer_thread = threading.Thread(
+            target=lambda: steer_result.setdefault(
+                "value", session.request_steer("same text")
+            )
+        )
+        steer_thread.start()
+        assert client.completion_returned.wait(timeout=1.0)
+        client.release_steer.set()
+        steer_thread.join(timeout=1.0)
+        turn_thread.join(timeout=1.0)
+
+        assert not steer_thread.is_alive()
+        assert not turn_thread.is_alive()
+        assert steer_result["value"] is False
+        result = turn_result["value"]
+        assert result.projected_messages[0][_INITIAL_USER_ECHO_MARKER] is True
+
+    def test_poisoned_steer_transport_retires_completed_session(self):
+        class PoisonedSteerClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.session: Optional[CodexAppServerSession] = None
+                self.poisoned = False
+                self.steered = False
+
+            def is_alive(self):
+                return not self.poisoned and not self._closed
+
+            def request(self, method, params=None, timeout=30.0):
+                if method == "turn/steer":
+                    self.poisoned = True
+                    raise TimeoutError("stdin write timed out")
+                return super().request(method, params, timeout)
+
+            def take_notification(self, timeout: float = 0.0):
+                if not self.steered:
+                    self.steered = True
+                    assert self.session is not None
+                    assert self.session.request_steer("change") is False
+                return super().take_notification(timeout)
+
+        client = PoisonedSteerClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+        client.session = session
+
+        result = session.run_turn("initial", turn_timeout=2.0)
+
+        assert result.error is None
+        assert result.should_retire is True
+        with pytest.raises(RuntimeError, match="closed or poisoned"):
+            session.ensure_started()
+
+    def test_poison_error_keeps_same_text_steer_indeterminate(self):
+        class PoisonWakeClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.session: Optional[CodexAppServerSession] = None
+                self.poisoned = False
+                self.injected = False
+
+            def is_alive(self):
+                return not self.poisoned and not self._closed
+
+            def request(self, method, params=None, timeout=30.0):
+                if method == "turn/steer":
+                    self.poisoned = True
+                    raise CodexAppServerError(
+                        code=-32098,
+                        message="transport closed after indeterminate stdin write",
+                    )
+                return super().request(method, params, timeout)
+
+            def take_notification(self, timeout: float = 0.0):
+                if not self.injected:
+                    self.injected = True
+                    assert self.session is not None
+                    assert self.session.request_steer("same text") is False
+                return super().take_notification(timeout)
+
+        client = PoisonWakeClient()
+        client.queue_notification(
+            "item/completed",
+            threadId="t",
+            turnId="tu1",
+            item={
+                "type": "userMessage",
+                "id": "u-accepted-before-poison",
+                "content": [{"type": "text", "text": "same text"}],
+            },
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        session = make_session(client)
+        client.session = session
+
+        result = session.run_turn("same text", turn_timeout=2.0)
+
+        assert result.should_retire is True
+        assert _INITIAL_USER_ECHO_MARKER not in result.projected_messages[0]
 
 
 
@@ -242,8 +738,8 @@ class TestRunTurn:
 
         original_respond = client.respond
 
-        def respond_and_release_parent(request_id, response):
-            original_respond(request_id, response)
+        def respond_and_release_parent(request_id, result, *, timeout=5.0):
+            original_respond(request_id, result, timeout=timeout)
             client.queue_notification(
                 "item/completed",
                 threadId="thread-fake-001",
@@ -375,6 +871,8 @@ class TestRunTurn:
         s.ensure_started()
         with s._active_turn_lock:
             s._active_turn_id = "turn-live-123"
+            s._active_turn_deadline = time.monotonic() + 30.0
+            s._active_turn_generation = 1
 
         assert s.request_steer("Use Postgres instead") is True
         method, params = client.requests[-1]
@@ -384,6 +882,97 @@ class TestRunTurn:
             "input": [{"type": "text", "text": "Use Postgres instead"}],
             "expectedTurnId": "turn-live-123",
         }
+
+    def test_steer_rejected_after_active_turn_deadline(self):
+        client = FakeClient()
+        s = make_session(client)
+        s.ensure_started()
+        with s._active_turn_lock:
+            s._active_turn_id = "turn-live-123"
+            s._active_turn_deadline = time.monotonic() - 0.01
+
+        assert s.request_steer("too late") is False
+        assert all(method != "turn/steer" for method, _ in client.requests)
+
+    def test_steer_timeout_is_bounded_by_active_turn_deadline(self):
+        class TimeoutCaptureClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.steer_timeout: Optional[float] = None
+
+            def request(self, method, params=None, timeout=30.0):
+                if method == "turn/steer":
+                    self.steer_timeout = timeout
+                return super().request(method, params, timeout)
+
+        client = TimeoutCaptureClient()
+        s = make_session(client)
+        s.ensure_started()
+        with s._active_turn_lock:
+            s._active_turn_id = "turn-live-123"
+            s._active_turn_deadline = time.monotonic() + 0.2
+            s._active_turn_generation = 1
+
+        assert s.request_steer("bounded") is True
+        assert client.steer_timeout is not None
+        assert 0 < client.steer_timeout <= 0.2
+
+    def test_late_steer_response_cannot_mutate_next_turn_reservation(self):
+        class LateResponseClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def request(self, method, params=None, timeout=30.0):
+                if method == "turn/steer":
+                    self.started.set()
+                    assert self.release.wait(timeout=1.0)
+                    return {"turnId": "different-turn"}
+                return super().request(method, params, timeout)
+
+        client = LateResponseClient()
+        session = make_session(client)
+        session.ensure_started()
+        with session._active_turn_condition:
+            session._active_turn_id = "turn-a"
+            session._active_turn_deadline = time.monotonic() + 1.0
+            session._active_turn_generation = 1
+
+        outcome = {}
+        worker = threading.Thread(
+            target=lambda: outcome.setdefault(
+                "value", session.request_steer("same text")
+            )
+        )
+        worker.start()
+        assert client.started.wait(timeout=1.0)
+
+        with session._active_turn_condition:
+            session._steer_reservations = {
+                token: reservation
+                for token, reservation in session._steer_reservations.items()
+                if reservation.get("generation") != 1
+            }
+            session._active_turn_id = "turn-b"
+            session._active_turn_deadline = time.monotonic() + 1.0
+            session._active_turn_generation = 2
+            session._next_steer_token += 1
+            next_token = session._next_steer_token
+            session._steer_reservations[next_token] = {
+                "generation": 2,
+                "text": "same text",
+                "status": "confirmed",
+                "expires_at": time.monotonic() + 1.0,
+            }
+
+        client.release.set()
+        worker.join(timeout=1.0)
+
+        assert not worker.is_alive()
+        assert outcome["value"] is False
+        assert session._steer_reservations[next_token]["status"] == "confirmed"
+        assert session._steer_reservations[next_token]["generation"] == 2
 
 
 
@@ -704,10 +1293,8 @@ class TestSessionRetirement:
 
 
 
-    def test_final_agent_message_without_turn_completed_is_recovered(self):
-        """A completed assistant item is still a usable terminal response when
-        codex omits turn/completed and then goes quiet.
-        """
+    def test_final_agent_message_without_turn_completed_times_out(self):
+        """An agentMessage alone is intermediate until turn/completed arrives."""
         client = FakeClient()
         client.queue_notification(
             "item/completed",
@@ -722,14 +1309,20 @@ class TestSessionRetirement:
             notification_poll_timeout=0.01,
         )
         assert r.final_text == "done"
-        assert r.interrupted is False
-        assert r.error is None
-        assert r.should_retire is False
+        assert r.interrupted is True
+        assert r.timed_out is True
+        assert r.error and "turn timed out after 0.05s" in r.error
+        assert r.should_retire is True
         assert any(
             msg["role"] == "assistant" and msg.get("content") == "done"
             for msg in r.projected_messages
         )
-        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+        # Once the absolute deadline has expired, do not spend another fixed
+        # timeout trying to write turn/interrupt; retiring the process is the
+        # fail-closed cleanup path.
+        assert not any(
+            method == "turn/interrupt" for method, _ in client.requests
+        )
 
 
     def test_post_tool_watchdog_uses_monotonic_clock(self):
@@ -745,11 +1338,20 @@ class TestSessionRetirement:
             threadId="t", turnId="tu1",
         )
         s = make_session(client)
-        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 1000.2])
+        monotonic_values = iter([1000.0] + [999.0] * 8 + [1000.2])
+        last_monotonic = [1000.2]
+
+        def fake_monotonic():
+            try:
+                last_monotonic[0] = next(monotonic_values)
+            except StopIteration:
+                pass
+            return last_monotonic[0]
+
         with patch.object(
             session_mod.time,
             "monotonic",
-            side_effect=lambda: next(monotonic_values),
+            side_effect=fake_monotonic,
         ):
             r = s.run_turn(
                 "tool then silence",
@@ -896,3 +1498,130 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
 
+
+class TestAbsoluteTurnDeadline:
+    def test_startup_and_turn_start_share_one_deadline(self):
+        class SlowClient(FakeClient):
+            @staticmethod
+            def _wait(delay: float, timeout: float) -> None:
+                wait_for = min(delay, timeout)
+                time.sleep(wait_for)
+                if timeout < delay:
+                    raise TimeoutError("request budget expired")
+
+            def initialize(self, **kwargs):
+                self._wait(0.02, float(kwargs.get("timeout", 10.0)))
+                return super().initialize(**kwargs)
+
+            def request(
+                self,
+                method: str,
+                params: Optional[dict] = None,
+                timeout: float = 30.0,
+            ):
+                if method in {"thread/start", "turn/start"}:
+                    self._wait(0.02 if method == "thread/start" else 0.03, timeout)
+                return super().request(method, params, timeout)
+
+        client = SlowClient()
+        session = make_session(client)
+        started = time.monotonic()
+        result = session.run_turn("x", turn_timeout=0.05)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.10
+        assert result.timed_out is True
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "turn/start timed out before" in result.error
+
+    def test_blocking_approval_is_declined_at_turn_deadline(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="approval-timeout",
+            command="pwd",
+            cwd="/tmp",
+        )
+
+        def blocking_callback(*_args, **_kwargs):
+            time.sleep(0.30)
+            return "once"
+
+        session = make_session(client, approval_callback=blocking_callback)
+        started = time.monotonic()
+        result = session.run_turn(
+            "x",
+            turn_timeout=0.05,
+            notification_poll_timeout=0.01,
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.15
+        assert result.timed_out is True
+        assert result.should_retire is True
+        # The callback consumed the whole turn budget. Do not exceed the
+        # deadline by attempting a best-effort response write; the session is
+        # retired instead.
+        assert client.responses == []
+
+    def test_notification_poll_is_capped_by_remaining_turn_budget(self):
+        class PollClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.poll_timeouts = []
+
+            def take_notification(self, timeout: float = 0.0):
+                self.poll_timeouts.append(timeout)
+                time.sleep(timeout)
+                return None
+
+        client = PollClient()
+        session = make_session(client)
+        started = time.monotonic()
+        result = session.run_turn(
+            "x", turn_timeout=0.04, notification_poll_timeout=5.0
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.12
+        assert result.timed_out is True
+        assert result.should_retire is True
+        assert client.poll_timeouts
+        assert max(client.poll_timeouts) <= 0.04
+
+    def test_blocking_approval_response_is_bounded_by_turn_deadline(self):
+        class BlockingResponseClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.response_timeout = None
+
+            def respond(self, request_id, result, *, timeout=5.0):
+                self.response_timeout = timeout
+                time.sleep(timeout)
+                raise TimeoutError("response write blocked")
+
+        client = BlockingResponseClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            request_id="blocked-response",
+            command="pwd",
+            cwd="/tmp",
+        )
+        session = make_session(
+            client,
+            request_routing=_ServerRequestRouting(auto_approve_exec=True),
+        )
+        started = time.monotonic()
+        result = session.run_turn(
+            "x", turn_timeout=0.05, notification_poll_timeout=0.01
+        )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.15
+        assert result.timed_out is True
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "approval response failed" in result.error
+        assert client.response_timeout is not None
+        assert client.response_timeout <= 0.05

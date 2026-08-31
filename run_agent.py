@@ -787,6 +787,19 @@ class AIAgent:
         instead of a bare reset. Default callers pass nothing and keep the
         existing reset-only behavior.
         """
+        # A Codex app-server thread is scoped to the Hermes session that owns
+        # its durable workspace mapping. CLI /new and /reset reuse this
+        # AIAgent instance after changing session_id, so retire the old live
+        # process here instead of letting the new session inherit it in memory.
+        codex_session = getattr(self, "_codex_session", None)
+        self._codex_session = None
+        self._codex_session_cwd = None
+        if codex_session is not None:
+            try:
+                codex_session.close()
+            except Exception:
+                pass
+
         # Token usage counters
         self.session_total_tokens = 0
         self.session_input_tokens = 0
@@ -4729,8 +4742,9 @@ class AIAgent:
         # reference behind.
         try:
             codex_session = getattr(self, "_codex_session", None)
+            self._codex_session = None
+            self._codex_session_cwd = None
             if codex_session is not None:
-                self._codex_session = None
                 codex_session.close()
         except Exception:
             pass

@@ -46,7 +46,7 @@ def fake_session(monkeypatch):
 
     monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
     monkeypatch.setattr(
-        CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
+        CodexAppServerSession, "ensure_started", lambda self, **_kwargs: "thread-stub-1"
     )
 
 
@@ -72,6 +72,75 @@ class TestApiModeAccepted:
         assert agent.api_mode == "codex_app_server"
 
 
+class TestTurnTimeoutConfiguration:
+    @staticmethod
+    def _run_with_config(monkeypatch, agent_config):
+        captured = {}
+
+        def fake_run_turn(self, user_input: str, **kwargs):
+            captured.update(kwargs)
+            return TurnResult(
+                final_text="done",
+                projected_messages=[{"role": "assistant", "content": "done"}],
+                turn_id="turn-timeout-config",
+                thread_id="thread-timeout-config",
+            )
+
+        config = {"agent": agent_config}
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self, **_kwargs: "thread-timeout-config",
+        )
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "hermes_cli.config.load_config_readonly", return_value=config
+        ):
+            agent = _make_codex_agent()
+            with patch.object(agent, "_spawn_background_review", return_value=None):
+                agent.run_conversation("hi")
+        return agent, captured
+
+    def test_configured_timeout_reaches_run_turn(self, monkeypatch):
+        agent, captured = self._run_with_config(
+            monkeypatch, {"codex_app_server_turn_timeout": "3600"}
+        )
+        assert agent.codex_app_server_turn_timeout == 3600.0
+        assert captured["turn_timeout"] == 3600.0
+
+    def test_default_timeout_remains_600(self, monkeypatch):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        agent, captured = self._run_with_config(monkeypatch, {})
+        assert DEFAULT_CONFIG["agent"]["codex_app_server_turn_timeout"] == 600
+        assert agent.codex_app_server_turn_timeout == 600.0
+        assert captured["turn_timeout"] == 600.0
+
+    @pytest.mark.parametrize(
+        "raw",
+        [True, False, 0, -1, "not-a-number", "nan", "inf", float("inf")],
+    )
+    def test_invalid_timeout_values_fall_back_to_default(self, raw):
+        from agent.agent_init import _normalize_codex_app_server_turn_timeout
+
+        assert _normalize_codex_app_server_turn_timeout(raw) == 600.0
+
+    def test_explicit_cwd_contract_is_loaded_from_agent_config(self):
+        config = {
+            "agent": {
+                "codex_app_server_require_explicit_cwd": True,
+                "codex_app_server_workspace_roots": ["/srv/repos"],
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "hermes_cli.config.load_config_readonly", return_value=config
+        ):
+            agent = _make_codex_agent()
+
+        assert agent.codex_app_server_require_explicit_cwd is True
+        assert agent.codex_app_server_workspace_roots == ["/srv/repos"]
+
+
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):
         agent = _make_codex_agent()
@@ -85,6 +154,46 @@ class TestRunConversationCodexPath:
         assert result["api_calls"] == 1
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
+
+    @pytest.mark.parametrize(
+        "status_error,interrupted",
+        [
+            ("turn ended status=failed", False),
+            ("turn ended status=interrupted", True),
+            ("turn ended status=unknown", False),
+        ],
+    )
+    def test_non_completed_turn_never_exposes_interim_text(
+        self, monkeypatch, status_error, interrupted
+    ):
+        def fake_run_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="interim text",
+                projected_messages=[
+                    {"role": "assistant", "content": "interim text"}
+                ],
+                interrupted=interrupted,
+                error=status_error,
+                turn_id="turn-non-completed",
+                thread_id="thread-non-completed",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self, **_kwargs: "thread-non-completed",
+        )
+        agent = _make_codex_agent()
+        review = MagicMock()
+        with patch.object(agent, "_spawn_background_review", review):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == ""
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["error"] == status_error
+        review.assert_not_called()
 
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
@@ -105,7 +214,7 @@ class TestRunConversationCodexPath:
 
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
         monkeypatch.setattr(
-            CodexAppServerSession, "ensure_started", lambda self: "thread-usage-1"
+            CodexAppServerSession, "ensure_started", lambda self, **_kwargs: "thread-usage-1"
         )
         agent = _make_codex_agent()
         with patch.object(agent, "_spawn_background_review", return_value=None):
@@ -155,7 +264,7 @@ class TestRunConversationCodexPath:
 
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
         monkeypatch.setattr(
-            CodexAppServerSession, "ensure_started", lambda self: "thread-compact-1"
+            CodexAppServerSession, "ensure_started", lambda self, **_kwargs: "thread-compact-1"
         )
         events = []
         agent = _make_codex_agent(event_callback=lambda name, payload: events.append((name, payload)))
@@ -280,7 +389,7 @@ class TestRunConversationCodexPath:
             )
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
         monkeypatch.setattr(
-            CodexAppServerSession, "ensure_started", lambda self: "th1"
+            CodexAppServerSession, "ensure_started", lambda self, **_kwargs: "th1"
         )
 
         agent = _make_codex_agent()
@@ -399,7 +508,7 @@ class TestRunConversationCodexPath:
         monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
         monkeypatch.setattr(
-            CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
+            CodexAppServerSession, "ensure_started", lambda self, **_kwargs: "thread-stub-1"
         )
         return captured
 
@@ -586,7 +695,7 @@ class TestErrorHandling:
             raise RuntimeError("subprocess died")
 
         monkeypatch.setattr(CodexAppServerSession, "ensure_started",
-                            lambda self: "t1")
+                            lambda self, **_kwargs: "t1")
         monkeypatch.setattr(CodexAppServerSession, "run_turn", boom_run_turn)
 
         agent = _make_codex_agent()
@@ -609,7 +718,7 @@ class TestErrorHandling:
                 thread_id="th",
             )
         monkeypatch.setattr(CodexAppServerSession, "ensure_started",
-                            lambda self: "th")
+                            lambda self, **_kwargs: "th")
         monkeypatch.setattr(CodexAppServerSession, "run_turn", interrupted_turn)
 
         agent = _make_codex_agent()
@@ -643,7 +752,7 @@ class TestSessionRetirementOnRunAgent:
             closes["count"] += 1
 
         monkeypatch.setattr(CodexAppServerSession, "ensure_started",
-                            lambda self: "th1")
+                            lambda self, **_kwargs: "th1")
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
         monkeypatch.setattr(CodexAppServerSession, "close", fake_close)
 
@@ -656,6 +765,41 @@ class TestSessionRetirementOnRunAgent:
         assert getattr(agent, "_codex_session", "MISSING") is None
         # Partial result was still returned (caller still sees the error)
         assert result["partial"] is True
+        assert result["error"] == "turn timed out after 600.0s"
+
+    def test_timed_out_intermediate_text_is_not_a_final_response(
+        self, monkeypatch
+    ):
+        def fake_run_turn(self, user_input, **kwargs):
+            return TurnResult(
+                final_text="intermediate progress, not a completed answer",
+                projected_messages=[
+                    {
+                        "role": "assistant",
+                        "content": "intermediate progress, not a completed answer",
+                    }
+                ],
+                interrupted=True,
+                timed_out=True,
+                error="turn timed out after 600.0s",
+                turn_id="tu1",
+                thread_id="th1",
+                should_retire=True,
+            )
+
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self, **_kwargs: "th1"
+        )
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+
+        agent = _make_codex_agent()
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("hi")
+
+        assert result["final_response"] == ""
+        assert result["completed"] is False
+        assert result["partial"] is True
+        assert result["timed_out"] is True
         assert result["error"] == "turn timed out after 600.0s"
 
     def test_normal_turn_keeps_session(self, fake_session):
@@ -680,7 +824,7 @@ class TestSessionRetirementOnRunAgent:
             closes["count"] += 1
 
         monkeypatch.setattr(CodexAppServerSession, "ensure_started",
-                            lambda self: "th1")
+                            lambda self, **_kwargs: "th1")
         monkeypatch.setattr(CodexAppServerSession, "run_turn", boom_run_turn)
         monkeypatch.setattr(CodexAppServerSession, "close", fake_close)
 
@@ -775,7 +919,7 @@ class TestCodexToolProgressBridge:
                 {"role": "assistant", "content": "done"}], turn_id="t1", thread_id="th1")
 
         monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
-        monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda self: "th1")
+        monkeypatch.setattr(CodexAppServerSession, "ensure_started", lambda self, **_kwargs: "th1")
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
 
         agent = _make_codex_agent()

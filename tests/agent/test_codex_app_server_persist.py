@@ -50,7 +50,12 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     agent = MagicMock()
     # Pre-seed the session so run_codex_app_server_turn skips the spawn block.
     agent._codex_session = MagicMock()
+    agent._codex_session.ensure_started.return_value = "thread-1"
     agent._codex_session.run_turn.return_value = _make_turn()
+    agent.session_cwd = str(Path.cwd().resolve())
+    agent.codex_app_server_require_explicit_cwd = False
+    agent.codex_app_server_workspace_roots = [agent.session_cwd]
+    agent._codex_session_cwd = agent.session_cwd
     agent.tool_progress_callback = None
     agent._iters_since_skill = 0
     agent._skill_nudge_interval = 0
@@ -75,6 +80,85 @@ def test_codex_success_flushes_and_reports_persisted():
     assert isinstance(result["messages"][-1]["timestamp"], float)
     # With the agent as sole persister, the gateway must SKIP its DB write.
     assert result["agent_persisted"] is True
+
+
+def test_codex_failed_projection_flush_reports_not_persisted():
+    """Gateway must be allowed to recover an unpersisted projected suffix."""
+    agent = _make_agent(session_db=MagicMock())
+    agent._flush_messages_to_session_db.return_value = False
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-flush-failure",
+    )
+
+    assert result["agent_persisted"] is False
+
+
+def test_codex_failed_flush_without_projections_reports_not_persisted():
+    """A failed turn still has an inbound user row that gateway may need to save."""
+    agent = _make_agent(session_db=MagicMock())
+    turn = _make_turn()
+    turn.projected_messages = []
+    turn.final_text = ""
+    turn.error = "startup failed"
+    agent._codex_session.run_turn.return_value = turn
+    agent._flush_messages_to_session_db.return_value = False
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[{"role": "user", "content": "hello"}],
+        effective_task_id="task-zero-projection-flush-failure",
+    )
+
+    agent._flush_messages_to_session_db.assert_called_once()
+    assert result["agent_persisted"] is False
+
+
+def test_codex_initial_user_echo_is_skipped_but_steer_is_retained():
+    """Only turn/start's echo is redundant; accepted turn/steer text is durable."""
+    agent = _make_agent(session_db=None)
+    authoritative = (
+        "handoff [HERMES_RUNTIME_CWD="
+        f"{agent.session_cwd}] continue the task"
+    )
+    codex_echo = "handoff  continue the task"
+    turn = _make_turn()
+    turn.projected_messages = [
+        {
+            "role": "user",
+            "content": codex_echo,
+            "_codex_initial_user_echo": True,
+        },
+        {"role": "user", "content": "do not modify migrations"},
+        # A steer may intentionally repeat turn/start's exact text. It is real
+        # user input and must remain durable once the explicit echo was skipped.
+        {"role": "user", "content": codex_echo},
+        {"role": "assistant", "content": "CODEX_ASSISTANT"},
+    ]
+    agent._codex_session.run_turn.return_value = turn
+    messages = [{"role": "user", "content": authoritative}]
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message=authoritative,
+        original_user_message=authoritative,
+        messages=messages,
+        effective_task_id="task-echo",
+    )
+
+    user_rows = [m for m in result["messages"] if m.get("role") == "user"]
+    assert [m["content"] for m in user_rows] == [
+        authoritative,
+        "do not modify migrations",
+        codex_echo,
+    ]
+    assert result["final_response"] == "CODEX_ASSISTANT"
 
 
 def test_codex_user_interrupt_is_reported_and_cleared():
@@ -127,8 +211,13 @@ def test_codex_turn_persists_each_message_exactly_once():
             session_id=sid,
         )
         agent._session_db_created = True
-        agent._codex_session = MagicMock()
-        agent._codex_session.run_turn.return_value = _make_turn()
+        codex_session = MagicMock()
+        codex_session.ensure_started.return_value = "thread-1"
+        codex_session.run_turn.return_value = _make_turn()
+        session_cwd = str(Path.cwd().resolve())
+        setattr(agent, "_codex_session", codex_session)
+        setattr(agent, "session_cwd", session_cwd)
+        setattr(agent, "_codex_session_cwd", session_cwd)
         agent.tool_progress_callback = None
 
         # Model the real flow: the inbound user turn is flushed at turn start

@@ -1068,6 +1068,26 @@ Plugin engines are **never auto-activated** — you must explicitly set `context
 
 See [Memory Providers](/user-guide/features/memory-providers) for the analogous single-select system for memory plugins.
 
+## Codex App-Server Repository Handoffs
+
+The optional Codex app-server runtime can require an explicit, allowlisted
+repository cwd for each handoff:
+
+```yaml
+agent:
+  codex_app_server_require_explicit_cwd: false  # backward-compatible default
+  codex_app_server_workspace_roots: []          # resolved agent cwd only
+```
+
+When the requirement is enabled, include
+`[HERMES_RUNTIME_CWD=/absolute/repository/path]` in the first 1 KiB of the
+message. The path must resolve to an existing directory inside a configured
+absolute workspace root. Hermes strips only the marker before sending the text
+to Codex. Continuity is isolated by Hermes session and canonical cwd; resets
+start clean, and an unavailable stored Codex thread is replaced once for that
+workspace. See [Codex App-Server Runtime](/user-guide/features/codex-app-server-runtime)
+for the full runtime contract.
+
 ## Iteration Budget
 
 When the agent is working on a complex task with many tool calls, it can burn through its iteration budget (default: 500 turns). Hermes does **not** inject mid-task pressure warnings — earlier builds warned the model at 70%/90% budget, which caused models to abandon complex tasks prematurely and was removed in April 2026.

@@ -1072,6 +1072,20 @@ agent:
   # slow or unreachable MCP servers. Default 600.
   # build_wait_timeout: 600
 
+  # Absolute wall-clock deadline for a Codex app-server turn. This bounds the
+  # Codex-owned inner tool loop and is independent of terminal.timeout.
+  # Positive seconds only; invalid values use the 600-second default.
+  # codex_app_server_turn_timeout: 600
+
+  # Require Codex app-server handoffs to name their repository explicitly as
+  # [HERMES_RUNTIME_CWD=/absolute/path] in the first 1 KiB. The marker is
+  # removed before Codex sees the request. Default false preserves implicit cwd.
+  # codex_app_server_require_explicit_cwd: false
+
+  # Absolute directories that may contain a marked repository cwd. An empty
+  # list means the normal resolved agent cwd is the sole allowed root.
+  # codex_app_server_workspace_roots: []
+
   # Max app-level retry attempts for API errors (connection drops, provider
   # timeouts, 5xx, etc.) before the agent surfaces the failure. Lower this
   # to 1 if you use fallback providers and want fast failover on flaky
