@@ -1795,13 +1795,26 @@ def _normalize_codex_response(
     # ``final_answer`` item present, content already holds the real answer and
     # merging narration into it is the leak the original guard was written
     # for — the interim callback still surfaces commentary in both cases.
+    #
+    # Commentary is merged after the content join rather than spliced into
+    # ``content_parts``, because the two are distinct output message items.
+    # A single "\n" is only a soft break in Markdown, so a report ending in a
+    # list or a paragraph would absorb the text that follows it; promoted
+    # narration is separated from the rest of the turn's content — and from a
+    # second commentary item — by a blank line instead.
+    promoted_commentary = ""
     if commentary_parts:
         if tool_calls and not saw_final_answer_phase:
-            content_parts[:0] = commentary_parts
+            promoted_commentary = "\n\n".join([p for p in commentary_parts if p])
         else:
             reasoning_parts.extend(commentary_parts)
 
     final_text = "\n".join([p for p in content_parts if p]).strip()
+    if promoted_commentary:
+        final_text = (
+            f"{promoted_commentary}\n\n{final_text}" if final_text
+            else promoted_commentary
+        ).strip()
     if (
         not final_text
         and hasattr(response, "output_text")
