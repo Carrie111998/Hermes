@@ -51,8 +51,10 @@ The direct backend offers these models:
 
 | Model | Strengths |
 |---|---|
-| `gemini-3-pro-image-preview` | Nano Banana Pro; highest fidelity and editing |
-| `gemini-2.5-flash-image` | Nano Banana; faster generation and editing |
+| `gemini-3.1-flash-lite-image` | Nano Banana 2 Lite; lowest latency and cost; 1K output |
+| `gemini-3.1-flash-image` | Nano Banana 2; balanced quality, speed, 4K output, and multi-reference editing |
+| `gemini-3-pro-image` | Nano Banana Pro; highest fidelity, reasoning, 4K output, and search grounding |
+| `gemini-2.5-flash-image` | Legacy Nano Banana; fast generation and editing |
 
 The selection is stored as:
 
@@ -60,7 +62,7 @@ The selection is stored as:
 image_gen:
   provider: gemini
   gemini:
-    model: gemini-3-pro-image-preview
+    model: gemini-3.1-flash-image
 ```
 
 You can override the model for scripts with `GEMINI_IMAGE_MODEL`.
@@ -175,7 +177,7 @@ Two inputs drive the edit:
 | **Krea** (`Krea 2`) | ✓ | up to 10 | reference-guided generation (`image_style_references`) |
 | **OpenAI (Codex auth)** | ✓ | up to 16 | Codex Responses `image_generation` tool with `input_image` content parts |
 | **OpenRouter** (Image API models) | ✓ | up to 14–16 (per model) | `input_references` on `POST /images/generations`; chat-served models use `image_url` content parts (up to 3) |
-| **Google AI Studio** (Gemini image models) | ✓ | up to 3 | Native Gemini `generateContent` with `inlineData` image parts |
+| **Google AI Studio** (Gemini image models) | ✓ | up to 14 (up to 3 on Gemini 2.5) | Native Gemini `generateContent` with `inlineData` image parts |
 
 FAL models with an editing endpoint: `flux-2/klein/9b`, `flux-2-pro`,
 `nano-banana-pro`, `gpt-image-1.5`, `gpt-image-2`, `ideogram/v3`, and
