@@ -9883,9 +9883,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # was for the previous session only, not for every session spawned
         # afterwards.
         self._explicit_model_override = False
-        self.reasoning_config = _parse_reasoning_config(
-            CLI_CONFIG["agent"].get("reasoning_effort", "")
-        )
         # /new is a full conversation boundary: session-scoped runtime
         # overrides (/model --session, /fast, one-turn restores) do not carry
         # forward.  Re-derive model/provider and service tier from config.yaml
@@ -9945,6 +9942,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # Best-effort: an unreachable config default must never block
                 # /new. The session keeps the current working model.
                 logger.debug("/new model reset to config default failed", exc_info=True)
+        # Re-resolve reasoning through the shared chokepoint for the model
+        # the fresh session lands on — i.e. after the config-default model
+        # reset above. Resolving from the global key only loses per-model
+        # reasoning_overrides (#96012); an explicit --reasoning stays
+        # authoritative for the whole run, matching the /model switch path.
+        if not getattr(self, "_reasoning_cli_flag_applied", False):
+            try:
+                from hermes_constants import resolve_reasoning_config
+                self.reasoning_config = resolve_reasoning_config(
+                    CLI_CONFIG, self.model
+                )
+            except Exception:
+                logger.debug(
+                    "reasoning re-resolution at /new failed; keeping prior level",
+                    exc_info=True,
+                )
         _sync_process_session_id(self.session_id)
 
         if self.agent:

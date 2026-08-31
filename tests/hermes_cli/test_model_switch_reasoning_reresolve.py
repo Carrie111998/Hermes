@@ -123,3 +123,90 @@ def test_failed_agent_swap_rolls_back_reasoning_config(monkeypatch):
     # The swap failed → the CLI snapshot (reasoning included) is restored.
     assert stub.reasoning_config == {"effort": "medium"}
     assert stub.model == "old-default-model"
+
+
+class _NewSessionStub:
+    """Minimum attrs ``new_session`` reads on ``self`` (agent/db disabled)."""
+
+    agent = None
+    session_id = "old-session"
+    _session_db = None
+    model = "glm-5.3-flash"
+    provider = "zai"
+    api_key = ""
+    base_url = ""
+    api_mode = ""
+    reasoning_config = {"enabled": True, "effort": "medium"}
+    _reasoning_cli_flag_applied = False
+
+
+def _config_with_override():
+    return {
+        "agent": {
+            "reasoning_effort": "medium",
+            "reasoning_overrides": {"glm-5-3-flash": "low"},
+        },
+        "model": {"default": "glm-5.3-flash"},
+    }
+
+
+def _run_new_session(monkeypatch, stub, config):
+    import cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "CLI_CONFIG", config)
+    monkeypatch.setattr(cli_mod, "_sync_process_session_id", lambda sid: None)
+    cli_mod.HermesCLI.new_session(stub, silent=True)
+
+
+def test_new_session_reresolves_reasoning_for_landed_model(monkeypatch):
+    # /new must re-resolve through the chokepoint, not the global key only —
+    # otherwise the per-model reasoning_overrides entry is lost (#96012).
+    stub = _NewSessionStub()
+
+    _run_new_session(monkeypatch, stub, _config_with_override())
+
+    assert stub.reasoning_config == {"enabled": True, "effort": "low"}
+
+
+def test_new_session_keeps_explicit_reasoning_flag(monkeypatch):
+    stub = _NewSessionStub()
+    stub._reasoning_cli_flag_applied = True
+    stub.reasoning_config = {"enabled": True, "effort": "low"}  # --reasoning
+
+    _run_new_session(monkeypatch, stub, _config_with_override())
+
+    # An explicit --reasoning is authoritative for the whole run.
+    assert stub.reasoning_config == {"enabled": True, "effort": "low"}
+
+
+def test_new_session_reresolves_after_model_reset(monkeypatch):
+    # Session had switched away from the config default; /new resets the
+    # model back to it and must resolve reasoning for THAT model.
+    stub = _NewSessionStub()
+    stub.model = "session-switched-model"
+
+    def _fake_switch_model(**kwargs):
+        return ModelSwitchResult(
+            success=True,
+            new_model="glm-5.3-flash",
+            target_provider="zai",
+            provider_changed=True,
+            api_key="",
+            base_url="",
+            api_mode="",
+            warning_message="",
+            provider_label="",
+            resolved_via_alias=False,
+            capabilities=None,
+            model_info=_FakeModelInfo(),
+            is_global=False,
+        )
+
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model", _fake_switch_model
+    )
+
+    _run_new_session(monkeypatch, stub, _config_with_override())
+
+    assert stub.model == "glm-5.3-flash"
+    assert stub.reasoning_config == {"enabled": True, "effort": "low"}
