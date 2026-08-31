@@ -43,6 +43,15 @@ def test_linux_falls_through_backends_until_success():
     assert calls == ["xclip", "xsel"]
 
 
+@pytest.mark.linux_only
+def test_wsl_text_write_uses_resolved_powershell():
+    with patch.object(clip, "_is_wsl", return_value=True), \
+         patch.object(clip, "_wsl_powershell_exe", return_value="/wsl/powershell.exe"), \
+         patch.object(clip.subprocess, "run", return_value=_completed()) as run:
+        assert clip.write_clipboard_text("hello") is True
+    assert run.call_args[0][0][0] == "/wsl/powershell.exe"
+
+
 
 
 

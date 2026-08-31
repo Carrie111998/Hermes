@@ -29,6 +29,7 @@ from hermes_cli.clipboard import (
     _xclip_has_image,
     _wsl_save,
     _wsl_has_image,
+    _wsl_powershell_exe,
     _wayland_save,
     _wayland_has_image,
     _windows_save,
@@ -155,15 +156,34 @@ class TestIsWsl:
 
 # ── WSL (powershell.exe) ────────────────────────────────────────────────
 
+class TestWslPowershellExe:
+    def test_prefers_path_candidate(self):
+        with patch("hermes_cli.clipboard.shutil.which", return_value="/opt/windows/powershell.exe"):
+            assert _wsl_powershell_exe() == "/opt/windows/powershell.exe"
+
+    def test_uses_standard_interop_path_when_path_is_stripped(self):
+        fallback = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        with patch("hermes_cli.clipboard.shutil.which", return_value=None), \
+             patch("hermes_cli.clipboard.os.path.isfile", return_value=True) as isfile:
+            assert _wsl_powershell_exe() == fallback
+        isfile.assert_called_once_with(fallback)
+
+    def test_preserves_graceful_failure_when_no_candidate_exists(self):
+        with patch("hermes_cli.clipboard.shutil.which", return_value=None), \
+             patch("hermes_cli.clipboard.os.path.isfile", return_value=False):
+            assert _wsl_powershell_exe() == "powershell.exe"
+
 class TestWslHasImage:
     @pytest.mark.parametrize("stdout, expected", [
         ("True\n", True),
         ("False\n", False),
     ])
     def test_clipboard_image_probe(self, stdout, expected):
-        with patch("hermes_cli.clipboard.subprocess.run") as mock_run:
+        with patch("hermes_cli.clipboard._wsl_powershell_exe", return_value="/wsl/powershell.exe"), \
+             patch("hermes_cli.clipboard.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout=stdout, returncode=0)
             assert _wsl_has_image() is expected
+        assert mock_run.call_args[0][0][0] == "/wsl/powershell.exe"
 
     def test_falls_back_to_get_clipboard_image(self):
         with patch("hermes_cli.clipboard.subprocess.run") as mock_run:
@@ -179,9 +199,11 @@ class TestWslSave:
     def test_successful_extraction(self, tmp_path):
         dest = tmp_path / "out.png"
         b64_png = base64.b64encode(FAKE_PNG).decode()
-        with patch("hermes_cli.clipboard.subprocess.run") as mock_run:
+        with patch("hermes_cli.clipboard._wsl_powershell_exe", return_value="/wsl/powershell.exe"), \
+             patch("hermes_cli.clipboard.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(stdout=b64_png + "\n", returncode=0)
             assert _wsl_save(dest) is True
+        assert mock_run.call_args[0][0][0] == "/wsl/powershell.exe"
         assert dest.read_bytes() == FAKE_PNG
 
 

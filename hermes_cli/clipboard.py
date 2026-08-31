@@ -15,6 +15,7 @@ Platform support:
 import base64
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -76,7 +77,7 @@ def _write_clipboard_commands() -> list:
         return [(["powershell", "-NoProfile", "-NonInteractive"], False)]
     attempts = []
     if _is_wsl():
-        attempts.append((["powershell.exe", "-NoProfile", "-NonInteractive"], False))
+        attempts.append(([_wsl_powershell_exe(), "-NoProfile", "-NonInteractive"], False))
     if os.environ.get("WAYLAND_DISPLAY"):
         attempts.append((["wl-copy", "--type", "text/plain"], True))
     attempts.append((["xclip", "-selection", "clipboard", "-in"], True))
@@ -390,14 +391,26 @@ def _linux_save(dest: Path) -> bool:
 # ── WSL2 (powershell.exe) ────────────────────────────────────────────────
 # Reuses _PS_CHECK_IMAGE / _PS_EXTRACT_IMAGE defined above.
 
+_WSL_POWERSHELL_FALLBACK = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+
+
+def _wsl_powershell_exe() -> str:
+    """Resolve PowerShell even when WSL omits Windows directories from PATH."""
+    exe = shutil.which("powershell.exe")
+    if exe:
+        return exe
+    if os.path.isfile(_WSL_POWERSHELL_FALLBACK):
+        return _WSL_POWERSHELL_FALLBACK
+    return "powershell.exe"
+
 def _wsl_has_image() -> bool:
     """Check if Windows clipboard has an image (via powershell.exe)."""
-    return _powershell_has_image("powershell.exe", timeout=8, label="WSL")
+    return _powershell_has_image(_wsl_powershell_exe(), timeout=8, label="WSL")
 
 
 def _wsl_save(dest: Path) -> bool:
     """Extract clipboard image via powershell.exe → base64 → decode to PNG."""
-    return _powershell_save_image("powershell.exe", dest, timeout=15, label="WSL")
+    return _powershell_save_image(_wsl_powershell_exe(), dest, timeout=15, label="WSL")
 
 
 # ── Wayland (wl-paste) ──────────────────────────────────────────────────
