@@ -126,19 +126,39 @@ def test_oauth_active_key_is_foreign_pool_entry():
     assert oauth_active_key_is_foreign_pool_entry(agent, "") is False
 
 
-def test_recover_refreshes_sole_xai_entry_when_expired_key_matches_nothing():
-    """8:34 hole: expired live key matches no pool entry, sole credential.
+def test_resolve_stale_oauth_pool_entry_does_not_guess_manual():
+    from types import SimpleNamespace
 
-    try_refresh_matching(hint=expired) returns None; a single-entry pool
-    then refuses to rotate. Recovery must retry without the hint.
-    """
+    from agent.agent_runtime_helpers import resolve_stale_oauth_pool_entry
+
+    manual = SimpleNamespace(id="manual-1", source="manual", runtime_api_key="other")
+    device = SimpleNamespace(id="dc-1", source="device_code", runtime_api_key="tok")
+
+    class _Pool:
+        def __init__(self, entries):
+            self._entries = entries
+
+        def entries(self):
+            return self._entries
+
+    assert resolve_stale_oauth_pool_entry(
+        SimpleNamespace(_credential_pool_entry_id=None), _Pool([manual])
+    ) is None
+    assert resolve_stale_oauth_pool_entry(
+        SimpleNamespace(_credential_pool_entry_id="manual-1"), _Pool([manual])
+    ) is manual
+    assert resolve_stale_oauth_pool_entry(
+        SimpleNamespace(_credential_pool_entry_id=None), _Pool([device])
+    ) is device
+
+
+def _xai_agent(*, api_key="expired-in-memory-token"):
     from unittest.mock import MagicMock
 
-    from agent.error_classifier import FailoverReason
     from run_agent import AIAgent
 
     agent = AIAgent(
-        api_key="expired-in-memory-token",
+        api_key=api_key,
         base_url="https://api.x.ai/v1",
         model="grok-4.6",
         quiet_mode=True,
@@ -150,24 +170,36 @@ def test_recover_refreshes_sole_xai_entry_when_expired_key_matches_nothing():
     agent._interrupt_requested = False
     agent._credential_pool_entry_id = None
     agent._swap_credential = MagicMock()
+    return agent
 
+
+def test_recover_adopts_reminted_device_code_entry_without_second_refresh():
+    """8:34 hole: expired live key, sole device_code entry already reminted."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from agent.error_classifier import FailoverReason
+
+    agent = _xai_agent()
     calls = []
-    refreshed = MagicMock(id="only-entry")
+    only = SimpleNamespace(
+        id="only-entry",
+        source="device_code",
+        runtime_api_key="fresh-store-token",
+    )
 
     class _FakePool:
         provider = "xai-oauth"
 
         def try_refresh_matching(self, api_key_hint=None, credential_id=None):
             calls.append({"api_key_hint": api_key_hint, "credential_id": credential_id})
-            if api_key_hint is None and credential_id is None:
-                return refreshed
             return None
 
         def mark_exhausted_and_rotate(self, **_kwargs):
-            raise AssertionError("must not rotate when the sole entry can refresh")
+            raise AssertionError("must not rotate when the reminted entry can be adopted")
 
         def entries(self):
-            return [MagicMock(id="only-entry", runtime_api_key="fresh-store-token")]
+            return [only]
 
         def has_available(self):
             return True
@@ -184,7 +216,99 @@ def test_recover_refreshes_sole_xai_entry_when_expired_key_matches_nothing():
     )
 
     assert recovered is True
-    assert calls[0]["api_key_hint"] == "expired-in-memory-token"
-    assert calls[-1] == {"api_key_hint": None, "credential_id": None}
-    agent._swap_credential.assert_called_once_with(refreshed)
+    assert calls == [
+        {"api_key_hint": "expired-in-memory-token", "credential_id": None}
+    ]
+    agent._swap_credential.assert_called_once_with(only)
+
+
+def test_recover_does_not_guess_sole_manual_other_account():
+    from types import SimpleNamespace
+
+    from agent.error_classifier import FailoverReason
+
+    agent = _xai_agent()
+    calls = []
+    manual = SimpleNamespace(
+        id="manual-other",
+        source="manual",
+        runtime_api_key="other-account-token",
+    )
+
+    class _FakePool:
+        provider = "xai-oauth"
+
+        def try_refresh_matching(self, api_key_hint=None, credential_id=None):
+            calls.append({"api_key_hint": api_key_hint, "credential_id": credential_id})
+            return None
+
+        def mark_exhausted_and_rotate(self, **_kwargs):
+            return None
+
+        def entries(self):
+            return [manual]
+
+        def has_available(self):
+            return True
+
+        def current(self):
+            return None
+
+    agent._credential_pool = _FakePool()
+    recovered, _ = agent._recover_with_credential_pool(
+        status_code=403,
+        has_retried_429=False,
+        classified_reason=FailoverReason.auth,
+        error_context={"message": REAL_EXPIRED_BODY},
+    )
+
+    assert recovered is False
+    assert all(c["credential_id"] is None for c in calls)
+    agent._swap_credential.assert_not_called()
+
+
+def test_recover_adopts_reminted_entry_by_credential_id():
+    from types import SimpleNamespace
+
+    from agent.error_classifier import FailoverReason
+
+    agent = _xai_agent()
+    agent._credential_pool_entry_id = "manual-1"
+    reminted = SimpleNamespace(
+        id="manual-1",
+        source="manual",
+        runtime_api_key="fresh-manual-token",
+    )
+    calls = []
+
+    class _FakePool:
+        provider = "xai-oauth"
+
+        def try_refresh_matching(self, api_key_hint=None, credential_id=None):
+            calls.append({"api_key_hint": api_key_hint, "credential_id": credential_id})
+            return None
+
+        def mark_exhausted_and_rotate(self, **_kwargs):
+            raise AssertionError("must adopt the reminted id, not rotate")
+
+        def entries(self):
+            return [reminted]
+
+        def has_available(self):
+            return True
+
+        def current(self):
+            return None
+
+    agent._credential_pool = _FakePool()
+    recovered, _ = agent._recover_with_credential_pool(
+        status_code=403,
+        has_retried_429=False,
+        classified_reason=FailoverReason.auth,
+        error_context={"message": REAL_EXPIRED_BODY},
+    )
+
+    assert recovered is True
+    agent._swap_credential.assert_called_once_with(reminted)
+    assert all(c.get("credential_id") != "manual-1" or c["api_key_hint"] for c in calls)
 

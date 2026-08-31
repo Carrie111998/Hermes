@@ -5826,7 +5826,12 @@ class AIAgent:
         active_key = str(self.api_key or "").strip()
         adopt_existing_singleton = False
         if singleton_key and active_key and singleton_key != active_key:
-            from agent.agent_runtime_helpers import oauth_active_key_is_foreign_pool_entry
+            from agent.agent_runtime_helpers import (
+                oauth_active_key_is_foreign_pool_entry,
+                oauth_pool_entry_is_device_code,
+                resolve_stale_oauth_pool_entry,
+            )
+            from hermes_cli.auth import _codex_access_token_is_expiring
 
             if oauth_active_key_is_foreign_pool_entry(self, active_key):
                 logger.debug(
@@ -5836,19 +5841,24 @@ class AIAgent:
                     self.provider,
                 )
                 return False
-            if getattr(self, "_credential_pool", None) is not None:
-                # Live key matches no pool entry: stale in-memory copy of
-                # the singleton (store/pool already reminted). Adopting
-                # that token recovers without spending a second single-use
-                # refresh token. No pool + mismatched keys still skips —
-                # that is the explicit ``api_key=`` / other-account case.
-                logger.info(
-                    "%s active api_key matched no pool entry; adopting "
-                    "current singleton access token without force-refresh",
-                    self.provider,
-                )
-                adopt_existing_singleton = True
-            else:
+            pool = getattr(self, "_credential_pool", None)
+            entry = resolve_stale_oauth_pool_entry(self, pool)
+            if (
+                pool is not None
+                and entry is not None
+                and oauth_pool_entry_is_device_code(entry)
+            ):
+                # Same device_code account; store already reminted. Adopt
+                # only when that token is not itself expired — otherwise
+                # fall through to force_refresh.
+                if not _codex_access_token_is_expiring(singleton_key, 60):
+                    logger.info(
+                        "%s adopting current singleton access token "
+                        "without force-refresh",
+                        self.provider,
+                    )
+                    adopt_existing_singleton = True
+            elif pool is None or entry is None or not oauth_pool_entry_is_device_code(entry):
                 logger.debug(
                     "%s singleton tokens differ from the active api_key; "
                     "skipping singleton force-refresh to avoid silent account swap. "
