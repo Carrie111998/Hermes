@@ -4441,16 +4441,17 @@ def _synthesize_ended_run(
 # ---------------------------------------------------------------------------
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    """Return True when ``task_id`` was explicitly parked in ``blocked``.
 
     A ``blocked`` status can come from two very different sources:
 
-    * **Worker- or operator-initiated** — a worker called
+    * **Creator-, worker-, or operator-initiated** — the creator requested
+      ``initial_status="blocked"``, a worker called
       ``kanban_block(reason="review-required: ...")`` (or somebody ran
       ``hermes kanban block <id>``).  This is a deliberate handoff that
-      should stay blocked until an operator unblocks it.  The block tool
-      emits a ``"blocked"`` event row in ``task_events``.
+      should stay blocked until an operator unblocks it.  Creation records
+      the requested status in the ``"created"`` payload; the block tool emits
+      a ``"blocked"`` event row in ``task_events``.
 
     * **Circuit-breaker** — ``_record_task_failure`` tripped after
       repeated crashes / spawn failures / timeouts.  This emits
@@ -4459,10 +4460,9 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
       finish, transient infra error clears).
 
     The cheapest signal that distinguishes the two is the most recent
-    ``"blocked"`` / ``"unblocked"`` event for the task.  If the most
-    recent one is ``"blocked"`` (or there is a ``"blocked"`` event and
-    no ``"unblocked"`` event has fired since), the task is sticky and
-    ``recompute_ready`` must *not* auto-promote it.
+    explicit block-state event for the task.  A ``"blocked"`` event or a
+    ``"created"`` event whose payload records ``status="blocked"`` is sticky;
+    a later ``"unblocked"`` event clears it.
 
     Returns ``False`` when there is no such event at all (e.g. the task
     was set to ``status='blocked'`` by the circuit breaker or by direct
@@ -4470,12 +4470,20 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     for that path.
     """
     row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('created', 'blocked', 'unblocked') "
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if not row or row["kind"] == "unblocked":
+        return False
+    if row["kind"] == "blocked":
+        return True
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(payload, dict) and payload.get("status") == "blocked"
 
 
 def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:

@@ -13,6 +13,7 @@ These tests pin down:
 
 * Worker / operator-initiated blocks are sticky and survive
   ``recompute_ready``.
+* Tasks created with ``initial_status="blocked"`` are equally sticky.
 * Circuit-breaker blocks (``gave_up`` event, status flipped via
   ``_record_task_failure``) still auto-recover — the original intent
   of #40c1decb3 is preserved.
@@ -74,6 +75,22 @@ def test_worker_block_is_not_auto_promoted_by_recompute_ready(kanban_home: Path)
             promoted = kb.recompute_ready(conn)
             assert promoted == 0, "worker-blocked task must not auto-promote"
             assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_initial_blocked_is_sticky_until_explicit_unblock(kanban_home: Path) -> None:
+    """An explicitly parked task must not be treated as dependency-blocked."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="awaiting human ops",
+            initial_status="blocked",
+        )
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        assert kb.unblock_task(conn, tid)
+        assert kb.get_task(conn, tid).status == "ready"
 
 
 
