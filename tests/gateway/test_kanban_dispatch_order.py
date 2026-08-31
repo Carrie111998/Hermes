@@ -30,17 +30,23 @@ def test_ready_dispatch_precedes_auto_decompose(monkeypatch, tmp_path):
             }
         },
     )
-    monkeypatch.setattr(kb, "list_boards", lambda include_archived=False: [{"slug": "default"}])
+    monkeypatch.setattr(
+        kb,
+        "list_boards",
+        lambda include_archived=False: [{"slug": "default"}],
+    )
     monkeypatch.setattr(kb, "reap_worker_zombies", lambda: [])
-    monkeypatch.setattr(kb, "dispatch_once", lambda *args, **kwargs: calls.append("dispatch"))
+    monkeypatch.setattr(
+        kb, "dispatch_once", lambda *args, **kwargs: calls.append("dispatch")
+    )
     monkeypatch.setattr(kb, "has_spawnable_ready", lambda conn: False)
     monkeypatch.setattr(kb, "review_dispatch_enabled", lambda: False)
-    monkeypatch.setattr(decomp, "list_triage_ids", lambda: ["t_atomic"])
+    monkeypatch.setattr(decomp, "list_triage_ids", lambda: ["task_exact_head"])
 
     def _decompose(*args, **kwargs):
         calls.append("decompose")
         runner._running = False
-        return decomp.DecomposeOutcome("t_atomic", False, "test stop")
+        return decomp.DecomposeOutcome("task_exact_head", False, "test stop")
 
     async def _to_thread(fn, *args, **kwargs):
         return fn(*args, **kwargs)

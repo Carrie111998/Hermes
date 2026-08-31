@@ -289,9 +289,7 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
-    if kb.is_atomic_pr_automation_task(
-        body=task.body, idempotency_key=task.idempotency_key
-    ):
+    if kb.is_atomic_pr_automation_task(body=task.body):
         return DecomposeOutcome(
             task_id,
             False,
