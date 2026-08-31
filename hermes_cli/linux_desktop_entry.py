@@ -77,12 +77,17 @@ def resolve_exec_command() -> str:
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # venv one), so prefix it explicitly — as-is: a venv interpreter
+            # is usually a symlink, and CPython locates pyvenv.cfg and the
+            # venv site-packages through the UNRESOLVED path. Resolving it
+            # escapes to the base interpreter, which lacks the venv's
+            # packages (#99581).
+            argv = [sys.executable, str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        # Unresolved for the same venv-symlink reason as above.
+        argv = [sys.executable, "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 

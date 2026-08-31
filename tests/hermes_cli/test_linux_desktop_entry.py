@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -107,10 +108,43 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
-    assert exec_line.split(" ")[0].strip('"') == interpreter
+    # As-is, not resolved: the venv interpreter path must survive unchanged
+    # (see the symlinked-venv regression test below).
+    assert exec_line.split(" ")[0].strip('"') == sys.executable
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
+
+
+# #99581: uv (and standard) venvs make sys.executable a symlink into the
+# base interpreter install. CPython finds pyvenv.cfg and the venv
+# site-packages through the UNRESOLVED path, so resolving the symlink when
+# building Exec= wrote the base interpreter into the entry — it lacks the
+# venv's packages, and the launch dies on the first third-party import
+# (ModuleNotFoundError), silently (Terminal=false).
+@pytest.mark.skipif(sys.platform == "win32", reason="needs symlink creation privileges on Windows")
+def test_exec_keeps_venv_symlink_interpreter_unresolved(tmp_path, xdg_home, monkeypatch):
+    root = _make_project(tmp_path)
+
+    base = tmp_path / "uv" / "python" / "bin" / "python3"
+    base.parent.mkdir(parents=True)
+    base.write_text("", encoding="utf-8")
+    venv_python = tmp_path / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base)
+    monkeypatch.setattr(lde.sys, "executable", str(venv_python))
+
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line.split(" ")[0].strip('"') == str(venv_python)
+    assert str(base) not in exec_line
 
 
 def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypatch):
