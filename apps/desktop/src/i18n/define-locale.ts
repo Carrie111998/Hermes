@@ -17,12 +17,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+function cloneLocaleTree<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map(item => cloneLocaleTree(item)) as T
+  }
+
+  if (isRecord(value)) {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cloneLocaleTree(item)])) as T
+  }
+
+  return value
+}
+
 function mergeTranslations<T>(base: T, overrides: TranslationOverride<T> | undefined): T {
   if (!isRecord(base) || !isRecord(overrides)) {
     return (overrides ?? base) as T
   }
 
-  const result: Record<string, unknown> = { ...base }
+  const result: Record<string, unknown> = cloneLocaleTree(base)
 
   for (const [key, value] of Object.entries(overrides)) {
     if (value === undefined) {

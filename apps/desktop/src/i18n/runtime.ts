@@ -27,7 +27,10 @@ function render(value: unknown, args: unknown[]): null | string {
 }
 
 /** The active → DEFAULT → key resolution every translator shares. `source`
- *  yields a message tree per locale — the app catalog, or a plugin's bundles. */
+ *  yields a message tree per locale — the app catalog, or a plugin's bundles.
+ *  The app catalog supplies an isolated English tree until a lazy locale load
+ *  completes, so synchronous callers remain usable without sharing mutations.
+ */
 export function translateFrom(
   source: (locale: Locale) => unknown,
   locale: Locale,

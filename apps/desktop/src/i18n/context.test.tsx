@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { useLayoutEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesConfigRecord } from '@/hermes'
@@ -25,11 +26,13 @@ function LanguageProbe({ target = 'zh' }: { target?: Locale }) {
 }
 
 function RapidSwitchProbe() {
-  const { locale, setLocale } = useI18n()
+  const { isSavingLocale, locale, saveError, setLocale } = useI18n()
 
   return (
     <div>
       <p data-testid="locale">{locale}</p>
+      <p data-testid="saving">{String(isSavingLocale)}</p>
+      <p data-testid="save-error">{saveError?.message ?? ''}</p>
       <button onClick={() => void setLocale('ja').catch(() => undefined)} type="button">
         Japanese
       </button>
@@ -40,10 +43,35 @@ function RapidSwitchProbe() {
   )
 }
 
+function ImmediateSwitchProbe() {
+  const { locale, setLocale } = useI18n()
+
+  useLayoutEffect(() => {
+    void setLocale('ar').catch(() => undefined)
+  }, [setLocale])
+
+  return <p data-testid="locale">{locale}</p>
+}
+
 describe('I18nProvider', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+  })
+
+  it('does not let an initial config effect supersede an earlier explicit choice', async () => {
+    const configClient: I18nConfigClient = {
+      getConfig: vi.fn().mockResolvedValue({ display: { language: 'zh' } }),
+      saveConfig: vi.fn().mockResolvedValue({ ok: true })
+    }
+
+    render(
+      <I18nProvider configClient={configClient}>
+        <ImmediateSwitchProbe />
+      </I18nProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('ar'))
   })
 
   it('defaults to English without a config client', () => {
@@ -288,6 +316,47 @@ describe('I18nProvider', () => {
     finishFirstSave({ ok: true })
     await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(2))
     expect(saveConfig.mock.calls[1]?.[0]).toMatchObject({ display: { language: 'zh' } })
+  })
+
+  it('does not publish a stale save failure over a newer switch', async () => {
+    let finishFirstSave!: (error?: Error) => void
+    let finishSecondSave!: (result: { ok: boolean }) => void
+
+    const firstSave = new Promise<{ ok: boolean }>((_resolve, reject) => {
+      finishFirstSave = reject
+    })
+
+    const secondSave = new Promise<{ ok: boolean }>(resolve => {
+      finishSecondSave = resolve
+    })
+
+    const saveConfig = vi.fn().mockReturnValueOnce(firstSave).mockReturnValueOnce(secondSave)
+
+    const configClient: I18nConfigClient = {
+      getConfig: vi.fn().mockResolvedValue({ display: { language: 'en' } }),
+      saveConfig
+    }
+
+    render(
+      <I18nProvider configClient={configClient}>
+        <RapidSwitchProbe />
+      </I18nProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('en'))
+    fireEvent.click(screen.getByRole('button', { name: 'Japanese' }))
+    await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Chinese' }))
+    await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('zh'))
+
+    finishFirstSave(new Error('stale save failed'))
+    await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(2))
+    expect(screen.getByTestId('save-error').textContent).toBe('')
+
+    finishSecondSave({ ok: true })
+    await waitFor(() => expect(screen.getByTestId('saving').textContent).toBe('false'))
+    expect(screen.getByTestId('locale').textContent).toBe('zh')
   })
 
   it('applies RTL direction for Arabic and restores LTR on switch back', async () => {

@@ -101,6 +101,7 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
   const [saveError, setSaveError] = useState<Error | null>(null)
   const localeRef = useRef(locale)
   const localeRequestRef = useRef(0)
+  const explicitLocaleChoiceRef = useRef(false)
   const saveQueueRef = useRef<Promise<void>>(Promise.resolve())
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
@@ -112,6 +113,10 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
 
   // eslint-disable-next-line no-restricted-syntax -- request-generation ref cancels stale async config/catalog loads
   useEffect(() => {
+    if (explicitLocaleChoiceRef.current) {
+      return undefined
+    }
+
     if (!configClient && normalizeLocale(initialLocale) === DEFAULT_LOCALE) {
       return undefined
     }
@@ -162,6 +167,7 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
       const previousLocale = localeRef.current
       const previousTranslations = getTranslations(previousLocale)
 
+      explicitLocaleChoiceRef.current = true
       localeRequestRef.current = requestId
       setSaveError(null)
       setIsLoadingConfig(false)
