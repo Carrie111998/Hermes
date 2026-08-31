@@ -691,6 +691,7 @@ def _chat_messages_to_responses_input(
                         item_id = raw_item.get("id")
                         if (
                             not is_github_responses
+                            and not has_codex_reasoning
                             and isinstance(item_id, str)
                             and item_id.strip()
                         ):
@@ -976,11 +977,19 @@ def _preflight_codex_input_items(
     )
     normalized: List[Dict[str, Any]] = []
     seen_ids: set = set()
+    reasoning_requires_anonymous_message = False
     for idx, item in enumerate(raw_items):
         if not isinstance(item, dict):
             raise ValueError(f"Codex Responses input[{idx}] must be an object.")
 
         item_type = item.get("type")
+        # Only an immediately following assistant message can belong to the
+        # de-identified reasoning chain.  A tool call/output, user item, or
+        # other Responses item closes that turn, so later assistant messages
+        # retain their independent IDs for cache reuse.
+        if reasoning_requires_anonymous_message and item_type not in {"reasoning", "message"}:
+            reasoning_requires_anonymous_message = False
+
         if item_type == "function_call":
             call_id = item.get("call_id")
             name = item.get("name")
@@ -1083,6 +1092,12 @@ def _preflight_codex_input_items(
                 else:
                     reasoning_item["summary"] = []
                 normalized.append(reasoning_item)
+                # A store-less replay strips the reasoning ID above.  The
+                # next assistant message belongs to that reasoning chain, so
+                # its server-issued ID must be stripped too; otherwise the
+                # API rejects the message for referencing a missing reasoning
+                # item (#97427).
+                reasoning_requires_anonymous_message = True
             continue
 
         if item_type == "compaction":
@@ -1131,6 +1146,7 @@ def _preflight_codex_input_items(
             item_id = item.get("id")
             if (
                 not is_github_responses
+                and not reasoning_requires_anonymous_message
                 and isinstance(item_id, str)
                 and item_id.strip()
             ):
@@ -1141,6 +1157,7 @@ def _preflight_codex_input_items(
             if isinstance(phase, str) and phase.strip():
                 normalized_item["phase"] = phase.strip()
             normalized.append(normalized_item)
+            reasoning_requires_anonymous_message = False
             continue
 
         role = item.get("role")

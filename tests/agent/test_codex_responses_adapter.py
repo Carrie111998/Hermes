@@ -302,6 +302,119 @@ _OVERSIZED_ITEM_ID = "x" * 408
 _VALID_ITEM_ID = "msg_abc123"
 
 
+def test_chat_replay_drops_message_id_paired_with_encrypted_reasoning():
+    """A store-less replay must not retain the message's server ID after
+    its required reasoning ID has been removed (#97427)."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "I'll inspect that.",
+            "codex_reasoning_items": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_required_by_msg",
+                    "encrypted_content": "opaque-reasoning",
+                    "summary": [],
+                }
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "id": _VALID_ITEM_ID,
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "I'll inspect that."}],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    reasoning_item = next(item for item in items if item.get("type") == "reasoning")
+    message_item = next(item for item in items if item.get("type") == "message")
+    assert "id" not in reasoning_item
+    assert "id" not in message_item
+    assert message_item["phase"] == "commentary"
+    assert message_item["content"] == [{"type": "output_text", "text": "I'll inspect that."}]
+
+
+def test_chat_replay_keeps_short_message_id_without_encrypted_reasoning():
+    """Message IDs still participate in cache reuse when no reasoning item
+    has been de-identified for the same assistant turn."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Plain answer.",
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "id": _VALID_ITEM_ID,
+                    "content": [{"type": "output_text", "text": "Plain answer."}],
+                }
+            ],
+        }
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    message_item = next(item for item in items if item.get("type") == "message")
+    assert message_item["id"] == _VALID_ITEM_ID
+
+
+def test_preflight_drops_only_message_id_following_replayed_reasoning():
+    """The final wire validation must preserve the same graph invariant as
+    history conversion without discarding unrelated cache IDs."""
+    items = _preflight_codex_input_items(
+        [
+            {"type": "reasoning", "id": "rs_required_by_msg", "encrypted_content": "opaque"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "id": "msg_requires_reasoning",
+                "content": [{"type": "output_text", "text": "Tool plan."}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "id": "msg_independent",
+                "content": [{"type": "output_text", "text": "Plain answer."}],
+            },
+        ]
+    )
+
+    message_items = [item for item in items if item.get("type") == "message"]
+    assert "id" not in message_items[0]
+    assert message_items[1]["id"] == "msg_independent"
+
+
+def test_preflight_keeps_message_id_after_reasoning_tool_round():
+    """A reasoning item followed by a tool round has no paired assistant
+    message, so a later assistant message must keep its independent ID."""
+    items = _preflight_codex_input_items(
+        [
+            {"type": "reasoning", "id": "rs_for_tool", "encrypted_content": "opaque"},
+            {"type": "function_call", "call_id": "call_1", "name": "pwd", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "/workspace"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "id": "msg_after_tool_round",
+                "content": [{"type": "output_text", "text": "The directory is ready."}],
+            },
+        ]
+    )
+
+    message_item = next(item for item in items if item.get("type") == "message")
+    assert message_item["id"] == "msg_after_tool_round"
+
+
 # The codex app-server overflows the Responses 64-char call_id limit for
 # MCP-routed tools, e.g. codex_mcp__hermes-tools__web_search_exec-<uuid> (#73492).
 _OVERSIZED_CALL_ID = "codex_mcp__hermes-tools__web_search_exec-" + "0" * 43
