@@ -364,7 +364,7 @@ class TestThreadContext(unittest.TestCase):
     def test_reply_uses_re_prefix(self):
         """Reply subject should have Re: prefix."""
         adapter = self._make_adapter()
-        adapter._thread_context["user@test.com"] = {
+        adapter._thread_context[("user@test.com", "T1")] = {
             "subject": "Project question",
             "message_id": "<original@test.com>",
         }
@@ -373,7 +373,9 @@ class TestThreadContext(unittest.TestCase):
             mock_server = MagicMock()
             mock_smtp.return_value = mock_server
 
-            adapter._send_email("user@test.com", "Here is the answer.", None)
+            adapter._send_email(
+                "user@test.com", "Here is the answer.", None, thread_id="T1"
+            )
 
             # Check the sent message
             send_call = mock_server.send_message.call_args[0][0]
@@ -436,7 +438,7 @@ class TestSendMethods(unittest.TestCase):
         """get_chat_info should return email address as chat info."""
         import asyncio
         adapter = self._make_adapter()
-        adapter._thread_context["user@test.com"] = {"subject": "Test", "message_id": "<m@t>"}
+        adapter._thread_context[("user@test.com", "T1")] = {"subject": "Test", "message_id": "<m@t>"}
 
         info = asyncio.run(
             adapter.get_chat_info("user@test.com")
