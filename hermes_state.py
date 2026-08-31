@@ -14151,7 +14151,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _do(conn):
             cursor = conn.execute(
                 "DELETE FROM messages "
-                "WHERE session_id = ? AND platform_message_id = ? AND observed = 1",
+                "WHERE session_id = ? AND platform_message_id = ? "
+                "AND observed = 1 AND active = 1",
                 (session_id, platform_message_id),
             )
             deleted = max(int(cursor.rowcount or 0), 0)

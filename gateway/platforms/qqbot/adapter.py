@@ -1418,6 +1418,8 @@ class QQAdapter(BasePlatformAdapter):
         if not isinstance(mentions, list):
             return False
         bot_openids = getattr(self, "_bot_openids", set())
+        if not bot_openids:
+            return False
         for mention in mentions:
             if not isinstance(mention, dict):
                 continue
@@ -1426,17 +1428,7 @@ class QQAdapter(BasePlatformAdapter):
                 for key in ("id", "member_openid", "user_openid", "union_openid")
                 if mention.get(key)
             }
-            if bot_openids:
-                if bot_openids.intersection(mention_ids):
-                    return True
-                continue
-            # READY should normally provide the bot OpenID before message
-            # dispatch starts. Fall back to the official User.bot field only
-            # if that identity was absent from the READY payload.
-            bot_flag = mention.get("bot")
-            if bot_flag is True or (
-                isinstance(bot_flag, str) and bot_flag.strip().lower() == "true"
-            ):
+            if bot_openids.intersection(mention_ids):
                 return True
         return False
 
@@ -1597,6 +1589,18 @@ class QQAdapter(BasePlatformAdapter):
                 return
             await self.handle_message(event)
         else:
+            # Attachment/quote processing above may yield long enough for the
+            # same platform message to arrive as an addressed event. The dedupe
+            # upgrade marks it addressed before that handler runs. Re-check
+            # immediately before the synchronous append so a delayed passive
+            # coroutine cannot reintroduce actionable-looking chatter.
+            if self._seen_message_modes.get(msg_id) != "observed":
+                logger.debug(
+                    "[%s] Skipping stale passive QQ append after addressed upgrade: %s",
+                    self._log_tag,
+                    msg_id,
+                )
+                return
             self._observe_group_message(event)
 
     async def _handle_guild_message(

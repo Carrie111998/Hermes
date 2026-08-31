@@ -350,6 +350,18 @@ class TestQQFullGroupMessages:
         assert adapter._session_store.entries[0][1]["observed"] is True
 
     @pytest.mark.asyncio
+    async def test_unknown_bot_identity_does_not_treat_other_bot_as_self(self, tmp_path):
+        adapter = self._make(tmp_path)
+        adapter._bot_openids = set()
+        payload = self._payload(mentions=[{"id": "other-bot-openid", "bot": True}])
+
+        await adapter._on_message("GROUP_MESSAGE_CREATE", payload)
+
+        adapter.handle_message.assert_not_awaited()
+        assert len(adapter._session_store.entries) == 1
+        assert adapter._session_store.entries[0][1]["observed"] is True
+
+    @pytest.mark.asyncio
     async def test_observed_event_is_replaced_before_addressed_dispatch_with_real_store(
         self, tmp_path
     ):
@@ -406,6 +418,42 @@ class TestQQFullGroupMessages:
         assert matching[0].get("observed", False) is False
         assert db.get_session(session.session_id)["message_count"] == 1
         db.close()
+
+    @pytest.mark.asyncio
+    async def test_delayed_passive_handler_cannot_append_after_addressed_upgrade(
+        self, tmp_path
+    ):
+        adapter = self._make(tmp_path)
+        passive_started = asyncio.Event()
+        release_passive = asyncio.Event()
+        attachment_calls = 0
+
+        async def gated_attachments(_attachments):
+            nonlocal attachment_calls
+            attachment_calls += 1
+            if attachment_calls == 1:
+                passive_started.set()
+                await release_passive.wait()
+            return {
+                "image_urls": [],
+                "image_media_types": [],
+                "voice_transcripts": [],
+                "attachment_info": "",
+            }
+
+        adapter._process_attachments = mock.AsyncMock(side_effect=gated_attachments)
+        payload = self._payload(msg_id="msg-race")
+        passive_task = asyncio.create_task(
+            adapter._on_message("GROUP_MESSAGE_CREATE", payload)
+        )
+        await passive_started.wait()
+
+        await adapter._on_message("GROUP_AT_MESSAGE_CREATE", payload)
+        release_passive.set()
+        await passive_task
+
+        adapter.handle_message.assert_awaited_once()
+        assert adapter._session_store.entries == []
 
     def test_addressed_duplicate_upgrades_prior_observation(self, tmp_path):
         adapter = self._make(tmp_path)
