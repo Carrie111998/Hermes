@@ -1473,8 +1473,8 @@ def _real_profile_state() -> dict:
         return state
 
 
-def _terminate_real_profile_proc(proc) -> None:
-    """Best-effort terminate one directly launched managed browser."""
+def _terminate_real_profile_proc(proc, copy_dir: str) -> None:
+    """Best-effort terminate a directly launched managed browser tree."""
     try:
         if proc.poll() is None:
             proc.terminate()
@@ -1484,6 +1484,16 @@ def _terminate_real_profile_proc(proc) -> None:
                 proc.kill()
     except Exception as e:
         logger.debug("real-profile chrome terminate failed: %s", e)
+    try:
+        from hermes_cli.browser_connect import _terminate_managed_profile_browsers
+
+        if not _terminate_managed_profile_browsers(copy_dir):
+            logger.warning(
+                "real-profile: browser descendants remained for managed profile %s",
+                copy_dir,
+            )
+    except Exception as e:
+        logger.debug("real-profile chrome tree terminate failed: %s", e)
 
 
 def _terminate_real_profile_chrome(state: dict | None = None) -> None:
@@ -1497,7 +1507,8 @@ def _terminate_real_profile_chrome(state: dict | None = None) -> None:
     active_state = state or _real_profile_state()
     procs = active_state["chrome_procs"]
     while procs:
-        _terminate_real_profile_proc(procs.pop())
+        proc, copy_dir = procs.pop()
+        _terminate_real_profile_proc(proc, copy_dir)
 
 
 def _terminate_all_real_profile_chrome() -> None:
@@ -1826,14 +1837,14 @@ def _real_profile_cdp() -> tuple:
             except OSError:
                 pass
             if chrome_proc.poll() is not None:
-                _terminate_real_profile_proc(chrome_proc)
+                _terminate_real_profile_proc(chrome_proc, copy_dir)
                 return None, (
                     "browser.use_real_profile is on, but Chrome exited during "
                     "startup (another instance may hold the profile copy)."
                 )
             _time.sleep(0.25)
         if port is None:
-            _terminate_real_profile_proc(chrome_proc)
+            _terminate_real_profile_proc(chrome_proc, copy_dir)
             return None, (
                 "browser.use_real_profile is on, but the real-profile browser "
                 "did not expose a debug port in time. Retry, or turn the toggle off."
@@ -1844,7 +1855,7 @@ def _real_profile_cdp() -> tuple:
         try:
             browser_cmd = _find_agent_browser()
         except FileNotFoundError as e:
-            _terminate_real_profile_proc(chrome_proc)
+            _terminate_real_profile_proc(chrome_proc, copy_dir)
             return None, (
                 "browser.use_real_profile is on, but the local browser engine "
                 f"(agent-browser) is not installed: {e}"
@@ -1862,18 +1873,18 @@ def _real_profile_cdp() -> tuple:
                 env=_build_browser_env(),
             )
         except subprocess.TimeoutExpired:
-            _terminate_real_profile_proc(chrome_proc)
+            _terminate_real_profile_proc(chrome_proc, copy_dir)
             return None, (
                 "browser.use_real_profile is on, but the real-profile browser "
                 "took too long to start. Retry, or turn the toggle off."
             )
         except (subprocess.SubprocessError, OSError) as e:
-            _terminate_real_profile_proc(chrome_proc)
+            _terminate_real_profile_proc(chrome_proc, copy_dir)
             return None, f"browser.use_real_profile is on, but the launch failed: {e}"
         if proc.returncode != 0:
             tail = (proc.stderr or proc.stdout or "").strip().splitlines()
             reason = tail[-1] if tail else f"exit {proc.returncode}"
-            _terminate_real_profile_proc(chrome_proc)
+            _terminate_real_profile_proc(chrome_proc, copy_dir)
             return None, (
                 f"browser.use_real_profile is on, but the real-profile browser "
                 f"failed to start: {reason}"
@@ -1894,13 +1905,13 @@ def _real_profile_cdp() -> tuple:
         except (OSError, ValueError):
             pass
         if not cdp:
-            _terminate_real_profile_proc(chrome_proc)
+            _terminate_real_profile_proc(chrome_proc, copy_dir)
             return None, (
                 "browser.use_real_profile is on, but the real-profile browser "
                 "started without exposing a devtools endpoint. Retry, or turn "
                 "the toggle off."
             )
-        state["chrome_procs"].append(chrome_proc)
+        state["chrome_procs"].append((chrome_proc, copy_dir))
         cache["cdp"] = cdp
         logger.info("real-profile browser ready for %s at %s (%s)", browser, cdp, copy_dir)
         return cdp, None

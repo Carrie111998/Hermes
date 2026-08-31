@@ -447,7 +447,8 @@ class TestRealProfileCdpLaunch:
             browser_a = Mock()
             browser_a.poll.return_value = None
             state_a["cache"]["cdp"] = "http://127.0.0.1:41000"
-            state_a["chrome_procs"].append(browser_a)
+            profile_a_dir = str(tmp_path / "profile-a" / "browser-profile" / "chrome")
+            state_a["chrome_procs"].append((browser_a, profile_a_dir))
         finally:
             reset_hermes_home_override(token_a)
 
@@ -466,7 +467,7 @@ class TestRealProfileCdpLaunch:
         assert state_a is not state_b
         close.assert_called_once_with(state_b["session"])
         assert state_a["cache"]["cdp"] == "http://127.0.0.1:41000"
-        assert state_a["chrome_procs"] == [browser_a]
+        assert state_a["chrome_procs"] == [(browser_a, profile_a_dir)]
         browser_a.terminate.assert_not_called()
         self._reset()
 
@@ -474,7 +475,9 @@ class TestRealProfileCdpLaunch:
         "failure",
         ["missing-agent-browser", "timeout", "oserror", "nonzero", "missing-cdp"],
     )
-    def test_post_launch_attach_failures_reap_provisional_chrome(self, tmp_path, failure):
+    def test_post_launch_attach_failures_reap_provisional_chrome(
+        self, tmp_path, monkeypatch, failure
+    ):
         import tools.browser_tool as bt
 
         self._reset()
@@ -498,6 +501,42 @@ class TestRealProfileCdpLaunch:
                 self.killed = True
 
         chrome = FakeChrome()
+
+        class FakeChild:
+            pid = 404
+
+            def __init__(self):
+                self.info = {
+                    "name": "chrome.exe",
+                    "cmdline": ["chrome.exe", f"--user-data-dir={tmp_path}"],
+                }
+                self.terminated = False
+
+            def children(self, recursive=True):
+                return []
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                raise AssertionError("graceful child termination should suffice")
+
+        child = FakeChild()
+
+        class FakePsutil:
+            NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+            AccessDenied = type("AccessDenied", (Exception,), {})
+
+            @staticmethod
+            def process_iter(attrs=None):
+                return iter([child])
+
+            @staticmethod
+            def wait_procs(procs, timeout=None):
+                return list(procs), []
+
+        import sys as _sys
+        monkeypatch.setitem(_sys.modules, "psutil", FakePsutil())
 
         def fake_popen(argv, **kwargs):
             (tmp_path / "DevToolsActivePort").write_text(
@@ -538,6 +577,7 @@ class TestRealProfileCdpLaunch:
         assert chrome.terminated is True
         assert chrome.waited is True
         assert chrome.killed is False
+        assert child.terminated is True
         assert bt._real_profile_state()["chrome_procs"] == []
         self._reset()
 
