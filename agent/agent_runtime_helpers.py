@@ -3961,14 +3961,44 @@ def repair_empty_non_final_messages(
             repaired.append(msg)
 
     if healed:
-        _ra().logger.warning(
-            "Pre-call sanitizer: healed %d empty non-final message(s) by "
-            "substituting placeholder content — an empty-content turn was in "
-            "the transcript and would 400 the request ('messages must have "
-            "non-empty content' / INVALID_REQUEST_BODY). Self-recovering the "
-            "poisoned transcript in memory; no restart needed.",
-            healed,
-        )
+        # Per-session sanitiser repair counter for escalation policy
+        session_id = getattr(_ra().AIAgent, "session_id", None) or "unknown"
+        if not hasattr(repair_empty_non_final_messages, "_session_repair_counts"):
+            repair_empty_non_final_messages._session_repair_counts = {}
+        counts = repair_empty_non_final_messages._session_repair_counts
+        counts[session_id] = counts.get(session_id, 0) + 1
+        repair_count = counts[session_id]
+        
+        # Threshold-based escalation: after 5 repairs in a session, escalate to ERROR
+        # and mark session for user notification
+        _ESCALATION_THRESHOLD = 5
+        if repair_count >= _ESCALATION_THRESHOLD:
+            _ra().logger.error(
+                "Pre-call sanitizer: HEALING LOOP DETECTED — session %s has been "
+                "repaired %d times. The underlying stream-death cause is likely "
+                "persistent. Consider /clear to drop affected history or /resume "
+                "to start fresh. Healed %d empty non-final message(s) this call.",
+                session_id,
+                repair_count,
+                healed,
+            )
+            # Mark session for user notification on next gateway turn
+            if hasattr(_ra().AIAgent, "_sanitiser_escalated"):
+                _ra().AIAgent._sanitiser_escalated = True
+                _ra().AIAgent._sanitiser_repair_count = repair_count
+        else:
+            _ra().logger.warning(
+                "Pre-call sanitizer: healed %d empty non-final message(s) by "
+                "substituting placeholder content — an empty-content turn was in "
+                "the transcript and would 400 the request ('messages must have "
+                "non-empty content' / INVALID_REQUEST_BODY). Self-recovering the "
+                "poisoned transcript in memory; no restart needed. "
+                "(Session %s repair count: %d/%d threshold)",
+                healed,
+                session_id,
+                repair_count,
+                _ESCALATION_THRESHOLD,
+            )
         return repaired
     return messages
 
