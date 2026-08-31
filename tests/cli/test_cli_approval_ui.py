@@ -125,6 +125,78 @@ class TestCliApprovalUi:
         thread.join(timeout=2)
         assert result["value"] == "once"
 
+    def test_zero_timeout_means_unlimited_deadline(self):
+        """approvals.timeout <= 0 must set an unlimited (None) deadline.
+
+        Regression test for the bug fixed alongside agent.clarify_timeout's
+        equivalent <=0-means-unlimited convention (#97925): a naive
+        ``_time.monotonic() + timeout`` with timeout=0 computes "now", so the
+        very next poll iteration sees ``remaining <= 0`` and auto-denies
+        instantly instead of waiting forever.
+        """
+        cli = _make_cli_stub()
+        result = {}
+
+        with patch.object(
+            cli_module, "CLI_CONFIG", {"approvals": {"timeout": 0}}
+        ):
+            def _run_callback():
+                result["value"] = cli._approval_callback(
+                    "rm -rf /tmp/example",
+                    "recursive delete",
+                )
+
+            thread = threading.Thread(target=_run_callback, daemon=True)
+            thread.start()
+
+            deadline = time.time() + 2
+            while cli._approval_state is None and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert cli._approval_state is not None
+            # The core assertion: a zero timeout must produce an unlimited
+            # (None) deadline, never a deadline that's already in the past.
+            assert cli._approval_deadline is None
+
+            # The poll loop must not auto-deny while None — give it several
+            # iterations of its own 1s poll interval, then respond normally.
+            time.sleep(0.05)
+            assert result == {}, "callback returned before a response was given"
+
+            cli._approval_state["response_queue"].put("once")
+            thread.join(timeout=2)
+
+        assert result["value"] == "once"
+
+    def test_positive_timeout_still_computes_a_real_deadline(self):
+        """A normal positive timeout must NOT be affected by the <=0 fix."""
+        cli = _make_cli_stub()
+        result = {}
+
+        with patch.object(
+            cli_module, "CLI_CONFIG", {"approvals": {"timeout": 300}}
+        ):
+            def _run_callback():
+                result["value"] = cli._approval_callback(
+                    "rm -rf /tmp/example",
+                    "recursive delete",
+                )
+
+            thread = threading.Thread(target=_run_callback, daemon=True)
+            thread.start()
+
+            deadline = time.time() + 2
+            while cli._approval_state is None and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert cli._approval_state is not None
+            assert cli._approval_deadline is not None
+            assert cli._approval_deadline > time.monotonic()
+
+            cli._approval_state["response_queue"].put("deny")
+            thread.join(timeout=2)
+
+        assert result["value"] == "deny"
 
     def test_sudo_prompt_restores_existing_draft_after_response(self):
         cli = _make_cli_stub()
