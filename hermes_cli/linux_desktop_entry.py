@@ -76,14 +76,20 @@ def resolve_exec_command() -> str:
             # installer's bash wrapper). Launched from the .desktop entry that
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
-            # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # Prefix the running interpreter. Do NOT Path.resolve() it:
+            # venv/bin/python is often a symlink to /usr/bin/python3.N, and
+            # following that drops the venv (ModuleNotFoundError: hermes_cli).
+            argv = [_running_interpreter(), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [_running_interpreter(), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
+
+
+def _running_interpreter() -> str:
+    """``sys.executable`` as the DE should invoke it — never follow venv symlinks."""
+    return str(Path(sys.executable))
 
 
 def _needs_interpreter(bin_path: Path) -> bool:
@@ -99,15 +105,24 @@ def _needs_interpreter(bin_path: Path) -> bool:
         # loader is self-sufficient.
         return False
     shebang = head.decode("utf-8", errors="replace").strip().lower()
-    if "python" not in shebang:
+    if not shebang.startswith("#!"):
+        return False
+    rest = shebang[2:].strip()
+    if "python" not in rest:
         # A shell wrapper (e.g. the installer's bash launcher) execs the venv
         # python itself — leave it alone.
         return False
+    prog = rest.split()[0]
+    # ``#!/usr/bin/env python3`` always escapes the venv when the DE spawns
+    # it. Do not substring-match the interpreter dir against the shebang:
+    # ``/usr/bin`` is inside ``/usr/bin/env python3`` and would skip the
+    # prefix (#90292) *and* is the follow-symlink target of venv/bin/python.
+    if Path(prog).name == "env":
+        return True
     # A python shebang pointing INSIDE the running interpreter's environment
-    # already resolves correctly; anything else (``/usr/bin/env python3``,
-    # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
-    return exe_dir not in shebang
+    # already resolves correctly; a system path would not.
+    exe_dir = str(Path(sys.executable).parent)
+    return exe_dir not in prog
 
 
 def _quote_exec_arg(arg: str) -> str:
