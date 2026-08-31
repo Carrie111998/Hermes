@@ -5253,6 +5253,52 @@ _mcp_thread: Optional[threading.Thread] = None
 # _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
 _lock = threading.Lock()
 
+
+def snapshot_live_mcp_tools(name: str) -> Optional[List[Tuple[str, str]]]:
+    """Return ``(tool_name, description)`` from a live owned session, or None.
+
+    Used by health/`hermes mcp test` so they do not open a second Streamable
+    HTTP session against hosts that evict the first (Slack MCP). Descriptions
+    are truncated to the same 80-char display budget as a standalone probe.
+    """
+    with _lock:
+        server = _servers.get(name)
+        if server is None or getattr(server, "session", None) is None:
+            return None
+        tools = list(getattr(server, "_tools", None) or [])
+    if not tools:
+        return None
+    out: List[Tuple[str, str]] = []
+    for tool in tools:
+        desc = getattr(tool, "description", "") or ""
+        if len(desc) > 80:
+            desc = desc[:77] + "..."
+        out.append((tool.name, desc))
+    return out
+
+
+def mcp_server_owned_or_connecting(name: str) -> bool:
+    """True if this process has claimed ``name`` (live, parked, or connecting)."""
+    with _lock:
+        return name in _servers or name in _server_connecting
+
+
+def mcp_event_loop_is_current() -> bool:
+    """True when the caller is running on the dedicated MCP event-loop thread."""
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return _mcp_loop is not None and running is _mcp_loop
+
+
+def mcp_event_loop_is_running() -> bool:
+    """True when the dedicated MCP loop exists and is running (any thread)."""
+    with _lock:
+        loop = _mcp_loop
+    return loop is not None and loop.is_running()
+
+
 # ---------------------------------------------------------------------------
 # Cross-process MCP discovery guard
 # ---------------------------------------------------------------------------

@@ -275,17 +275,66 @@ def _resolve_mcp_server_config(config: dict) -> dict:
     return _interpolate_env_vars(config)
 
 
+def _truncate_mcp_tool_desc(desc: str) -> str:
+    desc = desc or ""
+    return desc[:77] + "..." if len(desc) > 80 else desc
+
+
+def _wait_for_live_mcp_tools(
+    name: str, timeout: float, *, wait_for_claim: bool = False
+) -> Optional[List[Tuple[str, str]]]:
+    """Poll for a live session owned by this process. Never opens a new one.
+
+    Synchronous: may ``time.sleep`` on a worker/CLI thread. Must not run on
+    the dedicated MCP event-loop thread — if it does, we snapshot once and
+    return instead of blocking the loop.
+
+    ``wait_for_claim`` keeps waiting even before discovery has inserted the
+    name into the process-owned table — desktop's health sweep races that
+    by a few hundred milliseconds on gateway-open.
+    """
+    from tools.mcp_tool import (
+        mcp_event_loop_is_current,
+        mcp_server_owned_or_connecting,
+        snapshot_live_mcp_tools,
+    )
+
+    if mcp_event_loop_is_current():
+        return snapshot_live_mcp_tools(name)
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    saw_claim = False
+    while True:
+        snapshot = snapshot_live_mcp_tools(name)
+        if snapshot is not None:
+            return snapshot
+        owned = mcp_server_owned_or_connecting(name)
+        if owned:
+            saw_claim = True
+        elif saw_claim or not wait_for_claim:
+            return None
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
+
+
 def _probe_single_server(
     name: str, config: dict, connect_timeout: Optional[float] = None, *, details: Optional[dict] = None
 ) -> List[Tuple[str, str]]:
     """Temporarily connect to one MCP server, list its tools, disconnect.
 
     Returns list of ``(tool_name, description)`` tuples.
-    Raises on connection failure.
+    Raises on connection failure, including ``TimeoutError`` when this
+    process already owns the server (live or connecting) and a second
+    Streamable HTTP connect would evict it. All current callers wrap the
+    probe in ``except Exception`` (CLI print, dashboard/desktop ``ok:
+    false`` / red row, ``hermes doctor --live`` fail).
 
-    ``details``: optional dict the probe fills with extra capability counts
-    (``prompts``, ``resources``) — an out-param so the return shape stays
-    stable for existing CLI callers.
+    Synchronous. May poll with a short sleep on a worker/CLI thread.
+    Must not be called on the dedicated MCP event-loop thread (dashboard
+    uses ``asyncio.to_thread``; ``mcp.servers.test`` is in
+    ``_LONG_HANDLERS``). If it ever is, the wait snapshots once and
+    returns instead of blocking the loop.
     """
     issues = validate_mcp_server_entry(name, config)
     if issues:
@@ -307,6 +356,41 @@ def _probe_single_server(
         except (TypeError, ValueError):
             connect_timeout = 30.0
 
+    # Reuse (or wait for) the process-global session. A second Streamable HTTP
+    # connect to Slack MCP expires the live desktop session and is exactly
+    # what paints the Capabilities row red on every launch.
+    live = _wait_for_live_mcp_tools(name, connect_timeout)
+    if live is not None:
+        logger.info(
+            "MCP probe '%s': reusing live session (%d tool(s)); skip standalone connect",
+            name,
+            len(live),
+        )
+        return live
+    from tools.mcp_tool import mcp_event_loop_is_running, mcp_server_owned_or_connecting
+
+    if mcp_server_owned_or_connecting(name):
+        raise TimeoutError(
+            f"MCP server '{name}' is still connecting; not opening a second session"
+        )
+    # Gateway-open health sweep often beats discover_mcp_tools by a beat.
+    # Wait briefly for this process to claim the server before opening a
+    # second Streamable HTTP session that would evict Slack's live one.
+    if config.get("url") and mcp_event_loop_is_running():
+        grace = min(5.0, float(connect_timeout))
+        live = _wait_for_live_mcp_tools(name, grace, wait_for_claim=True)
+        if live is not None:
+            logger.info(
+                "MCP probe '%s': reusing live session after claim grace (%d tool(s))",
+                name,
+                len(live),
+            )
+            return live
+        if mcp_server_owned_or_connecting(name):
+            raise TimeoutError(
+                f"MCP server '{name}' is still connecting; not opening a second session"
+            )
+
     _ensure_mcp_loop()
     tools_found: List[Tuple[str, str]] = []
 
@@ -316,11 +400,9 @@ def _probe_single_server(
         )
         try:
             for t in server._tools:
-                desc = getattr(t, "description", "") or ""
-                # Truncate long descriptions for display
-                if len(desc) > 80:
-                    desc = desc[:77] + "..."
-                tools_found.append((t.name, desc))
+                tools_found.append(
+                    (t.name, _truncate_mcp_tool_desc(getattr(t, "description", "") or ""))
+                )
             if details is not None:
                 # Per-tool registry-schema sizes so the desktop can estimate the
                 # per-call token cost a server adds. Uses the SAME converted
