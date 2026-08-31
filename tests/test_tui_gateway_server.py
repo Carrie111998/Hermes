@@ -7639,6 +7639,28 @@ def test_ensure_session_db_row_stamps_profile_name(monkeypatch, tmp_path):
     assert created[0]["db_path"] == profile_home / "state.db"
 
 
+def test_ensure_session_db_row_stamps_launch_profile_instead_of_null(monkeypatch):
+    """Desktop sessions created on the launch backend omit profile_home.
+    Storing NULL made those rows disappear from the profile-scoped sidebar
+    after a switch (#99222). The process profile name must be written."""
+    created = []
+
+    class _LaunchDB:
+        def create_session(self, key, **kwargs):
+            created.append({"key": key, "profile_name": kwargs.get("profile_name")})
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server, "_get_db", lambda: _LaunchDB())
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+
+    server._ensure_session_db_row({"session_key": "k-launch", "source": "desktop"})
+
+    assert created == [{"key": "k-launch", "profile_name": "default"}]
+
+
 def test_session_title_clears_pending_after_persist(monkeypatch):
     class _FakeDB:
         def __init__(self):

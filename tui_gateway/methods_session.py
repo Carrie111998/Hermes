@@ -3218,12 +3218,9 @@ def _(rid, params: dict) -> dict:
                 cwd=_session_cwd(session),
                 # The branch stays on its parent's profile. Explicit stamp (not
                 # just the parent-backfill) so it holds even when the parent row
-                # predates the profile_name column.
-                profile_name=(
-                    Path(session["profile_home"]).name
-                    if session.get("profile_home")
-                    else None
-                ),
+                # predates the profile_name column. Launch-profile branches
+                # stamp the process profile rather than NULL (#99222).
+                profile_name=_session_persist_profile_name(session),
             )
             # Copy the whole parent history in bounded-chunk transactions —
             # a branch seed can be hundreds of rows, and per-row transactions

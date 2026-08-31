@@ -10,8 +10,13 @@ import { refChipElement } from './rich-editor'
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
 
 const openSession = vi.fn()
+const ensureGatewayProfile = vi.fn().mockResolvedValue(undefined)
 
 vi.mock('@/app/open-session', () => ({ openSession: (...args: unknown[]) => openSession(...args) }))
+vi.mock('@/store/profile', async importActual => ({
+  ...(await importActual<typeof import('@/store/profile')>()),
+  ensureGatewayProfile: (...args: unknown[]) => ensureGatewayProfile(...args)
+}))
 
 /** A live contenteditable holding real chips, with the watcher bound to it —
  *  the same pair both composers mount. */
@@ -50,6 +55,7 @@ afterEach(() => {
   closeRightRail()
   delete desktopWindow.hermesDesktop
   openSession.mockReset()
+  ensureGatewayProfile.mockClear()
   vi.useRealTimers()
 })
 
@@ -88,6 +94,7 @@ describe('ComposerDirectiveActions', () => {
     await vi.waitFor(() =>
       expect(openSession).toHaveBeenCalledWith('20260722_204335_d62c16', expect.any(Function), 'tab')
     )
+    expect(ensureGatewayProfile).toHaveBeenCalledWith('default')
   })
 
   it('leaves kinds with no action alone', () => {
