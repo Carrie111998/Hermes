@@ -103,8 +103,10 @@ scope_path="/sys/fs/cgroup$scope_group"
 scope_inode=$(stat -c %i "$scope_path")
 chown "$RUNTIME_UID:$RUNTIME_GID" "$scope_path" "$scope_path/cgroup.procs" "$scope_path/cgroup.subtree_control" "$scope_path/cgroup.threads"
 chmod u+rwx "$scope_path"
-printf '%s %s\n' "$scope_name" "$scope_inode" > "$auth_dir/scope"
-chmod 0444 "$auth_dir/scope"
+scope_tmp=$(mktemp "$auth_dir/.scope.XXXXXX")
+printf '%s %s\n' "$scope_name" "$scope_inode" > "$scope_tmp"
+chmod 0444 "$scope_tmp"
+mv "$scope_tmp" "$auth_dir/scope"
 
 [[ "$(docker inspect --format '{{.HostConfig.Privileged}}' "$container")" == false ]]
 [[ -z "$(docker inspect --format '{{.HostConfig.PidMode}}' "$container")" ]]

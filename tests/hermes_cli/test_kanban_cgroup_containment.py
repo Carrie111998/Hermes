@@ -63,6 +63,14 @@ def test_runtime_alias_mount_is_only_needed_under_shadowed_roots():
     assert not kc._runtime_alias_needs_mount("/opt/hermes-python/runtime")
 
 
+def test_effective_uid_fails_closed_when_platform_has_no_geteuid(monkeypatch):
+    monkeypatch.setattr(kc.sys, "platform", "win32")
+    monkeypatch.delattr(kc.os, "geteuid", raising=False)
+
+    with pytest.raises(kc.ContainmentError, match="Linux-only"):
+        kc._effective_uid()
+
+
 def test_board_schema_materializes_durable_worker_containment_identity(tmp_path):
     conn = kb.connect(tmp_path / "kanban.db")
     try:
@@ -629,14 +637,16 @@ def test_hard_delete_refuses_to_sever_uncleaned_containment_identity(tmp_path):
             cgroup_inode=17171,
         )
 
-        with pytest.raises(sqlite3.IntegrityError, match="uncleaned worker containment"):
-            kb.delete_task(conn, task_id)
+        assert not kb.delete_task(conn, task_id)
 
         assert kb.get_task(conn, task_id) is not None
-        assert conn.execute(
-            "SELECT COUNT(*) AS n FROM worker_containments WHERE task_id = ?",
+        containment = conn.execute(
+            "SELECT retirement_started_at, termination_certified_at "
+            "FROM worker_containments WHERE task_id = ?",
             (task_id,),
-        ).fetchone()["n"] == 1
+        ).fetchone()
+        assert containment["retirement_started_at"] is not None
+        assert containment["termination_certified_at"] is None
     finally:
         conn.close()
 

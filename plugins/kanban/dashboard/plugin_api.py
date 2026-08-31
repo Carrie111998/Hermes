@@ -733,47 +733,29 @@ async def upload_task_attachment(
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
 
         safe_name = _safe_attachment_name(file.filename or "")
+        data = bytearray()
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > KANBAN_ATTACHMENT_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"attachment exceeds {KANBAN_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit"
+                    ),
+                )
 
-        # Stream to disk with a hard size cap so a huge upload can't fill
-        # the disk. Read in chunks; abort + clean up if the cap is hit.
-        dest_dir = kanban_db.task_attachments_dir(task_id, board=board)
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        # Resolve name collisions: foo.pdf → foo (1).pdf, foo (2).pdf, …
-        dest_path = _collision_free_path(dest_dir, safe_name)
-        candidate = dest_path.name
-
-        total = 0
-        try:
-            with open(dest_path, "wb") as out:
-                while True:
-                    chunk = await file.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > KANBAN_ATTACHMENT_MAX_BYTES:
-                        out.close()
-                        dest_path.unlink(missing_ok=True)
-                        raise HTTPException(
-                            status_code=413,
-                            detail=(
-                                f"attachment exceeds {KANBAN_ATTACHMENT_MAX_BYTES // (1024 * 1024)} MB limit"
-                            ),
-                        )
-                    out.write(chunk)
-        except HTTPException:
-            raise
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
-
-        att_id = kanban_db.add_attachment(
+        att_id = kanban_db.store_attachment_bytes(
             conn,
             task_id,
-            filename=candidate,
-            stored_path=str(dest_path.resolve()),
+            safe_name,
+            bytes(data),
             content_type=file.content_type,
-            size=total,
             uploaded_by=(uploaded_by or "dashboard"),
+            board=board,
+            max_bytes=KANBAN_ATTACHMENT_MAX_BYTES,
         )
         att = kanban_db.get_attachment(conn, att_id)
         return {"attachment": _attachment_dict(att) if att else None}
@@ -1086,72 +1068,19 @@ def _ensure_contained_worker_retired(
     ``cleaned_at`` readback because the task row is the containment's audit
     owner and must not disappear while cgroup retirement is incomplete.
     """
-    task = conn.execute(
-        "SELECT status, current_run_id FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if task is None:
+    if kanban_db.ensure_task_containment_retired(
+        conn,
+        task_id,
+        reason=reason,
+        require_cleanup=require_cleanup,
+    ):
         return
-
-    rows = conn.execute(
-        "SELECT * FROM worker_containments "
-        "WHERE task_id = ? AND cleaned_at IS NULL ORDER BY run_id",
-        (task_id,),
-    ).fetchall()
-    if not rows:
-        return
-
-    current_run_id = (
-        int(task["current_run_id"])
-        if task["current_run_id"] is not None
-        else None
+    detail = (
+        "worker containment cleanup is not durable"
+        if require_cleanup
+        else "worker containment retirement could not be certified"
     )
-    active = next(
-        (row for row in rows if int(row["run_id"]) == current_run_id),
-        None,
-    )
-    if active is not None and active["termination_certified_at"] is None:
-        if task["status"] != "running" or not kanban_db.reclaim_task(
-            conn, task_id, reason=reason,
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="worker containment retirement could not be certified",
-            )
-
-    rows = conn.execute(
-        "SELECT * FROM worker_containments "
-        "WHERE task_id = ? AND cleaned_at IS NULL ORDER BY run_id",
-        (task_id,),
-    ).fetchall()
-    if any(row["termination_certified_at"] is None for row in rows):
-        # An older, already-inactive containment cannot be reclaimed through
-        # the active-task primitive.  Let the durable sweeper certify/clean it
-        # and verify the exact task-scoped evidence before proceeding.
-        kanban_db.cleanup_inactive_worker_containments(conn)
-        rows = conn.execute(
-            "SELECT * FROM worker_containments "
-            "WHERE task_id = ? AND cleaned_at IS NULL ORDER BY run_id",
-            (task_id,),
-        ).fetchall()
-        if any(row["termination_certified_at"] is None for row in rows):
-            raise HTTPException(
-                status_code=409,
-                detail="worker containment retirement could not be certified",
-            )
-
-    if require_cleanup and rows:
-        kanban_db.cleanup_inactive_worker_containments(conn)
-        pending = conn.execute(
-            "SELECT 1 FROM worker_containments "
-            "WHERE task_id = ? AND cleaned_at IS NULL LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        if pending is not None:
-            raise HTTPException(
-                status_code=409,
-                detail="worker containment cleanup is not durable",
-            )
+    raise HTTPException(status_code=409, detail=detail)
 
 
 # ---------------------------------------------------------------------------

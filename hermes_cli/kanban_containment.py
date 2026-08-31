@@ -121,6 +121,16 @@ class WorkerSpawn:
         return dict(termination)
 
 
+def _effective_uid() -> int:
+    """Return the Linux effective uid without importing a Windows-only hazard."""
+    if sys.platform != "linux":
+        raise ContainmentError("cgroup-v2 containment is Linux-only")
+    getter = getattr(os, "geteuid", None)
+    if getter is None:
+        raise ContainmentError("effective uid is unavailable")
+    return int(getter())
+
+
 def _current_cgroup_dir() -> Path:
     """Return the delegated worker root from unified cgroup-v2 membership."""
     if sys.platform != "linux":
@@ -148,7 +158,7 @@ def _current_cgroup_dir() -> Path:
             expected_inode <= 0
             or not stat.S_ISDIR(observed.st_mode)
             or int(observed.st_ino) != expected_inode
-            or int(observed.st_uid) != os.geteuid()
+            or int(observed.st_uid) != _effective_uid()
         ):
             raise ContainmentError(
                 "explicit cgroup root inode or runtime ownership mismatch"
@@ -277,7 +287,7 @@ def _create_worker_cgroup(run_id: int) -> tuple[Path, int]:
         raise ContainmentError(f"cannot create worker cgroup: {exc}") from exc
     if (
         not stat.S_ISDIR(observed.st_mode)
-        or int(observed.st_uid) != os.geteuid()
+        or int(observed.st_uid) != _effective_uid()
         or path.parent != root
         or not _NAME_RE.fullmatch(path.name)
     ):

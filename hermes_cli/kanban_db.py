@@ -606,6 +606,59 @@ def boards_root() -> Path:
     return kanban_home() / "kanban" / "boards"
 
 
+_BOARD_NAMESPACE_LOCK_DEPTH: ContextVar[int] = ContextVar(
+    "kanban_board_namespace_lock_depth", default=0
+)
+
+
+@contextlib.contextmanager
+def board_namespace_lock():
+    """Serialize named-board connect/create/import/remove outside board dirs."""
+    depth = _BOARD_NAMESPACE_LOCK_DEPTH.get()
+    if depth:
+        token = _BOARD_NAMESPACE_LOCK_DEPTH.set(depth + 1)
+        try:
+            yield
+        finally:
+            _BOARD_NAMESPACE_LOCK_DEPTH.reset(token)
+        return
+
+    root = boards_root()
+    root.mkdir(parents=True, exist_ok=True)
+    handle = (root / ".namespace.lock").open("a+b")
+    if _IS_WINDOWS and handle.seek(0, os.SEEK_END) == 0:
+        handle.write(b"\0")
+        handle.flush()
+    token = _BOARD_NAMESPACE_LOCK_DEPTH.set(1)
+    try:
+        if _IS_WINDOWS:
+            import msvcrt
+
+            handle.seek(0)
+            locking = getattr(msvcrt, "locking")
+            locking(handle.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if _IS_WINDOWS:
+                import msvcrt
+
+                handle.seek(0)
+                locking = getattr(msvcrt, "locking")
+                locking(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+            _BOARD_NAMESPACE_LOCK_DEPTH.reset(token)
+
+
 def current_board_path() -> Path:
     """Return the path to ``<root>/kanban/current``.
 
@@ -877,7 +930,7 @@ def read_board_metadata(board: Optional[str] = None) -> dict:
     return meta
 
 
-def write_board_metadata(
+def _write_board_metadata_unlocked(
     board: Optional[str],
     *,
     name: Optional[str] = None,
@@ -888,7 +941,7 @@ def write_board_metadata(
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> dict:
-    """Create / update ``board.json`` for ``board``.
+    """Create / update ``board.json`` while the namespace lock is held.
 
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
@@ -929,7 +982,35 @@ def write_board_metadata(
     return meta
 
 
-def create_board(
+def write_board_metadata(
+    board: Optional[str],
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    icon: Optional[str] = None,
+    color: Optional[str] = None,
+    archived: Optional[bool] = None,
+    default_workdir: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> dict:
+    """Update existing metadata without recreating a removed board namespace."""
+    slug = _normalize_board_slug(board) or DEFAULT_BOARD
+    with board_namespace_lock():
+        if slug != DEFAULT_BOARD:
+            _assert_named_board_available_unlocked(slug)
+        return _write_board_metadata_unlocked(
+            slug,
+            name=name,
+            description=description,
+            icon=icon,
+            color=color,
+            archived=archived,
+            default_workdir=default_workdir,
+            project_id=project_id,
+        )
+
+
+def _create_board_unlocked(
     slug: str,
     *,
     name: Optional[str] = None,
@@ -948,7 +1029,10 @@ def create_board(
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
-    meta = write_board_metadata(
+    directory = board_dir(normed)
+    if directory.is_symlink() or (directory / "kanban.db").is_symlink():
+        raise ValueError(f"board {normed!r} uses unsupported symlinked storage")
+    meta = _write_board_metadata_unlocked(
         normed,
         name=name,
         description=description,
@@ -960,6 +1044,29 @@ def create_board(
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
     return meta
+
+
+def create_board(
+    slug: str,
+    *,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    icon: Optional[str] = None,
+    color: Optional[str] = None,
+    default_workdir: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> dict:
+    """Create one board while excluding namespace publication/removal."""
+    with board_namespace_lock():
+        return _create_board_unlocked(
+            slug,
+            name=name,
+            description=description,
+            icon=icon,
+            color=color,
+            default_workdir=default_workdir,
+            project_id=project_id,
+        )
 
 
 def list_boards(*, include_archived: bool = True) -> list[dict]:
@@ -1006,7 +1113,7 @@ def list_boards(*, include_archived: bool = True) -> list[dict]:
     return entries
 
 
-def remove_board(slug: str, *, archive: bool = True) -> dict:
+def _remove_board_unlocked(slug: str, *, archive: bool = True) -> dict:
     """Remove or archive a board.
 
     ``archive=True`` (default) moves the board's directory to
@@ -1027,31 +1134,83 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     if not d.exists():
         raise ValueError(f"board {normed!r} does not exist")
 
-    # If the user removed the currently-active board, revert to default.
-    if get_current_board() == normed:
-        clear_current_board()
+    db_path = d / "kanban.db"
+    lock = (
+        _dispatch_tick_lock(db_path)
+        if db_path.is_file()
+        else contextlib.nullcontext(True)
+    )
+    with lock as lock_acquired:
+        if not lock_acquired:
+            raise ValueError(f"board {normed!r} is busy")
 
-    # A concurrent connect(board=normed) after the rename/delete recreates
-    # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
-    # dropped first so the schema init pass re-runs on that fresh file.
-    _INITIALIZED_PATHS.discard(str((d / "kanban.db").resolve()))
+        if db_path.is_file():
+            with connect(board=normed) as conn:
+                retirement_failed = False
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE board_lifecycle SET state='retiring' "
+                        "WHERE singleton=1"
+                    )
+                    task_ids = [
+                        row["task_id"]
+                        for row in conn.execute(
+                            "SELECT DISTINCT task_id FROM worker_containments "
+                            "WHERE cleaned_at IS NULL ORDER BY task_id"
+                        ).fetchall()
+                    ]
+                    for task_id in task_ids:
+                        if not ensure_task_containment_retired(
+                            conn,
+                            task_id,
+                            reason="board_removal",
+                            require_cleanup=True,
+                        ):
+                            retirement_failed = True
+                            break
+                    if retirement_failed:
+                        # Preserve all exact retirement evidence already written,
+                        # but keep a board whose removal failed usable for recovery.
+                        conn.execute(
+                            "UPDATE board_lifecycle SET state='active' "
+                            "WHERE singleton=1"
+                        )
+                if retirement_failed:
+                    raise ValueError(
+                        f"board {normed!r} worker containment could not be retired"
+                    )
 
-    if archive:
-        archive_root = boards_root() / "_archived"
-        archive_root.mkdir(parents=True, exist_ok=True)
-        ts = int(time.time())
-        target = archive_root / f"{normed}-{ts}"
-        # Avoid collision on rapid double-archives.
-        suffix = 1
-        while target.exists():
-            target = archive_root / f"{normed}-{ts}-{suffix}"
-            suffix += 1
-        d.rename(target)
-        return {"slug": normed, "action": "archived", "new_path": str(target)}
-    else:
+        # If the user removed the currently-active board, revert to default.
+        if get_current_board() == normed:
+            clear_current_board()
+
+        # A concurrent connect(board=normed) after the rename/delete recreates
+        # an empty sqlite file via mkdir(exist_ok=True); the cache entry must be
+        # dropped first so the schema init pass re-runs on that fresh file.
+        _INITIALIZED_PATHS.discard(str(db_path.resolve()))
+
+        if archive:
+            archive_root = boards_root() / "_archived"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            ts = int(time.time())
+            target = archive_root / f"{normed}-{ts}"
+            # Avoid collision on rapid double-archives.
+            suffix = 1
+            while target.exists():
+                target = archive_root / f"{normed}-{ts}-{suffix}"
+                suffix += 1
+            d.rename(target)
+            return {"slug": normed, "action": "archived", "new_path": str(target)}
+
         import shutil
         shutil.rmtree(d)
         return {"slug": normed, "action": "deleted", "new_path": ""}
+
+
+def remove_board(slug: str, *, archive: bool = True) -> dict:
+    """Remove one board while excluding namespace publication/recreation."""
+    with board_namespace_lock():
+        return _remove_board_unlocked(slug, archive=archive)
 
 
 # ---------------------------------------------------------------------------
@@ -1503,6 +1662,43 @@ CREATE TABLE IF NOT EXISTS worker_containments (
     unlink_intent_at INTEGER,
     cleaned_at INTEGER
 );
+
+-- Durable board-wide reservation used while a board is being removed. Stale
+-- connections may retain the old database inode after a namespace rename, so
+-- SQL triggers (not pathname checks) reject publication of new authority.
+CREATE TABLE IF NOT EXISTS board_lifecycle (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    state TEXT NOT NULL CHECK (state IN ('active', 'retiring'))
+);
+INSERT OR IGNORE INTO board_lifecycle(singleton, state) VALUES (1, 'active');
+
+CREATE TRIGGER IF NOT EXISTS guard_retiring_board_task_authority
+BEFORE UPDATE OF status, current_run_id, claim_lock, worker_pid ON tasks
+WHEN (SELECT state FROM board_lifecycle WHERE singleton = 1) = 'retiring'
+ AND (
+      (OLD.status != 'running' AND NEW.status = 'running')
+      OR (OLD.current_run_id IS NOT NEW.current_run_id
+          AND NEW.current_run_id IS NOT NULL)
+      OR (OLD.claim_lock IS NOT NEW.claim_lock AND NEW.claim_lock IS NOT NULL)
+      OR (OLD.worker_pid IS NOT NEW.worker_pid AND NEW.worker_pid IS NOT NULL)
+ )
+BEGIN
+    SELECT RAISE(ABORT, 'board retirement rejects task authority');
+END;
+
+CREATE TRIGGER IF NOT EXISTS guard_retiring_board_run_authority
+BEFORE INSERT ON task_runs
+WHEN (SELECT state FROM board_lifecycle WHERE singleton = 1) = 'retiring'
+BEGIN
+    SELECT RAISE(ABORT, 'board retirement rejects run authority');
+END;
+
+CREATE TRIGGER IF NOT EXISTS guard_retiring_board_containment_authority
+BEFORE INSERT ON worker_containments
+WHEN (SELECT state FROM board_lifecycle WHERE singleton = 1) = 'retiring'
+BEGIN
+    SELECT RAISE(ABORT, 'board retirement rejects containment authority');
+END;
 
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
@@ -2363,7 +2559,73 @@ def _schema_is_present(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def connect(
+def _named_board_slug_for_db_path(path: Path) -> Optional[str]:
+    """Classify named-board ownership lexically, before following symlinks."""
+    try:
+        lexical = Path(os.path.abspath(os.path.expanduser(os.fspath(path))))
+        root = Path(os.path.abspath(os.fspath(boards_root())))
+        if lexical.name != "kanban.db" or os.path.normcase(
+            os.fspath(lexical.parent.parent)
+        ) != os.path.normcase(os.fspath(root)):
+            return None
+        slug = _normalize_board_slug(lexical.parent.name)
+    except (OSError, ValueError):
+        return None
+    if not slug or slug == DEFAULT_BOARD:
+        return None
+    return slug
+
+
+def _named_board_slug_for_connection(
+    conn: sqlite3.Connection,
+) -> Optional[str]:
+    """Recover the named-board slug from a live or stale SQLite connection."""
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+    except sqlite3.DatabaseError:
+        return None
+    for row in rows:
+        name = row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        path = row["file"] if isinstance(row, sqlite3.Row) else row[2]
+        if name == "main" and path:
+            return _named_board_slug_for_db_path(Path(path))
+    return None
+
+
+def _assert_named_board_available_unlocked(slug: str) -> None:
+    """Reject missing or symlinked named-board storage while holding the lock."""
+    directory = board_dir(slug)
+    if directory.is_symlink() or (directory / "kanban.db").is_symlink():
+        raise ValueError(f"board {slug!r} uses unsupported symlinked storage")
+    if not board_exists(slug):
+        raise FileNotFoundError(f"board {slug!r} does not exist")
+
+
+@contextlib.contextmanager
+def board_filesystem_write(
+    *,
+    board: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+):
+    """Guard every named-board filesystem mutation against namespace removal."""
+    requested = _normalize_board_slug(board)
+    connection_slug = _named_board_slug_for_connection(conn) if conn is not None else None
+    if requested and connection_slug and requested != connection_slug:
+        raise ValueError(
+            f"board {requested!r} does not match connection board {connection_slug!r}"
+        )
+    slug = requested or connection_slug
+    if slug is None:
+        slug = get_current_board()
+    if slug == DEFAULT_BOARD:
+        yield slug
+        return
+    with board_namespace_lock():
+        _assert_named_board_available_unlocked(slug)
+        yield slug
+
+
+def _connect_unlocked(
     db_path: Optional[Path] = None,
     *,
     board: Optional[str] = None,
@@ -2502,6 +2764,21 @@ def connect(
     return conn
 
 
+def connect(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> sqlite3.Connection:
+    """Open a board DB, serializing named-board namespace resolution."""
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    slug = _named_board_slug_for_db_path(path)
+    if slug is None:
+        return _connect_unlocked(db_path, board=board)
+    with board_namespace_lock():
+        _assert_named_board_available_unlocked(slug)
+        return _connect_unlocked(db_path, board=board)
+
+
 @contextlib.contextmanager
 def connect_closing(
     db_path: Optional[Path] = None,
@@ -2537,6 +2814,19 @@ def connect_closing(
             pass
 
 
+def _init_db_unlocked(path: Path) -> Path:
+    """Initialize ``path`` after any required namespace lock/revalidation."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    resolved = str(path.resolve())
+    # Clear the cache entry so the underlying connect() re-runs the
+    # schema + migration pass unconditionally.
+    with _INIT_LOCK:
+        _INITIALIZED_PATHS.discard(resolved)
+    with contextlib.closing(connect(path)):
+        pass
+    return path
+
+
 def init_db(
     db_path: Optional[Path] = None,
     *,
@@ -2556,15 +2846,12 @@ def init_db(
         path = db_path
     else:
         path = kanban_db_path(board=board)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    resolved = str(path.resolve())
-    # Clear the cache entry so the underlying connect() re-runs the
-    # schema + migration pass unconditionally.
-    with _INIT_LOCK:
-        _INITIALIZED_PATHS.discard(resolved)
-    with contextlib.closing(connect(path)):
-        pass
-    return path
+    slug = _named_board_slug_for_db_path(path)
+    if slug is None:
+        return _init_db_unlocked(path)
+    with board_namespace_lock():
+        _assert_named_board_available_unlocked(slug)
+        return _init_db_unlocked(path)
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
@@ -4237,7 +4524,7 @@ def _collision_free_path(dest_dir: Path, safe_name: str) -> Path:
     return dest_dir / candidate
 
 
-def store_attachment_bytes(
+def _store_attachment_bytes_unlocked(
     conn: sqlite3.Connection,
     task_id: str,
     filename: str,
@@ -4294,6 +4581,31 @@ def store_attachment_bytes(
         except OSError:
             pass
         raise
+
+
+def store_attachment_bytes(
+    conn: sqlite3.Connection,
+    task_id: str,
+    filename: str,
+    data: bytes,
+    *,
+    content_type: Optional[str] = None,
+    uploaded_by: Optional[str] = None,
+    board: Optional[str] = None,
+    max_bytes: Optional[int] = None,
+) -> int:
+    """Store one attachment under the board namespace publication guard."""
+    with board_filesystem_write(board=board, conn=conn):
+        return _store_attachment_bytes_unlocked(
+            conn,
+            task_id,
+            filename,
+            data,
+            content_type=content_type,
+            uploaded_by=uploaded_by,
+            board=board,
+            max_bytes=max_bytes,
+        )
 
 
 def add_attachment(
@@ -5316,7 +5628,7 @@ def reclaim_task(
     )
     if exact_expectation:
         exact_legacy_done = False
-        with write_txn(conn):
+        with write_txn(conn, allow_nested=True):
             exact_row = conn.execute(
                 "SELECT status, claim_lock, worker_pid, current_run_id, started_at "
                 "FROM tasks WHERE id = ?",
@@ -5438,7 +5750,7 @@ def reclaim_task(
         termination = _terminate_reclaimed_worker(
             row["worker_pid"], prev_lock, signal_fn=signal_fn,
         )
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -5646,7 +5958,7 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-def complete_task(
+def _complete_task_with_namespace_locked(
     conn: sqlite3.Connection,
     task_id: str,
     *,
@@ -5888,6 +6200,31 @@ def complete_task(
             summary=(summary if summary is not None else result),
         )
     return True
+
+
+def complete_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    created_cards: Optional[Iterable[str]] = None,
+    expected_run_id: Optional[int] = None,
+    fire_lifecycle_hook: bool = True,
+) -> bool:
+    """Complete a task while excluding named-board filesystem retirement."""
+    with board_filesystem_write(conn=conn):
+        return _complete_task_with_namespace_locked(
+            conn,
+            task_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
+            created_cards=created_cards,
+            expected_run_id=expected_run_id,
+            fire_lifecycle_hook=fire_lifecycle_hook,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -7897,8 +8234,79 @@ def decompose_triage_task(
     return child_ids
 
 
+def ensure_task_containment_retired(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    require_cleanup: bool = False,
+) -> bool:
+    """Certify one task's contained workers before a lifecycle mutation."""
+    task = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        return True
+
+    rows = conn.execute(
+        "SELECT * FROM worker_containments "
+        "WHERE task_id = ? AND cleaned_at IS NULL ORDER BY run_id",
+        (task_id,),
+    ).fetchall()
+    if not rows:
+        return True
+
+    current_run_id = (
+        int(task["current_run_id"])
+        if task["current_run_id"] is not None
+        else None
+    )
+    active = next(
+        (row for row in rows if int(row["run_id"]) == current_run_id),
+        None,
+    )
+    if active is not None and active["termination_certified_at"] is None:
+        if task["status"] != "running" or not reclaim_task(
+            conn, task_id, reason=reason,
+        ):
+            return False
+
+    rows = conn.execute(
+        "SELECT * FROM worker_containments "
+        "WHERE task_id = ? AND cleaned_at IS NULL ORDER BY run_id",
+        (task_id,),
+    ).fetchall()
+    if any(row["termination_certified_at"] is None for row in rows):
+        cleanup_inactive_worker_containments(conn)
+        rows = conn.execute(
+            "SELECT * FROM worker_containments "
+            "WHERE task_id = ? AND cleaned_at IS NULL ORDER BY run_id",
+            (task_id,),
+        ).fetchall()
+        if any(row["termination_certified_at"] is None for row in rows):
+            return False
+
+    if require_cleanup and rows:
+        cleanup_inactive_worker_containments(conn)
+        pending = conn.execute(
+            "SELECT 1 FROM worker_containments "
+            "WHERE task_id = ? AND cleaned_at IS NULL LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if pending is not None:
+            return False
+    return True
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        # Retirement and archive are one writer transaction: no successor can
+        # publish authority between certification and the status transition.
+        if not ensure_task_containment_retired(
+            conn, task_id, reason="task_archive",
+        ):
+            return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -7940,6 +8348,19 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        if not ensure_task_containment_retired(
+            conn,
+            task_id,
+            reason="archived_task_delete",
+            require_cleanup=True,
+        ):
+            return False
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["status"] != "archived":
+            return False
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
@@ -7960,9 +8381,16 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     This keeps the operation atomic (single ``write_txn``).
 
     Returns ``True`` if the task existed and was deleted, ``False``
-    if the task was not found.
+    if the task was not found or containment cleanup could not be certified.
     """
     with write_txn(conn):
+        if not ensure_task_containment_retired(
+            conn,
+            task_id,
+            reason="task_delete",
+            require_cleanup=True,
+        ):
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -8244,20 +8672,21 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """
     kind = task.workspace_kind or "scratch"
     if kind == "scratch":
-        if task.workspace_path:
-            # Legacy scratch tasks that were set to an explicit path get the
-            # same absolute-path guard as dir: — consistent with the
-            # threat model.
-            p = Path(task.workspace_path).expanduser()
-            if not p.is_absolute():
-                raise ValueError(
-                    f"task {task.id} has non-absolute workspace_path "
-                    f"{task.workspace_path!r}; workspace paths must be absolute"
-                )
-        else:
-            p = workspaces_root(board=board) / task.id
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        with board_filesystem_write(board=board):
+            if task.workspace_path:
+                # Legacy scratch tasks that were set to an explicit path get the
+                # same absolute-path guard as dir: — consistent with the
+                # threat model.
+                p = Path(task.workspace_path).expanduser()
+                if not p.is_absolute():
+                    raise ValueError(
+                        f"task {task.id} has non-absolute workspace_path "
+                        f"{task.workspace_path!r}; workspace paths must be absolute"
+                    )
+            else:
+                p = workspaces_root(board=board) / task.id
+            p.mkdir(parents=True, exist_ok=True)
+            return p
     if kind == "dir":
         if not task.workspace_path:
             raise ValueError(
@@ -10019,7 +10448,7 @@ def _persist_containment_certification(
 
 def _persist_unlink_intent(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
     """Durably announce physical removal of one exact certified cgroup."""
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         conn.execute(
             "UPDATE worker_containments "
             "SET unlink_intent_at = COALESCE(unlink_intent_at, ?) "
@@ -10050,7 +10479,7 @@ def _persist_unlink_intent(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
 
 def _complete_containment_cleanup(conn: sqlite3.Connection, row: sqlite3.Row) -> bool:
     """CAS cleaned_at after exact certification, intent, and physical cleanup."""
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         cur = conn.execute(
             "UPDATE worker_containments SET cleaned_at = ? "
             "WHERE run_id = ? AND task_id = ? AND backend = 'cgroup_v2' "
@@ -10137,7 +10566,7 @@ def cleanup_inactive_worker_containments(conn: sqlite3.Connection) -> int:
             and active["status"] == "running"
             and active["current_run_id"] == int(row["run_id"])
         ):
-            with write_txn(conn):
+            with write_txn(conn, allow_nested=True):
                 retry_status = _retry_status_for_run(conn, row["task_id"])
                 cur = conn.execute(
                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -10400,7 +10829,7 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     about whether the run will succeed, so we need to let timeouts and
     crashes accumulate across spawn boundaries.
     """
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=True):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
             "last_failure_error = NULL WHERE id = ?",
@@ -11756,6 +12185,17 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
+def _open_worker_log(task: Task, *, board: Optional[str] = None):
+    """Open the task log without racing named-board namespace retirement."""
+    with board_filesystem_write(board=board):
+        log_dir = worker_logs_dir(board=board)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{task.id}.log"
+        rotate_bytes, backup_count = worker_log_rotation_config()
+        _rotate_worker_log(log_path, rotate_bytes, backup_count)
+        return open(log_path, "ab")
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -11939,14 +12379,8 @@ def _default_spawn(
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
     # logs don't collide across boards that happen to share task ids.
-    log_dir = worker_logs_dir(board=board)
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{task.id}.log"
-    rotate_bytes, backup_count = worker_log_rotation_config()
-    _rotate_worker_log(log_path, rotate_bytes, backup_count)
-
     # Use 'a' so a re-run on unblock appends rather than overwrites.
-    log_f = open(log_path, "ab")
+    log_f = _open_worker_log(task, board=board)
     try:
         popen_kwargs = {
             "cwd": workspace if os.path.isdir(workspace) else None,
