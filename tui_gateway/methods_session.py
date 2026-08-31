@@ -219,8 +219,7 @@ def _(rid, params: dict) -> dict:
                 if (
                     not row
                     or row.get("archived")
-                    or (row.get("source") or "").strip().lower()
-                    in exclude_sources
+                    or (row.get("source") or "").strip().lower() in exclude_sources
                 ):
                     return _ok(rid, {"sessions": []})
                 try:
