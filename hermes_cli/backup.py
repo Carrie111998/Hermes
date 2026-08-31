@@ -441,15 +441,26 @@ def is_zeroed_sqlite_file(
 ) -> bool:
     """True when *path* looks like the #68474 zeroed-state.db signature.
 
-    Signature: size > 0, first *probe_bytes* are all NUL (no ``SQLite format 3``
-    header). Used at SessionDB open and for snapshot diagnostics so a silent
-    all-zero file becomes a guided recovery instead of a generic failure.
+    Signature: the file carries no ``SQLite format 3`` header and no data —
+    either it is empty (size 0) or its first *probe_bytes* are all NUL. Used
+    at SessionDB open and for snapshot diagnostics so a silent wiped file
+    becomes a guided recovery instead of a generic failure.
+
+    A zero-length file is the MOST complete form of this condition (#97568):
+    every message is gone, and it was previously excluded by a ``size <= 0``
+    guard, so total loss stayed silent for days. SQLite's own minimum viable
+    file is 100 bytes (``verify_sqlite_integrity``), so anything below that
+    cannot hold a database — treat the empty file as zeroed, not as healthy.
     """
     try:
         size = path.stat().st_size
     except OSError:
         return False
-    if size <= 0:
+    if size == 0:
+        # Empty file: no header, no data — the wiped case. Quarantine it so
+        # the operator gets the ERROR log and the restore guidance.
+        return True
+    if size < 0:
         return False
     from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
 

@@ -1186,6 +1186,69 @@ class TestSafeCopyDb:
         p.write_bytes(bytes(4096))  # all NULs
         assert is_zeroed_sqlite_file(p) is True
 
+    def test_is_zeroed_sqlite_file_detects_empty_file(self, tmp_path):
+        """A zero-byte state.db is the most complete form of the wipe.
+
+        #97568: the ``size <= 0`` guard excluded it, so a deployment that
+        lost 100% of its history got no ERROR log, no quarantine, and no
+        restore hint — indistinguishable from a brand-new install.
+        """
+        from hermes_cli.backup import is_zeroed_sqlite_file
+        p = tmp_path / "state.db"
+        p.write_bytes(b"")  # truncated to nothing
+        assert is_zeroed_sqlite_file(p) is True
+
+    def test_is_zeroed_sqlite_file_agrees_with_integrity_check(self, tmp_path):
+        """Invariant: 'zeroed' and 'integrity-valid' never both hold.
+
+        Both read the same bytes and both feed the SessionDB open path, so a
+        file one calls healthy and the other calls broken is a contradiction
+        that silently picks the wrong recovery branch. SQLite's minimum
+        viable file is 100 bytes (header + one page), which is the shared
+        boundary this asserts.
+        """
+        from hermes_cli.backup import is_zeroed_sqlite_file, verify_sqlite_integrity
+
+        valid_header = b"SQLite format 3\x00"
+        cases = {
+            "empty.db": b"",
+            "nul_16.db": bytes(16),
+            "nul_99.db": bytes(99),
+            "nul_4096.db": bytes(4096),
+            "valid_min_100.db": valid_header + bytes(84),
+            "valid.db": valid_header + bytes(4080),
+            "garbage.db": b"\xde\xad\xbe\xef" + bytes(4092),
+        }
+        for name, data in cases.items():
+            p = tmp_path / name
+            p.write_bytes(data)
+            zeroed = is_zeroed_sqlite_file(p)
+            # run_pragma=False: the header + size probe is the part that
+            # shares a boundary with is_zeroed; PRAGMA walks every b-tree
+            # page and is capped at 2 GiB (irrelevant at these sizes).
+            intact = verify_sqlite_integrity(p, run_pragma=False)["valid"]
+            assert not (zeroed and intact), f"{name}: zeroed and intact"
+
+    def test_is_zeroed_sqlite_file_never_flags_a_healthy_db(self, tmp_path):
+        """A real SQLite database must never be reported as zeroed.
+
+        Regression guard in the costly direction: a false positive here
+        quarantines a perfectly good state.db on every startup.
+        """
+        import sqlite3
+
+        from hermes_cli.backup import is_zeroed_sqlite_file
+        p = tmp_path / "state.db"
+        conn = sqlite3.connect(str(p))
+        try:
+            conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT)")
+            conn.execute("INSERT INTO messages (body) VALUES ('hello')")
+            conn.commit()
+        finally:
+            conn.close()
+        assert p.stat().st_size > 0
+        assert is_zeroed_sqlite_file(p) is False
+
 
 # ---------------------------------------------------------------------------
 # Quick state snapshot tests
