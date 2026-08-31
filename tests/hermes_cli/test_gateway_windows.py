@@ -314,6 +314,66 @@ def test_install_scheduled_task_recreates_instead_of_change(monkeypatch, tmp_pat
     assert "cmd.exe" not in xml_seen["text"]
 
 
+@pytest.mark.windows_only
+def test_install_scheduled_task_success_removes_startup_fallback(
+    monkeypatch, tmp_path
+):
+    script_path = tmp_path / "gateway-service" / "Hermes_Gateway_alice.cmd"
+    startup_entry = tmp_path / "Startup" / "Hermes_Gateway_alice.vbs"
+    legacy_entry = startup_entry.with_suffix(".cmd")
+    startup_entry.parent.mkdir(parents=True)
+    startup_entry.write_text("fallback", encoding="utf-8")
+    legacy_entry.write_text("legacy fallback", encoding="utf-8")
+
+    monkeypatch.setattr(
+        gateway_windows,
+        "_prompt_install_choices",
+        lambda *args, **kwargs: (False, True),
+    )
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway_alice")
+    monkeypatch.setattr(gateway_windows, "_write_task_script", lambda: script_path)
+    monkeypatch.setattr(gateway_windows, "_is_running_as_admin", lambda: True)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_install_scheduled_task",
+        lambda task_name, path: (True, f"Registered Scheduled Task {task_name!r}"),
+    )
+    monkeypatch.setattr(gateway_windows, "get_startup_entry_path", lambda: startup_entry)
+    monkeypatch.setattr(gateway_windows, "_legacy_startup_entry_path", lambda: legacy_entry)
+    monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: None)
+
+    gateway_windows.install(
+        start_now=False,
+        start_on_login=True,
+        elevated_handoff=True,
+    )
+
+    assert not startup_entry.exists()
+    assert not legacy_entry.exists()
+
+
+@pytest.mark.windows_only
+def test_status_reports_scheduled_task_and_startup_fallback_together(
+    monkeypatch, tmp_path, capsys
+):
+    startup_entry = tmp_path / "Startup" / "Hermes_Gateway_alice.vbs"
+    startup_entry.parent.mkdir(parents=True)
+    startup_entry.write_text("fallback", encoding="utf-8")
+
+    monkeypatch.setattr(gateway_windows, "get_task_name", lambda: "Hermes_Gateway_alice")
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(gateway_windows, "is_startup_entry_installed", lambda: True)
+    monkeypatch.setattr(gateway_windows, "query_task_status", lambda: {})
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows, "get_startup_entry_path", lambda: startup_entry)
+
+    gateway_windows.status()
+
+    output = capsys.readouterr().out
+    assert "Scheduled Task registered: Hermes_Gateway_alice" in output
+    assert f"Windows login item installed: {startup_entry}" in output
+
+
 def test_gateway_vbs_script_is_console_less(monkeypatch):
     """The .vbs launcher must avoid cmd.exe entirely and Run pythonw hidden
     (issue #45599 fix A: no console -> no logon CTRL_CLOSE_EVENT / 0xC000013A)."""

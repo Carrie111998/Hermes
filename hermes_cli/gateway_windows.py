@@ -718,6 +718,19 @@ def _install_startup_entry(script_path: Path) -> Path:
     return entry
 
 
+def _remove_startup_entries() -> None:
+    """Remove fallback login entries after a Scheduled Task takes ownership."""
+    for entry in (get_startup_entry_path(), _legacy_startup_entry_path()):
+        try:
+            entry.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            print(f"⚠ Could not remove stale Windows login item {entry}: {exc}")
+        else:
+            print(f"✓ Removed stale Windows login item: {entry}")
+
+
 def _resolve_detached_python(python_exe: str) -> tuple[str, Path, list[str]]:
     """Return (hidden_console_python, venv_dir, extra_pythonpath) for detached runs.
 
@@ -1107,6 +1120,7 @@ def install(
 
     ok, detail = _install_scheduled_task(task_name, script_path)
     if ok:
+        _remove_startup_entries()
         print(f"✓ {detail}")
         print(f"  Task script: {script_path}")
         print("ℹ Gateway auto-start installed for Windows login.")
@@ -1457,13 +1471,14 @@ def status(deep: bool = False) -> None:
             for key in ("status", "last run time", "last run result"):
                 if key in info:
                     print(f"  {key.title()}: {info[key]}")
-    elif startup_installed:
+    elif not startup_installed:
+        print("✗ Gateway service not installed")
+
+    if startup_installed:
         entry = get_startup_entry_path()
         if not entry.exists():
             entry = _legacy_startup_entry_path()
         print(f"✓ Windows login item installed: {entry}")
-    else:
-        print("✗ Gateway service not installed")
 
     if pids:
         print(f"✓ Gateway process running (PID: {', '.join(map(str, pids))})")
