@@ -628,7 +628,20 @@ registry.register(
     icon: Terminal,
     keywords: ['terminal', 'shell', 'console', 'pty'],
     get: () => isPaneVisible('terminal'),
-    set: () => togglePaneVisible('terminal')
+    set: () => {
+      togglePaneVisible('terminal')
+      // After revealing the terminal pane, move keyboard focus into it.
+      // togglePaneVisible() makes the DOM element visible but does not call
+      // .focus() — the composer or whatever held focus before the toggle
+      // keeps it, so keystrokes still land in the chat rather than the
+      // shell (#98955). requestAnimationFrame lets the pane finish painting
+      // (Framer Motion expand animation) before the focus call so the
+      // element is both visible AND layout-stable when we focus it.
+      requestAnimationFrame(() => {
+        const xtermEl = document.querySelector<HTMLElement>('[data-terminal] .xterm-helper-textarea')
+        xtermEl?.focus()
+      })
+    }
   })
 )
 
