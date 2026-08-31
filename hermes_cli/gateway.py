@@ -1067,6 +1067,7 @@ def find_windows_gateway_services(
         if profile_processes is None:
             profile_processes = find_profile_gateway_processes(strict=True)
         service_names_by_pid: dict[int, set[str]] = {}
+        indeterminate_services_by_pid: dict[int, list[tuple[str, object]]] = {}
         for service in psutil_module.win_service_iter():
             try:
                 if all(
@@ -1089,18 +1090,20 @@ def find_windows_gateway_services(
                 raise RuntimeError("SCM service inspection failed") from exc
             if not service_name:
                 raise RuntimeError("SCM service has an empty name")
+            if not _is_hermes_windows_gateway_service(service_name):
+                continue
             if service_status == "stopped":
                 continue
             if service_status != "running":
-                raise RuntimeError(
-                    f"SCM service {service_name} has indeterminate status: {service_status}"
-                )
+                if service_pid > 0:
+                    indeterminate_services_by_pid.setdefault(service_pid, []).append(
+                        (service_name, service_status)
+                    )
+                continue
             if service_pid <= 0:
                 raise RuntimeError(
                     f"Running SCM service {service_name} has no valid process ID"
                 )
-            if not _is_hermes_windows_gateway_service(service_name):
-                continue
             service_names_by_pid.setdefault(service_pid, set()).add(service_name)
     except Exception as exc:
         raise RuntimeError("SCM service enumeration failed") from exc
@@ -1115,6 +1118,14 @@ def find_windows_gateway_services(
             ) > 0.001:
                 raise RuntimeError("Gateway process identity changed during SCM discovery")
             ancestor_pids = [int(parent.pid) for parent in gateway_process.parents()]
+            for pid in ancestor_pids:
+                indeterminate_services = indeterminate_services_by_pid.get(pid, [])
+                if indeterminate_services:
+                    service_name, service_status = indeterminate_services[0]
+                    raise RuntimeError(
+                        f"SCM service {service_name} has indeterminate status: "
+                        f"{service_status}"
+                    )
             shared_service_pids = [
                 pid
                 for pid in ancestor_pids

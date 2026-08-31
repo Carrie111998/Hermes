@@ -1015,15 +1015,16 @@ def test_find_windows_gateway_services_maps_verified_pid_tree(monkeypatch):
     profile = SimpleNamespace(profile="default", pid=300, create_time=300.0)
 
     class FakeService:
-        def __init__(self, name, pid):
+        def __init__(self, name, pid, status="running"):
             self.name = name
             self.pid = pid
+            self.status = status
 
         def as_dict(self):
             return {
                 "name": self.name,
                 "pid": self.pid,
-                "status": "running",
+                "status": self.status,
             }
 
     class FakeProcess:
@@ -1044,7 +1045,7 @@ def test_find_windows_gateway_services_maps_verified_pid_tree(monkeypatch):
     fake_psutil = SimpleNamespace(
         win_service_iter=lambda: [
             FakeService("HermesGateway", 100),
-            FakeService("UnrelatedService", 900),
+            FakeService("UnrelatedService", 900, "stop_pending"),
         ],
         Process=FakeProcess,
     )
@@ -1084,10 +1085,68 @@ def test_find_windows_gateway_services_ignores_task_scheduler_ancestor(monkeypat
         def parents(self):
             return [FakeProcess(200), FakeProcess(100)]
 
-        def children(self, recursive=False):
-            assert self.pid == 100
-            assert recursive is True
-            return [FakeProcess(200), FakeProcess(300)]
+        def create_time(self):
+            return float(self.pid)
+
+    fake_psutil = SimpleNamespace(
+        win_service_iter=lambda: [FakeService()],
+        Process=FakeProcess,
+    )
+
+    assert gateway.find_windows_gateway_services(
+        psutil_module=fake_psutil,
+        profile_processes=[profile],
+    ) == []
+
+
+def test_find_windows_gateway_services_rejects_transitional_ancestor(monkeypatch):
+    """A transitional Hermes service in the gateway ancestry remains fail-closed."""
+    monkeypatch.setattr(gateway.sys, "platform", "win32")
+    profile = SimpleNamespace(profile="default", pid=300, create_time=300.0)
+
+    class FakeService:
+        def as_dict(self):
+            return {"name": "HermesGateway", "pid": 100, "status": "stop_pending"}
+
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def parents(self):
+            return [FakeProcess(100)]
+
+        def create_time(self):
+            return float(self.pid)
+
+    fake_psutil = SimpleNamespace(
+        win_service_iter=lambda: [FakeService()],
+        Process=FakeProcess,
+    )
+
+    with pytest.raises(RuntimeError, match="indeterminate status: stop_pending"):
+        gateway.find_windows_gateway_services(
+            psutil_module=fake_psutil,
+            profile_processes=[profile],
+        )
+
+
+def test_find_windows_gateway_services_ignores_transitional_task_scheduler_ancestor(
+    monkeypatch,
+):
+    """A transitional Schedule service is rejected by ownership before status."""
+    monkeypatch.setattr(gateway.sys, "platform", "win32")
+    profile = SimpleNamespace(profile="default", pid=300, create_time=300.0)
+
+    class FakeService:
+        def as_dict(self):
+            return {"name": "Schedule", "pid": 100, "status": "stop_pending"}
+
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def parents(self):
+            return [FakeProcess(100)]
 
         def create_time(self):
             return float(self.pid)
@@ -1101,6 +1160,52 @@ def test_find_windows_gateway_services_ignores_task_scheduler_ancestor(monkeypat
         psutil_module=fake_psutil,
         profile_processes=[profile],
     ) == []
+
+
+def test_find_windows_gateway_services_filters_shared_non_hermes_service(monkeypatch):
+    """An OS service sharing a Hermes SCM host does not make ownership ambiguous."""
+    monkeypatch.setattr(gateway.sys, "platform", "win32")
+    profile = SimpleNamespace(profile="default", pid=300, create_time=300.0)
+
+    class FakeService:
+        def __init__(self, name):
+            self._name = name
+
+        def name(self):
+            return self._name
+
+        def pid(self):
+            return 100
+
+        def status(self):
+            return "running"
+
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def parents(self):
+            return [FakeProcess(100)]
+
+        def children(self, recursive=False):
+            assert self.pid == 100
+            assert recursive is True
+            return [FakeProcess(300)]
+
+        def create_time(self):
+            return float(self.pid)
+
+    fake_psutil = SimpleNamespace(
+        win_service_iter=lambda: [FakeService("Schedule"), FakeService("HermesGatewayA")],
+        Process=FakeProcess,
+    )
+
+    result = gateway.find_windows_gateway_services(
+        psutil_module=fake_psutil,
+        profile_processes=[profile],
+    )
+
+    assert [service.name for service in result] == ["HermesGatewayA"]
 
 
 def test_find_windows_gateway_services_rejects_shared_service_host_pid(monkeypatch):
