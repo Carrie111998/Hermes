@@ -223,6 +223,28 @@ def reset_discovery_state() -> None:
         _mcp_discovery_thread = None
 
 
+def _profile_mcp_is_populated() -> bool:
+    """True when the CALLING profile ended a discovery run with usable tools.
+
+    "Usable" is deliberately broader than "connected": a server registered
+    from the on-disk schema cache (``lazy``, #56832) has real, callable tools
+    in the registry and no live session — ``get_mcp_status`` reports it as
+    ``configured``, not ``connected``. Gating the retry allowance on
+    connection state alone therefore treated every lazily-registered profile
+    as a failed discovery and re-ran the whole pass on every subsequent agent
+    build, with a WARNING each time. Connection status and cache-backed
+    availability are separate facts; this asks the question the retry actually
+    cares about.
+
+    Raises nothing: callers treat an unreadable state as "cannot tell".
+    """
+    from tools.mcp_tool import get_mcp_status, get_registered_mcp_server_names
+
+    if any((entry or {}).get("connected") for entry in (get_mcp_status() or [])):
+        return True
+    return bool(get_registered_mcp_server_names())
+
+
 def _has_configured_mcp_servers() -> bool:
     """Cheap config probe so non-MCP users avoid importing the MCP stack."""
     try:
@@ -274,16 +296,23 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
             if thread is not None and thread.is_alive():
                 return
             try:
-                from tools.mcp_tool import get_mcp_status
-
-                status = get_mcp_status() or []
-                if any(entry.get("connected") for entry in status):
+                # Config first, and not only to keep the non-MCP startup path
+                # from importing the MCP stack: a profile with nothing
+                # configured is DONE, not failed. There is nothing for a retry
+                # to find, and the gateway now reaches this gate once per turn
+                # (``GatewayRunner._ensure_profile_mcp_tools``) — so treating
+                # it as a failure warned on every message an MCP-less profile
+                # ever received.
+                if not _has_configured_mcp_servers():
+                    return
+                if _profile_mcp_is_populated():
                     return
             except Exception:
                 return
             logger.warning(
-                "Background MCP discovery previously exited with no connected "
-                "servers; retrying discovery thread"
+                "Background MCP discovery for profile %s previously exited "
+                "with no usable MCP tools; retrying discovery thread",
+                home or "<default>",
             )
             state.started = False
             state.thread = None
@@ -309,16 +338,31 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
                     try:
                         _discover_mcp_tools_without_interactive_oauth()
                         try:
-                            from tools.mcp_tool import get_mcp_status
-                            status = get_mcp_status() or []
-                            if not any(entry.get("connected") for entry in status):
+                            if not _profile_mcp_is_populated():
+                                # Profile-stamped: on a multiplexed gateway an
+                                # unattributed "zero servers" line is not
+                                # actionable — it names neither the profile
+                                # whose config was read nor the one whose
+                                # agent will come up without MCP tools.
                                 logger.warning(
-                                    "Background MCP discovery completed with zero connected servers"
+                                    "Background MCP discovery for profile %s "
+                                    "completed with no usable MCP tools",
+                                    home or "<default>",
                                 )
                         except Exception:
                             logger.debug("Failed to inspect MCP status after background discovery", exc_info=True)
                     except Exception:
-                        logger.debug("Background MCP tool discovery failed", exc_info=True)
+                        # WARNING, not DEBUG: a discovery pass that raised
+                        # leaves this profile with NO MCP tools for every
+                        # agent built under it. At the gateway's default log
+                        # level a DEBUG line makes that indistinguishable
+                        # from "this profile has no MCP servers" — the exact
+                        # silence this investigation started from.
+                        logger.warning(
+                            "Background MCP tool discovery failed for profile %s",
+                            home or "<default>",
+                            exc_info=True,
+                        )
             finally:
                 global _mcp_discovery_thread
                 me = threading.current_thread()

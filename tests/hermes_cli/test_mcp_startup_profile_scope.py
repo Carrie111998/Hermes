@@ -167,7 +167,20 @@ class _Recorder:
 
 @pytest.fixture(autouse=True)
 def _reset_discovery_state():
-    """Start from a clean coordinator + registry map, leave no thread behind."""
+    """Start from a clean coordinator + registry map, leave no thread behind.
+
+    ``ensure_mcp_discovery_started`` latches ``tui_gateway.entry
+    ._mcp_discovery_enabled`` for the rest of the PROCESS (by design: later
+    agent builds re-invoke the idempotent spawn so the retry-after-zero-
+    connected allowance can fire). Left set, it makes
+    ``entry.wait_for_mcp_discovery`` delegate to ``mcp_startup`` in every
+    later test file too — which is what turned
+    ``test_make_agent_waits_for_shared_mcp_discovery`` red when this file ran
+    before it. Restore it here rather than weakening the production latch.
+    """
+    from tui_gateway import entry as tui_entry
+
+    was_enabled = tui_entry._mcp_discovery_enabled
     mcp_startup.reset_discovery_state()
     mcp_profile.reset_all_registries()
     try:
@@ -176,6 +189,7 @@ def _reset_discovery_state():
         _join_all_discovery()
         mcp_startup.reset_discovery_state()
         mcp_profile.reset_all_registries()
+        tui_entry._mcp_discovery_enabled = was_enabled
 
 
 @pytest.fixture
@@ -471,3 +485,25 @@ def test_zero_connected_retry_is_per_profile(profiles, recorder, caplog):
 
     assert recorder.password_envs_for(home_a) == [_ZUG_ENV, _ZUG_ENV]
     assert recorder.password_envs_for(home_b) == []
+
+
+def test_profile_without_mcp_servers_is_done_not_failed(tmp_path, recorder, caplog):
+    """"Nothing configured" must not read as "discovery failed" on every call.
+
+    The retry allowance exists for a run that *tried* and came back empty. A
+    profile with no ``mcp_servers`` never had a run to fail, and there is
+    nothing a retry could find. Since ``GatewayRunner._ensure_profile_mcp_tools``
+    reaches this gate once per turn, mistaking the two warned on every message
+    such a profile ever received.
+    """
+    home = tmp_path / "profile-no-mcp"
+    home.mkdir()
+    (home / "config.yaml").write_text("model: some-model\n", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="tui_gateway.entry"):
+        for _ in range(3):
+            _start_discovery_for(home)
+        _join_all_discovery()
+
+    assert [r.getMessage() for r in caplog.records] == []
+    assert recorder.seen == []

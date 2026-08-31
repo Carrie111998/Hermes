@@ -2494,6 +2494,72 @@ def _profile_runtime_scope(profile_home: "Path"):
         reset_hermes_home_override(home_token)
 
 
+# Minimum gap between per-turn MCP readiness attempts for ONE profile. See
+# GatewayRunner._profile_mcp_readiness_due.
+_PROFILE_MCP_READINESS_INTERVAL_S = 60.0
+
+
+def _ensure_profile_mcp_discovery(*, wait: bool = True) -> None:
+    """Discover the CURRENTLY SCOPED profile's MCP servers. Must run off-loop.
+
+    ``start_gateway()`` runs ``discover_mcp_tools()`` exactly once, under the
+    LAUNCH profile's ``HERMES_HOME``. That reads ``~/.hermes/config.yaml``'s
+    ``mcp_servers`` and nothing else, so on a multiplexed gateway every
+    *other* profile's ``mcp_servers`` were never loaded, never connected and
+    never registered (#67605).
+
+    Before the MCP state became profile-scoped that was merely wrong — one
+    process-global registry meant every profile shared (and 401'd on) the
+    launch profile's connections. Since ``tools/mcp_profile.py`` it is
+    *silent*: the launch profile's servers live in the launch profile's
+    registry, so ``_make_check_fn``'s availability probe reads the selected
+    profile's empty registry and drops those tools from the snapshot without
+    attempting a connection. The observed live symptom was a Matrix session
+    with no MCP tool, no connection error, and no discovery line in the
+    journal.
+
+    ``ensure_mcp_discovery_before_agent_build`` is the shared, per-profile
+    coordinator (``hermes_cli.mcp_startup``): it dedupes on the calling
+    profile's canonical home, replays that profile's ``HERMES_HOME`` override
+    and secret scope into the discovery thread, and — with ``wait`` — joins it
+    under the ``mcp_discovery_timeout`` bound so already-registering servers
+    land before the turn's ``AIAgent`` snapshots its tool list. A profile whose
+    discovery fails neither blocks nor suppresses any other profile.
+
+    The bound is a bound, not a guarantee: a server still connecting when it
+    expires registers into this profile's registry moments later, but the
+    ``AIAgent`` this turn built is already cached in ``_agent_cache`` and never
+    re-reads the registry, so that ONE session stays MCP-less until it is
+    rebuilt (config-signature change, eviction, ``/new``, ``/reload-mcp``).
+    Unlike the TUI (``tui_gateway.server._schedule_mcp_late_refresh``) the
+    messaging gateway has no pre-first-turn late refresh. That is why
+    ``_warm_profile_mcp_discovery`` starts every served profile's discovery at
+    gateway startup: by the time a first message arrives, this join normally
+    has nothing left to wait for.
+
+    Blocking: caller must already be off the event loop (executor / startup
+    thread) — a bounded join on the loop thread would stall platform
+    heartbeats (#16856). Never raises: a broken MCP config degrades the turn
+    to "no MCP tools", exactly as before.
+    """
+    try:
+        from hermes_cli.mcp_startup import (
+            ensure_mcp_discovery_before_agent_build,
+            start_background_mcp_discovery,
+        )
+
+        if wait:
+            ensure_mcp_discovery_before_agent_build(
+                logger=logger, thread_name="gateway-mcp-discovery",
+            )
+        else:
+            start_background_mcp_discovery(
+                logger=logger, thread_name="gateway-mcp-discovery",
+            )
+    except Exception:
+        logger.debug("Profile MCP discovery readiness failed", exc_info=True)
+
+
 def load_gateway_config_for_runner() -> "GatewayConfig":
     """Load gateway config for the process-level GatewayRunner.
 
@@ -16315,6 +16381,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     claimed[retry_claim] = active
 
         profile_homes = _multiplex_profile_homes(self.config)
+        self._warm_profile_mcp_discovery(profile_homes, active)
         for profile_name, profile_home in profile_homes:
             if profile_name == active:
                 continue  # handled by the primary startup loop
@@ -16362,6 +16429,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("could not record served_profiles", exc_info=True)
 
         return connected
+
+    def _warm_profile_mcp_discovery(
+        self, profile_homes: "list[tuple[str, Path]]", active: str
+    ) -> None:
+        """Kick off each served profile's MCP discovery at gateway startup.
+
+        ``start_gateway()`` discovers the ACTIVE profile's servers before
+        ``start()`` runs, so this covers the rest — the profiles that a
+        multiplexed gateway serves but whose ``mcp_servers`` nothing had ever
+        read. Without it the first inbound message for such a profile is the
+        one that pays for discovery, and any server slower than
+        ``mcp_discovery_timeout`` misses that first turn's tool snapshot.
+
+        Fire-and-forget: each call only spawns that profile's daemon discovery
+        thread (the per-profile coordinator dedupes against the later per-turn
+        readiness call), so a slow or dead MCP server cannot delay adapter
+        startup. A profile that fails here is logged and skipped; discovery is
+        never a reason to refuse to serve a profile.
+        """
+        for profile_name, profile_home in profile_homes:
+            if not profile_name or profile_name == active or profile_home is None:
+                continue
+            try:
+                with _profile_runtime_scope(Path(profile_home)):
+                    _ensure_profile_mcp_discovery(wait=False)
+            except Exception:
+                logger.debug(
+                    "Could not start MCP discovery for profile '%s'",
+                    profile_name,
+                    exc_info=True,
+                )
 
     async def _start_one_profile_adapters(
         self, profile_name: str, profile_home: "Path", claimed: Dict[tuple, str]
@@ -23932,6 +24030,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
+            # Background tasks build their own AIAgent, so they need the same
+            # profile-scoped MCP readiness the main turn path gets.
+            await self._ensure_profile_mcp_tools()
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
             )
@@ -29505,6 +29606,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
+            # This profile's MCP servers, before the turn builds its AIAgent
+            # and snapshots the tool list. Off-loop and bounded; see
+            # _ensure_profile_mcp_discovery.
+            await self._ensure_profile_mcp_tools()
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
@@ -29515,6 +29620,78 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
+
+    async def _ensure_profile_mcp_tools(self) -> None:
+        """Off-loop, bounded MCP discovery for the profile scope in effect.
+
+        Hops to the gateway executor via ``_run_in_executor_with_context`` for
+        two reasons: ``_ensure_profile_mcp_discovery`` blocks (bounded) on the
+        discovery join, and ``copy_context()`` carries the caller's
+        ``_profile_runtime_scope`` — the ``HERMES_HOME`` override AND the
+        profile secret scope — into the worker, which is what makes the
+        discovery thread read THIS profile's ``mcp_servers`` and resolve its
+        ``${VAR}`` refs against THIS profile's credentials.
+
+        Only reached from the multiplexed branches of ``_run_agent`` /
+        ``_run_background_task``; single-profile gateways keep discovering
+        once at ``start_gateway()`` and are unaffected. Never raises — a
+        shutting-down executor or a broken MCP config must not fail the turn.
+        """
+        if not self._profile_mcp_readiness_due():
+            return
+        try:
+            await self._run_in_executor_with_context(_ensure_profile_mcp_discovery)
+        except Exception:
+            logger.debug("Profile MCP discovery readiness skipped", exc_info=True)
+
+    def _profile_mcp_readiness_due(self) -> bool:
+        """Rate-limit the per-turn readiness call, per profile.
+
+        ``start_background_mcp_discovery``'s retry allowance was written for a
+        caller that runs once per AGENT BUILD (a TUI session start, a model
+        switch). This one runs once per MESSAGE, and for a profile whose MCP
+        server is genuinely down — jonathon's ToolHive 401, say —
+        ``_profile_mcp_is_populated()`` stays False forever, so every single
+        turn would re-enter the allowance: a fresh discovery thread, a
+        cross-process discovery lock acquisition (``discover_mcp_tools``
+        sleeps and retries when another process holds it), and a WARNING.
+
+        The floor is the same order as the connect backoff in
+        ``tools/mcp_tool.py`` (30s base), which is what actually stops the
+        re-connect: this stops the churn around it. Kept here rather than in
+        ``hermes_cli.mcp_startup`` so the shared coordinator's contract —
+        idempotent, retry allowed on the next call — is unchanged for the
+        CLI/TUI callers that depend on it.
+
+        An in-flight run is always allowed through: joining it IS the
+        readiness this method exists to provide, and it is the one case where
+        skipping would cost the turn its MCP tools. Never raises; an
+        unreadable profile scope degrades to "attempt it".
+        """
+        try:
+            from hermes_cli.mcp_startup import mcp_discovery_in_flight
+            from hermes_constants import get_hermes_home, hermes_home_key
+
+            if mcp_discovery_in_flight():
+                return True
+            key = hermes_home_key(str(get_hermes_home()))
+        except Exception:
+            return True
+
+        lock = getattr(self, "_profile_mcp_readiness_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._profile_mcp_readiness_lock = lock
+        now = time.monotonic()
+        with lock:
+            due_at = getattr(self, "_profile_mcp_readiness_due_at", None)
+            if due_at is None:
+                due_at = {}
+                self._profile_mcp_readiness_due_at = due_at
+            if key in due_at and now < due_at[key]:
+                return False
+            due_at[key] = now + _PROFILE_MCP_READINESS_INTERVAL_S
+        return True
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
