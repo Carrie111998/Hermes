@@ -31,14 +31,17 @@ import {
 
 type FakeChildProcess = EventEmitter & {
   stdout: EventEmitter
+  stderr: EventEmitter
 }
 
-// A minimal stand-in for a spawned child process: an EventEmitter with a
-// stdout EventEmitter, matching the surface waitForDashboardPort consumes
-// (child.stdout.on('data'), child.on('exit'|'error') + the .off() teardown).
+// A minimal stand-in for a spawned child process: an EventEmitter with
+// stdout/stderr EventEmitters, matching the surface the readiness wait
+// consumes (child.stdout/stderr.on('data'), child.on('exit'|'error') + the
+// .off() teardown).
 function makeFakeChild(): FakeChildProcess {
   const child = new EventEmitter() as FakeChildProcess
   child.stdout = new EventEmitter()
+  child.stderr = new EventEmitter()
 
   return child
 }
@@ -215,6 +218,97 @@ test('waitForDashboardReadyFile rejects when the child exits before file readine
   } finally {
     tmp.cleanup()
   }
+})
+
+// ---------------------------------------------------------------------------
+// #96315 readiness-race family — sentinel on stderr / timing jitter
+// ---------------------------------------------------------------------------
+//
+// The `serve` backend prints its READY sentinel on stderr because
+// tui_gateway.server redirects Python's stdout to stderr at import time (it
+// reserves stdout for JSON-RPC). A stdout-only watcher burned the full 90s
+// deadline against a healthy backend; these tests pin the multi-channel
+// state machine that replaces it. Pre-fix, every "resolves" case below was a
+// timeout rejection.
+
+test('resolves when the READY sentinel lands on stderr (serve stdout redirect)', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 1000)
+  child.stderr.emit('data', 'HERMES_BACKEND_READY port=50468\n')
+  assert.equal(await p, 50468)
+})
+
+test('resolves when the sentinel arrives split across stderr chunks', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 1000)
+  child.stderr.emit('data', 'noise\nHERMES_BACKEND_READY po')
+  child.stderr.emit('data', 'rt=50469\n')
+  assert.equal(await p, 50469)
+})
+
+test('resolves when the announcement landed before the wait attached (spawn-time tail)', async () => {
+  const child = makeFakeChild()
+  // Simulates outputTail buffering at spawn: the READY line flew past while
+  // the spawn path was still awaiting the claim/bookkeeping, before the
+  // wait's own data listeners existed (#96315 — the orphaned-promise race).
+  const outputTail = { text: () => 'noise before\nHERMES_BACKEND_READY port=50470\nmore noise' }
+  const p = waitForDashboardPortAnnouncement(child, { outputTail, timeoutMs: 1000 })
+  assert.equal(await p, 50470)
+})
+
+test('combined wait resolves via stderr even when a ready file never appears', async () => {
+  const tmp = mkTmpReadyFile()
+  const child = makeFakeChild()
+
+  try {
+    // The ready file is configured but never written (old runtime without
+    // ready-file support). The combined wait must NOT wait on the file alone:
+    // the stderr channel resolves the port.
+    const p = waitForDashboardPortAnnouncement(child, { readyFile: tmp.file, timeoutMs: 1000 })
+    child.stderr.emit('data', 'HERMES_BACKEND_READY port=40001\n')
+    assert.equal(await p, 40001)
+  } finally {
+    tmp.cleanup()
+  }
+})
+
+test('resolves when exit races the final chunk (data still buffered in the stream)', async () => {
+  const child = makeFakeChild()
+  let buffered = 'HERMES_BACKEND_READY port=30001\n'
+  ;(child.stdout as EventEmitter & { read?: () => unknown }).read = () => {
+    const chunk = buffered
+    buffered = ''
+    return chunk || null
+  }
+  const p = waitForDashboardPort(child, 1000)
+  // The child exits before the final chunk is delivered as a 'data' event —
+  // e.g. a watchdog/superseded attempt tearing the pipe down mid-boot.
+  child.emit('exit', 0, null)
+  assert.equal(await p, 30001)
+})
+
+test('resolves when the sentinel reached the buffer without a trailing newline at exit', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 1000)
+  child.stdout.emit('data', 'HERMES_BACKEND_READY port=30002')
+  child.emit('exit', 0, null)
+  assert.equal(await p, 30002)
+})
+
+test('exit scan finds an announcement already buffered in the spawn-time tail', async () => {
+  const child = makeFakeChild()
+  const outputTail = { text: () => 'HERMES_BACKEND_READY port=50471\n' }
+  const p = waitForDashboardPortAnnouncement(child, { outputTail, timeoutMs: 1000 })
+  child.emit('exit', 0, null)
+  assert.equal(await p, 50471)
+})
+
+test('a backend that announces then exits still resolves (not a boot failure)', async () => {
+  const child = makeFakeChild()
+  const p = waitForDashboardPort(child, 1000)
+  child.stdout.emit('data', 'HERMES_BACKEND_READY port=30003\n')
+  child.emit('exit', 0, null)
+  assert.equal(await p, 30003)
 })
 
 // ---------------------------------------------------------------------------

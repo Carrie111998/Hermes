@@ -12014,14 +12014,21 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
   // step 3 in hermes_cli/main.py), so the child re-homes to this profile.
-  // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
+  // --port 0: the OS assigns an ephemeral port; the child announces it on
+  // stdout — or on stderr, when tui_gateway.server's import-time stdout
+  // redirect is active. The readiness wait consumes BOTH streams, plus the
+  // atomic ready file, so whichever channel the runtime uses, boot proceeds.
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
   const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
   backend.args = getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
   const webDist = resolveWebDist()
-  const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+  // The backend writes this atomic JSON right before its READY sentinel; the
+  // readiness wait polls it alongside the stdout/stderr channels. Runtimes
+  // without the ready-file support simply never write it and fall through to
+  // the stream channels — the file is opportunistic, never load-bearing.
+  const readyFile = makeDashboardReadyFile()
 
   // Guard BEFORE the "Starting" line: a profile that only exists on a remote
   // backend (remote-primary desktop asked for a forced-local child) rejects
@@ -12109,7 +12116,14 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
 
   // Discover the ephemeral port the child bound to
   const port = await Promise.race([
-    waitForDashboardPortAnnouncement(child, { describeOutputTail: () => outputTail.describe(), readyFile }),
+    waitForDashboardPortAnnouncement(child, {
+      // outputTail was attached at spawn, before the claim await: an
+      // announcement that flew past during the claim is still observed
+      // instead of being lost to a listener attached too late (#96315).
+      outputTail,
+      describeOutputTail: () => outputTail.describe(),
+      readyFile
+    }),
     startFailed
   ])
 
@@ -12412,7 +12426,10 @@ async function startHermes() {
     backend.args = getBackendArgsForRuntime(backend)
     const hermesCwd = resolveHermesCwd()
     const webDist = resolveWebDist()
-    const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
+    // Opportunistic atomic ready-file channel; see the spawn above for why it
+    // is always armed. Runtimes that never write it fall through to the
+    // stdout/stderr announcement channels in the readiness wait.
+    const readyFile = makeDashboardReadyFile()
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
@@ -12550,6 +12567,9 @@ async function startHermes() {
     // Discover the ephemeral port the child bound to
     const port = await Promise.race([
       waitForDashboardPortAnnouncement(hermesProcess, {
+        // Spawn-time combined stdout+stderr buffer: catches announcements
+        // that raced the claim/attach bookkeeping (#96315).
+        outputTail: primaryOutputTail,
         describeOutputTail: () => primaryOutputTail.describe(),
         readyFile
       }),
