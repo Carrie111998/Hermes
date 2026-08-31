@@ -5729,16 +5729,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
         if not is_malformed_db_error(exc):
             return False
+        diagnostic_limit = 100
         try:
             lock_context = contextlib.nullcontext() if lock_held else self._lock
             with lock_context:
                 diagnostics = [
                     str(row[0]).lower()
-                    for row in self._conn.execute("PRAGMA integrity_check").fetchall()
+                    for row in self._conn.execute(
+                        f"PRAGMA integrity_check({diagnostic_limit})"
+                    ).fetchall()
                 ]
         except sqlite3.Error:
             return False
-        if not diagnostics or diagnostics == ["ok"]:
+        # SQLite returns at most N diagnostics. Reaching the requested cap is
+        # indistinguishable from a truncated mixed-corruption report, so it
+        # cannot authorize live FTS maintenance or a canonical write retry.
+        if (
+            not diagnostics
+            or diagnostics == ["ok"]
+            or len(diagnostics) >= diagnostic_limit
+        ):
             return False
         return all(
             "fts5 table" in diagnostic

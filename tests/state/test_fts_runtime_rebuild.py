@@ -95,6 +95,18 @@ def _base_fts_triggers(db_path):
     return {row[0] for row in rows}
 
 
+def _corrupt_btree_root(db_path, root_page):
+    data = bytearray(db_path.read_bytes())
+    page_size = int.from_bytes(data[16:18], "big")
+    if page_size == 1:
+        page_size = 65_536
+    page_start = (root_page - 1) * page_size
+    header_offset = page_start + (100 if root_page == 1 else 0)
+    assert data[header_offset] in {0x02, 0x05, 0x0A, 0x0D}
+    data[header_offset + 3 : header_offset + 5] = b"\xff\xff"
+    db_path.write_bytes(data)
+
+
 class TestRuntimeFtsRebuild:
     def test_reap_candidates_exclude_uninspectable_holder_suspicions(
         self, tmp_path
@@ -312,6 +324,95 @@ class TestRuntimeFtsRebuild:
 
         assert db._fts_runtime_rebuild_attempted is False
         assert db._fts_enabled is True
+
+    def test_integrity_report_at_diagnostic_cap_fails_closed(self, db):
+        generic = sqlite3.DatabaseError("database disk image is malformed")
+        generic.sqlite_errorcode = sqlite3.SQLITE_CORRUPT
+        cursor = SimpleNamespace(
+            fetchall=lambda: [("malformed FTS5 table: messages_fts",)] * 100
+        )
+        queries = []
+        fake_conn = SimpleNamespace(
+            execute=lambda sql: (queries.append(sql), cursor)[1]
+        )
+        real_conn = db._conn
+        db._conn = fake_conn
+        try:
+            assert db._has_fts_corruption_evidence(generic) is False
+        finally:
+            db._conn = real_conn
+        assert queries == ["PRAGMA integrity_check(100)"]
+
+    def test_physical_canonical_corruption_never_enters_fts_recovery(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "state.db"
+        seed = SessionDB(db_path=db_path)
+        seed.create_session("s1", source="test")
+        for index in range(160):
+            seed.append_message("s1", "user", f"payload {index} " + "x" * 1500)
+        seed.close()
+
+        raw = sqlite3.connect(str(db_path), isolation_level=None)
+        try:
+            raw.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            raw.execute("PRAGMA journal_mode=DELETE")
+            raw.execute("VACUUM")
+            plan = " ".join(
+                str(row[3])
+                for row in raw.execute(
+                    "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM messages"
+                ).fetchall()
+            )
+            assert "COVERING INDEX" in plan
+            root_row = raw.execute(
+                "SELECT rootpage FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'messages'"
+            ).fetchone()
+            assert root_row is not None
+            messages_root = int(root_row[0])
+        finally:
+            raw.close()
+
+        first = SessionDB(db_path=db_path)
+        sibling = SessionDB(db_path=db_path)
+        try:
+            _corrupt_btree_root(db_path, messages_root)
+            raw = sqlite3.connect(str(db_path), isolation_level=None)
+            try:
+                assert raw.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 160
+                with pytest.raises(sqlite3.DatabaseError, match="malformed"):
+                    raw.execute("SELECT * FROM messages NOT INDEXED").fetchall()
+            finally:
+                raw.close()
+
+            monkeypatch.setattr(
+                first, "rebuild_fts", lambda: pytest.fail("must not rebuild FTS")
+            )
+            triggers_before = _base_fts_triggers(db_path)
+            with pytest.raises(sqlite3.DatabaseError, match="malformed"):
+                first.append_message("s1", "user", "must not persist")
+
+            assert first._fts_runtime_rebuild_attempted is False
+            assert first._fts_stale is False
+            assert _meta_value(db_path, FTS_STALE_KEY) is None
+            assert _base_fts_triggers(db_path) == triggers_before
+            assert _active_structural_quarantine_path(db_path).exists()
+
+            callback_called = False
+
+            def _sibling_write(_conn):
+                nonlocal callback_called
+                callback_called = True
+
+            with pytest.raises(
+                sqlite3.DatabaseError, match="canonical writes disabled"
+            ):
+                sibling._execute_write(_sibling_write)
+            assert callback_called is False
+        finally:
+            first.close()
+            sibling.close()
 
     def test_contradictory_result_code_does_not_quarantine(self, db):
         contradictory = sqlite3.IntegrityError("database disk image is malformed")
