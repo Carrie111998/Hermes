@@ -409,6 +409,10 @@ exclude-newer = "14 days"
 # request-smuggling) fix in 4.4.1, published 2026-08-03. Remove after 2026-08-17.
 # aiohttp, cryptography: same shape — the advisory fixes are newer than the
 # 14-day window, so the resolver cannot see them without an exception.
+# msal 1.38.0 lifts its cryptography ceiling to include the core 50.x security
+# pin. Older releases leave installed environments formally inconsistent even
+# when uv's cryptography override resolves the graph. Remove the msal exception
+# after 2026-09-07, when 1.38.0 has aged through the normal 14-day window.
 #
 # defusedxml, python-olm, unpaddedbase64: the OPPOSITE shape (#80387, #79434,
 # #78227 family). These are ancient, effectively frozen releases (2021-2023)
@@ -433,7 +437,7 @@ exclude-newer = "14 days"
 # firecrawl-anydoc: same exact-pin shape (==0.2.4, hosted-OCR wiring PR).
 # The pin bump WAS the review; exclude-newer adds zero float protection to
 # an exact pin and would only delay the reviewed version 14 days.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false, firecrawl-anydoc = false }
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, msal = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false, firecrawl-anydoc = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
