@@ -358,6 +358,69 @@ class TestDiscordStreamingTTS:
         assert mixer.speech_active is False
 
     @pytest.mark.asyncio
+    async def test_mixer_replaced_during_worker_write_fails_before_audio_for_fallback(self):
+        """A stale child write must fail before the consumer marks it audible."""
+        from gateway.streaming_tts_consumer import StreamingTTSConsumer
+        from plugins.platforms.discord.adapter import _DiscordStreamingTTSHandle
+
+        class SingleChunkStreamer:
+            sample_rate = 24000
+            channels = 1
+            sample_width = 2
+
+            def stream(self, text):
+                del text
+                yield b"\x01\x00" * 32
+
+        adapter = _make_adapter()
+        mixer = vm.VoiceMixer()
+        vc = _VoiceClientState(mixer)
+        adapter._voice_clients[111] = vc
+        adapter._voice_text_channels[111] = 222
+        adapter._voice_mixers[111] = mixer
+        adapter._cancel_voice_timeout = MagicMock()
+        write_started = threading.Event()
+        release_write = threading.Event()
+
+        with patch("tools.tts_streaming.resolve_streaming_provider", return_value=SingleChunkStreamer()):
+            consumer = StreamingTTSConsumer(adapter, "222", {}, asyncio.get_running_loop())
+            consumer.start()
+            for _ in range(100):
+                if consumer.started:
+                    break
+                await asyncio.sleep(0.01)
+            assert consumer.started is True
+            assert isinstance(consumer._handle, _DiscordStreamingTTSHandle)
+            child = consumer._handle.child
+            original_write = vm.StreamingMixerChild.write
+
+            def blocking_write(self, pcm):
+                if self is child:
+                    write_started.set()
+                    if not release_write.wait(timeout=1.0):
+                        raise TimeoutError("test worker write was not released")
+                return original_write(self, pcm)
+
+            with patch.object(vm.StreamingMixerChild, "write", blocking_write):
+                consumer.on_delta("A complete answer.")
+                consumer.finish()
+                assert await asyncio.to_thread(write_started.wait, 1.0)
+
+                replacement = vm.VoiceMixer()
+                adapter._voice_mixers[111] = replacement
+                vc.source = replacement
+                release_write.set()
+                completed = await consumer.wait_complete(timeout=1.0)
+
+        assert completed is False
+        assert consumer.completed is False
+        assert consumer.audible is False
+        assert consumer.suppress_whole_file is False
+        assert child.drained is True
+        assert child._aborted is True
+        assert child._activated is True
+
+    @pytest.mark.asyncio
     async def test_unavailable_or_stale_voice_state_declines_streaming(self):
         from gateway.platforms.base import AudioFormat
 
