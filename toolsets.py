@@ -55,8 +55,8 @@ _HERMES_CORE_TOOLS = [
     "browser_exec",
     # Text-to-speech
     "text_to_speech",
-    # Planning & memory
-    "todo", "memory",
+    # Planning, goal control, and memory
+    "todo", "goal_control", "memory",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -213,6 +213,12 @@ TOOLSETS = {
     "todo": {
         "description": "Task planning and tracking for multi-step work",
         "tools": ["todo"],
+        "includes": []
+    },
+
+    "goal": {
+        "description": "Inspect and manage the current session's persisted goal",
+        "tools": ["goal_control"],
         "includes": []
     },
     
