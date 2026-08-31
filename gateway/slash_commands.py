@@ -997,7 +997,8 @@ class GatewaySlashCommandsMixin:
         # Test doubles and older stores may not expose the public lookup helper.
         # Keep the Matrix resume guard fail-closed if no origin can be resolved.
         entries = getattr(self.session_store, "_entries", {}) or {}
-        for entry in entries.values():            if getattr(entry, "session_id", None) == session_id:
+        for entry in entries.values():
+            if getattr(entry, "session_id", None) == session_id:
                 return getattr(entry, "origin", None)
         return None
 
@@ -1996,7 +1997,8 @@ class GatewaySlashCommandsMixin:
                         _display_cur = format_model_for_display(_cur_model)
                         _display_new = format_model_for_display(result.new_model)
                         if not hasattr(_self, "_pending_model_notes"):
-                            _self._pending_model_notes = {}                        _self._pending_model_notes[_session_key] = (
+                            _self._pending_model_notes = {}
+                        _self._pending_model_notes[_session_key] = (
                             f"[Note: model was just switched from {_display_cur} to {_display_new} "
                             f"via {result.provider_label or result.target_provider}. "
                             f"Adjust your self-identification accordingly.]"
@@ -2995,7 +2997,8 @@ class GatewaySlashCommandsMixin:
         """
         args = (event.get_command_args() or "").strip()
         quick_key = self._session_key_for_source(event.source) if event.source else None
-        if not quick_key:            return "Refine unavailable (no session)."
+        if not quick_key:
+            return "Refine unavailable (no session)."
         if quick_key in self._running_agents:
             return "Agent is running — wait for the turn to finish, then /refine."
 
@@ -3996,7 +3999,8 @@ class GatewaySlashCommandsMixin:
 
         raw_args = event.get_command_args().strip().lower()
         # Reuse the /reasoning arg parser: strips --global (any position),
-        # normalizes unicode dashes.        args, persist_global = self._parse_reasoning_command_args(raw_args)
+        # normalizes unicode dashes.
+        args, persist_global = self._parse_reasoning_command_args(raw_args)
         session_key = self._session_key_for_source(event.source)
         self._service_tier = self._resolve_session_service_tier(
             session_key=session_key
@@ -4995,7 +4999,8 @@ class GatewaySlashCommandsMixin:
         if not target_id:
             return t("gateway.resume.not_found", name=name)
         # Compression creates child continuations that hold the live transcript.
-        # Follow that chain so gateway /resume matches CLI behavior (#15000).        try:
+        # Follow that chain so gateway /resume matches CLI behavior (#15000).
+        try:
             target_id = await self._session_db.resolve_resume_session_id(target_id)
         except Exception as e:
             logger.debug("Failed to resolve resume continuation for %s: %s", target_id, e)
@@ -5994,7 +5999,8 @@ class GatewaySlashCommandsMixin:
                 await _adapter.send(
                     source.chat_id,
                     confirmation_text,
-                    reply_to=event.message_id,                    metadata={
+                    reply_to=event.message_id,
+                    metadata={
                         "is_approval_prompt": True,
                         "force_proactive_send": True,
                     },
