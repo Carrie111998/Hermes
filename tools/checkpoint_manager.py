@@ -601,7 +601,12 @@ def _register_project(store: Path, working_dir: str) -> None:
             pass
     try:
         meta_path.parent.mkdir(parents=True, exist_ok=True)
-        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        # Write atomically via temp+replace so a SIGKILL between open and
+        # close cannot leave a truncated JSON that triggers orphan detection
+        # and silently deletes rollback history (#98832).  Mirrors _save_ledger.
+        _tmp = meta_path.with_suffix(".json.tmp")
+        _tmp.write_text(json.dumps(meta), encoding="utf-8")
+        _tmp.replace(meta_path)
     except OSError as exc:
         logger.debug("Could not write project metadata %s: %s", meta_path, exc)
 
@@ -630,7 +635,11 @@ def _touch_project(store: Path, working_dir: str) -> None:
     if evidence:
         meta.update(evidence)
     try:
-        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        # Write atomically via temp+replace so a crash cannot truncate the
+        # metadata and trigger orphan detection (#98832).
+        _tmp = meta_path.with_suffix(".json.tmp")
+        _tmp.write_text(json.dumps(meta), encoding="utf-8")
+        _tmp.replace(meta_path)
     except OSError as exc:
         logger.debug("Could not update project metadata %s: %s", meta_path, exc)
 
