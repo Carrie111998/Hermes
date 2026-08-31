@@ -3,11 +3,15 @@ import {
   SiBilibili,
   SiDiscord,
   SiGmail,
+  SiGooglechat,
   SiHomeassistant,
+  SiLine,
   SiMatrix,
   SiMattermost,
+  SiNtfy,
   SiQq,
   SiSignal,
+  SiSimplex,
   SiTelegram,
   SiWechat,
   SiWhatsapp
@@ -34,22 +38,19 @@ function PhotonIcon(props: React.SVGProps<SVGSVGElement>) {
   )
 }
 
-// DingTalk and WeCom are absent from Simple Icons, but both marks are available
-// in permissively licensed icon sets already represented by Desktop's icon
-// dependencies: Tabler (MIT) and Tencent TDesign (MIT), respectively.
+// DingTalk's compact list mark uses the same small colored chip as the other
+// platforms, but keeps the brand's filled center at this size. The outer ring
+// preserves the circular silhouette; the white glyph prevents it becoming a
+// generic blue dot.
 function DingTalkIcon(props: React.SVGProps<SVGSVGElement>) {
   return (
-    <svg
-      fill="none"
-      stroke="currentColor"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      strokeWidth="2"
-      viewBox="0 0 24 24"
-      {...props}
-    >
-      <path d="M21 12a9 9 0 1 1-18 0a9 9 0 0 1 18 0" />
-      <path d="m8 7.5 7.02 2.632a1 1 0 0 1 .567 1.33L14.5 14H16l-5 4 1-4c-3.1.03-3.114-3.139-4-6.5" />
+    <svg fill="none" viewBox="0 0 24 24" {...props}>
+      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.75" />
+      <circle cx="12" cy="12" fill="currentColor" r="6.25" />
+      <path
+        d="m8.45 7.8 6.6 2.475a1 1 0 0 1 .568 1.33L14.48 13.9h1.5l-4.7 3.75.92-3.53c-2.27-.22-2.94-2.54-3.75-6.32Z"
+        fill="white"
+      />
     </svg>
   )
 }
@@ -69,14 +70,15 @@ function WeComIcon(props: React.SVGProps<SVGSVGElement>) {
 // request, so we fall back to a colored letter monogram for those.
 //
 // `iconColor` is the brand's hex from simpleicons.org so we can paint each
-// glyph in its native color on top of a soft tint. The fallback monogram uses
-// the same hex to keep visual consistency.
+// glyph in its native color on top of a soft tint. Locally curated marks use
+// the same contract, which keeps the fallback and brand paths visually aligned.
 type IconKind = 'brand' | 'generic'
 
 interface PlatformIconSpec {
   Icon?: ComponentType<SVGProps<SVGSVGElement>>
   color: string
   kind: IconKind
+  monochrome?: boolean
   monogram?: string
 }
 
@@ -86,12 +88,19 @@ const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   // Slack removed from Simple Icons by Salesforce request — letter monogram.
   slack: { color: '#4A154B', kind: 'brand', monogram: 'S' },
   mattermost: { Icon: SiMattermost, color: '#0058CC', kind: 'brand' },
-  matrix: { Icon: SiMatrix, color: '#000000', kind: 'brand' },
+  matrix: { Icon: SiMatrix, color: '#0DBD8B', kind: 'brand' },
   signal: { Icon: SiSignal, color: '#3A76F0', kind: 'brand' },
   whatsapp: { Icon: SiWhatsapp, color: '#25D366', kind: 'brand' },
   bluebubbles: { Icon: SiApple, color: '#0BD318', kind: 'brand' },
   photon: { Icon: PhotonIcon, color: '#6366F1', kind: 'brand' },
   homeassistant: { Icon: SiHomeassistant, color: '#18BCF2', kind: 'brand' },
+  google_chat: { Icon: SiGooglechat, color: '#34A853', kind: 'brand' },
+  irc: { color: '#64748B', kind: 'brand', monogram: 'IRC' },
+  line: { Icon: SiLine, color: '#00C300', kind: 'brand' },
+  ntfy: { Icon: SiNtfy, color: '#317F6F', kind: 'brand' },
+  raft: { color: '#6366F1', kind: 'brand', monogram: 'R' },
+  simplex: { Icon: SiSimplex, color: '#111827', kind: 'brand', monochrome: true },
+  teams: { color: '#6264A7', kind: 'brand', monogram: 'T' },
   email: { Icon: SiGmail, color: '#EA4335', kind: 'brand' },
   sms: { Icon: MessageSquareText, color: '#F43F5E', kind: 'generic' },
   webhook: { Icon: LinkIcon, color: '#71717A', kind: 'generic' },

@@ -9,12 +9,28 @@ describe('PlatformAvatar brand glyphs', () => {
   it.each([
     ['dingtalk', 'DingTalk'],
     ['wecom', 'WeCom'],
-    ['wecom_callback', 'WeCom (app)']
-  ])('renders a brand glyph for %s instead of a letter fallback', (platformId, platformName) => {
+    ['wecom_callback', 'WeCom (app)'],
+    ['matrix', 'Matrix'],
+    ['google_chat', 'Google Chat'],
+    ['line', 'LINE'],
+    ['ntfy', 'ntfy'],
+    ['simplex', 'SimpleX Chat']
+  ])('renders a local brand glyph for %s', (platformId, platformName) => {
     const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
 
     expect(container.querySelector('svg')).toBeTruthy()
     expect(screen.queryByText(platformName.charAt(0))).toBeNull()
+  })
+
+  it.each([
+    ['irc', 'IRC', 'IRC'],
+    ['raft', 'Raft', 'R'],
+    ['teams', 'Microsoft Teams', 'T']
+  ])('renders a stable brand monogram for %s', (platformId, platformName, monogram) => {
+    const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
+
+    expect(container.querySelector('svg')).toBeNull()
+    expect(screen.getByText(monogram)).toBeTruthy()
   })
 
   it('keeps the initial fallback for an unknown platform', () => {
