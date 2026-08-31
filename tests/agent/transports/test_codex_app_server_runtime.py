@@ -102,6 +102,36 @@ class TestCodexAppServerModule:
         assert ok is False
         assert "not found" in msg.lower() or "no such" in msg.lower()
 
+    def test_resolves_windows_cmd_extension(self, monkeypatch) -> None:
+        """On Windows, `codex` (no extension) is a POSIX shell wrapper that
+        CreateProcessW cannot run. `codex.cmd` is the real shim. The resolver
+        must fall back to it; otherwise the check falsely reports missing."""
+        from agent.transports import codex_app_server as cas
+
+        fake_cmd = (
+            "C:\\Users\\someone\\AppData\\Local\\hermes\\node\\codex.cmd"
+        )
+        monkeypatch.setattr(cas, "_resolve_codex_bin", lambda name: fake_cmd)
+
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            from subprocess import CompletedProcess
+
+            calls.append(cmd)
+            return CompletedProcess(cmd, 0, stdout="codex-cli 0.151.0", stderr="")
+
+        monkeypatch.setattr(cas.subprocess, "run", fake_run)
+
+        ok, msg = cas.check_codex_binary()
+
+        assert ok is True, msg
+        assert msg == "0.151.0"
+        assert len(calls) == 1
+        assert calls[0][0].endswith(".cmd"), (
+            f"expected resolved binary to end with .cmd, got {calls[0][0]!r}"
+        )
+
     def test_codex_error_class_is_runtimeerror(self) -> None:
         from agent.transports.codex_app_server import CodexAppServerError
 

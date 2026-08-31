@@ -32,6 +32,32 @@ from tools.environments.local import hermes_subprocess_env
 MIN_CODEX_VERSION = (0, 125, 0)
 
 
+def _resolve_codex_bin(name: str) -> str:
+    """Resolve a usable codex executable path across platforms.
+
+    On Windows, `npm i -g @openai/codex` installs both `codex` (a POSIX shell
+    wrapper without an extension) and `codex.cmd` (the Windows shim). The
+    shell wrapper cannot be invoked by `subprocess.run([...])` because
+    CreateProcessW does not consult PATHEXT, so the wrapper is silently
+    unrunnable from Python on Windows even though `where codex` reports it.
+
+    Fall back to `.cmd` / `.bat` / `.exe` candidates so the binary check and
+    app-server spawn both work on a stock Windows install.
+    """
+    import shutil
+
+    found = shutil.which(name)
+    if found:
+        return found
+    if os.name != "nt":
+        return name
+    for ext in (".cmd", ".bat", ".exe", ".com"):
+        candidate = shutil.which(name + ext)
+        if candidate:
+            return candidate
+    return name
+
+
 @dataclass
 class CodexAppServerError(RuntimeError):
     """Raised on JSON-RPC errors from the app-server."""
@@ -75,7 +101,7 @@ class CodexAppServerClient:
         extra_args: Optional[list[str]] = None,
         env: Optional[dict[str, str]] = None,
     ) -> None:
-        self._codex_bin = codex_bin
+        self._codex_bin = _resolve_codex_bin(codex_bin)
         # codex app-server is a model-driving CLI executor: it runs a
         # model-chosen agentic loop that executes shell commands, so it
         # legitimately needs LLM provider credentials (inherit_credentials=True)
@@ -390,9 +416,10 @@ def check_codex_binary(
     """Verify codex CLI is installed and meets minimum version.
 
     Returns (ok, message). Used by setup wizard and runtime startup."""
+    resolved = _resolve_codex_bin(codex_bin)
     try:
         proc = subprocess.run(
-            [codex_bin, "--version"],
+            [resolved, "--version"],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=10,
@@ -400,7 +427,7 @@ def check_codex_binary(
         )
     except FileNotFoundError:
         return False, (
-            f"codex CLI not found at {codex_bin!r}. Install with: "
+            f"codex CLI not found at {codex_bin!r} (resolved: {resolved!r}). Install with: "
             f"npm i -g @openai/codex"
         )
     except subprocess.TimeoutExpired:
