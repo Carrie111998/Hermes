@@ -476,7 +476,7 @@ def load_cli_config() -> Dict[str, Any]:
             "min_tail_user_messages": 1,  # Real user messages guaranteed in the tail (1 = existing single anchor)
         },
         "agent": {
-            "max_turns": 500,  # Default max tool-calling iterations (shared with subagents)
+            "max_turns": None,  # Unlimited by default; positive integers opt in to a cap
             "verbose": False,
             "system_prompt": "",
             "prefill_messages_file": "",
@@ -5218,7 +5218,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             reasoning: Reasoning effort override for this run (none|minimal|low|medium|high|xhigh|max|ultra). Wins over config.
             api_key: API key (default: from environment)
             base_url: API base URL (default: OpenRouter)
-            max_turns: Maximum tool-calling iterations shared with subagents (default: 500)
+            max_turns: Maximum tool-calling iterations shared with subagents (default: unlimited)
             verbose: Enable verbose logging
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)
@@ -10062,6 +10062,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # ``self.api_key`` may be a callable (Azure Foundry Entra ID bearer
         # provider). Never invoke it; just identify the auth surface.
         from agent.azure_identity_adapter import is_token_provider
+        from hermes_cli.config import TURN_LIMIT_UNLIMITED
 
         # Prefer the LIVE agent's credential when one exists: HermesCLI's
         # constructor seeds self.api_key from OPENAI/OPENROUTER env vars
@@ -10105,7 +10106,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print(f"  Timeout:      {terminal_timeout}s")
         print()
         print("  -- Agent --")
-        print(f"  Max Turns:  {self.max_turns}")
+        max_turns = "unlimited" if self.max_turns == TURN_LIMIT_UNLIMITED else self.max_turns
+        print(f"  Max Turns:  {max_turns}")
         print(f"  Toolsets:   {', '.join(self.enabled_toolsets) if self.enabled_toolsets else 'all'}")
         print(f"  Verbose:    {self.verbose}")
         print()

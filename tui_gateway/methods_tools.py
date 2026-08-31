@@ -1498,10 +1498,12 @@ def _(rid, params: dict) -> dict:
         cfg = _load_cfg()
         model = _resolve_model()
         from agent.secret_scope import get_secret
+        from hermes_cli.config import TURN_LIMIT_UNLIMITED
 
         api_key = get_secret("HERMES_API_KEY", "") or cfg.get("api_key", "")
         masked = f"****{api_key[-4:]}" if len(api_key) > 4 else "(not set)"
         base_url = os.environ.get("HERMES_BASE_URL", "") or cfg.get("base_url", "")
+        max_turns = _cfg_max_turns(cfg, TURN_LIMIT_UNLIMITED)
 
         sections = [
             {
@@ -1515,7 +1517,7 @@ def _(rid, params: dict) -> dict:
             {
                 "title": "Agent",
                 "rows": [
-                    ["Max Turns", str(_cfg_max_turns(cfg, 500))],
+                    ["Max Turns", "unlimited" if max_turns == TURN_LIMIT_UNLIMITED else str(max_turns)],
                     ["Toolsets", ", ".join(cfg.get("enabled_toolsets", [])) or "all"],
                     ["Verbose", str(cfg.get("verbose", False))],
                 ],

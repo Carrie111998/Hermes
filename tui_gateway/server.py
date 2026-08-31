@@ -8854,7 +8854,10 @@ def _make_agent(
         pass
 
     cfg = _load_cfg()
-    from hermes_cli.config import resolve_ephemeral_system_prompt_from_config
+    from hermes_cli.config import (
+        TURN_LIMIT_UNLIMITED,
+        resolve_ephemeral_system_prompt_from_config,
+    )
 
     system_prompt = resolve_ephemeral_system_prompt_from_config(cfg)
     startup_skills = _parse_tui_skills_env()
@@ -8953,7 +8956,7 @@ def _make_agent(
     _pr = _load_provider_routing()
     return AIAgent(
         model=model,
-        max_iterations=_cfg_max_turns(cfg, 500),
+        max_iterations=_cfg_max_turns(cfg, TURN_LIMIT_UNLIMITED),
         provider=runtime.get("provider"),
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
