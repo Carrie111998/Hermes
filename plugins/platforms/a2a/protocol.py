@@ -258,15 +258,43 @@ def data_part(data: Any, media_type: str = "application/json") -> dict:
     return {"data": data, "mediaType": media_type}
 
 
-def text_message(role: str, text: str, context_id: str = "") -> dict:
-    """Build an A2A v1.0 Message with a single text Part."""
+def text_message(role: str, text: str, context_id: str = "",
+                  sender: Optional[dict] = None,
+                  metadata: Optional[dict] = None) -> dict:
+    """Build an A2A v1.0 Message with a single text Part.
+
+    ``sender`` is the v1.0 AgentName identity of the sending agent
+    (``agentId`` / ``name`` / optional ``url``).  Peers use it to learn this
+    gateway's real endpoint so out-of-band completion pushes can be routed
+    back with the port included — the gap that left port-less ``ip:``
+    identities unresolvable as push targets.
+
+    Sender identity is carried inside the standard A2A ``metadata`` field
+    under the namespaced key ``a2a.sender`` — **not** as a non-standard
+    top-level field.  A strict A2A parser rejects unknown top-level keys;
+    carrying sender inside metadata avoids that rejection while preserving
+    the identity exchange that makes out-of-band pushes work.
+    """
     msg: dict[str, Any] = {
         "role": role,  # ROLE_USER | ROLE_AGENT
         "parts": [text_part(text)],
         "messageId": uuid.uuid4().hex,
     }
+    if isinstance(sender, dict) and sender:
+        # Strip bearer tokens and other sensitive fields before putting
+        # sender in metadata — tokens must never enter the wire message
+        # or evidence logs.
+        _SENSITIVE_SENDER_KEYS = frozenset({"token", "auth", "secret", "password"})
+        meta = dict(metadata or {})
+        meta["a2a.sender"] = {
+            k: v for k, v in sender.items()
+            if v is not None and k.lower() not in _SENSITIVE_SENDER_KEYS
+        }
+        metadata = meta
     if context_id:
         msg["contextId"] = context_id
+    if metadata:
+        msg["metadata"] = dict(metadata)
     return msg
 
 
@@ -353,6 +381,34 @@ def extract_text(message_or_params: dict) -> str:
             chunks.append(f"[data]\n{rendered}")
             continue
     return "\n".join(chunks).strip()
+
+
+def extract_sender(message_or_params: dict) -> Optional[dict]:
+    """Extract sender identity from an A2A Message's standard metadata.
+
+    Sender is carried inside the ``metadata`` field under the key
+    ``a2a.sender`` — never as a non-standard top-level field (the A2A v1.0
+    spec defines a fixed Message shape; unknown top-level keys cause strict
+    parsers to reject the message).
+
+    Returns the sender dict ``{agentId, name, url, ...}`` or ``None`` when
+    absent or malformed.
+    """
+    msg = message_or_params.get("message", message_or_params)
+    if not isinstance(msg, dict):
+        return None
+    metadata = msg.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    sender = metadata.get("a2a.sender")
+    return sender if isinstance(sender, dict) else None
+
+
+# A2A v1.0 Message top-level keys — used by the strict shape witness
+# to verify no non-standard fields are emitted on the wire.
+A2A_MESSAGE_KNOWN_KEYS = frozenset({
+    "role", "parts", "messageId", "contextId", "metadata",
+})
 
 
 def extract_context_id(params: dict) -> str:
@@ -783,6 +839,121 @@ class TaskStore:
         if history_length == 0:
             task.pop("history", None)
         return copy.deepcopy(task)
+
+    # ── Disk persistence (restart recovery) ──────────────────────────────
+
+    def persist(self, path: Path) -> None:
+        """Persist terminal task records to disk for restart recovery.
+
+        Only records in terminal states (COMPLETED, FAILED, CANCELED) and
+        non-terminal records younger than a bound are persisted.  Follows
+        the safe persistence discipline: unique temp file, 0o600, atomic
+        replace.
+        """
+        now = time.time()
+        with self._lock:
+            snapshot = {}
+            for tid, rec in self._tasks.items():
+                state = rec["state"]
+                # Always persist terminal records; persist non-terminal
+                # only if younger than _ORPHAN_TIMEOUT (300s) so stale
+                # working tasks don't accumulate on disk.
+                if state in TERMINAL_STATES or (now - rec.get("created_at", 0) < 300):
+                    snapshot[tid] = {
+                        "task_id": rec["task_id"],
+                        "context_id": rec["context_id"],
+                        "peer": rec.get("peer", ""),
+                        "agent_slug": rec.get("agent_slug", ""),
+                        "tenant": rec.get("tenant", ""),
+                        "state": state,
+                        "reply": rec.get("reply", ""),
+                        "created_at": rec.get("created_at", 0),
+                        "created_iso": rec.get("created_iso", ""),
+                        "completed_at": rec.get("completed_at"),
+                        "push_url": rec.get("push_url", ""),
+                        "push_config_id": rec.get("push_config_id", ""),
+                    }
+        try:
+            import fcntl
+            _HAS_FCNTL = True
+        except ImportError:
+            _HAS_FCNTL = False
+        try:
+            import msvcrt
+            _HAS_MSVCRT = True
+        except ImportError:
+            _HAS_MSVCRT = False
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_suffix(".lock")
+        lock_path.touch(exist_ok=True)
+        fd = lock_path.open()
+        try:
+            if _HAS_FCNTL:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            elif _HAS_MSVCRT:
+                msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+            import tempfile, os
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=str(path.parent), suffix=".tmp"
+            )
+            try:
+                os.fchmod(tmp_fd, 0o600)
+                with os.fdopen(tmp_fd, "w") as f:
+                    json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, str(path))
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        finally:
+            fd.close()
+
+    def restore(self, path: Path) -> int:
+        """Load persisted task records from disk.  Returns count restored."""
+        if not path.exists():
+            return 0
+        try:
+            with open(path) as f:
+                snapshot = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return 0
+        if not isinstance(snapshot, dict):
+            return 0
+        count = 0
+        with self._lock:
+            for tid, rec in snapshot.items():
+                if tid in self._tasks:
+                    # Already exists (in-memory); update terminal state
+                    # if the disk record is terminal and in-memory is not.
+                    existing = self._tasks[tid]
+                    if (existing["state"] not in TERMINAL_STATES
+                            and rec.get("state") in TERMINAL_STATES):
+                        existing["state"] = rec["state"]
+                        existing["reply"] = rec.get("reply", "")
+                        existing["completed_at"] = rec.get("completed_at")
+                    continue
+                # Restore the record
+                restored = {
+                    "task_id": rec.get("task_id", tid),
+                    "context_id": rec.get("context_id", ""),
+                    "peer": rec.get("peer", ""),
+                    "agent_slug": rec.get("agent_slug", ""),
+                    "tenant": rec.get("tenant", ""),
+                    "state": rec.get("state", STATE_SUBMITTED),
+                    "reply": rec.get("reply", ""),
+                    "created_at": rec.get("created_at", 0),
+                    "created_iso": rec.get("created_iso", ""),
+                    "completed_at": rec.get("completed_at"),
+                    "push_url": rec.get("push_url", ""),
+                    "push_config_id": rec.get("push_config_id", ""),
+                }
+                self._tasks[tid] = restored
+                count += 1
+            self._trim_locked()
+        return count
 
 # --------------------------------------------------------------------------
 # Conversation persistence (outside the context-compaction pipeline)
