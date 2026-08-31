@@ -19176,7 +19176,6 @@ def _reload_plugin_api_routes(plugin_name: str) -> Dict[str, Any]:
         # its own module object); only the mutation of the shared route
         # list is serialized.
         with _plugin_route_swap_lock:
-            prefix = f"/api/plugins/{plugin_name}"
             stale_routes = [
                 r for r in app.router.routes
                 if getattr(r, "path", "") == prefix
