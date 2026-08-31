@@ -2129,7 +2129,11 @@ class HermesACPAgent(acp.Agent):
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
 
-        if result.get("messages"):
+        if (
+            isinstance(result, dict)
+            and "messages" in result
+            and isinstance(result["messages"], list)
+        ):
             state.history = result["messages"]
             # Persist updated history so sessions survive process restarts.
             self.session_manager.save_session(session_id)
