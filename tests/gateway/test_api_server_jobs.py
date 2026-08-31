@@ -224,6 +224,7 @@ class TestGetJobResults:
             "results": [{"cursor": "2026-01-02_00-00-00.md", "content": "hi"}],
             "has_more": False,
             "next_after": "2026-01-02_00-00-00.md",
+            "next_before": None,
         }
         mock_results = MagicMock(return_value=page)
         async with TestClient(TestServer(app)) as cli:
@@ -234,15 +235,18 @@ class TestGetJobResults:
                 assert resp.status == 200
                 data = await resp.json()
                 assert data == page
-                mock_results.assert_called_once_with(VALID_JOB_ID, after=None, limit=20)
+                mock_results.assert_called_once_with(
+                    VALID_JOB_ID, after=None, before=None, limit=20,
+                )
 
     @pytest.mark.asyncio
     async def test_get_job_results_passes_after_and_limit(self, adapter):
-        """?after=<cursor>&limit=<n> forwards through, with limit clamped."""
+        """?after=<cursor>&before=<cursor>&limit=<n> forwards through, with limit clamped."""
         app = _create_app(adapter)
         mock_get = MagicMock(return_value=SAMPLE_JOB)
         mock_results = MagicMock(return_value={
-            "job_id": VALID_JOB_ID, "results": [], "has_more": False, "next_after": None,
+            "job_id": VALID_JOB_ID, "results": [], "has_more": False,
+            "next_after": None, "next_before": None,
         })
         async with TestClient(TestServer(app)) as cli:
             with patch(f"{_MOD}._CRON_AVAILABLE", True), \
@@ -250,11 +254,18 @@ class TestGetJobResults:
                  patch(f"{_MOD}._cron_get_results", mock_results):
                 resp = await cli.get(
                     f"/api/jobs/{VALID_JOB_ID}/results",
-                    params={"after": "2026-01-01_00-00-00.md", "limit": "9999"},
+                    params={
+                        "after": "2026-01-01_00-00-00.md",
+                        "before": "2026-01-03_00-00-00.md",
+                        "limit": "9999",
+                    },
                 )
                 assert resp.status == 200
                 mock_results.assert_called_once_with(
-                    VALID_JOB_ID, after="2026-01-01_00-00-00.md", limit=100,
+                    VALID_JOB_ID,
+                    after="2026-01-01_00-00-00.md",
+                    before="2026-01-03_00-00-00.md",
+                    limit=100,
                 )
 
     @pytest.mark.asyncio
@@ -403,6 +414,87 @@ class TestGetJobResultsRealStore:
                         headers=headers,
                     )
                     assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_before_cursor_pages_beyond_limit_no_gaps_no_duplicates(self, tmp_path):
+        """The bug the `before` cursor exists to fix: a store with more saved
+        results than `limit` must be fully retrievable via HTTP by paging
+        `before=<next_before>` after `after=<original after>` — every file
+        visited exactly once, newest first, nothing skipped and nothing
+        repeated."""
+        import time as _time
+
+        import cron.jobs as cron_jobs
+
+        job_id = "0123456789cd"  # valid 12-hex
+        n = 7
+        limit = 3
+
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([{
+                "id": job_id,
+                "name": "paging-e2e-job",
+                "schedule": "0 9 * * *",
+                "prompt": "do the thing",
+                "deliver": "local",
+                "enabled": True,
+            }])
+            for i in range(n):
+                cron_jobs.save_job_output(job_id, f"run {i}")
+                _time.sleep(1.01)
+
+            adapter = _make_adapter(api_key="sk-secret")
+            app = _create_app(adapter)
+            headers = {"Authorization": "Bearer sk-secret"}
+            async with TestClient(TestServer(app)) as cli:
+                with patch(f"{_MOD}._CRON_AVAILABLE", True), \
+                     patch(f"{_MOD}._cron_get", cron_jobs.get_job), \
+                     patch(f"{_MOD}._cron_get_results", cron_jobs.get_job_results):
+                    seen_contents = []
+                    seen_cursors = []
+                    params = {"limit": str(limit)}
+                    pages_fetched = 0
+                    first_next_after = None
+                    while True:
+                        resp = await cli.get(
+                            f"/api/jobs/{job_id}/results", params=params, headers=headers,
+                        )
+                        assert resp.status == 200
+                        data = await resp.json()
+                        pages_fetched += 1
+                        if first_next_after is None:
+                            first_next_after = data["next_after"]
+                        else:
+                            assert data["next_after"] == first_next_after
+                        seen_contents.extend(r["content"] for r in data["results"])
+                        seen_cursors.extend(r["cursor"] for r in data["results"])
+                        if not data["has_more"]:
+                            assert data["next_before"] is None
+                            break
+                        params = {"limit": str(limit), "before": data["next_before"]}
+                        assert pages_fetched <= n
+
+                    assert seen_contents == [f"run {n - 1 - i}" for i in range(n)]
+                    assert len(seen_cursors) == len(set(seen_cursors)) == n
+
+                    # A subsequent round using the high-water mark finds nothing
+                    # until new output lands, and then only the new output.
+                    resp = await cli.get(
+                        f"/api/jobs/{job_id}/results",
+                        params={"after": first_next_after},
+                        headers=headers,
+                    )
+                    assert (await resp.json())["results"] == []
+
+                    _time.sleep(1.01)
+                    cron_jobs.save_job_output(job_id, "run new")
+                    resp = await cli.get(
+                        f"/api/jobs/{job_id}/results",
+                        params={"after": first_next_after},
+                        headers=headers,
+                    )
+                    data = await resp.json()
+                    assert [r["content"] for r in data["results"]] == ["run new"]
 
     @pytest.mark.asyncio
     async def test_missing_output_dir_is_empty_not_error(self, tmp_path):

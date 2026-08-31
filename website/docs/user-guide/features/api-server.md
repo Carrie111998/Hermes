@@ -512,7 +512,15 @@ Fetch a single job's definition and last-run state.
 
 ### GET /api/jobs/\{job_id\}/results
 
-Poll a job's newest saved output files (its persisted run results), newest first. Supports `after=<cursor>` (only return results strictly newer than a previously-seen cursor — exact dedup for polling) and `limit=<n>` (clamped to 1-100, default 20). Each result carries a `cursor` (the underlying output filename) and `content` (the raw saved output, safe to render as a chat message). Returns an empty `results` list, not an error, if the job has no saved output yet.
+Poll a job's saved output files (its persisted run results), newest first, in bounded pages. Two cursors, two different jobs:
+
+- `after=<cursor>` — the client's high-water mark. Only results strictly newer than this cursor are ever considered, for the whole polling round. Pass a previous round's `next_after` back in to start the next round.
+- `before=<cursor>` — intra-round paging cursor. Only results strictly older than this cursor are considered. Pass the previous page's `next_before` back in to keep walking older, still-unseen results within the same round (same `after`); omit it to get the newest unseen page.
+- `limit=<n>` — clamped to 1-100, default 20.
+
+To drain everything newer than a high-water mark: call with `after` set and no `before`; while the response's `has_more` is `true`, call again with the same `after` and `before=<previous next_before>`. `next_before` is `null` once `has_more` is `false`. `next_after` is stable across every page of a round (it always reflects the single newest result matching `after`, independent of paging position) — capture it once and use it as `after` for the next round.
+
+Each result carries a `cursor` (the underlying output filename) and `content` (the raw saved output, safe to render as a chat message). Returns an empty `results` list, not an error, if the job has no saved output yet.
 
 ### PATCH /api/jobs/\{job_id\}
 
