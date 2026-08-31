@@ -197,33 +197,41 @@ class StreamingMixerChild:
     def drained(self) -> bool:
         return self.finished
 
-    def write(self, pcm: bytes) -> None:
-        """Append PCM, blocking while the fixed frame buffer is full."""
+    def write(self, pcm: bytes) -> bool:
+        """Append PCM and report whether any input was accepted.
+
+        Writers block while the fixed frame buffer is full.  A later abort may
+        discard already accepted PCM, but does not change this result: callers
+        use it to distinguish a pre-audio cancellation from a possible replay.
+        """
         if not pcm:
-            return
+            return False
 
         pcm_view = memoryview(pcm)
         offset = 0
+        accepted = False
         capacity = STREAMING_BUFFER_FRAME_CAPACITY * FRAME_SIZE
         while offset < len(pcm_view):
             activate = False
             with self._condition:
                 while len(self._buffer) >= capacity:
                     if self._input_finished or self._aborted:
-                        return
+                        return accepted
                     self._condition.wait()
                 if self._input_finished or self._aborted:
-                    return
+                    return accepted
 
                 size = min(capacity - len(self._buffer), len(pcm_view) - offset)
                 self._buffer.extend(pcm_view[offset:offset + size])
                 offset += size
+                accepted = True
                 if not self._activated:
                     self._activated = True
                     activate = True
 
             if activate and self._on_first_write is not None:
                 self._on_first_write(self)
+        return accepted
 
     def finish(self) -> None:
         """Mark input complete so a final partial frame may be zero-padded."""

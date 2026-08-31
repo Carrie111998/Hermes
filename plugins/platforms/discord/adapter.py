@@ -4300,12 +4300,14 @@ class DiscordAdapter(BasePlatformAdapter):
         pcm = self._discord_streaming_pcm(handle, chunk)
         if not pcm:
             return
-        await asyncio.to_thread(handle.child.write, pcm)
+        accepted = await asyncio.to_thread(handle.child.write, pcm)
+        if not accepted:
+            raise RuntimeError("Discord streaming TTS write accepted no PCM")
+        # A successful child write may already have been consumed by Discord;
+        # suppress whole-file fallback before detecting any later abort/staleness.
+        handle.audible = True
         if handle.aborted:
             raise RuntimeError("Discord streaming TTS write was aborted")
-        # A successful child write may already have been consumed by Discord;
-        # suppress whole-file fallback before detecting any later staleness.
-        handle.audible = True
         current = self._resolve_streaming_voice_mixer(handle.chat_id)
         if current is None or current[0] != handle.guild_id or current[1] is not handle.mixer:
             await self.abort_streaming_tts(handle, error="Discord voice mixer is no longer active")

@@ -110,6 +110,13 @@ class TestVoiceMixerCore:
         assert unfinished in mixer._streaming_speech
         assert mixer.speech_active is False
 
+    def test_streaming_child_write_reports_false_when_aborted_before_acceptance(self):
+        child = vm.VoiceMixer().begin_streaming_speech(fade_in_ms=0)
+        child.abort()
+
+        assert child.write(b"\x01\x00" * (vm.FRAME_SIZE // 2)) is False
+        assert child._activated is False
+
     def test_streaming_child_abort_wakes_writer_blocked_at_capacity(self):
         mixer = vm.VoiceMixer()
         child = mixer.begin_streaming_speech(fade_in_ms=0)
@@ -358,6 +365,65 @@ class TestDiscordStreamingTTS:
         assert mixer.speech_active is False
 
     @pytest.mark.asyncio
+    async def test_accepted_then_abort_before_worker_resume_suppresses_whole_file_replay(self):
+        """Accepted PCM may be consumed even when abort wins the resume race."""
+        from gateway.streaming_tts_consumer import StreamingTTSConsumer
+        from plugins.platforms.discord.adapter import _DiscordStreamingTTSHandle
+
+        class SingleChunkStreamer:
+            sample_rate = 24000
+            channels = 1
+            sample_width = 2
+
+            def stream(self, text):
+                del text
+                # 480 mono samples upsample to one complete Discord frame.
+                yield b"\xe8\x03" * (vm.FRAME_SIZE // 8)
+
+        adapter = _make_adapter()
+        mixer = vm.VoiceMixer()
+        vc = _VoiceClientState(mixer)
+        adapter._voice_clients[111] = vc
+        adapter._voice_text_channels[111] = 222
+        adapter._voice_mixers[111] = mixer
+        adapter._cancel_voice_timeout = MagicMock()
+        pcm_consumed = threading.Event()
+
+        with patch("tools.tts_streaming.resolve_streaming_provider", return_value=SingleChunkStreamer()):
+            consumer = StreamingTTSConsumer(adapter, "222", {}, asyncio.get_running_loop())
+            consumer.start()
+            for _ in range(100):
+                if consumer.started:
+                    break
+                await asyncio.sleep(0.01)
+            assert consumer.started is True
+            assert isinstance(consumer._handle, _DiscordStreamingTTSHandle)
+            child = consumer._handle.child
+            real_to_thread = asyncio.to_thread
+
+            async def consume_then_abort_before_worker_resume(func, /, *args, **kwargs):
+                result = await real_to_thread(func, *args, **kwargs)
+                if getattr(func, "__self__", None) is child and func.__name__ == "write":
+                    assert mixer.read() != vm.SILENCE_FRAME
+                    pcm_consumed.set()
+                    await adapter.abort_streaming_tts(consumer._handle)
+                return result
+
+            with patch("asyncio.to_thread", consume_then_abort_before_worker_resume):
+                consumer.on_delta("A complete answer.")
+                consumer.finish()
+                completed = await consumer.wait_complete(timeout=1.0)
+
+        assert pcm_consumed.is_set()
+        assert completed is False
+        assert consumer.completed is False
+        assert consumer.audible is True
+        assert consumer.suppress_whole_file is True
+        assert child.drained is True
+        assert child._aborted is True
+        assert child._activated is True
+
+    @pytest.mark.asyncio
     async def test_aborted_worker_write_before_child_lock_keeps_whole_file_fallback(self):
         """An aborted child that accepts no PCM must fail before audio."""
         from gateway.streaming_tts_consumer import StreamingTTSConsumer
@@ -381,6 +447,7 @@ class TestDiscordStreamingTTS:
         adapter._cancel_voice_timeout = MagicMock()
         write_entered = threading.Event()
         release_write = threading.Event()
+        write_results = []
 
         with patch("tools.tts_streaming.resolve_streaming_provider", return_value=SingleChunkStreamer()):
             consumer = StreamingTTSConsumer(adapter, "222", {}, asyncio.get_running_loop())
@@ -398,7 +465,10 @@ class TestDiscordStreamingTTS:
                 if self is child:
                     write_entered.set()
                     assert release_write.wait(timeout=1)
-                return original_write(self, pcm)
+                result = original_write(self, pcm)
+                if self is child:
+                    write_results.append(result)
+                return result
 
             with patch.object(vm.StreamingMixerChild, "write", write_after_abort_window):
                 consumer.on_delta("A complete answer.")
@@ -409,6 +479,7 @@ class TestDiscordStreamingTTS:
                 completed = await consumer.wait_complete(timeout=1.0)
 
         assert completed is False
+        assert write_results == [False]
         assert consumer.completed is False
         assert consumer.audible is False
         assert consumer.suppress_whole_file is False
