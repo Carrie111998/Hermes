@@ -105,8 +105,11 @@ export function useComposerDraft({
 
   const editorRef = useRef<HTMLDivElement | null>(null)
   const draftRef = useRef('')
+  const draftIntentGenerationRef = useRef(0)
+  const applyingProgrammaticDraftRef = useRef(false)
   const pendingDraftPersistRef = useRef<{ scope: string | null; text: string } | null>(null)
   const draftPersistTimerRef = useRef<number | undefined>(undefined)
+  const preservePersistedDraftRef = useRef(false)
   const activeQueueSessionKeyRef = useRef(activeQueueSessionKey)
   activeQueueSessionKeyRef.current = activeQueueSessionKey
   // Owned only by the swap effect below — unlike activeQueueSessionKeyRef this
@@ -138,6 +141,10 @@ export function useComposerDraft({
   // editor — so the visible text never lags the store.
   const paintDraft = useCallback(
     (next: string, focus = true) => {
+      if (!applyingProgrammaticDraftRef.current && next !== draftRef.current) {
+        draftIntentGenerationRef.current += 1
+      }
+
       draftRef.current = next
       setComposerText(next)
 
@@ -232,6 +239,11 @@ export function useComposerDraft({
     stashSessionDraft(scope, text, attachments)
 
   const loadIntoComposer = (text: string, attachments: ComposerAttachment[]) => {
+    // A visible restore starts a fresh draft lifecycle. Keeping the submitted
+    // receipt guard armed after rejection would make an attachment-only draft
+    // ignore later chip removal on pagehide/session switch/unmount.
+    preservePersistedDraftRef.current = false
+
     // Diagnostic breadcrumb for #59305-class reports: identifies WHAT kind of
     // state got restored into the composer (session switch, queue-edit
     // restore, history browse) without logging any raw content. REF_RE has the
@@ -247,11 +259,18 @@ export function useComposerDraft({
       })
     }
 
-    attachmentScope.$attachments.set(cloneAttachments(attachments))
-    paintDraft(text, false)
+    applyingProgrammaticDraftRef.current = true
+
+    try {
+      attachmentScope.$attachments.set(cloneAttachments(attachments))
+      paintDraft(text, false)
+    } finally {
+      applyingProgrammaticDraftRef.current = false
+    }
   }
 
-  const clearDraft = useCallback(() => {
+  const clearDraft = useCallback((preservePersistedDraft = false) => {
+    preservePersistedDraftRef.current = preservePersistedDraft
     setComposerText('')
     draftRef.current = ''
 
@@ -260,6 +279,44 @@ export function useComposerDraft({
       placeCaretEnd(editorRef.current)
     }
   }, [setComposerText])
+
+  const releasePersistedDraftReceipt = useCallback(() => {
+    preservePersistedDraftRef.current = false
+  }, [])
+
+  // The submitted receipt guard ignores the intentional empty emission from
+  // clearDraft(true). A later attachment add is new user intent even without a
+  // text event, so release the guard synchronously before pagehide/unmount can
+  // skip that attachment-only draft.
+  // eslint-disable-next-line no-restricted-syntax -- attachment atom events own receipt generation, not React renders
+  useEffect(() => {
+    let initialized = false
+
+    return attachmentScope.$attachments.subscribe(nextAttachments => {
+      if (!initialized) {
+        initialized = true
+
+        return
+      }
+
+      if (applyingProgrammaticDraftRef.current) {
+        return
+      }
+
+      // clearDraft(true) + submitted attachment removal is the submit engine's
+      // own visual clear. Any other transition, including non-empty -> empty,
+      // is newer user intent and must invalidate the receipt generation.
+      if (nextAttachments.length === 0 && preservePersistedDraftRef.current) {
+        return
+      }
+
+      draftIntentGenerationRef.current += 1
+
+      if (preservePersistedDraftRef.current) {
+        preservePersistedDraftRef.current = false
+      }
+    })
+  }, [attachmentScope])
 
   // Read the editor's current plain text into draftRef + composer state. This
   // closes the "queued rAF flush hasn't run yet" window so scope-swap/pagehide
@@ -313,6 +370,18 @@ export function useComposerDraft({
 
       if (isBrowsingHistory(sessionIdRef.current) || queueEditRef.current) {
         return
+      }
+
+      // A submitted/steered draft remains the crash-safe local receipt until
+      // the gateway accepts it. Clearing the visible editor emits an empty
+      // composer update; never let that debounce overwrite the receipt. Any
+      // later real typing or restore starts a fresh draft lifecycle.
+      if (preservePersistedDraftRef.current) {
+        if (!text) {
+          return
+        }
+
+        preservePersistedDraftRef.current = false
       }
 
       const scope = draftScopeRef.current
@@ -404,6 +473,7 @@ export function useComposerDraft({
     // fire later would just clobber with an older snapshot.
     window.clearTimeout(draftPersistTimerRef.current)
     pendingDraftPersistRef.current = null
+    preservePersistedDraftRef.current = false
     draftScopeRef.current = activeQueueSessionKey
 
     const { attachments, text } = takeSessionDraft(activeQueueSessionKey)
@@ -415,7 +485,7 @@ export function useComposerDraft({
 
       if (editing?.sessionKey === activeQueueSessionKey) {
         stashAt(activeQueueSessionKey, editing.draft, editing.attachments)
-      } else if (!isBrowsingHistory(sessionId)) {
+      } else if (!isBrowsingHistory(sessionId) && !preservePersistedDraftRef.current) {
         stashAt(activeQueueSessionKey, latestText)
       }
 
@@ -436,7 +506,10 @@ export function useComposerDraft({
     if (mode === 'flush') {
       window.clearTimeout(draftPersistTimerRef.current)
       pendingDraftPersistRef.current = null
-      stashAt(draftScopeRef.current, syncDraftFromEditor())
+
+      if (!preservePersistedDraftRef.current) {
+        stashAt(draftScopeRef.current, syncDraftFromEditor())
+      }
 
       return
     }
@@ -471,6 +544,10 @@ export function useComposerDraft({
         return
       }
 
+      if (preservePersistedDraftRef.current) {
+        return
+      }
+
       const latestText = syncDraftFromEditor()
       pendingDraftPersistRef.current = null
       stashAt(scope, latestText)
@@ -487,6 +564,7 @@ export function useComposerDraft({
   return {
     activeQueueSessionKeyRef,
     clearDraft,
+    draftIntentGenerationRef,
     draftRef,
     editorRef,
     focusInput,
@@ -496,6 +574,7 @@ export function useComposerDraft({
     isHelpHint,
     isSteerableText,
     loadIntoComposer,
+    releasePersistedDraftReceipt,
     requestMainFocus,
     sessionIdRef,
     setComposerText,

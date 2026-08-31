@@ -229,6 +229,7 @@ export function ChatBar({
   const {
     activeQueueSessionKeyRef,
     clearDraft,
+    draftIntentGenerationRef,
     draftRef,
     editorRef,
     focusInput,
@@ -238,6 +239,7 @@ export function ChatBar({
     isHelpHint,
     isSteerableText,
     loadIntoComposer,
+    releasePersistedDraftReceipt,
     requestMainFocus,
     sessionIdRef,
     setComposerText,
@@ -368,6 +370,7 @@ export function ChatBar({
     compacting,
     clearDraft,
     disabled,
+    draftIntentGenerationRef,
     draftRef,
     drainNextQueued,
     editorRef,
@@ -383,6 +386,7 @@ export function ChatBar({
     queueCurrentDraft,
     queueEdit,
     queuedPrompts,
+    releasePersistedDraftReceipt,
     sessionId,
     setComposerText,
     stashAt
@@ -435,6 +439,7 @@ export function ChatBar({
     const nextDraft = sanitizeComposerInput(composerPlainText(editor))
 
     if (nextDraft !== draftRef.current) {
+      draftIntentGenerationRef.current += 1
       draftRef.current = nextDraft
       setComposerText(nextDraft)
     }
@@ -490,6 +495,7 @@ export function ChatBar({
       return
     }
 
+    draftIntentGenerationRef.current += 1
     recordUndoPoint({ coalesce: inputType === 'insertText' || inputType === 'deleteContentBackward' })
   }
 
@@ -557,6 +563,7 @@ export function ChatBar({
     // not text they typed and want to keep (`@url:@url:\`https://…\``).
     const scope = openDirectiveScope(event.currentTarget)
 
+    draftIntentGenerationRef.current += 1
     recordUndoPoint()
     insertComposerContentsAtCaret(event.currentTarget, pathifyRefs(linkifyUrls(pastedText)), scope)
     scheduleFlushEditorToDraft(event.currentTarget)

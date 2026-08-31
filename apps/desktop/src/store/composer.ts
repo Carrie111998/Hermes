@@ -208,6 +208,12 @@ function loadPersistedDraftTexts(): [string, SessionDraft][] {
 }
 
 const draftsBySession = new Map<string, SessionDraft>(loadPersistedDraftTexts())
+const draftRevisionsBySession = new Map<string, number>()
+let nextDraftRevision = 0
+
+for (const key of draftsBySession.keys()) {
+  draftRevisionsBySession.set(key, ++nextDraftRevision)
+}
 
 /**
  * Patch one asynchronous attachment occurrence wherever the main composer owns
@@ -299,7 +305,13 @@ export function reloadPersistedDrafts(): void {
 
   for (const [key, draft] of incoming) {
     const local = draftsBySession.get(key)
-    draftsBySession.set(key, local?.attachments.length ? { ...local, text: draft.text } : draft)
+    const next = local?.attachments.length ? { ...local, text: draft.text } : draft
+
+    if (!local || local.text !== next.text) {
+      draftRevisionsBySession.set(key, ++nextDraftRevision)
+    }
+
+    draftsBySession.set(key, next)
     publishDraftTitle(key, deriveDraftTitle(draft.text))
   }
 
@@ -307,6 +319,7 @@ export function reloadPersistedDrafts(): void {
   for (const key of [...draftsBySession.keys()]) {
     if (!incoming.has(key)) {
       draftsBySession.delete(key)
+      draftRevisionsBySession.set(key, ++nextDraftRevision)
       publishDraftTitle(key, '')
     }
   }
@@ -379,8 +392,13 @@ function persistDraftTexts() {
   }
 }
 
-export function stashSessionDraft(scope: string | null | undefined, text: string, attachments: ComposerAttachment[]) {
+export function stashSessionDraft(
+  scope: string | null | undefined,
+  text: string,
+  attachments: ComposerAttachment[]
+): number {
   const key = draftKey(scope)
+  const revision = ++nextDraftRevision
 
   // Delete-then-set keeps MRU order for MAX_PERSISTED_DRAFTS eviction.
   draftsBySession.delete(key)
@@ -389,8 +407,11 @@ export function stashSessionDraft(scope: string | null | undefined, text: string
     draftsBySession.set(key, cloneDraft({ attachments, text }))
   }
 
+  draftRevisionsBySession.set(key, revision)
   persistDraftTexts()
   publishDraftTitle(key, deriveDraftTitle(text))
+
+  return revision
 }
 
 export function takeSessionDraft(scope: string | null | undefined): SessionDraft {
@@ -400,6 +421,19 @@ export function takeSessionDraft(scope: string | null | undefined): SessionDraft
 }
 
 export const clearSessionDraft = (scope: string | null | undefined) => stashSessionDraft(scope, '', [])
+
+export const isSessionDraftRevisionCurrent = (scope: string | null | undefined, revision: number): boolean =>
+  draftRevisionsBySession.get(draftKey(scope)) === revision
+
+export function clearSessionDraftIfRevision(scope: string | null | undefined, revision: number): boolean {
+  if (!isSessionDraftRevisionCurrent(scope, revision)) {
+    return false
+  }
+
+  clearSessionDraft(scope)
+
+  return true
+}
 
 /**
  * Move a stashed composer draft from one session key onto another.

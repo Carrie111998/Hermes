@@ -2,7 +2,13 @@ import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { useLayoutEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { clearSessionDraft, type ComposerAttachment, mainComposerScope, stashSessionDraft } from '@/store/composer'
+import {
+  clearSessionDraft,
+  type ComposerAttachment,
+  mainComposerScope,
+  stashSessionDraft,
+  takeSessionDraft
+} from '@/store/composer'
 import { $connection } from '@/store/session'
 
 import { useComposerActions } from '../../hooks/use-composer-actions'
@@ -29,8 +35,10 @@ interface ProbeHarnessProps {
   sessionId: string
 }
 
+let latestDraftApi: ReturnType<typeof useComposerDraft> | null = null
+
 function ProbeHarness({ activeQueueSessionKey, onLayoutSnapshot, sessionId }: ProbeHarnessProps) {
-  useComposerDraft({
+  latestDraftApi = useComposerDraft({
     activeQueueSessionKey,
     focusKey: null,
     inputDisabled: false,
@@ -247,6 +255,63 @@ describe('useComposerDraft — draft survives full unmount (Settings navigation,
     expect(mockComposerApi.setText).toHaveBeenCalledWith('unsent thought')
 
     remount.unmount()
+  })
+
+  it('does not let a visual clear overwrite a submit receipt during unmount', () => {
+    stashSessionDraft('session-nav', 'pending gateway acceptance', [])
+
+    const view = render(
+      <ProbeHarness activeQueueSessionKey="session-nav" onLayoutSnapshot={() => undefined} sessionId="session-nav" />
+    )
+
+    act(() => latestDraftApi!.clearDraft(true))
+    view.unmount()
+
+    expect(takeSessionDraft('session-nav')).toMatchObject({ text: 'pending gateway acceptance' })
+  })
+
+  it('does not resurrect a removed attachment after an attachment-only rejection', () => {
+    const attachment: ComposerAttachment = { id: 'file-rejected', kind: 'file', label: 'rejected.txt' }
+    stashSessionDraft('session-nav', '', [attachment])
+
+    const view = render(
+      <ProbeHarness activeQueueSessionKey="session-nav" onLayoutSnapshot={() => undefined} sessionId="session-nav" />
+    )
+
+    act(() => {
+      latestDraftApi!.clearDraft(true)
+      latestDraftApi!.loadIntoComposer('', [attachment])
+    })
+    const restoredGeneration = latestDraftApi!.draftIntentGenerationRef.current
+
+    act(() => {
+      mainComposerScope.remove(attachment.id)
+    })
+    expect(latestDraftApi!.draftIntentGenerationRef.current).toBeGreaterThan(restoredGeneration)
+    view.unmount()
+
+    expect(takeSessionDraft('session-nav')).toEqual({ attachments: [], text: '' })
+  })
+
+  it('persists the next attachment-only draft after a submitted receipt settles', () => {
+    const nextAttachment: ComposerAttachment = {
+      id: 'file-next',
+      kind: 'file',
+      label: 'next.txt',
+      occurrenceId: 'next-occurrence'
+    }
+
+    const view = render(
+      <ProbeHarness activeQueueSessionKey="session-nav" onLayoutSnapshot={() => undefined} sessionId="session-nav" />
+    )
+
+    act(() => {
+      latestDraftApi!.clearDraft(true)
+      mainComposerScope.add(nextAttachment)
+    })
+    view.unmount()
+
+    expect(takeSessionDraft('session-nav')).toEqual({ attachments: [nextAttachment], text: '' })
   })
 })
 
