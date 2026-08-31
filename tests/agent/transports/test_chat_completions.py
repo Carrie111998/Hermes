@@ -101,6 +101,60 @@ class TestChatCompletionsBasic:
         assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "max"}
 
 
+    def test_convert_messages_strips_tool_message_name(self, transport):
+        """``name`` on a tool-result message is a legacy OpenAI
+        function-calling field, redundant with ``tool_call_id`` on the modern
+        tool-message schema. Strict OpenAI-compatible proxies/gateways reject
+        any request containing it with HTTP 400 ``unrecognizedProperty=name``;
+        permissive providers (real OpenAI, OpenRouter) silently ignore it,
+        which masked the bug. make_tool_result_message() / the conversation
+        loop write it alongside ``tool_name``, so drop it here for every
+        chat_completions target.
+        """
+        msgs = [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "name": "get_weather",
+                "content": "sunny",
+                "tool_call_id": "call_1",
+            },
+        ]
+        result = transport.convert_messages(msgs)
+        # tool message loses ``name`` but keeps the linkage + content
+        assert "name" not in result[2]
+        assert result[2]["tool_call_id"] == "call_1"
+        assert result[2]["content"] == "sunny"
+        assert result[2]["role"] == "tool"
+        # assistant tool_calls[].function.name is untouched (not a message name)
+        assert result[1]["tool_calls"][0]["function"]["name"] == "get_weather"
+        # original list untouched (deepcopy-on-demand)
+        assert msgs[2]["name"] == "get_weather"
+
+    def test_convert_messages_keeps_assistant_name(self, transport):
+        """Only tool-role ``name`` is stripped. A ``name`` on a user/assistant
+        message (multi-participant OpenAI convention) is a valid schema field
+        and must survive."""
+        msgs = [
+            {"role": "user", "name": "alice", "content": "hi"},
+            {"role": "assistant", "name": "bot", "content": "hello"},
+        ]
+        result = transport.convert_messages(msgs)
+        assert result is msgs  # no tool-name / internal fields => no copy
+        assert result[0]["name"] == "alice"
+        assert result[1]["name"] == "bot"
+
     def test_convert_messages_no_codex_leaks(self, transport):
         msgs = [{"role": "user", "content": "hi"}]
         result = transport.convert_messages(msgs)

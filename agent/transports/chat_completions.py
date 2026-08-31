@@ -334,6 +334,19 @@ class ChatCompletionsTransport(ProviderTransport):
             ):
                 needs_sanitize = True
                 break
+            if msg.get("role") == "tool" and "name" in msg:
+                # ``name`` on a tool-result message is a legacy OpenAI
+                # function-calling field. The modern tool-message schema is
+                # {role, content, tool_call_id}; the tool→call linkage is
+                # carried by ``tool_call_id``, so ``name`` is redundant.
+                # Strict OpenAI-compatible proxies/gateways reject any request
+                # containing it with HTTP 400 ``unrecognizedProperty=name`` /
+                # "Request contained an unrecognized field". Permissive
+                # providers (real OpenAI, OpenRouter) silently ignore it,
+                # which masked the bug. Written by make_tool_result_message()
+                # / the conversation loop alongside ``tool_name``.
+                needs_sanitize = True
+                break
             if any(isinstance(k, str) and k.startswith("_") for k in msg):
                 needs_sanitize = True
                 break
@@ -411,6 +424,12 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg.pop("timestamp", None)  # #47868 — leak into strict providers
                 out_msg.pop("api_content", None)  # persist-what-you-send sidecar
 
+            # ``name`` on a tool-result message — legacy function-calling
+            # field, redundant with ``tool_call_id``. Strict OpenAI-compatible
+            # proxies/gateways 400 with ``unrecognizedProperty=name``; drop
+            # it on tool messages only (assistant ``name`` is left untouched).
+            if msg.get("role") == "tool" and "name" in msg:
+                mutable_msg().pop("name", None)
 
             # Drop all Hermes-internal scaffolding markers (``_``-prefixed).
             # OpenAI's message schema has no ``_``-prefixed fields, so this
