@@ -2499,8 +2499,18 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         from toolsets import validate_toolset
         from hermes_cli.toolset_validation import validate_platform_toolsets
 
+        raw_cfg = read_raw_config()
+        # Plugin toolsets (e.g. ``eikon``, ``buzz``, ``a2a``) register in the
+        # tool registry only after plugins load — which is after this validation
+        # runs — so ``validate_toolset`` alone flags them as unknown here. They
+        # are tracked in ``known_plugin_toolsets`` (the persisted per-platform
+        # plugin-toolset set written by the `hermes tools` save flow), so treat
+        # those names as valid too — but keyed per-platform, so a plugin known
+        # only for one platform cannot mask an invalid entry on another. See
+        # #81163, #38798.
         ts_warnings = validate_platform_toolsets(
-            read_raw_config().get("platform_toolsets"), validate_toolset
+            raw_cfg.get("platform_toolsets"), validate_toolset,
+            raw_cfg.get("known_plugin_toolsets"),
         )
         for w in ts_warnings:
             results["warnings"].append(w)
