@@ -1826,6 +1826,27 @@ def _maybe_preregister_client(
     _invalidate_tokens_on_client_change(
         storage, client_id, cfg.get("client_secret")
     )
+
+    # Same pre-registered client already persisted: leave the on-disk file alone.
+    # Hand-curated redirect_uris (e.g. Google's registered 127.0.0.1:53682 port)
+    # would otherwise be clobbered on every connect with a freshly-resolved
+    # random-port redirect, and uchg-locked files would fail the handshake with
+    # "Operation not permitted". Only rewrite when the client actually changed.
+    try:
+        with open(storage._client_info_path()) as fh:
+            existing = json.load(fh)
+        if (
+            existing.get("client_id") == client_id
+            and (existing.get("client_secret") or None) == (cfg.get("client_secret") or None)
+        ):
+            logger.debug(
+                "Same pre-registered client already persisted for '%s'; keeping on-disk client info",
+                storage._server_name,
+            )
+            return
+    except (OSError, ValueError):
+        pass
+
     port = cfg["_resolved_port"]
     redirect_uri = _resolve_redirect_uri(cfg, port)
 
