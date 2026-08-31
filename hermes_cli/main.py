@@ -2518,6 +2518,13 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     """TUI: --dev → tsx src; else node dist (HERMES_TUI_DIR prebuilt or esbuild)."""
     _ensure_tui_node()
 
+    def _production_argv(node: str, entry: Path) -> list[str]:
+        # React's scheduler drives the sustained Ink render loop through
+        # setImmediate. Keep that hot callback path out of V8's concurrent
+        # Maglev tier: native faults there terminate Node before JavaScript can
+        # report or recover, while baseline + TurboFan remain available.
+        return [node, "--no-maglev", "--expose-gc", str(entry)]
+
     def _node_bin(bin: str) -> str:
         if bin == "node":
             env_node = os.environ.get("HERMES_NODE")
@@ -2567,13 +2574,13 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             p = Path(ext_dir)
             if (p / "dist" / "entry.js").is_file():
                 node = _node_bin("node")
-                return [node, "--expose-gc", str(p / "dist" / "entry.js")], p
+                return _production_argv(node, p / "dist" / "entry.js"), p
 
         # 1b. Bundled prebuilt TUI (Docker image, Nix build, or prior npm build)
         bundled = _find_bundled_tui()
         if bundled is not None:
             node = _node_bin("node")
-            return [node, "--expose-gc", str(bundled)], bundled.parent
+            return _production_argv(node, bundled), bundled.parent
 
     # No prebuilt bundle available (or --dev, which never uses one) — we're
     # about to npm install/build from source, so the workspace must exist.
@@ -2727,7 +2734,7 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             sys.exit(1)
 
     node = _node_bin("node")
-    return [node, "--expose-gc", str(tui_dir / "dist" / "entry.js")], tui_dir
+    return _production_argv(node, tui_dir / "dist" / "entry.js"), tui_dir
 
 
 def _normalize_tui_toolsets(toolsets: object) -> list[str]:

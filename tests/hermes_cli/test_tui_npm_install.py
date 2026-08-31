@@ -320,6 +320,7 @@ def test_make_tui_argv_skips_build_only_on_termux_when_fresh(
     tmp_path: Path, main_mod, monkeypatch
 ) -> None:
     _touch_tui_entry(tmp_path)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: f"/bin/{name}")
     monkeypatch.setenv("TERMUX_VERSION", "1")
     monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: False)
     monkeypatch.setattr(main_mod, "_tui_need_rebuild", lambda _root: False)
@@ -332,7 +333,7 @@ def test_make_tui_argv_skips_build_only_on_termux_when_fresh(
 
     argv, cwd = main_mod._make_tui_argv(tmp_path, tui_dev=False)
 
-    assert argv == ["/bin/node", "--expose-gc", str(tmp_path / "dist" / "entry.js")]
+    assert argv == ["/bin/node", "--no-maglev", "--expose-gc", str(tmp_path / "dist" / "entry.js")]
     assert cwd == tmp_path
 
 
@@ -340,6 +341,7 @@ def test_make_tui_argv_skips_install_on_termux_when_bundle_fresh(
     tmp_path: Path, main_mod, monkeypatch
 ) -> None:
     _touch_tui_entry(tmp_path)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: f"/bin/{name}")
     monkeypatch.setenv("TERMUX_VERSION", "1")
     monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
     monkeypatch.setattr(main_mod, "_tui_need_rebuild", lambda _root: False)
@@ -352,7 +354,7 @@ def test_make_tui_argv_skips_install_on_termux_when_bundle_fresh(
 
     argv, cwd = main_mod._make_tui_argv(tmp_path, tui_dev=False)
 
-    assert argv == ["/bin/node", "--expose-gc", str(tmp_path / "dist" / "entry.js")]
+    assert argv == ["/bin/node", "--no-maglev", "--expose-gc", str(tmp_path / "dist" / "entry.js")]
     assert cwd == tmp_path
 
 
@@ -530,6 +532,7 @@ def test_make_tui_argv_exits_with_recovery_hint_when_workspace_unrecoverable(
     bundled_entry.parent.mkdir(parents=True)
     bundled_entry.write_text("// bundled TUI")
     monkeypatch.setattr(main_mod, "_find_bundled_tui", lambda: bundled_entry)
+    monkeypatch.setattr("hermes_constants.find_node_executable", lambda name: f"/usr/bin/{name}")
 
     def which(name: str) -> str | None:
         if name == "node":
@@ -550,7 +553,7 @@ def test_make_tui_argv_exits_with_recovery_hint_when_workspace_unrecoverable(
 
     argv, cwd = main_mod._make_tui_argv(tui_dir, tui_dev=False)
 
-    assert argv == ["/usr/bin/node", "--expose-gc", str(bundled_entry)]
+    assert argv == ["/usr/bin/node", "--no-maglev", "--expose-gc", str(bundled_entry)]
     assert cwd == bundled_entry.parent
 
 
