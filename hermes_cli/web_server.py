@@ -7254,13 +7254,45 @@ async def get_defaults():
     return DEFAULT_CONFIG
 
 
+def _schema_translation_key(field: str) -> str:
+    """Catalog key for a schema field's description (dots would nest in YAML)."""
+    return f"config_schema.{field.replace('.', '-')}.description"
+
+
+def _apply_schema_translations(
+    fields: Dict[str, Dict[str, Any]], lang: Optional[str]
+) -> Dict[str, Dict[str, Any]]:
+    """Translate schema field descriptions via the shared i18n catalogs.
+
+    The dashboard's language lives in the browser (localStorage), so the
+    server cannot resolve it from config; the endpoint receives it as ``lang``
+    and this pass swaps each field's description for its catalog entry.
+    Fields without a catalog entry keep their hardcoded English text, so the
+    page degrades gracefully until catalogs grow.
+    """
+    if not lang:
+        return fields
+    from agent.i18n import t as translate
+
+    translated: Dict[str, Dict[str, Any]] = {}
+    for field, entry in fields.items():
+        key = _schema_translation_key(field)
+        rendered = translate(key, lang=lang)
+        if rendered != key:
+            translated[field] = {**entry, "description": rendered}
+        else:
+            translated[field] = entry
+    return translated
+
+
 @app.get("/api/config/schema")
-async def get_schema(profile: Optional[str] = None):
+async def get_schema(profile: Optional[str] = None, lang: Optional[str] = None):
     # Discovery-driven provider options (voice command providers + memory
     # provider plugins) are merged per-request so providers added after server
     # start still show up, scoped to the requested profile's config.
     with _config_profile_scope(profile):
         fields = _schema_with_dynamic_provider_options()
+    fields = _apply_schema_translations(fields, lang)
     return {"fields": fields, "category_order": _CATEGORY_ORDER}
 
 

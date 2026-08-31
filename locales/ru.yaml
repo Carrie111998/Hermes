@@ -456,3 +456,57 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "База данных сеансов недоступна"
     session_not_found:           "Сеанс не найден в базе данных."
     warn_passthrough:            "⚠️ {error}"
+
+config_schema:
+  timezone:
+    description: "Часовой пояс IANA (напр. Europe/Moscow). Пусто — системный часовой пояс."
+  memory-provider:
+    description: "Плагин провайдера памяти"
+  model:
+    description: "Модель по умолчанию (напр. anthropic/claude-sonnet-4.6)"
+  model_context_length:
+    description: "Переопределение размера контекстного окна (0 = автоопределение по метаданным модели)"
+  terminal-backend:
+    description: "Бэкенд исполнения терминальных команд"
+  terminal-vercel_runtime:
+    description: "Рантайм Vercel Sandbox"
+  terminal-modal_mode:
+    description: "Режим песочницы Modal"
+  proxy-credential_source:
+    description: "Откуда iron-proxy загружает реальные секреты апстрима при старте"
+  proxy-enforce_on_docker:
+    description: "Запрещать Docker-песочницы, когда egress включён, но не настроен/не запущен"
+  tts-provider:
+    description: "Провайдер синтеза речи"
+  stt-provider:
+    description: "Провайдер распознавания речи"
+  stt-local-model:
+    description: "Размер локальной модели faster-whisper"
+  stt-groq-model:
+    description: "Модель Groq Whisper"
+  stt-openai-model:
+    description: "Модель транскрибации OpenAI"
+  stt-elevenlabs-model_id:
+    description: "Модель ElevenLabs Scribe"
+  display-skin:
+    description: "Визуальная тема CLI"
+  dashboard-theme:
+    description: "Тема веб-дашборда"
+  display-resume_display:
+    description: "Как возобновлённые сессии показывают историю"
+  display-busy_input_mode:
+    description: "Поведение ввода, пока агент выполняет задачу"
+  approvals-mode:
+    description: "Режим подтверждения опасных команд"
+  context-engine:
+    description: "Движок управления контекстом"
+  human_delay-mode:
+    description: "Режим имитации задержки печати"
+  logging-level:
+    description: "Уровень логирования для agent.log"
+  agent-service_tier:
+    description: "Сервисный уровень API (OpenAI/Anthropic)"
+  delegation-reasoning_effort:
+    description: "Усилия на рассуждение для субагентов-делегатов"
+  browser-headed:
+    description: "Запускать локальный браузер в оконном режиме (видимое окно). Окно также остаётся открытым между ходами; неактивные сессии всё равно закрываются после browser.inactivity_timeout."

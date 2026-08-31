@@ -456,3 +456,57 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "会话数据库不可用"
     session_not_found:           "数据库中未找到该会话。"
     warn_passthrough:            "⚠️ {error}"
+
+config_schema:
+  timezone:
+    description: "IANA 时区（如 Asia/Shanghai）。留空使用系统时区。"
+  memory-provider:
+    description: "记忆提供者插件"
+  model:
+    description: "默认模型（如 anthropic/claude-sonnet-4.6）"
+  model_context_length:
+    description: "上下文窗口覆盖（0 = 依据模型元数据自动检测）"
+  terminal-backend:
+    description: "终端执行后端"
+  terminal-vercel_runtime:
+    description: "Vercel 沙箱运行时"
+  terminal-modal_mode:
+    description: "Modal 沙箱模式"
+  proxy-credential_source:
+    description: "iron-proxy 启动时加载真实上游凭据的位置"
+  proxy-enforce_on_docker:
+    description: "启用出站代理但未配置/未运行时拒绝 Docker 沙箱"
+  tts-provider:
+    description: "语音合成提供者"
+  stt-provider:
+    description: "语音识别提供者"
+  stt-local-model:
+    description: "本地 faster-whisper 模型规格"
+  stt-groq-model:
+    description: "Groq Whisper 模型"
+  stt-openai-model:
+    description: "OpenAI 转录模型"
+  stt-elevenlabs-model_id:
+    description: "ElevenLabs Scribe 模型"
+  display-skin:
+    description: "CLI 视觉主题"
+  dashboard-theme:
+    description: "网页控制台主题"
+  display-resume_display:
+    description: "恢复会话时如何显示历史记录"
+  display-busy_input_mode:
+    description: "代理运行时的输入行为"
+  approvals-mode:
+    description: "危险命令审批模式"
+  context-engine:
+    description: "上下文管理引擎"
+  human_delay-mode:
+    description: "模拟输入延迟模式"
+  logging-level:
+    description: "agent.log 的日志级别"
+  agent-service_tier:
+    description: "API 服务层级（OpenAI/Anthropic）"
+  delegation-reasoning_effort:
+    description: "委托子代理的推理力度"
+  browser-headed:
+    description: "以有界面模式运行本地浏览器（可见窗口）。窗口在多轮之间保持打开；空闲会话仍会在 browser.inactivity_timeout 之后被回收。"

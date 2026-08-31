@@ -456,3 +456,57 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "A munkamenet-adatbázis nem érhető el"
     session_not_found:           "A munkamenet nem található az adatbázisban."
     warn_passthrough:            "⚠️ {error}"
+
+config_schema:
+  timezone:
+    description: "IANA timezone (e.g. America/New_York). Blank uses the system timezone."
+  memory-provider:
+    description: "Memory provider plugin"
+  model:
+    description: "Default model (e.g. anthropic/claude-sonnet-4.6)"
+  model_context_length:
+    description: "Context window override (0 = auto-detect from model metadata)"
+  terminal-backend:
+    description: "Terminal execution backend"
+  terminal-vercel_runtime:
+    description: "Vercel Sandbox runtime"
+  terminal-modal_mode:
+    description: "Modal sandbox mode"
+  proxy-credential_source:
+    description: "Where iron-proxy loads real upstream secrets at start time"
+  proxy-enforce_on_docker:
+    description: "Refuse Docker sandboxes when egress is enabled but not configured/running"
+  tts-provider:
+    description: "Text-to-speech provider"
+  stt-provider:
+    description: "Speech-to-text provider"
+  stt-local-model:
+    description: "Local faster-whisper model size"
+  stt-groq-model:
+    description: "Groq Whisper model"
+  stt-openai-model:
+    description: "OpenAI transcription model"
+  stt-elevenlabs-model_id:
+    description: "ElevenLabs Scribe model"
+  display-skin:
+    description: "CLI visual theme"
+  dashboard-theme:
+    description: "Web dashboard visual theme"
+  display-resume_display:
+    description: "How resumed sessions display history"
+  display-busy_input_mode:
+    description: "Input behavior while agent is running"
+  approvals-mode:
+    description: "Dangerous command approval mode"
+  context-engine:
+    description: "Context management engine"
+  human_delay-mode:
+    description: "Simulated typing delay mode"
+  logging-level:
+    description: "Log level for agent.log"
+  agent-service_tier:
+    description: "API service tier (OpenAI/Anthropic)"
+  delegation-reasoning_effort:
+    description: "Reasoning effort for delegated subagents"
+  browser-headed:
+    description: "Run the local browser in headed mode (visible window). Also keeps the window open between turns; idle sessions are still reaped after browser.inactivity_timeout."
