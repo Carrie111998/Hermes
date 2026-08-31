@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from hermes_state import SessionDB
@@ -264,3 +265,128 @@ def test_background_compaction_respects_opt_in_and_pressure_threshold(tmp_path: 
     agent.context_compressor.last_prompt_tokens = 74
     assert maybe_start_background_compression(agent, history, "system") is False
     assert not started.is_set()
+
+
+def test_adoption_publishes_prompt_rebuilt_by_background_worker(tmp_path: Path) -> None:
+    from agent.background_compression import (
+        adopt_completed_background_compression,
+        maybe_start_background_compression,
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "BACKGROUND_PROMPT_REBUILD"
+    db.create_session(session_id, source="test")
+    history = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    db.append_messages_batch(session_id, history)
+    started = threading.Event()
+    release = threading.Event()
+    agent = _agent_with_blocking_compressor(db, session_id, started, release)
+    agent._cached_system_prompt = "OLD PROMPT"
+    agent._cached_system_prompt_static = "OLD STATIC"
+
+    def _rebuild_prompt(worker, _system_message):
+        worker._cached_system_prompt_static = "NEW STATIC"
+        return "NEW PROMPT"
+
+    with patch.object(type(agent), "_build_system_prompt", _rebuild_prompt):
+        assert maybe_start_background_compression(agent, history, "system") is True
+        assert started.wait(3.0)
+        release.set()
+        assert agent._background_compression_job.done.wait(3.0)
+
+    # Worker state stays private until the next foreground turn boundary.
+    assert agent._cached_system_prompt == "OLD PROMPT"
+    assert agent._cached_system_prompt_static == "OLD STATIC"
+
+    adopted = adopt_completed_background_compression(agent, history)
+
+    assert adopted is not history
+    assert agent._cached_system_prompt == "NEW PROMPT"
+    assert agent._cached_system_prompt_static == "NEW STATIC"
+
+
+def test_external_memory_provider_disables_background_compaction(tmp_path: Path) -> None:
+    from agent.background_compression import maybe_start_background_compression
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "BACKGROUND_EXTERNAL_MEMORY_GATE"
+    db.create_session(session_id, source="test")
+    history = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    started = threading.Event()
+    release = threading.Event()
+    agent = _agent_with_blocking_compressor(db, session_id, started, release)
+    provider = SimpleNamespace(name="external")
+    agent._memory_manager = SimpleNamespace(providers=[provider])
+
+    assert maybe_start_background_compression(agent, history, "system") is False
+    assert agent._background_compression_job is None
+    assert not started.is_set()
+
+
+def test_adoption_retries_after_transient_history_reload_failure(tmp_path: Path) -> None:
+    from agent.background_compression import (
+        adopt_completed_background_compression,
+        maybe_start_background_compression,
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "BACKGROUND_ADOPTION_RETRY"
+    db.create_session(session_id, source="test")
+    history = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    db.append_messages_batch(session_id, history)
+    started = threading.Event()
+    release = threading.Event()
+    agent = _agent_with_blocking_compressor(db, session_id, started, release)
+
+    assert maybe_start_background_compression(agent, history, "system") is True
+    assert started.wait(3.0)
+    release.set()
+    job = agent._background_compression_job
+    assert job.done.wait(3.0)
+    durable = db.get_messages_as_conversation(session_id)
+
+    with patch.object(
+        db,
+        "get_messages_as_conversation",
+        side_effect=[RuntimeError("transient read failure"), durable],
+    ):
+        assert adopt_completed_background_compression(agent, history) is history
+        assert agent._background_compression_job is job
+        adopted = adopt_completed_background_compression(agent, history)
+
+    assert adopted == durable
+    assert agent._background_compression_job is None
+    assert agent._last_compaction_in_place is True
+
+
+def test_thread_start_failure_restores_scheduling_retryability(tmp_path: Path) -> None:
+    from agent.background_compression import maybe_start_background_compression
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "BACKGROUND_THREAD_START_RETRY"
+    db.create_session(session_id, source="test")
+    history = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    db.append_messages_batch(session_id, history)
+    started = threading.Event()
+    release = threading.Event()
+    agent = _agent_with_blocking_compressor(db, session_id, started, release)
+
+    with patch("agent.background_compression.threading.Thread.start", side_effect=RuntimeError("no thread")):
+        assert maybe_start_background_compression(agent, history, "system") is False
+
+    assert agent._background_compression_job is None
+    release.set()
+    assert maybe_start_background_compression(agent, history, "system") is True
+    assert agent._background_compression_job.done.wait(3.0)

@@ -32,6 +32,39 @@ class BackgroundCompressionJob:
     error: Optional[BaseException] = None
     committed: bool = False
     compressor_state: dict[str, Any] = field(default_factory=dict)
+    agent_state: dict[str, Any] = field(default_factory=dict)
+    boundary_messages: list[dict[str, Any]] = field(default_factory=list)
+
+
+class _BackgroundMemoryManagerView:
+    """Keep prompt reads available while suppressing live lifecycle writes."""
+
+    def __init__(self, manager: Any) -> None:
+        self._manager = manager
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._manager, name)
+
+    def on_session_end(self, _messages: list[dict[str, Any]]) -> None:
+        return None
+
+    def on_session_switch(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+def _has_external_memory_provider(agent: Any) -> bool:
+    manager = getattr(agent, "_memory_manager", None)
+    if manager is None:
+        return False
+    try:
+        return any(
+            getattr(provider, "name", "") != "builtin"
+            for provider in manager.providers
+        )
+    except Exception:
+        # An unknown manager cannot promise that its lifecycle state is safe to
+        # share with a concurrent compression worker.
+        return True
 
 
 def _background_pressure_tokens(compressor: Any) -> int:
@@ -57,13 +90,24 @@ def _run_background_compression(
     try:
         worker = copy.copy(agent)
         worker.context_compressor = copy.copy(agent.context_compressor)
+        # Tool refresh mutates several containers together. Isolate every one
+        # before the compaction boundary so the worker cannot half-publish onto
+        # the live agent while a foreground turn is still running.
+        worker.tools = copy.deepcopy(getattr(agent, "tools", None))
+        worker.valid_tool_names = set(getattr(agent, "valid_tool_names", set()))
+        worker._context_engine_tool_names = set(
+            getattr(agent, "_context_engine_tool_names", set())
+        )
+        manager = getattr(agent, "_memory_manager", None)
+        if manager is not None:
+            worker._memory_manager = _BackgroundMemoryManagerView(manager)
         worker._background_compression_enabled = False
         worker.status_callback = None
         worker._emit_status = lambda *_args, **_kwargs: None
         worker._emit_warning = lambda *_args, **_kwargs: None
         worker._session_messages = snapshot
 
-        compressed, _system_prompt = worker._compress_context(
+        compressed, system_prompt = worker._compress_context(
             snapshot,
             system_message,
             approx_tokens=approx_tokens,
@@ -83,6 +127,23 @@ def _run_background_compression(
                     job.compressor_state[name] = copy.deepcopy(
                         getattr(worker.context_compressor, name)
                     )
+            job.agent_state = {
+                "_cached_system_prompt": system_prompt,
+                "_cached_system_prompt_static": getattr(
+                    worker, "_cached_system_prompt_static", None
+                ),
+                "tools": copy.deepcopy(getattr(worker, "tools", None)),
+                "valid_tool_names": set(
+                    getattr(worker, "valid_tool_names", set())
+                ),
+                "_context_engine_tool_names": set(
+                    getattr(worker, "_context_engine_tool_names", set())
+                ),
+                "_tool_snapshot_generation": getattr(
+                    worker, "_tool_snapshot_generation", -1
+                ),
+            }
+            job.boundary_messages = copy.deepcopy(snapshot)
     except BaseException as exc:
         job.error = exc
         logger.warning(
@@ -112,6 +173,13 @@ def maybe_start_background_compression(
     if getattr(agent, "_persist_disabled", False):
         return False
     if not getattr(agent, "_session_db", None) or not getattr(agent, "session_id", None):
+        return False
+    # Stateful external providers own mutable turn buffers. A shallow worker
+    # cannot safely deliver compression lifecycle callbacks while foreground
+    # turns continue, and adopting later would include post-snapshot turns in
+    # the wrong boundary. Keep the feature disabled until MemoryManager grows
+    # a watermark-aware boundary contract.
+    if _has_external_memory_provider(agent):
         return False
     if not isinstance(messages, list) or len(messages) < 2:
         return False
@@ -158,7 +226,19 @@ def maybe_start_background_compression(
         name=f"hermes-bg-compress-{str(agent.session_id)[:16]}",
         daemon=True,
     )
-    thread.start()
+    try:
+        thread.start()
+    except Exception as exc:
+        job.error = exc
+        job.done.set()
+        if getattr(agent, "_background_compression_job", None) is job:
+            agent._background_compression_job = None
+        logger.warning(
+            "Background compression thread failed to start for session %s: %s",
+            agent.session_id,
+            exc,
+        )
+        return False
     logger.info(
         "Background compression started: session=%s tokens=%s trigger=%s",
         agent.session_id,
@@ -177,16 +257,17 @@ def adopt_completed_background_compression(
     if not isinstance(job, BackgroundCompressionJob) or not job.done.is_set():
         return conversation_history
 
-    agent._background_compression_job = None
     if (
         job.error is not None
         or not job.committed
         or job.session_id != str(getattr(agent, "session_id", ""))
     ):
+        agent._background_compression_job = None
         return conversation_history
 
     session_db = getattr(agent, "_session_db", None)
     if session_db is None:
+        agent._background_compression_job = None
         return conversation_history
     try:
         adopted = session_db.get_messages_as_conversation(job.session_id)
@@ -198,18 +279,31 @@ def adopt_completed_background_compression(
         )
         return conversation_history
     if not isinstance(adopted, list) or not adopted:
+        logger.warning(
+            "Background compression adoption reload returned no messages for session %s; "
+            "will retry at the next turn boundary",
+            job.session_id,
+        )
         return conversation_history
 
     compressor = getattr(agent, "context_compressor", None)
-    if compressor is not None:
-        for name, value in job.compressor_state.items():
-            try:
+    try:
+        if compressor is not None:
+            for name, value in job.compressor_state.items():
                 setattr(compressor, name, copy.deepcopy(value))
-            except Exception:
-                pass
-    agent._db_flush_scan_prefix = None
-    agent._flushed_db_message_ids = set()
-    agent._session_messages = adopted
+        for name, value in job.agent_state.items():
+            setattr(agent, name, copy.deepcopy(value))
+        agent._db_flush_scan_prefix = None
+        agent._flushed_db_message_ids = set()
+        agent._session_messages = adopted
+    except Exception:
+        logger.warning(
+            "Background compression live-state publication failed for session %s; "
+            "will retry at the next turn boundary",
+            job.session_id,
+            exc_info=True,
+        )
+        return conversation_history
     # The worker crossed the same full compaction boundary as a foreground
     # rewrite. Its transferred token sentinels suppress another background
     # launch until real provider usage calibrates the adopted transcript.
@@ -220,6 +314,21 @@ def adopt_completed_background_compression(
     agent._last_compaction_in_place = True
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = True
+    manager = getattr(agent, "_memory_manager", None)
+    if manager is not None:
+        try:
+            manager.commit_session_boundary_async(
+                job.boundary_messages,
+                new_session_id=job.session_id,
+                parent_session_id=job.session_id,
+                reason="compression",
+            )
+        except Exception:
+            logger.debug(
+                "memory manager background-compression boundary enqueue failed",
+                exc_info=True,
+            )
+    agent._background_compression_job = None
     logger.info(
         "Background compression adopted: session=%s messages=%d",
         job.session_id,
