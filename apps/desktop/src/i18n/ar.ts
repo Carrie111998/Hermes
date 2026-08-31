@@ -212,6 +212,7 @@ export const ar = defineLocale({
     hideRightSidebar: 'إخفاء الشريط الأيمن',
     showRightSidebar: 'إظهار الشريط الأيمن',
     unreadSessions: count => (count === 1 ? 'جلسة واحدة غير مقروءة' : `${count} جلسات غير مقروءة`),
+    needsAttention: count => (count === 1 ? 'عنصر واحد يحتاج انتباهك' : `${count} عناصر تحتاج انتباهك`),
     muteHaptics: 'كتم الاهتزازات',
     unmuteHaptics: 'تفعيل الاهتزازات',
     openSettings: 'فتح الإعدادات',
@@ -1124,14 +1125,18 @@ export const ar = defineLocale({
     archivedChats: 'المحادثات المؤرشفة',
     commands: 'الأوامر',
     sections: {
+      attention: 'تحتاج إلى انتباه',
       sessions: 'الجلسات',
       system: 'النظام',
-      usage: 'الاستخدام'
+      usage: 'الاستخدام',
+      maintenance: 'الصيانة'
     },
     sectionDescriptions: {
+      attention: 'راجع الجلسات التي تنتظرك أو التي لديها نتائج جديدة',
       sessions: 'البحث في الجلسات وإدارتها',
       system: 'الحالة والسجلات وإجراءات النظام',
-      usage: 'نشاط الرموز والتكلفة والمهارات عبر الزمن'
+      usage: 'نشاط الرموز والتكلفة والمهارات عبر الزمن',
+      maintenance: 'التشخيص والنسخ الاحتياطية والذاكرة'
     },
     nav: {
       newChat: {
@@ -1156,6 +1161,10 @@ export const ar = defineLocale({
       }
     },
     sectionEntries: {
+      attention: {
+        title: 'لوحة تحتاج إلى انتباه',
+        detail: 'مراجعة الجلسات التي تنتظرك أو التي لديها نتائج جديدة'
+      },
       sessions: {
         title: 'لوحة الجلسات',
         detail: 'البحث في الجلسات وتثبيتها وإدارتها'
@@ -1179,6 +1188,7 @@ export const ar = defineLocale({
     exportSession: 'تصدير الجلسة',
     deleteSession: 'حذف الجلسة',
     noSessions: 'لا توجد جلسات',
+    noAttention: 'لا يوجد ما يحتاج إلى انتباهك الآن.',
     gatewayRunning: 'البوابة تعمل',
     gatewayStopped: 'البوابة متوقفة',
     hermesActiveSessions: (version, count) => `Hermes ${version} لديه ${count} جلسة نشطة`,
