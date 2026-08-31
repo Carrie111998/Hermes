@@ -634,6 +634,8 @@ def cron_edit(args):
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
+        attach_to_session=getattr(args, "attach_to_session", None),
+        suppress_slack_unfurls=getattr(args, "suppress_slack_unfurls", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
     )
     if not result.get("success"):

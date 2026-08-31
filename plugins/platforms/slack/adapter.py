@@ -3024,13 +3024,21 @@ class SlackAdapter(BasePlatformAdapter):
             # 3000-char limits, so those fall back to plain text. The ``text``
             # field is always kept as the notification/accessibility fallback.
             blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
+            metadata_unfurls = {
+                key: metadata[key]
+                for key in ("unfurl_links", "unfurl_media")
+                if isinstance((metadata or {}).get(key), bool)
+            }
+            unfurl_kwargs = _slack_unfurl_kwargs(
+                {**(self.config.extra or {}), **metadata_unfurls}
+            )
 
             for i, chunk in enumerate(chunks):
                 kwargs = {
                     "channel": chat_id,
                     "text": chunk,
                     "mrkdwn": True,
-                    **_slack_unfurl_kwargs(self.config.extra),
+                    **unfurl_kwargs,
                 }
                 if blocks and i == 0:
                     kwargs["blocks"] = blocks

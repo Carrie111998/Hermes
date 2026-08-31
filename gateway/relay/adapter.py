@@ -1846,7 +1846,7 @@ class RelayAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="no transport")
         _sfp_unfurl = self._slack_unfurl_hints(str(platform_value))
         if _sfp_unfurl:
-            _sfp_metadata.update(_sfp_unfurl)
+            _sfp_metadata = {**_sfp_unfurl, **_sfp_metadata}
         result = await self._transport.send_outbound(
             {
                 "op": "send",

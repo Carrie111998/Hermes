@@ -573,6 +573,39 @@ class TestRegisteredHandlerForwardsAttachToSession:
         listed = next(j for j in listing["jobs"] if j["job_id"] == created["job_id"])
         assert listed.get("attach_to_session") is False
 
+    def test_update_persists_suppress_slack_unfurls(self):
+        from cron.jobs import get_job
+        from tools.registry import registry
+
+        created = json.loads(
+            registry.dispatch(
+                "cronjob",
+                {
+                    "action": "create",
+                    "schedule": "1h",
+                    "prompt": "post links without previews",
+                },
+            )
+        )
+        assert created["success"] is True
+        assert "suppress_slack_unfurls" not in (get_job(created["job_id"]) or {})
+
+        for value in (True, False):
+            updated = json.loads(
+                registry.dispatch(
+                    "cronjob",
+                    {
+                        "action": "update",
+                        "job_id": created["job_id"],
+                        "suppress_slack_unfurls": value,
+                    },
+                )
+            )
+            assert updated["success"] is True, updated
+            stored = get_job(created["job_id"])
+            assert stored is not None
+            assert stored["suppress_slack_unfurls"] is value
+
     def test_omitted_create_leaves_field_absent(self):
         from cron.jobs import get_job
         from tools.registry import registry

@@ -41,6 +41,38 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
 
 
+def test_cron_edit_delivery_flags_are_reversible_tristates():
+    parser = _build()
+
+    omitted = parser.parse_args(["cron", "edit", "j"])
+    assert omitted.attach_to_session is None
+    assert omitted.suppress_slack_unfurls is None
+
+    enabled = parser.parse_args(
+        [
+            "cron",
+            "edit",
+            "j",
+            "--attach-to-session",
+            "--suppress-slack-unfurls",
+        ]
+    )
+    assert enabled.attach_to_session is True
+    assert enabled.suppress_slack_unfurls is True
+
+    disabled = parser.parse_args(
+        [
+            "cron",
+            "edit",
+            "j",
+            "--no-attach-to-session",
+            "--no-suppress-slack-unfurls",
+        ]
+    )
+    assert disabled.attach_to_session is False
+    assert disabled.suppress_slack_unfurls is False
+
+
 def test_cron_accept_hooks_flag_on_run_and_tick():
     parser = _build()
     # --accept-hooks is suppressed-default; present only when passed.

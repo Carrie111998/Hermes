@@ -381,6 +381,52 @@ class TestDeliverResultWrapping:
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
 
+    @pytest.mark.parametrize(
+        "suppress_slack_unfurls",
+        [pytest.param(True, id="suppressed"), pytest.param(None, id="default")],
+    )
+    def test_standalone_slack_unfurls_use_local_config_copy(
+        self, suppress_slack_unfurls
+    ):
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        pconfig = PlatformConfig(enabled=True, extra={"existing": "preserved"})
+        config = GatewayConfig(platforms={Platform.SLACK: pconfig})
+        job = {
+            "id": "standalone-slack",
+            "deliver": "origin",
+            "origin": {"platform": "slack", "chat_id": "C123"},
+        }
+        if suppress_slack_unfurls is not None:
+            job["suppress_slack_unfurls"] = suppress_slack_unfurls
+
+        standalone_send = AsyncMock(return_value={"success": True})
+        with (
+            patch("gateway.config.load_gateway_config", return_value=config),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("gateway.relay.relay_fronted_platforms", return_value=set()),
+            patch("tools.send_message_tool._send_to_platform", new=standalone_send),
+        ):
+            result = _deliver_result(job, "scheduled result", adapters={})
+
+        assert result is None
+        standalone_send.assert_awaited_once()
+        sent_pconfig = standalone_send.await_args.args[1]
+        assert standalone_send.await_args.kwargs["thread_id"] is None
+        assert "thread_ts" not in standalone_send.await_args.kwargs
+        if suppress_slack_unfurls is True:
+            assert sent_pconfig is not pconfig
+            assert sent_pconfig.extra == {
+                "existing": "preserved",
+                "unfurl_links": False,
+                "unfurl_media": False,
+            }
+        else:
+            assert sent_pconfig is pconfig
+            assert "unfurl_links" not in sent_pconfig.extra
+            assert "unfurl_media" not in sent_pconfig.extra
+        assert pconfig.extra == {"existing": "preserved"}
+
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
         """Persisted Slack home survives restart without native Slack config."""
@@ -2367,7 +2413,7 @@ class TestCronContinuableSurfaceInChannel:
         return mock_cfg
 
     def _run_inchannel_delivery(self, extra, adapter, *, mirror_ok=True, origin=None,
-                                attach_to_session=True):
+                                attach_to_session=True, suppress_slack_unfurls=None):
         """Drive _deliver_result down the live-adapter path for a Slack
         channel-origin job with the given ``extra`` config. Returns the
         _open_continuable_cron_thread mock and the mirror_to_session mock."""
@@ -2400,6 +2446,8 @@ class TestCronContinuableSurfaceInChannel:
             # NOT depend on this — see the no-attach regression test).
             "attach_to_session": attach_to_session,
         }
+        if suppress_slack_unfurls is not None:
+            job["suppress_slack_unfurls"] = suppress_slack_unfurls
 
         with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
              patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
@@ -2602,6 +2650,43 @@ class TestCronContinuableSurfaceInChannel:
                 attach_to_session=False,
             )
         assert "scope_id" not in captured["metadata"]
+
+    @pytest.mark.parametrize(
+        ("suppress_slack_unfurls", "expected"),
+        [(True, False), (None, None)],
+        ids=("suppressed", "default"),
+    )
+    def test_slack_unfurl_metadata_preserves_top_level_routing(
+        self, suppress_slack_unfurls, expected
+    ):
+        captured = {}
+
+        class _SpyRouter:
+            def __init__(self, *a, **k):
+                pass
+
+            async def _deliver_to_platform(self, target, text, metadata):
+                captured["target"] = target
+                captured["metadata"] = metadata
+                return {"success": True, "message_id": "msg_1"}
+
+        adapter = self._slack_adapter(supports_inchannel=True)
+        with patch("gateway.delivery.DeliveryRouter", _SpyRouter):
+            self._run_inchannel_delivery(
+                {},
+                adapter,
+                attach_to_session=False,
+                suppress_slack_unfurls=suppress_slack_unfurls,
+            )
+
+        assert captured["target"].thread_id is None
+        assert "thread_id" not in captured["metadata"]
+        assert "thread_ts" not in captured["metadata"]
+        for key in ("unfurl_links", "unfurl_media"):
+            if expected is None:
+                assert key not in captured["metadata"]
+            else:
+                assert captured["metadata"][key] is expected
 
     def test_native_adapter_scalar_false_fails_safe_to_thread(self):
         """D6 fallback boundary with a REAL (non-mock) adapter shape: a native

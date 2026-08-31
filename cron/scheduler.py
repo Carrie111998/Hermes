@@ -3561,6 +3561,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 media_metadata = dict(media_metadata or {})
                 media_metadata.setdefault("scope_id", str(origin["scope_id"]))
 
+            if platform == Platform.SLACK and job.get("suppress_slack_unfurls") is True:
+                route_metadata["unfurl_links"] = False
+                route_metadata["unfurl_media"] = False
+
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
@@ -3870,7 +3874,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            standalone_pconfig = pconfig
+            if platform == Platform.SLACK and job.get("suppress_slack_unfurls") is True:
+                from dataclasses import replace
+
+                standalone_pconfig = replace(
+                    pconfig,
+                    extra={
+                        **(getattr(pconfig, "extra", None) or {}),
+                        "unfurl_links": False,
+                        "unfurl_media": False,
+                    },
+                )
+            coro = _send_to_platform(platform, standalone_pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -3899,7 +3915,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(asyncio.run, _send_to_platform(platform, standalone_pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
