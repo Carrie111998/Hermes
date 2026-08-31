@@ -1435,7 +1435,11 @@ def test_try_refresh_codex_client_credentials_adopts_store_token_when_pool_ident
     """
     agent = _build_xai_oauth_agent(monkeypatch)
     refresh_calls = {"count": 0}
-    store_token = "store-already-reminted"
+    store_token = (
+        "eyJhbGciOiJub25lIn0."
+        "eyJleHAiOjk5OTk5OTk5OTl9."
+        "sig"
+    )
 
     class _Pool:
         def entries(self):

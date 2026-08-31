@@ -1455,38 +1455,36 @@ def recover_with_credential_pool(
         refresh_kwargs = {"api_key_hint": _api_key_hint}
         if _credential_id:
             refresh_kwargs["credential_id"] = _credential_id
-        refreshed = pool.try_refresh_matching(**refresh_kwargs)
         if (
-            refreshed is None
-            and (agent.provider or "") == "xai-oauth"
+            (agent.provider or "") == "xai-oauth"
             and is_xai_stale_oauth_error(error_context, status_code)
         ):
-            # Expired live token matches no runtime_api_key after remint.
-            # Identify the failed *account* (stable id, else sole
-            # device_code entry) and adopt its current token. Do not
-            # guess a lone MANUAL other-account entry, and do not
-            # force-refresh when the pool already holds a newer token.
+            # Adopt a reminted token *before* try_refresh_matching so a
+            # bound _credential_pool_entry_id cannot force-POST the new
+            # single-use refresh token. Identify the failed account
+            # (stable id, else sole device_code); never guess a lone
+            # MANUAL other-account entry.
             entry = resolve_stale_oauth_pool_entry(agent, pool)
             if entry is not None:
                 runtime = str(getattr(entry, "runtime_api_key", "") or "").strip()
                 active = str(getattr(agent, "api_key", "") or "").strip()
                 if runtime and runtime != active:
-                    _ra().logger.info(
-                        "xai-oauth stale 403: live key matched no pool entry; "
-                        "adopting reminted pool entry %s without a second refresh",
-                        getattr(entry, "id", "?"),
-                    )
-                    agent._swap_credential(entry)
-                    return True, has_retried_429
-                if not _credential_id:
-                    _ra().logger.info(
-                        "xai-oauth stale 403: failed credential identity "
-                        "matched no pool runtime key; refreshing pool entry %s",
-                        getattr(entry, "id", "?"),
-                    )
-                    refreshed = pool.try_refresh_matching(
-                        credential_id=getattr(entry, "id", None)
-                    )
+                    from hermes_cli.auth import _codex_access_token_is_expiring
+
+                    if not _codex_access_token_is_expiring(runtime, 60):
+                        _ra().logger.info(
+                            "xai-oauth stale 403: live key matched no pool "
+                            "entry; adopting reminted pool entry %s without "
+                            "a second refresh",
+                            getattr(entry, "id", "?"),
+                        )
+                        agent._swap_credential(entry)
+                        return True, has_retried_429
+                if not refresh_kwargs.get("credential_id"):
+                    eid = getattr(entry, "id", None)
+                    if isinstance(eid, str) and eid:
+                        refresh_kwargs["credential_id"] = eid
+        refreshed = pool.try_refresh_matching(**refresh_kwargs)
         if refreshed is not None:
             # ``try_refresh_matching()`` re-mints a fresh OAuth token and reports
             # success even when the upstream keeps rejecting it — a single-entry

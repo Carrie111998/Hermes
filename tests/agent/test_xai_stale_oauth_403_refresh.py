@@ -150,6 +150,12 @@ def test_resolve_stale_oauth_pool_entry_does_not_guess_manual():
     assert resolve_stale_oauth_pool_entry(
         SimpleNamespace(_credential_pool_entry_id=None), _Pool([device])
     ) is device
+    imported = SimpleNamespace(
+        id="dc-imported", source="manual:device_code", runtime_api_key="tok"
+    )
+    assert resolve_stale_oauth_pool_entry(
+        SimpleNamespace(_credential_pool_entry_id=None), _Pool([imported])
+    ) is imported
 
 
 def _xai_agent(*, api_key="expired-in-memory-token"):
@@ -216,9 +222,7 @@ def test_recover_adopts_reminted_device_code_entry_without_second_refresh():
     )
 
     assert recovered is True
-    assert calls == [
-        {"api_key_hint": "expired-in-memory-token", "credential_id": None}
-    ]
+    assert calls == []
     agent._swap_credential.assert_called_once_with(only)
 
 
@@ -310,5 +314,55 @@ def test_recover_adopts_reminted_entry_by_credential_id():
 
     assert recovered is True
     agent._swap_credential.assert_called_once_with(reminted)
-    assert all(c.get("credential_id") != "manual-1" or c["api_key_hint"] for c in calls)
+    assert calls == []
+
+
+def test_recover_refreshes_device_code_entry_when_runtime_still_matches():
+    from types import SimpleNamespace
+
+    from agent.error_classifier import FailoverReason
+
+    agent = _xai_agent(api_key="same-expired-token")
+    calls = []
+    refreshed = SimpleNamespace(id="dc-1")
+    only = SimpleNamespace(
+        id="dc-1",
+        source="device_code",
+        runtime_api_key="same-expired-token",
+    )
+
+    class _FakePool:
+        provider = "xai-oauth"
+
+        def try_refresh_matching(self, api_key_hint=None, credential_id=None):
+            calls.append({"api_key_hint": api_key_hint, "credential_id": credential_id})
+            if credential_id == "dc-1":
+                return refreshed
+            return None
+
+        def mark_exhausted_and_rotate(self, **_kwargs):
+            raise AssertionError("must refresh the device_code entry by id")
+
+        def entries(self):
+            return [only]
+
+        def has_available(self):
+            return True
+
+        def current(self):
+            return None
+
+    agent._credential_pool = _FakePool()
+    recovered, _ = agent._recover_with_credential_pool(
+        status_code=403,
+        has_retried_429=False,
+        classified_reason=FailoverReason.auth,
+        error_context={"message": REAL_EXPIRED_BODY},
+    )
+
+    assert recovered is True
+    assert calls == [
+        {"api_key_hint": "same-expired-token", "credential_id": "dc-1"}
+    ]
+    agent._swap_credential.assert_called_once_with(refreshed)
 
