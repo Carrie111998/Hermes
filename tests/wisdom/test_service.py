@@ -5,7 +5,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_wisdom.client import Draft, WisdomConflict, WisdomValidationError
+from hermes_wisdom.client import (
+    Draft,
+    WisdomAuthError,
+    WisdomConflict,
+    WisdomValidationError,
+)
 from hermes_wisdom.contract import (
     PackageManifest,
     SystemSpecification,
@@ -159,6 +164,7 @@ class ReviewClient:
         self.publications = 0
         self.uploaded = 0
         self.revisions: list[dict] = []
+        self.state = "ready"
 
     def _draft(self):
         _records, content_hash = verify_content_files(self.files)
@@ -174,7 +180,7 @@ class ReviewClient:
             contentHash=content_hash,
             authorDescription=self.description,
             authorDescriptionHash=author_description_hash(self.description),
-            state="ready",
+            state=self.state,
             packageManifestHash=sha256_address(manifest),
             packageManifestSchemaVersion=1,
             systemSpec=None,
@@ -195,6 +201,12 @@ class ReviewClient:
             files=self.files,
             content_files=records,
             content_hash=content_hash,
+        )
+
+    def draft(self, _draft_id):
+        return SimpleNamespace(
+            draft=self._draft(),
+            effective_policy={"publication_policy": "open", "policy_version": 1},
         )
 
     def upload_private_objects(self, objects):
@@ -218,11 +230,17 @@ class ReviewClient:
 
     def approve(self, _draft_id, **hashes):
         self.approvals.append(hashes)
+        self.state = "owner_approved"
         return self._draft().model_copy(update={"state": "owner_approved"})
 
     def publish(self, _draft_id, *, content_hash):
         self.publications += 1
+        self.state = "published"
         return {"state": "published", "content_hash": content_hash}
+
+    def decline(self, _draft_id):
+        self.state = "declined"
+        return {"state": "declined"}
 
 
 def _review_service(tmp_path: Path, *, client: ReviewClient):
@@ -249,6 +267,50 @@ def _review_service(tmp_path: Path, *, client: ReviewClient):
         "manifest_hash": draft.packageManifestHash or "",
     })
     return WisdomService(store=store, client=client)
+
+
+def test_owner_draft_approval_reconciles_a_portal_won_race(monkeypatch, tmp_path: Path):
+    client = ReviewClient()
+    service = _review_service(tmp_path, client=client)
+    monkeypatch.setattr(service, "require_setup", lambda: None)
+    client.state = "pending_moderation"
+
+    result = service.approve_owner_draft("draft-review")
+
+    assert result["publication_state"] == "pending_moderation"
+    assert result["already_advanced"] is True
+    assert client.approvals == []
+    assert client.publications == 0
+
+
+def test_owner_draft_approval_uses_hash_bound_review_and_publication(
+    monkeypatch, tmp_path: Path
+):
+    client = ReviewClient()
+    service = _review_service(tmp_path, client=client)
+    monkeypatch.setattr(service, "require_setup", lambda: None)
+
+    result = service.approve_owner_draft("draft-review")
+
+    assert result["publication_state"] == "published"
+    assert len(client.approvals) == 1
+    assert client.publications == 1
+    assert service.store.receipt("draft-review") is None
+
+
+def test_owner_draft_decline_reports_already_published_without_mutating(
+    monkeypatch, tmp_path: Path
+):
+    client = ReviewClient()
+    service = _review_service(tmp_path, client=client)
+    monkeypatch.setattr(service, "require_setup", lambda: None)
+    client.state = "published"
+
+    result = service.decline_owner_draft("draft-review")
+
+    assert result["state"] == "published"
+    assert result["already_advanced"] is True
+    assert client.state == "published"
 
 
 def _install_service(monkeypatch, tmp_path: Path, *, client: InstallClient):
@@ -494,9 +556,7 @@ def test_telegram_candidate_creates_an_owner_private_draft_and_portal_link(
         "skill_name": "telegram-skill",
         "qualification": "high_usage",
         "state": "ready",
-        "portal_url": (
-            "https://portal.test/orgs/wisdom-local/wisdom/review/draft-1"
-        ),
+        "portal_url": ("https://portal.test/orgs/wisdom-local/wisdom/review/draft-1"),
         "created": True,
     }
     assert fake.uploaded > 0
@@ -527,9 +587,10 @@ def test_telegram_candidate_publish_uses_normal_review_and_approval(
     monkeypatch.setattr(
         service,
         "review",
-        lambda draft_id, *, acknowledge, portal=False: reviewed.append(
-            (draft_id, acknowledge)
-        ),
+        lambda draft_id, *, acknowledge, portal=False: reviewed.append((
+            draft_id,
+            acknowledge,
+        )),
     )
     monkeypatch.setattr(
         service,
@@ -1078,6 +1139,61 @@ def test_install_retries_from_staged_bytes_after_directory_swap_failure(
     installation = service.store.installation("skill-1")
     assert installation["state"] == "active"
     assert Path(installation["target_path"], "SKILL.md").read_text() == "# Managed\n"
+
+
+def test_portal_install_url_preserves_explicit_version_selector():
+    service = object.__new__(WisdomService)
+
+    assert service._resolve_install_ref(
+        "https://portal.example/orgs/team/wisdom/skills/skill-1?version=7"
+    ) == ("skill-1", 7)
+    with pytest.raises(PackagePolicyError, match="invalid Wisdom version"):
+        service._resolve_install_ref(
+            "https://portal.example/orgs/team/wisdom/skills/skill-1?version=latest"
+        )
+
+
+def test_command_home_does_not_read_remote_collections_when_status_is_degraded(
+    monkeypatch, tmp_path: Path
+):
+    service = WisdomService(
+        store=WisdomStore(tmp_path / "state"),
+        client=SimpleNamespace(),
+    )
+    degraded = {
+        "configured": True,
+        "gateway_available": False,
+        "capability_advertised": False,
+        "entitled": False,
+        "dogfood_admin_claim": False,
+    }
+    monkeypatch.setattr(service, "status", lambda: degraded)
+    monkeypatch.setattr(
+        service,
+        "search_skills",
+        lambda *_args, **_kwargs: pytest.fail("must not query the unavailable plane"),
+    )
+
+    assert service.command_home() == {"status": degraded}
+
+
+def test_status_distinguishes_authentication_failure_from_plane_unavailability(
+    tmp_path: Path,
+):
+    class AuthenticationFailureClient:
+        def capability(self):
+            raise WisdomAuthError("expired local credential")
+
+    service = WisdomService(
+        store=WisdomStore(tmp_path / "state"),
+        client=AuthenticationFailureClient(),
+    )
+
+    status = service.status()
+
+    assert status["gateway_available"] is False
+    assert status["error_kind"] == "authentication"
+    assert status["error"] == "expired local credential"
 
 
 def test_install_recovery_verifies_target_when_swap_won_before_journal_advance(

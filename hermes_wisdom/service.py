@@ -14,7 +14,7 @@ import webbrowser
 from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from hermes_constants import get_hermes_home, get_skills_dir
 from tools.skill_usage import is_bundled, is_hub_installed
@@ -22,6 +22,7 @@ from tools.skills_guard import scan_skill, should_allow_install
 from tools.skillevaluator_scan import run_tier1_scan, tier1_advisory_enabled
 
 from .client import (
+    WisdomAuthError,
     WisdomClient,
     WisdomConflict,
     WisdomError,
@@ -462,14 +463,24 @@ class WisdomService:
         try:
             client = self.client
             live = True
+            error_kind = None
             capability = client.capability()
             scopes = list(client.display_scopes)
             authenticated_org_id = client.display_org_id
             admin_gate = (
                 client.identity.get("claims", {}).get("tool_gateway_admin") is True
             )
+        except WisdomAuthError as exc:
+            live = False
+            error_kind = "authentication"
+            capability = {}
+            scopes = []
+            authenticated_org_id = None
+            admin_gate = False
+            error = str(exc)
         except Exception as exc:
             live = False
+            error_kind = "unavailable"
             capability = {}
             scopes = []
             authenticated_org_id = None
@@ -501,12 +512,15 @@ class WisdomService:
             ),
             "gateway_available": live,
             "error": None if live else error,
+            "error_kind": error_kind,
             "capability_advertised": "wisdom" in (capability.get("features") or []),
+            "entitled": "wisdom:read" in scopes,
             "display_scopes": scopes,
             "dogfood_admin_claim": admin_gate,
             "installation_id": installation_id,
             "verified_org_id": verified_org_id,
             "authenticated_org_id": authenticated_org_id,
+            "local_store": str(self.store.path),
             "pending_operations": self.store.pending_operations(),
             "contract": asdict(CONTRACT_PIN),
         }
@@ -1363,11 +1377,319 @@ class WisdomService:
         self.store.consume_receipt(draft_id)
         return result
 
+    def _record_owner_draft_state(self, draft_id: str, state: str) -> None:
+        """Mirror an authoritative owner-draft state into the local ledger."""
+        local = self.store.draft(draft_id)
+        if not local:
+            return
+        if state == "declined":
+            self.store.dismiss_candidate(
+                str(local["skill_id"]), str(local["source_hash"])
+            )
+            self.store.set_draft_state(draft_id, state)
+        elif state in {
+            "owner_approved",
+            "publishing",
+            "pending_moderation",
+            "changes_requested",
+            "published",
+            "invalidated",
+        }:
+            self.store.complete_contribution(draft_id, state)
+        else:
+            self.store.set_draft_state(draft_id, state)
+
+    def _owner_draft_state(self, draft_id: str) -> dict[str, Any]:
+        draft = self.client.draft(draft_id).draft
+        self._record_owner_draft_state(draft_id, draft.state)
+        return draft.model_dump(mode="json")
+
+    def _resume_owner_publication(
+        self, draft_id: str, draft: dict[str, Any]
+    ) -> dict[str, Any]:
+        published = self.client.publish(
+            draft_id, content_hash=str(draft["contentHash"])
+        )
+        state = str(published.get("state") or "")
+        if state not in {"pending_moderation", "published"}:
+            raise WisdomValidationError(
+                "Gateway returned an invalid publication state"
+            )
+        self._record_owner_draft_state(draft_id, state)
+        self.store.consume_receipt(draft_id)
+        return {
+            "draft": draft,
+            "publication": published,
+            "publication_state": state,
+        }
+
+    def approve_owner_draft(self, draft_id: str) -> dict[str, Any]:
+        """Approve or reconcile an owner draft across Portal/Telegram races."""
+        self.require_setup()
+        draft = self._owner_draft_state(draft_id)
+        state = str(draft["state"])
+        if state in {
+            "pending_moderation",
+            "changes_requested",
+            "published",
+            "declined",
+            "invalidated",
+        }:
+            return {
+                "draft": draft,
+                "publication_state": state,
+                "already_advanced": True,
+            }
+        if state in {"owner_approved", "publishing"}:
+            return self._resume_owner_publication(draft_id, draft)
+        if state != "ready":
+            raise WisdomConflict(
+                f"this private draft is currently {state.replace('_', ' ')}",
+                code=f"state_is_{state}",
+            )
+
+        try:
+            self.review(draft_id, acknowledge=True)
+            result = self.approve(draft_id)
+        except (WisdomConflict, PackagePolicyError):
+            # A Portal action may win after the first read or after the review
+            # receipt is created. Resolve the committed state instead of
+            # treating a repeated explicit confirmation as a generic failure.
+            refreshed = self._owner_draft_state(draft_id)
+            refreshed_state = str(refreshed["state"])
+            if refreshed_state in {"owner_approved", "publishing"}:
+                return self._resume_owner_publication(draft_id, refreshed)
+            if refreshed_state in {
+                "pending_moderation",
+                "changes_requested",
+                "published",
+                "declined",
+                "invalidated",
+            }:
+                return {
+                    "draft": refreshed,
+                    "publication_state": refreshed_state,
+                    "already_advanced": True,
+                }
+            raise
+        publication = result.get("publication")
+        publication = publication if isinstance(publication, dict) else {}
+        return {
+            "draft": draft,
+            **result,
+            "publication_state": str(publication.get("state") or "published"),
+        }
+
+    def decline_owner_draft(self, draft_id: str) -> dict[str, Any]:
+        """Decline or reconcile an owner draft without stale-button errors."""
+        self.require_setup()
+        draft = self._owner_draft_state(draft_id)
+        state = str(draft["state"])
+        if state in {"published", "declined"}:
+            return {"draft": draft, "state": state, "already_advanced": True}
+        try:
+            self.decline(draft_id)
+        except WisdomConflict:
+            refreshed = self._owner_draft_state(draft_id)
+            refreshed_state = str(refreshed["state"])
+            if refreshed_state in {"published", "declined"}:
+                return {
+                    "draft": refreshed,
+                    "state": refreshed_state,
+                    "already_advanced": True,
+                }
+            raise
+        return {
+            "draft": {**draft, "state": "declined"},
+            "state": "declined",
+            "withdrawn": state == "pending_moderation",
+        }
+
     def list_skills(self) -> dict[str, Any]:
         response = self.client.list_skills()
         return response.model_dump(mode="json")
 
-    def show(self, skill_id: str) -> dict[str, Any]:
+    def command_home(self) -> dict[str, Any]:
+        """Return the compact, profile-scoped state used by messaging UIs."""
+        status = self.status()
+        if (
+            not status["configured"]
+            or not status["gateway_available"]
+            or not status["capability_advertised"]
+            or not status["entitled"]
+            or not status["dogfood_admin_claim"]
+        ):
+            return {"status": status}
+        self.require_setup()
+        skills = self.search_skills()
+        drafts = self.list_owner_drafts()
+        candidates = self.list_candidates(qualified_only=True)
+        installations = self.list_installations()
+        notifications = self.notifications(mark_seen=False).get("events", [])
+        return {
+            "status": status,
+            "organization_id": self.store.active_org_id(),
+            "counts": {
+                "published": len(skills),
+                "suggested": len(candidates),
+                "drafts": len(drafts),
+                "installed": len(
+                    [item for item in installations if item.get("state") == "active"]
+                ),
+                "notifications": len(notifications),
+            },
+        }
+
+    def list_owner_drafts(self) -> list[dict[str, Any]]:
+        """List the current user's authoritative owner-private drafts."""
+        self.require_setup()
+        return [item.model_dump(mode="json") for item in self.client.list_drafts()]
+
+    def list_installations(self) -> list[dict[str, Any]]:
+        """List local managed installs joined to authoritative update state."""
+        self.require_setup()
+        installation_id = self.store.installation_identity()
+        remote = {
+            str(item["skill_id"]): item
+            for item in self.client.installations(installation_id)
+        }
+        results: list[dict[str, Any]] = []
+        for item in self.store.installations():
+            authoritative = remote.get(str(item["skill_id"])) or {}
+            results.append({
+                **item,
+                "latest_version": authoritative.get("latest_version"),
+                "effective_update_mode": authoritative.get("update_mode")
+                or item.get("update_mode"),
+                "skill_state": authoritative.get("skill_state"),
+            })
+        return results
+
+    def list_candidates(
+        self,
+        *,
+        qualified_only: bool = True,
+        query: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return qualified suggestions, or all manually eligible local skills."""
+        self.require_setup()
+        candidates = self.scan_candidates()
+        if qualified_only:
+            candidates = [
+                item
+                for item in candidates
+                if item.get("qualification") in {"high_usage", "refinement"}
+            ]
+        needle = str(query or "").strip().casefold()
+        if needle:
+            candidates = [
+                item
+                for item in candidates
+                if needle in str(item.get("name") or "").casefold()
+            ]
+        return candidates
+
+    def search_skills(self, query: str | None = None) -> list[dict[str, Any]]:
+        """Search authoritative discovery pages without inventing client authority."""
+        self.require_setup()
+        skills: list[dict[str, Any]] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for _page in range(100):
+            response = self.client.list_skills(cursor=cursor)
+            skills.extend(
+                item.model_dump(mode="json") for item in response.skills
+            )
+            cursor = response.next_cursor
+            if not cursor:
+                break
+            if cursor in seen_cursors:
+                raise WisdomValidationError(
+                    "Gateway returned a repeated Wisdom discovery cursor"
+                )
+            seen_cursors.add(cursor)
+        else:
+            raise WisdomValidationError("Wisdom discovery exceeded the page limit")
+        needle = str(query or "").strip().casefold()
+        if not needle:
+            return skills
+        return [
+            item
+            for item in skills
+            if any(
+                needle in str(item.get(field) or "").casefold()
+                for field in (
+                    "slug",
+                    "author_description",
+                    "created_by_user_id",
+                    "created_by_display_name",
+                    "author_name",
+                    "author",
+                )
+            )
+        ]
+
+    def resolve_skill(
+        self,
+        reference: str,
+        *,
+        include_compatibility: bool = True,
+    ) -> dict[str, Any]:
+        """Resolve an opaque ID or exact slug, keeping misses opaque."""
+        raw, _version = self._resolve_install_ref(reference)
+        try:
+            return self.show(raw, include_compatibility=include_compatibility)
+        except WisdomNotFound:
+            matches = [
+                item for item in self.search_skills(raw) if item.get("slug") == raw
+            ]
+            if len(matches) != 1:
+                raise WisdomNotFound("Wisdom skill not found")
+            return self.show(
+                str(matches[0]["id"]),
+                include_compatibility=include_compatibility,
+            )
+
+    def prepare_local_submission(self, skill_name: str) -> dict[str, Any]:
+        """Prepare and submit one manually selected local skill as owner-private."""
+        self.require_setup()
+        candidates = [
+            item
+            for item in self.list_candidates(qualified_only=False, query=skill_name)
+            if item.get("name") == skill_name
+        ]
+        if len(candidates) != 1:
+            raise WisdomNotFound("local skill not found")
+        candidate = candidates[0]
+        if candidate.get("eligibility") != "eligible":
+            raise PackagePolicyError(
+                str(candidate.get("reason") or "skill needs an instruction-only fork")
+            )
+        prepared = self.suggest(
+            skill_name,
+            local_skill_id=str(candidate["local_skill_id"]),
+        )
+        submitted = self.suggest(
+            skill_name,
+            description=str(prepared["drafted_description"]),
+            system_specification=dict(prepared["system_specification"]),
+            local_skill_id=str(candidate["local_skill_id"]),
+        )
+        draft = submitted.get("draft")
+        if not isinstance(draft, dict) or not isinstance(draft.get("id"), str):
+            raise WisdomValidationError("Gateway did not return an owner-private draft")
+        return {
+            "draft": draft,
+            "portal_url": self.portal_review_url(str(draft["id"])),
+            "notice": submitted.get("notice"),
+        }
+
+    def show(
+        self,
+        skill_id: str,
+        *,
+        include_compatibility: bool = True,
+    ) -> dict[str, Any]:
         detail = self.client.skill(skill_id)
         result = detail.model_dump(mode="json")
         versions = [
@@ -1379,7 +1701,7 @@ class WisdomService:
             latest = self.client.version(skill_id, max(versions))
             result["latest_version_detail"] = latest.model_dump(mode="json")
             specification = latest.version.get("system_spec")
-            if isinstance(specification, dict):
+            if include_compatibility and isinstance(specification, dict):
                 parsed_specification = SystemSpecification.model_validate(specification)
                 result["local_compatibility"] = asdict(
                     evaluate(
@@ -1387,6 +1709,8 @@ class WisdomService:
                         detect_local_capabilities(parsed_specification),
                     )
                 )
+        if include_compatibility:
+            result["local_installation"] = self.store.installation(skill_id)
         return result
 
     def versions(self, skill_id: str) -> list[dict[str, Any]]:
@@ -1434,6 +1758,13 @@ class WisdomService:
             if parsed.scheme in {"http", "https"}
             else reference
         )
+        if parsed.scheme in {"http", "https"}:
+            selected = parse_qs(parsed.query).get("version", [])
+            if selected:
+                raw_version = selected[-1]
+                if not raw_version.isdigit() or int(raw_version) < 1:
+                    raise PackagePolicyError("invalid Wisdom version selector")
+                return raw, int(raw_version)
         if "@v" in raw:
             skill_id, raw_version = raw.rsplit("@v", 1)
             if not raw_version.isdigit() or int(raw_version) < 1:

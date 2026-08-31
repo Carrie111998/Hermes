@@ -1181,6 +1181,7 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_type: Optional[str] = None,
         thread_id: Optional[str] = None,
         user_name: Optional[str] = None,
+        command: Optional[str] = None,
     ) -> bool:
         """Return whether a Telegram inline-button caller may perform gated actions."""
         normalized_user_id = str(user_id or "").strip()
@@ -1207,13 +1208,25 @@ class TelegramAdapter(BasePlatformAdapter):
                     user_name=str(user_name).strip() if user_name else None,
                     thread_id=str(thread_id) if thread_id is not None else None,
                 )
-                return bool(auth_fn(source))
+                if not bool(auth_fn(source)):
+                    return False
+                if command:
+                    slash_access = getattr(runner, "_check_slash_access", None)
+                    if not callable(slash_access):
+                        return False
+                    return slash_access(source, command) is None
+                return True
             except Exception:
                 logger.debug(
                     "[Telegram] Falling back to env-only callback auth for user %s",
                     normalized_user_id,
                     exc_info=True,
                 )
+                if command:
+                    # Command callbacks must obey the same central slash policy
+                    # as their originating command. Never downgrade to the
+                    # legacy environment-only callback check on policy errors.
+                    return False
 
         allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
         if not allowed_csv:
@@ -7707,8 +7720,59 @@ class TelegramAdapter(BasePlatformAdapter):
             chat_type=str(query_chat_type) if query_chat_type is not None else None,
             thread_id=str(query_thread_id) if query_thread_id is not None else None,
             user_name=query_user_name,
+            command="wisdom" if data.startswith("wi:cmd:") else None,
         ):
             await query.answer(text="⛔ You are not authorized to manage skills.")
+            return
+
+        if data.startswith("wi:cmd:"):
+            token = data.removeprefix("wi:cmd:")
+            try:
+                await query.answer(text="Checking current state…")
+
+                def command_action():
+                    from gateway.wisdom_command import (
+                        WisdomCommandContext,
+                        WisdomCommandController,
+                    )
+                    from hermes_wisdom.service import WisdomService
+
+                    service = WisdomService()
+                    context = WisdomCommandContext(
+                        user_id=caller_id,
+                        chat_id=str(query_chat_id or caller_id),
+                        profile=getattr(self, "_owner_profile", None),
+                        organization_id=service.store.active_org_id(),
+                        is_group=str(query_chat_type or "").lower()
+                        in {"group", "supergroup", "channel", "forum"},
+                    )
+                    view = WisdomCommandController().execute_token(
+                        token, service, context
+                    )
+                    return view, context
+
+                view, command_context = await self._run_wisdom_profile_operation(
+                    command_action
+                )
+                await self._prepare_wisdom_command_view(view, command_context)
+                await self._edit_wisdom_command_view(query, view)
+            except (PermissionError, ValueError) as exc:
+                await query.answer(text=str(exc), show_alert=True)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Collective Wisdom command action failed: %s",
+                    self.name,
+                    _redact_telegram_error_text(exc),
+                )
+                # Preserve the original card and controls so transient failures
+                # can be retried without losing context.
+                try:
+                    await query.answer(
+                        text="Collective Wisdom is temporarily unavailable. Try again.",
+                        show_alert=True,
+                    )
+                except Exception:
+                    pass
             return
 
         parts = data.split(":", 3)
@@ -8010,6 +8074,268 @@ class TelegramAdapter(BasePlatformAdapter):
                 return operation()
 
         return await asyncio.to_thread(scoped)
+
+    @staticmethod
+    def _wisdom_command_html(view) -> str:
+        """Render a presentation-neutral Wisdom view as one compact rich card."""
+        def compact(value: Any, limit: int) -> str:
+            text = str(value or "")
+            return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+        controls: list[str] = []
+
+        def button(action) -> str | None:
+            label = _html.escape(compact(action.label, 48))
+            if action.url:
+                return (
+                    '<tg-button type="url" url="'
+                    f'{_html.escape(str(action.url), quote=True)}">{label}</tg-button>'
+                )
+            if action.callback_data:
+                style = ' style="danger"' if action.destructive else (
+                    ' style="primary"' if action.primary else ""
+                )
+                return (
+                    f'<tg-button type="callback_data"{style} data="'
+                    f'{_html.escape(str(action.callback_data), quote=True)}">'
+                    f"{label}</tg-button>"
+                )
+            return None
+
+        item_html: list[str] = []
+        for item in view.items[:5]:
+            inline = [value for action in item.actions if (value := button(action))]
+            suffix = f"<br/>{' '.join(inline)}" if inline else ""
+            candidate = (
+                f"<p><b>{_html.escape(compact(item.title, 140))}</b>"
+                f"<br/>{_html.escape(compact(item.detail, 300)).replace(chr(10), '<br/>')}"
+                f"{suffix}</p>"
+            )
+            if sum(map(len, item_html)) + len(candidate) > 2600:
+                break
+            item_html.append(candidate)
+        controls = [value for action in view.actions if (value := button(action))]
+        summary = (
+            f"<p>{_html.escape(compact(view.summary, 600)).replace(chr(10), '<br/>')}</p>"
+            if view.summary
+            else ""
+        )
+        notice = (
+            f"<p><i>{_html.escape(compact(view.notice, 400))}</i></p>"
+            if view.notice
+            else ""
+        )
+        action_html = f"<p>{' '.join(controls)}</p>" if controls else ""
+        return (
+            f"<h3>{_html.escape(compact(view.title, 120))}</h3>"
+            f"{summary}{''.join(item_html)}{notice}{action_html}"
+        )
+
+    @staticmethod
+    def _wisdom_command_text(view) -> str:
+        """Bound fallback text below Telegram's message-size ceiling."""
+        value = view.to_text()
+        return value if len(value) <= 3500 else value[:3499].rstrip() + "…"
+
+    @staticmethod
+    def _wisdom_command_error_text(exc: Exception) -> str:
+        """Return a stable user-safe command error without upstream details."""
+        from gateway.wisdom_command import command_error_text
+
+        return command_error_text(exc)
+
+    @staticmethod
+    def _wisdom_command_keyboard(view) -> Optional["InlineKeyboardMarkup"]:
+        rows = []
+        for actions in [*(item.actions for item in view.items), view.actions]:
+            row = []
+            for action in actions:
+                if action.url:
+                    row.append(InlineKeyboardButton(action.label, url=action.url))
+                elif action.callback_data:
+                    row.append(
+                        InlineKeyboardButton(
+                            action.label, callback_data=action.callback_data
+                        )
+                    )
+            if row:
+                rows.extend([row[index : index + 2] for index in range(0, len(row), 2)])
+        return InlineKeyboardMarkup(rows) if rows else None
+
+    async def _prepare_wisdom_command_view(self, view, context) -> None:
+        """Turn private group actions into DM links, then bind callbacks.
+
+        This runs for both initial cards and callback-driven navigation.  In
+        particular, pagination must not turn a group-safe ``Continue in DM``
+        action back into an in-group mutation callback.
+        """
+        from gateway.wisdom_command import bind_view_callbacks, issue_continuation
+
+        continuation_actions = [
+            action
+            for action in [
+                *view.actions,
+                *(action for item in view.items for action in item.actions),
+            ]
+            if action.operation == "continue_dm"
+        ]
+        if continuation_actions:
+            username = str(
+                getattr(getattr(self, "_bot", None), "username", "") or ""
+            )
+            if not username:
+                try:
+                    bot_user = await self._bot.get_me()
+                    username = str(getattr(bot_user, "username", "") or "")
+                except Exception:
+                    logger.debug(
+                        "[%s] Could not resolve Telegram username for Wisdom DM link",
+                        self.name,
+                        exc_info=True,
+                    )
+            for action in continuation_actions:
+                if username:
+                    token = issue_continuation(
+                        str(action.arguments.get("raw_args") or ""), context
+                    )
+                    action.url = f"https://t.me/{username}?start=wisdom_{token}"
+                else:
+                    action.label = "DM this bot, then run /wisdom"
+                action.operation = None
+
+        bind_view_callbacks(view, context)
+
+    async def _edit_wisdom_command_view(self, query, view) -> None:
+        message = getattr(query, "message", None)
+        raw_request = getattr(getattr(self, "_bot", None), "do_api_request", None)
+        if message is not None and callable(raw_request):
+            try:
+                await raw_request(
+                    "editMessageText",
+                    api_kwargs={
+                        "chat_id": normalize_telegram_chat_id(message.chat_id),
+                        "message_id": int(message.message_id),
+                        "rich_message": {"html": self._wisdom_command_html(view)},
+                        "link_preview_options": {"is_disabled": True},
+                    },
+                )
+                return
+            except Exception as exc:
+                logger.debug(
+                    "[%s] Wisdom command rich edit failed: %s",
+                    self.name,
+                    _redact_telegram_error_text(exc),
+                )
+        try:
+            await query.edit_message_text(
+                text=_html.escape(self._wisdom_command_text(view)),
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._wisdom_command_keyboard(view),
+            )
+        except Exception:
+            pass
+
+    async def send_wisdom_command(self, raw_args: str, *, source) -> None:
+        """Execute and render `/wisdom` inside this Telegram adapter's profile."""
+        from gateway.wisdom_command import (
+            WisdomCommandContext,
+            WisdomCommandController,
+        )
+        from hermes_wisdom.service import WisdomService
+
+        user_id = str(getattr(source, "user_id", None) or "")
+        chat_id = str(source.chat_id)
+        is_group = str(getattr(source, "chat_type", "") or "").lower() in {
+            "group",
+            "supergroup",
+            "channel",
+            "forum",
+        }
+
+        def command_action():
+            service = WisdomService()
+            context = WisdomCommandContext(
+                user_id=user_id,
+                chat_id=chat_id,
+                profile=getattr(self, "_owner_profile", None),
+                organization_id=service.store.active_org_id(),
+                is_group=is_group,
+            )
+            view = WisdomCommandController().execute(raw_args, service, context)
+            return view, context
+
+        try:
+            view, command_context = await self._run_wisdom_profile_operation(
+                command_action
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Collective Wisdom command failed: %s",
+                self.name,
+                _redact_telegram_error_text(exc),
+            )
+            text = (
+                "<b>Collective Wisdom could not continue</b>\n"
+                f"{_html.escape(self._wisdom_command_error_text(exc))}"
+            )
+            await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=text,
+                parse_mode=ParseMode.HTML,
+                **self._link_preview_kwargs(),
+            )
+            return
+
+        await self._prepare_wisdom_command_view(view, command_context)
+        delivered = False
+        raw_request = getattr(getattr(self, "_bot", None), "do_api_request", None)
+        if callable(raw_request):
+            try:
+                await raw_request(
+                    "sendRichMessage",
+                    api_kwargs={
+                        "chat_id": normalize_telegram_chat_id(chat_id),
+                        "rich_message": {"html": self._wisdom_command_html(view)},
+                        "link_preview_options": {"is_disabled": True},
+                    },
+                )
+                delivered = True
+            except Exception as exc:
+                logger.debug(
+                    "[%s] Wisdom command rich send failed: %s",
+                    self.name,
+                    _redact_telegram_error_text(exc),
+                )
+        if not delivered:
+            await self._send_message_with_thread_fallback(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=_html.escape(self._wisdom_command_text(view)),
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._wisdom_command_keyboard(view),
+                **self._link_preview_kwargs(),
+            )
+
+    async def send_wisdom_continuation(self, token: str, *, source) -> None:
+        """Resume a user-bound group `/wisdom` request inside its DM."""
+        from gateway.wisdom_command import (
+            WisdomCommandContext,
+            resolve_continuation,
+        )
+        from hermes_wisdom.service import WisdomService
+
+        def continuation_action() -> str:
+            service = WisdomService()
+            context = WisdomCommandContext(
+                user_id=str(getattr(source, "user_id", None) or ""),
+                chat_id=str(source.chat_id),
+                profile=getattr(self, "_owner_profile", None),
+                organization_id=service.store.active_org_id(),
+                is_group=False,
+            )
+            return resolve_continuation(token, context)
+
+        raw_args = await self._run_wisdom_profile_operation(continuation_action)
+        await self.send_wisdom_command(raw_args, source=source)
 
     @staticmethod
     def _wisdom_candidate_resolved_state(

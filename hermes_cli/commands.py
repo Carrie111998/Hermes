@@ -329,6 +329,20 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("search", "browse", "inspect", "install", "audit",
                             "pending", "approve", "reject", "diff", "approval"),
                desktop="settings"),
+    CommandDef(
+        "wisdom",
+        "Browse, contribute, install, and manage Collective Wisdom skills",
+        "Tools & Skills",
+        gateway_only=True,
+        args_hint="[keyword]",
+        subcommands=(
+            "setup", "status", "browse", "show", "versions", "candidates",
+            "submit", "drafts", "review", "install", "installed", "check",
+            "update", "uninstall", "notifications", "help",
+        ),
+        busy_policy="reject",
+        desktop="messaging",
+    ),
     CommandDef("memory", "Review pending memory writes / toggle the approval gate",
                "Tools & Skills",
                args_hint="[pending|approve|reject|approval] [id|on|off]",
@@ -771,6 +785,7 @@ _TELEGRAM_MENU_PRIORITY = (
     "resume",
     "sessions",
     "model",
+    "wisdom",
     # Maintenance / diagnostics — the ones that prompted this priority list.
     "debug",
     "restart",
@@ -1478,7 +1493,7 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "wisdom"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

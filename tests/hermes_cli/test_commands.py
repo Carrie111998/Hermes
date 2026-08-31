@@ -48,6 +48,22 @@ def _completions(completer: SlashCommandCompleter, text: str):
 
 class TestCommandRegistry:
 
+    def test_wisdom_is_a_busy_rejecting_gateway_command(self):
+        command = resolve_command("wisdom")
+
+        assert command is not None
+        assert command.category == "Tools & Skills"
+        assert command.gateway_only is True
+        assert command.busy_policy == "reject"
+        assert {"browse", "submit", "install", "update", "notifications"} <= set(
+            command.subcommands
+        )
+
+    def test_wisdom_survives_the_default_telegram_menu_cap(self):
+        menu, _hidden = telegram_menu_commands(max_commands=60)
+
+        assert "wisdom" in {name for name, _description in menu}
+
 
     def test_save_command_supports_formats(self):
         cmd = resolve_command("save")

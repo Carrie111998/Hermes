@@ -17248,9 +17248,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "help": self._handle_help_command,
             "commands": self._handle_commands_command,
             "profile": self._handle_profile_command,
+            "wisdom": self._handle_wisdom_command,
             "update": self._handle_update_command,
             "version": self._handle_version_command,
         }
+
+    async def _handle_wisdom_command(self, event: MessageEvent):
+        """Dispatch `/wisdom` through the active profile's shared service."""
+        source = event.source
+        adapter = self._adapter_for_source(source)
+        rich_handler = getattr(adapter, "send_wisdom_command", None)
+        if callable(rich_handler):
+            await rich_handler(event.get_command_args(), source=source)
+            return ""
+
+        from gateway.wisdom_command import (
+            WisdomCommandContext,
+            WisdomCommandController,
+        )
+        from hermes_wisdom.service import WisdomService
+
+        profile_home = self._resolve_profile_home_for_source(source)
+
+        def command_action():
+            with _profile_runtime_scope(profile_home):
+                service = WisdomService()
+                context = WisdomCommandContext(
+                    user_id=str(source.user_id or ""),
+                    chat_id=str(source.chat_id),
+                    profile=getattr(source, "profile", None),
+                    organization_id=service.store.active_org_id(),
+                    is_group=str(source.chat_type or "").lower()
+                    in {"group", "supergroup", "channel", "forum"},
+                )
+                return WisdomCommandController().execute(
+                    event.get_command_args(), service, context
+                )
+        try:
+            view = await asyncio.to_thread(command_action)
+        except Exception as exc:
+            logger.warning(
+                "Collective Wisdom command failed (%s)", type(exc).__name__
+            )
+            from gateway.wisdom_command import command_error_text
+
+            return f"Collective Wisdom could not continue: {command_error_text(exc)}"
+        return view.to_text()
 
     async def _dispatch_busy_slash_command(
         self, event: MessageEvent, cmd_def, quick_key: str, source,
@@ -18420,6 +18463,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_topic_command(event)
         
         if canonical == "start":
+            start_args = event.get_command_args().strip()
+            if start_args.startswith("wisdom_"):
+                wisdom_denied = self._check_slash_access(source, "wisdom")
+                if wisdom_denied is not None:
+                    return wisdom_denied
+                token = start_args.removeprefix("wisdom_")
+                adapter = self._adapter_for_source(source)
+                continuation = getattr(adapter, "send_wisdom_continuation", None)
+                if callable(continuation):
+                    try:
+                        await continuation(token, source=source)
+                    except (PermissionError, ValueError) as exc:
+                        return str(exc)
+                    except Exception as exc:
+                        logger.warning(
+                            "Collective Wisdom DM continuation failed (%s)",
+                            type(exc).__name__,
+                        )
+                        return (
+                            "Collective Wisdom could not continue that request. "
+                            "Run /wisdom in this chat instead."
+                        )
             logger.info("Ignoring /start platform ping for session %s", _quick_key)
             return ""
 
