@@ -1,0 +1,52 @@
+version: 1
+generated_by: jay-os-v1/scripts/jay_os_bootstrap_driver.py
+source_evidence_dir: jay-os-v1/evidence
+nodes:
+  jay:
+    tailscale_ip: 100.78.252.90
+    role: primary_control_plane
+    status: online
+    policy: reserve_control_plane_headroom
+  m1:
+    tailscale_ip: 100.85.86.51
+    role: general_background_worker_and_standby
+    status: online
+  rtx:
+    tailscale_ip: 100.120.123.103
+    role: gpu_worker_protected_voice_node
+    status: online
+    policy: voice_preempts_batch
+  m5:
+    tailscale_ip: 100.96.157.75
+    role: opportunistic_personal_capacity
+    status: offline_last_inventory
+    policy: never_critical_dependency
+providers:
+  github:
+    cli_user: onenyc77-prog
+    repo: NousResearch/hermes-agent
+    push_status: blocked_by_ssh_push_permission_mismatch
+  telegram:
+    connected: true
+  node:
+    version: v24.20.0
+  npm:
+    version: 11.19.0
+  pnpm:
+    version: 10.33.0
+  docker:
+    available: true
+  uv:
+    available: true
+  ollama:
+    local_or_tunnel_reachable: false
+control_planes:
+  one_memory:
+    status: inventory_incomplete
+    note: hermes config exposes om; vx MCP disabled per memory until OAuth/DCR fix
+  mastra:
+    status: no_existing_package_detected_in_initial_inventory
+bottlenecks:
+  - service_identity_control_plane_not_verified
+  - github_push_permission_mismatch
+  - rtx_voice_stack_not_verified

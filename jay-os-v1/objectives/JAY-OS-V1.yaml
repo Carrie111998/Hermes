@@ -1,0 +1,90 @@
+id: JAY-OS-V1
+name: JAY OS v1 — Autonomous Company Execution System
+status: RUNNING
+source_spec: constitution/JAY_OS_V1.md
+created_utc: '2026-08-31T19:37:00Z'
+portfolio: One Memory
+risk_class: foundation
+policy_class: A_safe_reversible_until_external_release_or_security_blast_radius_change
+state_machine:
+  current: DISCOVERED
+  next:
+    - TRIAGED
+    - PLANNED
+    - READY
+    - RUNNING
+    - VALIDATING_LOCAL
+    - VALIDATING_STAGING
+    - RELEASING
+    - VERIFYING_PROD
+    - DONE
+principles:
+  - foundations_first
+  - parallel_by_default
+  - evidence_over_status
+  - no_human_login_or_otp_for_agents
+  - one_memory_control_plane
+  - mastra_execution_and_improvement_plane
+  - github_work_ledger
+  - voice_priority_on_rtx
+  - m5_opportunistic_only
+workstreams:
+  A_tailscale_network:
+    status: evidence_captured
+    dependencies: []
+  B_machine_resource_inventory:
+    status: evidence_captured
+    dependencies: []
+  C_jay_repo_config_inventory:
+    status: evidence_captured
+    dependencies: []
+  D_onememory_auth_api_capability:
+    status: evidence_captured
+    dependencies: []
+  E_github_ci_cd_repo_inventory:
+    status: evidence_captured
+    dependencies: []
+  F_mastra_inventory:
+    status: evidence_captured
+    dependencies: []
+  G_rtx_qwen3_tts_voice:
+    status: evidence_captured
+    dependencies: []
+  H_testing_release_infra:
+    status: evidence_captured
+    dependencies: []
+  I_security_adversarial:
+    status: evidence_captured
+    dependencies: []
+  J_business_work_intake:
+    status: evidence_captured
+    dependencies: []
+exit_tests:
+  H0_30:
+    - authoritative_current_state_graph_exists
+  H2:
+    - nodes_visible
+    - restart_reconnect_tested
+    - safe_test_job_each_eligible_node
+    - m5_optional
+    - rtx_voice_reservation_recognized
+  H4:
+    - objective_decomposed_and_dispatched_across_two_backends_or_nodes
+    - trace_provenance_preserved
+  H6:
+    - one_real_issue_completed_end_to_end
+  H8:
+    - measured_mastra_challenger_experiment
+  H10:
+    - continuous_voice_session_from_iphone
+  H12:
+    - chaos_tests_recover_or_degrade_safely
+metrics_contract:
+  autonomy_ratio: null
+  runnable_parallelism: 10
+  allocatable_capacity_used: null
+  blocker_age_p95: null
+  estimate_p50: 90m_to_runnable_foundation_v1
+  estimate_p90: 4h_if_auth_windows_voice_remediation_nontrivial
+  releases_passed: 0
+  voice_status: rtx_online_unverified_qwen3_tts

@@ -1,0 +1,46 @@
+version: 1
+terms:
+  - id: JAY_OS_V1_AUTONOMY
+    name: JAY OS v1 autonomy policy
+    label: JAY OS v1 autonomy policy
+    definition: Safe/reversible classes execute autonomously; guarded external/release actions require policy gates; founder is required only for protected Class C decisions.
+policy: JAY_OS_V1_AUTONOMY
+classes:
+  A_fully_autonomous:
+    description: Safe, reversible, pre-authorized operations.
+    examples:
+      - repo_inspection
+      - test_execution
+      - local_builds
+      - branch_worktree_creation
+      - trace_analysis
+      - documentation
+      - reversible_dev_config
+      - synthetic_data_generation
+      - read_only_production_inspection
+  B_autonomous_with_policy_gate:
+    description: Operations allowed after machine-checkable quality/policy gates pass.
+    examples:
+      - pr_creation
+      - pr_merge_after_required_reviews
+      - staging_deploy
+      - low_medium_risk_prod_deploy_after_quality_gates
+      - approved_marketing_experiments
+      - approved_customer_followups
+  C_founder_required:
+    description: Decisions requiring Andres/founder judgment or authorization.
+    examples:
+      - irreversible_destructive_production_data_actions
+      - security_policy_blast_radius_increase
+      - critical_root_credential_rotation_without_recovery
+      - new_recurring_external_spend_beyond_budget
+      - legal_commitments
+      - novel_pricing_or_discounts_beyond_policy
+      - strategic_business_pivots
+      - high_risk_customer_promises
+defaults:
+  ask_founder_only_for_class_C: true
+  safe_reversible_operations_do_not_wait_for_allow: true
+  no_human_otp_or_login_for_agents: true
+  require_short_lived_scoped_tokens: true
+  immutable_audit_logs_required: true
