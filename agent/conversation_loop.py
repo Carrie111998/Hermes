@@ -59,6 +59,8 @@ from agent.message_sanitization import (
     _sanitize_structure_surrogates,
     _sanitize_surrogates,
     _sanitize_tools_non_ascii,
+    insert_assistant_bridge_for_mistral,
+    is_mistral_model,
     _looks_like_image_content_rejection,
     _strip_images_from_messages,
     _strip_non_ascii,
@@ -2520,6 +2522,14 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        # Mistral-family models enforce strict tool → assistant → user role
+        # alternation.  Other providers (OpenAI, NVIDIA Nemotron) are lenient;
+        # Mistral returns HTTP 400 "Unexpected role 'user' after role 'tool'"
+        # without the bridge.  Insert a synthetic empty assistant message at
+        # every tool→user transition when the active model is Mistral (#20154).
+        if is_mistral_model(getattr(agent, "model", "")):
+            insert_assistant_bridge_for_mistral(api_messages)
 
         # NOTE (empty-content class fix): no send-time pad loop here.  The
         # single owner for "never send a turn strict wire validation rejects

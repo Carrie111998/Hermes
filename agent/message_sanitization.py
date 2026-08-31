@@ -1047,3 +1047,57 @@ def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
 # The one genuinely shared image POLICY — removing images when a server
 # rejects them while preserving tool_call_id pairing — already has a single
 # owner here: ``_strip_images_from_messages`` above.
+
+
+_MISTRAL_MODEL_PREFIXES = (
+    "mistral",
+    "devstral",
+    "codestral",
+    "magistral",
+    "ministral",
+    "pixtral",
+)
+
+
+def is_mistral_model(model: str) -> bool:
+    """Return True when *model* names a Mistral-family model.
+
+    Mistral's chat API enforces strict role alternation: a ``user`` message
+    MUST NOT immediately follow a ``tool`` message — an ``assistant`` stub
+    must bridge them.  Other providers (OpenAI, NVIDIA Nemotron) are lenient.
+    """
+    lm = (model or "").lower().strip()
+    return any(lm.startswith(p) for p in _MISTRAL_MODEL_PREFIXES)
+
+
+def insert_assistant_bridge_for_mistral(messages: list) -> bool:
+    """Insert a synthetic empty assistant message between consecutive
+    ``tool`` → ``user`` transitions for Mistral-family models.
+
+    Mistral's chat API rejects ``Unexpected role 'user' after role 'tool'``
+    (HTTP 400) when a user turn follows tool results without an intervening
+    assistant message.  OpenAI and NVIDIA Nemotron are lenient; Mistral is not.
+
+    Mutates *messages* in place.  Returns True if any bridging was inserted.
+
+    Usage::
+
+        if is_mistral_model(agent.model):
+            insert_assistant_bridge_for_mistral(api_messages)
+
+    Fixes #20154.
+    """
+    i = 1
+    inserted = False
+    while i < len(messages):
+        prev_role = messages[i - 1].get("role", "")
+        curr_role = messages[i].get("role", "")
+        if prev_role == "tool" and curr_role == "user":
+            # Insert a synthetic empty assistant message to satisfy Mistral's
+            # strict tool → assistant → user alternation rule.
+            messages.insert(i, {"role": "assistant", "content": ""})
+            inserted = True
+            i += 2  # skip past the inserted stub and the original user msg
+        else:
+            i += 1
+    return inserted
