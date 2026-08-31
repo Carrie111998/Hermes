@@ -33,6 +33,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.message_metadata import stamp_message_timestamp
+from agent.tool_result_egress import (
+    is_multimodal_tool_result as _is_multimodal_tool_result,
+    redact_tool_result_for_egress as _redact_tool_result_for_egress,
+)
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
 )
@@ -391,20 +395,6 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left_parts[:common_len] == right_parts[:common_len]
 
 
-def _is_multimodal_tool_result(value: Any) -> bool:
-    """True if the value is a multimodal tool result envelope.
-
-    Multimodal handlers (e.g. tools/computer_use) return a dict with
-    `_multimodal=True`, a `content` key holding OpenAI-style content
-    parts, and an optional `text_summary` for string-only fallbacks.
-    """
-    return (
-        isinstance(value, dict)
-        and value.get("_multimodal") is True
-        and isinstance(value.get("content"), list)
-    )
-
-
 def _multimodal_text_summary(value: Any) -> str:
     """Extract a plain text view of a multimodal tool result.
 
@@ -613,11 +603,13 @@ def make_tool_result_message(
     # paths that do not go through the live executor's canonical-id helper.
     tool_call_id = _normalize_tool_call_id(tool_call_id)
 
-    # Order matters: detect provider-side elision on the RAW content and
-    # append the notice first, THEN wrap — so the notice lives inside the
-    # untrusted block next to the data it describes, appended exactly once
-    # at construction time (cache-safe).
-    wrapped = _maybe_wrap_untrusted(name, _maybe_append_elision_notice(name, content))
+    # Detect provider-side elision on the raw content, then redact every
+    # model-visible text carrier before wrapping it as untrusted data. Keep
+    # ``content`` unchanged for the risk scan below so redaction cannot hide
+    # evidence from classification.
+    content_with_notice = _maybe_append_elision_notice(name, content)
+    redacted_content = _redact_tool_result_for_egress(content_with_notice)
+    wrapped = _maybe_wrap_untrusted(name, redacted_content)
     message = stamp_message_timestamp({
         "role": "tool",
         "name": name,

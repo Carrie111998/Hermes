@@ -55,6 +55,9 @@ from tools.computer_use.backend import (
     ComputerUseBackend,
     UIElement,
 )
+from tools.computer_use.capture_targeting import (
+    capture_app_matches as _capture_app_matches,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -678,6 +681,29 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
                 "window_id": args.get("window_id"),
             })
         cap = backend.capture(**capture_kwargs)
+        requested_app = args.get("app")
+        exact_binding = (
+            args.get("pid") is not None and args.get("window_id") is not None
+        )
+        if (
+            isinstance(requested_app, str)
+            and requested_app.strip()
+            and not exact_binding
+            and not _capture_app_matches(requested_app, cap.app)
+        ):
+            returned_app = cap.app.strip() if isinstance(cap.app, str) else ""
+            return json.dumps({
+                "ok": False,
+                "action": "capture",
+                "code": "capture_target_mismatch",
+                "error": (
+                    f"capture requested app {requested_app.strip()!r}, but the "
+                    f"backend returned {returned_app or '<unverifiable>'!r}. "
+                    "Screenshot and element data were withheld before response "
+                    "materialization. Use list_apps/list_windows or an exact "
+                    "pid+window_id binding."
+                ),
+            })
         return _capture_response(cap)
 
     if action == "wait":

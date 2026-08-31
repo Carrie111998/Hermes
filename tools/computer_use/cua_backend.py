@@ -61,6 +61,9 @@ from tools.computer_use.backend import (
     ComputerUseBackend,
     UIElement,
 )
+from tools.computer_use.capture_targeting import (
+    match_windows_for_app as _resolve_windows_for_app,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2883,81 +2886,13 @@ class CuaDriverBackend(ComputerUseBackend):
     def _match_windows_for_app(
         self, windows: List[Dict[str, Any]], app: str
     ) -> List[Dict[str, Any]]:
-        """Resolve ``app=`` through exact names before convenience substrings.
-
-        Linux ``list_windows`` can omit an app name while ``list_apps`` retains
-        name/bundle-ID metadata. Exact direct names and exact metadata aliases
-        must win over substring matches: querying ``Code`` must not silently
-        select ``Visual Studio Code`` merely because it is frontmost.
-        """
-        app_lower = app.strip().lower()
-        if not app_lower:
-            return []
-
-        direct_exact = [
-            w for w in windows
-            if app_lower == str(w.get("app_name", "")).strip().lower()
-        ]
-        if direct_exact:
-            return direct_exact
-
-        try:
-            running_apps = self.list_apps()
-        except Exception as exc:
-            # A title can still be the only usable identity on X11 when app
-            # enumeration is unavailable, so retain the constrained title
-            # fallback below instead of treating this as a hard no-match.
-            logger.debug("computer_use list_apps fallback failed for %r: %s", app, exc)
-            running_apps = []
-
-        exact_pids: set[int] = set()
-        partial_pids: set[int] = set()
-        for raw_app in running_apps:
-            if not isinstance(raw_app, dict) or raw_app.get("running") is False:
-                continue
-            raw_pid = raw_app.get("pid")
-            if isinstance(raw_pid, bool) or not isinstance(raw_pid, (int, str)):
-                continue
-            try:
-                pid = int(raw_pid)
-            except ValueError:
-                continue
-            if pid <= 0:
-                continue
-
-            aliases = {
-                value.strip().lower()
-                for key in ("bundle_id", "bundleId", "name", "app_name", "display_name")
-                if isinstance((value := raw_app.get(key)), str) and value.strip()
-            }
-            if app_lower in aliases:
-                exact_pids.add(pid)
-            elif any(app_lower in alias for alias in aliases):
-                partial_pids.add(pid)
-
-        metadata_exact = [w for w in windows if w.get("pid") in exact_pids]
-        if metadata_exact:
-            return metadata_exact
-
-        direct_partial = [
-            w for w in windows
-            if app_lower in str(w.get("app_name", "")).lower()
-        ]
-        if direct_partial:
-            return direct_partial
-
-        metadata_partial = [w for w in windows if w.get("pid") in partial_pids]
-        if metadata_partial:
-            return metadata_partial
-
-        # Some X11 backends expose a title but no app name. Restrict this final
-        # fallback to nameless rows so a localized app name is not overridden
-        # merely because its title happens to be in the caller's language.
-        return [
-            w for w in windows
-            if not str(w.get("app_name", "")).strip()
-            and app_lower in str(w.get("title", "")).lower()
-        ]
+        """Compatibility delegate to the bounded capture-target resolver."""
+        return _resolve_windows_for_app(
+            windows,
+            app,
+            list_apps=self.list_apps,
+            logger=logger,
+        )
 
     def _capture_full_screen(self, mode: str) -> CaptureResult:
         """Capture the whole displayed screen via cua-driver's desktop lane.

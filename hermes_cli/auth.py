@@ -78,7 +78,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from hermes_cli.config import (
@@ -86,6 +86,12 @@ from hermes_cli.config import (
     get_config_path,
     read_raw_config,
     require_readable_config_before_write,
+)
+from hermes_cli.auth_suppression import (
+    filter_suppressed_entries as _filter_suppressed_global_entries,
+    source_is_suppressed as _source_is_suppressed,
+    suppressed_sources_for as _suppressed_sources_for,
+    suppression_union as _suppression_union,
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
@@ -1489,6 +1495,23 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     return auth_file
 
 
+_GLOBAL_PROVIDER_STATE_SOURCES = {
+    "nous": "device_code",
+    "openai-codex": "device_code",
+    "xai-oauth": "device_code",
+}
+
+
+def _global_provider_state_source(
+    provider_id: str, state: Dict[str, Any]
+) -> Optional[str]:
+    """Resolve the source whose suppression governs a global singleton state."""
+    explicit_source = state.get("source")
+    if isinstance(explicit_source, str) and explicit_source.strip():
+        return explicit_source.strip()
+    return _GLOBAL_PROVIDER_STATE_SOURCES.get(provider_id)
+
+
 def _load_provider_state_with_source(
     auth_store: Dict[str, Any],
     provider_id: str,
@@ -1515,6 +1538,15 @@ def _load_provider_state_with_source(
         if isinstance(global_providers, dict):
             global_state = global_providers.get(provider_id)
             if isinstance(global_state, dict):
+                fallback_source = _global_provider_state_source(
+                    provider_id, global_state
+                )
+                if (
+                    fallback_source
+                    and fallback_source
+                    in _suppressed_sources_for_provider(auth_store, provider_id)
+                ):
+                    return None, None
                 return dict(global_state), global_path
     return None, None
 
@@ -1687,7 +1719,20 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def _suppressed_sources_for_provider(
+    auth_store: Dict[str, Any], provider_id: str
+) -> set[str]:
+    """Compatibility delegate to the canonical profile/root suppression owner."""
+    return _suppression_union(
+        auth_store,
+        _load_global_auth_store(),
+        provider_id,
+    )
+
+
+def read_credential_pool(
+    provider_id: Optional[str] = None,
+) -> Union[Dict[str, Any], List[Any]]:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1723,7 +1768,12 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
             existing = merged.get(gp_key)
             if isinstance(existing, list) and existing:
                 continue
-            merged[gp_key] = list(gp_entries)
+            filtered_entries = _filter_suppressed_global_entries(
+                gp_entries,
+                _suppressed_sources_for_provider(auth_store, gp_key),
+            )
+            if filtered_entries:
+                merged[gp_key] = filtered_entries
         return merged
 
     provider_entries = pool.get(provider_id)
@@ -1731,7 +1781,12 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return list(provider_entries)
     # Profile has no entries for this provider — fall back to global.
     global_entries = global_pool.get(provider_id)
-    return list(global_entries) if isinstance(global_entries, list) else []
+    if not isinstance(global_entries, list):
+        return []
+    return _filter_suppressed_global_entries(
+        global_entries,
+        _suppressed_sources_for_provider(auth_store, provider_id),
+    )
 
 
 _POOL_STATUS_FIELDS = (
@@ -1898,11 +1953,32 @@ def suppress_credential_source(provider_id: str, source: str) -> None:
 
 
 def is_source_suppressed(provider_id: str, source: str) -> bool:
-    """Check if a credential source has been suppressed by the user."""
+    """Check if a credential source has been suppressed by the user.
+
+    Consults the profile store AND the global root, and answers their UNION.
+
+    ``read_credential_pool`` and ``_load_provider_state_with_source`` already fall
+    back to the global root so a provider authed there is visible to a profile
+    process that has not configured it locally. This one did not, which left the
+    deny-list as the one piece of auth state a profile escaped by simply not
+    repeating it: ``hermes auth remove`` at the root writes a suppression marker
+    meaning "stop seeding this source", and every profile then re-seeded it anyway.
+
+    Union rather than shadow, deliberately. For a credential pool, a profile's own
+    answer should win when it has one — that is what shadowing is for. A deny-list
+    is the opposite: it must not be escapable by omission, or it is not a list. The
+    cost is that a global suppression can no longer be overridden in one profile;
+    expressing that now means unsuppressing globally and suppressing in the others,
+    which states the intent explicitly instead of relying on an absent key.
+
+    """
     try:
-        auth_store = _load_auth_store()
-        suppressed = auth_store.get("suppressed_sources", {})
-        return source in suppressed.get(provider_id, [])
+        return _source_is_suppressed(
+            _load_auth_store(),
+            _load_global_auth_store(),
+            provider_id,
+            source,
+        )
     except Exception:
         return False
 
@@ -1934,6 +2010,42 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
             auth_store.pop("suppressed_sources", None)
         _save_auth_store(auth_store)
         return True
+
+
+def lift_provider_suppressions(provider_id: str) -> List[str]:
+    """Lift every suppression marker this scope can write for ``provider_id``.
+
+    Re-adding a credential is an explicit re-engagement signal, so ``hermes auth
+    add`` and the dashboard's pool-add both clear the provider's whole deny-list
+    rather than only the source being re-added.
+
+    Writes stay scoped to this process's store — a profile must not rewrite the
+    global root on the other profiles' behalf — so in profile mode a marker set at
+    the root survives, and because ``is_source_suppressed`` answers the union of
+    both scopes it stays in force. Those names are RETURNED rather than dropped so
+    the caller can say so, instead of reporting a clean re-engagement and leaving
+    the user to wonder why a provider they just re-added still will not seed from
+    that source. Always empty in classic mode, where there is no global scope
+    distinct from this one.
+    """
+    try:
+        local = _suppressed_sources_for(_load_auth_store(), provider_id)
+    except Exception:
+        logger.debug(
+            "auth: could not read suppression markers for %s", provider_id, exc_info=True
+        )
+        return []
+    for source in local:
+        try:
+            unsuppress_credential_source(provider_id, source)
+        except Exception:
+            logger.debug(
+                "auth: could not lift suppression %s/%s", provider_id, source, exc_info=True
+            )
+    try:
+        return _suppressed_sources_for(_load_global_auth_store(), provider_id)
+    except Exception:
+        return []
 
 
 def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:

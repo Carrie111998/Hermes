@@ -1,5 +1,6 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
+import json
 import logging
 
 import pytest
@@ -112,6 +113,28 @@ class TestEnvAssignments:
         assert result.startswith("export ")
         assert "SECRET_TOKEN=" in result
         assert "mypassword" not in result
+
+    @pytest.mark.parametrize(
+        ("key", "delimiter", "opposite_quote"),
+        [
+            ("API_KEY", "'", '"'),
+            ("API_KEY", '"', "'"),
+            ("openai_key", "'", '"'),
+            ("openai_key", '"', "'"),
+        ],
+    )
+    def test_quoted_env_value_with_opposite_quote_redacts_without_swallowing_markup(
+        self, key, delimiter, opposite_quote
+    ):
+        value = "opaque-value-" + opposite_quote + "-still-secret-123456"
+        markup = "<span>public-tail</span>"
+        text = f"{key}={delimiter}{value}{delimiter};{markup}"
+
+        result = redact_sensitive_text(text, force=True)
+
+        assert value not in result
+        assert result.startswith(f"{key}={delimiter}")
+        assert result.endswith(f"{delimiter};{markup}")
 
 
 class TestBareSecretEnvSuffixes:
@@ -250,6 +273,76 @@ class TestJsonFields:
         text = '{"name": "John", "model": "gpt-4"}'
         result = redact_sensitive_text(text)
         assert result == text
+
+    @pytest.mark.parametrize(
+        "mode",
+        ["default", "code_file", "file_read", "terminal"],
+    )
+    def test_exact_credential_fields_redact_in_every_output_mode(self, mode):
+        access_value = "access-" + "opaque-carrier-value"
+        refresh_value = "refresh-" + "opaque-carrier-value"
+        session_value = "session-" + "opaque-carrier-value"
+        digest = "7f" * 32
+        text = json.dumps({
+            "access_token": access_value,
+            "refresh_token": refresh_value,
+            "session_token": session_value,
+            "sha256": digest,
+            "message": "token_count remains public prose",
+        })
+
+        if mode == "terminal":
+            from agent.redact import redact_terminal_output
+
+            result = redact_terminal_output(text, "printf result", force=True)
+        else:
+            result = redact_sensitive_text(
+                text,
+                force=True,
+                code_file=mode == "code_file",
+                file_read=mode == "file_read",
+            )
+
+        assert access_value not in result
+        assert refresh_value not in result
+        assert session_value not in result
+        assert digest in result
+        assert "token_count remains public prose" in result
+
+    @pytest.mark.parametrize(
+        "mode",
+        ["default", "code_file", "file_read", "terminal"],
+    )
+    def test_dashboard_session_assignment_redacts_without_consuming_markup(
+        self, mode
+    ):
+        session_value = "dashboard-" + "opaque-carrier-value"
+        digest = "ab" * 32
+        text = (
+            '<script>window.__HERMES_SESSION_TOKEN__ = "'
+            + session_value
+            + '";</script><main data-sha="'
+            + digest
+            + '">ready</main>'
+        )
+
+        if mode == "terminal":
+            from agent.redact import redact_terminal_output
+
+            result = redact_terminal_output(text, "printf result", force=True)
+        else:
+            result = redact_sensitive_text(
+                text,
+                force=True,
+                code_file=mode == "code_file",
+                file_read=mode == "file_read",
+            )
+
+        assert session_value not in result
+        assert "window.__HERMES_SESSION_TOKEN__" in result
+        assert result.endswith(
+            '";</script><main data-sha="' + digest + '">ready</main>'
+        )
 
 
 class TestAuthHeaders:

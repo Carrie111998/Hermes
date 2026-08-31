@@ -19,12 +19,18 @@ from pathlib import Path
 import pytest
 
 
-def _make_auth_store(pool: dict | None = None, providers: dict | None = None) -> dict:
+def _make_auth_store(
+    pool: dict | None = None,
+    providers: dict | None = None,
+    suppressed_sources: dict | None = None,
+) -> dict:
     store: dict = {"version": 1}
     if pool is not None:
         store["credential_pool"] = pool
     if providers is not None:
         store["providers"] = providers
+    if suppressed_sources is not None:
+        store["suppressed_sources"] = suppressed_sources
     return store
 
 
@@ -55,6 +61,53 @@ def _write(path: Path, payload: dict) -> None:
 # ---------------------------------------------------------------------------
 # read_credential_pool — provider-slice reads
 # ---------------------------------------------------------------------------
+
+
+def _fallback_entry(entry_id: str, source: str) -> dict:
+    return {
+        "id": entry_id,
+        "label": entry_id,
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": source,
+        "access_token": "opaque-" + entry_id + "-value",
+    }
+
+
+def test_provider_slice_filters_suppressed_global_sources(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    suppressed_source = "device_code"
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "xai-oauth": [
+            _fallback_entry("global-device", suppressed_source),
+            _fallback_entry("global-manual", "manual"),
+        ],
+    }))
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(
+            pool={},
+            suppressed_sources={"xai-oauth": [suppressed_source]},
+        ),
+    )
+
+    assert [entry["id"] for entry in read_credential_pool("xai-oauth")] == [
+        "global-manual"
+    ]
+
+    # A non-empty local slice remains authoritative even when global fallback
+    # has unsuppressed entries available.
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(
+            pool={"xai-oauth": [_fallback_entry("profile-local", "manual")]},
+            suppressed_sources={"xai-oauth": [suppressed_source]},
+        ),
+    )
+    assert [entry["id"] for entry in read_credential_pool("xai-oauth")] == [
+        "profile-local"
+    ]
 
 
 
@@ -109,9 +162,109 @@ def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):
 # ---------------------------------------------------------------------------
 
 
+def test_whole_pool_merge_filters_suppressed_global_sources(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    suppressed_source = "device_code"
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "xai-oauth": [
+            _fallback_entry("global-device", suppressed_source),
+            _fallback_entry("global-manual", "manual"),
+        ],
+        "openrouter": [_fallback_entry("global-router", "manual")],
+    }))
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(
+            pool={},
+            suppressed_sources={"xai-oauth": [suppressed_source]},
+        ),
+    )
+
+    merged = read_credential_pool()
+    assert isinstance(merged, dict)
+    assert [entry["id"] for entry in merged["xai-oauth"]] == ["global-manual"]
+    assert [entry["id"] for entry in merged["openrouter"]] == ["global-router"]
+
+
+
 # ---------------------------------------------------------------------------
 # get_provider_auth_state — singleton fallback
 # ---------------------------------------------------------------------------
+
+
+def test_provider_state_fallback_respects_profile_source_suppression(profile_env):
+    from hermes_cli.auth import get_provider_auth_state
+
+    suppressed_source = "device_code"
+    access_value = "xai-access-" + "opaque-value"
+    refresh_value = "xai-refresh-" + "opaque-value"
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(providers={
+            "xai-oauth": {
+                "tokens": {
+                    "access_token": access_value,
+                    "refresh_token": refresh_value,
+                },
+                "auth_mode": "oauth_device_code",
+            },
+        }),
+    )
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(
+            providers={},
+            suppressed_sources={"xai-oauth": [suppressed_source]},
+        ),
+    )
+
+    assert get_provider_auth_state("xai-oauth") is None
+
+
+def test_root_only_suppression_blocks_all_profile_global_fallbacks(profile_env):
+    """A root deny-list cannot disappear when a named profile omits it."""
+    from hermes_cli.auth import get_provider_auth_state, read_credential_pool
+
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(
+            pool={
+                "xai-oauth": [
+                    _fallback_entry("global-device", "device_code"),
+                    _fallback_entry("global-manual", "manual"),
+                ],
+            },
+            providers={
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "synthetic-access-value",
+                        "refresh_token": "synthetic-refresh-value",
+                    },
+                    "auth_mode": "oauth_device_code",
+                },
+            },
+            suppressed_sources={"xai-oauth": ["device_code"]},
+        ),
+    )
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(pool={}, providers={}),
+    )
+
+    # Provider-slice fallback keeps the unsuppressed positive control only.
+    assert [entry["id"] for entry in read_credential_pool("xai-oauth")] == [
+        "global-manual"
+    ]
+
+    # Whole-pool merge applies the same union-of-denials policy.
+    merged = read_credential_pool()
+    assert isinstance(merged, dict)
+    assert [entry["id"] for entry in merged["xai-oauth"]] == ["global-manual"]
+
+    # Singleton/provider-state fallback cannot resurrect the root device login.
+    assert get_provider_auth_state("xai-oauth") is None
+
 
 
 def test_provider_auth_state_falls_back_to_global_when_profile_has_none(profile_env):
@@ -288,3 +441,166 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+# ---------------------------------------------------------------------------
+# is_source_suppressed — a deny-list must not be escapable by omission
+# ---------------------------------------------------------------------------
+
+
+def _suppressed_store(mapping: dict) -> dict:
+    # ``providers`` is not decoration: _load_auth_store() discards the whole
+    # store and returns an empty default unless it finds a dict-valued
+    # "providers" or "credential_pool" key, so a fixture carrying only
+    # suppressed_sources would read back as {} and pass for the wrong reason.
+    return {"version": 1, "providers": {}, "suppressed_sources": mapping}
+
+
+def test_a_global_suppression_is_honoured_inside_a_profile(profile_env):
+    """`hermes auth remove` at the root must not silently reverse per profile.
+
+    read_credential_pool and get_provider_auth_state already fall back to the
+    global root so a provider authed there is visible in profile mode.
+    is_source_suppressed did not, which left the deny-list as the one piece of
+    auth state a profile escaped by simply not repeating it: the root said "stop
+    seeding this source" and every profile re-seeded it on the next load.
+    """
+    from hermes_cli.auth import is_source_suppressed
+
+    _write(profile_env["global"] / "auth.json",
+           _suppressed_store({"copilot": ["env:GITHUB_TOKEN", "gh_cli"]}))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+
+    assert is_source_suppressed("copilot", "gh_cli") is True
+    assert is_source_suppressed("copilot", "env:GITHUB_TOKEN") is True
+    assert is_source_suppressed("copilot", "manual") is False
+    assert is_source_suppressed("openrouter", "gh_cli") is False
+
+
+def test_a_profile_suppression_still_works_on_its_own(profile_env):
+    """The pre-existing behaviour: a marker written in the profile is honoured
+    there even when the global root knows nothing about it."""
+    from hermes_cli.auth import is_source_suppressed
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={}))
+    _write(profile_env["profile"] / "auth.json",
+           _suppressed_store({"zai": ["env:GLM_API_KEY"]}))
+
+    assert is_source_suppressed("zai", "env:GLM_API_KEY") is True
+
+
+def test_the_two_scopes_are_unioned_not_shadowed(profile_env):
+    """A profile that suppresses ONE source does not un-suppress the others.
+
+    This is the difference between union and shadow, and it is the whole point:
+    with shadowing, a profile listing any marker at all would hide every global
+    marker for that provider.
+    """
+    from hermes_cli.auth import is_source_suppressed
+
+    _write(profile_env["global"] / "auth.json",
+           _suppressed_store({"copilot": ["gh_cli"]}))
+    _write(profile_env["profile"] / "auth.json",
+           _suppressed_store({"copilot": ["env:GH_TOKEN"]}))
+
+    assert is_source_suppressed("copilot", "gh_cli") is True
+    assert is_source_suppressed("copilot", "env:GH_TOKEN") is True
+
+
+def test_a_dict_shaped_entry_is_accepted(profile_env):
+    """unsuppress_credential_source already handles a dict as well as a list, so
+    the reader has to accept both or the two disagree about the same file."""
+    from hermes_cli.auth import is_source_suppressed
+
+    _write(profile_env["global"] / "auth.json",
+           _suppressed_store({"copilot": {"gh_cli": "2026-08-19T00:00:00Z"}}))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+
+    assert is_source_suppressed("copilot", "gh_cli") is True
+
+
+def test_a_malformed_global_store_does_not_break_the_check(profile_env):
+    """Same robustness the neighbouring fallback paths already have: an unreadable
+    global file must not make a profile process raise on an auth question."""
+    from hermes_cli.auth import is_source_suppressed
+
+    (profile_env["global"] / "auth.json").write_text("{not valid json")
+    _write(profile_env["profile"] / "auth.json",
+           _suppressed_store({"copilot": ["gh_cli"]}))
+
+    assert is_source_suppressed("copilot", "gh_cli") is True
+    assert is_source_suppressed("copilot", "manual") is False
+# ---------------------------------------------------------------------------
+# lift_provider_suppressions — re-engagement across the two scopes
+# ---------------------------------------------------------------------------
+
+
+def test_lifting_suppressions_reports_what_the_root_still_denies(profile_env):
+    """`hermes auth add` lifts what it owns and names what it cannot.
+
+    The re-engagement gesture clears the provider's whole deny-list, but a profile
+    must not rewrite the global root on the other profiles' behalf. Since
+    is_source_suppressed now answers the union, a root marker stays in force — so
+    it is returned, not dropped, and the caller says so rather than reporting a
+    clean re-engagement that only partly happened.
+    """
+    from hermes_cli.auth import is_source_suppressed, lift_provider_suppressions
+
+    _write(profile_env["global"] / "auth.json",
+           _suppressed_store({"copilot": ["gh_cli"]}))
+    _write(profile_env["profile"] / "auth.json",
+           _suppressed_store({"copilot": ["env:GH_TOKEN", "claude_code"]}))
+
+    assert lift_provider_suppressions("copilot") == ["gh_cli"]
+
+    # What the profile owned is gone for good...
+    assert is_source_suppressed("copilot", "env:GH_TOKEN") is False
+    assert is_source_suppressed("copilot", "claude_code") is False
+    # ...and the name that came back is not advisory: it is still denied.
+    assert is_source_suppressed("copilot", "gh_cli") is True
+
+
+def test_lifting_suppressions_leaves_other_providers_alone(profile_env):
+    """The gesture is per-provider: re-adding copilot must not re-enable zai."""
+    from hermes_cli.auth import is_source_suppressed, lift_provider_suppressions
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={}))
+    _write(profile_env["profile"] / "auth.json",
+           _suppressed_store({"copilot": ["gh_cli"], "zai": ["env:GLM_API_KEY"]}))
+
+    assert lift_provider_suppressions("copilot") == []
+
+    assert is_source_suppressed("copilot", "gh_cli") is False
+    assert is_source_suppressed("zai", "env:GLM_API_KEY") is True
+
+
+def test_lifting_suppressions_reports_nothing_without_a_distinct_global(profile_env,
+                                                                       monkeypatch):
+    """Classic mode: one scope, so there is never a residual to report.
+
+    Pointing the default root at the active home is what "no global scope distinct
+    from mine" means to _global_auth_file_path(), and is how the vast majority of
+    installs run.  Behaviour there must be exactly what it was before the union.
+    """
+    import hermes_constants
+    from hermes_cli.auth import is_source_suppressed, lift_provider_suppressions
+
+    monkeypatch.setattr(hermes_constants, "get_default_hermes_root",
+                        lambda: profile_env["profile"])
+    _write(profile_env["profile"] / "auth.json",
+           _suppressed_store({"copilot": ["gh_cli", "env:GH_TOKEN"]}))
+
+    assert lift_provider_suppressions("copilot") == []
+    assert is_source_suppressed("copilot", "gh_cli") is False
+    assert is_source_suppressed("copilot", "env:GH_TOKEN") is False
+
+
+def test_lifting_suppressions_accepts_a_dict_shaped_entry(profile_env):
+    """An older store holds a mapping keyed by source name; the write side already
+    migrated it in place, so the read side must not be the one to trip over it."""
+    from hermes_cli.auth import is_source_suppressed, lift_provider_suppressions
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={}))
+    _write(profile_env["profile"] / "auth.json",
+           _suppressed_store({"copilot": {"gh_cli": "2026-08-19T00:00:00Z"}}))
+
+    assert lift_provider_suppressions("copilot") == []
+    assert is_source_suppressed("copilot", "gh_cli") is False

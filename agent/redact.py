@@ -152,14 +152,28 @@ _PREFIX_PATTERNS = [
 _SECRET_ENV_NAMES = r"(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|PASS|PW|CREDENTIAL|AUTH)"
 # Uppercase keys keep the legacy embedded match (``MYTOKEN=…``, ``FOO_SECRET``)
 # — an all-caps key is almost never prose.
+_ENV_ASSIGN_SINGLE_QUOTED_RE = re.compile(
+    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(')([^'\r\n]*)'",
+)
+_ENV_ASSIGN_DOUBLE_QUOTED_RE = re.compile(
+    rf'([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(")([^"\r\n]*)"',
+)
 _ENV_ASSIGN_RE = re.compile(
-    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
+    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*()([^\s'\"]+)",
 )
 # Lowercase env names: only underscore-boundary forms (``openai_key=…``,
 # ``FAL_KEY=…``, ``db_pw=…``) — NOT bare ``password=``/``token=``/``secret=``,
 # which appear in prose, URLs, and form bodies (issue #77484).
+_ENV_ASSIGN_LOWER_SINGLE_QUOTED_RE = re.compile(
+    rf"([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(')([^'\r\n]*)'",
+    re.IGNORECASE,
+)
+_ENV_ASSIGN_LOWER_DOUBLE_QUOTED_RE = re.compile(
+    rf'([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(")([^"\r\n]*)"',
+    re.IGNORECASE,
+)
 _ENV_ASSIGN_LOWER_RE = re.compile(
-    rf"([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*(['\"]?)(\S+)\2",
+    rf"([a-z0-9_]+(?:_|^)(?:key|pass|pw|token|secret|password|passwd|credential|auth)(?=[^a-z0-9_]|$))\s*=\s*()([^\s'\"]+)",
     re.IGNORECASE,
 )
 
@@ -171,9 +185,9 @@ _ENV_ASSIGN_LOWER_RE = re.compile(
 # These run only in a config-file context, NOT in prose, code, or URLs — three
 # carve-outs preserved from the original design (#4367 + the documented
 # web-URL passthrough below):
-#   1. The value is bounded by ``[^\s&]`` (stops at whitespace AND ``&``) so
-#      form-urlencoded bodies are handled pair-by-pair (by _redact_form_body),
-#      not greedily swallowed.
+#   1. Quoted values bind the opening quote possessively, so the regex cannot
+#      backtrack to an unquoted match and swallow trailing shell/HTML markup.
+#      Unquoted values stop at whitespace, ``&``, ``;``, or markup start.
 #   2. _CFG_DOTTED_RE only matches when the key is NAMESPACED (contains a dot),
 #      which is unambiguously a config key — never a prose word.
 #   3. _CFG_ANCHORED_RE matches a bare secret-word key only at line start
@@ -181,7 +195,7 @@ _ENV_ASSIGN_LOWER_RE = re.compile(
 #      mid-sentence is left alone.
 # The colon-form URL guard (skip when ``://`` present) lives at the call site.
 _SECRET_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential|auth)"
-_CFG_VALUE = r"(['\"]?)([^\s&]+?)\2(?=[\s&]|$)"
+_CFG_VALUE = r"(['\"]?+)([^\s&]+?)\2(?=[\s&;<]|$)"
 # Linear pre-gate for the _CFG_*_RE subs below: a text with no secret keyword
 # can never match either pattern, so the (potentially backtrack-heavy) subs
 # are skipped entirely for such text. See the call site in
@@ -319,6 +333,19 @@ def _key_has_secret_keyword(key: str) -> bool:
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(
     rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
+    re.IGNORECASE,
+)
+
+# Exact credential carriers remain sensitive even when their surrounding text
+# is source code or file content. Keep this list narrow so code_file=True still
+# preserves illustrative generic fields such as ``{"token": "example"}``.
+_ALWAYS_REDACT_JSON_FIELD_RE = re.compile(
+    r'("(?:access_token|refresh_token|session_token)")\s*:\s*"([^"]+)"',
+    re.IGNORECASE,
+)
+
+_JS_SESSION_TOKEN_ASSIGN_RE = re.compile(
+    r"((?:window\s*\.\s*)?__HERMES_SESSION_TOKEN__\s*=\s*)(['\"])([^'\"\r\n]*)(\2)",
     re.IGNORECASE,
 )
 
@@ -791,10 +818,11 @@ def redact_sensitive_text(
     URL userinfo. The default remains False because actionable OAuth callback,
     magic-link, and pre-signed URLs must survive ordinary tool flows unchanged.
 
-    Set code_file=True to skip the ENV-assignment and JSON-field regex
+    Set code_file=True to skip the broad ENV-assignment and generic JSON-field
     patterns when the text is known to be source code (e.g. MAX_TOKENS=***
-    constants, "apiKey": "test" fixtures). Prefix patterns, auth headers,
-    private keys, DB connstrings, JWTs, and URL secrets are still redacted.
+    constants, "apiKey": "test" fixtures). Exact access/refresh/session token
+    JSON carriers, prefix patterns, auth headers, private keys, DB connstrings,
+    JWTs, and URL secrets are still redacted.
 
     Set file_read=True for file *content* returned to the agent (read_file /
     search_files / cat). Secrets are STILL redacted — they are never exposed —
@@ -830,6 +858,35 @@ def redact_sensitive_text(
     if file_read:
         code_file = True
 
+    # Dashboard bootstrap HTML carries the session credential in a JavaScript
+    # assignment. Match only the quoted value so trailing ``;</script>`` and
+    # later markup cannot be swallowed by the generic ENV-assignment pass.
+    if "HERMES_SESSION_TOKEN" in text:
+        _js_session_assignment = _JS_SESSION_TOKEN_ASSIGN_RE.search(text)
+        if _js_session_assignment is not None:
+            _js_mask = _mask_token_nonreusable if file_read else _mask_token
+            text = _JS_SESSION_TOKEN_ASSIGN_RE.sub(
+                lambda m: (
+                    f"{m.group(1)}{m.group(2)}{_js_mask(m.group(3))}{m.group(4)}"
+                ),
+                text,
+            )
+            # The carrier proves this block is JavaScript/HTML, not an env or
+            # dotted-config dump. Keep the broad assignment passes off so they
+            # cannot reinterpret markup after the now-masked value.
+            code_file = True
+
+    # Exact JSON credential fields are high-confidence carriers, not generic
+    # secret-keyword guesses. Redact them in every output mode, including
+    # source/file/ordinary-terminal paths where the broad JSON pass below is
+    # intentionally disabled to avoid corrupting examples and prose.
+    if ":" in text and '"' in text:
+        _exact_json_mask = _mask_token_nonreusable if file_read else _mask_token
+        text = _ALWAYS_REDACT_JSON_FIELD_RE.sub(
+            lambda m: f'{m.group(1)}: "{_exact_json_mask(m.group(2))}"',
+            text,
+        )
+
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
         _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
@@ -860,6 +917,8 @@ def redact_sensitive_text(
                 if not _key_has_secret_keyword(name):
                     return m.group(0)
                 return f"{name}={quote}{_mask_token(value)}{quote}"
+            text = _ENV_ASSIGN_SINGLE_QUOTED_RE.sub(_redact_env, text)
+            text = _ENV_ASSIGN_DOUBLE_QUOTED_RE.sub(_redact_env, text)
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
             # Lowercase env names (``openai_key=…``). Skip URLs — the query
             # string may contain ``token=``/``key=`` params that are
@@ -868,6 +927,8 @@ def redact_sensitive_text(
             # case). The uppercase regex above is all-caps-only, so it never
             # matches URL params; the lowercase one would (issue #77484).
             if "://" not in text:
+                text = _ENV_ASSIGN_LOWER_SINGLE_QUOTED_RE.sub(_redact_env, text)
+                text = _ENV_ASSIGN_LOWER_DOUBLE_QUOTED_RE.sub(_redact_env, text)
                 text = _ENV_ASSIGN_LOWER_RE.sub(_redact_env, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
