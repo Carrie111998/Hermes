@@ -210,6 +210,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         self._discovery_fetched_at: float = 0.0
         self._discovery_lock = threading.Lock()
         self._jwks_client: Any = None
+        self._jwks_client_lock = threading.Lock()
 
     # ---- public API (DashboardAuthProvider) -------------------------------
 
@@ -307,8 +308,11 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         # unreachable.
         try:
             claims = self._verify_id_token(access_token)
-        except InvalidCodeError:
+        except InvalidCodeError as exc:
             # Expired / invalid token — protocol says return None, not raise.
+            # Keep claim/config drift diagnosable without turning attacker-
+            # controlled invalid tokens into warning-level log spam.
+            logger.debug("self-hosted OIDC: session token invalid: %s", exc)
             return None
         except ProviderError:
             raise
@@ -594,31 +598,70 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
 
     def _get_jwks_client(self) -> Any:
         if self._jwks_client is None:
-            from jwt import PyJWKClient  # lazy import
+            with self._jwks_client_lock:
+                if self._jwks_client is None:
+                    from jwt import PyJWKClient  # lazy import
 
-            disco = self._get_discovery()
-            self._jwks_client = PyJWKClient(
-                disco["jwks_uri"],
-                cache_keys=True,
-                lifespan=_JWKS_CACHE_SECONDS,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": "HermesAgent/1.0",
-                },
-            )
+                    disco = self._get_discovery()
+                    self._jwks_client = PyJWKClient(
+                        disco["jwks_uri"],
+                        cache_keys=True,
+                        lifespan=_JWKS_CACHE_SECONDS,
+                        headers={
+                            "Accept": "application/json",
+                            "User-Agent": "HermesAgent/1.0",
+                        },
+                    )
         return self._jwks_client
 
     def _verify_id_token(self, id_token: str) -> Dict[str, Any]:
         import jwt  # lazy import — keeps startup fast for the ungated path
 
+        # Reject tokens that are not even structurally valid JWTs before any
+        # discovery/JWKS I/O. PyJWKClient otherwise reports some malformed
+        # inputs as lookup failures, which makes middleware misclassify a bad
+        # bearer as a retryable provider outage (503 instead of 401).
+        try:
+            header = jwt.get_unverified_header(id_token)
+        except jwt.InvalidTokenError as exc:
+            raise InvalidCodeError("ID token is malformed") from exc
+        if header.get("alg") not in _ALLOWED_ID_TOKEN_ALGS:
+            raise InvalidCodeError("ID token uses an unsupported algorithm")
+
         disco = self._get_discovery()
 
         try:
-            signing_key = self._get_jwks_client().get_signing_key_from_jwt(
-                id_token
-            )
-        except jwt.PyJWKClientError as exc:
+            jwks_client = self._get_jwks_client()
+            # Use PyJWKClient's per-key LRU on the normal path. Its generic
+            # PyJWKClientError also represents an unknown ``kid``, so inspect
+            # the cached, successfully parsed set below before classifying the
+            # token as invalid rather than treating an unusable JWKS as 401.
+            signing_key = jwks_client.get_signing_key(header.get("kid"))
+        except jwt.PyJWKClientConnectionError as exc:
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
+        except jwt.PyJWKSetError as exc:
+            raise ProviderError(f"JWKS is unusable: {exc}") from exc
+        except jwt.PyJWKClientError as exc:
+            try:
+                signing_keys = jwks_client.get_signing_keys()
+                signing_key = jwks_client.match_kid(
+                    signing_keys, header.get("kid")
+                )
+            except jwt.PyJWKClientConnectionError as lookup_exc:
+                raise ProviderError(
+                    f"JWKS lookup failed: {lookup_exc}"
+                ) from lookup_exc
+            except (jwt.PyJWKClientError, jwt.PyJWKSetError) as lookup_exc:
+                # A malformed/empty JWKS document is an IDP outage, not
+                # evidence that the caller's token is invalid. Preserve the
+                # session so middleware returns 503 instead of forcing logout.
+                raise ProviderError(
+                    f"JWKS is unusable: {lookup_exc}"
+                ) from lookup_exc
+            if signing_key is None:
+                raise InvalidCodeError(
+                    "ID token signing key is unknown"
+                ) from exc
         except Exception as exc:  # pragma: no cover - defensive
             raise ProviderError(f"JWKS lookup failed: {exc!r}") from exc
 
@@ -653,7 +696,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
                 )
             except Exception:
                 pass
-            raise ProviderError(
+            raise InvalidCodeError(
                 f"ID token verification failed: {exc}{details}"
             ) from exc
 

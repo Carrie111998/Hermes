@@ -19620,6 +19620,22 @@ def start_server(
             host, app.state.trusted_public_hosts
         )
 
+    # Parse installed-app callbacks once before the listener is started. An
+    # invalid allowlist is an operator configuration error and must fail closed
+    # rather than being discovered only after an authorization attempt.
+    from hermes_cli.dashboard_auth.native_redirects import (
+        NativeRedirectConfigurationError,
+        configured_native_redirect_uris,
+    )
+
+    server_config = load_config()
+    try:
+        app.state.native_redirect_uris = configured_native_redirect_uris(
+            server_config
+        )
+    except NativeRedirectConfigurationError as exc:
+        raise SystemExit(f"Invalid native redirect configuration: {exc}") from exc
+
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public
     # dashboards). If a caller still passes it, warn that it is now a no-op
@@ -19789,10 +19805,7 @@ def start_server(
     # Non-loopback ping cadence is config-driven (dashboard.ws_ping_interval /
     # dashboard.ws_ping_timeout, #79635); the 20/20 defaults keep the
     # Cloudflare-Tunnel-friendly behaviour when unset or invalid.
-    try:
-        _dash_cfg = load_config().get("dashboard") or {}
-    except Exception:
-        _dash_cfg = {}
+    _dash_cfg = server_config.get("dashboard") or {}
 
     def _ws_ping_setting(key: str, default: float = 20.0) -> float:
         try:

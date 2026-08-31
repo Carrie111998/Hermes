@@ -50,6 +50,36 @@ def test_dashboard_ws_values_propagate_from_yaml(_temp_home):
     assert dash.get("theme") == "default"
 
 
+def test_dashboard_auth_security_values_propagate_from_yaml(_temp_home):
+    from hermes_cli.config import load_config
+    from hermes_cli.dashboard_auth.native_redirects import (
+        configured_native_redirect_uris,
+    )
+    from hermes_cli.web_server import _dashboard_forwarded_allow_ips
+
+    _write_config(
+        _temp_home,
+        """
+        dashboard:
+          trusted_proxies:
+            - 172.18.0.0/16
+          oauth:
+            native_redirect_uris:
+              - com.example.hermes:/oauth/callback
+        """,
+    )
+    cfg = load_config()
+
+    assert _dashboard_forwarded_allow_ips(cfg["dashboard"]) == [
+        "127.0.0.1",
+        "::1",
+        "172.18.0.0/16",
+    ]
+    assert configured_native_redirect_uris(cfg) == frozenset(
+        {"com.example.hermes:/oauth/callback"}
+    )
+
+
 def test_ws_orphan_reap_grace_reads_config(_temp_home):
     from tui_gateway import server
 

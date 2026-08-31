@@ -111,12 +111,43 @@ Passwords, etc.) autofill the form, something no embedded desktop webview can
 offer. Token-only credentials (e.g. drain) are not interactive sign-ins and do
 not advertise `native_pkce`.
 
+Desktop uses a literal loopback callback by default. Installed mobile apps may
+instead use an exact operator-approved private-use callback configured in
+`~/.hermes/config.yaml`:
+
+```yaml
+dashboard:
+  # Required when a reverse proxy reaches Hermes from a non-loopback address.
+  # List only the proxy IP/CIDR; never use a wildcard on a public backend.
+  trusted_proxies:
+    - 172.18.0.0/16
+  oauth:
+    native_redirect_uris:
+      - com.example.hermes:/oauth/callback
+```
+
+Each entry must use a dotted private-use scheme and an absolute path, with no
+authority, userinfo, query, fragment, whitespace, backslash, or unsafe URI
+delimiter. Matching is byte-for-byte: there are no wildcard, prefix, suffix, or
+case-normalized matches. Restart the gateway after changing this startup-only
+allowlist. The upstream identity provider still redirects only to the gateway's
+HTTPS callback; the private-use scheme is registered with the installed app,
+not the identity provider.
+
+Hermes takes the native endpoint rate-limit identity from Uvicorn's trusted
+connection metadata, never directly from `X-Forwarded-For`. If a reverse proxy
+connects from outside loopback, include its exact address or bounded CIDR in
+`dashboard.trusted_proxies`; otherwise every proxied client appears to come
+from the proxy itself and shares its rate-limit budget. Loopback remains trusted
+automatically; wildcards and `/0` networks are rejected.
+
 The relevant endpoints (all public, pre-auth bootstrap, same as the existing
 `/auth/*` OAuth routes):
 
 - `GET /auth/native/authorize` — starts the brokered PKCE login
 - `POST /auth/native/token` — exchanges the loopback code + verifier for tokens
 - `POST /auth/native/refresh` — rotates tokens from the app's refresh token
+- `POST /auth/native/logout` — best-effort, provider-scoped token revocation
 
 ## See also
 

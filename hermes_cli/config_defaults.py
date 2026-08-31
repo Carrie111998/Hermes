@@ -1747,6 +1747,11 @@ DEFAULT_CONFIG = {
         "oauth": {
             "client_id": "",  # agent:{instance_id} — Portal provisions this
             "portal_url": "",  # blank → use plugin default (production Portal)
+            # Exact installed-app callbacks accepted in addition to RFC 8252
+            # literal-loopback redirects by /auth/native/authorize. Entries
+            # must use a dotted private-use scheme and an absolute path, with
+            # no authority, query, or fragment. Empty preserves loopback-only.
+            "native_redirect_uris": [],
         },
         # Username/password gate configuration — read by the bundled
         # ``dashboard_auth/basic`` plugin (a self-hosted "just put a

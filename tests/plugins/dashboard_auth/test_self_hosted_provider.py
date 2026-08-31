@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import time
 import urllib.parse
 from typing import Any, Dict
@@ -161,10 +162,24 @@ def _make_provider(
     fake_key.key = serialization.load_pem_private_key(
         rsa_keypair["private_pem"].encode(), password=None
     ).public_key()
+    fake_key.key_id = rsa_keypair["kid"]
     fake_client = MagicMock()
-    fake_client.get_signing_key_from_jwt.return_value = fake_key
+    fake_client.get_signing_key.return_value = fake_key
     p._jwks_client = fake_client
     return p
+
+
+def _real_jwks_client(jwk_set: Dict[str, Any]) -> jwt.PyJWKClient:
+    """Use PyJWT's real parser/key lookup with only network fetch stubbed."""
+    client = jwt.PyJWKClient("https://unused.example/jwks", cache_keys=True)
+
+    def _fetch_data():
+        # Mirror PyJWKClient.fetch_data's cache write while avoiding network.
+        client.jwk_set_cache.put(jwk_set)
+        return jwk_set
+
+    client.fetch_data = MagicMock(side_effect=_fetch_data)
+    return client
 
 
 def _mock_post(status_code: int, body: Any, *, ctype: str = "application/json"):
@@ -548,28 +563,139 @@ class TestVerifySession:
 
     def test_wrong_audience_raises(self, provider, rsa_keypair):
         token = _mint_id_token(rsa_keypair, aud="some-other-client")
-        with pytest.raises(ProviderError, match="verification failed"):
-            provider.verify_session(access_token=token)
+        assert provider.verify_session(access_token=token) is None
 
 
-    def test_failure_message_surfaces_claims(self, provider, rsa_keypair):
+    def test_failure_message_surfaces_claims(self, provider, rsa_keypair, caplog):
         token = _mint_id_token(rsa_keypair, iss="https://evil.example")
-        with pytest.raises(ProviderError) as excinfo:
-            provider.verify_session(access_token=token)
-        msg = str(excinfo.value)
-        assert "'https://evil.example'" in msg
-        assert f"'{_ISSUER}'" in msg
+        with caplog.at_level(logging.DEBUG, logger=oidc_plugin.logger.name):
+            assert provider.verify_session(access_token=token) is None
+        assert "'https://evil.example'" in caplog.text
+        assert f"'{_ISSUER}'" in caplog.text
+
+    def test_malformed_token_is_invalid_without_discovery(self, rsa_keypair):
+        provider = oidc_plugin.SelfHostedOIDCProvider(
+            issuer=_ISSUER, client_id=_CLIENT_ID
+        )
+        with patch.object(provider, "_get_discovery") as discovery:
+            assert provider.verify_session(access_token="not-a-jwt") is None
+        discovery.assert_not_called()
+
+    @pytest.mark.parametrize("algorithm", ["none", "HS256"])
+    def test_unsupported_token_algorithm_is_invalid_without_discovery(
+        self, algorithm
+    ):
+        provider = oidc_plugin.SelfHostedOIDCProvider(
+            issuer=_ISSUER, client_id=_CLIENT_ID
+        )
+        header = base64.urlsafe_b64encode(
+            json.dumps(
+                {"alg": algorithm, "typ": "JWT"}, separators=(",", ":")
+            ).encode()
+        ).rstrip(b"=").decode()
+        signature = "" if algorithm == "none" else "c2ln"
+        token = f"{header}.e30.{signature}"
+
+        with patch.object(provider, "_get_discovery") as discovery:
+            assert provider.verify_session(access_token=token) is None
+        discovery.assert_not_called()
 
 
     def test_jwks_unreachable_raises(self, provider, rsa_keypair):
         token = _mint_id_token(rsa_keypair)
         bad_client = MagicMock()
-        bad_client.get_signing_key_from_jwt.side_effect = jwt.PyJWKClientError(
+        bad_client.get_signing_key.side_effect = jwt.PyJWKClientConnectionError(
             "fetch failed"
         )
         provider._jwks_client = bad_client
         with pytest.raises(ProviderError, match="JWKS"):
             provider.verify_session(access_token=token)
+
+    def test_unusable_jwks_is_provider_error(self, provider, rsa_keypair):
+        token = _mint_id_token(rsa_keypair)
+        bad_client = MagicMock()
+        bad_client.get_signing_key.side_effect = jwt.PyJWKSetError(
+            "The JWK Set did not contain any keys"
+        )
+        provider._jwks_client = bad_client
+
+        with pytest.raises(ProviderError, match="unusable"):
+            provider.verify_session(access_token=token)
+
+    def test_unknown_signing_key_is_invalid(self, provider, rsa_keypair):
+        token = _mint_id_token(rsa_keypair)
+        unknown_key_client = MagicMock()
+        unknown_key_client.get_signing_key.side_effect = jwt.PyJWKClientError(
+            'Unable to find a signing key that matches: "test-key-1"'
+        )
+        unknown_key_client.get_signing_keys.return_value = [MagicMock()]
+        unknown_key_client.match_kid.return_value = None
+        provider._jwks_client = unknown_key_client
+
+        assert provider.verify_session(access_token=token) is None
+        unknown_key_client.get_signing_keys.assert_called_once_with()
+
+    def test_real_pyjwkclient_verifies_fixture(self, rsa_keypair):
+        provider = oidc_plugin.SelfHostedOIDCProvider(
+            issuer=_ISSUER,
+            client_id=_CLIENT_ID,
+        )
+        provider._discovery = dict(_DISCOVERY_DOC)
+        provider._discovery_fetched_at = time.time()
+        jwks_client = _real_jwks_client(
+            {"keys": [rsa_keypair["jwk"]]}
+        )
+        provider._jwks_client = jwks_client
+
+        session = provider.verify_session(
+            access_token=_mint_id_token(rsa_keypair)
+        )
+
+        assert session is not None
+        assert session.user_id == "usr_abc"
+        jwks_client.fetch_data.assert_called_once_with()
+
+    def test_real_pyjwkclient_unknown_key_is_invalid(self, rsa_keypair):
+        provider = oidc_plugin.SelfHostedOIDCProvider(
+            issuer=_ISSUER,
+            client_id=_CLIENT_ID,
+        )
+        provider._discovery = dict(_DISCOVERY_DOC)
+        provider._discovery_fetched_at = time.time()
+        jwks_client = _real_jwks_client(
+            {"keys": [rsa_keypair["jwk"]]}
+        )
+        provider._jwks_client = jwks_client
+        token = jwt.encode(
+            {
+                "iss": _ISSUER,
+                "aud": _CLIENT_ID,
+                "sub": "usr_abc",
+                "iat": int(time.time()),
+                "exp": int(time.time()) + 900,
+            },
+            rsa_keypair["private_pem"],
+            algorithm="RS256",
+            headers={"kid": "unknown-key"},
+        )
+
+        assert provider.verify_session(access_token=token) is None
+        assert jwks_client.fetch_data.call_count == 2
+
+    def test_real_pyjwkclient_empty_set_is_provider_error(self, rsa_keypair):
+        provider = oidc_plugin.SelfHostedOIDCProvider(
+            issuer=_ISSUER,
+            client_id=_CLIENT_ID,
+        )
+        provider._discovery = dict(_DISCOVERY_DOC)
+        provider._discovery_fetched_at = time.time()
+        jwks_client = _real_jwks_client({"keys": []})
+        provider._jwks_client = jwks_client
+
+        with pytest.raises(ProviderError, match="unusable"):
+            provider.verify_session(
+                access_token=_mint_id_token(rsa_keypair)
+            )
 
     def test_jwks_client_sends_explicit_http_headers(self):
         provider = oidc_plugin.SelfHostedOIDCProvider(
@@ -726,4 +852,3 @@ class TestPluginRegister:
         oidc_plugin.register(ctx)
         registered = ctx.register_dashboard_auth_provider.call_args.args[0]
         assert registered._client_secret == "cfg-secret"
-

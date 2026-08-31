@@ -16,6 +16,7 @@ binds.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Awaitable, Callable
 
@@ -23,7 +24,11 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 
 from hermes_cli.dashboard_auth import list_session_providers
-from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+from hermes_cli.dashboard_auth.audit import (
+    AuditEvent,
+    audit_log,
+    client_ip as _client_ip,
+)
 from hermes_cli.dashboard_auth.base import (
     DashboardAuthProvider,
     ProviderError,
@@ -52,6 +57,7 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/auth/native/authorize",
     "/auth/native/token",
     "/auth/native/refresh",
+    "/auth/native/logout",
     "/auth/password-login",
     "/auth/logout",
     "/login",
@@ -84,13 +90,6 @@ def _path_is_public(path: str) -> bool:
         path == prefix or path.startswith(prefix)
         for prefix in _GATE_PUBLIC_PREFIXES
     )
-
-
-def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for", "")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else ""
 
 
 def _ordered_session_providers(
@@ -287,7 +286,7 @@ def _extract_bearer(request: Request) -> str:
     return ""
 
 
-def _verify_bearer(request: Request, *, access_token: str):
+async def _verify_bearer(request: Request, *, access_token: str):
     """Verify a native-app bearer access token via the session-provider stack.
 
     Returns the :class:`Session` on success, or ``None`` if no provider
@@ -301,7 +300,10 @@ def _verify_bearer(request: Request, *, access_token: str):
     unreachable_provider: str | None = None
     for provider in list_session_providers():
         try:
-            session = provider.verify_session(access_token=access_token)
+            session = await asyncio.to_thread(
+                provider.verify_session,
+                access_token=access_token,
+            )
         except ProviderError as e:
             _log.warning(
                 "dashboard-auth: provider %r unreachable during bearer verify: %s",
@@ -356,7 +358,10 @@ async def gated_auth_middleware(
     bearer = _extract_bearer(request)
     if bearer:
         try:
-            bearer_session = _verify_bearer(request, access_token=bearer)
+            bearer_session = await _verify_bearer(
+                request,
+                access_token=bearer,
+            )
         except ProviderError as e:
             # At least one provider's IDP/JWKS was unreachable and none
             # verified the token — transient outage, not bad credentials.
@@ -421,7 +426,10 @@ async def gated_auth_middleware(
         unreachable_provider: str | None = None
         for provider in _ordered_session_providers(provider_hint):
             try:
-                session = provider.verify_session(access_token=at)
+                session = await asyncio.to_thread(
+                    provider.verify_session,
+                    access_token=at,
+                )
             except ProviderError as e:
                 _log.warning(
                     "dashboard-auth: provider %r unreachable during verify: %s",
@@ -454,7 +462,7 @@ async def gated_auth_middleware(
         # serve the request transparently; only after every provider rejects
         # the RT do we fall through to clear-and-relogin.
         try:
-            refreshed = _attempt_refresh(
+            refreshed = await _attempt_refresh(
                 request,
                 refresh_token=_rt,
                 provider_hint=provider_hint,
@@ -544,7 +552,12 @@ def _expires_in_seconds(session) -> int:
     return max(60, int(session.expires_at) - int(time.time()))
 
 
-def _attempt_refresh(request: Request, *, refresh_token, provider_hint: str | None = None):
+async def _attempt_refresh(
+    request: Request,
+    *,
+    refresh_token,
+    provider_hint: str | None = None,
+):
     """Try to rotate an expired session via the refresh token.
 
     The provider hint only changes candidate order. ``RefreshExpiredError``
@@ -561,7 +574,10 @@ def _attempt_refresh(request: Request, *, refresh_token, provider_hint: str | No
     unavailable_provider: str | None = None
     for provider in _ordered_session_providers(provider_hint):
         try:
-            new_session = provider.refresh_session(refresh_token=refresh_token)
+            new_session = await asyncio.to_thread(
+                provider.refresh_session,
+                refresh_token=refresh_token,
+            )
         except RefreshExpiredError:
             audit_log(
                 AuditEvent.REFRESH_FAILURE,
