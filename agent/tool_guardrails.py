@@ -759,6 +759,10 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
             "For terminal failures, run a small diagnostic such as `pwd && ls -la` "
             "in the same tool, then try an absolute path, a simpler command, a different "
             "working directory, or a different tool such as read_file/write_file/patch."
+            " If the error is an import crash (ModuleNotFoundError, ABI mismatch, "
+            "a compiled .so built for another CPython), check the environment first: "
+            "a PYTHONPATH-poisoned interpreter re-reports the same crash no matter "
+            "how many times the command is re-run — fix the env, not the command."
         )
     return common + (
         "Try different arguments, a narrower query/path, an absolute path when relevant, "

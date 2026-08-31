@@ -1775,7 +1775,7 @@ tool_loop_guardrails:
     max_subagents: 50          # max subagents spawned per turn (0 = unlimited)
 ```
 
-`hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. See also [Docker / unattended deployments](docker.md).
+`hard_stop_enabled` defaults to `false` because interactive sessions have a human in the loop. In unattended deployments (gateway, cron, kanban workers) set it to `true` so repeated failures are blocked rather than only warned. The counters reset at the start of every turn, so a legitimate multi-turn session is never starved — a single turn that spirals into unbounded repetition is stopped. See also [Docker / unattended deployments](docker.md).
 
 ### Per-turn runaway-loop caps
 
