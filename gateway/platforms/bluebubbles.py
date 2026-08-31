@@ -123,6 +123,8 @@ _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
+_HELPER_REFRESH_TIMEOUT_SECONDS = 1.0
+_HELPER_REFRESH_COOLDOWN_SECONDS = 2.0
 
 
 def _redact(text: str) -> str:
@@ -202,6 +204,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._runner = None
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
+        self._helper_refresh_lock = asyncio.Lock()
+        self._helper_refresh_after = 0.0
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
 
     # ------------------------------------------------------------------
@@ -257,6 +261,53 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         res = await self.client.post(self._api_url(path), json=payload)
         res.raise_for_status()
         return res.json()
+
+    async def _helper_is_connected(self) -> bool:
+        """Refresh a stale negative helper snapshot without blocking hot paths.
+
+        BlueBubbles can report ``helper_connected=False`` during gateway
+        startup while its macOS helper is still attaching. A one-time snapshot
+        would then disable private-API features for the entire process. Refresh
+        negative snapshots with a short timeout, a cooldown, and single-flight
+        locking; once the helper is observed connected, keep the monotonic
+        positive state.
+        """
+        if not self._private_api_enabled or not self.client:
+            return False
+        if self._helper_connected:
+            return True
+
+        loop = asyncio.get_running_loop()
+        if loop.time() < self._helper_refresh_after:
+            return False
+
+        async with self._helper_refresh_lock:
+            if not self._private_api_enabled or not self.client:
+                return False
+            if self._helper_connected:
+                return True
+            if loop.time() < self._helper_refresh_after:
+                return False
+            try:
+                info = await asyncio.wait_for(
+                    self._api_get("/api/v1/server/info"),
+                    timeout=_HELPER_REFRESH_TIMEOUT_SECONDS,
+                )
+                if bool((info or {}).get("data", {}).get("helper_connected")):
+                    self._helper_connected = True
+                    return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "[bluebubbles] helper status refresh failed: %s",
+                    type(exc).__name__,
+                )
+
+            self._helper_refresh_after = (
+                loop.time() + _HELPER_REFRESH_COOLDOWN_SECONDS
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -554,6 +605,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 chunks.append(para)
             else:
                 chunks.extend(self.truncate_message(para, max_length=self.MAX_MESSAGE_LENGTH))
+        use_private_reply = bool(reply_to and await self._helper_is_connected())
         last = SendResult(success=True)
         for chunk in chunks:
             guid = await self._resolve_chat_guid(chat_id)
@@ -572,7 +624,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 "tempGuid": f"temp-{datetime.utcnow().timestamp()}",
                 "message": chunk,
             }
-            if reply_to and self._private_api_enabled and self._helper_connected:
+            if reply_to and use_private_reply:
                 payload["method"] = "private-api"
                 payload["selectedMessageGuid"] = reply_to
                 payload["partIndex"] = 0
@@ -726,28 +778,36 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        if not self._private_api_enabled or not self._helper_connected or not self.client:
+        if not await self._helper_is_connected():
+            return
+        client = self.client
+        if client is None:
             return
         try:
             guid = await self._resolve_chat_guid(chat_id)
             if guid:
                 encoded = quote(guid, safe="")
-                await self.client.post(
+                response = await client.post(
                     self._api_url(f"/api/v1/chat/{encoded}/typing"), timeout=5
                 )
+                response.raise_for_status()
         except Exception:
             pass
 
     async def stop_typing(self, chat_id: str) -> None:
-        if not self._private_api_enabled or not self._helper_connected or not self.client:
+        if not await self._helper_is_connected():
+            return
+        client = self.client
+        if client is None:
             return
         try:
             guid = await self._resolve_chat_guid(chat_id)
             if guid:
                 encoded = quote(guid, safe="")
-                await self.client.delete(
+                response = await client.delete(
                     self._api_url(f"/api/v1/chat/{encoded}/typing"), timeout=5
                 )
+                response.raise_for_status()
         except Exception:
             pass
 
@@ -756,15 +816,19 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def mark_read(self, chat_id: str) -> bool:
-        if not self._private_api_enabled or not self._helper_connected or not self.client:
+        if not await self._helper_is_connected():
+            return False
+        client = self.client
+        if client is None:
             return False
         try:
             guid = await self._resolve_chat_guid(chat_id)
             if guid:
                 encoded = quote(guid, safe="")
-                await self.client.post(
+                response = await client.post(
                     self._api_url(f"/api/v1/chat/{encoded}/read"), timeout=5
                 )
+                response.raise_for_status()
                 return True
         except Exception:
             pass
