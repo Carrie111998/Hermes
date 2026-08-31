@@ -678,10 +678,240 @@ class TestInvalidateTokensOnClientChange:
         _maybe_preregister_client(storage, cfg, meta)
         assert (d / "chg-server.json").exists()
 
+    def test_preregister_same_client_does_not_rewrite_client_json(self, tmp_path, monkeypatch):
+        """Pre-registered client.json must NOT be rewritten when identity is unchanged.
+
+        The on-disk file may carry hand-curated redirect_uris (e.g. a
+        registered 127.0.0.1:53682 port), or a macOS uchg immutable flag.
+        Every-connect rewriting would clobber the redirect and/or fail with
+        Operation not permitted.  Only a real client_id/secret change should
+        trigger a write.
+        """
+        pytest.importorskip("mcp")
+        from tools.mcp_oauth import (
+            _build_client_metadata, _maybe_preregister_client,
+        )
+        storage, d = self._seed(tmp_path, monkeypatch)
+        cfg = {"client_id": "client-a", "_resolved_port": 1455}
+        meta = _build_client_metadata(dict(cfg))
+
+        # Run once: writes client.json from scratch.
+        _maybe_preregister_client(storage, cfg, meta)
+        client_path = d / "chg-server.client.json"
+        pre_mtime = client_path.stat().st_mtime_ns
+
+        # Run again with identical config: must NOT rewrite.
+        _maybe_preregister_client(storage, cfg, meta)
+        post_mtime = client_path.stat().st_mtime_ns
+        assert post_mtime == pre_mtime, \
+            "client.json mtime changed on no-op call (unnecessary rewrite)"
+
+    def test_preregister_different_client_rewrites(self, tmp_path, monkeypatch):
+        """Changing the client_id MUST rewrite client.json (so the new redirect_uri takes effect)."""
+        pytest.importorskip("mcp")
+        from tools.mcp_oauth import (
+            _build_client_metadata, _maybe_preregister_client,
+        )
+        storage, d = self._seed(tmp_path, monkeypatch)
+        cfg = {"client_id": "client-a", "_resolved_port": 1455}
+        meta = _build_client_metadata(dict(cfg))
+        _maybe_preregister_client(storage, cfg, meta)
+        client_path = d / "chg-server.client.json"
+        pre_mtime = client_path.stat().st_mtime_ns
+
+        cfg2 = {"client_id": "client-b", "_resolved_port": 1455}
+        meta2 = _build_client_metadata(dict(cfg2))
+        _maybe_preregister_client(storage, cfg2, meta2)
+        post_mtime = client_path.stat().st_mtime_ns
+        assert post_mtime > pre_mtime, \
+            "client.json mtime should advance after client_id change"
+        info = json.loads(client_path.read_text())
+        assert info["client_id"] == "client-b"
+
+    def test_preregister_changed_secret_rewrites(self, tmp_path, monkeypatch):
+        """Changing client_secret MUST rewrite client.json."""
+        pytest.importorskip("mcp")
+        from tools.mcp_oauth import (
+            _build_client_metadata, _maybe_preregister_client,
+        )
+        storage, d = self._seed(tmp_path, monkeypatch,
+                                client_id="client-a", client_secret="old-secret")
+        cfg = {"client_id": "client-a", "client_secret": "new-secret", "_resolved_port": 1455}
+        meta = _build_client_metadata(dict(cfg))
+        _maybe_preregister_client(storage, cfg, meta)
+        client_path = d / "chg-server.client.json"
+        info = json.loads(client_path.read_text())
+        assert info["client_secret"] == "new-secret"
+
 
 # ---------------------------------------------------------------------------
-# Non-interactive / startup-safety tests
+# Refresh-token carry-forward (RFC 6749 section 6)
 # ---------------------------------------------------------------------------
+
+class TestRefreshTokenCarryForward:
+    """Hermes' _handle_token_response and _handle_refresh_response overrides
+    must preserve an existing refresh_token when the server omits one in its
+    response (RFC 6749 section 6: the client "MUST use the existing refresh token").
+
+    The MCP SDK's base class already implements this for _handle_refresh_response,
+    but Hermes delegates to a custom override that dropped the base behavior.
+    """
+
+    @pytest.mark.asyncio
+    async def test_carry_forward_on_refresh_when_server_omits(self, tmp_path, monkeypatch):
+        """When a refresh response has no refresh_token, the previous one MUST be carried
+        forward so the credential does not degrade to access-only."""
+        import httpx
+
+        pytest.importorskip("mcp")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        provider = build_oauth_auth("test-server", "https://example.com/mcp")
+        assert provider is not None
+
+        from mcp.shared.auth import OAuthToken
+        initial = OAuthToken(
+            access_token="acc1",
+            refresh_token="rt-keep-me",
+            token_type="Bearer",
+        )
+        provider.context.current_tokens = initial
+        provider.context.update_token_expiry(initial)
+
+        # Simulate a refresh grant response that OMITS refresh_token (Google's behavior).
+        response = httpx.Response(200, json={
+            "access_token": "acc2",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        })
+        result = await provider._handle_refresh_response(response)
+
+        assert result is True, "refresh should succeed"
+        assert provider.context.current_tokens is not None
+        assert provider.context.current_tokens.access_token == "acc2"
+        assert provider.context.current_tokens.refresh_token == "rt-keep-me", \
+            "refresh_token must be carried forward when server omits it"
+
+        # On-disk token must also carry the refresh_token.
+        token_path = tmp_path / "mcp-tokens" / "test-server.json"
+        assert token_path.exists()
+        data = json.loads(token_path.read_text())
+        assert data["refresh_token"] == "rt-keep-me"
+
+    @pytest.mark.asyncio
+    async def test_carry_forward_on_token_exchange(self, tmp_path, monkeypatch):
+        """The carry-forward also applies to _handle_token_response for defense in
+        depth — the initial exchange typically includes it, but a 201 Created with
+        malformed scopes shouldn't silently drop it either."""
+        import httpx
+
+        pytest.importorskip("mcp")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        provider = build_oauth_auth("test-server", "https://example.com/mcp")
+        assert provider is not None
+
+        from mcp.shared.auth import OAuthToken
+        initial = OAuthToken(
+            access_token="acc1",
+            refresh_token="original-rt",
+            token_type="Bearer",
+        )
+        provider.context.current_tokens = initial
+
+        # 201 Created with refresh_token omitted.
+        response = httpx.Response(201, json={
+            "access_token": "acc-new",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        })
+        await provider._handle_token_response(response)
+
+        assert provider.context.current_tokens is not None
+        assert provider.context.current_tokens.refresh_token == "original-rt"
+
+    @pytest.mark.asyncio
+    async def test_no_carry_forward_without_prior_token(self, tmp_path, monkeypatch):
+        """When there is no prior token (first-time auth exchange), a missing
+        refresh_token is left as None — we cannot carry forward what never existed."""
+        import httpx
+
+        pytest.importorskip("mcp")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        provider = build_oauth_auth("test-server", "https://example.com/mcp")
+        assert provider is not None
+        provider.context.current_tokens = None  # no prior state
+
+        response = httpx.Response(200, json={
+            "access_token": "acc-fresh",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        })
+        result = await provider._handle_refresh_response(response)
+
+        assert result is True
+        assert provider.context.current_tokens is not None
+        assert provider.context.current_tokens.refresh_token is None, \
+            "no prior token -> refresh_token stays None (next refresh will fail)"
+
+    @pytest.mark.asyncio
+    async def test_server_provided_refresh_token_is_not_overwritten(self, tmp_path, monkeypatch):
+        """When the server DOES include a refresh_token, we MUST NOT overwrite it
+        with the previous one — the server may be rotating tokens (RFC 6749 section 10.4)."""
+        import httpx
+
+        pytest.importorskip("mcp")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        provider = build_oauth_auth("test-server", "https://example.com/mcp")
+        assert provider is not None
+
+        from mcp.shared.auth import OAuthToken
+        provider.context.current_tokens = OAuthToken(
+            access_token="old-acc",
+            refresh_token="old-rt",
+            token_type="Bearer",
+        )
+
+        # Server sends a new refresh_token (rotation).
+        response = httpx.Response(200, json={
+            "access_token": "new-acc",
+            "refresh_token": "new-rt",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+        })
+        result = await provider._handle_refresh_response(response)
+
+        assert result is True
+        assert provider.context.current_tokens.refresh_token == "new-rt", \
+            "server-issued refresh_token must NOT be replaced by carry-forward"
+
+    @pytest.mark.asyncio
+    async def test_carry_forward_logs_info(self, tmp_path, monkeypatch, caplog):
+        """The carry-forward path should log at INFO level."""
+        import httpx
+        import logging
+
+        pytest.importorskip("mcp")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
+        provider = build_oauth_auth("carry-log-test", "https://example.com/mcp")
+        assert provider is not None
+
+        from mcp.shared.auth import OAuthToken
+        provider.context.current_tokens = OAuthToken(
+            access_token="a1", refresh_token="rt-log", token_type="Bearer",
+        )
+
+        with caplog.at_level(logging.INFO, logger="tools.mcp_oauth"):
+            await provider._handle_refresh_response(
+                httpx.Response(200, json={"access_token": "a2", "token_type": "Bearer"})
+            )
+
+        assert any(
+            "carried forward existing" in msg for msg in caplog.messages
+        ), "carry-forward should log an info message"
 
 class TestIsInteractive:
     """_is_interactive() detects headless/daemon/container environments."""
