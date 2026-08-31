@@ -638,6 +638,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_complete.add_argument("--metadata", default=None,
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
+    p_complete.add_argument(
+        "--accept-unproven",
+        action="store_true",
+        help=(
+            "Skip the proof-required gate. Records a 'card_closed_without_proof' "
+            "audit event on the task. Use sparingly -- the gate is the discipline."
+        ),
+    )
 
     p_edit = sub.add_parser(
         "edit",
@@ -2344,6 +2352,82 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
     return reason if verdict != "done" else None
 
 
+def _validate_proof_metadata(
+    metadata: "Optional[dict]",
+    task_id: str,
+    conn: "sqlite3.Connection",
+) -> Optional[str]:
+    """Enforce `kanban complete` proof-required contract for non-goal cards.
+
+    A card is *verified-done* iff --metadata.proof is a non-empty list of
+    references that resolve at completion time. Returns None when acceptable,
+    or an error string explaining the rejection otherwise.
+
+    Acceptable proof entries (shape auto-detected):
+
+      - URL https?://...   verified by HEAD returning 2xx (5s timeout)
+      - absolute file path verified via os.path.exists()
+      - card reference t_<hex>  verified via kb.get_task()
+      - attachment id (positive int) verified via kb.list_attachments()
+
+    Caller MUST skip this gate when the task is goal-mode (the auxiliary
+    judge already enforces the acceptance contract there) or when the
+    operator passed --accept-unproven.
+    """
+    import re as _re
+    import urllib.error
+    import urllib.request
+
+    if not isinstance(metadata, dict):
+        return (
+            "--metadata.proof is required to mark a non-goal card done. "
+            "Pass --metadata '{\"proof\": [\"<URL or path or t_id>\"]}' "
+            "or create the card with --goal."
+        )
+    proof = metadata.get("proof")
+    if not isinstance(proof, list) or not proof:
+        return (
+            "--metadata.proof must be a non-empty list (URL, file path, "
+            "card id, or attachment id). Refusing to mark card done without proof."
+        )
+
+    for entry in proof:
+        if not isinstance(entry, str) or not entry.strip():
+            return f"proof entries must be non-empty strings; got: {entry!r}"
+        s = entry.strip()
+        if s.startswith("http://") or s.startswith("https://"):
+            try:
+                req = urllib.request.Request(s, method="HEAD")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    if not (200 <= resp.status < 300):
+                        return f"proof URL did not return 2xx: {s} (status {resp.status})"
+            except urllib.error.HTTPError as exc:
+                # Server explicitly rejected — different failure class than
+                # a network glitch, so report the status code rather than
+                # masking it as a generic fetch error.
+                return f"proof URL did not return 2xx: {s} (status {exc.code})"
+            except Exception as exc:
+                return f"proof URL fetch failed: {s} ({exc})"
+        elif os.path.isabs(s) or s.startswith("file://"):
+            p = s.removeprefix("file://") if s.startswith("file://") else s
+            if not os.path.exists(p):
+                return f"proof file does not exist on disk: {p}"
+        elif _re.match(r"^t_[0-9a-f]{6,}$", s):
+            if kb.get_task(conn, s) is None:
+                return f"proof card does not exist: {s}"
+        elif s.isdigit():
+            aid = int(s)
+            attachments = kb.list_attachments(conn, task_id)
+            if not any(a.id == aid for a in attachments):
+                return f"proof attachment id {aid} is not attached to {task_id}"
+        else:
+            return (
+                f"unrecognized proof entry shape: {s!r}; "
+                "expected a URL, absolute file path, t_<hex>, or numeric attachment id"
+            )
+    return None
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -2375,10 +2459,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
+            task = kb.get_task(conn, tid)
+            # Austin standing rule 2026-08-30: "done" is verified-done.
+            # Goal-mode cards are exempt; --accept-unproven is an audit trail.
+            if task is not None and not task.goal_mode and not getattr(args, "accept_unproven", False):
+                rejection = _validate_proof_metadata(metadata, tid, conn)
+                if rejection is not None:
+                    print(
+                        f"kanban: refusing to complete {tid} without proof: {rejection} "
+                        f"Pass --accept-unproven to override, or supply --metadata with a 'proof' list.",
+                        file=sys.stderr,
+                    )
+                    failed.append(tid)
+                    continue
             # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
             # to every terminal handoff so request-review cannot bypass the
             # acceptance contract that protects complete.
-            task = kb.get_task(conn, tid)
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or args.result or "").strip(),
@@ -2391,6 +2487,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 )
                 failed.append(tid)
                 continue
+
+            # Audit trail for --accept-unproven overrides.
+            if task is not None and getattr(args, "accept_unproven", False) and not task.goal_mode:
+                try:
+                    kb._append_event(
+                        conn,
+                        tid,
+                        "card_closed_without_proof",
+                        {
+                            "reason": "operator used --accept-unproven",
+                            "accepted_by": _profile_author(),
+                        },
+                    )
+                except Exception:
+                    pass
 
             if not kb.complete_task(
                 conn, tid,
