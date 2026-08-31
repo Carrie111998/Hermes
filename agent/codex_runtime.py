@@ -714,6 +714,34 @@ def run_codex_app_server_turn(
         _ServerRequestRouting,
     )
 
+    # The native Codex thread is authoritative for context. Hermes persists
+    # only the binding in model_config so a rebuilt AIAgent (gateway restart,
+    # /resume, cache eviction) reconnects with thread/resume instead of
+    # silently creating a new Codex task.
+    requested_thread_id = None
+    strict_thread_resume = False
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db is not None and session_id:
+        try:
+            requested_thread_id = session_db.get_session_model_config_value(
+                session_id, "codex_thread_id"
+            )
+            if not isinstance(requested_thread_id, str):
+                requested_thread_id = None
+            strict_thread_resume = (
+                session_db.get_session_model_config_value(
+                    session_id, "codex_thread_resume_strict", False
+                )
+                is True
+            )
+        except Exception:
+            logger.debug(
+                "codex app-server thread binding lookup failed (session=%s)",
+                session_id,
+                exc_info=True,
+            )
+
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
@@ -760,6 +788,8 @@ def run_codex_app_server_turn(
         # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            thread_id=requested_thread_id,
+            resume_fallback_to_start=not strict_thread_resume,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -810,6 +840,23 @@ def run_codex_app_server_turn(
             ),
             "error": str(exc),
         }
+
+    # Persist after every successful handshake, including turns whose
+    # turn/start later failed. The binding is known as soon as run_turn sets
+    # TurnResult.thread_id, and saving it here prevents an orphan native task
+    # from being replaced on the next retry.
+    if session_db is not None and session_id and turn.thread_id:
+        try:
+            if turn.thread_id != requested_thread_id:
+                session_db.patch_session_model_config(
+                    session_id, {"codex_thread_id": turn.thread_id}
+                )
+        except Exception:
+            logger.warning(
+                "codex app-server thread binding persist failed (session=%s)",
+                session_id,
+                exc_info=True,
+            )
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its
     # interrupt handoff/cleanup so a hard stop cannot poison the next turn and a

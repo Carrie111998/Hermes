@@ -5167,6 +5167,14 @@ class GatewaySlashCommandsMixin:
             parts = shlex.split(raw_args)
         except ValueError as exc:
             return t("gateway.resume.parse_error", error=exc)
+
+        # Native Codex tasks live outside Hermes' SessionDB. Keep the existing
+        # /resume contract intact and route only the explicit ``codex``
+        # namespace to the app-server-backed picker.
+        if parts and parts[0].lower() == "codex":
+            return await self._handle_codex_resume_command(
+                event, " ".join(parts[1:]).strip()
+            )
         allow_all = "--all" in parts
         allow_cross_room = "--cross-room" in parts
         name = " ".join(p for p in parts if p not in {"--all", "--cross-room"}).strip()
@@ -5334,6 +5342,17 @@ class GatewaySlashCommandsMixin:
 
         raw_args = event.get_command_args().strip()
         try:
+            native_parts = shlex.split(raw_args)
+        except ValueError as exc:
+            return t("gateway.resume.parse_error", error=exc)
+        if native_parts and native_parts[0].lower() == "codex":
+            query_parts = native_parts[1:]
+            if query_parts and query_parts[0].lower() in {"search", "find"}:
+                query_parts = query_parts[1:]
+            return await self._handle_codex_sessions_command(
+                event, " ".join(query_parts).strip()
+            )
+        try:
             include_all, include_unnamed, target, search_query = (
                 parse_session_listing_args(raw_args)
             )
@@ -5389,6 +5408,204 @@ class GatewaySlashCommandsMixin:
             rows,
             include_source=cross_origin,
             title=title,
+        )
+
+    async def _handle_codex_sessions_command(
+        self, event: MessageEvent, search_term: str = ""
+    ) -> str:
+        """List host-native Codex tasks for an explicitly configured admin.
+
+        The catalog contains previews and workspaces from every Codex client on
+        the host, so normal same-chat ownership is not enough: unlike Hermes
+        sessions, these rows have no gateway user identity to authorize
+        against. Requiring an explicit admin keeps a shared bot from becoming
+        a host-wide Codex history oracle.
+        """
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        if not self._resume_caller_is_admin(source):
+            return (
+                "Native Codex tasks are host-wide and can only be listed by "
+                "an explicitly configured gateway admin."
+            )
+
+        from agent.transports.codex_thread_catalog import list_codex_threads
+
+        try:
+            rows, next_cursor = await asyncio.to_thread(
+                list_codex_threads,
+                limit=10,
+                search_term=search_term or None,
+            )
+        except Exception as exc:
+            from agent.redact import redact_sensitive_text
+
+            safe_error = redact_sensitive_text(str(exc), force=True)
+            return f"❌ Could not list native Codex tasks: {safe_error}"
+
+        if not rows:
+            suffix = f" matching “{search_term}”" if search_term else ""
+            return f"No native Codex tasks found{suffix}."
+
+        title = "Codex Tasks"
+        if search_term:
+            title += f" matching “{search_term}”"
+        lines = [f"🧵 **{title}**", ""]
+        for index, row in enumerate(rows, start=1):
+            display = re.sub(r"\s+", " ", row.title).strip()[:80]
+            workspace = os.path.basename(row.cwd.rstrip(os.sep)) if row.cwd else ""
+            workspace_part = f" · `{workspace}`" if workspace else ""
+            pin = " 📌" if row.is_pinned else ""
+            lines.append(
+                f"{index}. **{display}**{pin}{workspace_part} · "
+                f"`{row.source}` · `{row.thread_id[:12]}`"
+            )
+        lines.extend(
+            [
+                "",
+                "Resume: `/resume codex <number|thread-id|name>`.",
+                "The Codex task remains the source of truth; Hermes stores only its route binding.",
+            ]
+        )
+        if next_cursor:
+            lines.append("More tasks are available; use `/sessions codex search <query>`.")
+        return "\n".join(lines)
+
+    async def _handle_codex_resume_command(
+        self, event: MessageEvent, target: str
+    ) -> str:
+        """Bind this gateway lane to an existing native Codex task."""
+        source = await asyncio.to_thread(
+            self._normalize_source_for_session_key, event.source
+        )
+        if not self._resume_caller_is_admin(source):
+            return (
+                "Native Codex tasks are host-wide and can only be resumed by "
+                "an explicitly configured gateway admin."
+            )
+        if not target:
+            return await self._handle_codex_sessions_command(event)
+
+        from gateway.run import _load_gateway_config
+        from hermes_cli.codex_runtime_switch import get_current_runtime
+
+        try:
+            user_config = await asyncio.to_thread(_load_gateway_config)
+        except Exception:
+            user_config = {}
+        if get_current_runtime(user_config) != "codex_app_server":
+            return (
+                "Enable the native Codex runtime first with "
+                "`/codex-runtime codex_app_server`, then retry."
+            )
+
+        from agent.transports.codex_thread_catalog import (
+            list_codex_threads,
+            resolve_codex_thread,
+        )
+
+        try:
+            rows, _ = await asyncio.to_thread(list_codex_threads, limit=100)
+            selected = resolve_codex_thread(rows, target)
+            if selected is None and not target.isdigit():
+                matches, _ = await asyncio.to_thread(
+                    list_codex_threads, limit=20, search_term=target
+                )
+                selected = resolve_codex_thread(matches, target)
+        except Exception as exc:
+            from agent.redact import redact_sensitive_text
+
+            safe_error = redact_sensitive_text(str(exc), force=True)
+            return f"❌ Could not query native Codex tasks: {safe_error}"
+        if selected is None:
+            return (
+                f"Native Codex task not found or ambiguous: `{target}`. "
+                "Run `/sessions codex` and choose a number."
+            )
+
+        session_key = self._session_key_for_source(source)
+        current_entry = await self.async_session_store.get_or_create_session(source)
+        current_thread_id = await self._session_db.get_session_model_config_value(
+            current_entry.session_id, "codex_thread_id"
+        )
+        if current_thread_id == selected.thread_id:
+            return (
+                f"Already using native Codex task **{selected.title[:100]}** "
+                f"(`{selected.thread_id[:12]}`)."
+            )
+        now = datetime.now()
+        import json as _json
+        import uuid as _uuid
+
+        session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{_uuid.uuid4().hex[:6]}"
+        origin = current_entry.origin or source
+        try:
+            origin_json = _json.dumps(origin.to_dict())
+        except Exception:
+            origin_json = None
+        model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
+        model = None
+        if isinstance(model_cfg, dict):
+            model = model_cfg.get("default") or model_cfg.get("model")
+        display_name = getattr(current_entry, "display_name", None)
+        if not isinstance(display_name, str):
+            display_name = None
+
+        try:
+            await self._session_db.create_session(
+                session_id=session_id,
+                source=source.platform.value if source.platform else "gateway",
+                model=model,
+                model_config={
+                    "codex_thread_id": selected.thread_id,
+                    # An explicit native-task selection must never degrade to
+                    # a silently duplicated thread when Codex rejects resume
+                    # (for example because Desktop has the active writer).
+                    "codex_thread_resume_strict": True,
+                },
+                cwd=selected.cwd or None,
+                user_id=source.user_id,
+                session_key=session_key,
+                chat_id=source.chat_id,
+                chat_type=source.chat_type,
+                thread_id=source.thread_id,
+                origin_json=origin_json,
+                display_name=display_name,
+            )
+        except Exception as exc:
+            from agent.redact import redact_sensitive_text
+
+            logger.error("Failed to create native Codex route session: %s", exc)
+            safe_error = redact_sensitive_text(str(exc), force=True)
+            return f"❌ Could not create the Hermes route binding: {safe_error}"
+        try:
+            await self._session_db.set_session_title(
+                session_id, f"Codex: {selected.title[:100]}"
+            )
+        except Exception:
+            logger.debug(
+                "Failed to title native Codex route session %s",
+                session_id,
+                exc_info=True,
+            )
+
+        self._release_running_agent_state(session_key)
+        switched = await self.async_session_store.switch_session(
+            session_key, session_id
+        )
+        if not switched:
+            return "❌ Could not switch this chat to the native Codex task."
+        self._clear_conversation_scope(session_key, reason="resume_codex")
+        self._evict_cached_agent(session_key)
+
+        title = re.sub(r"\s+", " ", selected.title).strip()[:100]
+        workspace = selected.cwd or "Codex's stored workspace"
+        return (
+            f"↪ Resumed native Codex task **{title}** (`{selected.thread_id[:12]}`).\n"
+            f"Workspace: `{workspace}`\n"
+            "Your next message continues that Codex task. If Codex Desktop is "
+            "actively writing to it, finish or stop that turn first."
         )
 
     async def _handle_branch_command(self, event: MessageEvent) -> str:

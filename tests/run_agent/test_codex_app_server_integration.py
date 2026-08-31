@@ -86,6 +86,93 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    @pytest.mark.parametrize(
+        ("strict_resume", "expected_fallback"),
+        [(False, True), (True, False)],
+    )
+    def test_resumes_persisted_native_codex_thread(
+        self, tmp_path, monkeypatch, strict_resume, expected_fallback
+    ):
+        from hermes_state import SessionDB
+        import agent.transports.codex_app_server_session as session_mod
+
+        captured = {}
+
+        class CapturingSession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, user_input, **kwargs):
+                return TurnResult(
+                    final_text="resumed",
+                    projected_messages=[
+                        {"role": "assistant", "content": "resumed"}
+                    ],
+                    thread_id="native-thread-existing",
+                    turn_id="turn-resumed",
+                )
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(session_mod, "CodexAppServerSession", CapturingSession)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        agent = _make_codex_agent()
+        model_config = {"codex_thread_id": "native-thread-existing"}
+        if strict_resume:
+            model_config["codex_thread_resume_strict"] = True
+        db.create_session(
+            agent.session_id,
+            "cli",
+            model_config=model_config,
+        )
+        agent._session_db = db
+        agent._session_db_created = True
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            result = agent.run_conversation("continue")
+
+        assert result["final_response"] == "resumed"
+        assert captured["thread_id"] == "native-thread-existing"
+        assert captured["resume_fallback_to_start"] is expected_fallback
+        db.close()
+
+    def test_persists_new_native_codex_thread_binding(self, tmp_path, monkeypatch):
+        from hermes_state import SessionDB
+        import agent.transports.codex_app_server_session as session_mod
+
+        class StartingSession:
+            def __init__(self, **kwargs):
+                assert kwargs["thread_id"] is None
+
+            def run_turn(self, user_input, **kwargs):
+                return TurnResult(
+                    final_text="started",
+                    projected_messages=[
+                        {"role": "assistant", "content": "started"}
+                    ],
+                    thread_id="native-thread-new",
+                    turn_id="turn-new",
+                )
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(session_mod, "CodexAppServerSession", StartingSession)
+        db = SessionDB(db_path=tmp_path / "state.db")
+        agent = _make_codex_agent()
+        db.create_session(agent.session_id, "cli")
+        agent._session_db = db
+        agent._session_db_created = True
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("start")
+
+        assert db.get_session_model_config_value(
+            agent.session_id, "codex_thread_id"
+        ) == "native-thread-new"
+        db.close()
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
