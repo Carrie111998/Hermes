@@ -25,7 +25,7 @@ import {
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { recoverInFlightTurnJournal } from '@/lib/inflight-turn-journal'
 import { setSessionYolo } from '@/lib/yolo-session'
-import { $clarifyRequests, bindClarifyToolCallAlias, rebindClarifyRequest } from '@/store/clarify'
+import { $clarifyRequests, bindClarifyToolCallAlias, clearClarifyRequest, rebindClarifyRequest } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
 import {
@@ -1687,8 +1687,24 @@ export function useSessionActions({
         clearStoredTranscriptReadOnly(storedSessionId)
         const pendingApproval = restorePendingApproval(resumed, resumed.session_id)
         const pendingClarifyState = restorePendingClarifyFromSnapshot(resumed, resumed.session_id, resumeStartedAt)
-        rebindClarifyRequest(previousRuntimeId, resumed.session_id)
-        const pendingClarify = pendingClarifyState.request ?? $clarifyRequests.get()[resumed.session_id] ?? null
+
+        if (pendingClarifyState.authoritativeAbsent) {
+          // Backend said this runtime has no pending clarify. Drop the old
+          // identity's request instead of moving it onto the minted key.
+          if (previousRuntimeId && previousRuntimeId !== resumed.session_id) {
+            const stale = $clarifyRequests.get()[previousRuntimeId]
+
+            if (stale) {
+              clearClarifyRequest(stale.requestId, previousRuntimeId)
+            }
+          }
+        } else {
+          rebindClarifyRequest(previousRuntimeId, resumed.session_id)
+        }
+
+        const pendingClarify = pendingClarifyState.authoritativeAbsent
+          ? null
+          : (pendingClarifyState.request ?? $clarifyRequests.get()[resumed.session_id] ?? null)
 
         const clarifyAuthoritativelyAbsent =
           pendingClarifyState.authoritativeAbsent && !$clarifyRequests.get()[resumed.session_id]

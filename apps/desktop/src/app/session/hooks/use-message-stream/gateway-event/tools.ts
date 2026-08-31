@@ -95,6 +95,10 @@ export function handleToolEvent(ctx: GatewayEventContext): boolean {
               ? (payload.args as { question: string }).question
               : undefined
             : undefined,
+        questions:
+          typeof payload?.args === 'object' && payload.args !== null
+            ? (payload.args as { questions?: unknown }).questions
+            : undefined,
         requestId: typeof payload?.tool_id === 'string' ? payload.tool_id : undefined,
         toolName: typeof payload?.name === 'string' ? payload.name : undefined
       })

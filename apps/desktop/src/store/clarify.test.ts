@@ -10,6 +10,7 @@ import {
   normalizeChoices,
   normalizeQuestions,
   noteClarifyToolCall,
+  rebindClarifyRequest,
   setClarifyRequest,
   settleClarifyRequest,
   skipClarifyRequest
@@ -351,5 +352,121 @@ describe('clarify same-epoch tool-call alias', () => {
     expect(settleClarifyRequest('session-alias', { toolName: 'clarify' })).toBe(false)
     expect($clarifyRequests.get()['session-alias']?.requestId).toBe('req-live')
     expect(hasClarifyRequest('session-alias')).toBe(true)
+  })
+})
+
+describe('identity-absent matching-text batch fallback', () => {
+  beforeEach(() => {
+    $clarifyRequests.set({})
+  })
+
+  afterEach(() => {
+    $clarifyRequests.set({})
+  })
+
+  const batch = (): ClarifyRequest => ({
+    choices: null,
+    multiSelect: false,
+    question: '',
+    questions: [
+      { choices: null, multiSelect: false, qid: 'q0', question: 'Drink?' },
+      { choices: null, multiSelect: false, qid: 'q1', question: 'Productive when?' }
+    ],
+    requestId: 'req-batch',
+    sessionId: 'session-batch'
+  })
+
+  it('settles an identity-absent clarify completion whose ordered question list matches', () => {
+    setClarifyRequest(batch())
+
+    expect(
+      settleClarifyRequest('session-batch', {
+        questions: [{ question: 'Drink?' }, { question: 'Productive when?' }],
+        toolName: 'clarify'
+      })
+    ).toBe(true)
+    expect(hasClarifyRequest('session-batch')).toBe(false)
+  })
+
+  it('does not settle a missing, empty, reordered, or changed question list', () => {
+    setClarifyRequest(batch())
+    expect(settleClarifyRequest('session-batch', { toolName: 'clarify' })).toBe(false)
+    expect(settleClarifyRequest('session-batch', { questions: [], toolName: 'clarify' })).toBe(false)
+    expect(
+      settleClarifyRequest('session-batch', {
+        questions: [{ question: 'Productive when?' }, { question: 'Drink?' }],
+        toolName: 'clarify'
+      })
+    ).toBe(false)
+    expect(
+      settleClarifyRequest('session-batch', {
+        questions: [{ question: 'Drink?' }, { question: 'Changed?' }],
+        toolName: 'clarify'
+      })
+    ).toBe(false)
+    expect(hasClarifyRequest('session-batch')).toBe(true)
+  })
+
+  it('does not settle an unbound present id, sibling alias, or non-clarify tool', () => {
+    setClarifyRequest({ ...batch(), toolCallId: 'call-batch' })
+    expect(settleClarifyRequest('session-batch', { requestId: 'unbound', toolName: 'clarify' })).toBe(false)
+    expect(settleClarifyRequest('session-batch', { requestId: 'call-other', toolName: 'clarify' })).toBe(false)
+    expect(
+      settleClarifyRequest('session-batch', {
+        questions: [{ question: 'Drink?' }, { question: 'Productive when?' }],
+        toolName: 'read_file'
+      })
+    ).toBe(false)
+    expect(hasClarifyRequest('session-batch')).toBe(true)
+  })
+})
+
+describe('rebind current-map and newer-target precedence', () => {
+  beforeEach(() => {
+    $clarifyRequests.set({})
+  })
+
+  afterEach(() => {
+    $clarifyRequests.set({})
+  })
+
+  it('keeps the target request when it is a newer epoch and drops the old key', () => {
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: 'Old?',
+      requestId: 'req-old',
+      sessionId: 'rt-old',
+      toolCallId: 'call-old'
+    })
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: 'New?',
+      requestId: 'req-new',
+      sessionId: 'rt-new',
+      toolCallId: 'call-new'
+    })
+
+    expect(rebindClarifyRequest('rt-old', 'rt-new')).toBe(true)
+    expect($clarifyRequests.get()['rt-old']).toBeUndefined()
+    expect($clarifyRequests.get()['rt-new']?.requestId).toBe('req-new')
+    expect($clarifyRequests.get()['rt-new']?.toolCallId).toBe('call-new')
+  })
+
+  it('is idempotent after the old key is already gone', () => {
+    setClarifyRequest({
+      choices: null,
+      multiSelect: false,
+      question: 'Live?',
+      requestId: 'req-live',
+      sessionId: 'rt-new',
+      toolCallId: 'call-live'
+    })
+
+    expect(rebindClarifyRequest('rt-old', 'rt-new')).toBe(true)
+    expect(rebindClarifyRequest('rt-old', 'rt-new')).toBe(true)
+    expect($clarifyRequests.get()['rt-new']?.requestId).toBe('req-live')
+    expect(Object.keys($clarifyRequests.get())).toEqual(['rt-new'])
   })
 })

@@ -41,7 +41,7 @@ import {
   writeEnvFile,
   writeMockProviderConfig,
 } from './fixtures'
-import { BLOCKING_CLARIFY_QUESTION, BLOCKING_CLARIFY_TRIGGER, type MockServer, startMockServer } from './mock-server'
+import { BLOCKING_CLARIFY_CONTINUATION, BLOCKING_CLARIFY_QUESTION, BLOCKING_CLARIFY_TRIGGER, type MockServer, startMockServer } from './mock-server'
 import { RealSessionBuilder } from './real-session-builder'
 import { type ElectronApplication, expect, type Page, test } from './test'
 
@@ -239,10 +239,11 @@ test.describe('clarify card durability across a long session', () => {
     await expect(settled.getByText(BLOCKING_CLARIFY_QUESTION)).toHaveCount(1)
     await expect(liveClarifyCard(page)).toHaveCount(0)
 
-    // Attention clears on that one settlement. The settled row above is also
-    // the continuation evidence: it only renders once the blocking tool has
-    // returned to the agent loop, so the turn is no longer stuck on a request
-    // nothing on screen could answer — which was the whole field failure.
+    // Attention clears on that one settlement. Then the unique post-tool
+    // assistant continuation must appear exactly once — seeded history must
+    // not satisfy it.
     await expect(needsInputAttention(page)).toHaveCount(0, { timeout: 60_000 })
+    await page.getByText(BLOCKING_CLARIFY_CONTINUATION).waitFor({ state: 'visible', timeout: 60_000 })
+    await expect(page.getByText(BLOCKING_CLARIFY_CONTINUATION)).toHaveCount(1)
   })
 })

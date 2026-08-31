@@ -1884,4 +1884,74 @@ describe('cold resume runtime identity move', () => {
     expect($clarifyRequests.get()['rt-new']?.toolCallId).toBe('call-live')
     expect(Object.keys($clarifyRequests.get())).toEqual(['rt-new'])
   })
+
+  it('does not resurrect an old request when the resumed backend reports no pending clarify', async () => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-old']])
+    }
+
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-old', createClientSessionState('stored-A')]])
+    }
+
+    setClarifyRequest({
+      choices: ['Allow', 'Deny'],
+      multiSelect: false,
+      question: 'Proceed?',
+      requestId: 'req-stale',
+      sessionId: 'rt-old',
+      toolCallId: 'call-stale'
+    })
+
+    setSessions([storedSession()])
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({
+      messages: [
+        { content: 'help me choose', role: 'user', timestamp: 1 },
+        { content: 'choose a path', role: 'assistant', timestamp: 2 }
+      ],
+      session_id: 'stored-A'
+    } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 2,
+          messages: [],
+          messages_omitted: true,
+          resumed: 'stored-A',
+          running: false,
+          session_id: 'rt-new',
+          session_key: 'stored-A'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      createElement(RuntimeMoveHarness, {
+        onReady: ready => {
+          resume = ready
+        },
+        requestGateway,
+        runtimeIdByStoredSessionIdRef,
+        sessionStateByRuntimeIdRef
+      })
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    expect($clarifyRequests.get()['rt-old']).toBeUndefined()
+    expect($clarifyRequests.get()['rt-new']).toBeUndefined()
+    expect(Object.keys($clarifyRequests.get())).toEqual([])
+    expect(sessionStateByRuntimeIdRef.current.get('rt-new')?.needsInput).toBe(false)
+    const projected = sessionStateByRuntimeIdRef.current.get('rt-new')?.messages ?? []
+    expect(
+      projected.some(message =>
+        message.parts.some(part => part.type === 'tool-call' && part.toolName === 'clarify' && part.result === undefined)
+      )
+    ).toBe(false)
+  })
 })

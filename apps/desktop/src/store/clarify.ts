@@ -361,7 +361,7 @@ export function restoreClarifyRequest(request: ClarifyRequest): boolean {
  */
 export function settleClarifyRequest(
   sessionId: string | null | undefined,
-  correlation: { question?: string; requestId?: string; toolName?: string }
+  correlation: { question?: string; questions?: unknown; requestId?: string; toolName?: string }
 ): boolean {
   const current = $clarifyRequests.get()[keyFor(sessionId)]
 
@@ -397,7 +397,32 @@ export function settleClarifyRequest(
     return true
   }
 
+  if (identityAbsentQuestionListMatches(current, correlation.questions)) {
+    clearClarifyRequest(current.requestId, current.sessionId)
+
+    return true
+  }
+
   return false
+}
+
+function identityAbsentQuestionListMatches(current: ClarifyRequest, raw: unknown): boolean {
+  const expected = current.questions?.map(question => question.question.trim()) ?? []
+
+  if (expected.length === 0 || !Array.isArray(raw) || raw.length === 0 || raw.length !== expected.length) {
+    return false
+  }
+
+  return raw.every((item, index) => {
+    const text =
+      typeof item === 'string'
+        ? item.trim()
+        : item && typeof item === 'object' && typeof (item as { question?: unknown }).question === 'string'
+          ? (item as { question: string }).question.trim()
+          : ''
+
+    return text.length > 0 && text === expected[index]
+  })
 }
 
 /**
