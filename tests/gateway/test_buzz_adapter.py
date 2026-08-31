@@ -3060,16 +3060,25 @@ class TestInboundMediaAuthorizationGate:
         assert result.raw_response is None
 
     @pytest.mark.asyncio
-    async def test_live_media_redacts_long_path_before_bounding(self, tmp_path):
+    async def test_live_media_redacts_long_path_before_bounding(
+        self, tmp_path, monkeypatch
+    ):
         parent = tmp_path
         private_parts = []
         for index in range(6):
             part = f"private-{index}-" + ("x" * 150)
             private_parts.append(part)
             parent = parent / part
-            parent.mkdir()
         media = parent / "handoff.txt"
-        media.write_text("safe handoff", encoding="utf-8")
+        real_is_file = Path.is_file
+
+        def synthetic_media_is_file(path):
+            return path == media or real_is_file(path)
+
+        # macOS limits a physical path to 1024 bytes.  Keep the overlong path
+        # synthetic so this test exercises redaction-before-bounding on every
+        # supported host instead of failing while arranging the fixture.
+        monkeypatch.setattr(Path, "is_file", synthetic_media_is_file)
         adapter = _make_adapter()
         adapter._run_cli = AsyncMock(
             return_value=(
