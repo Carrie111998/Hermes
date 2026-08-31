@@ -9950,8 +9950,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not getattr(self, "_reasoning_cli_flag_applied", False):
             try:
                 from hermes_constants import resolve_reasoning_config
+                # A missing/blank model means "unknown current model" — the
+                # chokepoint then resolves for the config-default model
+                # instead of AttributeError-ing into the stale-keeping path.
                 self.reasoning_config = resolve_reasoning_config(
-                    CLI_CONFIG, self.model
+                    CLI_CONFIG, getattr(self, "model", None)
                 )
             except Exception:
                 logger.debug(
