@@ -573,6 +573,26 @@ class TelegramNotifier(BaseSubscriber):
             from events.formatting import cron_stale_body
             return cron_stale_body(p)
 
+        if et in (EventType.CRON_PAUSED, EventType.CRON_RESUMED):
+            # The generic fallback splatted the full `reason` field — for a
+            # resume that is the multi-KB pause reason being LIFTED, and it
+            # read as if the hold were still in force (2026-08-31, the
+            # tracker-identity-repair resume). Lead with what happened; keep
+            # the reason to one clamped line with the right tense, and point
+            # at `hermes cron show` for the full text.
+            verb = "paused" if et == EventType.CRON_PAUSED else "resumed"
+            lines = [f"{p.get('job_name', '?')} {verb} (caller: {p.get('caller', '?')})"]
+            if et == EventType.CRON_RESUMED and p.get("next_run_at"):
+                lines.append(f"Next run: {p.get('next_run_at')}")
+            reason = str(p.get("reason") or "").strip()
+            if reason:
+                label = "Reason" if et == EventType.CRON_PAUSED else "Lifted pause reason (no longer in force)"
+                clamped = reason[:300] + ("…" if len(reason) > 300 else "")
+                lines.append(f"{label}: {clamped}")
+                if len(reason) > 300:
+                    lines.append(f"Full text: hermes cron show {p.get('job_id', '?')}")
+            return "\n".join(lines)
+
         if et == EventType.JOB_DISCOVERED:
             return f"Title: {p.get('title', '?')}\nCompany: {p.get('company', '?')}\nSource: {p.get('source', '?')}"
 

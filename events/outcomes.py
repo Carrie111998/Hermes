@@ -210,7 +210,12 @@ _VALUE_FIELDS = ("status", "reason", "outcome", "result", "conclusion", "message
 _PREVIOUS_FIELDS = ("before", "previous_status", "previous", "from")
 
 _CRON_FAILURE_RE = re.compile(
-    r"(?:\b(?:RED|FAILED|FAILURE|CRITICAL)\b"
+    # MISSING (uppercase only) is the fleet's shouted absent-thing marker:
+    # financier_digest_pin_verify ("MISSING <job> -- no execution row"),
+    # audit_rotate's live-file state, mempalace_weekly_firstfire_check.
+    # Lowercase "missing" in prose stays benign. Added 2026-08-31 after a
+    # pin-verify run reporting a missed digest fire rendered green.
+    r"(?:\b(?:RED|FAILED|FAILURE|CRITICAL|MISSING)\b"
     r"|\berrors?=[1-9]\d*\b"
     r"|\bfirst error\b"
     r"|\brc=[1-9]\d*\b"

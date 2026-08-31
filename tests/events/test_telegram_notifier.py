@@ -79,6 +79,42 @@ class TestAgentIterationBriefFormatting:
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
         )
 
+    def test_cron_resumed_clamps_lifted_pause_reason(
+        self, bus, topics_config, verbosity_config,
+    ):
+        # 2026-08-31: a resume event splatted the multi-KB pause reason it was
+        # LIFTING via the generic fallback, reading as if the hold still stood.
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        long_reason = "Gate-2 hold, Diego-authorized. " * 40
+        event = Event.create(
+            EventType.CRON_RESUMED, "cron",
+            {"job_id": "f65a9fc3a115", "job_name": "tracker-identity-repair",
+             "caller": "hermes_cli:cron_resume", "reason": long_reason,
+             "next_run_at": "2026-08-31T16:50:00-04:00"},
+            priority=Priority.LOW,
+        )
+        body = notifier._format_payload(event)
+        assert body.startswith("tracker-identity-repair resumed")
+        assert "no longer in force" in body
+        assert "hermes cron show f65a9fc3a115" in body
+        assert len(body) < 600
+        assert long_reason not in body
+
+    def test_cron_paused_keeps_short_reason_in_full(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        event = Event.create(
+            EventType.CRON_PAUSED, "cron",
+            {"job_id": "abc", "job_name": "some-job",
+             "caller": "mcp", "reason": "wedged on selector rot"},
+            priority=Priority.LOW,
+        )
+        body = notifier._format_payload(event)
+        assert body.startswith("some-job paused")
+        assert "Reason: wedged on selector rot" in body
+        assert "Full text" not in body
+
     def test_brief_rendered_verbatim_without_counters(
         self, bus, topics_config, verbosity_config,
     ):

@@ -200,6 +200,36 @@ def test_cron_completed_legacy_failure_marker_is_compatibility_evidence():
     assert any(item.path == "payload.output_summary" for item in verdict.evidence)
 
 
+def test_cron_completed_uppercase_missing_marker_is_failure():
+    # The live 2026-08-31 shape: financier-digest-pin-verify reporting a
+    # missed fire rendered as a green cron_completed.
+    verdict = evaluate_outcome(
+        _event(
+            {
+                "output_summary": (
+                    "financier digest pin check -- 2026-08-31 16:40\n"
+                    "MISSING financier-digest-pm (fff8a15ea495) -- expected "
+                    "16:20, no execution row today."
+                )
+            },
+            event_type=EventType.CRON_COMPLETED,
+        )
+    )
+
+    assert verdict.state is OutcomeState.FAILED
+
+
+def test_cron_completed_lowercase_missing_prose_is_benign():
+    verdict = evaluate_outcome(
+        _event(
+            {"output_summary": "sweep complete; 0 missing files, nothing to do"},
+            event_type=EventType.CRON_COMPLETED,
+        )
+    )
+
+    assert verdict.state is OutcomeState.SUCCEEDED
+
+
 @pytest.mark.parametrize("marker", ["exit=1", "exit_code=2", "exit=-1", "exit_code=-9"])
 def test_cron_completed_nonzero_legacy_exit_is_failure(marker):
     verdict = evaluate_outcome(
