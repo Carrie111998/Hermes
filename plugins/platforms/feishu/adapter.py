@@ -66,6 +66,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+
+from plugins.platforms.feishu.feishu_table_card import build_table_card_payload
 from typing import Any, Dict, List, Literal, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -271,6 +273,18 @@ async def _read_limited_feishu_webhook_body(request: Any, max_bytes: int) -> byt
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 
+# Card payload rejected by the API (invalid schema/component) — triggers the
+# interactive → post downgrade in ``send``. Only reached when the opt-in
+# ``tables_as_cards`` setting routes table content through card tables.
+_CARD_CONTENT_INVALID_RE = re.compile(
+    r"invalid card|card.*invalid|invalid.*card|schema|element"
+    r"|content format of the (post|card|interactive) type is incorrect"
+    r"|unable to parse card",
+    re.IGNORECASE,
+)
+# msg types the interactive→post→text downgrade ladder walks through.
+_CARD_DOWNGRADE_NEXT = {"interactive": "post", "post": "text"}
+
 # Feishu reactions render as prominent badges, unlike Discord/Telegram's
 # small footer emoji — a success badge on every message would add noise, so
 # we only mark start (Typing) and failure (CrossMark); the reply itself is
@@ -436,6 +450,10 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    # Opt-in: render markdown tables as native card table components (real
+    # column-width control) instead of post/md tables. Default off — the
+    # common post+md path renders tables acceptably (issue #52786).
+    tables_as_cards: bool = False
 
 
 @dataclass
@@ -1661,6 +1679,7 @@ class FeishuAdapter(BasePlatformAdapter):
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
             ),
+            tables_as_cards=_to_boolean(extra.get("tables_as_cards", "false")),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1693,6 +1712,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._tables_as_cards = settings.tables_as_cards
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -1984,29 +2004,58 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                    next_type = _CARD_DOWNGRADE_NEXT.get(msg_type)
+                    invalid_re = (
+                        _CARD_CONTENT_INVALID_RE
+                        if msg_type == "interactive"
+                        else _POST_CONTENT_INVALID_RE
+                    )
+                    if next_type is None or not invalid_re.search(str(exc)):
                         raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
+                    logger.warning(
+                        "[Feishu] Invalid %s payload rejected by API; downgrading to %s",
+                        msg_type, next_type,
+                    )
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        msg_type=next_type,
+                        payload=(
+                            _build_markdown_post_payload(chunk)
+                            if next_type == "post"
+                            else json.dumps(
+                                {"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False
+                            )
+                        ),
                         reply_to=reply_to,
                         metadata=metadata,
                     )
+                    msg_type = next_type
                 if (
-                    msg_type == "post"
-                    and not self._response_succeeded(response)
-                    and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
+                    not self._response_succeeded(response)
+                    and (
+                        (msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or "")))
+                        or (msg_type == "interactive" and _CARD_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or "")))
+                    )
                 ):
-                    logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
+                    downgrade_to = _CARD_DOWNGRADE_NEXT[msg_type]
+                    logger.warning(
+                        "[Feishu] %s payload rejected by API response; downgrading to %s",
+                        msg_type, downgrade_to,
+                    )
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                        msg_type=downgrade_to,
+                        payload=(
+                            _build_markdown_post_payload(chunk)
+                            if downgrade_to == "post"
+                            else json.dumps(
+                                {"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False
+                            )
+                        ),
                         reply_to=reply_to,
                         metadata=metadata,
                     )
+                    msg_type = downgrade_to
                 last_response = response
 
             return self._finalize_send_result(last_response, "send failed")
@@ -4659,6 +4708,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _build_outbound_payload(
         self, content: str, *, prefer_post: bool = False,
+        allow_card_table: bool = True,
     ) -> tuple[str, str]:
         # Empirically (issue #52786), current Feishu clients render markdown
         # tables inside ``post``-type ``md`` elements natively. The previous
@@ -4671,6 +4721,14 @@ class FeishuAdapter(BasePlatformAdapter):
         # markdown document: when a long markdown reply is split at
         # MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise
         # mis-classify a plain-prose chunk as ``text``. See #26841.
+        #
+        # ``allow_card_table`` is False on the message-update path: the
+        # im/v1 update API rejects changing msg_type on an existing message,
+        # so edits must not emit interactive cards.
+        if getattr(self, "_tables_as_cards", False) and allow_card_table:
+            card_payload = build_table_card_payload(content)
+            if card_payload is not None:
+                return "interactive", card_payload
         if prefer_post or _MARKDOWN_HINT_RE.search(content):
             return "post", _build_markdown_post_payload(content)
         text_payload = {"text": content}
