@@ -3952,8 +3952,14 @@ def is_zeroed_state_db(
         size = path.stat().st_size
     except OSError:
         return False
-    if size <= 0:
+    if size < 0:
         return False
+    # A 0-byte file is the most complete form of data loss — the entire
+    # state.db was truncated.  The original guard (size <= 0: return False)
+    # excluded this case, leaving 0-byte files silently treated as a fresh
+    # install instead of quarantined with an ERROR log (#97568).
+    if size == 0:
+        return True
     from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
 
     head = read_header_bytes_preopen(
