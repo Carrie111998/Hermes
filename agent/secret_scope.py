@@ -286,15 +286,45 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
     return secrets
 
 
-def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a profile's secret mapping from its ``<home>/.env``.
+def build_profile_secret_scope(
+    hermes_home: Path,
+    *,
+    include_process_env: bool = False,
+) -> Dict[str, str]:
+    """Build an isolated secret mapping for one profile.
 
     Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
     global vars are intentionally NOT copied in — ``get_secret`` reads those
     from ``os.environ`` directly, so the scope holds only profile secrets.
+
+    ``include_process_env`` is reserved for the profile that owns the running
+    process. Managed deployments commonly inject that launch profile's secrets
+    directly into the service environment instead of persisting ``.env``.
+    Multiplex callers must never enable it for a secondary profile: doing so
+    would copy the launch profile's credentials across the isolation boundary.
+
+    Precedence mirrors normal Hermes startup: process environment first, then
+    the profile's ``.env``, then configured external secret sources.
     """
     home = Path(hermes_home)
-    secrets = load_env_file(home / ".env")
+    secrets: Dict[str, str] = {}
+    if include_process_env:
+        from hermes_constants import (
+            get_process_hermes_home,
+            hermes_home_key,
+        )
+
+        if hermes_home_key(home) != hermes_home_key(get_process_hermes_home()):
+            raise ValueError(
+                "process environment credentials may only be included in "
+                "the process launch profile's secret scope"
+            )
+        secrets.update(
+            (key, value)
+            for key, value in os.environ.items()
+            if not _is_global_env(key)
+        )
+    secrets.update(load_env_file(home / ".env"))
 
     try:
         from hermes_cli.env_loader import get_secret_source_values

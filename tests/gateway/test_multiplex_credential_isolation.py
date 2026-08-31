@@ -87,6 +87,49 @@ class TestProfilePathResolutionUnderMultiplexScope:
         assert a_seen == prof_a / "skills"
         assert b_seen == prof_b / "skills"
 
+    def test_launch_profile_keeps_process_injected_credentials(
+        self, tmp_path, monkeypatch
+    ):
+        """The gateway owner keeps its deployment env without leaking it.
+
+        Managed gateways commonly inject the launch profile's provider keys
+        from a secret manager directly into the process environment instead
+        of persisting them in ``<home>/.env``.  Multiplex scoping must retain
+        those keys for that exact profile while a secondary profile remains
+        authoritative for its own credentials.
+        """
+        from agent.auxiliary_client import _scoped_key_env
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.runtime_provider import _getenv
+
+        launch_home = tmp_path / "launch"
+        secondary_home = launch_home / "profiles" / "secondary"
+        launch_home.mkdir()
+        secondary_home.mkdir(parents=True)
+        (secondary_home / ".env").write_text(
+            "META_API_KEY=secondary-meta-key\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(launch_home))
+        monkeypatch.setenv("META_API_KEY", "launch-meta-key")
+        monkeypatch.setenv("PROCESS_ONLY_API_KEY", "launch-only-key")
+        ss.set_multiplex_active(True)
+
+        with _profile_runtime_scope(launch_home):
+            assert _getenv("META_API_KEY") == "launch-meta-key"
+            assert _scoped_key_env("META_API_KEY") == "launch-meta-key"
+            assert ss.get_secret("PROCESS_ONLY_API_KEY") == "launch-only-key"
+
+        with _profile_runtime_scope(secondary_home):
+            assert _getenv("META_API_KEY") == "secondary-meta-key"
+            assert _scoped_key_env("META_API_KEY") == "secondary-meta-key"
+            assert ss.get_secret("PROCESS_ONLY_API_KEY") is None
+
+        with pytest.raises(ValueError, match="process launch profile"):
+            ss.build_profile_secret_scope(
+                secondary_home,
+                include_process_env=True,
+            )
+
 
 def test_cold_profile_hydrates_external_source_without_global_env(
     tmp_path, monkeypatch
@@ -164,5 +207,3 @@ def test_cold_profile_hydrates_external_source_without_global_env(
     assert calls["count"] == 1
     assert "TEST_PROVIDER_API_KEY" not in os.environ
     assert "EXPLICIT_API_KEY" not in os.environ
-
-

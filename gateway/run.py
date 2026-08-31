@@ -2465,18 +2465,24 @@ def _profile_runtime_scope(profile_home: "Path"):
       1. ``set_hermes_home_override`` — redirects ``get_hermes_home()`` (config,
          skills, memory, SOUL, sessions) to the profile's home. Contextvar, so
          it propagates into the agent worker thread via ``copy_context()``.
-      2. ``set_secret_scope`` — installs the profile's ``.env`` secrets as the
-         authoritative credential source, so ``get_secret`` reads this profile's
-         keys and never the process-global ``os.environ`` (which in a
-         multiplexer may hold another profile's values).
+      2. ``set_secret_scope`` — installs an authoritative credential mapping.
+         The process launch profile receives its own deployment-injected env
+         plus profile sources; secondary profiles receive only their own
+         sources and never the process-global ``os.environ`` (which belongs to
+         the launch profile).
 
     Only used on the multiplexed inbound path. Single-profile gateways never
-    enter this scope, so their behavior is unchanged. Loading the profile's
-    ``.env`` here does NOT mutate ``os.environ`` — ``build_profile_secret_scope``
-    returns an isolated dict — which is what keeps subprocesses (MCP, kanban)
-    from inheriting cross-profile secrets.
+    enter this scope, so their behavior is unchanged. Building the mapping
+    here does NOT mutate ``os.environ`` —
+    ``build_profile_secret_scope`` returns an isolated dict — which is what
+    keeps subprocesses (MCP, kanban) from inheriting cross-profile secrets.
     """
-    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from hermes_constants import (
+        get_process_hermes_home,
+        hermes_home_key,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
     from agent.secret_scope import (
         build_profile_secret_scope,
         set_secret_scope,
@@ -2484,9 +2490,17 @@ def _profile_runtime_scope(profile_home: "Path"):
     )
     from hermes_cli.env_loader import hydrate_profile_secret_sources
 
+    is_launch_profile = (
+        hermes_home_key(profile_home) == hermes_home_key(get_process_hermes_home())
+    )
     home_token = set_hermes_home_override(str(profile_home))
     hydrate_profile_secret_sources(Path(profile_home))
-    secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    secret_token = set_secret_scope(
+        build_profile_secret_scope(
+            Path(profile_home),
+            include_process_env=is_launch_profile,
+        )
+    )
     try:
         yield
     finally:
