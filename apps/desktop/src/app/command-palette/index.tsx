@@ -71,6 +71,7 @@ import { $bindings, bindingsFor } from '@/store/keybinds'
 import { $dismissedAutoProjectIds, filterVisibleProjects } from '@/store/layout'
 import { openPetGenerate } from '@/store/pet-generate'
 import { openBrowserTab } from '@/store/preview'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree, goToProject, openFolderAsProject, requestStartWorkSession } from '@/store/projects'
 import { $connection } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
@@ -109,7 +110,9 @@ import { usePaletteContributions } from './contrib'
 import { HighlightWatcher } from './highlight-watcher'
 import { MarketplaceThemePage } from './marketplace-theme-page'
 import { PetInlineToggle, PetPalettePage } from './pet-palette-page'
+import { commandPaletteQueryKey } from './query-scope'
 import { rankPaletteGroups } from './rank-groups'
+import { resolvePaletteSearchStatus } from './search-status'
 
 interface PaletteItem {
   /** Keybind action id — its live combo renders as a hotkey hint. */
@@ -505,14 +508,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   // rewrites these stores on every progress line, and only a changed string
   // should rebuild the palette's groups.
   const connection = useStore($connection)
-
-  const queryScope = [
-    connection?.connectionId ?? '',
-    connection?.mode ?? 'local',
-    connection?.baseUrl ?? '',
-    connection?.remoteIdentity ?? '',
-    connection?.profile ?? ''
-  ].join(':')
+  const activeGatewayProfile = useStore($activeGatewayProfile)
 
   const desktopVersion = useStore($desktopVersion)
   const clientStatus = useStore($updateStatus)
@@ -579,19 +575,19 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   // root-page search text. Scope keys prevent cached rows from one backend or
   // profile appearing during another backend's revalidation.
   const configQuery = useQuery({
-    queryKey: ['command-palette', queryScope, 'config'],
+    queryKey: commandPaletteQueryKey('config', connection, activeGatewayProfile),
     queryFn: () => getHermesConfigRecord()
   })
 
   const sessionsQuery = useQuery({
     enabled: hasRootSearch,
-    queryKey: ['command-palette', queryScope, 'sessions'],
+    queryKey: commandPaletteQueryKey('sessions', connection, activeGatewayProfile),
     queryFn: () => listAllProfileSessions(200, 1, 'exclude')
   })
 
   const archivedQuery = useQuery({
     enabled: hasRootSearch,
-    queryKey: ['command-palette', queryScope, 'archived'],
+    queryKey: commandPaletteQueryKey('archived', connection, activeGatewayProfile),
     queryFn: () => listAllProfileSessions(200, 0, 'only')
   })
 
@@ -602,13 +598,21 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const sessions = useMemo(() => (sessionsQuery.data?.sessions ?? []).map(toSessionEntry), [sessionsQuery.data])
   const archivedSessions = useMemo(() => (archivedQuery.data?.sessions ?? []).map(toSessionEntry), [archivedQuery.data])
 
-  const sessionSearchStatus = hasRootSearch
-    ? sessionsQuery.isPending || archivedQuery.isPending
-      ? t.common.loading
-      : sessionsQuery.isError || archivedQuery.isError
-        ? t.common.error
-        : undefined
-    : undefined
+  const searchStatus = resolvePaletteSearchStatus(hasRootSearch, [
+    {
+      hasData: Boolean(sessionsQuery.data),
+      isError: sessionsQuery.isError,
+      isPending: sessionsQuery.isPending
+    },
+    {
+      hasData: Boolean(archivedQuery.data),
+      isError: archivedQuery.isError,
+      isPending: archivedQuery.isPending
+    }
+  ])
+
+  const sessionSearchStatus =
+    searchStatus === 'loading' ? t.common.loading : searchStatus === 'error' ? t.common.error : undefined
 
   // Search/sub-page are local to a mount, and this component remounts per open
   // (keyed by open count), so each open starts clean without a reset effect.

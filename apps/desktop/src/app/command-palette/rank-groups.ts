@@ -18,6 +18,16 @@ interface NormalizedPaletteItem {
 const SCORE_ORDER = [3, 2, 1] as const
 const normalizedItems = new WeakMap<RankablePaletteItem, NormalizedPaletteItem>()
 
+function allocationOrder<T extends RankablePaletteItem>(groups: Array<RankablePaletteGroup<T>>): number[] {
+  return groups
+    .map((group, index) => ({
+      index,
+      key: normalize(group.heading ?? group.items[0]?.label ?? '')
+    }))
+    .sort((left, right) => left.key.localeCompare(right.key) || left.index - right.index)
+    .map(entry => entry.index)
+}
+
 function normalizedItem(item: RankablePaletteItem): NormalizedPaletteItem {
   const cached = normalizedItems.get(item)
 
@@ -67,21 +77,52 @@ export function rankPaletteGroups<T extends RankablePaletteItem>(
     return groups
   }
 
+  const limit = Math.max(0, Math.floor(maxItems))
+
+  if (limit === 0) {
+    return groups.map(group => ({ ...group, items: [] })).filter(group => group.items.length > 0)
+  }
+
+  // A group can contribute at most `limit` rows in total, so retaining only
+  // the first `limit` matches in each score bucket is sufficient. The scan is
+  // still global across score levels, which means a later exact/prefix match
+  // cannot be displaced by an earlier weak match. Once a group has `limit`
+  // exact matches, the rest of that group's candidates cannot enter the global
+  // result and need not be scored.
   const buckets = new Map<number, T[][]>(SCORE_ORDER.map(score => [score, groups.map(() => [])]))
 
-  groups.forEach((group, groupIndex) => {
+  let exactMatches = 0
+
+  for (const [groupIndex, group] of groups.entries()) {
     for (const item of group.items) {
       const score = scoreItem(item, normalizedSearch)
 
       if (score > 0) {
-        buckets.get(score)?.[groupIndex]?.push(item)
+        const bucket = buckets.get(score)?.[groupIndex]
+
+        if (bucket && bucket.length < limit) {
+          bucket.push(item)
+
+          if (score === SCORE_ORDER[0]) {
+            exactMatches += 1
+          }
+        }
+
+        if (score === SCORE_ORDER[0] && bucket?.length === limit) {
+          break
+        }
       }
     }
-  })
+
+    if (exactMatches === limit) {
+      break
+    }
+  }
 
   const selected = groups.map(() => [] as T[])
   const highestScore = groups.map(() => 0)
-  let remaining = Math.max(0, maxItems)
+  const order = allocationOrder(groups)
+  let remaining = limit
 
   for (const score of SCORE_ORDER) {
     const groupBuckets = buckets.get(score) as T[][]
@@ -91,7 +132,11 @@ export function rankPaletteGroups<T extends RankablePaletteItem>(
     while (remaining > 0 && selectedInPass) {
       selectedInPass = false
 
-      for (let groupIndex = 0; groupIndex < groups.length && remaining > 0; groupIndex += 1) {
+      for (const groupIndex of order) {
+        if (remaining === 0) {
+          break
+        }
+
         const item = groupBuckets[groupIndex]?.[cursors[groupIndex] ?? 0]
 
         if (!item) {

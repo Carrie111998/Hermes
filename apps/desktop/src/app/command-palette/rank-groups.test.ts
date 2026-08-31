@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { rankPaletteGroups } from './rank-groups'
 
@@ -65,6 +65,44 @@ describe('rankPaletteGroups', () => {
     const ranked = rankPaletteGroups(groups, 'tools', 6)
 
     expect(ranked.map(group => group.items.length)).toEqual([3, 3])
+  })
+
+  it('allocates an equal-score remainder independently of source group order', () => {
+    const groups = ['First', 'Second'].map(heading => ({
+      heading,
+      items: Array.from({ length: 10 }, (_, index) => item(`${heading}-${index}`, 'Tools match'))
+    }))
+
+    const countByHeading = (input: typeof groups) =>
+      new Map(rankPaletteGroups(input, 'tools', 5).map(group => [group.heading, group.items.length]))
+
+    expect(countByHeading(groups)).toEqual(countByHeading([...groups].reverse()))
+  })
+
+  it('keeps stronger matches from later groups when the global cap is reached', () => {
+    const ranked = rankPaletteGroups(
+      [
+        { heading: 'Weak', items: Array.from({ length: 20 }, (_, index) => item(`weak-${index}`, 'Other', ['tools'])) },
+        { heading: 'Strong', items: Array.from({ length: 20 }, (_, index) => item(`strong-${index}`, 'Tools option')) }
+      ],
+      'tools',
+      4
+    )
+
+    expect(ranked.find(group => group.heading === 'Strong')?.items).toHaveLength(4)
+    expect(ranked.find(group => group.heading === 'Weak')).toBeUndefined()
+  })
+
+  it('stops scoring once the cap is filled with exact matches', () => {
+    const lateLabel = vi.fn(() => 'Tools late')
+    const lateItem = { get label() { return lateLabel() } }
+    const groups = [
+      { heading: 'First', items: Array.from({ length: 3 }, (_, index) => item(`exact-${index}`, 'Tools')) },
+      { heading: 'Late', items: [lateItem] }
+    ]
+
+    expect(rankPaletteGroups(groups, 'tools', 3)).toEqual([{ heading: 'First', items: groups[0]!.items }])
+    expect(lateLabel).not.toHaveBeenCalled()
   })
 
   it('leaves curated empty-search groups intact', () => {
