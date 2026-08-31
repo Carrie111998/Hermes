@@ -499,6 +499,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_show.add_argument("task_id")
     p_show.add_argument("--json", action="store_true")
     p_show.add_argument(
+        "--all-events",
+        action="store_true",
+        help="List every task event; by default only the most recent 20 are "
+             "shown, with a notice counting the omitted ones",
+    )
+    p_show.add_argument(
         "--state-type",
         choices=("status", "outcome"),
         default=None,
@@ -1936,7 +1942,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if events:
         print()
         print(f"Events ({len(events)}):")
-        for e in events[-20:]:
+        shown = events if getattr(args, "all_events", False) else events[-20:]
+        if len(shown) < len(events):
+            print(f"  … {len(events) - len(shown)} earlier events not shown "
+                  f"(use --all-events to list them)")
+        for e in shown:
             pl = f" {e.payload}" if e.payload else ""
             run_tag = f" [run {e.run_id}]" if e.run_id else ""
             print(f"  [{_fmt_ts(e.created_at)}]{run_tag} {e.kind}{pl}")
