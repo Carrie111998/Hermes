@@ -115,14 +115,6 @@ OPEN_PREVIEW_SCHEMA = {
 }
 
 
-registry.register(
-    name="open_preview",
-    toolset="desktop_ui",
-    schema=OPEN_PREVIEW_SCHEMA,
-    handler=lambda args, **kw: open_preview_tool(
-        url=args.get("url", ""),
-        label=args.get("label", ""),
-        new_tab=args.get("new_tab", False),
-    ),
-    emoji="🖼️",
-)
+# Registration removed: consolidated into the `desktop_preview` tool (#95681);
+# this module keeps its functions for preview_tool. `new_tab` is local and
+# rides along there — a second tab is how one conversation holds two pages.
