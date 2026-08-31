@@ -175,6 +175,35 @@ def find_cli_roots(records: Sequence[ProcessRecord]) -> List[ProcessRecord]:
     return roots
 
 
+def enrichment_pids(records: Sequence[ProcessRecord]) -> frozenset:
+    """PIDs that need the expensive fields (cmdline/exe/username/rss).
+
+    The controller's two-phase census reads only cheap fields
+    (pid/ppid/name/create_time) for the whole process table, then enriches
+    just this set — because on Windows each of cmdline/exe/username/rss opens
+    a handle per process, and doing that across ~600 processes is what makes a
+    naive census cost tens of seconds (worst exactly during the churn storm
+    P6 targets).
+
+    The set is a deliberate SUPERSET of what the planner strictly needs: every
+    process whose NAME is a Claude binary, plus every create-time-validated
+    descendant of one. That covers every CLI root (all Claude-named), every
+    tree member (a descendant of a root), and every Claude-named ancestor
+    (included by name, so ``find_cli_roots`` can still classify a
+    desktop-app parent). Seeding by NAME is what keeps this pure and cheap:
+    classification needs cmdline/exe, which we do not have yet at this phase,
+    so we cannot filter to "CLI only" here — over-including a handful of
+    desktop-app processes costs nothing and preserves correctness.
+    """
+    out: set = set()
+    for seed in records:
+        if os.path.basename(str(seed.name or "")).lower() not in _CLI_BASENAMES:
+            continue
+        out.add(seed.pid)
+        out.update(m.pid for m in collect_tree(seed, records))
+    return frozenset(out)
+
+
 def collect_tree(root: ProcessRecord, records: Sequence[ProcessRecord]) -> Tuple[ProcessRecord, ...]:
     """Root plus every descendant reachable via create-time-validated ppid
     links. A child that predates its claimed parent is a recycled ppid and is

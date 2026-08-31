@@ -165,38 +165,46 @@ class SingletonLock:
 # ---------------------------------------------------------------- live adapters
 
 def live_snapshot() -> ProcessSnapshot:
-    """Whole-box census via psutil. Per-process failures yield incomplete
-    records (which protect their trees) rather than silent gaps."""
+    """Whole-box census via psutil, in two phases.
+
+    Phase 1 reads only CHEAP fields (pid/ppid/name/create_time) for every
+    process. Phase 2 enriches ONLY the Claude-named processes and their trees
+    (``planner.enrichment_pids``) with the expensive fields
+    (cmdline/exe/username/rss). Each expensive field opens a per-process
+    handle on Windows, so fetching them for all ~600 processes cost tens of
+    seconds — worst during the very churn storm P6 exists to act on. Every
+    process the planner actually classifies or protects is Claude-named or a
+    descendant of one, so the un-enriched majority never needs those fields.
+
+    A process that could not be enriched (access denied, recycled between
+    phases) is marked incomplete, which protects its whole tree — fail-safe.
+    Non-enriched, non-Claude processes keep empty expensive fields; they are
+    never tree members, so those fields are never read for them."""
     import psutil
 
-    records: List[ProcessRecord] = []
+    # Phase 1 — cheap whole-table census.
+    cheap: List[ProcessRecord] = []
     complete = True
     try:
-        for proc in psutil.process_iter(
-            ["pid", "ppid", "name", "exe", "cmdline", "create_time",
-             "memory_info", "username"]
-        ):
+        for proc in psutil.process_iter(["pid", "ppid", "name", "create_time"]):
             try:
                 info = proc.info
-                mem = info.get("memory_info")
-                cmdline = info.get("cmdline")
-                record_complete = (
-                    info.get("name") is not None
-                    and cmdline is not None
-                    and info.get("create_time") is not None
-                    and info.get("username") is not None
-                )
-                records.append(
+                cheap.append(
                     ProcessRecord(
                         pid=int(info["pid"]),
                         ppid=info.get("ppid"),
                         name=str(info.get("name") or ""),
-                        exe=info.get("exe"),
-                        cmdline=tuple(str(a) for a in (cmdline or [])),
+                        exe=None,
+                        cmdline=(),
                         create_time=float(info.get("create_time") or 0.0),
-                        rss=int(getattr(mem, "rss", 0) or 0) if mem else 0,
-                        username=info.get("username"),
-                        complete=bool(record_complete),
+                        rss=0,
+                        username=None,
+                        # Cheap records are complete for how they are USED
+                        # (name + ancestry only); they are never tree members.
+                        complete=(
+                            info.get("name") is not None
+                            and info.get("create_time") is not None
+                        ),
                     )
                 )
             except Exception:
@@ -204,7 +212,40 @@ def live_snapshot() -> ProcessSnapshot:
                 continue
     except Exception:
         complete = False
-    return ProcessSnapshot(taken_at=time.time(), records=tuple(records), complete=complete)
+
+    # Phase 2 — enrich only Claude processes and their trees.
+    targets = planner.enrichment_pids(cheap)
+    by_pid = {r.pid: r for r in cheap}
+    for pid in targets:
+        base = by_pid.get(pid)
+        if base is None:
+            continue
+        try:
+            proc = psutil.Process(pid)
+            with proc.oneshot():
+                if abs(proc.create_time() - base.create_time) > 1.0:
+                    # Recycled between phases — do not graft a stranger's
+                    # fields onto this slot. Mark incomplete: its tree is
+                    # protected rather than acted on with mixed identity.
+                    by_pid[pid] = dataclasses.replace(base, complete=False)
+                    complete = False
+                    continue
+                mem = proc.memory_info()
+                enriched = dataclasses.replace(
+                    base,
+                    exe=proc.exe(),
+                    cmdline=tuple(str(a) for a in (proc.cmdline() or [])),
+                    rss=int(getattr(mem, "rss", 0) or 0),
+                    username=proc.username(),
+                    complete=True,
+                )
+            by_pid[pid] = enriched
+        except Exception:
+            by_pid[pid] = dataclasses.replace(base, complete=False)
+            complete = False
+
+    records = tuple(by_pid[r.pid] for r in cheap)
+    return ProcessSnapshot(taken_at=time.time(), records=records, complete=complete)
 
 
 def _projects_dir() -> Path:

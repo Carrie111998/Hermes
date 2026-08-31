@@ -80,6 +80,24 @@ def test_find_cli_roots_counts_only_topmost_cli():
     assert [r.pid for r in roots] == [-30]
 
 
+def test_enrichment_pids_covers_claude_procs_and_their_trees_only():
+    """The two-phase census enriches only Claude-named processes and their
+    create-time-valid descendants; the un-related majority stays cheap."""
+    root = cli_rec(-30, create_time=NOW - 500)
+    child = rec(-31, ppid=-30, name="node.exe", create_time=NOW - 400)      # MCP child
+    grandchild = rec(-32, ppid=-31, name="bun.exe", create_time=NOW - 300)
+    unrelated = rec(-99, name="chrome.exe", create_time=NOW - 400)
+    # A claude-named process seeds by NAME even before classification.
+    desktop = rec(-40, name="claude.exe",
+                  exe=r"C:\a\app\Claude.exe", create_time=NOW - 900)
+    recycled = rec(-33, ppid=-30, name="python.exe", create_time=NOW - 9000)  # predates root
+    records = (root, child, grandchild, unrelated, desktop, recycled)
+    pids = planner.enrichment_pids(records)
+    assert pids == frozenset({-30, -31, -32, -40})
+    assert -99 not in pids           # unrelated stays cheap
+    assert -33 not in pids           # recycled ppid excluded from the tree
+
+
 # ---------------------------------------------------------------- transcripts
 
 def test_transcript_exact_wins():
