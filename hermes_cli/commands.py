@@ -566,6 +566,21 @@ def is_gateway_known_command(name: str | None) -> bool:
     return False
 
 
+def rewrite_known_bang_command(text: str) -> str:
+    """Rewrite a known leading ``!cmd`` to the gateway ``/cmd`` form."""
+    if not text.startswith("!"):
+        return text
+
+    parts = text[1:].split(maxsplit=1)
+    if not parts:
+        return text
+    first_token = parts[0]
+    cmd_name = first_token.split("@", 1)[0].lower()
+    if cmd_name and "/" not in cmd_name and is_gateway_known_command(cmd_name):
+        return "/" + text[1:]
+    return text
+
+
 # Commands with explicit mid-run (running-agent) behavior in gateway/run.py.
 # DERIVED from the registry: every command whose ``busy_policy`` is not
 # "reject" either dispatches while the agent is busy or interrupts it first.
@@ -1478,7 +1493,12 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights"})
+#   - busy: set-once preference for what a message does mid-run; reached via
+#     /hermes busy on Slack. Demoted at the 50-cap when /busy became
+#     gateway-available — without this entry /busy claims a native slot and
+#     silently clamps /insights (a recurring inspection surface), breaking
+#     Telegram parity.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "busy"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

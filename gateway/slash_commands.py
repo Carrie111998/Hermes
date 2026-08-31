@@ -4284,6 +4284,9 @@ class GatewaySlashCommandsMixin:
         """
         arg = event.get_command_args().strip().lower()
         if not arg or arg == "status":
+            # Report the mode actually in effect for this source: with
+            # multiplex profiles a routed profile's startup snapshot can
+            # override the global default.
             mode = self._effective_busy_input_mode(event.source)
             if mode == "queue":
                 behavior = "queues for next turn"
@@ -4303,42 +4306,54 @@ class GatewaySlashCommandsMixin:
             )
 
         # Persist before mutate
-        from cli import save_config_value
-        if save_config_value("display.busy_input_mode", arg):
-            profile_name = self._busy_profile_name_for_source(event.source)
-            if profile_name:
-                from gateway.run import _load_gateway_runtime_config
+        try:
+            from cli import save_config_values
+            from hermes_cli import managed_scope
+            from hermes_cli.config import busy_mode_config_values
 
-                self._snapshot_profile_busy_modes(
-                    profile_name,
-                    _load_gateway_runtime_config(),
+            updates = busy_mode_config_values(arg)
+            if any(managed_scope.is_key_managed(key) for key in updates):
+                return EphemeralReply(
+                    "Busy input mode is managed by your administrator and "
+                    "cannot be changed here."
+                )
+            if save_config_values(updates):
+                text_mode = updates["display.busy_text_mode"]
+                profile_name = self._busy_profile_name_for_source(event.source)
+                if profile_name:
+                    from gateway.run import _load_gateway_runtime_config
+
+                    self._snapshot_profile_busy_modes(
+                        profile_name,
+                        _load_gateway_runtime_config(),
+                    )
+                else:
+                    self._busy_input_mode = arg
+                    self._busy_text_mode = text_mode
+
+                adapter = self._adapter_for_source(event.source)
+                if adapter is not None:
+                    adapter._busy_text_mode = self._effective_busy_text_mode(
+                        event.source
+                    )
+                if arg == "queue":
+                    behavior = "Messages will be queued for the next turn while Hermes is busy."
+                elif arg == "steer":
+                    behavior = "Messages will be steered into the current run (after the next tool call)."
+                else:
+                    behavior = "Messages will interrupt the current run while Hermes is busy."
+                return EphemeralReply(
+                    f"Busy input mode set to **`{arg}`** (saved)." + "\n"
+                    f"_{behavior}_"
                 )
             else:
-                self._busy_input_mode = arg
-                # busy_input_mode is the source of truth for the text mode
-                # too (run.py:_load_busy_text_mode) — re-derive it so the
-                # adapter refresh below doesn't read a stale value and keep
-                # interrupting after e.g. /busy queue (config IS saved; only
-                # the live session lagged until restart).
-                self._busy_text_mode = self._load_busy_text_mode()
-
-            adapter = self._adapter_for_source(event.source)
-            if adapter is not None:
-                adapter._busy_text_mode = self._effective_busy_text_mode(event.source)
-
-            if arg == "queue":
-                behavior = "Messages will be queued for the next turn while Hermes is busy."
-            elif arg == "steer":
-                behavior = "Messages will be steered into the current run (after the next tool call)."
-            else:
-                behavior = "Messages will interrupt the current run while Hermes is busy."
+                return EphemeralReply(
+                    f"Busy input mode could not be saved to config. Mode unchanged."
+                )
+        except Exception as e:
+            logger.warning("Failed to save busy_input_mode: %s", e)
             return EphemeralReply(
-                f"Busy input mode set to **`{arg}`** (saved)." + "\n"
-                f"_{behavior}_"
-            )
-        else:
-            return EphemeralReply(
-                f"Busy input mode could not be saved to config. Mode unchanged."
+                f"Could not save busy input mode: {e}. Mode unchanged."
             )
 
     async def _handle_footer_command(self, event: MessageEvent) -> str:

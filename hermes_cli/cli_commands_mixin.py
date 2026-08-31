@@ -3848,7 +3848,9 @@ class CLICommandsMixin:
             /busy steer         Inject Enter mid-run via /steer (after next tool call)
             /busy interrupt     Redirect the current run on Enter (default)
         """
-        from cli import _ACCENT, _DIM, _RST, _cprint, save_config_value
+        from cli import _ACCENT, _DIM, _RST, _cprint, save_config_values
+        from hermes_cli import managed_scope
+        from hermes_cli.config import busy_mode_config_values
         parts = cmd.strip().split(maxsplit=1)
         if len(parts) < 2 or parts[1].strip().lower() == "status":
             _cprint(f"  {_ACCENT}Busy input mode: {self.busy_input_mode}{_RST}")
@@ -3868,8 +3870,16 @@ class CLICommandsMixin:
             _cprint(f"  {_DIM}Usage: /busy [queue|steer|interrupt|status]{_RST}")
             return
 
+        updates = busy_mode_config_values(arg)
+        if any(managed_scope.is_key_managed(key) for key in updates):
+            _cprint(
+                f"  {_DIM}Busy input mode is managed by your administrator "
+                f"and cannot be changed here.{_RST}"
+            )
+            return
+
         self.busy_input_mode = arg
-        if save_config_value("display.busy_input_mode", arg):
+        if save_config_values(updates):
             if arg == "queue":
                 behavior = "Enter will queue follow-up input while Hermes is busy."
             elif arg == "steer":
