@@ -21,7 +21,7 @@ from __future__ import annotations
 from datetime import datetime
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -278,6 +278,76 @@ async def test_admin_runs_quick_command_when_gating_enabled():
     )
 
     assert result == "quick-command-admin"
+
+
+@pytest.mark.asyncio
+async def test_secondary_profile_executes_its_own_quick_command():
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["primary-admin"],
+            "user_allowed_commands": ["danger"],
+        }
+    )
+    runner.config.quick_commands = {
+        "danger": {"type": "exec", "command": "printf PRIMARY"}
+    }
+    secondary = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(
+                enabled=True,
+                token="***",
+                extra={
+                    "allow_admin_from": ["secondary-admin"],
+                    "user_allowed_commands": ["danger"],
+                },
+            )
+        },
+        multiplex_profiles=True,
+        quick_commands={
+            "danger": {"type": "exec", "command": "printf SECONDARY"}
+        },
+    )
+    runner._profile_configs = {
+        "default": runner.config,
+        "secondary": secondary,
+    }
+    source = replace(_make_source(user_id="user1"), profile="secondary")
+    proc = AsyncMock()
+    proc.communicate.return_value = (b"ok", b"")
+
+    with patch(
+        "gateway.run.asyncio.create_subprocess_shell",
+        new=AsyncMock(return_value=proc),
+    ) as create_process:
+        result = await runner._handle_message(_make_event("/danger", source))
+
+    assert result == "ok"
+    assert create_process.await_args.args[0] == "printf SECONDARY"
+
+
+@pytest.mark.asyncio
+async def test_secondary_profile_expands_its_own_quick_alias():
+    runner = _make_runner(platform_extra={})
+    runner.config.quick_commands = {
+        "go": {"type": "alias", "target": "/help"}
+    }
+    secondary = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(enabled=True, token="***", extra={})
+        },
+        multiplex_profiles=True,
+        quick_commands={"go": {"type": "alias", "target": "/whoami"}},
+    )
+    runner._profile_configs = {
+        "default": runner.config,
+        "secondary": secondary,
+    }
+    source = replace(_make_source(user_id="user1"), profile="secondary")
+
+    result = await runner._handle_message(_make_event("/go", source))
+
+    assert "Tier:" in result
+    assert "Slash commands:" in result
 
 
 # ---------------------------------------------------------------------------

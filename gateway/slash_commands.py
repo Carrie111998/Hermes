@@ -3310,6 +3310,12 @@ class GatewaySlashCommandsMixin:
         chat_name = source.chat_name or chat_id
         if source.platform is None:
             return t("gateway.set_home.save_failed", error="Missing logical platform")
+        runtime_config = self._session_config_for_source(source)
+        if runtime_config is None:
+            return t(
+                "gateway.set_home.save_failed",
+                error=f"No gateway config registered for profile {source.profile!r}",
+            )
 
         via_relay = getattr(source, "delivered_via_upstream_relay", False) is True
         if via_relay:
@@ -3362,9 +3368,10 @@ class GatewaySlashCommandsMixin:
         except Exception as e:
             logger.warning("Home config saved but legacy env persistence failed: %s", e)
 
-        # Keep the running gateway config in sync too. The pre-restart
-        # notification path reads self.config before the process reloads config.
-        platform_config = getattr(self, "config").platforms.setdefault(
+        # Keep the running profile config in sync too. The pre-restart
+        # notification and handoff paths read this registered config before the
+        # process reloads config.
+        platform_config = runtime_config.platforms.setdefault(
             source.platform,
             PlatformConfig(enabled=not via_relay),
         )

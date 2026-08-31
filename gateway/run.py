@@ -8430,6 +8430,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return configs.get(profile)
         return primary_config if profile == "default" else None
 
+    def _quick_commands_for_source(self, source: SessionSource) -> Dict[str, Any]:
+        """Return only the quick commands registered for ``source``'s profile."""
+        config = self._session_config_for_source(source)
+        if config is None:
+            return {}
+        if isinstance(config, dict):
+            quick_commands = config.get("quick_commands", {}) or {}
+        else:
+            quick_commands = getattr(config, "quick_commands", {}) or {}
+        return quick_commands if isinstance(quick_commands, dict) else {}
+
     def _build_session_context_for_source(
         self,
         source: SessionSource,
@@ -18982,11 +18993,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Preserve built-in precedence; aliases only need early handling when
         # the typed command is not already known.
         if command and _cmd_def is None:
-            if isinstance(self.config, dict):
-                quick_commands = self.config.get("quick_commands", {}) or {}
-            else:
-                quick_commands = getattr(self.config, "quick_commands", {}) or {}
-            if isinstance(quick_commands, dict) and command in quick_commands:
+            quick_commands = self._quick_commands_for_source(source)
+            if command in quick_commands:
                 qcmd = quick_commands[command]
                 if qcmd.get("type") == "alias":
                     target = (qcmd.get("target") or "").strip()
@@ -19427,12 +19435,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
-            if isinstance(self.config, dict):
-                quick_commands = self.config.get("quick_commands", {}) or {}
-            else:
-                quick_commands = getattr(self.config, "quick_commands", {}) or {}
-            if not isinstance(quick_commands, dict):
-                quick_commands = {}
+            quick_commands = self._quick_commands_for_source(source)
             if command in quick_commands:
                 # Quick commands are slash capabilities too — and type:exec
                 # ones run a shell command in the gateway process. The early

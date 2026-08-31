@@ -21,8 +21,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent
 from gateway.run import GatewayRunner
-from gateway.session import SessionEntry
+from gateway.session import SessionEntry, SessionSource
 
 
 def _adapter(tag):
@@ -150,6 +151,53 @@ async def test_secondary_profile_handoff_uses_its_own_adapter(monkeypatch):
         f"session key must carry the profile namespace, got {captured['session_key']}"
     )
     assert captured["source"].profile == "medicina"
+
+
+@pytest.mark.asyncio
+async def test_secondary_sethome_refreshes_registered_handoff_config(monkeypatch):
+    runner, _ = _make_multiplex_runner()
+    monkeypatch.setattr(
+        "gateway.slash_commands.persist_home_channel",
+        lambda _home, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.save_env_value",
+        lambda _key, _value: None,
+    )
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="9999",
+        chat_name="new-secondary-home",
+        chat_type="dm",
+        user_id="secondary-user",
+        profile="medicina",
+    )
+
+    result = await runner._handle_set_home_command(
+        MessageEvent(text="/sethome", source=source, message_id="sethome-1")
+    )
+
+    assert "Home channel set" in result
+    assert runner.config.get_home_channel(Platform.TELEGRAM).chat_id == "1111"
+    assert (
+        runner._profile_configs["medicina"]
+        .get_home_channel(Platform.TELEGRAM)
+        .chat_id
+        == "9999"
+    )
+
+    used = {}
+    monkeypatch.setattr(
+        "gateway.run.resolve_delivery_transport",
+        _spy_transport_factory(used),
+    )
+    await runner._process_handoff(
+        {"id": "cli-session", "title": "work", "handoff_platform": "telegram"},
+        profile_name="medicina",
+    )
+
+    assert used["home_chat_id"] == "9999"
+    assert used["adapter_tag"] == "medicina"
 
 
 @pytest.mark.asyncio
