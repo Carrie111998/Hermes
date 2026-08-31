@@ -60,6 +60,7 @@ import {
   setCurrentCwd,
   setCurrentFastMode,
   setCurrentModel,
+  setCurrentModelSource,
   setCurrentProvider,
   setCurrentReasoningEffort,
   setMessages,
@@ -568,6 +569,7 @@ describe('createBackendSessionForSend profile routing', () => {
     $currentModel.set('')
     $currentProvider.set('')
     $currentReasoningEffort.set('')
+    setCurrentModelSource('')
     setNewChatWorkspaceTarget(undefined)
     vi.restoreAllMocks()
   })
@@ -652,10 +654,56 @@ describe('createBackendSessionForSend profile routing', () => {
     expect(ambientRequest).not.toHaveBeenCalledWith('session.create', expect.anything())
   })
 
+  it('omits reasoning_effort when the composer only MIRRORS a profile default', async () => {
+    // The composer seeds its effort from `agent.reasoning_effort`, but only
+    // while no session is active — so in app-global remote mode it keeps the
+    // seed of whatever profile the app happened to be scoped to, and a chat
+    // started on another profile was born with THAT profile's effort pinned.
+    const params = await createWith(() => {
+      setCurrentModelSource('default')
+      setCurrentReasoningEffort('medium')
+    })
+
+    expect(params).not.toHaveProperty('reasoning_effort')
+  })
+
+  it('omits reasoning_effort when the selection source is unset', async () => {
+    const params = await createWith(() => {
+      setCurrentModelSource('')
+      setCurrentReasoningEffort('medium')
+    })
+
+    expect(params).not.toHaveProperty('reasoning_effort')
+  })
+
+  it('still sends reasoning_effort for a real user pick', async () => {
+    const params = await createWith(() => {
+      setCurrentModelSource('manual')
+      setCurrentReasoningEffort('high')
+    })
+
+    expect(params).toMatchObject({ reasoning_effort: 'high' })
+  })
+
+  it('keeps sending the composer model when the effort is withheld', async () => {
+    // The two are gated independently here: this change is scoped to effort so
+    // it composes with the model-side fix rather than duplicating it.
+    const params = await createWith(() => {
+      setCurrentModelSource('default')
+      setCurrentModel('openai/gpt-5.6-sol')
+      setCurrentProvider('openai-codex')
+      setCurrentReasoningEffort('medium')
+    })
+
+    expect(params).toMatchObject({ model: 'openai/gpt-5.6-sol', provider: 'openai-codex' })
+    expect(params).not.toHaveProperty('reasoning_effort')
+  })
+
   it('freezes the visible selector state before profile readiness and sends fast: false explicitly', async () => {
     const profileReady = deferred<void>()
     vi.mocked(ensureGatewayProfile).mockReturnValueOnce(profileReady.promise)
 
+    setCurrentModelSource('manual')
     setCurrentModel('anthropic/claude-sonnet-4.6')
     setCurrentProvider('anthropic')
     setCurrentReasoningEffort('high')

@@ -71,6 +71,7 @@ import {
   $newChatWorkspaceTarget,
   $sessions,
   $yoloActive,
+  getCurrentModelSource,
   getSessionOwnerHint,
   type NewChatWorkspaceTarget,
   resolveComposerSessionKey,
@@ -242,8 +243,9 @@ function reconcileAuthoritativeMessages(
 // mode one backend serves every profile, so an omitted profile silently lands the
 // chat on the launch (default) profile — the "rubberbands back to default" bug.
 // A no-op for single-profile/local-pooled users (a backend resolves its own launch
-// profile to None). The sticky UI model/effort/fast ride as per-session overrides,
-// never the profile default (that lives in Settings → Model).
+// profile to None). The sticky UI model/fast ride as per-session overrides, never
+// the profile default (that lives in Settings → Model); the sticky effort rides
+// only when the user actually picked it (see `isManualSelection` below).
 async function desktopSessionCreateParams(
   cwd: string,
   capturedRoute = resolveNewChatOwnerRoute()
@@ -252,8 +254,18 @@ async function desktopSessionCreateParams(
   // profile handshake below can yield long enough for background config/model
   // refreshes to finish; reading atoms afterward would silently create the
   // session with a different selection than the one the user submitted.
+  //
+  // Only a real user pick may override the target profile's configured effort.
+  // `'default'`/unset means the composer is MIRRORING some profile's
+  // `agent.reasoning_effort` — and in app-global remote mode that is routinely a
+  // DIFFERENT profile than this chat's, because one backend serves them all and
+  // the composer only reseeds while no session is active. Sending the mirror as
+  // an explicit per-session override therefore transplants profile A's default
+  // onto profile B; omitting it lets the gateway resolve the target profile's.
+  const isManualSelection = getCurrentModelSource() === 'manual'
+
   const selection = {
-    effort: $currentReasoningEffort.get().trim(),
+    effort: isManualSelection ? $currentReasoningEffort.get().trim() : '',
     fast: $currentFastMode.get(),
     model: $currentModel.get().trim(),
     provider: $currentProvider.get().trim()
