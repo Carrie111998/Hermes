@@ -50,10 +50,11 @@ param(
     [switch]$NoMarkerCleanup,
     [switch]$SelfTestUi,
     [switch]$SelfTestPipeDrain,
+    [switch]$SelfTestRetryState,
     [switch]$SelfTestMarker
 )
 
-if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $InstallRoot) {
+if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestRetryState -and -not $InstallRoot) {
     # Mandatory in spirit; relaxed in the signature only so the self-test
     # switches can drive the UI / the pipe drain without a checkout.
     throw "-InstallRoot is required"
@@ -1119,6 +1120,55 @@ function Invoke-HermesStep([string]$Exe, [string[]]$HermesArgs, [string]$Tag) {
     return @{ Code = $code; Output = $all; TreeQuiesced = (-not $stalled -or $proc.HasExited); StartedAfterJobAssignment = $true }
 }
 
+# ── Update retry state machine (#96205) ────────────────────────────────────
+# `hermes update` can COMPLETE (its output shows "✓ Update complete!") and
+# still be killed by the stall watchdog: the post-update finalization
+# (gateway-restart hand-off) can stay alive and silent past the idle
+# ceiling, so Invoke-HermesStep terminates the tree and reports the timeout
+# sentinel 124. The old gate retried on ANY non-zero, non-2 exit code,
+# re-running a completed update from scratch -- the #96205 retry storm that
+# parked the Desktop popup for 70+ minutes.
+#
+# The completion marker is therefore a TERMINAL state: an update that
+# printed it is done, whatever exit code the step ended with. Terminal
+# states are never re-run.
+function Get-HermesUpdateRetryState([int]$Code, [string]$Output) {
+    if ($Code -eq 0) { return 'success' }
+    if ($Output -match 'Update complete!') { return 'completed' }
+    if ($Code -eq 2) { return 'fail-closed' }
+    return 'retryable'
+}
+
+# Run the update step through the retry state machine. Only the 'retryable'
+# state gets the single update-boundary retry (fresh code on disk, stale
+# code in memory). Exit 2 ("close all Hermes windows") is not retryable, and
+# neither is a completed update. A 'completed' state is surfaced as success
+# -- exit 0 -- with the captured output preserved so the truthful-completion
+# check below still sees a "Desktop build failed" warning if one was printed.
+function Invoke-HermesUpdateWithRetry([scriptblock]$Step) {
+    $res = & $Step
+    Write-HandoffLog "hermes update exit code: $($res.Code)"
+    $state = Get-HermesUpdateRetryState -Code $res.Code -Output $res.Output
+    if ($state -eq 'retryable') {
+        # One retry for the update-boundary class (fresh code on disk, stale
+        # code in memory).
+        Write-HandoffLog "first attempt failed; retrying once (freshly pulled fix loads on the second run)"
+        Publish-UiProgress "Retrying update"
+        $res = & $Step
+        Write-HandoffLog "retry exit code: $($res.Code)"
+        $state = Get-HermesUpdateRetryState -Code $res.Code -Output $res.Output
+    }
+    if ($state -eq 'completed') {
+        # Truthful completion: the install state is done even though the step
+        # was killed at the idle ceiling while finalizing. Report success so
+        # the hand-off relaunches the NEW build instead of re-running the
+        # update (the #96205 retry storm).
+        Write-HandoffLog "update completed but the step was killed during post-update finalization (exit $($res.Code)); treating as success, not retrying (#96205)"
+        $res = @{ Code = 0; Output = $res.Output; TreeQuiesced = $res.TreeQuiesced; StartedAfterJobAssignment = $res.StartedAfterJobAssignment }
+    }
+    return $res
+}
+
 $finalCode = 1
 $finalMsg = "update did not complete"
 $script:TreeSafeToFinalize = $true
@@ -1357,6 +1407,70 @@ exit 3
     exit 0
 }
 
+# -SelfTestRetryState: prove the retry state machine never re-runs a ------
+# completed update (#96205). Fixture states drive Get-HermesUpdateRetryState,
+# then the real gate runs with a step that "completes" and is then killed
+# with the timeout sentinel 124: the step must be invoked exactly once and
+# the result must surface as exit 0 for the downstream hand-off. Exits before
+# any marker/desktop machinery, same as the other self-test arms.
+if ($SelfTestRetryState) {
+    New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
+    $problems = @()
+    $fixtures = @(
+        @{ Name = 'clean success';             Code = 0;   Output = 'Update complete! (v0.20.5)';          Expected = 'success' }
+        @{ Name = 'fail-closed exit 2';        Code = 2;   Output = 'close all Hermes windows';               Expected = 'fail-closed' }
+        @{ Name = 'completed then timeout';    Code = 124; Output = 'Update complete! (v0.20.5) [main @ 2903a3fd]'; Expected = 'completed' }
+        @{ Name = 'completed then exit 3';     Code = 3;   Output = 'Update complete! (v0.19.0 -> v0.20.0)'; Expected = 'completed' }
+        @{ Name = 'timeout mid-update';        Code = 124; Output = 'Cloning into C:\hermes...';              Expected = 'retryable' }
+        @{ Name = 'ordinary failure';          Code = 1;   Output = 'Traceback (most recent call last)';      Expected = 'retryable' }
+        @{ Name = 'exit 9 with completion';    Code = 9;   Output = 'done. Update complete!';                 Expected = 'completed' }
+        @{ Name = 'stale output, no marker';   Code = 124; Output = 'pip install -e .';                       Expected = 'retryable' }
+        @{ Name = 'empty output timeout';      Code = 124; Output = '';                                        Expected = 'retryable' }
+    )
+    foreach ($f in $fixtures) {
+        $actual = Get-HermesUpdateRetryState -Code $f.Code -Output $f.Output
+        if ($actual -ne $f.Expected) { $problems += "$($f.Name): state '$actual', expected '$($f.Expected)'" }
+    }
+
+    # The gate itself: a step that printed the completion marker and was then
+    # killed with 124 must be invoked EXACTLY ONCE and surface as success --
+    # the exact #96205 shape (update completes, exits 124, must not re-run).
+    $ctx = @{ N = 0 }
+    $res = Invoke-HermesUpdateWithRetry {
+        $ctx.N = $ctx.N + 1
+        return @{ Code = 124; Output = 'Update complete! (v0.20.5) [main @ 2903a3fd]'; TreeQuiesced = $true; StartedAfterJobAssignment = $true }
+    }
+    if ($ctx.N -ne 1) { $problems += "completed-after-timeout step was invoked $($ctx.N) times (expected 1) -- the #96205 retry storm is back" }
+    if ($res.Code -ne 0) { $problems += "completed-after-timeout surfaced as exit $($res.Code), expected 0" }
+    if ($res.Output -notmatch 'Update complete!') { $problems += "completed-after-timeout lost the step output" }
+
+    # A genuine mid-update timeout (no completion marker) keeps the single
+    # retry, and its outcome is final.
+    $ctx2 = @{ N = 0 }
+    $res2 = Invoke-HermesUpdateWithRetry {
+        $ctx2.N = $ctx2.N + 1
+        return @{ Code = 124; Output = 'Cloning into...'; TreeQuiesced = $true; StartedAfterJobAssignment = $true }
+    }
+    if ($ctx2.N -ne 2) { $problems += "mid-update timeout was invoked $($ctx2.N) times (expected 2: first attempt + one retry)" }
+    if ($res2.Code -ne 124) { $problems += "mid-update timeout surfaced as exit $($res2.Code), expected 124" }
+
+    # Fail-closed (exit 2) is not retried either.
+    $ctx3 = @{ N = 0 }
+    $res3 = Invoke-HermesUpdateWithRetry {
+        $ctx3.N = $ctx3.N + 1
+        return @{ Code = 2; Output = 'close all Hermes windows'; TreeQuiesced = $true; StartedAfterJobAssignment = $true }
+    }
+    if ($ctx3.N -ne 1) { $problems += "fail-closed exit 2 was invoked $($ctx3.N) times (expected 1)" }
+    if ($res3.Code -ne 2) { $problems += "fail-closed exit 2 surfaced as exit $($res3.Code), expected 2" }
+
+    if ($problems.Count -gt 0) {
+        Write-Host "RETRY-STATE SELF-TEST: FAIL -- $($problems -join '; ')"
+        exit 1
+    }
+    Write-Host "RETRY-STATE SELF-TEST: PASS"
+    exit 0
+}
+
 try {
     New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
     Remove-Item -LiteralPath $ResultPath -Force -ErrorAction SilentlyContinue
@@ -1495,17 +1609,13 @@ try {
     }
     Write-HandoffLog ("running: python " + ($updateArgs -join " "))
     Publish-UiProgress "Updating code and dependencies"
-    $res = Invoke-HermesStep $pythonExe $updateArgs "update"
-    Write-HandoffLog "hermes update exit code: $($res.Code)"
-
-    if ($res.Code -ne 0 -and $res.Code -ne 2) {
-        # One retry for the update-boundary class (fresh code on disk, stale
-        # code in memory). Exit 2 ("close all Hermes windows") is not retryable.
-        Write-HandoffLog "first attempt failed; retrying once (freshly pulled fix loads on the second run)"
-        Publish-UiProgress "Retrying update"
-        $res = Invoke-HermesStep $pythonExe $updateArgs "update"
-        Write-HandoffLog "retry exit code: $($res.Code)"
-    }
+    # The retry decision lives in Invoke-HermesUpdateWithRetry (the #96205
+    # state machine): only a genuinely failed attempt is retried once. An
+    # update that COMPLETED (its output shows "✓ Update complete!") is
+    # terminal even if the stall watchdog later kills the finalizing step
+    # with 124 -- re-running it would re-apply the whole install and hang
+    # the Desktop popup for 70+ minutes.
+    $res = Invoke-HermesUpdateWithRetry { Invoke-HermesStep $pythonExe $updateArgs "update" }
 
     # -- 4. Truthful completion: don't trust exit 0 -------------------------
     # `hermes update` treats a Desktop GUI build failure as NON-fatal (prints

@@ -607,11 +607,22 @@ if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
     FINAL_MSG="Update skipped: the git checkout is on a branch that isn't fully merged into $BRANCH. Switch to the target branch and update again (see the terminal output for the exact commands)."
     exit 8
   fi
-  log "retrying once (freshly pulled fix loads on the second run)"
-  publish_stage "Retrying update"
-  OUT="$("$HERMES_BIN" update --yes --gateway $KEEP_STASH --branch "$BRANCH" 2>&1)"; CODE=$?
-  printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
-  log "retry exit code: $CODE"
+  # A COMPLETED update is terminal (#96205): if the update printed its
+  # completion marker ("✓ Update complete!") before the process was
+  # interrupted -- killed with the timeout sentinel 124 by an outer
+  # watchdog, SIGINT, ... -- the install state is already done. Re-running
+  # it would re-apply the whole update (the retry storm that hangs the
+  # desktop updater for 70+ minutes). Surface success instead.
+  if printf '%s' "$OUT" | grep -q "Update complete!"; then
+    log "update completed before the process was interrupted (exit $CODE); treating as success, not retrying (#96205)"
+    CODE=0
+  else
+    log "retrying once (freshly pulled fix loads on the second run)"
+    publish_stage "Retrying update"
+    OUT="$("$HERMES_BIN" update --yes --gateway $KEEP_STASH --branch "$BRANCH" 2>&1)"; CODE=$?
+    printf '%s\n' "$OUT" >> "$LOG" 2>/dev/null
+    log "retry exit code: $CODE"
+  fi
 fi
 trap 'on_signal TERM' TERM
 
