@@ -15,7 +15,6 @@ import re
 import socket as _socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -236,7 +235,7 @@ def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bo
 
 
 def build_auto_tts_output_path(platform) -> str:
-    """Return a unique temp output path for gateway auto-TTS synthesis.
+    """Return a unique audio-cache output path for gateway auto-TTS synthesis.
 
     Platform-awareness lives HERE (the caller knows its platform), not in the
     TTS tool's ``HERMES_SESSION_PLATFORM`` contextvar — that contextvar is
@@ -252,13 +251,7 @@ def build_auto_tts_output_path(platform) -> str:
     from tools.tts_tool import OPUS_VOICE_PLATFORMS
 
     ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
-    audio_path = os.path.join(
-        tempfile.gettempdir(),
-        "hermes_voice",
-        f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}",
-    )
-    os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-    return audio_path
+    return str(get_audio_cache_dir() / f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}")
 
 
 def utf16_len(s: str) -> int:

@@ -12,6 +12,7 @@ voice bubble). The fix passes an explicit output path from
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -23,6 +24,7 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
     build_auto_tts_output_path,
+    get_audio_cache_dir,
 )
 from gateway.session import SessionSource, build_session_key
 from tools.tts_tool import OPUS_VOICE_PLATFORMS
@@ -76,6 +78,19 @@ def _hold_typing():
 # ---------------------------------------------------------------------------
 # build_auto_tts_output_path: OPUS_VOICE_PLATFORMS is the single source of truth
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected_suffix"),
+    [(Platform.TELEGRAM, ".ogg"), (Platform.DISCORD, ".mp3")],
+)
+def test_output_path_uses_audio_cache_with_platform_native_extension(
+    platform, expected_suffix
+):
+    path = Path(build_auto_tts_output_path(platform))
+
+    assert path.parent == get_audio_cache_dir()
+    assert path.suffix == expected_suffix
 
 
 @pytest.mark.parametrize(
