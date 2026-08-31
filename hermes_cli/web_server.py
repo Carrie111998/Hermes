@@ -19113,7 +19113,11 @@ def _reload_plugin_api_routes(plugin_name: str) -> Dict[str, Any]:
     ones before the SPA catch-all.  The new module is imported BEFORE the
     old routes are dropped, so a plugin that fails re-import keeps serving
     its previous routes (the old route objects still reference the old
-    module's functions even after the ``sys.modules`` eviction).
+    module's functions even after the ``sys.modules`` eviction).  The
+    remove+mount swap runs under a module-level lock: requests racing
+    the swap can briefly see a 404 for paths that are brand-new in the
+    reloaded file, while previously served paths keep answering
+    throughout.
 
     Never raises — the request path must stay safe even when the plugin
     file on disk is broken mid-edit; failures come back as a structured
