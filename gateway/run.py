@@ -2744,6 +2744,7 @@ from gateway.session import (
     build_session_key,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
+    trusted_prompt_token_snapshot,
 )
 from gateway.delivery import (
     DeliveryRouter,
@@ -20406,15 +20407,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 _msg_count = len(history)
 
-                # Prefer actual API-reported tokens from the last turn
-                # (stored in session entry) over the rough char-based estimate.
-                _stored_tokens = session_entry.last_prompt_tokens
-                if _stored_tokens > 0:
+                # A provider snapshot is comparable only when it was captured
+                # for the route about to run. Legacy and cross-model values
+                # fall back to the current provider's replay shape.
+                _stored_tokens = trusted_prompt_token_snapshot(
+                    session_entry, _hyg_model
+                )
+                if _stored_tokens is not None:
                     _approx_tokens = _stored_tokens
-                    _token_source = "actual"
+                    _token_source = "provider-reported last prompt"
                 else:
-                    _approx_tokens = estimate_messages_tokens_rough(history)
-                    _token_source = "estimated"
+                    from agent.message_sanitization import needs_reasoning_echo
+
+                    _approx_tokens = estimate_messages_tokens_rough(
+                        history,
+                        include_reasoning_content=needs_reasoning_echo(
+                            _hyg_provider, _hyg_model, _hyg_base_url
+                        ),
+                    )
+                    _token_source = "rough wire estimate"
                     # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
                     # sessions, but that just means hygiene fires a bit early — which
                     # is safe and harmless.  The 85% threshold already provides ample
@@ -20992,6 +21003,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     if _hyg_rotated:
                                         # Reset stored token count — transcript rewritten
                                         session_entry.last_prompt_tokens = 0
+                                        session_entry.last_prompt_tokens_model = None
+                                        session_entry.last_prompt_tokens_at = None
                                         history = _compressed
                                         _new_count = len(_compressed)
                                         _new_tokens = estimate_messages_tokens_rough(
@@ -21002,6 +21015,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # compacted transcript inside _compress_context.
                                         # Reset counts to match the new active set.
                                         session_entry.last_prompt_tokens = 0
+                                        session_entry.last_prompt_tokens_model = None
+                                        session_entry.last_prompt_tokens_at = None
                                         history = _compressed
                                         _new_count = len(_compressed)
                                         _new_tokens = estimate_messages_tokens_rough(
@@ -21903,6 +21918,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self.async_session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+                last_prompt_tokens_model=agent_result.get("model"),
                 touch_activity=not bool(getattr(event, "internal", False)),
             )
 

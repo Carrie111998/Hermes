@@ -95,10 +95,24 @@ def _preflight_request_tokens(
             "using generic transcript estimate",
             exc_info=True,
         )
+    _needs_reasoning_echo = getattr(
+        agent, "_needs_thinking_reasoning_pad", None
+    )
+    include_reasoning_content = None
+    if callable(_needs_reasoning_echo):
+        try:
+            include_reasoning_content = bool(_needs_reasoning_echo())
+        except Exception:
+            logger.debug(
+                "reasoning replay policy unavailable; using persisted "
+                "reasoning_content in preflight estimate",
+                exc_info=True,
+            )
     return estimate_request_tokens_rough(
         messages,
         system_prompt=system_prompt or "",
         tools=tools,
+        include_reasoning_content=include_reasoning_content,
     )
 
 
