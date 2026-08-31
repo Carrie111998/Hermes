@@ -4528,9 +4528,9 @@ def recompute_ready(
     blocked purely by a parent dependency unblocks itself when the
     parent completes), *except* in two cases:
 
-    1. The most recent block event was a worker-initiated
-       ``kanban_block`` — those stay blocked until an explicit
-       ``kanban_unblock`` (#28712).
+    1. The creator requested ``initial_status="blocked"`` or the most
+       recent explicit block event was ``blocked`` — those stay parked
+       until an explicit ``kanban_unblock`` (#28712).
 
     2. The task's ``consecutive_failures`` has reached the effective
        failure limit.  This prevents infinite retry loops when a task
@@ -4559,10 +4559,9 @@ def recompute_ready(
             task_id = row["id"]
             cur_status = row["status"]
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for explicit human intervention — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
+                # Creator / worker / operator explicitly parked the task — do not
+                # silently auto-recover.  ``unblock_task`` is the only legitimate
+                # exit (it emits ``"unblocked"`` which flips this predicate back).
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
