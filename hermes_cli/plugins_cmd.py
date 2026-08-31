@@ -3048,7 +3048,7 @@ def dashboard_remove_user_plugin(name: str) -> dict[str, Any]:
     return {"ok": True, "name": name}
 
 
-def cmd_plugin_doctor(target: str = ".", *, ci: bool = False) -> None:
+def cmd_plugin_doctor(target: str | None = None, *, ci: bool = False) -> None:
     """Validate one plugin through runtime discovery and registration."""
     from rich.console import Console
 

@@ -163,9 +163,7 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
     )
     plugins_doctor.add_argument(
         "target",
-        nargs="?",
-        default=".",
-        help="Plugin path or installed plugin id (default: current directory)",
+        help="Plugin path or installed plugin id",
     )
     plugins_doctor.add_argument(
         "--ci",
