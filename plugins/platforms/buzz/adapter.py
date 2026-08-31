@@ -276,26 +276,62 @@ def _is_mention_continuation(char: str) -> bool:
     )
 
 
-def _has_complete_mention(content: str, name: str) -> bool:
-    target = f"@{name}".casefold()
-    for start, char in enumerate(content or ""):
+def _complete_mention_spans(content: str, name: str) -> List[Tuple[int, int]]:
+    """Return complete marker spans in NFKC-normalized content."""
+    normalized_content = unicodedata.normalize("NFKC", content or "")
+    normalized_name = unicodedata.normalize("NFKC", name or "")
+    target = f"@{normalized_name}".casefold()
+    spans: List[Tuple[int, int]] = []
+    for start, char in enumerate(normalized_content):
         if char != "@":
             continue
         if start and (
-            content[start - 1] == "@"
-            or _is_mention_continuation(content[start - 1])
+            normalized_content[start - 1] == "@"
+            or _is_mention_continuation(normalized_content[start - 1])
         ):
             continue
-        for end in range(start + 2, len(content) + 1):
-            candidate = content[start:end].casefold()
+        for end in range(start + 2, len(normalized_content) + 1):
+            candidate = normalized_content[start:end].casefold()
             if len(candidate) > len(target):
                 break
             if candidate != target:
                 continue
-            if end < len(content) and _is_mention_continuation(content[end]):
+            if (
+                end < len(normalized_content)
+                and _is_mention_continuation(normalized_content[end])
+            ):
                 continue
-            return True
-    return False
+            spans.append((start, end))
+            break
+    return spans
+
+
+def _has_complete_mention(content: str, name: str) -> bool:
+    return bool(_complete_mention_spans(content, name))
+
+
+def _select_configured_handoffs(
+    configured: Dict[str, Tuple[str, str]],
+    content: str,
+) -> Tuple[set[str], List[str]]:
+    """Select one longest configured identity for each visible marker."""
+    by_start: Dict[int, Tuple[int, str, str]] = {}
+    matched_names: set[str] = set()
+    for key, (name, pubkey) in configured.items():
+        for start, end in _complete_mention_spans(content, name):
+            matched_names.add(key)
+            current = by_start.get(start)
+            if current is None or end > current[0]:
+                by_start[start] = (end, key, pubkey)
+
+    selected_pubkeys: List[str] = []
+    seen_pubkeys: set[str] = set()
+    for start in sorted(by_start):
+        _end, _key, pubkey = by_start[start]
+        if pubkey not in seen_pubkeys:
+            selected_pubkeys.append(pubkey)
+            seen_pubkeys.add(pubkey)
+    return matched_names, selected_pubkeys
 
 # How many events to request per poll / seed call.
 _FETCH_LIMIT = 50
@@ -1447,6 +1483,26 @@ class BuzzAdapter(BasePlatformAdapter):
             )
         return code, out, err
 
+    def _configured_handoff_mentions(
+        self,
+        content: str,
+    ) -> Tuple[set[str], List[str]]:
+        """Return configured names/pubkeys whose complete marker is present."""
+        return _select_configured_handoffs(
+            self.outbound_mention_pubkeys,
+            content,
+        )
+
+    def prefers_fresh_final_streaming(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Use a fresh structured send when a stream ends with a handoff."""
+        del metadata
+        _names, pubkeys = self._configured_handoff_mentions(content)
+        return bool(pubkeys)
+
     async def send(
         self,
         chat_id: str,
@@ -1467,12 +1523,18 @@ class BuzzAdapter(BasePlatformAdapter):
         )
         if reply_target and self._reply_to_mode != "off":
             args += ["--reply-to", str(reply_target)]
-        protected_names: set[str] = set()
-        protected_pubkeys: List[str] = []
-        for key, (name, pubkey) in self.outbound_mention_pubkeys.items():
-            if _has_complete_mention(content, name):
-                protected_names.add(key)
-                protected_pubkeys.append(pubkey)
+        protected_names, protected_pubkeys = self._configured_handoff_mentions(
+            content
+        )
+        if protected_pubkeys and meta.get("expect_edits"):
+            return SendResult(
+                success=False,
+                error=(
+                    "Configured Buzz handoffs are deferred to the final message "
+                    "so structured mention metadata is preserved"
+                ),
+                raw_response={"configured_handoff_requires_final_send": True},
+            )
         mention_pubkeys = await self._mention_pubkeys_for(
             chat_id,
             content,
@@ -1564,6 +1626,18 @@ class BuzzAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Buzz edit needs a message id")
         if not content:
             return SendResult(success=False, error="Empty message")
+        _protected_names, protected_pubkeys = self._configured_handoff_mentions(
+            content
+        )
+        if protected_pubkeys:
+            return SendResult(
+                success=False,
+                error=(
+                    "Configured Buzz handoffs require a fresh message with "
+                    "structured mentions"
+                ),
+                raw_response={"configured_handoff_requires_fresh_send": True},
+            )
         args = ["messages", "edit", "--event", str(message_id), "--content", "-"]
         code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
@@ -1702,12 +1776,9 @@ class BuzzAdapter(BasePlatformAdapter):
         if reply_target and self._reply_to_mode != "off":
             args += ["--reply-to", str(reply_target)]
         send_content = caption or ""
-        protected_names: set[str] = set()
-        protected_pubkeys: List[str] = []
-        for key, (name, pubkey) in self.outbound_mention_pubkeys.items():
-            if _has_complete_mention(send_content, name):
-                protected_names.add(key)
-                protected_pubkeys.append(pubkey)
+        protected_names, protected_pubkeys = self._configured_handoff_mentions(
+            send_content
+        )
         code, out, err = await self._run_message_send(
             args,
             send_content,
@@ -3379,11 +3450,12 @@ async def _standalone_send(
         )
     except ValueError:
         return {"error": "Buzz standalone send: invalid outbound_mention_pubkeys"}
-    protected_names: set[str] = set()
-    for key, (name, pubkey) in outbound_mention_pubkeys.items():
-        if _has_complete_mention(message, name):
-            protected_names.add(key)
-            args += ["--mention", pubkey]
+    protected_names, protected_pubkeys = _select_configured_handoffs(
+        outbound_mention_pubkeys,
+        message,
+    )
+    for pubkey in protected_pubkeys:
+        args += ["--mention", pubkey]
     # Same reply_to_mode / reply_in_thread gate as the live adapter, so
     # out-of-process cron delivery (deliver=buzz) doesn't thread when the
     # operator asked for flat channel replies.

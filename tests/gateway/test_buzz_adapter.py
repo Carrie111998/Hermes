@@ -2274,6 +2274,112 @@ class TestBuzzAdapterSend:
         assert mention_values == [OTHER_PUBKEY]
 
     @pytest.mark.asyncio
+    async def test_configured_handoff_matches_unicode_compatibility_content(self):
+        adapter = _make_adapter(
+            {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}
+        )
+        adapter._channel_member_pubkeys = AsyncMock(return_value=[AGENT_PUBKEY])
+        adapter._profile_display_name = AsyncMock(return_value="Ｒｅｖｉｅｗｅｒ")
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": True, "event_id": "evt-exact-unicode-content", "message": ""},
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "@Ｒｅｖｉｅｗｅｒ please check this")
+
+        assert result.success is True
+        args, _text = cli.calls[0]
+        mention_values = [
+            args[index + 1]
+            for index, value in enumerate(args)
+            if value == "--mention"
+        ]
+        assert mention_values == [OTHER_PUBKEY]
+
+    @pytest.mark.asyncio
+    async def test_configured_handoff_prefers_longest_overlapping_display_name(self):
+        adapter = _make_adapter(
+            {
+                "outbound_mention_pubkeys": {
+                    "Ann": OTHER_PUBKEY,
+                    "Ann Lee": AGENT_PUBKEY,
+                }
+            }
+        )
+        dynamic_pubkey = "c" * 64
+        adapter._channel_member_pubkeys = AsyncMock(return_value=[dynamic_pubkey])
+        adapter._profile_display_name = AsyncMock(return_value="Ann")
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": True, "event_id": "evt-longest-name", "message": ""},
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "Please ask @Ann Lee to review")
+
+        assert result.success is True
+        args, _text = cli.calls[0]
+        mention_values = [
+            args[index + 1]
+            for index, value in enumerate(args)
+            if value == "--mention"
+        ]
+        assert mention_values == [AGENT_PUBKEY]
+
+    @pytest.mark.asyncio
+    async def test_configured_handoff_keeps_distinct_overlapping_names(self):
+        adapter = _make_adapter(
+            {
+                "outbound_mention_pubkeys": {
+                    "Ann": OTHER_PUBKEY,
+                    "Ann Lee": AGENT_PUBKEY,
+                }
+            }
+        )
+        adapter._channel_member_pubkeys = AsyncMock(return_value=[])
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": True, "event_id": "evt-distinct-names", "message": ""},
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "Ask @Ann, then @Ann Lee")
+
+        assert result.success is True
+        args, _text = cli.calls[0]
+        mention_values = [
+            args[index + 1]
+            for index, value in enumerate(args)
+            if value == "--mention"
+        ]
+        assert mention_values == [OTHER_PUBKEY, AGENT_PUBKEY]
+
+    @pytest.mark.asyncio
+    async def test_stream_preview_defers_configured_handoff_to_final_send(self):
+        adapter = _make_adapter(
+            {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}
+        )
+        cli = _ScriptedCli()
+        adapter._run_cli = cli
+
+        result = await adapter.send(
+            CHANNEL,
+            "Starting handoff to @Reviewer",
+            metadata={"expect_edits": True},
+        )
+
+        assert result.success is False
+        assert "final message" in (result.error or "")
+        assert cli.calls == []
+
+    @pytest.mark.asyncio
     async def test_send_configured_handoff_fails_instead_of_downgrading(self):
         adapter = _make_adapter(
             {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}
@@ -3816,6 +3922,35 @@ class TestStandaloneSend:
 
 
 class TestBuzzAdapterEdit:
+
+    @pytest.mark.asyncio
+    async def test_edit_refuses_configured_handoff_without_structured_mentions(self):
+        adapter = _make_adapter(
+            {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}
+        )
+        cli = _ScriptedCli()
+        adapter._run_cli = cli
+
+        result = await adapter.edit_message(
+            CHANNEL,
+            "orig1",
+            "Complete handoff: @Reviewer",
+            finalize=True,
+        )
+
+        assert result.success is False
+        assert "fresh message" in (result.error or "")
+        assert cli.calls == []
+
+    def test_configured_handoff_prefers_fresh_stream_final(self):
+        adapter = _make_adapter(
+            {"outbound_mention_pubkeys": {"Reviewer": OTHER_PUBKEY}}
+        )
+
+        assert adapter.prefers_fresh_final_streaming(
+            "Complete handoff: @Reviewer"
+        ) is True
+        assert adapter.prefers_fresh_final_streaming("No handoff") is False
 
     @pytest.mark.asyncio
     async def test_edit_targets_the_original_event_and_uses_stdin(self):
