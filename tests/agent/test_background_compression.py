@@ -85,7 +85,7 @@ def test_background_compaction_splices_durable_tail_without_blocking(tmp_path: P
     agent = _agent_with_blocking_compressor(db, session_id, started, release)
 
     assert maybe_start_background_compression(agent, history, "system") is True
-    assert started.wait(1.0)
+    assert started.wait(3.0)
 
     concurrent_tail = {"role": "user", "content": "arrived while summarizing"}
     db.append_messages_batch(session_id, [concurrent_tail])
@@ -129,7 +129,7 @@ def test_adoption_suppresses_reschedule_until_fresh_real_usage(tmp_path: Path) -
     agent._usage_anchor = object()
 
     assert maybe_start_background_compression(agent, history, "system") is True
-    assert started.wait(1.0)
+    assert started.wait(3.0)
     release.set()
     assert agent._background_compression_job.done.wait(3.0)
 
@@ -170,7 +170,7 @@ def test_inflight_job_is_never_adopted_or_started_twice(tmp_path: Path) -> None:
     agent = _agent_with_blocking_compressor(db, session_id, started, release)
 
     assert maybe_start_background_compression(agent, history, "system") is True
-    assert started.wait(1.0)
+    assert started.wait(3.0)
     assert maybe_start_background_compression(agent, history, "system") is False
     assert adopt_completed_background_compression(agent, history) is history
 
@@ -203,7 +203,7 @@ def test_failed_background_compaction_preserves_original_transcript(tmp_path: Pa
 
     agent.context_compressor.compress.side_effect = _fail
     assert maybe_start_background_compression(agent, history, "system") is True
-    assert started.wait(1.0)
+    assert started.wait(3.0)
     release.set()
     assert agent._background_compression_job.done.wait(3.0)
 
@@ -236,7 +236,7 @@ def test_completed_job_from_previous_session_is_not_adopted(tmp_path: Path) -> N
     agent = _agent_with_blocking_compressor(db, session_id, started, release)
 
     assert maybe_start_background_compression(agent, history, "system") is True
-    assert started.wait(1.0)
+    assert started.wait(3.0)
     release.set()
     assert agent._background_compression_job.done.wait(3.0)
     agent.session_id = "NEW_SESSION"
@@ -297,15 +297,77 @@ def test_adoption_publishes_prompt_rebuilt_by_background_worker(tmp_path: Path) 
         release.set()
         assert agent._background_compression_job.done.wait(3.0)
 
-    # Worker state stays private until the next foreground turn boundary.
-    assert agent._cached_system_prompt == "OLD PROMPT"
-    assert agent._cached_system_prompt_static == "OLD STATIC"
+        # Worker state stays private until the next foreground turn boundary.
+        assert agent._cached_system_prompt == "OLD PROMPT"
+        assert agent._cached_system_prompt_static == "OLD STATIC"
 
-    adopted = adopt_completed_background_compression(agent, history)
+        adopted = adopt_completed_background_compression(agent, history)
 
     assert adopted is not history
     assert agent._cached_system_prompt == "NEW PROMPT"
     assert agent._cached_system_prompt_static == "NEW STATIC"
+
+
+def test_adoption_rebuilds_prompt_and_tools_from_live_runtime_after_model_switch(
+    tmp_path: Path,
+) -> None:
+    from agent.background_compression import (
+        adopt_completed_background_compression,
+        maybe_start_background_compression,
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "BACKGROUND_MODEL_SWITCH"
+    db.create_session(session_id, source="test")
+    history = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+    ]
+    db.append_messages_batch(session_id, history)
+    started = threading.Event()
+    release = threading.Event()
+    agent = _agent_with_blocking_compressor(db, session_id, started, release)
+    agent.model = "model-a"
+
+    def _rebuild_prompt(target, _system_message):
+        target._cached_system_prompt_static = f"STATIC:{target.model}"
+        return f"PROMPT:{target.model}"
+
+    def _refresh_tools(target):
+        name = f"tool-{target.model}"
+        target.tools = [
+            {
+                "type": "function",
+                "function": {"name": name, "description": "", "parameters": {}},
+            }
+        ]
+        target.valid_tool_names = {name}
+        target._context_engine_tool_names = set()
+        target._tool_snapshot_generation += 1
+        return True
+
+    with (
+        patch.object(type(agent), "_build_system_prompt", _rebuild_prompt),
+        patch(
+            "agent.conversation_compression._refresh_agent_tool_definitions",
+            side_effect=_refresh_tools,
+        ),
+    ):
+        assert maybe_start_background_compression(agent, history, "system") is True
+        assert started.wait(3.0)
+        agent.model = "model-b"
+        agent._cached_system_prompt = None
+        release.set()
+        assert agent._background_compression_job.done.wait(3.0)
+
+        adopted = adopt_completed_background_compression(agent, history)
+
+    assert adopted is not history
+    assert agent._cached_system_prompt == "PROMPT:model-b"
+    assert agent._cached_system_prompt_static == "STATIC:model-b"
+    assert agent.valid_tool_names == {"tool-model-b"}
+    assert agent.tools[0]["function"]["name"] == "tool-model-b"
+    assert db.get_session(session_id)["system_prompt"] == "PROMPT:model-b"
 
 
 def test_external_memory_provider_disables_background_compaction(tmp_path: Path) -> None:

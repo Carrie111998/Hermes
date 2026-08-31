@@ -28,11 +28,11 @@ _POST_COMPACTION_STATE_FIELDS = (
 @dataclass
 class BackgroundCompressionJob:
     session_id: str
+    system_message: str = ""
     done: threading.Event = field(default_factory=threading.Event)
     error: Optional[BaseException] = None
     committed: bool = False
     compressor_state: dict[str, Any] = field(default_factory=dict)
-    agent_state: dict[str, Any] = field(default_factory=dict)
     boundary_messages: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -107,7 +107,7 @@ def _run_background_compression(
         worker._emit_warning = lambda *_args, **_kwargs: None
         worker._session_messages = snapshot
 
-        compressed, system_prompt = worker._compress_context(
+        compressed, _system_prompt = worker._compress_context(
             snapshot,
             system_message,
             approx_tokens=approx_tokens,
@@ -127,22 +127,6 @@ def _run_background_compression(
                     job.compressor_state[name] = copy.deepcopy(
                         getattr(worker.context_compressor, name)
                     )
-            job.agent_state = {
-                "_cached_system_prompt": system_prompt,
-                "_cached_system_prompt_static": getattr(
-                    worker, "_cached_system_prompt_static", None
-                ),
-                "tools": copy.deepcopy(getattr(worker, "tools", None)),
-                "valid_tool_names": set(
-                    getattr(worker, "valid_tool_names", set())
-                ),
-                "_context_engine_tool_names": set(
-                    getattr(worker, "_context_engine_tool_names", set())
-                ),
-                "_tool_snapshot_generation": getattr(
-                    worker, "_tool_snapshot_generation", -1
-                ),
-            }
             job.boundary_messages = copy.deepcopy(snapshot)
     except BaseException as exc:
         job.error = exc
@@ -218,7 +202,10 @@ def maybe_start_background_compression(
             return False
 
     snapshot = copy.deepcopy(messages)
-    job = BackgroundCompressionJob(session_id=str(agent.session_id))
+    job = BackgroundCompressionJob(
+        session_id=str(agent.session_id),
+        system_message=system_message or "",
+    )
     agent._background_compression_job = job
     thread = threading.Thread(
         target=_run_background_compression,
@@ -291,8 +278,25 @@ def adopt_completed_background_compression(
         if compressor is not None:
             for name, value in job.compressor_state.items():
                 setattr(compressor, name, copy.deepcopy(value))
-        for name, value in job.agent_state.items():
-            setattr(agent, name, copy.deepcopy(value))
+
+        # Rebuild prompt/tool state from the live runtime rather than publishing
+        # the shallow worker's snapshot. A model switch can complete while the
+        # summary is in flight; restoring the worker's model-A prompt and tools
+        # onto model B would make the next request use a torn runtime. The shared
+        # refresh helper publishes the complete tool tuple under its generation
+        # guard, and rebuilding here preserves the normal compaction-boundary
+        # refresh without allowing the background worker to win a stale race.
+        from agent.conversation_compression import _refresh_agent_tool_definitions
+
+        previous_prompt = getattr(agent, "_cached_system_prompt", None)
+        _refresh_agent_tool_definitions(agent)
+        agent._invalidate_system_prompt()
+        rebuilt_prompt = agent._build_system_prompt(job.system_message)
+        if previous_prompt is not None and rebuilt_prompt == previous_prompt:
+            agent._cached_system_prompt = previous_prompt
+        else:
+            agent._cached_system_prompt = rebuilt_prompt
+        session_db.update_system_prompt(job.session_id, agent._cached_system_prompt)
         agent._db_flush_scan_prefix = None
         agent._flushed_db_message_ids = set()
         agent._session_messages = adopted
