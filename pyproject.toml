@@ -241,7 +241,7 @@ honcho = ["honcho-ai==2.2.0"]
 # excluded from [all] like honcho/hindsight so a quarantined upstream release
 # can't break fresh installs.
 supermemory = ["supermemory==3.50.0"]
-mem0 = ["mem0ai==2.0.10"]
+mem0 = ["mem0ai==2.0.19"]
 # Image resize recovery for the vision tools. Pillow is now a CORE dependency
 # (see the main `dependencies` list above) since the byte/pixel shrink paths are on
 # the default vision-embed path and the mid-session lazy install deadlocked the
@@ -433,7 +433,7 @@ exclude-newer = "14 days"
 # firecrawl-anydoc: same exact-pin shape (==0.2.4, hosted-OCR wiring PR).
 # The pin bump WAS the review; exclude-newer adds zero float protection to
 # an exact pin and would only delay the reviewed version 14 days.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false, firecrawl-anydoc = false }
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false, firecrawl-anydoc = false, mem0ai = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's

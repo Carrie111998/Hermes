@@ -13,10 +13,11 @@ exclude-newer-span = "P14D"
 
 [options.exclude-newer-package]
 setuptools = false
-huggingface-hub = false
+mem0ai = false
 vercel = false
 pillow = false
 unpaddedbase64 = false
+huggingface-hub = false
 h2 = false
 defusedxml = false
 aiohttp = false
@@ -1901,7 +1902,7 @@ requires-dist = [
     { name = "mcp", marker = "extra == 'computer-use'", specifier = "==2.0.0" },
     { name = "mcp", marker = "extra == 'dev'", specifier = "==2.0.0" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = "==2.0.0" },
-    { name = "mem0ai", marker = "extra == 'mem0'", specifier = "==2.0.10" },
+    { name = "mem0ai", marker = "extra == 'mem0'", specifier = "==2.0.19" },
     { name = "microsoft-teams-apps", marker = "extra == 'teams'", specifier = "==2.0.13.4" },
     { name = "mistralai", marker = "extra == 'mistral'", specifier = "==2.4.8" },
     { name = "modal", marker = "extra == 'modal'", specifier = "==1.3.4" },
@@ -2492,7 +2493,7 @@ wheels = [
 
 [[package]]
 name = "mem0ai"
-version = "2.0.10"
+version = "2.0.19"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -2504,9 +2505,9 @@ dependencies = [
     { name = "qdrant-client" },
     { name = "sqlalchemy" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/90/43/b71a46ea164dbee57d2b436d60bc446179e5829e51759ee199240552701f/mem0ai-2.0.10.tar.gz", hash = "sha256:0d2afcd51f093c915b7d1e6208e86fbf563340de181e5604ff8af9513f3dffc8", size = 236842, upload-time = "2026-06-27T17:10:02.81Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e2/7e/0c01a5abd2a542425f795f1e64288d7843875449ccc7b745ffd41ff44d76/mem0ai-2.0.19.tar.gz", hash = "sha256:f58d66cdcc62954b97f300e64a63f2ff40c9508ff71cb99aec9a31ba98b6cacc", size = 249034, upload-time = "2026-08-24T13:16:45.835Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a4/58/9c25e77f06ec3483267f898c42fba783f2dcc411c7234dd34830bef8a372/mem0ai-2.0.10-py3-none-any.whl", hash = "sha256:9a99401c2c57bfbaf6ab780b193e458eb46802b4d75cac42f61eff13c9e34062", size = 329294, upload-time = "2026-06-27T17:10:01.157Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/15/1ec84875a8f5ae2ba4fbc7e89a9dd0a9b63028c04acfc2a1adb5b13455d4/mem0ai-2.0.19-py3-none-any.whl", hash = "sha256:c0d04476eb15872f65688297befb57708e12b04298d4f4215229b2066578956e", size = 344762, upload-time = "2026-08-24T13:16:44.111Z" },
 ]
 
 [[package]]
