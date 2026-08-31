@@ -420,10 +420,11 @@ class LdapAuthProvider(DashboardAuthProvider):
         ):
             raise RefreshExpiredError("refresh token expired or invalid")
         # Search mode: re-check the account still exists in the directory
-        # so a disabled/deleted user is cut off at access-token expiry
-        # instead of riding the 30-day refresh horizon. Direct mode has no
-        # service credentials to search with, so refresh is token-only
-        # there (documented tradeoff).
+        # so a deleted-or-moved user is cut off at access-token expiry
+        # instead of riding the 30-day refresh horizon. A merely disabled
+        # account still exists at its DN, so this probe cannot see it.
+        # Direct mode has no service credentials to search with, so
+        # refresh is token-only there (documented tradeoff).
         if self._verify_user_on_refresh and self._user_search_base:
             if not self._user_still_present(str(payload.get("dn", ""))):
                 raise RefreshExpiredError(
