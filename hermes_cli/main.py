@@ -252,7 +252,12 @@ def _set_process_title() -> None:
 
         setproctitle.setproctitle("hermes")
         return
-    except ImportError:
+    except (ImportError, UnicodeDecodeError):
+        # UnicodeDecodeError: setproctitle 1.3.x on Darwin truncates the
+        # argv buffer one byte short; if argv ends in a multibyte character
+        # the module-level getproctitle() decode blows up at import. A
+        # cosmetic title-setter must never abort startup — fall through to
+        # the ctypes fallback below.
         pass
 
     # Strategy 2/3: platform-specific ctypes fallback
