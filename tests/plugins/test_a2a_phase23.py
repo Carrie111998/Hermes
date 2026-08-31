@@ -645,6 +645,23 @@ class TestDynamicAgentCards:
         card = adapter._build_card()
         assert [s["name"] for s in card["skills"]] == ["webz"]
 
+    def test_explicit_empty_advertised_toolsets_hides_registered_tools(self, monkeypatch):
+        from tools.registry import registry
+        from gateway.config import PlatformConfig
+        from plugins.platforms.a2a.adapter import A2AAdapter
+
+        monkeypatch.setattr(registry, "get_registered_toolset_names",
+                            lambda: ["terminal", "spotify", "todo"])
+        monkeypatch.setattr(registry, "get_tool_names_for_toolset", lambda ts: [ts])
+        monkeypatch.delenv("A2A_ADVERTISED_TOOLSETS", raising=False)
+
+        adapter = A2AAdapter(PlatformConfig(
+            enabled=True,
+            extra={"advertised_toolsets": []},
+        ))
+        card = adapter._build_card()
+        assert [skill["name"] for skill in card["skills"]] == ["general"]
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Capability-based routing (a2a_orchestrate)

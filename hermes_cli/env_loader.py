@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
-from utils import atomic_replace, fast_safe_load
+from utils import atomic_replace, env_var_enabled, fast_safe_load
 
 
 # Env var name suffixes that indicate credential values.  These are the
@@ -478,7 +478,7 @@ def load_hermes_dotenv(
     Behavior:
     - `~/.hermes/.env` overrides stale shell-exported values when present.
     - project `.env` acts as a dev fallback and only fills missing values when
-      the user env exists.
+      the user env exists, unless `HERMES_DISABLE_PROJECT_ENV_FALLBACK=true`.
     - if no user env exists, the project `.env` also overrides stale shell vars.
     - callers that only maintain the installation can set
       ``load_external_secrets=False`` to avoid loading optional secret-manager
@@ -489,6 +489,8 @@ def load_hermes_dotenv(
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
+    if env_var_enabled("HERMES_DISABLE_PROJECT_ENV_FALLBACK"):
+        project_env_path = None
 
     # Normalize safe formatting and remove invalid NUL bytes before parsing.
     if user_env.exists():

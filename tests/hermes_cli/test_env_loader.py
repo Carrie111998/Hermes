@@ -620,3 +620,20 @@ def test_other_profile_home_does_not_bridge_process_config(tmp_path, monkeypatch
 
     # The other profile's .env value stands; the process config was not applied.
     assert os.getenv("TERMINAL_ENV") == "docker"
+
+
+def test_disable_project_env_fallback_skips_inaccessible_project_secrets(tmp_path, monkeypatch):
+    """Isolated runtimes must not read or require the checkout-level .env."""
+    home = tmp_path / "edge-home"
+    home.mkdir()
+    project_env = tmp_path / "project.env"
+    project_env.write_text("CORE_ONLY_SECRET=must-not-load\n", encoding="utf-8")
+    project_env.chmod(0)
+
+    monkeypatch.setenv("HERMES_DISABLE_PROJECT_ENV_FALLBACK", "true")
+    monkeypatch.delenv("CORE_ONLY_SECRET", raising=False)
+
+    loaded = load_hermes_dotenv(hermes_home=home, project_env=project_env)
+
+    assert loaded == []
+    assert "CORE_ONLY_SECRET" not in os.environ

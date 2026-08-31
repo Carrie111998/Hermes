@@ -347,12 +347,17 @@ class A2AAdapter(BasePlatformAdapter):
         self.port = int(os.getenv("A2A_PORT") or extra.get("port", _DEFAULT_PORT))
         self.host = security.resolve_bind_host()
         self.agent_name = _default_agent_name()
-        self._advertised_toolsets = [
-            t.strip() for t in (
-                list(extra.get("advertised_toolsets") or [])
-                or os.getenv("A2A_ADVERTISED_TOOLSETS", "").split(",")
-            ) if str(t).strip()
-        ]
+        if "advertised_toolsets" in extra:
+            configured_toolsets = extra.get("advertised_toolsets")
+        elif "A2A_ADVERTISED_TOOLSETS" in os.environ:
+            configured_toolsets = os.environ.get("A2A_ADVERTISED_TOOLSETS", "").split(",")
+        else:
+            configured_toolsets = None
+        self._advertised_toolsets = (
+            [str(t).strip() for t in (configured_toolsets or []) if str(t).strip()]
+            if configured_toolsets is not None
+            else None
+        )
         self._active_profile = _active_profile_name()
         self._agents = self._load_served_agents(extra)
 
@@ -630,7 +635,7 @@ class A2AAdapter(BasePlatformAdapter):
             from tools.registry import registry as tool_registry
             names = tool_registry.get_registered_toolset_names()
             configured = (agent or {}).get("advertised_toolsets") if agent else self._advertised_toolsets
-            allowed = set(configured or []) or None
+            allowed = None if configured is None else set(configured)
             mapping = {
                 n: tool_registry.get_tool_names_for_toolset(n)
                 for n in names
