@@ -8791,23 +8791,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             selected = result.payload if result.changed and isinstance(result.payload, dict) else None
             selected_model = selected.get("model") if selected else None
-            selected_provider = (
-                (selected or {}).get("provider")
-                or (selected or {}).get("requested_provider")
+            selected_public_runtime = (
+                (selected or {}).get("runtime")
+                if isinstance((selected or {}).get("runtime"), dict)
+                else {}
             )
-            if not (
-                isinstance(selected_model, str)
-                and selected_model.strip()
-                and isinstance(selected_provider, str)
-                and selected_provider.strip()
-            ):
+            # requested_provider is the resolver selector. The canonical
+            # provider is host-derived and may be shared by custom aliases.
+            current_requested_provider = runtime_kwargs.get("requested_provider") or runtime_kwargs.get("provider")
+            current_canonical_provider = runtime_kwargs.get("provider")
+            top_requested_provider = (selected or {}).get("requested_provider")
+            nested_requested_provider = selected_public_runtime.get("requested_provider")
+            if nested_requested_provider and nested_requested_provider != current_requested_provider:
+                requested_provider = nested_requested_provider
+            else:
+                requested_provider = top_requested_provider or nested_requested_provider
+            canonical_provider = (
+                (selected or {}).get("provider")
+                or selected_public_runtime.get("provider")
+            )
+            if requested_provider and requested_provider != current_requested_provider:
+                selected_provider = requested_provider
+            elif canonical_provider and canonical_provider != current_canonical_provider:
+                selected_provider = canonical_provider
+            else:
+                selected_provider = requested_provider or canonical_provider or current_requested_provider
+            if not (isinstance(selected_model, str) and selected_model.strip()):
                 return model, runtime_kwargs, result.trace
             selected_model = selected_model.strip()
+            if not isinstance(selected_provider, str) or not selected_provider.strip():
+                return model, runtime_kwargs, result.trace
             selected_provider = selected_provider.strip()
+            current_provider = current_requested_provider
             selected_runtime = dict(runtime_kwargs)
-            if selected_provider != runtime_kwargs.get("provider"):
+            if selected_provider != current_provider:
                 selected_runtime = _resolve_runtime_agent_kwargs_for_provider(selected_provider)
-            selected_runtime["provider"] = selected_runtime.get("provider") or selected_provider
+            selected_runtime["provider"] = selected_runtime.get("provider") or runtime_kwargs.get("provider")
             selected_runtime["requested_provider"] = selected_provider
             self._last_turn_route_trace = result.trace
             logger.info(
@@ -19131,10 +19150,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
+                    # Commands can run before this turn creates a session.
+                    # Use the persisted physical id when one exists; expose
+                    # None otherwise rather than aliasing the durable key.
+                    _physical_session_id = None
+                    _session_store = getattr(self, "session_store", None)
+                    _peek_session_id = getattr(_session_store, "peek_session_id", None)
+                    if callable(_peek_session_id):
+                        try:
+                            _physical_session_id = _peek_session_id(_quick_key)
+                        except Exception:
+                            _physical_session_id = None
                     result = invoke_plugin_command(
                         plugin_handler,
                         user_args,
-                        session_id=_quick_key,
+                        session_id=_physical_session_id,
                         session_key=_quick_key,
                         platform=source.platform.value if source.platform else None,
                     )

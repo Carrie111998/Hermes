@@ -171,6 +171,78 @@ def test_turn_route_middleware_receives_redacted_route_and_resolves_provider(mon
     assert trace == [{"source": "test"}]
 
 
+def test_gateway_turn_route_resolves_requested_custom_alias_and_host_api_mode(monkeypatch):
+    runner = _make_runner()
+    calls = []
+
+    def fake_apply(route, **_context):
+        return SimpleNamespace(
+            changed=True,
+            payload={
+                **route,
+                "model": "target",
+                "provider": "custom",
+                "requested_provider": "custom:beta",
+                "runtime": {**route["runtime"], "requested_provider": "custom:beta", "api_mode": "invalid"},
+            },
+            trace=[],
+        )
+
+    def fake_resolve(provider):
+        calls.append(provider)
+        return {
+            "provider": "custom",
+            "requested_provider": provider,
+            "api_key": "beta-key",
+            "base_url": "https://beta.example/v1",
+            "api_mode": "responses",
+        }
+
+    monkeypatch.setattr("hermes_cli.middleware.apply_turn_route_middleware", fake_apply)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs_for_provider", fake_resolve)
+    model, runtime, _trace = runner._apply_turn_route_middleware(
+        message="route this", model="primary",
+        runtime_kwargs={"provider": "custom", "requested_provider": "custom:alpha",
+                        "api_key": "alpha-key", "base_url": "https://alpha.example/v1",
+                        "api_mode": "chat_completions"},
+        session_key="chat-1", session_id="session-1", source=_make_source(),
+    )
+
+    assert calls == ["custom:beta"]
+    assert model == "target"
+    assert runtime["provider"] == "custom"
+    assert runtime["requested_provider"] == "custom:beta"
+    assert runtime["api_key"] == "beta-key"
+    assert runtime["api_mode"] == "responses"
+
+
+def test_gateway_turn_route_same_requested_identity_preserves_host_runtime(monkeypatch):
+    runner = _make_runner()
+
+    def fake_apply(route, **_context):
+        return SimpleNamespace(
+            changed=True,
+            payload={**route, "model": "target", "provider": "custom",
+                     "requested_provider": "custom:alpha",
+                     "runtime": {**route["runtime"], "api_mode": "invalid"}},
+            trace=[],
+        )
+
+    monkeypatch.setattr("hermes_cli.middleware.apply_turn_route_middleware", fake_apply)
+    resolver = MagicMock()
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs_for_provider", resolver)
+    _model, runtime, _trace = runner._apply_turn_route_middleware(
+        message="route this", model="primary",
+        runtime_kwargs={"provider": "custom", "requested_provider": "custom:alpha",
+                        "api_key": "alpha-key", "api_mode": "chat_completions"},
+        session_key="chat-1", session_id="session-1", source=_make_source(),
+    )
+
+    resolver.assert_not_called()
+    assert runtime["api_key"] == "alpha-key"
+    assert runtime["api_mode"] == "chat_completions"
+
+
 def test_gateway_internal_turn_bypasses_turn_route_middleware(monkeypatch):
     runner = _make_runner()
     invoked = False

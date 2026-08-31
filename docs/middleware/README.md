@@ -54,10 +54,13 @@ Supported middleware kinds:
 `turn_route` is called once for an external user turn before Hermes constructs
 the provider client or agent. The callback receives no credentials, API keys,
 or provider clients. Its public runtime DTO is limited to `provider`,
-`requested_provider`, and `api_mode`; command paths and argument vectors are
-never exposed. It may replace `model`, `provider`, `requested_provider`,
-and non-secret runtime hints. Hermes resolves or refreshes credentials for the
-selected provider through its normal resolver after this decision. Internal events and tool
+`requested_provider`, and host-derived `api_mode`; command paths and argument
+vectors are never exposed. `requested_provider` is the selector passed through
+Hermes' normal resolver, while `provider` and `api_mode` remain host-derived
+diagnostic fields. Middleware may replace `model` and `requested_provider`, but
+must not use the informational runtime fields to select credentials or a
+transport. Hermes resolves or refreshes credentials for the selected provider
+through its normal resolver after this decision. Internal events and tool
 continuations must set `internal` or `tool_continuation` and bypass this phase.
 Routing failures are fail-open and retain the host route.
 

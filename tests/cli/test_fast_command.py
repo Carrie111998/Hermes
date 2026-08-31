@@ -296,6 +296,85 @@ class TestFastModeRouting(unittest.TestCase):
         assert calls[1]["model"] == "primary-a"
         assert calls[1]["provider"] == "primary"
 
+    def test_turn_route_resolves_requested_custom_alias_and_keeps_api_mode_host_owned(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="primary",
+            api_key="alpha-key",
+            base_url="https://alpha.example/v1",
+            provider="custom",
+            requested_provider="custom:alpha",
+            api_mode="chat_completions",
+            acp_command=None,
+            acp_args=[],
+            _credential_pool=None,
+            service_tier=None,
+            agent=None,
+            session_id="session-alias",
+        )
+        observed = {}
+
+        def fake_apply(route, **_context):
+            return SimpleNamespace(
+                changed=True,
+                payload={
+                    **route,
+                    "model": "target",
+                    "provider": "custom",
+                    "requested_provider": "custom:beta",
+                    "runtime": {**route["runtime"], "requested_provider": "custom:beta", "api_mode": "invalid"},
+                },
+                trace=[],
+            )
+
+        def fake_resolve(*, requested):
+            observed["requested"] = requested
+            return {
+                "provider": "custom",
+                "requested_provider": requested,
+                "api_key": "beta-key",
+                "base_url": "https://beta.example/v1",
+                "api_mode": "responses",
+            }
+
+        with patch("hermes_cli.middleware.apply_turn_route_middleware", fake_apply), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve
+        ):
+            route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "route this")
+
+        assert observed["requested"] == "custom:beta"
+        assert route["runtime"]["provider"] == "custom"
+        assert route["runtime"]["requested_provider"] == "custom:beta"
+        assert route["runtime"]["api_key"] == "beta-key"
+        assert route["runtime"]["api_mode"] == "responses"
+
+    def test_turn_route_same_requested_identity_preserves_host_runtime(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="primary", api_key="alpha-key", base_url="https://alpha.example/v1",
+            provider="custom", requested_provider="custom:alpha", api_mode="chat_completions",
+            acp_command=None, acp_args=[], _credential_pool=None, service_tier=None,
+            agent=None, session_id="session-alias",
+        )
+
+        def fake_apply(route, **_context):
+            return SimpleNamespace(
+                changed=True,
+                payload={**route, "model": "target", "provider": "custom",
+                         "requested_provider": "custom:alpha",
+                         "runtime": {**route["runtime"], "api_mode": "invalid"}},
+                trace=[],
+            )
+
+        with patch("hermes_cli.middleware.apply_turn_route_middleware", fake_apply), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider"
+        ) as resolve:
+            route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "route this")
+
+        resolve.assert_not_called()
+        assert route["runtime"]["api_key"] == "alpha-key"
+        assert route["runtime"]["api_mode"] == "chat_completions"
+
     def test_turn_route_middleware_timeout_fails_open_to_primary(self):
         cli_mod = _import_cli()
         stub = SimpleNamespace(

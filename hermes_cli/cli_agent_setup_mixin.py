@@ -349,19 +349,37 @@ class CLIAgentSetupMixin:
                 )
                 if result.changed and isinstance(result.payload, dict):
                     selected_model = result.payload.get("model")
-                    selected_provider = (
-                        result.payload.get("provider")
-                        or result.payload.get("requested_provider")
+                    selected_public_runtime = (
+                        result.payload.get("runtime")
+                        if isinstance(result.payload.get("runtime"), dict)
+                        else {}
                     )
-                    if (
-                        isinstance(selected_model, str)
-                        and selected_model.strip()
-                        and isinstance(selected_provider, str)
-                        and selected_provider.strip()
-                    ):
+                    # requested_provider is the resolver selector. The
+                    # canonical provider is host-derived and may be shared by
+                    # custom aliases.
+                    current_requested_provider = runtime.get("requested_provider") or runtime.get("provider")
+                    current_canonical_provider = runtime.get("provider")
+                    top_requested_provider = result.payload.get("requested_provider")
+                    nested_requested_provider = selected_public_runtime.get("requested_provider")
+                    if nested_requested_provider and nested_requested_provider != current_requested_provider:
+                        requested_provider = nested_requested_provider
+                    else:
+                        requested_provider = top_requested_provider or nested_requested_provider
+                    canonical_provider = (
+                        result.payload.get("provider")
+                        or selected_public_runtime.get("provider")
+                    )
+                    if requested_provider and requested_provider != current_requested_provider:
+                        selected_provider = requested_provider
+                    elif canonical_provider and canonical_provider != current_canonical_provider:
+                        selected_provider = canonical_provider
+                    else:
+                        selected_provider = requested_provider or canonical_provider or current_requested_provider
+                    if isinstance(selected_model, str) and selected_model.strip() and isinstance(selected_provider, str) and selected_provider.strip():
                         selected_provider = selected_provider.strip()
                         selected_model = selected_model.strip()
-                        if selected_provider != runtime.get("provider"):
+                        current_provider = current_requested_provider
+                        if selected_provider != current_provider:
                             from hermes_cli.runtime_provider import resolve_runtime_provider
 
                             resolved = resolve_runtime_provider(requested=selected_provider)
@@ -375,6 +393,10 @@ class CLIAgentSetupMixin:
                                 "args": list(resolved.get("args") or []),
                                 "credential_pool": resolved.get("credential_pool"),
                             }
+                        # api_mode is host-derived; middleware runtime hints
+                        # never change the transport without resolver
+                        # realization.
+                        runtime["requested_provider"] = selected_provider
                         route["model"] = selected_model
                         route["runtime"] = runtime
                         route["middleware_trace"] = result.trace
