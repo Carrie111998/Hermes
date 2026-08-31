@@ -116,6 +116,31 @@ class TestQQGroupSenderAttribution:
         assert "群昵称=Alice" in event.source.user_name
 
     @pytest.mark.asyncio
+    async def test_identity_resolution_is_offloaded_from_event_loop(self, tmp_path):
+        adapter = self._make(tmp_path / "identities.json")
+
+        async def run_off_loop(func, *args):
+            return func(*args)
+
+        with mock.patch(
+            "gateway.platforms.qqbot.adapter.asyncio.to_thread",
+            new=mock.AsyncMock(side_effect=run_off_loop),
+        ) as to_thread:
+            await adapter._handle_group_message(
+                {"group_openid": "group-1"},
+                "msg-1",
+                "hello",
+                {"member_openid": "member-1", "username": "Alice"},
+                "",
+            )
+
+        to_thread.assert_awaited_once_with(
+            adapter._identity_store.resolve,
+            "group-1",
+            {"member_openid": "member-1", "username": "Alice"},
+        )
+
+    @pytest.mark.asyncio
     async def test_group_message_falls_back_to_stable_member_label(self, tmp_path):
         adapter = self._make(tmp_path / "identities.json")
 
@@ -130,6 +155,20 @@ class TestQQGroupSenderAttribution:
         event = adapter.handle_message.await_args.args[0]
         assert event.source.user_name.startswith("QQ sender id=")
         assert "群昵称=" not in event.source.user_name
+
+    @pytest.mark.asyncio
+    async def test_group_message_without_member_openid_is_rejected(self, tmp_path):
+        adapter = self._make(tmp_path / "identities.json")
+
+        await adapter._handle_group_message(
+            {"group_openid": "group-1"},
+            "msg-1",
+            "hello",
+            {"id": "non-member-author-id", "username": "Unknown"},
+            "",
+        )
+
+        adapter.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_group_message_includes_event_group_nickname(self, tmp_path):

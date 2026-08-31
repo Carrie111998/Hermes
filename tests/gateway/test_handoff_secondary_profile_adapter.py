@@ -62,7 +62,7 @@ def _make_multiplex_runner():
 
     store = MagicMock()
     store.get_or_create_session = AsyncMock(return_value=SessionEntry(
-        session_key="k", session_id="s",
+        session_key="agent:medicina:telegram:dm:2222", session_id="s",
         created_at=datetime.now(), updated_at=datetime.now(),
         platform=Platform.TELEGRAM, chat_type="dm",
     ))
@@ -146,6 +146,39 @@ async def test_secondary_profile_handoff_uses_its_own_adapter(monkeypatch):
         f"session key must carry the profile namespace, got {captured['session_key']}"
     )
     assert captured["source"].profile == "medicina"
+
+
+@pytest.mark.asyncio
+async def test_handoff_switches_the_exact_key_created_by_session_store(monkeypatch):
+    runner, captured = _make_multiplex_runner()
+    created_key = "agent:medicina:telegram:thread:2222:topic:system:handoff"
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key=created_key,
+        session_id="created-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="thread",
+    )
+    used = {}
+    monkeypatch.setattr(
+        "gateway.run.resolve_delivery_transport", _spy_transport_factory(used),
+    )
+    secondary = _config("2222")
+    secondary.platforms[Platform.TELEGRAM].extra["thread_sessions_per_user"] = True
+    monkeypatch.setattr("gateway.run.load_gateway_config", lambda: secondary)
+
+    await runner._process_handoff(
+        {
+            "id": "cli-session",
+            "title": "work",
+            "handoff_platform": "telegram",
+            "handoff_thread_id": "topic",
+        },
+        profile_name="medicina",
+    )
+
+    assert captured["session_key"] == created_key
 
 
 @pytest.mark.asyncio

@@ -7442,6 +7442,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        self._profile_configs: Dict[str, GatewayConfig] = {"default": self.config}
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            self._profile_configs[get_active_profile_name() or "default"] = self.config
+        except Exception:
+            logger.debug("could not register active profile config", exc_info=True)
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -7481,10 +7488,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _bg_max_age_hours * 3600 if _bg_max_age_hours and _bg_max_age_hours > 0 else None
         )
         self.session_store = SessionStore(
-            self.config.sessions_dir, self.config,
+            self.config.sessions_dir,
+            self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key, max_active_age=_bg_max_age_seconds,
             ),
+            config_for_source_fn=self._session_config_for_source,
         )
         # One enforced loop-side boundary for the synchronous SessionStore.
         # Sync helpers keep using ``session_store`` directly; async gateway
@@ -8403,6 +8412,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def exit_code(self) -> Optional[int]:
         return self._exit_code
 
+    def _session_config_for_source(
+        self, source: SessionSource
+    ) -> Optional[GatewayConfig]:
+        """Return the registered gateway config for ``source``'s profile.
+
+        Returning ``None`` for an unknown explicit profile is deliberate: key
+        derivation and ownership checks must fail closed rather than silently
+        applying the primary profile's isolation policy.
+        """
+        profile = str(getattr(source, "profile", "") or "").strip()
+        if not profile:
+            return self.config
+        configs = getattr(self, "_profile_configs", None)
+        if isinstance(configs, dict):
+            return configs.get(profile)
+        return self.config if profile == "default" else None
+
+    def _build_session_context_for_source(
+        self,
+        source: SessionSource,
+        session_entry: Optional[SessionEntry] = None,
+    ) -> SessionContext:
+        """Build prompt context with the same profile config used for routing."""
+        config = self._session_config_for_source(source)
+        if config is None:
+            raise RuntimeError(
+                f"no gateway config registered for session source profile {source.profile!r}"
+            )
+        return build_session_context(source, config, session_entry)
+
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
         if hasattr(self, "session_store") and self.session_store is not None:
@@ -8412,7 +8451,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return session_key
             except Exception:
                 pass
-        config = getattr(self, "config", None)
+        config = self._session_config_for_source(source)
+        if config is None:
+            raise RuntimeError(
+                f"no gateway config registered for session source profile {source.profile!r}"
+            )
         # Mirror SessionStore._resolve_profile_for_key so this fallback path
         # produces the same namespace as the primary path: None (legacy
         # agent:main) unless multiplexing is on, then the active profile.
@@ -14970,10 +15013,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=handoff_profile,
         )
 
-        # Make sure there's an entry in the session_store for this key. If
-        # the home channel has never been used, get_or_create_session
-        # creates one; switch_session then re-points it.
-        await self.async_session_store.get_or_create_session(dest_source)
+        # Make sure there's an entry in the session_store for this source and
+        # switch the exact key the store created. The store is the single source
+        # of truth for profile-specific isolation; independently rebuilding the
+        # key here can diverge when a secondary profile overrides group/thread
+        # policy.
+        created_entry = await self.async_session_store.get_or_create_session(dest_source)
+        created_key = getattr(created_entry, "session_key", None)
+        if not isinstance(created_key, str) or not created_key:
+            raise RuntimeError("session store returned an entry without a session key")
+        if created_key != session_key:
+            logger.debug(
+                "Handoff: store-resolved key %s supersedes precomputed key %s",
+                created_key,
+                session_key,
+            )
+        session_key = created_key
 
         # Re-bind the destination key to the CLI session_id. switch_session
         # ends the prior session in SQLite and reopens the CLI session under
@@ -16700,6 +16755,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "for that profile, or change dm_policy/group_policy away from "
                 "'open'."
             )
+        profile_configs = getattr(self, "_profile_configs", None)
+        if not isinstance(profile_configs, dict):
+            profile_configs = {"default": self.config}
+            self._profile_configs = profile_configs
+        profile_configs[profile_name] = profile_cfg
 
         port_binding_platforms = sorted(
             platform.value
@@ -19758,8 +19818,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _pending_stt_prepared
             else event.text
         ) or ""
+        isolation_config = self._session_config_for_source(source)
+        if isolation_config is None:
+            raise RuntimeError(
+                f"no gateway config registered for session source profile {source.profile!r}"
+            )
         _group_sessions_per_user, _thread_sessions_per_user = resolve_session_isolation(
-            self.config,
+            isolation_config,
             source,
         )
         # Prefer the already resolved session key from the caller so this write
@@ -20463,11 +20528,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
         logger.info(
-            "inbound message: platform=%s user_id=%s user_name=%s chat=%s "
-            "msg=%r reply_to_id=%s reply_to_text=%r",
+            "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name,
-            source.user_id or "unknown",
-            source.user_name or "unknown",
+            source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown",
             _msg_preview,
             _reply_id,
@@ -20638,8 +20701,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_key": session_key,
             })
         
-        # Build session context
-        context = build_session_context(source, self.config, session_entry)
+        # Build session context with the same profile-specific isolation policy
+        # used by SessionStore and /resume ownership checks.
+        context = self._build_session_context_for_source(source, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)

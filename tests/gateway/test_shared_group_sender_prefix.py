@@ -15,6 +15,24 @@ def _make_runner(config: GatewayConfig) -> GatewayRunner:
     return runner
 
 
+def test_session_context_uses_secondary_profile_isolation_policy():
+    primary = GatewayConfig(multiplex_profiles=True, group_sessions_per_user=False)
+    secondary = GatewayConfig(multiplex_profiles=True, group_sessions_per_user=True)
+    runner = _make_runner(primary)
+    runner._profile_configs = {"default": primary, "secondary": secondary}
+    source = SessionSource(
+        platform=Platform.QQBOT,
+        chat_id="qq-group",
+        chat_type="group",
+        user_id="alice",
+        profile="secondary",
+    )
+
+    context = runner._build_session_context_for_source(source)
+
+    assert context.shared_multi_user_session is False
+
+
 @pytest.mark.asyncio
 async def test_preprocess_uses_qq_platform_group_override():
     runner = _make_runner(
@@ -46,6 +64,37 @@ async def test_preprocess_uses_qq_platform_group_override():
     assert result == (
         "[QQ sender id=abc12345 | 群昵称=Alice Group] hello"
     )
+
+
+@pytest.mark.asyncio
+async def test_preprocess_uses_secondary_profile_isolation_policy():
+    primary = GatewayConfig(
+        multiplex_profiles=True,
+        group_sessions_per_user=True,
+    )
+    secondary = GatewayConfig(
+        multiplex_profiles=True,
+        group_sessions_per_user=False,
+    )
+    runner = _make_runner(primary)
+    runner._profile_configs = {"default": primary, "secondary": secondary}
+    source = SessionSource(
+        platform=Platform.QQBOT,
+        chat_id="qq-group",
+        chat_type="group",
+        user_id="member-1",
+        user_name="Alice",
+        profile="secondary",
+    )
+
+    result = await runner._prepare_inbound_message_text(
+        event=MessageEvent(text="hello", source=source),
+        source=source,
+        history=[],
+        session_key="agent:secondary:qqbot:group:qq-group",
+    )
+
+    assert result == "[Alice] hello"
 
 
 @pytest.mark.asyncio

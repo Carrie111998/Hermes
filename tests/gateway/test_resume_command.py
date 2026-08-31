@@ -4,12 +4,13 @@ Tests the _handle_resume_command handler (switch to a previously-named session)
 across gateway messenger platforms.
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource, build_session_key
 
@@ -927,6 +928,19 @@ class TestSameOriginChatGroupScoping:
         bob = self._src("bob", platform=Platform.QQBOT, chat_id="qq-group")
 
         assert runner._same_origin_chat(alice, bob) is True
+
+    def test_secondary_profile_uses_its_own_isolation_policy(self):
+        runner = _make_runner()
+        runner.config.group_sessions_per_user = False
+        secondary = GatewayConfig(group_sessions_per_user=True)
+        runner._profile_configs = {"secondary": secondary}
+        alice = replace(
+            self._src("alice", platform=Platform.QQBOT, chat_id="qq-group"),
+            profile="secondary",
+        )
+        bob = replace(alice, user_id="bob")
+
+        assert runner._same_origin_chat(alice, bob) is False
 
     @pytest.mark.asyncio
     async def test_qq_override_isolates_persisted_group_when_global_is_shared(

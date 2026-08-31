@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
+logger = logging.getLogger(__name__)
 _MAX_NAME_LENGTH = 80
 
 
@@ -81,15 +83,23 @@ class QQIdentityStore:
         os.chmod(self.path, 0o600)
 
     def resolve(self, group_openid: str, author: dict[str, Any]) -> QQSenderIdentity:
-        """Resolve the current sender and record its latest group display name."""
-        member_openid = str(author.get("member_openid") or author.get("id") or "").strip()
+        """Resolve the current sender and best-effort persist its display name."""
+        member_openid = str(author.get("member_openid") or "").strip()
+        if not member_openid:
+            raise ValueError("QQ group sender is missing member_openid")
         stable_id = _stable_sender_id(group_openid, member_openid)
         group_display_name = _clean_name(author.get("username"))
         key = self.member_key(group_openid, member_openid)
 
         with self._lock:
             members = self._data.setdefault("members", {})
-            profile = members.setdefault(key, {})
+            if not isinstance(members, dict):
+                members = {}
+                self._data["members"] = members
+            profile = members.get(key)
+            if not isinstance(profile, dict):
+                profile = {}
+                members[key] = profile
             changed = profile.get("stable_id") != stable_id
             profile["stable_id"] = stable_id
 
@@ -104,7 +114,13 @@ class QQIdentityStore:
                 changed = True
 
             if changed:
-                self._write()
+                try:
+                    self._write()
+                except (OSError, TypeError, ValueError):
+                    logger.warning(
+                        "Could not persist QQ sender identity observation",
+                        exc_info=True,
+                    )
 
         return QQSenderIdentity(
             group_openid=group_openid,

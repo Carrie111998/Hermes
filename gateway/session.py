@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -1271,10 +1271,18 @@ class SessionStore:
     Falls back to legacy JSONL files if SQLite is unavailable.
     """
     
-    def __init__(self, sessions_dir: Path, config: GatewayConfig,
-                 has_active_processes_fn=None):
+    def __init__(
+        self,
+        sessions_dir: Path,
+        config: GatewayConfig,
+        has_active_processes_fn=None,
+        config_for_source_fn: Optional[
+            Callable[[SessionSource], Optional[GatewayConfig]]
+        ] = None,
+    ):
         self.sessions_dir = sessions_dir
         self.config = config
+        self._config_for_source_fn = config_for_source_fn
         self._entries: Dict[str, SessionEntry] = {}
         self._loaded = False
         # A fallback-only initial load must be reconciled with state.db after
@@ -2229,10 +2237,22 @@ class SessionStore:
 
         return recovered_profile == self._active_profile_name()
 
+    def _config_for_source(self, source: SessionSource) -> GatewayConfig:
+        """Return the profile-specific config used to derive ``source`` keys."""
+        if self._config_for_source_fn is None:
+            return self.config
+        resolved = self._config_for_source_fn(source)
+        if resolved is None:
+            raise RuntimeError(
+                f"no gateway config registered for session source profile {source.profile!r}"
+            )
+        return resolved
+
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
+        config = self._config_for_source(source)
         group_per_user, thread_per_user = resolve_session_isolation(
-            self.config,
+            config,
             source,
         )
         return build_session_key(
@@ -2253,8 +2273,9 @@ class SessionStore:
         if source.platform != Platform.SLACK or not source.scope_id:
             return None
         legacy_source = replace(source, scope_id=None, guild_id=None)
+        config = self._config_for_source(source)
         group_per_user, thread_per_user = resolve_session_isolation(
-            self.config,
+            config,
             source,
         )
         return build_session_key(

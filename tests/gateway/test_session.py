@@ -54,6 +54,34 @@ def test_resolve_session_isolation_prefers_platform_override():
     assert resolve_session_isolation(config, feishu_source) == (True, False)
 
 
+def test_session_store_uses_secondary_profile_config_for_session_key(tmp_path):
+    primary = GatewayConfig(
+        multiplex_profiles=True,
+        group_sessions_per_user=False,
+    )
+    secondary = GatewayConfig(
+        multiplex_profiles=True,
+        group_sessions_per_user=True,
+    )
+    store = SessionStore(
+        tmp_path,
+        primary,
+        config_for_source_fn=lambda source: (
+            secondary if source.profile == "secondary" else primary
+        ),
+    )
+    alice = SessionSource(
+        platform=Platform.QQBOT,
+        chat_id="qq-group",
+        chat_type="group",
+        user_id="alice",
+        profile="secondary",
+    )
+    bob = replace(alice, user_id="bob")
+
+    assert store._generate_session_key(alice) != store._generate_session_key(bob)
+
+
 def test_session_context_uses_platform_group_override():
     config = GatewayConfig(
         platforms={

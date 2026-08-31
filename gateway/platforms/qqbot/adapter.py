@@ -1391,7 +1391,14 @@ class QQAdapter(BasePlatformAdapter):
         group_openid = str(d.get("group_openid", ""))
         if not group_openid:
             return
-        member_openid = str(author.get("member_openid", ""))
+        member_openid = str(author.get("member_openid", "")).strip()
+        if not member_openid:
+            logger.warning(
+                "[%s] Dropping QQ group message %s without member_openid",
+                self._log_tag,
+                msg_id,
+            )
+            return
         if not self._is_group_allowed(group_openid, member_openid):
             return
 
@@ -1427,7 +1434,11 @@ class QQAdapter(BasePlatformAdapter):
             return
 
         self._chat_type_map[group_openid] = "group"
-        identity = self._identity_store.resolve(group_openid, author)
+        identity = await asyncio.to_thread(
+            self._identity_store.resolve,
+            group_openid,
+            author,
+        )
         self._log_group_identity_probe(identity.stable_id, author)
         event = MessageEvent(
             source=self.build_source(

@@ -1070,8 +1070,14 @@ class GatewaySlashCommandsMixin:
         # Non-DM: scope by participant whenever the session key for this source
         # is per-user. is_shared_multi_user_session mirrors build_session_key's
         # isolation rules exactly, so the guard stays in lock-step with the key.
+        config_for_source = getattr(self, "_session_config_for_source", None)
+        isolation_config = (
+            config_for_source(current) if callable(config_for_source) else self.config
+        )
+        if isolation_config is None:
+            return False
         group_per_user, thread_per_user = resolve_session_isolation(
-            self.config, current
+            isolation_config, current
         )
         shared = is_shared_multi_user_session(
             current,
@@ -1228,8 +1234,16 @@ class GatewaySlashCommandsMixin:
             # do NOT also require user-id equality (otherwise a co-member is
             # wrongly blocked from their own shared session). A per-user session
             # still requires the same owner.
+            config_for_source = getattr(self, "_session_config_for_source", None)
+            isolation_config = (
+                config_for_source(source)
+                if callable(config_for_source)
+                else self.config
+            )
+            if isolation_config is None:
+                return False
             group_per_user, thread_per_user = resolve_session_isolation(
-                self.config, source
+                isolation_config, source
             )
             shared = is_shared_multi_user_session(
                 source,
