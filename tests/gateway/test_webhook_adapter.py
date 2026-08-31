@@ -832,6 +832,178 @@ class TestDeliverCrossPlatformThreadId:
         )
 
 
+# ===================================================================
+# Media forwarding to cross-platform deliver: targets
+# ===================================================================
+
+
+class TestWebhookMediaForwarding:
+    """WebhookAdapter must forward media (not just text) to a route's
+    cross-platform ``deliver:`` target. Without overrides for
+    send_image_file / send_document / send_video / send_voice /
+    send_multiple_images, MEDIA: attachments hit BasePlatformAdapter's
+    fallback stubs and silently never reach the target platform."""
+
+    CHAT_ID = "webhook:r1:abc123"
+
+    def _setup_adapter_with_mock_target(self, deliver=None):
+        """Webhook adapter with a mocked gateway_runner and target adapter,
+        plus delivery info for CHAT_ID routing to that target."""
+        adapter = _make_adapter()
+        adapter._delivery_info[self.CHAT_ID] = (
+            {"deliver": "telegram", "deliver_extra": {"chat_id": "999"}}
+            if deliver is None
+            else deliver
+        )
+
+        mock_target = AsyncMock()
+        mock_runner = MagicMock()
+        mock_runner.adapters = {Platform("telegram"): mock_target}
+        mock_runner.config.get_home_channel.return_value = None
+        adapter.gateway_runner = mock_runner
+        return adapter, mock_target
+
+    # -- forwards to the resolved target adapter ---------------------
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_forwards_to_target(self):
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        mock_target.send_image_file = AsyncMock(return_value=SendResult(success=True))
+
+        result = await adapter.send_image_file(
+            self.CHAT_ID, "/tmp/photo.jpg", caption="look"
+        )
+
+        mock_target.send_image_file.assert_awaited_once_with(
+            chat_id="999", image_path="/tmp/photo.jpg", caption="look",
+            reply_to=None, metadata=None,
+        )
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_send_document_forwards_to_target(self):
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        mock_target.send_document = AsyncMock(return_value=SendResult(success=True))
+
+        result = await adapter.send_document(
+            self.CHAT_ID, "/tmp/report.pdf", file_name="report.pdf"
+        )
+
+        mock_target.send_document.assert_awaited_once_with(
+            chat_id="999", file_path="/tmp/report.pdf", caption=None,
+            file_name="report.pdf", reply_to=None, metadata=None,
+        )
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_send_video_forwards_to_target(self):
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        mock_target.send_video = AsyncMock(return_value=SendResult(success=True))
+
+        result = await adapter.send_video(self.CHAT_ID, "/tmp/clip.mp4")
+
+        mock_target.send_video.assert_awaited_once_with(
+            chat_id="999", video_path="/tmp/clip.mp4", caption=None,
+            reply_to=None, metadata=None,
+        )
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_send_voice_forwards_to_target(self):
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        mock_target.send_voice = AsyncMock(return_value=SendResult(success=True))
+
+        result = await adapter.send_voice(self.CHAT_ID, "/tmp/note.ogg")
+
+        mock_target.send_voice.assert_awaited_once_with(
+            chat_id="999", audio_path="/tmp/note.ogg", caption=None,
+            reply_to=None, metadata=None,
+        )
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_send_multiple_images_forwards_to_target(self):
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        mock_target.send_multiple_images = AsyncMock(return_value=None)
+        images = [("file:///tmp/a.jpg", "a"), ("file:///tmp/b.jpg", "b")]
+
+        result = await adapter.send_multiple_images(self.CHAT_ID, images)
+
+        mock_target.send_multiple_images.assert_awaited_once_with(
+            chat_id="999", images=images, metadata=None, human_delay=0.0,
+        )
+        assert result is None
+
+    # -- falls back to base behaviour ---------------------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("deliver_type", ["log", "not-a-real-platform"])
+    async def test_send_image_file_falls_back_when_deliver_not_cross_platform(
+        self, deliver_type
+    ):
+        """deliver: log (or an unrecognized platform name) never reaches
+        the target adapter — base's fallback notice path runs instead."""
+        adapter, mock_target = self._setup_adapter_with_mock_target(
+            deliver={"deliver": deliver_type}
+        )
+        mock_target.send_image_file = AsyncMock(return_value=SendResult(success=True))
+
+        with patch.object(
+            adapter, "send", new=AsyncMock(return_value=SendResult(success=True))
+        ) as mock_send:
+            await adapter.send_image_file(self.CHAT_ID, "/tmp/photo.jpg")
+
+        mock_target.send_image_file.assert_not_called()
+        mock_send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_falls_back_when_no_gateway_runner(self):
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        adapter.gateway_runner = None
+        mock_target.send_image_file = AsyncMock(return_value=SendResult(success=True))
+
+        with patch.object(
+            adapter, "send", new=AsyncMock(return_value=SendResult(success=True))
+        ) as mock_send:
+            await adapter.send_image_file(self.CHAT_ID, "/tmp/photo.jpg")
+
+        mock_target.send_image_file.assert_not_called()
+        mock_send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_falls_back_when_target_lacks_method(self):
+        """Target adapter exists but has no native send_image_file — fall
+        through to the base notice rather than raising AttributeError."""
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        mock_target_limited = AsyncMock(spec=["send"])
+        adapter.gateway_runner.adapters = {Platform("telegram"): mock_target_limited}
+
+        with patch.object(
+            adapter, "send", new=AsyncMock(return_value=SendResult(success=True))
+        ) as mock_send:
+            result = await adapter.send_image_file(self.CHAT_ID, "/tmp/photo.jpg")
+
+        mock_send.assert_awaited_once()
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_send_multiple_images_falls_back_when_target_lacks_method(self):
+        """send_multiple_images has no SendResult return value, so its
+        fall-through must be exercised separately from the other overrides."""
+        adapter, mock_target = self._setup_adapter_with_mock_target()
+        mock_target_limited = AsyncMock(spec=["send"])
+        adapter.gateway_runner.adapters = {Platform("telegram"): mock_target_limited}
+        images = [("file:///tmp/a.jpg", "a")]
+
+        with patch.object(
+            adapter, "send", new=AsyncMock(return_value=SendResult(success=True))
+        ) as mock_send:
+            result = await adapter.send_multiple_images(self.CHAT_ID, images)
+
+        mock_send.assert_awaited_once()
+        assert result is None
+
+
 class TestInsecureNoAuthSafetyRail:
     """connect() refuses to start when INSECURE_NO_AUTH is combined with a
     non-loopback bind. Guards against accidentally exposing an unauthenticated
