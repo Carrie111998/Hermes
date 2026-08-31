@@ -39,6 +39,11 @@ def normalize_budget_tokens(value: Any) -> Optional[int]:
     """
     if value is None or isinstance(value, bool):
         return None
+    # Only accept real config shapes (int / float / numeric string). Objects
+    # that merely implement ``__int__`` (unittest.mock.MagicMock → 1, etc.)
+    # must not activate a 1-token budget.
+    if not isinstance(value, (int, float, str)):
+        return None
     try:
         tokens = int(value)
     except (TypeError, ValueError):

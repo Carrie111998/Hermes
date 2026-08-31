@@ -13579,12 +13579,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print(f"  Total tokens:              {total:>10,}")
         from agent.session_budget import (
             budget_remaining_tokens as _budget_remaining,
+            normalize_budget_tokens as _normalize_budget,
         )
+        _sb_cap = _normalize_budget(getattr(agent, "session_budget_tokens", None))
         _sb_remaining = _budget_remaining(agent)
-        if _sb_remaining is not None:
+        if _sb_cap is not None and _sb_remaining is not None:
+            _sb_action = getattr(agent, "session_budget_action", "abort")
+            if not isinstance(_sb_action, str):
+                _sb_action = "abort"
             print(
                 f"  Session budget remaining:  {_sb_remaining:>10,}"
-                f"  / {agent.session_budget_tokens:,} ({agent.session_budget_action})"
+                f"  / {_sb_cap:,} ({_sb_action})"
             )
         print(f"  API calls:                 {calls:>10,}")
         print(f"  Session duration:          {elapsed:>10}")

@@ -29,6 +29,7 @@ def _agent(total=0, aux=0, cap=None, action="abort", calls=0, warned=False):
         (True, None),       # bool rejected (YAML `true`)
         (False, None),
         ("nope", None),
+        (object(), None),   # non-numeric objects stay unlimited
         (5_000_000, 5_000_000),
         ("5000000", 5_000_000),
         (100.0, 100),
@@ -36,6 +37,18 @@ def _agent(total=0, aux=0, cap=None, action="abort", calls=0, warned=False):
 )
 def test_normalize_budget_tokens(value, expected):
     assert sb.normalize_budget_tokens(value) == expected
+
+
+def test_normalize_budget_tokens_rejects_int_coercible_objects():
+    """MagicMock and other __int__ objects must not become a 1-token cap."""
+    from unittest.mock import MagicMock
+
+    class Intish:
+        def __int__(self):
+            return 5
+
+    assert sb.normalize_budget_tokens(MagicMock()) is None
+    assert sb.normalize_budget_tokens(Intish()) is None
 
 
 # ── normalize_budget_action ────────────────────────────────────────────────
