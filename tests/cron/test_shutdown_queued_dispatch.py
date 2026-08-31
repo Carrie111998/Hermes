@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import threading
 from unittest.mock import patch
 
 import pytest
@@ -37,6 +38,18 @@ class DeferredPool:
         future: concurrent.futures.Future = concurrent.futures.Future()
         self.futures.append(future)
         return future
+
+
+class BlockingSubmitPool:
+    def __init__(self):
+        self.future: concurrent.futures.Future = concurrent.futures.Future()
+        self.submit_entered = threading.Event()
+        self.allow_submit_return = threading.Event()
+
+    def submit(self, _callback):
+        self.submit_entered.set()
+        assert self.allow_submit_return.wait(timeout=5)
+        return self.future
 
 
 def _queue_without_starting(job: dict, pool: DeferredPool, monkeypatch) -> concurrent.futures.Future:
@@ -110,3 +123,27 @@ def test_shutdown_does_not_cancel_a_worker_that_already_started(cron_store):
     assert not future.cancelled()
     assert job_id in sched.get_running_job_ids()
     future.set_result(True)
+
+
+def test_shutdown_cancels_during_submit_to_future_publication(cron_store, monkeypatch):
+    job = jobs_mod.create_job(prompt="poll", schedule="every 10m", deliver="local")
+    pool = BlockingSubmitPool()
+    monkeypatch.setattr(sched, "get_due_jobs", lambda: [dict(job)])
+    monkeypatch.setattr(sched, "_get_parallel_pool", lambda _workers: pool)
+    monkeypatch.setattr(sched, "_get_sequential_pool", lambda: pool)
+    tick_result: list[int] = []
+
+    tick_thread = threading.Thread(
+        target=lambda: tick_result.append(sched.tick(verbose=False, sync=False))
+    )
+    tick_thread.start()
+    assert pool.submit_entered.wait(timeout=5)
+    assert sched._running_lock.locked()
+    pool.allow_submit_return.set()
+    tick_thread.join(timeout=5)
+
+    assert not tick_thread.is_alive()
+    assert tick_result == [1]
+    assert sched.cancel_queued_jobs_for_shutdown("gateway restart") == [job["id"]]
+    assert pool.future.cancelled()
+    assert job["id"] not in sched.get_running_job_ids()

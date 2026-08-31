@@ -8089,15 +8089,23 @@ def tick(
                 finally:
                     release_running_job(j["id"])
 
-            with _running_lock:
-                _queued_dispatches[job_id] = {
-                    "future": _FUTURE_PENDING,
-                    "execution_id": execution["id"],
-                    "job": dispatched_job,
-                    "context": _ctx,
-                }
             try:
-                fut = pool.submit(_run_and_release)
+                # Publish the real Future under the same lock that exposes the
+                # queued record.  Otherwise shutdown can observe
+                # _FUTURE_PENDING after submit has enqueued the callback but
+                # before this thread records the cancellable Future, skip it,
+                # and misclassify the tick as interrupted.
+                with _running_lock:
+                    _queued_dispatches[job_id] = {
+                        "future": _FUTURE_PENDING,
+                        "execution_id": execution["id"],
+                        "job": dispatched_job,
+                        "context": _ctx,
+                    }
+                    fut = pool.submit(_run_and_release)
+                    if job_id in _running_job_ids:
+                        _running_futures[job_id] = fut
+                        _queued_dispatches[job_id]["future"] = fut
             except Exception as submit_err:
                 release_running_job(job_id)
                 _clear_run_claim_best_effort()
@@ -8121,14 +8129,6 @@ def tick(
                 )
                 return None
 
-            # Record the owning future so the stale sweep can distinguish
-            # "still executing" from "claim leaked before/after the future".
-            with _running_lock:
-                if job_id in _running_job_ids:
-                    _running_futures[job_id] = fut
-                    dispatch = _queued_dispatches.get(job_id)
-                    if dispatch is not None:
-                        dispatch["future"] = fut
             return fut
 
         # Sequential pass for env-mutating (workdir) jobs.
