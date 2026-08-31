@@ -411,6 +411,7 @@ class ProcessSession:
     notify_on_complete: bool = False             # Queue agent notification on exit
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
+    notification_session_key: str = ""          # Delivery route only; not process ownership
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
     _watch_suppressed: int = field(default=0, repr=False)    # matches dropped by rate limit
     _watch_disabled: bool = field(default=False, repr=False) # permanently killed after strike limit
@@ -620,18 +621,9 @@ class ProcessRegistry:
                 # Emit exactly one "watch disabled, falling back to notify_on_complete"
                 # summary event so the agent/user sees why things went quiet.
                 self.completion_queue.put({
-                    "session_id": session.id,
-                    "session_key": session.session_key,
-                    "task_id": session.task_id,
-                    "command": session.command,
+                    **self._notification_route_fields(session),
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
-                    "platform": session.watcher_platform,
-                    "chat_id": session.watcher_chat_id,
-                    "user_id": session.watcher_user_id,
-                    "user_name": session.watcher_user_name,
-                    "thread_id": session.watcher_thread_id,
-                    "message_id": session.watcher_message_id,
                     "message": (
                         f"Watch patterns disabled for process {session.id} — "
                         f"{WATCH_STRIKE_LIMIT} consecutive rate-limit windows triggered "
@@ -658,20 +650,11 @@ class ProcessRegistry:
             return
 
         notification = {
-            "session_id": session.id,
-            "session_key": session.session_key,
-            "task_id": session.task_id,
-            "command": session.command,
+            **self._notification_route_fields(session),
             "type": "watch_match",
             "pattern": matched_pattern,
             "output": output,
             "suppressed": suppressed,
-            "platform": session.watcher_platform,
-            "chat_id": session.watcher_chat_id,
-            "user_id": session.watcher_user_id,
-            "user_name": session.watcher_user_name,
-            "thread_id": session.watcher_thread_id,
-            "message_id": session.watcher_message_id,
         }
         _redact_process_result(notification)
         self.completion_queue.put(notification)
@@ -684,18 +667,9 @@ class ProcessRegistry:
     def _emit_lifetime_watch_disabled(self, session: ProcessSession) -> None:
         """Queue the watch_disabled summary for the lifetime-cap path (#93513)."""
         self.completion_queue.put({
-            "session_id": session.id,
-            "session_key": session.session_key,
-            "task_id": session.task_id,
-            "command": session.command,
+            **self._notification_route_fields(session),
             "type": "watch_disabled",
             "suppressed": 0,
-            "platform": session.watcher_platform,
-            "chat_id": session.watcher_chat_id,
-            "user_id": session.watcher_user_id,
-            "user_name": session.watcher_user_name,
-            "thread_id": session.watcher_thread_id,
-            "message_id": session.watcher_message_id,
             "message": (
                 f"Watch patterns disabled for process {session.id} — "
                 f"reached the lifetime cap of {WATCH_LIFETIME_MAX_HITS} delivered "
@@ -1038,6 +1012,17 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        notification_session_key: str = "",
+        parent_session_id: str = "",
+        notify_on_complete: bool = False,
+        watch_patterns: list = None,
+        watcher_platform: str = "",
+        watcher_chat_id: str = "",
+        watcher_user_id: str = "",
+        watcher_user_name: str = "",
+        watcher_thread_id: str = "",
+        watcher_message_id: str = "",
+        watcher_interval: int = 0,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -1063,8 +1048,19 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            notification_session_key=notification_session_key,
+            parent_session_id=parent_session_id,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            notify_on_complete=bool(notify_on_complete),
+            watch_patterns=list(watch_patterns or []),
+            watcher_platform=watcher_platform or "",
+            watcher_chat_id=watcher_chat_id or "",
+            watcher_user_id=watcher_user_id or "",
+            watcher_user_name=watcher_user_name or "",
+            watcher_thread_id=watcher_thread_id or "",
+            watcher_message_id=watcher_message_id or "",
+            watcher_interval=int(watcher_interval or 0),
         )
 
         pty_scope_attempted = False
@@ -1281,6 +1277,17 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        notification_session_key: str = "",
+        parent_session_id: str = "",
+        notify_on_complete: bool = False,
+        watch_patterns: list = None,
+        watcher_platform: str = "",
+        watcher_chat_id: str = "",
+        watcher_user_id: str = "",
+        watcher_user_name: str = "",
+        watcher_thread_id: str = "",
+        watcher_message_id: str = "",
+        watcher_interval: int = 0,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1298,10 +1305,21 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            notification_session_key=notification_session_key,
+            parent_session_id=parent_session_id,
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            notify_on_complete=bool(notify_on_complete),
+            watch_patterns=list(watch_patterns or []),
+            watcher_platform=watcher_platform or "",
+            watcher_chat_id=watcher_chat_id or "",
+            watcher_user_id=watcher_user_id or "",
+            watcher_user_name=watcher_user_name or "",
+            watcher_thread_id=watcher_thread_id or "",
+            watcher_message_id=watcher_message_id or "",
+            watcher_interval=int(watcher_interval or 0),
         )
 
         # Run the command in the sandbox with output capture
@@ -1368,7 +1386,9 @@ class ProcessRegistry:
             if not session.exited:
                 self._running[session.id] = session
 
-        if not session.exited:
+        if session.exited:
+            self._move_to_finished(session)
+        else:
             self._write_checkpoint()
 
         return session
@@ -1625,6 +1645,7 @@ class ProcessRegistry:
         """
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
+            already_finished = session.id in self._finished
             self._finished[session.id] = session
         session._completion_event.set()
         self._write_checkpoint()
@@ -1632,13 +1653,18 @@ class ProcessRegistry:
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
-        if was_running and session.notify_on_complete:
+        # failed_start never enters `_running`, so `was_running` is false;
+        # still notify once if the session was not already finished.
+        if session.notify_on_complete and (was_running or not already_finished):
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
             notification = {
                 "type": "completion",
                 "session_id": session.id,
-                "session_key": session.session_key,
+                "session_key": (
+                    session.notification_session_key or session.session_key
+                ),
+                "parent_session_id": session.parent_session_id,
                 "task_id": session.task_id,
                 "command": session.command,
                 "exit_code": session.exit_code,
@@ -1864,6 +1890,50 @@ class ProcessRegistry:
         except Exception:
             return False
 
+    @classmethod
+    def should_surface_process_notification(
+        cls,
+        evt: dict,
+        surface_child: "bool | None" = None,
+    ) -> bool:
+        """Whether CLI/gateway/TUI should show this process notification.
+
+        Successful subagent-owned process events are noise by default. Failed
+        completions (nonzero/unknown exit or abnormal reason) stay visible even
+        when ``delegation.surface_child_process_notifications`` is false.
+        Async-delegation results are never suppressed here.
+        """
+        if evt.get("type") == "async_delegation":
+            return True
+        task_id = str(evt.get("task_id") or "")
+        if not task_id.startswith("sa-"):
+            return True
+        if surface_child is None:
+            surface_child = cls._surface_child_process_notifications()
+        if surface_child:
+            return True
+        completion_reason = str(evt.get("completion_reason") or "exited")
+        return evt.get("type") == "completion" and (
+            evt.get("exit_code") != 0
+            or completion_reason not in {"exited", "already_exited"}
+        )
+
+    @staticmethod
+    def _notification_route_fields(session: "ProcessSession") -> dict:
+        return {
+            "session_id": session.id,
+            "session_key": session.notification_session_key or session.session_key,
+            "parent_session_id": session.parent_session_id,
+            "task_id": session.task_id,
+            "command": session.command,
+            "platform": session.watcher_platform,
+            "chat_id": session.watcher_chat_id,
+            "user_id": session.watcher_user_id,
+            "user_name": session.watcher_user_name,
+            "thread_id": session.watcher_thread_id,
+            "message_id": session.watcher_message_id,
+        }
+
     def drain_notifications(
         self,
         session_key: str = "",
@@ -1948,27 +2018,30 @@ class ProcessRegistry:
             ):
                 continue
 
-            # Subagent-owned process notifications (task_id "sa-...") are
-            # suppressed from the parent conversation by default — the
-            # child's consolidated delegation result is the deliverable;
-            # "npm ci finished" walls mid-chat are noise. Dropped, NOT
-            # requeued (children never drain notify events, so requeueing
-            # would pin them in the queue forever). Type 'async_delegation'
-            # is the delegation result itself and is NEVER suppressed.
-            _evt_task_id = str(evt.get("task_id") or "")
-            if not is_async_delegation and _evt_task_id.startswith("sa-"):
-                if surface_child is None:
+            # Successful subagent-owned process notifications (task_id
+            # "sa-...") are suppressed from the parent conversation by
+            # default — the child's consolidated result is the deliverable and
+            # "npm ci finished" walls are noise. Failed completions are never
+            # noise: nonzero/unknown exits and abnormal terminal reasons stay
+            # visible even when the surfacing flag is false. Dropped events are
+            # NOT requeued (children never drain notify events). Type
+            # 'async_delegation' is the delegation result and is NEVER
+            # suppressed.
+            if not self.should_surface_process_notification(
+                evt, surface_child=surface_child
+            ):
+                _evt_task_id = str(evt.get("task_id") or "")
+                if surface_child is None and _evt_task_id.startswith("sa-"):
                     surface_child = self._surface_child_process_notifications()
-                if not surface_child:
-                    logger.debug(
-                        "Suppressed subagent-owned process notification "
-                        "(delegation.surface_child_process_notifications=false): "
-                        "type=%s session_id=%s task_id=%s",
-                        evt.get("type", "completion"),
-                        _evt_sid,
-                        _evt_task_id,
-                    )
-                    continue
+                logger.debug(
+                    "Suppressed subagent-owned process notification "
+                    "(delegation.surface_child_process_notifications=false): "
+                    "type=%s session_id=%s task_id=%s",
+                    evt.get("type", "completion"),
+                    _evt_sid,
+                    _evt_task_id,
+                )
+                continue
 
             text = format_process_notification(evt)
             if text:
@@ -2807,6 +2880,7 @@ class ProcessRegistry:
                             "started_at": s.started_at,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
+                            "notification_session_key": s.notification_session_key,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -2897,6 +2971,9 @@ class ProcessRegistry:
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
+                notification_session_key=entry.get(
+                    "notification_session_key", ""
+                ),
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
@@ -2925,7 +3002,9 @@ class ProcessRegistry:
                 self.pending_watchers.append({
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
-                    "session_key": session.session_key,
+                    "session_key": (
+                        session.notification_session_key or session.session_key
+                    ),
                     "platform": session.watcher_platform,
                     "chat_id": session.watcher_chat_id,
                     "user_id": session.watcher_user_id,
