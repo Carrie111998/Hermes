@@ -357,6 +357,7 @@ def _kill_stale_dashboard_processes(
     *,
     restart_managed: bool = False,
     already_restarted_units: "set[str] | None" = None,
+    exclude_pids: "set[int] | None" = None,
 ) -> dict[str, list]:
     """Kill running ``hermes dashboard`` / ``hermes serve`` processes.
 
@@ -409,6 +410,16 @@ def _kill_stale_dashboard_processes(
             except (ValueError, TypeError):
                 pass
 
+    if exclude_pids:
+        # PIDs the update itself just relaunched from a recorded identity.
+        # The scan matches on cmdline, not age, so without this the sweep
+        # would kill and restart the very processes we brought back.
+        for pid in exclude_pids:
+            try:
+                exclude.add(int(pid))
+            except (TypeError, ValueError):
+                pass
+
     if restart_managed:
         # An SSH-owned backend belongs to an attached Desktop client even when
         # the updater runs from an unrelated remote shell with no Desktop child
@@ -448,11 +459,18 @@ def _kill_stale_dashboard_processes(
             # Already handled directly by the caller (e.g. hermes update's
             # systemd fleet-restart loop) — leave these alone instead of
             # killing and re-restarting a process that's already fresh.
+            # systemd accepts a unit with or without the ``.service``
+            # suffix and the two callers of this function historically
+            # passed different spellings, so compare on the normalized
+            # name from both sides rather than trusting one convention.
+            _restarted = {
+                str(unit).removesuffix(".service") for unit in already_restarted_units
+            }
             pids = [
                 pid
                 for pid in pids
                 if (pid_service.get(pid) or "").removesuffix(".service")
-                not in already_restarted_units
+                not in _restarted
             ]
             if not pids:
                 return {"matched": [], "killed": [], "failed": []}

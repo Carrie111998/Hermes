@@ -289,6 +289,21 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
 _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
+#: A clustered short-option run whose LAST letter is ``c`` — ``bash -lc``,
+#: ``sh -ec``, ``bash -lic``. POSIX shells accept the command string as the
+#: next argument here exactly as they do for a bare ``-c``, so the walk has
+#: to read the payload from these too or the whole recursion is one flag
+#: letter away from being bypassed.
+_CLUSTERED_COMMAND_OPTION = re.compile(r"^-[A-Za-z]*c$")
+
+
+def _is_shell_command_option(argument: str) -> bool:
+    """True when *argument* introduces a shell's command-string operand."""
+    return argument in {"-c", "--command"} or bool(
+        _CLUSTERED_COMMAND_OPTION.match(argument)
+    )
+
+
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
@@ -714,6 +729,134 @@ def _direct_lifecycle_scan(command: str) -> bool:
     ) or contains_launchctl_submit_command(command)
 
 
+# ---------------------------------------------------------------------------
+# `hermes update` inside a supervised gateway
+# ---------------------------------------------------------------------------
+# A direct `hermes update` is not a lifecycle verb, but from inside a
+# supervised gateway it is strictly worse than one: the terminal tool owns
+# the updater's lifetime, so a tool timeout, a cancelled turn or the
+# gateway's own restart kills the updater mid-mutation. What survives is a
+# checkout whose HEAD has moved while a pre-update interpreter is still
+# live — a torn module graph, with lazy imports pulling new modules into an
+# old graph. The supported routes both hand ownership to something that
+# outlives this process: the detached `/update` slash command, or a shell
+# outside the gateway.
+#
+# Detection is token-aware only (never a raw-text regex): the words
+# "hermes update" appear constantly in prose, docs and grep patterns, and
+# only the command POSITION makes them an execution.
+_HERMES_EXECUTABLES = frozenset({"hermes", "hermes.exe"})
+_HERMES_MODULE_TARGETS = frozenset({"hermes_cli.main", "hermes_cli"})
+# Global selectors that take a separate value token, so the subcommand sits
+# one token further right (`hermes -p zeus update`).
+_HERMES_VALUE_FLAGS = frozenset({"-p", "--profile"})
+# `--check` and `--plan` return before any mutation (see
+# `hermes_cli.main`'s update dispatch), so they stay runnable from inside
+# the gateway — they are how the agent answers "is there an update?".
+_UPDATE_READ_ONLY_FLAGS = frozenset({"--check", "--plan"})
+
+
+def _rest_after_hermes_executable(segment: list[str]) -> Optional[list[str]]:
+    """Tokens following the ``hermes`` entry point in *segment*, else None.
+
+    Handles the shim (``hermes``, ``/usr/local/bin/hermes``) and the module
+    invocation the desktop/gateway updaters use
+    (``python -m hermes_cli.main``).
+    """
+    index = _command_token_index(segment)
+    if index is None:
+        return None
+    index = _peel_transparent_prefixes(segment, index)
+    if index >= len(segment):
+        return None
+    name = _executable_name(segment[index]).casefold()
+    arguments = segment[index + 1 :]
+    if name in _HERMES_EXECUTABLES:
+        return arguments
+    if name.startswith("python"):
+        try:
+            module_flag = arguments.index("-m")
+        except ValueError:
+            return None
+        if module_flag + 1 >= len(arguments):
+            return None
+        if arguments[module_flag + 1] not in _HERMES_MODULE_TARGETS:
+            return None
+        return arguments[module_flag + 2 :]
+    return None
+
+
+def _is_mutating_hermes_update(arguments: list[str]) -> bool:
+    """True when *arguments* select the mutating ``update`` subcommand."""
+    index = 0
+    while index < len(arguments) and arguments[index].startswith("-"):
+        if arguments[index] in _HERMES_VALUE_FLAGS and index + 1 < len(arguments):
+            index += 2
+        else:
+            index += 1
+    if index >= len(arguments) or arguments[index] != "update":
+        return False
+    tail = arguments[index + 1 :]
+    return not any(token in _UPDATE_READ_ONLY_FLAGS for token in tail)
+
+
+def contains_hermes_update_command(text: str) -> bool:
+    """True when *text* executes a mutating ``hermes update``.
+
+    Never raises: an untokenizable input yields no segments and therefore
+    no verdict, exactly like the other scanners in this module.
+    """
+    if not text or "update" not in text:
+        return False
+    try:
+        from tools.shell_heredoc import strip_inert_heredoc_bodies
+
+        text = strip_inert_heredoc_bodies(text)
+    except Exception:
+        pass
+    normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    for segment in _iter_command_segments(normalized):
+        arguments = _rest_after_hermes_executable(segment)
+        if arguments is not None and _is_mutating_hermes_update(arguments):
+            return True
+    return False
+
+
+def contains_hermes_update_command_or_referenced_script(
+    command: str,
+    *,
+    cwd: Optional[str] = None,
+    read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+) -> bool:
+    """``contains_hermes_update_command`` plus the referenced-script walk.
+
+    Shares the bounded recursion the gateway-lifecycle guard uses, so a
+    wrapper script (``bash deploy.sh``) or an ``sh -c`` payload carrying
+    the update is caught with the same depth/size/binary protections.
+    Total by construction, for the same reason documented on
+    :func:`contains_gateway_lifecycle_command_or_referenced_script`.
+    """
+    try:
+        return _contains_unsafe_gateway_action(
+            command,
+            cwd=cwd,
+            depth=0,
+            visited=set(),
+            read_remote_script=read_remote_script,
+            direct_scan=contains_hermes_update_command,
+        )
+    except Exception:
+        logger.warning(
+            "hermes-update guard referenced-script walk failed; "
+            "falling back to direct-scan verdict",
+            exc_info=True,
+        )
+        try:
+            return contains_hermes_update_command(command)
+        except Exception:
+            return False
+
+
 def _expand_candidate_path(candidate: str) -> Optional[Path]:
     """Sanitize a tokenized path candidate at the ingestion boundary.
 
@@ -789,7 +932,7 @@ def _references_at(
             if argument == "--":
                 arg_index += 1
                 break
-            if argument in {"-c", "--command"}:
+            if _is_shell_command_option(argument):
                 break
             if argument in _SHELL_OPTIONS_WITH_VALUES:
                 arg_index += 2
@@ -798,10 +941,9 @@ def _references_at(
                 arg_index += 1
                 continue
             break
-        if arg_index < len(arguments) and arguments[arg_index] not in {
-            "-c",
-            "--command",
-        }:
+        if arg_index < len(arguments) and not _is_shell_command_option(
+            arguments[arg_index]
+        ):
             resolved = _resolve_terminal_script_path(arguments[arg_index], cwd)
             if resolved is not None:
                 yield resolved
@@ -861,7 +1003,7 @@ def _iter_shell_command_payloads(command: str) -> Iterator[str]:
             continue
         arguments = segment[index + 1 :]
         for arg_index, argument in enumerate(arguments[:-1]):
-            if argument in {"-c", "--command"}:
+            if _is_shell_command_option(argument):
                 yield arguments[arg_index + 1]
                 break
 
@@ -1032,8 +1174,16 @@ def _contains_unsafe_gateway_action(
     depth: int,
     visited: set[Path],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    direct_scan: Optional[Callable[[str], bool]] = None,
 ) -> bool:
-    if _direct_lifecycle_scan(command):
+    """Bounded walk: scan *command*, its ``sh -c`` payloads and its scripts.
+
+    ``direct_scan`` selects WHAT counts as unsafe at each level; the walk
+    itself (depth bound, size bound, binary/cloud-placeholder refusals,
+    remote reads) is shared. Defaults to the gateway-lifecycle scan.
+    """
+    scan = direct_scan or _direct_lifecycle_scan
+    if scan(command):
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
@@ -1045,6 +1195,7 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            direct_scan=direct_scan,
         ):
             return True
 
@@ -1093,6 +1244,7 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            direct_scan=direct_scan,
         ):
             return True
     return False

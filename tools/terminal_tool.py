@@ -3167,6 +3167,41 @@ def terminal_tool(
                     pass
                 return None
 
+            # Hard-block: a direct `hermes update` from inside the gateway.
+            # The tool owns the updater's lifetime, so a tool timeout, a
+            # cancelled turn, or the restart the update itself triggers kills
+            # the updater mid-mutation — leaving a checkout whose HEAD has
+            # moved while this pre-update interpreter is still live and lazily
+            # importing from it (torn module graph). The detached `/update`
+            # slash command spawns the updater outside this process's
+            # ownership and stays the supported route; read-only
+            # `hermes update --check` / `--plan` are not blocked.
+            from cron.lifecycle_guard import (
+                contains_hermes_update_command_or_referenced_script,
+            )
+
+            if contains_hermes_update_command_or_referenced_script(
+                command,
+                cwd=guard_cwd,
+                read_remote_script=_read_script_in_env,
+            ):
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 1,
+                    "error": (
+                        "Blocked: `hermes update` cannot run from inside the gateway "
+                        "process. This tool owns the update's lifetime — a tool "
+                        "timeout, a cancelled turn, or the restart the update "
+                        "triggers would kill it after the checkout has already "
+                        "moved, leaving running Hermes processes importing a mixed "
+                        "module graph. Use the detached `/update` command instead, "
+                        "or run `hermes update` from a shell outside the gateway. "
+                        "`hermes update --check` and `hermes update --plan` are "
+                        "read-only and still allowed here."
+                    ),
+                    "status": "error",
+                }, ensure_ascii=False)
+
             if contains_gateway_lifecycle_command_or_referenced_script(
                 command,
                 cwd=guard_cwd,

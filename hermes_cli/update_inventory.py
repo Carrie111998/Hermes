@@ -51,6 +51,14 @@ class RuntimeRecord:
     code_sha: Optional[str] = None       # stamped running-code sha (#91283)
     code_version: Optional[str] = None
     restart_via: str = ""         # human-readable restart mechanism
+    # Exact supervisor identity, captured pre-mutation. A custom unit name
+    # (``my-dashboard.service``), a launchd label (``ai.hermes.gateway-zeus``)
+    # or a Windows SCM service name is unreadable once the process and its
+    # cgroup are gone, and it does NOT follow from the profile name — the
+    # restart phase must relaunch by THIS string, never by a profile
+    # substring match against a discovery glob.
+    unit: str = ""
+    unit_scope: str = ""          # systemd: user | system; launchd: gui/<uid>
     detail: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -76,6 +84,166 @@ class UpdatePlan:
             for r in self.runtimes
         ]
         return payload
+
+
+@dataclass(frozen=True)
+class SupervisorIdentity:
+    """Exact, relaunch-capable identity of a runtime's supervisor.
+
+    ``unit`` is the string the restart phase must hand back to the
+    supervisor verbatim: a systemd unit (``acme-dash.service``), a launchd
+    label (``ai.hermes.gateway-zeus``) or a Windows SCM service name. It
+    is NOT derivable from the profile — operators name custom units freely
+    — and it is unreadable once the process and its cgroup are gone, which
+    is why it must be captured in the pre-mutation inventory rather than
+    during late cleanup.
+    """
+
+    unit: str = ""
+    scope: str = ""
+    cgroup: str = ""
+
+
+def _default_pid_cgroup(pid: int) -> Optional[str]:
+    """Unified-hierarchy cgroup path for *pid*; ``None`` off Linux."""
+    try:
+        from hermes_cli.main import _get_pid_cgroup_path
+
+        return _get_pid_cgroup_path(int(pid))
+    except Exception as exc:
+        logger.debug("cgroup reader unavailable: %s", exc)
+        return None
+
+
+def capture_supervisor_identity(
+    pid: int,
+    *,
+    cgroup_of=None,
+    launchd_labels: Optional[dict] = None,
+    windows_services: Optional[dict] = None,
+) -> SupervisorIdentity:
+    """Resolve the exact supervisor identity of *pid*. Never raises."""
+    if windows_services:
+        name = windows_services.get(int(pid)) if pid is not None else None
+        if name:
+            return SupervisorIdentity(unit=str(name), scope="scm")
+    if launchd_labels:
+        label = launchd_labels.get(int(pid)) if pid is not None else None
+        if label:
+            return SupervisorIdentity(unit=str(label), scope="launchd")
+    if cgroup_of is None:
+        cgroup_of = _default_pid_cgroup
+    try:
+        cgroup = cgroup_of(int(pid)) or ""
+    except Exception as exc:
+        logger.debug("cgroup probe failed for %s: %s", pid, exc)
+        return SupervisorIdentity()
+    cgroup = str(cgroup)
+    unit = ""
+    trimmed = cgroup.rstrip("/")
+    if trimmed.endswith(".service"):
+        unit = trimmed.rsplit("/", 1)[-1]
+    scope = ""
+    if "/system.slice/" in cgroup:
+        scope = "system"
+    elif "/user.slice/" in cgroup:
+        scope = "user"
+    return SupervisorIdentity(unit=unit, scope=scope if unit else "", cgroup=cgroup)
+
+
+def parse_launchctl_list_labels(text: str) -> dict:
+    """Map live PIDs to launchd labels from ``launchctl list`` output.
+
+    Rows whose PID column is ``-`` are loaded-but-not-running jobs; they
+    have no PID to reconcile against and are skipped. Never raises.
+    """
+    labels: dict[int, str] = {}
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        label = parts[-1].strip()
+        if label:
+            labels[pid] = label
+    return labels
+
+
+#: Where a user/system LaunchAgent plist normally lives. Searched in
+#: order; the first hit wins.
+_LAUNCHD_PLIST_DIRS = (
+    "~/Library/LaunchAgents",
+    "/Library/LaunchAgents",
+    "/Library/LaunchDaemons",
+)
+
+
+def launchd_plist_for_label(label: str, *, search_dirs=None) -> str:
+    """Path of *label*'s plist, or ``""``.
+
+    Recorded pre-mutation because ``launchctl bootout`` (the only stop a
+    KeepAlive agent respects) unloads the job — bringing it back requires
+    re-bootstrapping the plist by path. A label is a filename component,
+    never a path: anything with a separator is rejected outright.
+    """
+    label = str(label or "").strip()
+    if not label or "/" in label or "\\" in label or label in (".", ".."):
+        return ""
+    if search_dirs is None:
+        search_dirs = [Path(d).expanduser() for d in _LAUNCHD_PLIST_DIRS]
+    for directory in search_dirs:
+        try:
+            candidate = Path(directory) / f"{label}.plist"
+            if candidate.is_file():
+                return str(candidate)
+        except (OSError, ValueError) as exc:
+            logger.debug("launchd plist probe failed in %s: %s", directory, exc)
+    return ""
+
+
+def _live_launchd_labels() -> dict:
+    """``launchctl list`` PIDs → labels on macOS; ``{}`` elsewhere."""
+    try:
+        from hermes_cli.gateway import is_macos
+
+        if not is_macos():
+            return {}
+    except Exception:
+        return {}
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["launchctl", "list"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except Exception as exc:
+        logger.debug("launchctl list probe failed: %s", exc)
+        return {}
+    if result.returncode != 0:
+        return {}
+    return parse_launchctl_list_labels(result.stdout or "")
+
+
+def _windows_service_names_by_pid() -> dict:
+    """Gateway PIDs → SCM service names on Windows; ``{}`` elsewhere."""
+    try:
+        from hermes_cli.gateway import find_windows_gateway_services
+
+        return {
+            int(service.gateway_pid): str(service.name)
+            for service in find_windows_gateway_services()
+        }
+    except Exception as exc:
+        logger.debug("Windows SCM identity probe failed: %s", exc)
+        return {}
 
 
 def _detect_supervisor_for_pid(
@@ -386,7 +554,66 @@ def collect_runtime_inventory() -> UpdatePlan:
     except Exception as exc:
         logger.debug("Serve/dashboard ledger inventory failed: %s", exc)
 
+    _attach_supervisor_identities(plan)
     return plan
+
+
+# Supervisors whose classification is an inference the identity probe may
+# legitimately correct. ``desktop`` is excluded on purpose: the Desktop app
+# respawns its own backend, and that ownership outranks any unit the
+# backend happens to sit in.
+_IDENTITY_UPGRADABLE_SUPERVISORS = frozenset({"manual", "manual-serve", "service"})
+
+
+def _attach_supervisor_identities(plan: UpdatePlan) -> None:
+    """Fill each runtime's EXACT supervisor identity, in place.
+
+    Runs while every runtime is still alive — the whole point. A custom
+    unit name lives in the process's cgroup, which disappears with the
+    process, so a post-stop probe (the old late-cleanup discovery) can
+    only ever guess. Also records the cgroup itself, which the updater's
+    isolation check compares against.
+
+    Never raises: a runtime whose identity cannot be read keeps whatever
+    the collectors inferred.
+    """
+    try:
+        runtimes = [r for r in plan.runtimes if isinstance(r, RuntimeRecord)]
+        if not runtimes:
+            return
+        launchd_labels = _live_launchd_labels()
+        windows_services = _windows_service_names_by_pid()
+        for runtime in runtimes:
+            pid = runtime.pid
+            if not isinstance(pid, int) or pid <= 0:
+                continue
+            identity = capture_supervisor_identity(
+                pid,
+                launchd_labels=launchd_labels,
+                windows_services=windows_services,
+            )
+            if identity.cgroup:
+                runtime.detail["cgroup"] = identity.cgroup
+            if not identity.unit:
+                continue
+            runtime.unit = identity.unit
+            runtime.unit_scope = identity.scope
+            if identity.scope == "launchd":
+                plist = launchd_plist_for_label(identity.unit)
+                if plist:
+                    runtime.detail["plist"] = plist
+            if runtime.supervisor in _IDENTITY_UPGRADABLE_SUPERVISORS:
+                if identity.scope == "launchd":
+                    runtime.supervisor = "launchd"
+                elif identity.scope == "scm":
+                    runtime.supervisor = "windows-service"
+                else:
+                    runtime.supervisor = "systemd"
+                runtime.restart_via = _restart_mechanism(
+                    runtime.supervisor, runtime.profile
+                )
+    except Exception as exc:
+        logger.debug("Supervisor-identity capture failed: %s", exc)
 
 
 def print_update_plan(plan: UpdatePlan) -> None:
@@ -454,12 +681,45 @@ def match_runtime_outcomes(
         external = set(externally_supervised_profiles or [])
         killed = {int(p) for p in (killed_pids or set())}
 
+        def _identity_matches(unit: str, candidates: set) -> bool:
+            """Exact supervisor-identity match against a bookkeeping list.
+
+            ``.service`` is optional on both sides because systemctl
+            accepts (and echoes) either spelling.
+            """
+            unit = (unit or "").strip()
+            if not unit:
+                return False
+            aliases = {unit, unit.removesuffix(".service")}
+            for candidate in candidates:
+                name = str(candidate).strip()
+                if name in aliases or name.removesuffix(".service") in aliases:
+                    return True
+            return False
+
         for runtime in plan.runtimes:
             r = runtime if isinstance(runtime, RuntimeRecord) else None
             if r is None:
                 continue
             outcome = "unaccounted"
-            if r.profile in relaunched or r.profile in external:
+            # Exact identity FIRST. A runtime carrying a recorded unit is
+            # reconciled by that unit only: profile-substring matching
+            # both invents coverage (a restarted `hermes-gateway.service`
+            # "accounting for" an untouched `acme-dash.service` on the
+            # same profile) and misses custom units entirely.
+            if _identity_matches(r.unit, failed_set):
+                outcome = "failed"
+            elif _identity_matches(r.unit, restarted_set):
+                outcome = "restarted"
+            elif r.profile in external:
+                # Someone else owns this runtime's lifecycle, and they
+                # report per profile, not per unit — the only signal there
+                # is.
+                outcome = "restarted"
+            elif r.unit:
+                if r.pid is not None and r.pid in killed:
+                    outcome = "stopped"
+            elif r.profile in relaunched:
                 outcome = "restarted"
             elif r.pid is not None and r.pid in killed:
                 outcome = "stopped"

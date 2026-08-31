@@ -6431,8 +6431,26 @@ class GatewaySlashCommandsMixin:
                 )
             else:
                 hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
+                # Leave the gateway's supervisor cgroup, not just its
+                # session. `setsid` alone keeps the updater inside
+                # `hermes-gateway.service`, where the restart the update
+                # itself performs (or any `systemctl stop`) SIGKILLs it
+                # mid-mutation — a moved HEAD with live pre-update
+                # interpreters. A transient scope is owned by nothing in
+                # the fleet. Without systemd-run the updater's own
+                # isolation check is the fail-closed backstop.
+                from hermes_cli.update_quiesce import (
+                    isolated_updater_shell_prefix,
+                    systemd_run_user_scope_binary,
+                    updater_scope_unit_name,
+                )
+
+                scope_prefix = isolated_updater_shell_prefix(
+                    systemd_run=systemd_run_user_scope_binary(),
+                    unit_name=updater_scope_unit_name(),
+                )
                 update_cmd = (
-                    f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
+                    f"PYTHONUNBUFFERED=1 {scope_prefix}{hermes_cmd_str} update --gateway"
                     f" > {shlex.quote(str(output_path))} 2>&1; "
                     # Avoid `status=$?`: `status` is a read-only special parameter
                     # in zsh, and this command string is copied/reused in macOS/zsh
