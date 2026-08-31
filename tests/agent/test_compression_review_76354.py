@@ -278,7 +278,9 @@ class TestF6ExecutorSaturation:
         run the refused job."""
         _drain_admission_slots()
         release = threading.Event()
-        started = threading.Barrier(5, timeout=10)  # 4 workers + main
+        started = threading.Barrier(  # SRL-4049: workers + main
+            cc._COMPRESS_EXECUTOR_MAX_WORKERS + 1, timeout=10
+        )
 
         def blocked_worker(fence: CompressionCommitFence):
             started.wait()
@@ -298,18 +300,22 @@ class TestF6ExecutorSaturation:
             )
 
         try:
-            for i in range(4):
+            for i in range(cc._COMPRESS_EXECUTOR_MAX_WORKERS):
                 t = threading.Thread(target=host, args=(i,), name=f"sat-{i}")
                 t.start()
                 hosts.append(t)
-            started.wait()  # all 4 workers occupy the pool
+            started.wait()  # all workers occupy the pool
             for t in hosts:
                 t.join(timeout=5)  # hosts time out; workers stay wedged
                 assert not t.is_alive()
 
-            # All 4 slots still admitted (workers blocked).
+            # All slots still admitted (workers blocked).
+            # SRL-4049: pool agora tem MAX_WORKERS=8; o teste satura TUDO.
             with cc._compress_admission_lock:
-                assert cc._compress_admitted_count == 4
+                assert (
+                    cc._compress_admitted_count
+                    == cc._COMPRESS_EXECUTOR_MAX_WORKERS
+                )
 
             fifth_ran = threading.Event()
 

@@ -911,7 +911,7 @@ _COMMIT_OVERRUN_WAIT_SLICE_SECONDS = 30.0
 # slot via the future done-callback, restoring normal service. If a worker
 # NEVER returns, its slot is lost for the process lifetime — bounded,
 # observable degradation instead of an unbounded stale-job queue.
-_COMPRESS_EXECUTOR_MAX_WORKERS = 4
+_COMPRESS_EXECUTOR_MAX_WORKERS = 8  # SRL-4049 F2: fanout de sessoes grandes satura 4
 _compress_admission_lock = threading.Lock()
 _compress_admitted_count = 0
 
@@ -2701,6 +2701,39 @@ def finalize_context_engine_compression_notification(
     return bool(pending())
 
 
+
+# SRL-4049 (F1): fence-cancel sobrevivente. Quando a sumarizacao concluiu
+# (compressed produced) mas o commit foi cancelado, o produto caro nao e
+# descartado: fica em cache por session_id com TTL curto e e reaplicado no
+# proximo turno. Cache em modulo (thread-safe via GIL stores) — nao toca em
+# state durable; um cache invalido apenas custa uma re-sumarizacao.
+_SRL4049_PENDING_COMMITS: dict = {}
+_SRL4049_PENDING_TTL_S = 900.0  # 15 min: cobre o ciclo de fence da frota
+
+
+def _srl4049_cache_pending_commit(session_id: str, compressed, system_prompt):
+    if not session_id:
+        return
+    import time as _t
+    _SRL4049_PENDING_COMMITS[session_id] = {
+        "compressed": compressed,
+        "system_prompt": system_prompt,
+        "ts": _t.monotonic(),
+    }
+
+
+def _srl4049_take_pending_commit(session_id: str):
+    if not session_id:
+        return None
+    import time as _t
+    entry = _SRL4049_PENDING_COMMITS.pop(session_id, None)
+    if not entry:
+        return None
+    if _t.monotonic() - entry["ts"] > _SRL4049_PENDING_TTL_S:
+        return None
+    return entry
+
+
 def compress_context(
     agent: Any,
     messages: list,
@@ -2799,6 +2832,26 @@ def compress_context(
     checkpoint_required = (
         getattr(agent, "compression_checkpoint_required", False) is True
     )
+
+    # SRL-4049 F1: reaplica um summary pronto cujo commit foi fence-cancelado
+    # em turno anterior. Barato: pop do cache e valida tamanho antes de usar.
+    # Gate: so em force=True (o turno seguinte do LEO/manual). Caminho automatico
+    # continua no fluxo normal para nao mudar a semantica in_place testada.
+    try:
+        if force:
+            _pending_entry = _srl4049_take_pending_commit(agent.session_id or "")
+            if (
+                _pending_entry is not None
+                and estimate_messages_tokens_rough(messages) > estimate_messages_tokens_rough(_pending_entry["compressed"])
+            ):
+                logger.info(
+                    "SRL-4049: reaplicando summary cacheado de fence-cancel "
+                    "(session=%s, %d msgs) sem re-sumarizar.",
+                    agent.session_id or "none", len(_pending_entry["compressed"]),
+                )
+                return list(_pending_entry["compressed"]), _pending_entry["system_prompt"]
+    except Exception as _srl4049_err:
+        logger.warning("SRL-4049: falha ao reaplicar cached summary (%s)", _srl4049_err)
     if getattr(agent, "api_mode", None) == "codex_app_server":
         if checkpoint_required:
             raise _checkpoint_blocked(
@@ -3758,6 +3811,25 @@ def compress_context(
         if commit_fence is not None:
             _commit_fence_entered = commit_fence.begin_commit(_hard_cancel_event)
             if not _commit_fence_entered:
+                # SRL-4049 F1: a sumarizacao CONCLUIU (compressed != messages)
+                # porem o commit foi cancelado. Cache o produto para o proximo
+                # turno em vez de descartar horas de LLM.
+                if (
+                    messages_before_compression is None
+                    or compressed != messages_before_compression
+                ) and compressed:
+                    # SRL-4049: o system prompt novo ainda nao existe neste
+                    # ponto (new_system_prompt nasce depois da rotacao) —
+                    # usa o cached ou reconstrui do system_message.
+                    _sp_for_cache = agent._cached_system_prompt or system_message
+                    _srl4049_cache_pending_commit(
+                        agent.session_id or "", list(compressed), _sp_for_cache
+                    )
+                    logger.info(
+                        "SRL-4049: fence-cancel com summary pronto — "
+                        "cacheado para reaplicacao (session=%s, %d msgs).",
+                        agent.session_id or "none", len(compressed),
+                    )
                 _restore_compressor_attempt_state(
                     agent.context_compressor,
                     _compressor_attempt_snapshot,
