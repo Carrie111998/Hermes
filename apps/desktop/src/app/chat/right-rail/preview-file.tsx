@@ -1120,7 +1120,6 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
       <OfficePreviewView
         formulaBarLabel={t.preview.formulaBarLabel}
         preview={state.office}
-        slideLabel={t.preview.slideLabel}
         truncatedLabel={t.preview.officeTruncated}
       />
     )
