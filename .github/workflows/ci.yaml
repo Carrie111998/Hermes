@@ -192,6 +192,9 @@ jobs:
     name: Review label gate
     needs: [detect, supply-chain]
     if: always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true')
+    permissions:
+      contents: read
+      pull-requests: read
     uses: ./.github/workflows/review-labels.yml
     with:
       ci_review: ${{ needs.detect.outputs.ci_review == 'true' }}
