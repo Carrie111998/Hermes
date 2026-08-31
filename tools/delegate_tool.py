@@ -4059,6 +4059,27 @@ def delegate_task(
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
 
+    # Orphan guard: resolve per-task credentials for EVERY task before any
+    # child agent is constructed. A task whose model/provider cannot be
+    # resolved fails the whole call here, while building nothing - the
+    # mid-batch failure mode (children 0..k-1 constructed, then task k+1
+    # errors and they leak) cannot happen.
+    task_creds_list: List[Any] = []
+    for i, t in enumerate(task_list):
+        task_model = t.get("model") or model
+        task_provider = t.get("provider") or provider
+        if task_model != model or task_provider != provider:
+            try:
+                task_creds_list.append(
+                    _resolve_delegation_credentials(
+                        cfg, parent_agent, model=task_model, provider=task_provider
+                    )
+                )
+            except ValueError as exc:
+                return tool_error(f"task[{i}] {exc}")
+        else:
+            task_creds_list.append(creds)
+
     # Build all child agents on the main thread (thread-safe construction).
     # _build_child_preserving_parent_tools saves/restores the parent's
     # resolved tool names around each construction under a lock, so child
@@ -4077,44 +4098,43 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
-        # Per-task model/provider beat the top-level per-call values (which
-        # already beat delegation config). Only re-resolve credentials when
-        # the task actually overrides — otherwise reuse the top-level bundle.
-        task_model = t.get("model") or model
-        task_provider = t.get("provider") or provider
-        task_creds = creds
-        if task_model != model or task_provider != provider:
-            try:
-                task_creds = _resolve_delegation_credentials(
-                    cfg, parent_agent, model=task_model, provider=task_provider
-                )
-            except ValueError as exc:
-                return tool_error(f"task[{i}] {exc}")
+        # Credentials were fully pre-resolved above (orphan guard); this
+        # loop can no longer fail on credential resolution.
+        task_creds = task_creds_list[i]
         try:
             child = _build_child_preserving_parent_tools(
-            task_index=i,
-            goal=t["goal"],
-            context=_child_context,
-            # Subagents always inherit the parent's toolsets; the model
-            # cannot choose or narrow them (no model-facing toolsets arg).
-            toolsets=None,
-            model=task_creds["model"],
-            max_iterations=effective_max_iter,
-            task_count=n_tasks,
-            parent_agent=parent_agent,
-            override_provider=task_creds["provider"],
-            override_base_url=task_creds["base_url"],
-            override_api_key=task_creds["api_key"],
-            override_api_mode=task_creds["api_mode"],
-            override_request_overrides=task_creds.get("request_overrides"),
-            override_max_tokens=task_creds.get("max_output_tokens"),
-            override_acp_command=task_creds.get("command"),
-            override_acp_args=task_creds.get("args"),
-            role=effective_role,
+                task_index=i,
+                goal=t["goal"],
+                context=_child_context,
+                # Subagents always inherit the parent's toolsets; the model
+                # cannot choose or narrow them (no model-facing toolsets arg).
+                toolsets=None,
+                model=task_creds["model"],
+                max_iterations=effective_max_iter,
+                task_count=n_tasks,
+                parent_agent=parent_agent,
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_request_overrides=task_creds.get("request_overrides"),
+                override_max_tokens=task_creds.get("max_output_tokens"),
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
+                role=effective_role,
             )
         except ValueError as exc:
-            # Explicit-pin preflight failures (e.g. pinned delegation.command
-            # missing from PATH) refuse the spawn loudly (#80450).
+            # Construction-time preflight failure (e.g. pinned
+            # delegation.command missing from PATH, #80450). Dispose of the
+            # children already built for earlier tasks so nothing leaks,
+            # then refuse the whole spawn.
+            for done in children:
+                try:
+                    close = getattr(done, "close", None)
+                    if callable(close):
+                        close()
+                except Exception:
+                    logger.debug("orphan-guard: cleanup of child %s failed", getattr(done, "session_id", "?"), exc_info=True)
             return tool_error(f"task[{i}] {exc}")
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
