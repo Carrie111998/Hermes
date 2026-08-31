@@ -57,13 +57,43 @@ def icon_path(project_root: Path) -> Path:
     return project_root / "apps" / "desktop" / "assets" / "icon.png"
 
 
-def resolve_exec_command() -> str:
-    """Build the absolute ``Exec=`` command line for ``hermes desktop``.
+def packaged_linux_executable(project_root: Path) -> Optional[Path]:
+    """Return the newest unpacked Linux Electron binary under ``release/``.
 
-    Prefer the real ``hermes`` executable (argv[0] or PATH). When Hermes
-    runs as a module with no launcher installed, use the current
-    interpreter, also absolute.
+    Matches the Linux candidates ``cmd_gui`` launches. Used so the XDG
+    ``Exec=`` line can invoke that binary directly instead of
+    ``hermes desktop``, whose ``subprocess.run`` waits until Electron
+    exits and GNOME treats as a failed favorites/panel launch.
     """
+    release_dir = project_root / "apps" / "desktop" / "release"
+    candidates = [
+        release_dir / "linux-unpacked" / "hermes",
+        release_dir / "linux-unpacked" / "Hermes",
+        release_dir / "linux-arm64-unpacked" / "hermes",
+        release_dir / "linux-arm64-unpacked" / "Hermes",
+    ]
+    existing = [p for p in candidates if p.is_file()]
+    if not existing:
+        return None
+    return max(existing, key=lambda p: p.stat().st_mtime)
+
+
+def resolve_exec_command(project_root: Optional[Path] = None) -> str:
+    """Build the absolute ``Exec=`` command line for the XDG launcher.
+
+    When a packaged Linux Electron app is on disk, point ``Exec`` at that
+    binary so the desktop environment's child *is* Electron (returns as
+    soon as the binary is exec'd). GPU / ozone / keychain policy stay in
+    the Electron process (``config.yaml`` + env), not hard-coded flags.
+
+    If nothing is packaged yet, fall back to ``hermes desktop`` so a
+    first-run menu item can still trigger a build.
+    """
+    if project_root is not None:
+        packaged = packaged_linux_executable(project_root)
+        if packaged is not None:
+            return _quote_exec_arg(str(packaged.resolve()))
+
     from hermes_cli.relaunch import resolve_hermes_bin
 
     bin_path = resolve_hermes_bin()
@@ -106,7 +136,7 @@ def _needs_interpreter(bin_path: Path) -> bool:
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
     # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
+    exe_dir = str(Path(sys.executable).resolve().parent).lower()
     return exe_dir not in shebang
 
 
@@ -190,7 +220,7 @@ def install_desktop_entry(project_root: Path) -> Optional[Path]:
     # Use the themed name when the checkout has no icon (a lite or
     # packaged install). A broken absolute path renders as no icon.
     icon_value = str(icon) if icon.is_file() else "hermes"
-    contents = render_desktop_entry(resolve_exec_command(), icon_value)
+    contents = render_desktop_entry(resolve_exec_command(project_root), icon_value)
 
     try:
         entry_path.parent.mkdir(parents=True, exist_ok=True)
