@@ -119,6 +119,7 @@ from urllib.parse import urlparse
 
 from tools.registry import tool_error
 from tools.ansi_strip import strip_unicode_tags
+from tools import mcp_profile as _mcp_profile
 
 logger = logging.getLogger(__name__)
 
@@ -2396,11 +2397,17 @@ class MCPServerTask:
         "_reconnect_retries", "_session_proven", "_was_parked",
         "_inflight_tasks", "_reconnecting", "_suspect_reason",
         "_teardown_race", "_permanent_grace_used", "_stdio_child_pids",
-        "_ever_connected",
+        "_ever_connected", "_profile_key", "_profile_home",
     )
 
     def __init__(self, name: str):
         self.name = name
+        # Canonical identity of the profile that owns this connection, bound
+        # at construction from the active MCP profile scope. The long-lived
+        # run task reconnects, re-registers tools and rebuilds credentials
+        # from THIS identity rather than re-deriving it later, so a reconnect
+        # can never drift onto another profile's config or secrets.
+        self._profile_key, self._profile_home = _mcp_profile.current_profile()
         self.session: Optional[Any] = None
         self.tool_timeout: float = _DEFAULT_TOOL_TIMEOUT
         self._task: Optional[asyncio.Task] = None
@@ -3645,7 +3652,14 @@ class MCPServerTask:
             try:
                 from tools.mcp_service_account import build_service_account_auth
                 sa_cfg = config.get("service_account") or {}
-                _oauth_auth = build_service_account_auth(self.name, sa_cfg)
+                # Pass the OWNING profile's home explicitly rather than
+                # letting the provider re-resolve get_hermes_home(): that
+                # pins the token cache file (0600, under this profile's home)
+                # and the refresh lock to this profile, so two profiles using
+                # the same logical server name can never share a token.
+                _oauth_auth = build_service_account_auth(
+                    self.name, sa_cfg, hermes_home=self._profile_home,
+                )
             except Exception as exc:
                 logger.warning(
                     "MCP service-account setup failed for '%s': %s", self.name, exc
@@ -3911,6 +3925,10 @@ class MCPServerTask:
             )
         self._register_discovered_tools_if_needed()
 
+    def _registry(self):
+        """Return the profile registry that owns this connection."""
+        return _mcp_profile.registry_for_key(self._profile_key, self._profile_home)
+
     def _register_discovered_tools_if_needed(self) -> None:
         """Re-register tools after an owned server reconnects if needed.
 
@@ -3926,19 +3944,25 @@ class MCPServerTask:
         """
         if self._registered_tool_names:
             return
+        # Ownership is resolved against the OWNING profile's registry, not the
+        # ambient one: a reconnect that re-registers tools must publish into
+        # the profile this task was created for even if the loop's ambient
+        # profile scope has since moved on.
+        owner = self._registry()
         if not self._ready.is_set():
             with _lock:
-                if _servers.get(self.name) is not self:
+                if owner.servers.get(self.name) is not self:
                     return
-        self._registered_tool_names = _register_server_tools(
-            self.name, self, self._config
-        )
+        with _mcp_profile.profile_scope(self._profile_home):
+            self._registered_tool_names = _register_server_tools(
+                self.name, self, self._config
+            )
         # A retained initial-failure server that just published tools has
         # recovered: drop its stale connect error so status surfaces stop
         # reporting it as failed.
         with _lock:
-            if _servers.get(self.name) is self:
-                _server_connect_errors.pop(self.name, None)
+            if owner.servers.get(self.name) is self:
+                owner.server_connect_errors.pop(self.name, None)
 
     async def run(self, config: dict):
         """Long-lived coroutine: connect, discover tools, wait, disconnect.
@@ -4488,15 +4512,32 @@ class MCPServerTask:
 # Module-level state
 # ---------------------------------------------------------------------------
 
-_servers: Dict[str, MCPServerTask] = {}
-_server_connecting: set[str] = set()
-_server_connect_errors: Dict[str, str] = {}
+# PROFILE-SCOPED STATE (see tools/mcp_profile.py).
+#
+# Every name below is a live *view* onto the active profile's
+# ``MCPProfileRegistry``, not a plain process-global container. Reads and
+# writes land in the registry keyed by the canonical profile home
+# (``hermes_home_key()`` over the resolved ``HERMES_HOME``), so two profiles
+# that both configure a server called ``toolhive`` get separate configs,
+# sessions, credentials, token caches, cooldowns and errors instead of
+# whichever one connected first winning the shared slot.
+#
+# They keep dict/set semantics, so every call site below reads exactly as it
+# did when these were globals — that is deliberate. Threading an explicit
+# ``profile_key=`` through 60+ call sites would leave any site that was missed
+# silently process-global again; a view cannot be forgotten.
+_MCP_STATE_VIEWS = _mcp_profile.make_state_views()
+
+_servers: Dict[str, MCPServerTask] = _MCP_STATE_VIEWS["servers"]
+_server_connecting: set[str] = _MCP_STATE_VIEWS["server_connecting"]
+_server_connect_errors: Dict[str, str] = _MCP_STATE_VIEWS["server_connect_errors"]
 # Lazy MCP startup (#56832): servers whose tools were registered from the
-# on-disk schema cache without spawning/connecting. Keyed by server name;
-# entries are popped once a real connection is established on first use.
-_lazy_server_configs: Dict[str, dict] = {}
-_lazy_server_fingerprints: Dict[str, str] = {}
-_lazy_server_tool_names: Dict[str, List[str]] = {}
+# on-disk schema cache without spawning/connecting. Keyed by server name
+# within the owning profile; entries are popped once a real connection is
+# established on first use.
+_lazy_server_configs: Dict[str, dict] = _MCP_STATE_VIEWS["lazy_server_configs"]
+_lazy_server_fingerprints: Dict[str, str] = _MCP_STATE_VIEWS["lazy_server_fingerprints"]
+_lazy_server_tool_names: Dict[str, List[str]] = _MCP_STATE_VIEWS["lazy_server_tool_names"]
 # Discovery installs a task-local claim before calling ``_connect_server`` so
 # it can retain a recoverable parked task without making standalone probe calls
 # publish failed servers into module-global ownership.
@@ -4524,8 +4565,12 @@ _connect_server_claim: contextvars.ContextVar[
 # server is retried on a backoff schedule instead of on every worker
 # session -- isolating it from the rest of the bridge. A successful
 # connection clears the state.
-_server_connect_retry_after: Dict[str, float] = {}   # name -> monotonic deadline
-_server_connect_failures: Dict[str, int] = {}        # name -> consecutive failures
+_server_connect_retry_after: Dict[str, float] = _MCP_STATE_VIEWS[
+    "server_connect_retry_after"
+]  # name -> monotonic deadline (per profile)
+_server_connect_failures: Dict[str, int] = _MCP_STATE_VIEWS[
+    "server_connect_failures"
+]  # name -> consecutive failures (per profile)
 _CONNECT_RETRY_BASE_BACKOFF_SEC = 30.0
 _CONNECT_RETRY_MAX_BACKOFF_SEC = 600.0
 
@@ -4576,8 +4621,13 @@ def _connect_cooldown_active(server_name: str) -> bool:
 # the breaker most recently transitioned into the open state. Use the
 # ``_bump_server_error`` / ``_reset_server_error`` helpers to mutate
 # this state — they keep the count and timestamp in sync.
-_server_error_counts: Dict[str, int] = {}
-_server_breaker_opened_at: Dict[str, float] = {}
+#
+# Profile-scoped: a server that is failing for profile A must not open the
+# breaker on profile B's independent connection to the same logical server.
+_server_error_counts: Dict[str, int] = _MCP_STATE_VIEWS["server_error_counts"]
+_server_breaker_opened_at: Dict[str, float] = _MCP_STATE_VIEWS[
+    "server_breaker_opened_at"
+]
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 
@@ -4608,8 +4658,13 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 # Classification happens at CALL TIME from data captured at DISCOVERY —
 # no toolset or schema mutation, so the conversation's toolset stays
 # byte-stable and prompt caching is preserved.
-_server_trust_levels: Dict[str, str] = {}
-_tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
+# Profile-scoped: trust is an OPERATOR decision recorded in each profile's own
+# config.yaml, so profile A marking ``toolhive`` untrusted must not be able to
+# relax (or tighten) the gate profile B's config asked for.
+_server_trust_levels: Dict[str, str] = _MCP_STATE_VIEWS["server_trust_levels"]
+_tool_read_only_hints: Dict[str, Dict[str, bool]] = _MCP_STATE_VIEWS[
+    "tool_read_only_hints"
+]
 
 _TRUST_FULL = "full"
 _TRUST_UNTRUSTED = "untrusted"
@@ -5247,13 +5302,20 @@ def _handle_session_expired_and_retry(
 # Exact raw server names whose ``supports_parallel_tool_calls`` config is True.
 # Raw identity matters: distinct names such as ``foo-bar`` and ``foo_bar`` both
 # sanitize to ``foo_bar`` but must not share policy.
-_parallel_safe_servers: set = set()
+_parallel_safe_servers: set = _MCP_STATE_VIEWS["parallel_safe_servers"]
 
 # Exact MCP tool-name provenance. The generated registry name is lossy because
 # provider-safe normalization maps punctuation to ``_``. Keep the raw server
 # name captured at registration time so policy and capability checks never rely
 # on parsing or re-sanitizing the generated name.
-_mcp_tool_server_names: Dict[str, str] = {}
+#
+# Profile-scoped: the model tool registry is process-global and keyed by tool
+# name, so profile A and profile B both exposing ``toolhive`` share the public
+# name ``mcp__toolhive__<tool>``. Ownership is recorded per profile and every
+# handler/check_fn resolves the task through the CALLER's registry, so the
+# shared name is only ever a label — it can never carry a call across the
+# profile boundary. See ``_make_tool_handler`` / ``_make_check_fn``.
+_mcp_tool_server_names: Dict[str, str] = _MCP_STATE_VIEWS["mcp_tool_server_names"]
 
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -5270,7 +5332,10 @@ _lock = threading.Lock()
 # gateway + CLI + TUI) from all running MCP discovery simultaneously.
 # See issue #62771.
 _LOCK_UNAVAILABLE: Any = object()  # sentinel: locking broken/unavailable
-_MCP_DISCOVERY_LOCK_PATH: Optional[str] = None  # resolved lazily
+# Resolved lazily and cached PER PROFILE on its registry: the lock file lives
+# under the owning profile's home, so a process multiplexing four profiles
+# holds four independent locks rather than serializing every profile's
+# discovery on (and pointing every profile at) whichever home resolved first.
 
 # Retry constants for the bounded wait when another process holds the lock.
 _MCP_DISCOVERY_LOCK_MAX_RETRIES: int = 240
@@ -5355,14 +5420,15 @@ def _try_acquire_mcp_discovery_lock() -> Any:
         Locking mechanism is broken or unavailable -- caller should run
         discovery unguarded.
     """
-    global _MCP_DISCOVERY_LOCK_PATH
+    from pathlib import Path
+
     try:
-        from hermes_constants import get_hermes_home
-        if _MCP_DISCOVERY_LOCK_PATH is None:
-            _MCP_DISCOVERY_LOCK_PATH = str(
-                get_hermes_home() / ".mcp-discovery.lock"
+        registry = _mcp_profile.current_registry()
+        if registry.discovery_lock_path is None:
+            registry.discovery_lock_path = str(
+                Path(registry.home) / ".mcp-discovery.lock"
             )
-        lock_path = _MCP_DISCOVERY_LOCK_PATH
+        lock_path = registry.discovery_lock_path
     except Exception:
         return _LOCK_UNAVAILABLE
 
@@ -5519,14 +5585,44 @@ def _ensure_mcp_loop():
         _mcp_thread.start()
 
 
-def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
-    """Carry the caller's context-local HERMES_HOME override into ``coro``.
+def _wrap_with_profile_scope(coro: "Coroutine") -> "Coroutine":
+    """Carry the caller's full profile scope into ``coro`` on the MCP loop.
 
-    Returns ``coro`` unchanged when no override is active. Otherwise wraps
-    it so the override is set inside the coroutine's own (task-local)
-    context on the MCP loop and reset when it completes — concurrent calls
-    carrying different scopes don't interfere.
+    Tasks scheduled with ``run_coroutine_threadsafe`` are created INSIDE the
+    loop thread, so they copy the LOOP thread's context — not the scheduling
+    thread's. Three context-locals therefore vanish at the thread hop unless
+    they are re-established inside the task's own context:
+
+    1. The ``HERMES_HOME`` override — without it OAuth/service-account token
+       stores and every other ``get_hermes_home()`` read inside the coroutine
+       resolve the process home instead of the routed profile's.
+    2. The **secret scope** — ``_interpolate_env_vars`` and the
+       service-account password/client-secret resolution both go through
+       ``agent.secret_scope.get_secret``. Losing the scope means a profile's
+       token exchange either reads whichever profile's values happen to be in
+       ``os.environ`` (single-profile) or fails closed with
+       ``UnscopedSecretError`` (multiplexed). This is the credential half of
+       the same isolation bug as the shared registry slot.
+    3. The **MCP profile identity pin** — the key used to select the profile's
+       server config, ``MCPServerTask``, cooldown/breaker state and tool
+       ownership. Pinning it explicitly (rather than re-deriving it on the
+       loop) is what makes the long-lived run task keep its originating
+       profile across reconnects and lazy first-use connects: ``start()``
+       creates that task with ``asyncio.ensure_future``, which copies this
+       context.
+
+    All three are task-local, so concurrent calls carrying different profiles
+    never interfere.
+
+    Returns ``coro`` UNCHANGED when neither a home override nor a secret scope
+    is active. That is the single-profile CLI/TUI case: the loop thread's
+    ambient home already resolves to the same profile, so wrapping would add a
+    coroutine frame per MCP call and buy nothing. The identity pin is only
+    meaningful alongside one of the two scopes it protects — and
+    ``MCPServerTask`` independently binds its owning profile at construction,
+    so a single-profile reconnect is covered either way.
     """
+    home_override = None
     try:
         from hermes_constants import (
             get_hermes_home_override,
@@ -5536,18 +5632,56 @@ def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
 
         home_override = get_hermes_home_override()
     except Exception:
-        return coro
-    if not home_override:
+        set_hermes_home_override = reset_hermes_home_override = None  # type: ignore[assignment]
+
+    secret_scope = None
+    try:
+        from agent.secret_scope import (
+            current_secret_scope,
+            reset_secret_scope,
+            set_secret_scope,
+        )
+
+        secret_scope = current_secret_scope()
+    except Exception:
+        set_secret_scope = reset_secret_scope = None  # type: ignore[assignment]
+
+    if not home_override and secret_scope is None:
         return coro
 
+    # Resolve the profile identity on the CALLING thread, where the override
+    # above is still visible, and pin that exact value on the loop side.
+    try:
+        profile_home = _mcp_profile.current_profile_home()
+    except Exception:
+        profile_home = None
+
     async def _scoped():
-        token = set_hermes_home_override(home_override)
+        home_token = (
+            set_hermes_home_override(home_override)
+            if home_override and set_hermes_home_override is not None
+            else None
+        )
+        secret_token = (
+            set_secret_scope(secret_scope)
+            if secret_scope is not None and set_secret_scope is not None
+            else None
+        )
+        profile_token = _mcp_profile.pin_profile(profile_home)
         try:
             return await coro
         finally:
-            reset_hermes_home_override(token)
+            _mcp_profile.unpin_profile(profile_token)
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
 
     return _scoped()
+
+
+# Back-compat alias: the wrapper used to carry only the HERMES_HOME override.
+_wrap_with_home_override = _wrap_with_profile_scope
 
 
 def _wrap_with_dashboard_oauth_flow(coro):
@@ -5594,17 +5728,13 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
 
     coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
 
-    # Propagate the context-local HERMES_HOME override onto the MCP loop.
-    # Tasks scheduled via run_coroutine_threadsafe are created INSIDE the
-    # loop thread, so they copy the loop thread's context — not the
-    # scheduling thread's. A per-request profile scope (the dashboard's
-    # ?profile= endpoints, e.g. the MCP "Test server" probe) would silently
-    # vanish here: OAuth token stores and any other get_hermes_home()
-    # resolution inside the coroutine would read the process home instead
-    # of the selected profile's. Re-establish the override inside the
-    # task's own context (task-local — concurrent calls carrying different
-    # scopes don't interfere). No-op when no override is active.
-    coro = _wrap_with_home_override(coro)
+    # Propagate the caller's profile scope onto the MCP loop: HERMES_HOME
+    # override, secret scope, and the MCP profile identity used to select
+    # config/registry state. See _wrap_with_profile_scope for why each one is
+    # required — losing any of them routes a profile's MCP work through
+    # another profile's home, credentials or server registry.
+    inner_coro = coro
+    coro = _wrap_with_profile_scope(coro)
     coro = _wrap_with_dashboard_oauth_flow(coro)
 
     future = safe_schedule_threadsafe(
@@ -5613,6 +5743,12 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
         log_message="MCP scheduling failed",
     )
     if future is None:
+        # safe_schedule_threadsafe closes the coroutine it was handed. When
+        # that was one of the wrappers above, the wrapper never ran, so the
+        # coroutine it would have awaited is still un-started and would leak a
+        # "coroutine was never awaited" RuntimeWarning. Close it here.
+        if coro is not inner_coro and asyncio.iscoroutine(inner_coro):
+            inner_coro.close()
         raise RuntimeError("MCP event loop unavailable (failed to schedule)")
     start_time = time.monotonic()
     deadline = None if timeout is None else start_time + timeout
@@ -6194,9 +6330,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         )
                     _call_coro = server.session.call_tool(tool_name, arguments=args)
                     _watch_children = getattr(server, "_watch_stdio_children", None)
+                    # Do not call the watcher merely to inspect its return
+                    # value: an async function call creates a coroutine that
+                    # must be awaited or closed, which caused a warning on
+                    # normal MCP tool calls. The watcher is an async method in
+                    # production and AsyncMock in tests.
                     _watch_ok = (
                         _watch_children is not None
-                        and inspect.isawaitable(_watch_children())
+                        and inspect.iscoroutinefunction(_watch_children)
                         and asyncio.iscoroutine(_call_coro)
                     )
                     if not _watch_ok:
@@ -8367,8 +8508,23 @@ def shutdown_mcp_servers():
     the anyio cancel-scope cleanup happens in the same Task that opened it.
     All servers are shut down in parallel via ``asyncio.gather``.
     """
+    # Process-level teardown: sweep EVERY profile's registry, not just the
+    # ambient one. In a multiplexed gateway the shutdown hook runs with
+    # whatever profile scope happens to be current (often none), so scoping
+    # this to one registry would strand every other profile's live sessions
+    # and stdio subprocesses.
+    registries = _mcp_profile.all_registries()
+
+    def _clear_cooldowns() -> None:
+        with _lock:
+            for reg in registries:
+                reg.server_connect_retry_after.clear()
+                reg.server_connect_failures.clear()
+
     with _lock:
-        servers_snapshot = list(_servers.values())
+        servers_snapshot = [
+            server for reg in registries for server in reg.servers.values()
+        ]
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still
     # be populated here — a server that failed to connect is never recorded
@@ -8377,9 +8533,7 @@ def shutdown_mcp_servers():
     # entries exist. Clear them so a post-shutdown restart re-attempts every
     # configured server immediately.
     if not servers_snapshot:
-        with _lock:
-            _server_connect_retry_after.clear()
-            _server_connect_failures.clear()
+        _clear_cooldowns()
         _stop_mcp_loop()
         return
 
@@ -8394,12 +8548,13 @@ def shutdown_mcp_servers():
                     "Error closing MCP server '%s': %s", server.name, result,
                 )
         with _lock:
-            _servers.clear()
-            # Drop connect-retry cooldowns too: a full shutdown/restart
-            # should re-attempt every server immediately, not honour a
-            # stale per-server backoff from before the restart (#50394).
-            _server_connect_retry_after.clear()
-            _server_connect_failures.clear()
+            for reg in registries:
+                reg.servers.clear()
+                # Drop connect-retry cooldowns too: a full shutdown/restart
+                # should re-attempt every server immediately, not honour a
+                # stale per-server backoff from before the restart (#50394).
+                reg.server_connect_retry_after.clear()
+                reg.server_connect_failures.clear()
 
     with _lock:
         loop = _mcp_loop
@@ -8420,9 +8575,7 @@ def shutdown_mcp_servers():
     # timed out, or was never scheduled (loop already stopped), a full
     # shutdown must leave no stale connect-cooldown state behind — the
     # next start should re-attempt every server immediately (#50394).
-    with _lock:
-        _server_connect_retry_after.clear()
-        _server_connect_failures.clear()
+    _clear_cooldowns()
 
     _stop_mcp_loop()
 
