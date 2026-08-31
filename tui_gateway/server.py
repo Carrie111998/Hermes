@@ -145,7 +145,14 @@ _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
-_answers: dict[str, str] = {}
+
+
+class _SudoEmptySubmission(str):
+    """Identity-bearing empty string used only across the blocking bridge."""
+
+
+_SUDO_EMPTY_SUBMISSION = _SudoEmptySubmission()
+_answers: dict[str, str | None] = {}
 # Batch clarify accumulators: rid → {"qids": [...], "answers": {qid: answer}}.
 # Written by clarify.respond (per-question lock, update-in-place), read out by
 # _block on resolution/timeout so locked answers survive the deadline.
@@ -4763,7 +4770,10 @@ def _clear_pending(sid: str | None = None) -> None:
     with _prompt_lock:
         for rid, (owner_sid, ev) in list(_pending.items()):
             if sid is None or owner_sid == sid:
-                _answers[rid] = ""
+                prompt = _pending_prompt_payloads.get(rid)
+                _answers[rid] = (
+                    None if prompt and prompt[0] == "sudo.request" else ""
+                )
                 ev.set()
 
 
@@ -8269,12 +8279,24 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
         logger.debug("failed to emit session.info after project workspace move", exc_info=True)
 
 
+def _gateway_sudo_password_callback(sid: str) -> str | None:
+    answer = _block(
+        "sudo.request",
+        sid,
+        {},
+        timeout=120,
+    )
+    if answer is _SUDO_EMPTY_SUBMISSION:
+        return ""
+    return answer or None
+
+
 def _wire_callbacks(sid: str):
     from tools.terminal_tool import set_sudo_password_callback
     from tools.skills_tool import set_secret_capture_callback
     from tools.project_tools import set_project_workspace_callback
 
-    set_sudo_password_callback(lambda: _block("sudo.request", sid, {}, timeout=120))
+    set_sudo_password_callback(lambda: _gateway_sudo_password_callback(sid))
     set_project_workspace_callback(_apply_project_workspace)
 
     def secret_cb(env_var, prompt, metadata=None):
