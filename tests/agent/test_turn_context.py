@@ -428,6 +428,24 @@ def test_native_preflight_owner_matches_responses_route(
     assert _native_responses_compaction_owns_turn_start(agent) is expected
 
 
+def test_native_preflight_owner_respects_wire_removal_override():
+    """An explicit transport override can remove context_management."""
+    agent = types.SimpleNamespace(
+        api_mode="codex_responses",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        model="gpt-5.6-sol-900k",
+        codex_responses_native_compaction=True,
+        compression_enabled=True,
+        compression_checkpoint_required=False,
+        codex_responses_compact_threshold=200_000,
+        context_compressor=types.SimpleNamespace(threshold_tokens=450_000),
+        request_overrides={"context_management": None},
+    )
+
+    assert _native_responses_compaction_owns_turn_start(agent) is False
+
+
 # ── Between-turns MCP refresh (cache-safe late-binding) ──────────────────────
 #
 # A slow MCP server that connects after the agent's build-time tool snapshot

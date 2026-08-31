@@ -216,7 +216,20 @@ def native_compaction_context_management(
         getattr(agent, "codex_responses_compact_threshold", None),
         getattr(compressor, "threshold_tokens", None) if compressor is not None else None,
     )
-    return [{"type": "compaction", "compact_threshold": threshold}]
+    payload = [{"type": "compaction", "compact_threshold": threshold}]
+
+    # The transport applies request_overrides after assembling its normal
+    # kwargs. Resolve an explicit context_management override here too so
+    # request conversion and turn-start ownership see the same effective wire
+    # value. In particular, ``None``/empty/invalid overrides remove the field
+    # during transport preflight and must leave Hermes local compression as the
+    # owner instead of creating a no-owner gap.
+    request_overrides = getattr(agent, "request_overrides", None)
+    if isinstance(request_overrides, dict) and "context_management" in request_overrides:
+        override = request_overrides["context_management"]
+        return override if isinstance(override, list) and override else None
+
+    return payload
 
 
 # Retention budget for plaintext user messages carried across a native
