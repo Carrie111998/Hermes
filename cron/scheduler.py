@@ -44,6 +44,7 @@ from typing import Any, List, Optional, Protocol
 # the module) fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from agent.i18n import t
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
@@ -280,10 +281,11 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             reason = "weekly usage limit"
         elif "quota" in lower:
             reason = "quota limit"
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider {reason}. "
-            f"{_fallback_chain_phrase()} "
-            "Full details saved in cron output."
+        return t(
+            "gateway.cron_failure_rate_limit",
+            job_name=job_name,
+            reason=reason,
+            fallback_chain=_fallback_chain_phrase(),
         )
 
     # The scheduler's own inactivity watchdog (see the TimeoutError raised
@@ -327,10 +329,10 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     if provider_reachable and (
         "readtimeout" in lower or "timed out" in lower or "timeout" in lower
     ):
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider timeout. "
-            f"{_fallback_chain_phrase()} "
-            "Full details saved in cron output."
+        return t(
+            "gateway.cron_failure_timeout",
+            job_name=job_name,
+            fallback_chain=_fallback_chain_phrase(),
         )
 
     # Match authentication/authorization wording at a word boundary and the
@@ -339,10 +341,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     if provider_reachable and (
         re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text)
     ):
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider authentication error. "
-            "Full details saved in cron output."
-        )
+        return t("gateway.cron_failure_auth", job_name=job_name)
 
     # Strip common exception wrappers and collapse provider payloads. Bound
     # the input first so a multi-KB provider blob cannot slow the
@@ -354,7 +353,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if len(cleaned) > 180:
         cleaned = cleaned[:177].rstrip() + "..."
-    message = f"⚠️ Cron '{job_name}' failed: {cleaned}"
+    message = t("gateway.cron_failure_generic", job_name=job_name, cleaned=cleaned)
 
     # Import-class failures (#95294 part 3): a long-lived gateway whose
     # checkout was updated underneath it (interrupted `hermes update`, manual
@@ -384,10 +383,10 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             skew = None  # delivery must never die on a diagnostics probe
         if skew is not None:
             boot_rev, disk_rev = skew
-            message += (
-                f" Likely cause: the gateway is running stale code (booted "
-                f"on {boot_rev}, disk is at {disk_rev}) — run "
-                "`hermes gateway restart` to fix it."
+            message += t(
+                "gateway.cron_failure_code_skew_suffix",
+                boot_rev=boot_rev,
+                disk_rev=disk_rev,
             )
 
     return message
@@ -3155,11 +3154,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
         delivery_content = (
-            f"Cronjob Response: {task_name}\n"
+            t("gateway.cron_response_prefix") + f"{task_name}\n"
             f"(job_id: {job_id})\n"
             f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+            f"{content}"
+            + t("gateway.cron_stop_hint_prefix") + f"{task_name}\")."
         )
     else:
         delivery_content = content
@@ -5628,10 +5627,11 @@ def run_job(
             # Script crashed / timed out / exited non-zero.  Deliver the
             # error so the user knows the watchdog itself broke — silent
             # failure for an alerting job is the worst-case outcome.
-            alert = (
-                f"⚠ Cron watchdog '{job_name}' script failed\n\n"
-                f"{output}\n\n"
-                f"Time: {now_iso}"
+            alert = t(
+                "gateway.cron_watchdog_failed",
+                job_name=job_name,
+                output=output,
+                now_iso=now_iso,
             )
             doc = (
                 f"# Cron Job: {job_name}\n\n"

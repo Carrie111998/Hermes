@@ -49,6 +49,7 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.i18n import t
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
@@ -286,16 +287,14 @@ def _should_skip_model_call_for_reference_handoff(
     return True
 
 
-# Fallback final_response for a turn ended by the sole-handoff skip (#80622).
-# Deliberately NOT a replay of the last assistant text: finalize_turn's
-# non-assistant-tail chokepoint (#43849) appends final_response as a fresh
-# assistant row, so recovering the previous turn's prose here would duplicate
-# it in the durable transcript AND re-deliver it to the user as if it were
-# this turn's answer. A short status is honest and idempotent.
-_HANDOFF_SKIP_FINAL_RESPONSE = (
-    "Context was compacted. The previous response is complete — "
-    "awaiting your next message."
-)
+def _handoff_skip_final_response() -> str:
+    """Resolve the sole-handoff fallback at delivery time.
+
+    This is deliberately not a replay of the last assistant text:
+    ``finalize_turn`` appends it as a fresh assistant row, so replaying prior
+    prose would duplicate it in storage and re-deliver it as a new answer.
+    """
+    return t("gateway.compaction_handoff_waiting")
 
 
 # Stable prefix of the local interrupt status string emitted when a turn is
@@ -1306,10 +1305,7 @@ _EMPTY_TOOL_RESPONSE_NUDGE = (
 # exception path (a provider moderation error classified as
 # ``content_policy_blocked``) end with the same actionable next steps, so they
 # share one trailer to keep the guidance from drifting between the two sites.
-_CONTENT_POLICY_RECOVERY_HINT = (
-    "Try rephrasing the request, narrowing the context, or "
-    "adding a fallback provider with `hermes fallback add`."
-)
+_CONTENT_POLICY_RECOVERY_HINT = t("gateway.cl_content_policy_recovery_hint")
 
 
 # Memo for the send-path tool-call argument canonicalization inside
@@ -2725,7 +2721,7 @@ def run_conversation(
             failed = True
             _turn_exit_reason = "ollama_runtime_context_too_small"
             append_message(messages, {"role": "assistant", "content": final_response})
-            agent._emit_status("❌ Ollama runtime context is too small for Hermes tool use")
+            agent._emit_status(t("gateway.cl_ollama_context_too_small"))
             api_call_count -= 1
             agent._api_call_count = api_call_count
             try:
@@ -2909,7 +2905,7 @@ def run_conversation(
                         "handoff would be the sole active user turn (#80622)"
                     )
                     if not final_response:
-                        final_response = _HANDOFF_SKIP_FINAL_RESPONSE
+                        final_response = _handoff_skip_final_response()
                     _turn_exit_reason = "compaction_handoff_not_actionable"
                     break
                 continue
@@ -3020,9 +3016,9 @@ def run_conversation(
                     )
                     _nous_remaining = nous_rate_limit_remaining()
                     if _nous_remaining is not None and _nous_remaining > 0:
-                        _nous_msg = (
-                            f"Nous Portal rate limit active — "
-                            f"resets in {_fmt_nous_remaining(_nous_remaining)}."
+                        _nous_msg = t(
+                            "gateway.cl_nous_rate_limit",
+                            reset=_fmt_nous_remaining(_nous_remaining),
                         )
                         agent._buffer_vprint(
                             f"⏳ {_nous_msg} Trying fallback..."
@@ -3041,11 +3037,9 @@ def run_conversation(
                         agent._flush_status_buffer()
                         agent._persist_session(messages, conversation_history)
                         return {
-                            "final_response": (
-                                f"⏳ {_nous_msg}\n\n"
-                                "No fallback provider available. "
-                                "Try again after the reset, or add a "
-                                "fallback provider in config.yaml."
+                            "final_response": t(
+                                "gateway.cl_nous_no_fallback",
+                                nous=_nous_msg,
                             ),
                             "messages": messages,
                             "api_calls": api_call_count,
@@ -3514,7 +3508,7 @@ def run_conversation(
                     # rate-limit symptom.  Switch to fallback immediately
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
-                        agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
+                        agent._buffer_status(t("gateway.cl_empty_malformed_switching"))
                     if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
@@ -3588,7 +3582,7 @@ def run_conversation(
                     if retry_count >= max_retries:
                         # Try fallback before giving up
                         if agent._has_pending_fallback():
-                            agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
+                            agent._buffer_status(t("gateway.cl_max_retries_invalid_trying_fallback", max=max_retries))
                         if agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
@@ -3599,7 +3593,7 @@ def run_conversation(
                             break
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
-                        agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
+                        agent._emit_status(t("gateway.cl_max_retries_invalid_giving_up", max=max_retries))
                         logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
@@ -3789,19 +3783,18 @@ def run_conversation(
                         _refusal_log or "(no text)",
                     )
                     agent._emit_status(
-                        "⚠️ The model declined to respond to this request (safety refusal)."
+                        t("gateway.cl_refusal_status")
                     )
 
                     _refusal_detail = (
-                        f"Model's explanation: {_refusal_text}"
+                        t("gateway.cl_refusal_explanation", explanation=_refusal_text)
                         if _refusal_text
-                        else "The model returned no explanation."
+                        else t("gateway.cl_refusal_no_explanation")
                     )
-                    _refusal_response = (
-                        "⚠️  The model declined to respond to this request "
-                        "(safety refusal — not a Hermes/gateway failure).\n\n"
-                        f"{_refusal_detail}\n\n"
-                        f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                    _refusal_response = t(
+                        "gateway.cl_refusal_response",
+                        detail=_refusal_detail,
+                        hint=_CONTENT_POLICY_RECOVERY_HINT,
                     )
 
                     agent._cleanup_task_resources(effective_task_id)
@@ -3889,14 +3882,7 @@ def run_conversation(
                         # Return a user-friendly message as the response so
                         # CLI (response box) and gateway (chat message) both
                         # display it naturally instead of a suppressed error.
-                        _exhaust_response = (
-                            "⚠️ **Thinking Budget Exhausted**\n\n"
-                            "The model used all its output tokens on reasoning "
-                            "and had none left for the actual response.\n\n"
-                            "To fix this:\n"
-                            "→ Lower reasoning effort: `/thinkon low` or `/thinkon minimal`\n"
-                            "→ Or switch to a larger/non-reasoning model with `/model`"
-                        )
+                        _exhaust_response = t("gateway.cl_thinking_budget_exhausted")
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
                         return {
@@ -5403,7 +5389,7 @@ def run_conversation(
                         _retry.restart_with_redirected_messages = True
                         break
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
-                    _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
+                    _interrupt_text = t("gateway.cl_interrupted_handling_error", error_type=error_type, detail=agent._clean_error_message(str(api_error)))
                     close_interrupted_tool_sequence(messages, _interrupt_text)
                     agent._persist_session(messages, conversation_history)
                     agent.clear_interrupt()
@@ -5537,8 +5523,10 @@ def run_conversation(
                         )
                         if len(messages) < original_len or old_ctx > _reduced_ctx:
                             agent._buffer_status(
-                                COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE.format(
-                                    new_ctx=_reduced_ctx, old_ctx=old_ctx
+                                t(
+                                    "gateway.cl_context_reduced",
+                                    reduced=f"{_reduced_ctx:,}",
+                                    old=f"{old_ctx:,}",
                                 )
                             )
                             time.sleep(2)
@@ -5627,15 +5615,13 @@ def run_conversation(
                                     "— switching to fallback provider..."
                                 )
                             else:
-                                agent._buffer_status(
-                                    "⚠️ Billing or credits exhausted — switching to fallback provider..."
-                                )
+                                agent._buffer_status(t("gateway.cl_billing_switching_fallback"))
                         elif _is_transport_failure:
                             agent._buffer_status(
                                 "⚠️ Provider unreachable — switching to fallback provider..."
                             )
                         else:
-                            agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+                            agent._buffer_status(t("gateway.cl_rate_limited_switching_fallback"))
                         if agent._try_activate_fallback(reason=classified.reason):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
@@ -5804,7 +5790,7 @@ def run_conversation(
                             "failed": True,
                             "compression_exhausted": True,
                         }
-                    agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
+                    agent._buffer_status(t("gateway.cl_payload_too_large", n=compression_attempts, max=max_compression_attempts))
 
                     original_len = len(messages)
                     # A 413 is a BYTE-size error, so this branch scores
@@ -5874,7 +5860,7 @@ def run_conversation(
                     )
                     if made_progress:
                         if len(messages) < original_len:
-                            agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
+                            agent._buffer_status(t("gateway.cl_compressed_retrying", before=original_len, after=len(messages)))
                         else:
                             agent._buffer_status(
                                 f"🗜️ Compressed {original_bytes:,} → {new_bytes:,} "
@@ -6153,7 +6139,7 @@ def run_conversation(
                             "failed": True,
                             "compression_exhausted": True,
                         }
-                    agent._buffer_status(COMPRESSION_RETRY_TOO_LARGE_STATUS_TEMPLATE.format(tokens=approx_tokens, attempt=compression_attempts, cap=max_compression_attempts))
+                    agent._buffer_status(t("gateway.cl_context_too_large_compressing", tokens=f"{approx_tokens:,}", n=compression_attempts, max=max_compression_attempts))
 
                     original_len = len(messages)
                     original_tokens = estimate_messages_tokens_rough(messages)
@@ -6203,7 +6189,7 @@ def run_conversation(
 
                     if len(messages) < original_len or (new_tokens > 0 and new_tokens < original_tokens * 0.95) or (new_ctx and new_ctx < old_ctx):
                         if len(messages) < original_len:
-                            agent._buffer_status(COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE.format(before=original_len, after=len(messages)))
+                            agent._buffer_status(t("gateway.cl_compressed_retrying", before=original_len, after=len(messages)))
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
                         time.sleep(2)  # Brief pause between compression retries
@@ -6334,11 +6320,11 @@ def run_conversation(
                     # abort silently (#35314, #17446).
                     if agent._has_pending_fallback():
                         if classified.reason == FailoverReason.content_policy_blocked:
-                            agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
+                            agent._buffer_status(t("gateway.api_safety_trying_fallback"))
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
-                            agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
+                            agent._buffer_status(t("gateway.api_non_retryable_trying_fallback", status_code=status_code))
                     if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
@@ -6363,8 +6349,7 @@ def run_conversation(
                     _nonretryable_summary = agent._summarize_api_error(api_error)
                     if classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
-                            f"❌ Provider safety filter blocked this request: "
-                            f"{_nonretryable_summary}"
+                            t("gateway.api_safety_blocked", summary=_nonretryable_summary)
                         )
                     elif classified.reason == FailoverReason.ssl_cert_verification:
                         agent._emit_status(
@@ -6373,8 +6358,7 @@ def run_conversation(
                         )
                     else:
                         agent._emit_status(
-                            f"❌ Non-retryable error (HTTP {status_code}): "
-                            f"{_nonretryable_summary}"
+                            t("gateway.api_non_retryable", status_code=status_code, summary=_nonretryable_summary)
                         )
                     agent._vprint(f"{agent.log_prefix}❌ Non-retryable client error (HTTP {status_code}). Aborting.", force=True)
                     agent._vprint(f"{agent.log_prefix}   🔌 Provider: {_provider}  Model: {_model}", force=True)
@@ -6497,11 +6481,10 @@ def run_conversation(
                     else:
                         agent._persist_session(messages, conversation_history)
                     if classified.reason == FailoverReason.content_policy_blocked:
-                        _policy_response = (
-                            "⚠️  The model provider's safety filter blocked this request "
-                            "(not a Hermes/gateway failure).\n\n"
-                            f"Provider message: {_nonretryable_summary}\n\n"
-                            f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                        _policy_response = t(
+                            "gateway.cl_policy_blocked_response",
+                            summary=_nonretryable_summary,
+                            hint=_CONTENT_POLICY_RECOVERY_HINT,
                         )
                         return _content_policy_blocked_result(
                             messages,
@@ -6552,7 +6535,7 @@ def run_conversation(
                         continue
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
-                        agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
+                        agent._buffer_status(t("gateway.api_max_retries_trying_fallback", max_retries=max_retries))
                     if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
@@ -6573,7 +6556,7 @@ def run_conversation(
                                 f"(unverified — may be a content-filter rejection) — {_final_summary}"
                             )
                         else:
-                            agent._emit_status(f"❌ Billing or credits exhausted — {_final_summary}")
+                            agent._emit_status(t("gateway.api_error_billing", summary=_final_summary))
                         _billing_guidance = _billing_or_entitlement_message(
                             capability="model access",
                             provider=_provider,
@@ -6590,9 +6573,9 @@ def run_conversation(
                             unverified=classified.billing_unverified,
                         )
                     elif is_rate_limited:
-                        agent._emit_status(f"❌ Rate limited after {max_retries} retries — {_final_summary}")
+                        agent._emit_status(t("gateway.api_error_rate_limited", max_retries=max_retries, summary=_final_summary))
                     else:
-                        agent._emit_status(f"❌ API failed after {max_retries} retries — {_final_summary}")
+                        agent._emit_status(t("gateway.api_error_failed", max_retries=max_retries, summary=_final_summary))
                     agent._vprint(f"{agent.log_prefix}   💀 Final error: {_final_summary}", force=True)
 
                     # Detect SSE stream-drop pattern (e.g. "Network
@@ -6726,14 +6709,7 @@ def run_conversation(
                             model=_model,
                         )
                     elif _is_stream_drop:
-                        _final_response += (
-                            "\n\nThe provider's stream connection keeps "
-                            "dropping — this often happens when generating "
-                            "very large tool call responses (e.g. write_file "
-                            "with long content). Try asking me to use "
-                            "execute_code with Python's open() for large "
-                            "files, or to write in smaller sections."
-                        )
+                        _final_response += t("gateway.cl_stream_drop_hint")
                     return {
                         "final_response": _final_response,
                         "messages": messages,
@@ -6790,8 +6766,18 @@ def run_conversation(
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"
                     elif _backoff_policy == "zai_coding_overload_short":
                         _policy_note = " (Z.AI Coding overload short retry)"
-                    _wait_reason = "Provider overloaded" if _is_zai_coding_overload and not is_rate_limited else "Rate limited"
-                    _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
+                    if _is_zai_coding_overload and not is_rate_limited:
+                        _rate_limit_status = (
+                            f"⏱️ Provider overloaded. Waiting {wait_time:.1f}s "
+                            f"(attempt {retry_count + 1}/{max_retries}){_policy_note}..."
+                        )
+                    else:
+                        _rate_limit_status = t(
+                            "gateway.cl_rate_limited_waiting",
+                            wait=f"{wait_time:.1f}",
+                            n=retry_count + 1,
+                            max=max_retries,
+                        ) + _policy_note
                     # Normal retries are buffered to avoid noisy transient chatter. Long
                     # Z.AI Coding waits are different: they can last minutes, so surface
                     # progress immediately instead of making the TUI look frozen.
@@ -6800,7 +6786,7 @@ def run_conversation(
                     else:
                         agent._buffer_status(_rate_limit_status)
                 else:
-                    agent._buffer_status(f"⏳ Retrying in {wait_time:.1f}s (attempt {retry_count}/{max_retries})...")
+                    agent._buffer_status(t("gateway.cl_retrying_in", wait=f"{wait_time:.1f}", n=retry_count, max=max_retries))
                 logger.warning(
                     "Retrying API call in %ss (attempt %s/%s) %s policy=%s error=%s",
                     wait_time,
@@ -6823,7 +6809,7 @@ def run_conversation(
                             _retry.restart_with_redirected_messages = True
                             break
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
-                        _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
+                        _interrupt_text = t("gateway.cl_interrupted_retrying", n=retry_count, max=max_retries)
                         close_interrupted_tool_sequence(messages, _interrupt_text)
                         agent._persist_session(messages, conversation_history)
                         agent.clear_interrupt()
@@ -6879,7 +6865,7 @@ def run_conversation(
                     "handoff would be the sole active user turn (#80622)"
                 )
                 if not final_response:
-                    final_response = _HANDOFF_SKIP_FINAL_RESPONSE
+                    final_response = _handoff_skip_final_response()
                 _turn_exit_reason = "compaction_handoff_not_actionable"
                 break
             # In-loop compression rebuilt `messages` with fresh compaction
@@ -7681,7 +7667,7 @@ def run_conversation(
                     _turn_exit_reason = "guardrail_halt"
                     final_response = agent._toolguard_controlled_halt_response(decision)
                     agent._emit_status(
-                        f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
+                        t("gateway.tool_guardrail_halted", tool=decision.tool_name, code=decision.code)
                     )
                     append_message(messages, {"role": "assistant", "content": final_response})
                     # Emit the halt message to the client so it's not
@@ -7816,7 +7802,7 @@ def run_conversation(
                                 "active user turn (#80622)"
                             )
                             if not final_response:
-                                final_response = _HANDOFF_SKIP_FINAL_RESPONSE
+                                final_response = _handoff_skip_final_response()
                             _turn_exit_reason = "compaction_handoff_not_actionable"
                             break
                 elif agent.compression_enabled:
@@ -7955,7 +7941,7 @@ def run_conversation(
                     if fallback and getattr(agent, '_last_content_tools_all_housekeeping', False):
                         _turn_exit_reason = "fallback_prior_turn_content"
                         logger.info("Empty follow-up after tool calls — using prior turn content as final response")
-                        agent._emit_status("↻ Empty response after tool calls — using earlier content as final answer")
+                        agent._emit_status(t("gateway.cl_empty_after_tools_using_earlier"))
                         agent._last_content_with_tools = None
                         agent._last_content_tools_all_housekeeping = False
                         agent._empty_content_retries = 0
@@ -8053,8 +8039,7 @@ def run_conversation(
                             agent._thinking_prefill_retries,
                         )
                         agent._buffer_status(
-                            f"↻ Thinking-only response — prefilling to continue "
-                            f"({agent._thinking_prefill_retries}/2)"
+                            t("gateway.thinking_prefill_retry", n=agent._thinking_prefill_retries)
                         )
                         interim_msg = agent._build_assistant_message(
                             assistant_message, "incomplete"
@@ -8123,14 +8108,18 @@ def run_conversation(
                             _empty_retry_budget, wait_time, agent.model,
                         )
                         _budget_note = (
-                            " — high-cost request, reduced retry budget"
+                            t("gateway.empty_response_high_cost_note")
                             if _empty_retry_budget < _empty_guard.DEFAULT_EMPTY_RETRY_BUDGET
                             else ""
                         )
                         agent._buffer_status(
-                            f"⚠️ Empty response from model — retrying "
-                            f"({agent._empty_content_retries}/{_empty_retry_budget}) "
-                            f"in {wait_time:.0f}s{_budget_note}"
+                            t(
+                                "gateway.empty_response_retry",
+                                n=agent._empty_content_retries,
+                                max_retries=_empty_retry_budget,
+                                wait_seconds=f"{wait_time:.0f}",
+                                budget_note=_budget_note,
+                            )
                         )
                         # Sleep in small increments to stay responsive to interrupts
                         sleep_end = time.time() + wait_time
@@ -8189,8 +8178,7 @@ def run_conversation(
                             agent.provider,
                         )
                         agent._buffer_status(
-                            "⚠️ Model returning empty responses — "
-                            "switching to fallback provider..."
+                            t("gateway.empty_response_switching_fallback")
                         )
                         if agent._try_activate_fallback():
                             active_system_prompt = _sync_failover_system_message(
@@ -8254,8 +8242,7 @@ def run_conversation(
                             "Reasoning: %s", reasoning_preview,
                         )
                         agent._emit_status(
-                            "⚠️ Model produced reasoning but no visible "
-                            "response after all retries. Returning empty."
+                            t("gateway.empty_response_reasoning_only")
                         )
                     else:
                         logger.warning(
@@ -8266,9 +8253,9 @@ def run_conversation(
                             agent.provider,
                         )
                         agent._emit_status(
-                            "❌ Model returned no content after all retries"
-                            + (" and fallback attempts." if agent._fallback_chain else
-                               ". No fallback providers configured.")
+                            t("gateway.empty_response_no_content")
+                            if agent._fallback_chain
+                            else t("gateway.empty_response_no_content_no_fallback")
                         )
 
                     # Deliver a labeled reasoning excerpt instead of a bare
@@ -8788,14 +8775,16 @@ def run_conversation(
             ):
                 if _is_local_processing_error:
                     _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
-                    final_response = f"I apologize, but I encountered an error while processing the model response: {error_msg}"
+                    final_response = t(
+                        "gateway.cl_local_processing_error", error=error_msg
+                    )
                 elif _outer_error_count >= _outer_error_cap:
                     failed = True
                     _turn_exit_reason = f"repeated_outer_errors({error_msg[:80]})"
-                    final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
+                    final_response = t("gateway.cl_repeated_errors", error=error_msg)
                 else:
                     _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
-                    final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
+                    final_response = t("gateway.cl_repeated_errors", error=error_msg)
                 # Don't append the assistant message here — a thinking-prefill
                 # or interim assistant may already be the tail, and appending
                 # would create assistant→assistant.  finalize_turn handles
