@@ -109,6 +109,18 @@ def test_messages_endpoint_keeps_legacy_branch_parent_transcript(
             parent_session_id="parent",
         )
         seed.append_message("legacy-branch", "user", "branch transcript")
+        seed.reopen_session("parent")
+
+        marker = seed._conn.execute(
+            "SELECT json_extract(model_config, '$._branched_from') "
+            "FROM sessions WHERE id = 'legacy-branch'"
+        ).fetchone()[0]
+        assert marker == "parent"
+        assert _session_latest_descendant("parent", seed) == (
+            "parent",
+            ["parent"],
+        )
+        assert seed.resolve_resume_session_id("parent") == "parent"
     finally:
         seed.close()
 

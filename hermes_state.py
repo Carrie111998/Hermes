@@ -7229,10 +7229,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def reopen_session(self, session_id: str) -> None:
         """Clear ended_at/end_reason so a session can be resumed.
 
-        Before clearing a reset boundary, stabilize markerless legacy reset
-        children that still depend on the parent's mutable end_reason.
+        Before clearing a branch or reset boundary, stabilize markerless
+        legacy children that still depend on the parent's mutable end_reason.
         """
         def _do(conn):
+            # WHERE shape shared with _BRANCH_CHILD_SQL's fallback arm via
+            # _legacy_branch_child_sql so stamping and classification cannot
+            # drift when the mutable parent boundary is cleared below.
+            conn.execute(
+                "UPDATE sessions AS child SET model_config = json_set("
+                "COALESCE(child.model_config, '{}'), '$._branched_from', "
+                "child.parent_session_id) "
+                "WHERE child.parent_session_id = ? "
+                "AND json_extract(COALESCE(child.model_config, '{}'), "
+                "                 '$._branched_from') IS NULL "
+                f"AND {_legacy_branch_child_sql('child')}",
+                (session_id,),
+            )
             placeholders = ",".join("?" for _ in _RESET_END_REASONS)
             # WHERE shape shared with _RESET_CHILD_SQL's fallback arm via
             # _legacy_reset_child_sql so the stamping and the listing
