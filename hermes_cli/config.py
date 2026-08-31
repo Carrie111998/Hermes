@@ -1057,6 +1057,51 @@ def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
     return missing
 
 
+def _split_key_path(dotted_key: str):
+    """Split a user-supplied dotted config key into path segments.
+
+    A backslash immediately before a dot (``\\.``) escapes that dot, keeping
+    it inside the segment instead of splitting on it.  ``\\\\`` is an escaped
+    literal backslash.  This lets leaf keys that legitimately contain dots —
+    model names like ``glm-5.3-flash`` — be addressed from the CLI::
+
+        hermes config set 'providers.Bai.models.glm-5\\.3-flash.context_length' 1000000
+
+    Quote the key in shells so the backslash survives.
+    """
+    if "\\" not in dotted_key:
+        return dotted_key.split(".")
+    parts = []
+    buf = []
+    i = 0
+    n = len(dotted_key)
+    while i < n:
+        ch = dotted_key[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = dotted_key[i + 1]
+            if nxt == ".":
+                buf.append(".")  # escaped dot → literal
+                i += 2
+                continue
+            if nxt == "\\":
+                buf.append("\\")  # escaped backslash → one literal
+                i += 2
+                continue
+            # Unknown/trailing escape: keep the backslash literally.
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ".":
+            parts.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
 def _set_nested(config, dotted_key: str, value):
     """Set a value at an arbitrarily nested dotted key path.
 
@@ -1064,6 +1109,10 @@ def _set_nested(config, dotted_key: str, value):
       _set_nested(c, "a.b.c", 1)     → c["a"]["b"]["c"] = 1
       _set_nested(c, "a.0.b", 1)     → c["a"][0]["b"] = 1
       _set_nested(c, "providers.1", "x") → c["providers"][1] = "x"
+
+    Segments may contain literal dots when escaped with a backslash
+    (``glm-5\\.3-flash`` navigates the key ``glm-5.3-flash``);
+    see :func:`_split_key_path`.
 
     Intermediate dicts are created on demand.  List indices are parsed
     from numeric path segments; the referenced index must already exist
@@ -1079,7 +1128,7 @@ def _set_nested(config, dotted_key: str, value):
     destroying list-typed config like ``custom_providers`` whenever a
     caller used an indexed path.
     """
-    parts = dotted_key.split(".")
+    parts = _split_key_path(dotted_key)
     current = config
     for part in parts[:-1]:
         if isinstance(current, list):
@@ -1141,7 +1190,7 @@ _MISSING = object()
 def _get_nested(config, dotted_key: str):
     """Return a dotted-path value from nested dict/list config data."""
     current = config
-    for part in dotted_key.split("."):
+    for part in _split_key_path(dotted_key):
         if isinstance(current, list):
             try:
                 current = current[int(part)]
@@ -1158,7 +1207,7 @@ def _get_nested(config, dotted_key: str):
 
 def _unset_nested(config, dotted_key: str) -> bool:
     """Remove a dotted-path value from nested dict/list config data."""
-    parts = dotted_key.split(".")
+    parts = _split_key_path(dotted_key)
     if not parts:
         return False
 
@@ -5421,7 +5470,7 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     if not key:
         return False, None
 
-    segments = key.split(".")
+    segments = _split_key_path(key)
     top = segments[0]
 
     # ── Underscore-prefixed keys are internal/test markers ───────────
@@ -5592,7 +5641,7 @@ def set_config_value(key: str, value: str, force: bool = False):
         print(f"✗ Invalid config key: {key!r} (empty or surrounding whitespace).",
               file=sys.stderr)
         sys.exit(1)
-    if any(seg == "" for seg in key.split(".")):
+    if any(seg == "" for seg in _split_key_path(key)):
         print(
             f"✗ Invalid config key: {key!r} — contains an empty path segment "
             "(leading, trailing, or doubled '.').",
