@@ -271,6 +271,12 @@ def test_stream_long_buffer_idle_flush(fake_voice_mode, monkeypatch):
     played = fake_voice_mode
     _patch_sync_fallback(monkeypatch)
 
+    def fake_tts(text, output_path, **kwargs):
+        _write_tiny_wav(output_path)
+        return {"ok": True}
+
+    monkeypatch.setattr(tts_tool, "text_to_speech_tool", fake_tts)
+
     text_queue = queue.Queue()
     stop = threading.Event()
     done = threading.Event()
