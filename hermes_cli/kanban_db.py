@@ -342,6 +342,7 @@ def _fire_dispatch_tick_hook(
             result.auto_assigned_default,
             result.respawn_guarded,
             result.skipped_per_profile_capped,
+            result.skipped_review_disabled_skills,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
         )):
@@ -8060,6 +8061,9 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_review_disabled_skills: list[tuple[str, str, str]] = field(default_factory=list)
+    """Review tasks left for human review because the assignee disabled the
+    required skill. Entries are ``(task_id, assignee, skill)`` tuples."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -9621,6 +9625,27 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+def _profile_disables_skill(profile_name: str, skill_name: str) -> bool:
+    """Return whether a worker profile disabled a skill it would preload."""
+    try:
+        from agent.skill_utils import get_disabled_skill_names
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.profiles import resolve_profile_env
+
+        token = set_hermes_home_override(resolve_profile_env(profile_name))
+        try:
+            return skill_name in get_disabled_skill_names()
+        finally:
+            reset_hermes_home_override(token)
+    except Exception as exc:
+        _log.debug(
+            "kanban review: could not read disabled skills for profile %s: %s",
+            profile_name,
+            exc,
+        )
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Memory-aware dispatch guard (OOF-30 / OOF-77)
 #
@@ -10339,6 +10364,30 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        if _profile_disables_skill(row["assignee"], "sdlc-review"):
+            result.skipped_review_disabled_skills.append(
+                (row["id"], row["assignee"], "sdlc-review")
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    already_reported = conn.execute(
+                        "SELECT 1 FROM task_events "
+                        "WHERE task_id = ? AND kind = 'review_dispatch_skipped' "
+                        "LIMIT 1",
+                        (row["id"],),
+                    ).fetchone()
+                    if already_reported is None:
+                        _append_event(
+                            conn,
+                            row["id"],
+                            "review_dispatch_skipped",
+                            {
+                                "assignee": row["assignee"],
+                                "reason": "required_skill_disabled",
+                                "skill": "sdlc-review",
+                            },
+                        )
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
