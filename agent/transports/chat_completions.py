@@ -12,6 +12,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 import json
 from typing import Any, Dict
 
+from agent.chat_completion_validation import is_valid_chat_completion_response
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.reasoning_effort import (
     KIMI_K3_EFFORTS,
@@ -1030,14 +1031,14 @@ class ChatCompletionsTransport(ProviderTransport):
         )
 
     def validate_response(self, response: Any) -> bool:
-        """Check that response has valid choices."""
-        if response is None:
+        """Check that response has valid choices and is not a router failure shim."""
+        choices = getattr(response, "choices", None)
+        if not isinstance(choices, (list, tuple)) or not choices:
+            # The shared classifier intentionally understands Responses payloads
+            # for auxiliary recovery.  This transport cannot normalize those
+            # shapes, so fail closed at its own consumption boundary.
             return False
-        if not hasattr(response, "choices") or response.choices is None:
-            return False
-        if not response.choices:
-            return False
-        return True
+        return is_valid_chat_completion_response(response)
 
     def extract_cache_stats(self, response: Any) -> dict[str, int] | None:
         """Extract cache stats from prompt_tokens_details (OpenRouter/OpenAI)
