@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _normalized_base_url(value: Any) -> str:
@@ -22,6 +25,14 @@ def _normalize_provider_id(value: str) -> str:
     try:
         from hermes_cli.providers import normalize_provider
     except Exception:  # pragma: no cover - import resilience
+        # Silent degradation: alias collapse is disabled and we fall back to a
+        # bare lowercase. Log so a future import cycle/refactor can't regress
+        # the dedup invisibly.
+        logger.warning(
+            "fallback provider alias collapse degraded to lowercase: "
+            "could not import hermes_cli.providers.normalize_provider",
+            exc_info=True,
+        )
         return value.lower()
     return normalize_provider(value)
 
