@@ -925,6 +925,15 @@ def build_turn_context(
                 )
                 if _idle_status:
                     agent._emit_status(_idle_status)
+                    # Also _vprint so the TUI always shows the status.
+                    # _emit_status alone is buffered until the turn stream
+                    # opens; pre-turn idle compaction can run for minutes
+                    # with no visible feedback because the stream hasn't
+                    # started yet (#97239).
+                    agent._vprint(
+                        f"{agent.log_prefix}🗜  {_idle_status}",
+                        force=True,
+                    )
                 _idle_input = messages
                 messages, active_system_prompt = agent._compress_context(
                     messages, system_message, approx_tokens=_idle_tokens,
