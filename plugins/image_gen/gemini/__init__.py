@@ -281,7 +281,7 @@ class GeminiImageGenProvider(ImageGenProvider):
             response = requests.post(
                 endpoint,
                 params={"key": api_key},
-                headers={"Content-Type": "application/json"},
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
                 json=payload,
                 timeout=timeout,
             )
