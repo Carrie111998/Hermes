@@ -73,6 +73,7 @@ def _create_app(adapter: WebhookAdapter) -> web.Application:
     # Mirror connect(): client_max_size enforces the cap on chunked bodies.
     app = web.Application(client_max_size=adapter._max_body_bytes)
     app.router.add_get("/health", adapter._handle_health)
+    app.router.add_get("/webhooks/{route_name}", adapter._handle_webhook_readiness)
     app.router.add_post("/webhooks/{route_name}", adapter._handle_webhook)
     return app
 
@@ -175,6 +176,31 @@ class TestValidateSignature:
         req = _mock_request(headers={"linear-signature": sig})
 
         assert adapter._validate_signature(req, body, "real-secret") is False
+
+    @pytest.mark.parametrize("header", [
+        "X-Signature",
+        "Attio-Signature",
+        "X-Attio-Signature",
+    ])
+    def test_provider_body_hmac_signatures_accept(self, header):
+        adapter = _make_adapter()
+        body = b'{"id":"meeting-123","type":"meeting.completed"}'
+        secret = "provider-signing-secret"
+        signature = _generic_signature(body, secret)
+
+        req = _mock_request(headers={header: signature})
+
+        assert adapter._validate_signature(req, body, secret) is True
+
+    def test_provider_body_hmac_sha256_prefix_accepts(self):
+        adapter = _make_adapter()
+        body = b'{"id":"meeting-123"}'
+        secret = "provider-signing-secret"
+        signature = "sha256=" + _generic_signature(body, secret)
+
+        req = _mock_request(headers={"X-Signature": signature})
+
+        assert adapter._validate_signature(req, body, secret) is True
 
 
     def test_non_ascii_svix_signature_rejected(self):
@@ -487,6 +513,46 @@ class TestPayloadFilters:
 class TestHTTPHandling:
 
     @pytest.mark.asyncio
+    async def test_registered_route_get_is_side_effect_free_readiness(self):
+        adapter = _make_adapter(
+            routes={"circleback": {"secret": "secret", "prompt": "private"}}
+        )
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/webhooks/circleback")
+            payload = await response.json()
+
+        assert response.status == 200
+        assert payload == {"status": "ready"}
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unknown_route_get_returns_404(self):
+        adapter = _make_adapter(routes={"known": {"prompt": "ok"}})
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/webhooks/missing")
+            payload = await response.json()
+
+        assert response.status == 404
+        assert payload == {"error": "Unknown webhook route"}
+
+    @pytest.mark.asyncio
+    async def test_disabled_route_get_is_not_ready(self):
+        adapter = _make_adapter(
+            routes={"paused": {"enabled": False, "secret": "secret", "prompt": "x"}}
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.get("/webhooks/paused")
+
+        assert response.status == 403
+
+    @pytest.mark.asyncio
     async def test_unknown_route_returns_404(self):
         """POST to an unknown route returns 404."""
         adapter = _make_adapter(routes={"real": {"secret": _INSECURE_NO_AUTH, "prompt": "x"}})
@@ -519,6 +585,55 @@ class TestHTTPHandling:
 
 
 class TestIdempotency:
+
+    @pytest.mark.asyncio
+    async def test_retries_without_delivery_header_use_payload_id(self):
+        secret = "circleback-secret"
+        adapter = _make_adapter(
+            routes={"circleback": {"secret": secret, "prompt": "meeting {id}"}}
+        )
+        adapter.handle_message = AsyncMock()
+        body = b'{"id":"meeting-stable-id"}'
+        headers = {"X-Signature": _generic_signature(body, secret)}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post("/webhooks/circleback", data=body, headers=headers)
+            retry = await cli.post("/webhooks/circleback", data=body, headers=headers)
+            retry_payload = await retry.json()
+            await asyncio.sleep(0)
+
+        assert first.status == 202
+        assert retry.status == 200
+        assert retry_payload["status"] == "duplicate"
+        adapter.handle_message.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_same_payload_id_with_changed_event_body_is_not_duplicate(self):
+        secret = "circleback-secret"
+        adapter = _make_adapter(
+            routes={"events": {"secret": secret, "prompt": "event {id}"}}
+        )
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            statuses = []
+            for event_type in ("meeting.created", "meeting.completed"):
+                body = json.dumps(
+                    {"id": "same-resource-id", "type": event_type},
+                    separators=(",", ":"),
+                ).encode()
+                response = await cli.post(
+                    "/webhooks/events",
+                    data=body,
+                    headers={"X-Signature": _generic_signature(body, secret)},
+                )
+                statuses.append(response.status)
+            await asyncio.sleep(0)
+
+        assert statuses == [202, 202]
+        assert adapter.handle_message.await_count == 2
 
     @pytest.mark.asyncio
     async def test_duplicate_delivery_id_returns_200(self):
@@ -952,6 +1067,10 @@ class TestMultiplexProfileWebhookAuthentication:
     @staticmethod
     def _app(adapter):
         app = _create_app(adapter)
+        app.router.add_get(
+            "/p/{profile}/webhooks/{route_name}",
+            adapter._handle_webhook_readiness,
+        )
         app.router.add_post(
             "/p/{profile}/webhooks/{route_name}",
             adapter._handle_webhook,
@@ -1010,6 +1129,31 @@ class TestMultiplexProfileWebhookAuthentication:
                 headers=headers,
             )
             assert default_profile.status == 404
+
+    @pytest.mark.asyncio
+    async def test_readiness_is_bound_to_named_profile(
+        self, tmp_path, monkeypatch
+    ):
+        adapter = _make_adapter(
+            routes={
+                "circleback": {
+                    "profile": "worker",
+                    "secret": "worker-secret",
+                    "prompt": "meeting",
+                }
+            },
+            host="127.0.0.1",
+        )
+        self._configure_profiles(adapter, tmp_path, monkeypatch)
+
+        async with TestClient(TestServer(self._app(adapter))) as cli:
+            worker = await cli.get("/p/worker/webhooks/circleback")
+            other = await cli.get("/p/other/webhooks/circleback")
+            bare = await cli.get("/webhooks/circleback")
+
+        assert worker.status == 200
+        assert other.status == 404
+        assert bare.status == 404
 
 
 def test_route_profile_validation_fails_closed():

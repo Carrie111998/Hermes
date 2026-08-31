@@ -12,12 +12,14 @@ significant debugging to find. Surfacing invalid toolset names (and the
 zero-tools end state) loudly turns that silent failure into an actionable one.
 """
 
+from collections.abc import Collection
 from typing import Callable, List
 
 
 def validate_platform_toolsets(
     platform_toolsets: object,
     is_valid_toolset: Callable[[str], bool],
+    additional_valid_names: Collection[str] = (),
 ) -> List[str]:
     """Return human-readable warnings for a ``platform_toolsets`` mapping.
 
@@ -37,7 +39,10 @@ def validate_platform_toolsets(
         platform_toolsets: The raw ``platform_toolsets`` value from config. Only
             ``dict`` values carry toolset entries; anything else yields no
             warnings (nothing to validate).
-        is_valid_toolset: Predicate returning ``True`` for a known toolset name.
+        is_valid_toolset: Predicate returning ``True`` for a known static
+            toolset name.
+        additional_valid_names: Dynamic names that are valid platform entries,
+            such as plugin toolsets, MCP server names, and ``no_mcp``.
 
     Returns:
         A list of warning strings (empty when everything is valid).
@@ -46,13 +51,15 @@ def validate_platform_toolsets(
     if not isinstance(platform_toolsets, dict) or not platform_toolsets:
         return warnings
 
+    additional_valid = set(additional_valid_names)
+
     valid_count = 0
     for platform, raw in platform_toolsets.items():
         names = raw if isinstance(raw, list) else [raw]
         for name in names:
             if not isinstance(name, str) or not name:
                 continue
-            if is_valid_toolset(name):
+            if is_valid_toolset(name) or name in additional_valid:
                 valid_count += 1
                 continue
             suggestion = f"hermes-{platform}"

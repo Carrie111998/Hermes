@@ -68,6 +68,29 @@ from gateway.response_filters import is_autonomous_silence_response
 logger = logging.getLogger(__name__)
 
 
+def _payload_delivery_id(
+    route_name: str, payload: Any, body: bytes
+) -> Optional[str]:
+    """Return a retry key for one exact body carrying a stable resource ID.
+
+    A provider's top-level ``id`` is often a resource ID rather than an event
+    delivery ID. Include the raw-body digest so exact retries deduplicate while
+    distinct events about the same resource continue through the pipeline.
+    """
+    if not isinstance(payload, dict):
+        return None
+    payload_id = payload.get("id")
+    if isinstance(payload_id, bool) or not isinstance(payload_id, (str, int)):
+        return None
+    if isinstance(payload_id, str) and not payload_id:
+        return None
+    return "payload-id:" + json.dumps(
+        [route_name, payload_id, hashlib.sha256(body).hexdigest()],
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+
+
 def _is_webhook_silence_response(content: Any) -> bool:
     """Whether an agent response means "deliberately say nothing".
 
@@ -288,6 +311,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # Content-Length and would otherwise bypass the header check below.
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
+        app.router.add_get("/webhooks/{route_name}", self._handle_webhook_readiness)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
         # routes the inbound event to that profile. Same handler; the profile is
@@ -296,6 +320,9 @@ class WebhookAdapter(BasePlatformAdapter):
         # when gateway.multiplex_profiles is on (the handler validates).
         app.router.add_post(
             "/p/{profile}/webhooks/{route_name}", self._handle_webhook
+        )
+        app.router.add_get(
+            "/p/{profile}/webhooks/{route_name}", self._handle_webhook_readiness
         )
 
         self._runner = web.AppRunner(app)
@@ -502,6 +529,29 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
+
+    async def _handle_webhook_readiness(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Confirm that a webhook route is registered without processing it."""
+        self._reload_dynamic_routes()
+        profile = self._resolve_request_profile(request)
+        if profile is _PROFILE_REJECTED:
+            return web.json_response(
+                {"error": "Unknown or unconfigured profile"}, status=404
+            )
+        route_name = request.match_info.get("route_name", "")
+        route_config = self._routes.get(route_name)
+        if not route_config:
+            return web.json_response({"error": "Unknown webhook route"}, status=404)
+        request_profile = profile if isinstance(profile, str) else None
+        if not self._route_allows_profile(route_config, request_profile):
+            return web.json_response({"error": "Unknown webhook route"}, status=404)
+        if route_config.get("enabled", True) is False:
+            return web.json_response(
+                {"error": f"Route disabled: {route_name}"}, status=403
+            )
+        return web.json_response({"status": "ready"})
 
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""
@@ -750,8 +800,10 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Check event type filter
         event_type = (
-            request.headers.get("X-GitHub-Event", "")
+            request.headers.get("Linear-Event", "")
+            or request.headers.get("X-GitHub-Event", "")
             or request.headers.get("X-GitLab-Event", "")
+            or request.headers.get("X-Event-Type", "")
             or payload.get("event_type", "")
             or payload.get("type", "")
             or "unknown"
@@ -842,14 +894,19 @@ class WebhookAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
-        # Build a unique delivery ID
+        # Trusted provider delivery headers take priority. Providers such as
+        # Circleback omit them but retry a stable top-level payload ID.
         delivery_id = request.headers.get(
             "X-GitHub-Delivery",
             request.headers.get(
                 "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+                request.headers.get("X-Request-ID", ""),
             ),
         )
+        if not delivery_id:
+            delivery_id = _payload_delivery_id(route_name, payload, raw_body)
+        if not delivery_id:
+            delivery_id = str(int(time.time() * 1000))
 
         # ── Idempotency ─────────────────────────────────────────
         # Skip duplicate deliveries (webhook retries).
@@ -1174,19 +1231,21 @@ class WebhookAdapter(BasePlatformAdapter):
             ).hexdigest()
             return _hmac_str_equal(v2_sig, expected_v2)
 
-        # Generic V1 (legacy): X-Webhook-Signature = <hex HMAC-SHA256 of body>
-        # (deprecated — no replay protection, since the signature only
-        # covers the body: a captured (body, signature) pair replays
-        # indefinitely with no timestamp binding it to a specific delivery.)
-        # Only reachable when X-Webhook-Signature-V2 was not sent at all —
-        # see the guard above.
-        generic_sig = request.headers.get("X-Webhook-Signature", "")
-        if generic_sig:
-            expected = hmac.new(
-                secret.encode(), body, hashlib.sha256
-            ).hexdigest()
+        # Generic/provider HMAC-SHA256 signatures (legacy body-only; no replay
+        # protection). Providers differ by header name and may prefix the hex
+        # digest with ``sha256=``.
+        expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        for header_name in (
+            "X-Webhook-Signature",
+            "Attio-Signature",
+            "X-Attio-Signature",
+            "X-Signature",
+        ):
+            signature = _header(header_name)
+            if not signature:
+                continue
             route_name = request.match_info.get("route_name", "")
-            if route_name not in self._v1_signature_warned:
+            if header_name == "X-Webhook-Signature" and route_name not in self._v1_signature_warned:
                 self._v1_signature_warned.add(route_name)
                 logger.warning(
                     "[webhook] Route '%s' uses legacy body-only HMAC (no "
@@ -1196,7 +1255,7 @@ class WebhookAdapter(BasePlatformAdapter):
                     "'<timestamp>.<body>').",
                     route_name,
                 )
-            return _hmac_str_equal(generic_sig, expected)
+            return _hmac_str_equal(signature.removeprefix("sha256="), expected)
 
         # No recognised signature header but secret is configured → reject
         logger.debug(

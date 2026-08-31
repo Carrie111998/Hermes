@@ -2499,8 +2499,23 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
         from toolsets import validate_toolset
         from hermes_cli.toolset_validation import validate_platform_toolsets
 
+        raw_config = read_raw_config()
+        dynamic_toolset_names = {"no_mcp"}
+        known_plugins = raw_config.get("known_plugin_toolsets") or {}
+        if isinstance(known_plugins, dict):
+            for names in known_plugins.values():
+                if isinstance(names, list):
+                    dynamic_toolset_names.update(
+                        name for name in names if isinstance(name, str) and name
+                    )
+        mcp_servers = raw_config.get("mcp_servers") or {}
+        if isinstance(mcp_servers, dict):
+            dynamic_toolset_names.update(str(name) for name in mcp_servers)
+
         ts_warnings = validate_platform_toolsets(
-            read_raw_config().get("platform_toolsets"), validate_toolset
+            raw_config.get("platform_toolsets"),
+            validate_toolset,
+            additional_valid_names=dynamic_toolset_names,
         )
         for w in ts_warnings:
             results["warnings"].append(w)
