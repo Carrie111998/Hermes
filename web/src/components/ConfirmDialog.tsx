@@ -1,6 +1,6 @@
 import { Button } from "@nous-research/ui/ui/components/button";
 import { AlertTriangle } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { cn, themedBody } from "@/lib/utils";
 
@@ -14,6 +14,7 @@ interface ConfirmDialogProps {
   onConfirm: () => void;
   open: boolean;
   title: string;
+  typedConfirmation?: string;
 }
 
 export function ConfirmDialog({
@@ -26,21 +27,45 @@ export function ConfirmDialog({
   onConfirm,
   open,
   title,
+  typedConfirmation,
 }: ConfirmDialogProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
+  const onCancelRef = useRef(onCancel);
+  const [typedValue, setTypedValue] = useState("");
+  useEffect(() => {
+    onCancelRef.current = onCancel;
+  }, [onCancel]);
+  const cancel = useCallback(() => {
+    setTypedValue("");
+    onCancelRef.current();
+  }, []);
+  const confirm = () => {
+    setTypedValue("");
+    onConfirm();
+  };
+
+  useEffect(() => {
+    if (!open) {
+      // Prop-driven closure can bypass the Cancel/Confirm handlers.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setTypedValue("");
+    }
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
 
     const prevActive = document.activeElement as HTMLElement | null;
     dialogRef.current
-      ?.querySelector<HTMLButtonElement>("[data-confirm]")
+      ?.querySelector<HTMLElement>(
+        typedConfirmation ? "[data-confirm-input]" : "[data-confirm]",
+      )
       ?.focus();
 
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
-        onCancel();
+        cancel();
       }
     };
 
@@ -53,7 +78,7 @@ export function ConfirmDialog({
       document.body.style.overflow = prevOverflow;
       prevActive?.focus?.();
     };
-  }, [open, onCancel]);
+  }, [open, cancel, typedConfirmation]);
 
   if (!open) return null;
 
@@ -64,7 +89,7 @@ export function ConfirmDialog({
       aria-labelledby="confirm-dialog-title"
       aria-describedby={description ? "confirm-dialog-desc" : undefined}
       onClick={(e) => {
-        if (e.target === e.currentTarget) onCancel();
+        if (e.target === e.currentTarget) cancel();
       }}
       className="fixed inset-0 z-[200] flex items-center justify-center bg-background/85 p-4"
     >
@@ -101,16 +126,36 @@ export function ConfirmDialog({
           </div>
         </div>
 
+        {typedConfirmation && (
+          <label className="flex flex-col gap-2 px-4 pt-4 text-xs text-muted-foreground">
+            Type{" "}
+            <strong className="text-foreground">{typedConfirmation}</strong> to
+            confirm
+            <input
+              autoComplete="off"
+              className="border border-border bg-background px-3 py-2 text-foreground"
+              data-confirm-input
+              onChange={(event) => setTypedValue(event.target.value)}
+              value={typedValue}
+            />
+          </label>
+        )}
+
         <div className="flex items-center justify-end gap-2 p-3">
-          <Button type="button" outlined onClick={onCancel} disabled={loading}>
+          <Button type="button" outlined onClick={cancel} disabled={loading}>
             {cancelLabel}
           </Button>
           <Button
             data-confirm
             type="button"
             destructive={destructive}
-            onClick={onConfirm}
-            disabled={loading}
+            onClick={confirm}
+            disabled={
+              loading ||
+              Boolean(
+                typedConfirmation && typedValue !== typedConfirmation,
+              )
+            }
           >
             {loading ? "…" : confirmLabel}
           </Button>

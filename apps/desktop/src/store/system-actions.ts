@@ -13,6 +13,9 @@ const POLL_TIMEOUT_S = 180
 // indicator (glyph spinner) so the restart shows up where users already look,
 // instead of a toast that vanishes or a generic "Agents running" counter.
 export const $gatewayRestarting = atom(false)
+export const $gatewayRestartConfirmationOpen = atom(false)
+
+let restartConfirmationWaiters: Array<(confirmed: boolean) => void> = []
 
 // Poll a backend action to completion (or a bounded window), throwing on a
 // non-zero exit so the caller can surface the failure.
@@ -35,13 +38,34 @@ async function awaitAction(started: ActionResponse): Promise<void> {
 // indicator. Self-contained and never rejects, so every trigger — Cmd+K, the
 // messaging save/toggle toasts — gets identical feedback from a plain
 // `void runGatewayRestart()`, and a failure is the only thing that toasts.
-export async function runGatewayRestart(): Promise<void> {
+export function runGatewayRestart(): Promise<boolean> {
+  if ($gatewayRestarting.get()) {
+    return Promise.resolve(false)
+  }
+
+  $gatewayRestartConfirmationOpen.set(true)
+
+  return new Promise(resolve => {
+    restartConfirmationWaiters.push(resolve)
+  })
+}
+
+export function closeGatewayRestartConfirmation(confirmed = false): void {
+  $gatewayRestartConfirmationOpen.set(false)
+  const waiters = restartConfirmationWaiters
+  restartConfirmationWaiters = []
+  waiters.forEach(resolve => resolve(confirmed))
+}
+
+export async function runConfirmedGatewayRestart(): Promise<boolean> {
   $gatewayRestarting.set(true)
 
   try {
     await awaitAction(await restartGateway())
+    return true
   } catch (err) {
     notifyError(err, translateNow('commandCenter.gatewayRestartFailed'))
+    return false
   } finally {
     $gatewayRestarting.set(false)
   }

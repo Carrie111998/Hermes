@@ -119,6 +119,39 @@ describe("api.getModelOptions", () => {
   });
 });
 
+describe("service mutation transport", () => {
+  it.each([
+    ["restartGateway", "/api/gateway/restart", "RESTART"],
+    ["updateHermes", "/api/hermes/update", "UPDATE"],
+  ] as const)(
+    "always gives %s a typed confirmation and idempotency key",
+    async (method, path, confirmation) => {
+      vi.stubGlobal("window", {});
+      vi.spyOn(crypto, "randomUUID").mockReturnValue(
+        "00000000-0000-4000-8000-000000000001",
+      );
+      const fetchMock = jsonFetchMock();
+      vi.stubGlobal("fetch", fetchMock);
+
+      await api[method]();
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        path,
+        expect.objectContaining({
+          body: JSON.stringify({
+            confirmation,
+            idempotency_key: "00000000-0000-4000-8000-000000000001",
+          }),
+          credentials: "include",
+          method: "POST",
+        }),
+      );
+      const headers = fetchMock.mock.calls[0][1]?.headers as Headers;
+      expect(headers.get("Content-Type")).toBe("application/json");
+    },
+  );
+});
+
 describe("api OAuth helpers", () => {
   it("starts OAuth login in gated mode without requiring an injected session token", async () => {
     vi.stubGlobal("window", { __HERMES_AUTH_REQUIRED__: true });
@@ -199,4 +232,25 @@ describe("api OAuth helpers", () => {
       "/api/providers/oauth/sessions/oauth-session?profile=worker",
     ]);
   });
+});
+
+it("falls back to random bytes when randomUUID is unavailable", async () => {
+  vi.stubGlobal("window", {});
+  const getRandomValues = vi.fn((bytes: Uint8Array) => {
+    bytes.fill(0);
+    return bytes;
+  });
+  vi.stubGlobal("crypto", { getRandomValues });
+  const fetchMock = jsonFetchMock();
+  vi.stubGlobal("fetch", fetchMock);
+
+  await api.restartGateway();
+
+  const request = JSON.parse(
+    fetchMock.mock.calls[0][1]?.body as string,
+  ) as { idempotency_key: string };
+  expect(request.idempotency_key).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
+  expect(getRandomValues).toHaveBeenCalledTimes(1);
 });

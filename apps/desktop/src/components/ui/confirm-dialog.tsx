@@ -31,6 +31,11 @@ interface ConfirmDialogProps {
   /** A third, non-destructive way out, shown between Cancel and Confirm (e.g.
    *  "Remove from sidebar" beside "Delete worktree"). Closes on click. */
   secondaryAction?: ConfirmSecondaryAction
+  /** Focus control for dialogs with no input. Pass `preventCloseButtonAutoFocus`
+   *  so opening doesn't land focus on the close/cancel button (which would pop
+   *  its tooltip with no pointer near it). */
+  onOpenAutoFocus?: (event: Event) => void
+  typedConfirmation?: string
 }
 
 interface ConfirmSecondaryAction {
@@ -54,13 +59,17 @@ export function ConfirmDialog({
   cancelLabel,
   destructive = false,
   dismissOnConfirm = false,
-  secondaryAction
+  secondaryAction,
+  onOpenAutoFocus,
+  typedConfirmation
 }: ConfirmDialogProps) {
   const { t } = useI18n()
   const confirmRef = useRef<HTMLButtonElement>(null)
+  const typedInputRef = useRef<HTMLInputElement>(null)
   const closeTimerRef = useRef<null | number>(null)
   const [status, setStatus] = useState<'done' | 'idle' | 'saving'>('idle')
   const [error, setError] = useState<null | string>(null)
+  const [typedValue, setTypedValue] = useState('')
   const busy = status === 'saving' || status === 'done'
   const resolvedConfirmLabel = confirmLabel ?? t.common.confirm
   const resolvedBusyLabel = busyLabel ?? t.common.loading
@@ -71,6 +80,7 @@ export function ConfirmDialog({
     if (open) {
       setStatus('idle')
       setError(null)
+      setTypedValue('')
     }
   }, [open])
 
@@ -93,17 +103,20 @@ export function ConfirmDialog({
   }, [])
 
   async function run() {
-    if (busy) {
+    if (busy || (typedConfirmation && typedValue !== typedConfirmation)) {
       return
     }
 
     setError(null)
 
     if (dismissOnConfirm) {
+      setStatus('saving')
+
       try {
         await onConfirm()
         onClose()
       } catch (err) {
+        setStatus('idle')
         setError(err instanceof Error ? err.message : t.errors.genericFailure)
       }
 
@@ -132,12 +145,23 @@ export function ConfirmDialog({
         onKeyDown={event => {
           // Enter/Space confirm regardless of which button holds focus
           // (preventDefault stops a focused Cancel from swallowing it).
-          if ((event.key === 'Enter' || event.key === ' ') && !busy) {
+          const isSpaceInTypedInput =
+            event.key === ' ' && event.target instanceof HTMLInputElement
+          if ((event.key === 'Enter' || event.key === ' ') && !busy && !isSpaceInTypedInput) {
             event.preventDefault()
             void run()
           }
         }}
         onOpenAutoFocus={event => {
+          if (onOpenAutoFocus) {
+            onOpenAutoFocus(event)
+            return
+          }
+          if (typedConfirmation) {
+            event.preventDefault()
+            typedInputRef.current?.focus()
+            return
+          }
           // Focus must land inside the dialog or the handler above never sees
           // the key: it stays on whatever opened the dialog (a menu item, a
           // sidebar row) and Enter re-triggers that instead. Radix's default
@@ -158,6 +182,19 @@ export function ConfirmDialog({
           </div>
         )}
 
+        {typedConfirmation && (
+          <label className="grid gap-2 text-xs text-muted-foreground">
+            Type <strong className="text-foreground">{typedConfirmation}</strong> to confirm
+            <input
+              autoComplete="off"
+              className="rounded-md border border-border bg-background px-3 py-2 text-foreground"
+              onChange={event => setTypedValue(event.target.value)}
+              ref={typedInputRef}
+              value={typedValue}
+            />
+          </label>
+        )}
+
         <DialogFooter>
           <Button disabled={busy} onClick={onClose} type="button" variant="ghost">
             {resolvedCancelLabel}
@@ -176,7 +213,7 @@ export function ConfirmDialog({
             </Button>
           )}
           <Button
-            disabled={busy}
+            disabled={busy || Boolean(typedConfirmation && typedValue !== typedConfirmation)}
             onClick={() => void run()}
             ref={confirmRef}
             variant={destructive ? 'destructive' : 'default'}
