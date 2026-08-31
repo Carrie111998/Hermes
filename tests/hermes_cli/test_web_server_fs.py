@@ -77,6 +77,22 @@ def test_fs_download_rejects_sensitive_files(client, tmp_path):
     assert response.status_code == 403
 
 
+def test_fs_default_cwd_uses_requested_profile_config(client, tmp_path, monkeypatch):
+    profile_dir = tmp_path / "lex"
+    profile_dir.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (profile_dir / "config.yaml").write_text(f"terminal:\n  cwd: {workspace}\n")
+
+    monkeypatch.setattr(web_server, "_resolve_profile_dir", lambda name: profile_dir)
+    monkeypatch.setattr(web_server, "_fs_git_branch", lambda cwd: "")
+
+    response = client.get("/api/fs/default-cwd", params={"profile": "lex"})
+
+    assert response.status_code == 200
+    assert response.json() == {"cwd": str(workspace), "branch": ""}
+
+
 def test_fs_endpoints_require_auth(tmp_path):
     client = TestClient(web_server.app)
     target = tmp_path / "secret.txt"
