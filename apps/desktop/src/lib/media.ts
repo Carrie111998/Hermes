@@ -1,8 +1,10 @@
-import { readDesktopFileDataUrl } from '@/lib/desktop-fs'
+import { type DesktopFsScope, readDesktopFileDataUrl } from '@/lib/desktop-fs'
 import { capitalize } from '@/lib/text'
 import { $connection } from '@/store/session'
 
 export type MediaKind = 'audio' | 'image' | 'video' | 'file'
+
+export type MediaOwner = DesktopFsScope
 
 interface MediaInfo {
   kind: MediaKind
@@ -77,13 +79,13 @@ export function isFileMediaPath(path: string): boolean {
   return /^(?:file:|\/|~\/|[a-z]:[\\/]|\\\\)/i.test(path)
 }
 
-export async function resolveMediaDisplaySrc(path: string): Promise<string> {
+export async function resolveMediaDisplaySrc(path: string, owner?: MediaOwner): Promise<string> {
   if (isInlineMediaSrc(path) || !isFileMediaPath(path)) {
     return path
   }
 
-  if (window.hermesDesktop && isRemoteGateway()) {
-    return gatewayMediaDataUrl(path)
+  if (window.hermesDesktop && (owner?.connectionId || (!owner && isRemoteGateway()))) {
+    return gatewayMediaDataUrl(path, owner)
   }
 
   if (!window.hermesDesktop?.readFileDataUrl) {
@@ -194,8 +196,8 @@ export function isRemoteGateway(): boolean {
 // bridge. Remote Desktop artifacts can live anywhere the gateway can read
 // (workspace, skills, ~/.hermes/cache, etc.); /api/media is intentionally
 // narrower and rejects non-images plus images outside its media roots.
-export async function gatewayMediaDataUrl(path: string): Promise<string> {
-  return readDesktopFileDataUrl(filePathFromMediaPath(path))
+export async function gatewayMediaDataUrl(path: string, owner?: MediaOwner): Promise<string> {
+  return readDesktopFileDataUrl(filePathFromMediaPath(path), owner)
 }
 
 // Remote-mode replacement for opening gateway-local file paths with file://.

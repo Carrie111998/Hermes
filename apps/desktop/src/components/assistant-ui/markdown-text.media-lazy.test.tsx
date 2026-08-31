@@ -98,6 +98,37 @@ describe('lazy transcript media', () => {
     expect(FakeIntersectionObserver.instances[0].options?.rootMargin).toBe('600px 0px')
   })
 
+  it('uses the transcript scrollport as the observer root', () => {
+    const { container } = render(
+      <div data-slot="aui_thread-viewport">
+        <MarkdownImage alt="diagram" height={240} src="/tmp/scrollport.svg" width={320} />
+      </div>
+    )
+
+    expect(FakeIntersectionObserver.instances[0].options?.root).toBe(container.firstElementChild)
+  })
+
+  it('keeps filesystem placeholders accessible and reserves their dimensions', () => {
+    render(<MarkdownImage alt="A diagram" height={240} src="/tmp/placeholder.svg" width={320} />)
+
+    const placeholder = screen.getByRole('img', { name: 'A diagram' })
+    expect(placeholder.getAttribute('aria-busy')).toBe('true')
+    expect(placeholder.getAttribute('width')).toBe('320')
+    expect(placeholder.getAttribute('height')).toBe('240')
+    expect(screen.getByText('Loading placeholder.svg...')).toBeTruthy()
+  })
+
+  it.each([
+    ['relative', 'images/relative.svg'],
+    ['blob', 'blob:https://example.test/image-id']
+  ])('renders %s sources immediately without lazy filesystem gating', (_kind, src) => {
+    render(<MarkdownImage alt="inline diagram" src={src} />)
+
+    expect(screen.getByRole('img', { name: 'inline diagram' }).getAttribute('src')).toBe(src)
+    expect(FakeIntersectionObserver.instances).toHaveLength(0)
+    expect(api).not.toHaveBeenCalled()
+  })
+
   it('does not eagerly resolve an off-screen MEDIA image link', async () => {
     const href = mediaMarkdownHref('/tmp/offscreen-media-link.svg')
 
@@ -135,10 +166,9 @@ describe('lazy transcript media', () => {
     render(<MarkdownImage alt="diagram" decoding="sync" loading="eager" src="/tmp/native-lazy.svg" />)
     admit()
 
-    const image = await screen.findByRole('img', { name: 'diagram' })
-
-    expect(image.getAttribute('loading')).toBe('lazy')
-    expect(image.getAttribute('decoding')).toBe('async')
+    const image = (await screen.findAllByRole('img', { name: 'diagram' })).at(-1)
+    expect(image?.getAttribute('loading')).toBe('lazy')
+    expect(image?.getAttribute('decoding')).toBe('async')
   })
 
   it('preserves image alt text, lightbox opening, and resolved-source download semantics', async () => {
@@ -175,8 +205,8 @@ describe('lazy transcript media', () => {
     expect(api).toHaveBeenCalledTimes(1)
 
     await act(async () => request.resolve({ dataUrl: 'data:image/svg+xml;base64,c2hhcmVk' }))
-    expect((await screen.findByRole('img', { name: 'first' })).getAttribute('src')).toBe(
-      'data:image/svg+xml;base64,c2hhcmVk'
+    await waitFor(() =>
+      expect(screen.getByRole('img', { name: 'first' }).getAttribute('src')).toBe('data:image/svg+xml;base64,c2hhcmVk')
     )
     expect(screen.getByRole('img', { name: 'second' }).getAttribute('src')).toBe('data:image/svg+xml;base64,c2hhcmVk')
   })
@@ -189,16 +219,16 @@ describe('lazy transcript media', () => {
     const first = render(<MarkdownImage alt="first" src="/tmp/settled-request.svg" />)
     admit()
 
-    expect((await screen.findByRole('img', { name: 'first' })).getAttribute('src')).toBe(
-      'data:image/svg+xml;base64,Zmlyc3Q='
+    await waitFor(() =>
+      expect(screen.getByRole('img', { name: 'first' }).getAttribute('src')).toBe('data:image/svg+xml;base64,Zmlyc3Q=')
     )
     first.unmount()
 
     render(<MarkdownImage alt="second" src="/tmp/settled-request.svg" />)
     admit()
 
-    expect((await screen.findByRole('img', { name: 'second' })).getAttribute('src')).toBe(
-      'data:image/svg+xml;base64,c2Vjb25k'
+    await waitFor(() =>
+      expect(screen.getByRole('img', { name: 'second' }).getAttribute('src')).toBe('data:image/svg+xml;base64,c2Vjb25k')
     )
     expect(api).toHaveBeenCalledTimes(2)
   })
@@ -217,8 +247,8 @@ describe('lazy transcript media', () => {
     await act(async () => undefined)
 
     expect(api).toHaveBeenCalledTimes(1)
-    expect(screen.queryByRole('img', { name: 'diagram' })).toBeNull()
     expect(screen.getByText('Loading new.svg...')).not.toBeNull()
+    expect(screen.getAllByRole('img', { name: 'diagram' })).toHaveLength(1)
     expect(FakeIntersectionObserver.instances).toHaveLength(2)
 
     admit()
@@ -283,7 +313,7 @@ describe('lazy transcript media', () => {
     expect(api.mock.calls.map(([request]) => request.profile)).toEqual(['remote-work', 'personal'])
 
     await act(async () => firstRequest.resolve({ dataUrl: 'data:image/svg+xml;base64,c3RhbGU=' }))
-    expect(screen.queryByRole('img', { name: 'diagram' })).toBeNull()
+    expect(screen.getByText('Loading scoped.svg...')).not.toBeNull()
 
     await act(async () => secondRequest.resolve({ dataUrl: 'data:image/svg+xml;base64,Y3VycmVudA==' }))
     expect((await screen.findByRole('img', { name: 'diagram' })).getAttribute('src')).toBe(

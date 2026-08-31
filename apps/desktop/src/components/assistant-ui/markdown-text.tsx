@@ -9,7 +9,7 @@ import {
 } from '@assistant-ui/react-streamdown'
 import { useStore } from '@nanostores/react'
 import type { code as streamdownCode } from '@streamdown/code'
-import { type ComponentProps, memo, useEffect, useMemo, useRef, useState } from 'react'
+import { type ComponentProps, createContext, memo, useContext, useEffect, useMemo, useRef, useState } from 'react'
 
 import { ExpandableBlock } from '@/components/chat/expandable-block'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
@@ -22,10 +22,10 @@ import { normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/extern
 import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { parseMarkdownIntoBlocksCached } from '@/lib/markdown-blocks'
 import { preprocessMarkdown } from '@/lib/markdown-preprocess'
+import type { MediaOwner } from '@/lib/media'
 import {
   downloadGatewayMediaFile,
   isFileMediaPath,
-  isInlineMediaSrc,
   isMarkdownDocumentPath,
   isRemoteGateway,
   mediaExternalUrl,
@@ -149,15 +149,19 @@ function OpenMediaButton({ kind, path }: { kind: 'audio' | 'video'; path: string
 const TRANSCRIPT_MEDIA_ROOT_MARGIN = '600px 0px'
 const inFlightTranscriptImageRequests = new Map<string, Promise<string>>()
 
-function resolveTranscriptImageSrc(path: string, scopeKey: string): Promise<string> {
-  const key = `${scopeKey}\u0000${path}`
+const TranscriptMediaOwnerContext = createContext<MediaOwner | undefined>(undefined)
+
+export const TranscriptMediaOwnerProvider = TranscriptMediaOwnerContext.Provider
+
+function resolveTranscriptImageSrc(path: string, scopeKey: string, owner?: MediaOwner): Promise<string> {
+  const key = `${scopeKey}\\u0000${path}`
   const cached = inFlightTranscriptImageRequests.get(key)
 
   if (cached) {
     return cached
   }
 
-  const request = resolveMediaDisplaySrc(path)
+  const request = resolveMediaDisplaySrc(path, owner)
   inFlightTranscriptImageRequests.set(key, request)
 
   // Share only concurrent reads. Holding fulfilled data URLs here would retain
@@ -200,7 +204,10 @@ function useNearViewport(enabled: boolean) {
           setNearViewport(true)
         }
       },
-      { rootMargin: TRANSCRIPT_MEDIA_ROOT_MARGIN }
+      {
+        root: target.closest('[data-slot="aui_thread-viewport"]'),
+        rootMargin: TRANSCRIPT_MEDIA_ROOT_MARGIN
+      }
     )
 
     observer.observe(target)
@@ -445,11 +452,16 @@ export function MarkdownImage(props: ComponentProps<'img'>) {
 
 function MarkdownImageContent({ className, src, alt, ...props }: ComponentProps<'img'>) {
   const rawSrc = typeof src === 'string' ? src : ''
-  const needsResolution = Boolean(rawSrc && !isInlineMediaSrc(rawSrc))
+  const owner = useContext(TranscriptMediaOwnerContext)
+  const needsResolution = Boolean(rawSrc && isFileMediaPath(rawSrc))
   const { nearViewport, targetRef } = useNearViewport(needsResolution)
   const connection = useStore($connection)
-  const scopeKey = desktopFsCacheKey(connection)
-  const [resolvedSrc, setResolvedSrc] = useState(() => (rawSrc && isInlineMediaSrc(rawSrc) ? rawSrc : ''))
+
+  const scopeKey = owner
+    ? `${owner.mode || 'local'}:${owner.connectionId || ''}:${owner.profile || ''}`
+    : desktopFsCacheKey(connection)
+
+  const [resolvedSrc, setResolvedSrc] = useState(() => (rawSrc && !needsResolution ? rawSrc : ''))
   const [failed, setFailed] = useState(false)
   const { open, openFailed } = useOpenMediaFile(rawSrc)
   const name = mediaName(rawSrc || String(alt || 'image'))
@@ -458,15 +470,15 @@ function MarkdownImageContent({ className, src, alt, ...props }: ComponentProps<
     let cancelled = false
 
     setFailed(false)
-    setResolvedSrc(rawSrc && isInlineMediaSrc(rawSrc) ? rawSrc : '')
+    setResolvedSrc(rawSrc && !needsResolution ? rawSrc : '')
 
-    if (!rawSrc || isInlineMediaSrc(rawSrc) || !nearViewport) {
+    if (!rawSrc || !needsResolution || !nearViewport) {
       return () => {
         cancelled = true
       }
     }
 
-    void resolveTranscriptImageSrc(rawSrc, scopeKey)
+    void resolveTranscriptImageSrc(rawSrc, scopeKey, owner)
       .then(value => {
         if (!cancelled) {
           setResolvedSrc(value)
@@ -481,7 +493,7 @@ function MarkdownImageContent({ className, src, alt, ...props }: ComponentProps<
     return () => {
       cancelled = true
     }
-  }, [nearViewport, rawSrc, scopeKey])
+  }, [nearViewport, needsResolution, owner, rawSrc, scopeKey])
 
   if (!rawSrc) {
     return null
@@ -502,7 +514,17 @@ function MarkdownImageContent({ className, src, alt, ...props }: ComponentProps<
   if (!resolvedSrc) {
     return (
       <span className="my-2 block text-sm text-muted-foreground" ref={targetRef}>
-        Loading {name}...
+        <img
+          alt={alt}
+          aria-busy="true"
+          className={cn('block h-auto max-w-full rounded-lg opacity-0', className)}
+          decoding="async"
+          height={props.height}
+          loading="lazy"
+          src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs="
+          width={props.width}
+        />
+        <span>{`Loading ${name}...`}</span>
       </span>
     )
   }
