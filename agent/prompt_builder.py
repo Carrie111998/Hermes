@@ -1524,6 +1524,12 @@ def clear_skills_system_prompt_cache(*, clear_snapshot: bool = False) -> None:
     """Drop the in-process skills prompt cache (and optionally the disk snapshot)."""
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE.clear()
+    try:
+        from agent.skill_router import clear_staged_router_prompt_states
+
+        clear_staged_router_prompt_states()
+    except Exception:
+        logger.debug("Could not clear staged router prompt state", exc_info=True)
     if clear_snapshot:
         try:
             _skills_prompt_snapshot_path().unlink(missing_ok=True)
@@ -1832,6 +1838,15 @@ def _build_skills_system_prompt_inner(
     compact_categories: "frozenset[str] | None",
     project_dirs: "list[Path] | None" = None,
 ) -> str:
+    from agent.skill_router import (
+        activate_staged_router_prompt_state,
+        forget_staged_router_prompt_state,
+        get_staged_router_config,
+        record_staged_router_prompt_state,
+        staged_router_cache_key,
+    )
+
+    staged_router_config = get_staged_router_config()
     # Include the resolved platform so per-platform disabled-skill lists
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
@@ -1846,11 +1861,13 @@ def _build_skills_system_prompt_inner(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        staged_router_cache_key(staged_router_config),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
         if cached is not None:
             _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
+            activate_staged_router_prompt_state(cache_key)
             return cached
 
     # ── Layer 2: disk snapshot ────────────────────────────────────────
@@ -2088,27 +2105,44 @@ def _build_skills_system_prompt_inner(
         _basic_tools = "web_search or terminal"
         if available_tools is not None and "web_search" not in available_tools:
             _basic_tools = "terminal"
-        index_lines = []
-        for category in sorted(skills_by_category.keys()):
-            # Deduplicate and sort skills within each category
-            seen = set()
-            if category in demoted:
-                names = sorted({name for name, _ in skills_by_category[category]})
-                index_lines.append(f"  {category} [names only]: {', '.join(names)}")
-                continue
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
-                if name in seen:
+        if staged_router_config["enabled"]:
+            from agent.skill_router import (
+                STAGED_ROUTER_PROMPT_MARKER,
+                staged_index_lines,
+            )
+
+            index_lines = staged_index_lines(
+                skills_by_category, staged_router_config
+            )
+            routing_note = (
+                "\n" + STAGED_ROUTER_PROMPT_MARKER + " "
+                "shortlist to each user turn. Scan that shortlist first. Use "
+                "skills_list for fallback discovery when the shortlist does not "
+                "cover a relevant skill.\n"
+            )
+        else:
+            index_lines = []
+            routing_note = ""
+            for category in sorted(skills_by_category.keys()):
+                # Deduplicate and sort skills within each category
+                seen = set()
+                if category in demoted:
+                    names = sorted({name for name, _ in skills_by_category[category]})
+                    index_lines.append(f"  {category} [names only]: {', '.join(names)}")
                     continue
-                seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+                cat_desc = category_descriptions.get(category, "")
+                if cat_desc:
+                    index_lines.append(f"  {category}: {cat_desc}")
                 else:
-                    index_lines.append(f"    - {name}")
+                    index_lines.append(f"  {category}:")
+                for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    if desc:
+                        index_lines.append(f"    - {name}: {desc}")
+                    else:
+                        index_lines.append(f"    - {name}")
 
         result = (
             "## Skills\n"
@@ -2130,17 +2164,22 @@ def _build_skills_system_prompt_inner(
             "<available_skills>\n"
             + "\n".join(index_lines) + "\n"
             "</available_skills>\n"
+            + routing_note +
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
             + hidden_note
         )
 
     # ── Store in LRU cache ────────────────────────────────────────────
+    record_staged_router_prompt_state(
+        cache_key, skills_by_category, staged_router_config
+    )
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE[cache_key] = result
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
         while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:
-            _SKILLS_PROMPT_CACHE.popitem(last=False)
+            evicted_key, _ = _SKILLS_PROMPT_CACHE.popitem(last=False)
+            forget_staged_router_prompt_state(evicted_key)
 
     return result
 

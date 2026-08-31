@@ -5,6 +5,7 @@ import importlib
 import logging
 import os
 import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -386,6 +387,71 @@ class TestBuildSkillsSystemPrompt:
 
         second = build_skills_system_prompt()
         assert "cached-skill" not in second
+
+    def test_staged_router_reduces_system_prompt_to_hot_skills_and_families(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for category, name, description in (
+            ("core", "hot-skill", "Always visible"),
+            ("devops", "deploy-one", "Deploy one"),
+            ("devops", "deploy-two", "Deploy two"),
+        ):
+            skill_dir = tmp_path / "skills" / category / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n"
+            )
+        config = {
+            "enabled": True,
+            "hot_skills": ["hot-skill"],
+            "max_families": 3,
+            "max_exact_lookups": 3,
+            "max_ranked": 5,
+        }
+
+        with patch(
+            "agent.skill_router.get_staged_router_config", return_value=config
+        ):
+            result = build_skills_system_prompt()
+
+        assert "hot-skill: Always visible" in result
+        assert "devops: 2 skills" in result
+        assert "Deploy one" not in result
+        assert "Deploy two" not in result
+        assert "precision-ranked candidate shortlist" in result
+
+    def test_staged_router_prompt_build_publishes_exact_visible_session_state(
+        self, monkeypatch, tmp_path
+    ):
+        from agent.skill_router import consume_staged_router_prompt_state
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "devops" / "deploy-one"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: deploy-one\ndescription: Deploy one\n---\n"
+        )
+        config = {"enabled": True, "hot_skills": ["deploy-one"]}
+
+        with patch(
+            "agent.skill_router.get_staged_router_config", return_value=config
+        ):
+            first = build_skills_system_prompt()
+            first_state = consume_staged_router_prompt_state()
+            second = build_skills_system_prompt()
+            cached_state = consume_staged_router_prompt_state()
+
+        assert second == first
+        assert first_state == cached_state
+        assert first_state["enabled"] is True
+        assert first_state["skills"] == [
+            {
+                "name": "deploy-one",
+                "category": "devops",
+                "description": "Deploy one",
+            }
+        ]
 
 
 # =========================================================================

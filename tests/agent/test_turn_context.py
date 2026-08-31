@@ -88,6 +88,10 @@ class _FakeAgent:
         self._invalid_tool_retries = -1
         self._vision_supported = None
         self._persist_calls = 0
+        self._session_db = types.SimpleNamespace(
+            get_session=lambda _sid: None,
+            set_latest_user_api_content=MagicMock(return_value=1),
+        )
         self._session_messages = []
         self._pending_cli_user_message = None
         self._session_persist_lock = threading.RLock()
@@ -208,6 +212,121 @@ def test_returns_turn_context_with_user_message_appended():
     assert isinstance(ctx.messages[-1]["timestamp"], float)
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+def test_skill_router_context_is_persisted_in_api_sidecar_only():
+    agent = _FakeAgent()
+    with patch(
+        "agent.skill_router.route_skills_for_turn",
+        return_value="[SKILL ROUTER — ranked]\n- debug: Debug failures",
+    ):
+        ctx = _build(agent, user_message="fix it")
+
+    assert ctx.messages[-1]["content"] == "fix it"
+    assert ctx.messages[-1]["api_content"] == (
+        "fix it\n\n[SKILL ROUTER — ranked]\n- debug: Debug failures"
+    )
+    assert agent._persist_calls == 1
+
+
+def test_skill_router_context_composes_after_plugin_context():
+    agent = _FakeAgent()
+    with (
+        patch(
+            "hermes_cli.lifecycle.invoke_hook",
+            return_value=[{"context": "PLUGIN CONTEXT"}],
+        ),
+        patch(
+            "agent.skill_router.route_skills_for_turn",
+            return_value="ROUTER CONTEXT",
+        ),
+    ):
+        ctx = _build(agent, user_message="fix it")
+
+    assert ctx.messages[-1]["api_content"] == (
+        "fix it\n\nPLUGIN CONTEXT\n\nROUTER CONTEXT"
+    )
+
+
+def test_user_turn_is_persisted_before_router_network_work():
+    agent = _FakeAgent()
+
+    def route_after_persist(_agent, _message):
+        assert agent._persist_calls == 1
+        return "ROUTER CONTEXT"
+
+    with patch(
+        "agent.skill_router.route_skills_for_turn", side_effect=route_after_persist
+    ):
+        _build(agent, user_message="fix it")
+
+
+def test_router_network_is_skipped_when_inbound_persistence_fails():
+    agent = _FakeAgent()
+    agent._staged_skill_router_state = {
+        "version": 1,
+        "enabled": True,
+        "config": {"enabled": True},
+        "skills": [
+            {"name": "debug", "category": "software", "description": "Debug it"}
+        ],
+    }
+    agent._persist_session = MagicMock(side_effect=OSError("disk unavailable"))
+
+    with patch(
+        "agent.skill_router.route_skills_for_turn",
+        side_effect=AssertionError("router network called after persist failure"),
+    ) as route:
+        ctx = _build(agent, user_message="fix it")
+
+    route.assert_not_called()
+    agent._session_db.set_latest_user_api_content.assert_not_called()
+    assert "[SKILL ROUTER FALLBACK" in ctx.messages[-1]["api_content"]
+    assert "debug: Debug it" in ctx.messages[-1]["api_content"]
+
+
+def test_codex_app_server_receives_router_context_in_turn_payload():
+    agent = _FakeAgent()
+    agent.api_mode = "codex_app_server"
+
+    with patch(
+        "agent.skill_router.route_skills_for_turn", return_value="ROUTER CONTEXT"
+    ):
+        ctx = _build(agent, user_message="fix it")
+
+    assert ctx.user_message == "fix it\n\nROUTER CONTEXT"
+    assert "api_content" not in ctx.messages[-1]
+
+
+def test_multimodal_turn_gets_durable_full_catalog_without_router_call():
+    agent = _FakeAgent()
+    agent._staged_skill_router_state = {
+        "version": 1,
+        "enabled": True,
+        "config": {"enabled": True},
+        "skills": [
+            {"name": "vision", "category": "media", "description": "See images"}
+        ],
+    }
+    content = [
+        {"type": "text", "text": "inspect this"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+    ]
+
+    with patch(
+        "agent.skill_router.route_skills_for_turn",
+        side_effect=AssertionError("multimodal turn must use deterministic fallback"),
+    ):
+        ctx = _build(
+            agent,
+            user_message=content,
+            summarize_user_message_for_log=lambda _content: "inspect this [image]",
+        )
+
+    assert ctx.messages[-1]["content"][-1]["type"] == "text"
+    assert "[SKILL ROUTER FALLBACK" in ctx.messages[-1]["content"][-1]["text"]
+    assert "vision: See images" in ctx.messages[-1]["content"][-1]["text"]
+    assert agent._persist_calls == 1
 
 
 def test_user_message_preserves_platform_event_timestamp():

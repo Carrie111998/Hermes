@@ -1806,6 +1806,11 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    # Structured staged-router state is bound after the immutable system prompt
+    # is restored/built. The bound snapshot is then persisted in model_config.
+    agent._staged_skill_router_state = None
+    agent._staged_skill_router_state_bound = False
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,
