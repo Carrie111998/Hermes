@@ -3317,6 +3317,45 @@ class TestRunConversation:
         assert result is failed_result
         assert order == ["logical", "metrics"]
 
+    def test_early_incomplete_return_logs_terminal_failure(self, agent):
+        from agent import relay_runtime
+
+        incomplete_result = {
+            "final_response": "partial answer",
+            "messages": [],
+            "api_calls": 2,
+            "completed": False,
+            "partial": True,
+            "error": "response truncated",
+        }
+
+        with (
+            patch(
+                "agent.conversation_loop.run_conversation",
+                return_value=incomplete_result,
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.start_task_run",
+            ),
+            patch(
+                "hermes_cli.observability.relay_shared_metrics.finish_task_run",
+            ),
+            patch.object(
+                relay_runtime.SESSION_COORDINATOR,
+                "finish_logical_calls",
+            ) as finish_logical_calls,
+            patch("run_agent.logger.warning") as warning,
+        ):
+            result = agent.run_conversation("private prompt")
+
+        assert result is incomplete_result
+        finish_logical_calls.assert_called_once()
+        assert finish_logical_calls.call_args.kwargs["outcome"] == "failed"
+        assert any(
+            call.args and str(call.args[0]).startswith("Turn ended:")
+            for call in warning.call_args_list
+        )
+
     def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
         payload_built = False
         hook_called = False

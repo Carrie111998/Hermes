@@ -7880,21 +7880,35 @@ class APIServerAdapter(BasePlatformAdapter):
                         "cancelled",
                         last_event="run.cancelled",
                     )
-                # Check for structured failure (non-retryable client errors like
-                # 401/400 return failed=True instead of raising, so the except
-                # block below never fires — issue #15561).
-                elif isinstance(result, dict) and result.get("failed"):
+                # Structured non-success results return normally instead of
+                # raising. Treat every explicit incomplete contract as failed;
+                # checking only ``failed`` turned completed=False / partial=True
+                # early exits into terminal-successful empty runs (#97278).
+                elif isinstance(result, dict) and (
+                    result.get("failed") is True
+                    or result.get("completed") is False
+                    or result.get("partial") is True
+                ):
                     error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
+                    final_response = result.get("final_response", "") or ""
+                    completed = result.get("completed") is True
+                    partial = result.get("partial") is True
                     _put_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "error": error_msg,
+                        "output": final_response,
+                        "completed": completed,
+                        "partial": partial,
                     })
                     self._set_run_status(
                         run_id,
                         "failed",
                         error=error_msg,
+                        output=final_response,
+                        completed=completed,
+                        partial=partial,
                         last_event="run.failed",
                     )
                 else:

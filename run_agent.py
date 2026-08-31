@@ -9026,9 +9026,37 @@ class AIAgent:
                     # outer finally: a refresher firing between stop and join
                     # would otherwise set an interrupt that survives the clear.
             terminal = result if isinstance(result, dict) else {}
+            terminal_incomplete = (
+                terminal.get("failed") is True
+                or terminal.get("completed") is False
+                or terminal.get("partial") is True
+            )
+            if terminal_incomplete and not terminal.get("turn_exit_reason"):
+                # Early returns inside conversation_loop intentionally bypass
+                # finalize_turn, but that must not also erase the terminal
+                # diagnostic operators use to distinguish a clean empty answer
+                # from an aborted turn (#97278).  Stamp the shared result at the
+                # outer boundary so every present and future bypass is covered.
+                terminal["turn_exit_reason"] = "early_return"
+                _early_error = redact_sensitive_text(
+                    str(terminal.get("error") or terminal.get("failure_reason") or "")
+                )[:500]
+                logger.warning(
+                    "Turn ended: reason=early_return completed=%s failed=%s "
+                    "partial=%s interrupted=%s api_calls=%s response_len=%d "
+                    "session=%s error=%s",
+                    terminal.get("completed"),
+                    terminal.get("failed") is True,
+                    terminal.get("partial") is True,
+                    terminal.get("interrupted") is True,
+                    terminal.get("api_calls", "unknown"),
+                    len(str(terminal.get("final_response") or "")),
+                    session_id or "none",
+                    _early_error or "none",
+                )
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
-            elif terminal.get("failed") is True:
+            elif terminal_incomplete:
                 relay_outcome = "failed"
             else:
                 relay_outcome = "success"
