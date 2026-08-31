@@ -35,6 +35,7 @@ holds POSIX locks on that inode, so raw descriptor counts lag the real
 connection count and make such assertions flaky.
 """
 
+import sqlite3
 import threading
 
 import pytest
@@ -101,6 +102,108 @@ def test_read_conn_returned_to_pool_and_reused(db):
     assert db._read_pool.qsize() >= 1, "connection was not returned to the pool"
     with db._read_ctx() as conn:
         assert conn is first, "pooled connection was not reused"
+
+
+def _poison(db, exc: BaseException) -> sqlite3.Connection:
+    """Borrow the pooled connection and fail its block with *exc*.
+
+    Returns the connection that was checked out, so callers can assert on its
+    identity afterwards. The failure is raised from inside the ``_read_ctx``
+    block because that is exactly what a query failure looks like to the
+    context manager -- and corrupting the backing file instead is NOT
+    deterministic here: SQLite serves the already-open connection from its
+    page cache, so a truncated state.db keeps returning rows until the cache
+    is evicted.
+    """
+    with pytest.raises(type(exc)):
+        with db._read_ctx() as conn:
+            borrowed = conn
+            raise exc
+    return borrowed
+
+
+@pytest.mark.requires_wal
+def test_pooled_read_conn_discarded_after_database_error(db):
+    """A pooled connection whose query raised DatabaseError must not come back.
+
+    The write path already self-heals; the read pool did not. Returning the
+    connection unconditionally meant a poisoned one -- truncated backing file,
+    "file is not a database", a state.db replaced under a long-lived gateway --
+    went to the head of a LifoQueue and was handed straight back to the next
+    checkout, so every later read failed for as long as the process lived.
+    """
+    with db._read_ctx() as conn:
+        primed = conn
+    assert db._read_pool.qsize() >= 1, "pool must be primed for this to test anything"
+
+    poisoned = _poison(db, sqlite3.DatabaseError("file is not a database"))
+    assert poisoned is primed, "LIFO must have handed back the pooled connection"
+
+    assert poisoned not in list(db._read_pool.queue), (
+        "poisoned connection was returned to the pool"
+    )
+    with db._read_ctx() as conn:
+        assert conn is not poisoned, "next checkout reused the poisoned connection"
+
+
+@pytest.mark.requires_wal
+def test_read_path_self_heals_after_database_error(db):
+    """The read after the discard must serve real rows off a fresh connection."""
+    with db._read_ctx() as conn:
+        primed = conn
+    poisoned = _poison(db, sqlite3.DatabaseError("database disk image is malformed"))
+    assert poisoned is primed
+
+    assert db.get_session("s1")["id"] == "s1"
+    assert len(db.get_messages("s1")) == 2
+    assert db.search_messages("graphiti", limit=5)
+
+
+@pytest.mark.requires_wal
+def test_discarded_read_conn_returns_its_permit(db):
+    """Discarding must go through _close_read_conn, not drop the connection.
+
+    A discard that skipped the permit release would trade a poisoned
+    connection for a permanently narrower read path -- the ceiling ratcheting
+    down one slot per fault, which is the same outage in slow motion.
+    """
+    from hermes_state import _READ_POOL_MAX
+
+    with db._read_ctx():
+        pass
+    for _ in range(_READ_POOL_MAX * 2):
+        _poison(db, sqlite3.DatabaseError("file is not a database"))
+
+    held = [db._checkout_read_conn() for _ in range(_READ_POOL_MAX)]
+    try:
+        assert all(c is not None for c in held), (
+            "discards stranded permits -- the ceiling ratcheted down"
+        )
+    finally:
+        for c in held:
+            if c is not None:
+                db._close_read_conn(c)
+
+
+@pytest.mark.requires_wal
+def test_non_database_error_keeps_the_pooled_conn(db):
+    """The discard is scoped to DatabaseError, not to any failure in the block.
+
+    Caller-side bugs (a KeyError while shaping rows, a cancellation) say
+    nothing about the connection's health, and discarding on those would throw
+    away a good descriptor -- and the pool's whole point -- on every unrelated
+    exception.
+    """
+    with db._read_ctx() as conn:
+        primed = conn
+
+    borrowed = _poison(db, ValueError("caller-side bug"))
+    assert borrowed is primed
+    assert borrowed in list(db._read_pool.queue), (
+        "a non-DatabaseError must leave the connection in the pool"
+    )
+    with db._read_ctx() as conn:
+        assert conn is primed, "healthy connection must still be reused"
 
 
 @pytest.mark.requires_wal
