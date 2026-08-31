@@ -2059,17 +2059,26 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         from hermes_cli.managed_uv import managed_python_env
 
         uv_env = managed_python_env()
-        uv_env["VIRTUAL_ENV"] = str(_m().PROJECT_ROOT / "venv")
         if _m()._is_termux_env(uv_env):
             uv_env.pop("PYTHONPATH", None)
             uv_env.pop("PYTHONHOME", None)
         try:
-            _m()._install_python_dependencies_with_optional_fallback([uv_bin, "pip"], env=uv_env)
+            # Sync deps into EVERY present project venv (venv and .venv when
+            # both exist — #97340): the CLI shim / desktop-served profiles
+            # run from .venv while gateway/webui/dashboard services run from
+            # venv. Syncing only venv leaves the launcher's env stale.
+            for venv_dir in _project_venv_dirs():
+                venv_env = dict(uv_env)
+                venv_env["VIRTUAL_ENV"] = str(venv_dir)
+                _m()._install_python_dependencies_with_optional_fallback([uv_bin, "pip"], env=venv_env)
         except _shim_quarantine_error_type() as _sqe:
             # #87331: this runs inside the ZIP-fallback error handler, so the
             # boundary except clause in cmd_update cannot catch it — refuse
             # here with the same defer-via-marker contract.
             _refuse_update_for_contended_shims(_sqe)
+        # Keep the primary (git-install) venv as the tool-dependency restore
+        # target below, matching pre-#97340 behavior.
+        uv_env["VIRTUAL_ENV"] = str(_project_venv_dirs()[0])
     else:
         # Use sys.executable to explicitly call the venv's pip module,
         # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
@@ -4621,8 +4630,34 @@ def _wait_for_windows_update_gateway_exit(
             pass
     return survivors
 
+def _project_venv_dirs() -> list[Path]:
+    """Project venv dirs to sync/probe/holder-detect, in order ``venv`` then ``.venv``.
+
+    An install can carry BOTH ``venv`` (older git-install flow) and ``.venv``
+    (uv/bootstrap flow): the ``~/.local/bin/hermes`` shim and Desktop-spawned
+    ``hermes --profile <p> serve --isolated`` processes run from ``.venv``
+    while gateway/webui/dashboard services run from ``venv`` (#97340). A
+    dep-sync / health-probe / holder-detection that only ever looks at
+    ``venv`` leaves the shim's env stale (``ModuleNotFoundError:
+    snowballstemmer`` after an update adds a dependency). So every such site
+    must cover ALL present project venvs.
+
+    Returns every ``venv``/``.venv`` directory actually present at
+    PROJECT_ROOT. When NO project venv exists (a plain dev checkout), falls
+    back to the single ``venv`` target so callers keep the historical
+    ``--python sys.executable`` pin / healthy-no-venv behavior instead of
+    silently skipping.
+    """
+    present = [
+        d
+        for name in ("venv", ".venv")
+        if (d := _m().PROJECT_ROOT / name).is_dir()
+    ]
+    return present or [_m().PROJECT_ROOT / "venv"]
+
+
 def _venv_core_imports_healthy() -> tuple[bool, str]:
-    """Probe the project venv for the core imports the backend needs to boot.
+    """Probe the project venvs for the core imports the backend needs to boot.
 
     Runs a tiny import check inside the venv interpreter (NOT this process —
     ``hermes update`` may be driven by a different Python). Catches the
@@ -4637,7 +4672,18 @@ def _venv_core_imports_healthy() -> tuple[bool, str]:
     Returns ``(healthy, detail)``. Never raises; unknown states report
     healthy so a probe failure can't force needless reinstalls.
     """
-    venv_dir = _m().PROJECT_ROOT / "venv"
+    # Every present project venv must be healthy (venv OR .venv — #97340).
+    # A stale .venv that still lacks a dependency the release added must
+    # trip a repair even when the git-install venv is fine.
+    for venv_dir in _project_venv_dirs():
+        healthy, detail = _probe_single_venv_imports(venv_dir)
+        if not healthy:
+            return False, detail
+    return True, ""
+
+
+def _probe_single_venv_imports(venv_dir: Path) -> tuple[bool, str]:
+    """Run the core-import probe against one specific venv (see caller)."""
     venv_python = venv_python_path(venv_dir, windows=_m()._is_windows())
     if not venv_python.exists():
         # No venv interpreter at all. In a dev checkout that's normal (the
@@ -4715,11 +4761,15 @@ def _detect_venv_python_processes(
     except Exception:
         return []
 
-    venv_dir = _m().PROJECT_ROOT / "venv"
-    try:
-        venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
-    except OSError:
-        venv_prefix = str(venv_dir).lower().rstrip(os.sep) + os.sep
+    venv_dirs = _project_venv_dirs()
+    venv_prefixes: list[str] = []
+    for venv_dir in venv_dirs:
+        try:
+            venv_prefixes.append(
+                str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
+            )
+        except OSError:
+            venv_prefixes.append(str(venv_dir).lower().rstrip(os.sep) + os.sep)
     try:
         root_prefix = str(_m().PROJECT_ROOT.resolve()).lower().rstrip(os.sep) + os.sep
     except OSError:
@@ -4775,15 +4825,17 @@ def _detect_venv_python_processes(
         cmdline_low = cmdline_raw.lower()
         cwd_low = str(info.get("cwd") or "").lower().rstrip(os.sep) + os.sep
 
-        # Primary match: the executable itself lives under this venv
-        # (venv\Scripts\python(w).exe — the desktop backend / gateway case).
-        is_holder = exe_norm.startswith(venv_prefix)
+        # Primary match: the executable itself lives under one of this
+        # install's venvs (venv\Scripts\python(w).exe — the desktop backend
+        # / gateway case, from either the `venv` or `.venv` layout).
+        is_holder = any(exe_norm.startswith(p) for p in venv_prefixes)
         # Fallback: uv/base-interpreter trampolines run a python whose exe is
         # OUTSIDE the venv but which still imports from it and holds its .pyd
         # files. Catch those by what they're running: a cmdline that references
-        # this venv's path, or a `-m hermes_cli.main ...` invocation tied to
-        # this install (install root in the cmdline or as the working dir).
-        if not is_holder and venv_prefix in cmdline_low:
+        # one of this install's venv paths, or a `-m hermes_cli.main ...`
+        # invocation tied to this install (install root in the cmdline or as
+        # the working dir).
+        if not is_holder and any(p in cmdline_low for p in venv_prefixes):
             is_holder = True
         if not is_holder and "hermes_cli.main" in cmdline_low:
             if root_prefix in cmdline_low or cwd_low.startswith(root_prefix):
@@ -5136,11 +5188,14 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
     except Exception:
         return []
 
-    venv_dir = _m().PROJECT_ROOT / "venv"
-    try:
-        venv_prefix = str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
-    except OSError:
-        venv_prefix = str(venv_dir).lower().rstrip(os.sep) + os.sep
+    venv_prefixes: list[str] = []
+    for venv_dir in _project_venv_dirs():
+        try:
+            venv_prefixes.append(
+                str(venv_dir.resolve()).lower().rstrip(os.sep) + os.sep
+            )
+        except OSError:
+            venv_prefixes.append(str(venv_dir).lower().rstrip(os.sep) + os.sep)
 
     # Never return ourselves or our own ancestry: a CLI ``hermes update``
     # runs from the venv python and would otherwise nominate itself.
@@ -5180,7 +5235,7 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
             exe = (parent.exe() or "").lower()
         except Exception:
             continue
-        if exe.startswith(venv_prefix):
+        if any(exe.startswith(p) for p in venv_prefixes):
             found.append(ppid)
     return found
 
@@ -7971,41 +8026,46 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 from hermes_cli.managed_uv import ensure_uv
 
                 repair_uv = ensure_uv()
+                repair_venv_dirs = _project_venv_dirs()
                 # A managed install whose venv is gone entirely (interrupted
                 # repair after the old venv was moved aside) needs the venv
                 # recreated before dependencies can be installed into it.
-                venv_python_missing = not (
-                    venv_python_path(
-                        _m().PROJECT_ROOT / "venv", windows=_m()._is_windows()
-                    )
-                ).exists()
-                if venv_python_missing and repair_uv:
-                    print("→ Recreating virtual environment...")
-                    subprocess.run(
-                        [repair_uv, "venv", "venv"],
-                        cwd=_m().PROJECT_ROOT,
-                        check=False,
-                    )
+                # #97340: recreate EVERY present project venv (venv and .venv)
+                # so a missing .venv interpreter is healed too.
+                if repair_uv:
+                    for venv_dir in repair_venv_dirs:
+                        venv_python_missing = not venv_python_path(
+                            venv_dir, windows=_m()._is_windows()
+                        ).exists()
+                        if venv_python_missing:
+                            print("→ Recreating virtual environment...")
+                            subprocess.run(
+                                [repair_uv, "venv", venv_dir.name],
+                                cwd=_m().PROJECT_ROOT,
+                                check=False,
+                            )
                 if repair_uv:
                     # Isolated from third-party UV env vars (#83914), same as
                     # the main-path and git-path dependency syncs.
                     from hermes_cli.managed_uv import managed_python_env
 
                     repair_env = managed_python_env()
-                    repair_env["VIRTUAL_ENV"] = str(_m().PROJECT_ROOT / "venv")
-                    _m()._install_python_dependencies_with_optional_fallback(
-                        [repair_uv, "pip"], env=repair_env, group="all"
-                    )
-                    _m()._refresh_active_lazy_features(
-                        [repair_uv, "pip"],
-                        env=repair_env,
-                        features=active_lazy_features,
-                    )
-                    _m()._restore_active_tool_dependencies(
-                        active_tool_dependencies,
-                        [repair_uv, "pip"],
-                        env=repair_env,
-                    )
+                    for venv_dir in repair_venv_dirs:
+                        venv_env = dict(repair_env)
+                        venv_env["VIRTUAL_ENV"] = str(venv_dir)
+                        _m()._install_python_dependencies_with_optional_fallback(
+                            [repair_uv, "pip"], env=venv_env, group="all"
+                        )
+                        _m()._refresh_active_lazy_features(
+                            [repair_uv, "pip"],
+                            env=venv_env,
+                            features=active_lazy_features,
+                        )
+                        _m()._restore_active_tool_dependencies(
+                            active_tool_dependencies,
+                            [repair_uv, "pip"],
+                            env=venv_env,
+                        )
                 else:
                     _m()._install_python_dependencies_with_optional_fallback(
                         [sys.executable, "-m", "pip"], group="all"
@@ -8364,23 +8424,34 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if uv_bin:
             # Use official managed_python_env() isolation so third-party
             # UV_PYTHON_INSTALL_DIR (e.g. WorkBuddy) cannot hijack uv; then
-            # point VIRTUAL_ENV at this install's venv.
+            # point VIRTUAL_ENV at this install's venvs, one at a time.
             from hermes_cli.managed_uv import managed_python_env
 
             uv_env = managed_python_env()
-            uv_env["VIRTUAL_ENV"] = str(_m().PROJECT_ROOT / "venv")
             if _m()._is_termux_env(uv_env):
                 uv_env.pop("PYTHONPATH", None)
                 uv_env.pop("PYTHONHOME", None)
                 install_group = "termux-all"
                 print("  → Termux detected: using uv + curated termux-all optional profile...")
             if not deps_current:
-                if _m()._is_termux_env(uv_env) and _is_android_python():
-                    print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
-                    _install_psutil_android_compat([uv_bin, "pip"], env=uv_env)
-                _m()._install_python_dependencies_with_optional_fallback(
-                    [uv_bin, "pip"], env=uv_env, group=install_group
-                )
+                # Sync deps into EVERY present project venv (venv and .venv
+                # when both exist — #97340). The CLI shim / desktop-served
+                # profiles run from .venv while gateway/webui/dashboard
+                # services run from venv; syncing only venv leaves the .venv
+                # the launcher actually uses stale (ModuleNotFoundError).
+                for venv_dir in _project_venv_dirs():
+                    venv_env = dict(uv_env)
+                    venv_env["VIRTUAL_ENV"] = str(venv_dir)
+                    if _m()._is_termux_env(venv_env) and _is_android_python():
+                        print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
+                        _install_psutil_android_compat([uv_bin, "pip"], env=venv_env)
+                    _m()._install_python_dependencies_with_optional_fallback(
+                        [uv_bin, "pip"], env=venv_env, group=install_group
+                    )
+            # Keep the primary (git-install) venv as the lazy-refresh /
+            # tool-dependency / verify target below, matching pre-#97340
+            # behavior (set on BOTH the deps-current and deps-changed paths).
+            uv_env["VIRTUAL_ENV"] = str(_project_venv_dirs()[0])
         else:
             # Use sys.executable to explicitly call the venv's pip module,
             # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
