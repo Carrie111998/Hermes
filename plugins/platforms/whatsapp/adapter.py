@@ -299,7 +299,7 @@ from gateway.platforms.base import (
     cache_image_from_url,
     cache_audio_from_url,
 )
-from utils import env_int
+from utils import env_int, is_truthy_value
 
 
 def _is_allowed_bridge_path(url: str) -> bool:
@@ -665,8 +665,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 # history flags report them as absent, which
                                 # only matches when the flags are disabled.
                                 extra = self.config.extra if isinstance(self.config.extra, dict) else {}
-                                want_sync = bool(extra.get("sync_full_history", False))
-                                want_api = bool(extra.get("enable_history_api", False))
+                                want_sync = is_truthy_value(extra.get("sync_full_history"), default=False)
+                                want_api = is_truthy_value(extra.get("enable_history_api"), default=False)
                                 run_sync = bool(data.get("syncFullHistory", False))
                                 run_api = bool(data.get("historyApi", False))
                                 flags_match = (want_sync == run_sync) and (want_api == run_api)
@@ -765,10 +765,13 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # Pass WhatsApp history API flags from config.yaml (opt-in, default off).
             # These are feature flags, not secrets — config.yaml is the right
             # place per AGENTS.md contribution rubric.
-            if self.config.extra.get("sync_full_history", False):
-                bridge_env["WHATSAPP_SYNC_FULL_HISTORY"] = "true"
-            if self.config.extra.get("enable_history_api", False):
-                bridge_env["WHATSAPP_ENABLE_HISTORY_API"] = "true"
+            extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+            bridge_env["WHATSAPP_SYNC_FULL_HISTORY"] = (
+                "true" if is_truthy_value(extra.get("sync_full_history"), default=False) else "false"
+            )
+            bridge_env["WHATSAPP_ENABLE_HISTORY_API"] = (
+                "true" if is_truthy_value(extra.get("enable_history_api"), default=False) else "false"
+            )
 
             # Windows: the gateway process (pythonw.exe under Electron/Tauri)
             # may run inside a job object that disallows breakaway, causing

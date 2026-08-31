@@ -143,6 +143,7 @@ class TestStaleBridgeHandshake:
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch("aiohttp.ClientSession", mock_client), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task", side_effect=lambda coro: (coro.close(), MagicMock())[1]), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
              patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
              patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
@@ -174,7 +175,7 @@ class TestStaleBridgeHandshake:
 
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch("aiohttp.ClientSession", mock_client), \
-             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task") as mock_task, \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task", side_effect=lambda coro: (coro.close(), MagicMock())[1]) as mock_task, \
              patch("subprocess.Popen") as mock_popen, \
              patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True), \
              patch.object(adapter, "_mark_connected", create=True):
@@ -213,6 +214,8 @@ class TestStaleBridgeHandshake:
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch("aiohttp.ClientSession", mock_client), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task", side_effect=lambda coro: (coro.close(), MagicMock())[1]), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task", side_effect=lambda coro: (coro.close(), MagicMock())[1]) as mock_task, \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
              patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
              patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
@@ -252,6 +255,7 @@ class TestWindowsDetachFallback:
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task", side_effect=lambda coro: (coro.close(), MagicMock())[1]), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
              patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
              patch("subprocess.Popen", side_effect=fake_popen) as mock_popen, \
@@ -286,6 +290,7 @@ class TestWindowsDetachFallback:
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task", side_effect=lambda coro: (coro.close(), MagicMock())[1]), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
              patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
              patch("subprocess.Popen", side_effect=other_err) as mock_popen, \
@@ -312,6 +317,7 @@ class TestDepRefreshStamp:
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task", side_effect=lambda coro: (coro.close(), MagicMock())[1]), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
              patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
              patch("subprocess.run") as mock_run, \
@@ -339,6 +345,7 @@ class TestCacheDirEnvPassthrough:
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task", side_effect=lambda coro: (coro.close(), MagicMock())[1]), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
              patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
              patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
@@ -355,3 +362,38 @@ class TestCacheDirEnvPassthrough:
         assert env["HERMES_AUDIO_CACHE_DIR"] == str(get_audio_cache_dir())
         assert env["HERMES_DOCUMENT_CACHE_DIR"] == str(get_document_cache_dir())
         assert env["WHATSAPP_SEND_READ_RECEIPTS"] == "true"
+
+
+class TestHistoryFlagEnvPassthrough:
+    @pytest.mark.parametrize("config_value", [False, "false", 0, "0"])
+    @pytest.mark.asyncio
+    async def test_false_like_config_overrides_inherited_true_env(self, tmp_path, monkeypatch, config_value):
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+        adapter.config.extra = {
+            "sync_full_history": config_value,
+            "enable_history_api": config_value,
+        }
+        monkeypatch.setenv("WHATSAPP_SYNC_FULL_HISTORY", "true")
+        monkeypatch.setenv("WHATSAPP_ENABLE_HISTORY_API", "true")
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1
+        mock_proc.returncode = 1
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task", side_effect=lambda coro: (coro.close(), MagicMock())[1]), \
+             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
+             patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
+            await adapter.connect()
+
+        env = mock_popen.call_args.kwargs["env"]
+        assert env["WHATSAPP_SYNC_FULL_HISTORY"] == "false"
+        assert env["WHATSAPP_ENABLE_HISTORY_API"] == "false"
