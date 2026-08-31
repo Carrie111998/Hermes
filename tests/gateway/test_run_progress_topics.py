@@ -742,8 +742,8 @@ def test_all_mode_respects_custom_preview_length(monkeypatch, tmp_path):
     assert len(preview_text) <= 120, f"Preview too long ({len(preview_text)}): {preview_text}"
 
 
-def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_path):
-    """The real gateway path must retain the URL beyond its visible cap."""
+def test_discord_tool_url_not_truncated_at_zero(monkeypatch, tmp_path):
+    """tool_preview_length: 0 must show the full URL (documented 'no limit')."""
     import yaml
 
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
@@ -790,9 +790,7 @@ def test_discord_truncated_tool_url_links_to_full_destination(monkeypatch, tmp_p
 
     assert result["final_response"] == "done"
     assert adapter.sent
-    visible = UrlPreviewAgent.URL[:37] + "..."
-    label = visible.removeprefix("https://")
-    assert f"[{label}](<{UrlPreviewAgent.URL}>)" in adapter.sent[0]["content"]
+    assert UrlPreviewAgent.URL in adapter.sent[0]["content"]
 
 
 class CommentaryAgent:

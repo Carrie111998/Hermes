@@ -133,6 +133,19 @@ class TestPrepareToolPreview:
         assert preview.truncated is False
         assert preview.url is None
 
+    def test_max_len_zero_means_unlimited(self):
+        """max_len=0 (the default tool_preview_length) must NOT truncate."""
+        url = "https://example.com/a/very/long/path/to/a/page"
+        for kwargs in (
+            {"urls": [url]},
+            {"query": url},
+        ):
+            preview = prepare_tool_preview(
+                "web_extract", kwargs, fallback=url, max_len=0
+            )
+            assert preview.text == url
+            assert preview.truncated is False
+
     def test_truncated_non_url_has_no_link_target(self):
         preview = prepare_tool_preview(
             "web_search",
