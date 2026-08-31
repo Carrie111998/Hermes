@@ -12,6 +12,7 @@ small and focused on this one endpoint pair.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import stat
 import sys
@@ -31,6 +32,13 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "soul-test-token")
     from hermes_cli import web_server
+
+    # Pin the resolved token too: _SESSION_TOKEN is resolved at import time, so
+    # a later module-level ``import hermes_cli.web_server`` in another test file
+    # can freeze it to a different value before this fixture runs. Patching the
+    # module attribute (rather than only the env var) makes these tests
+    # order-independent within the process.
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", "soul-test-token")
 
     with TestClient(web_server.app, raise_server_exceptions=False) as c:
         c.headers["Authorization"] = "Bearer soul-test-token"
@@ -129,3 +137,566 @@ class TestSoulWriteDurability:
         assert r.status_code == 200, r.text
         mode = stat.S_IMODE(soul.stat().st_mode)
         assert mode == 0o644, f"first save created SOUL.md as {oct(mode)}"
+
+
+class TestIsolatedProfileSoulScope:
+    """An isolated (``--isolated``) dashboard scoped to one named profile must
+    not read or write another profile's SOUL.md (#91330).
+
+    The unified machine dashboard is intentionally a machine-wide management
+    surface (cross-profile access is by design). But a server launched with
+    ``--isolated`` from a named profile runs scoped to that profile, and
+    letting it rewrite another profile's persona is a prompt-injection vector.
+    """
+
+    @pytest.fixture()
+    def isolated_home(self, tmp_path, monkeypatch):
+        """A hermes root with two real profiles; server scoped to ``alice``."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        for p in ("alice", "bob"):
+            (profiles_root / p).mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(profiles_root / "alice"))
+        return profiles_root
+
+    @contextlib.contextmanager
+    def _client(self, monkeypatch, *, isolated: bool):
+        """A TestClient with the shared app scoped as isolated or not.
+
+        ``app.state.isolated`` is a process-global; snapshot it and restore it
+        on exit so an isolated test can't leak into a later non-isolated test
+        in the same process (its only default is when the attribute is never
+        set at all).
+        """
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "soul-test-token")
+        from hermes_cli import web_server
+
+        prev = getattr(web_server.app.state, "isolated", None)
+        had = hasattr(web_server.app.state, "isolated")
+        web_server.app.state.isolated = isolated
+        c = TestClient(web_server.app, raise_server_exceptions=False)
+        c.headers["Authorization"] = "Bearer soul-test-token"
+        try:
+            with c:
+                yield c
+        finally:
+            if had:
+                web_server.app.state.isolated = prev
+            else:
+                delattr(web_server.app.state, "isolated")
+
+    def test_cross_profile_soul_write_refused(self, isolated_home, monkeypatch):
+        bob = isolated_home / "bob"
+        (bob / "SOUL.md").write_text("# Bob's persona\n", encoding="utf-8")
+        before = (bob / "SOUL.md").read_text(encoding="utf-8")
+
+        with self._client(monkeypatch, isolated=True) as c:
+            r = c.put("/api/profiles/bob/soul", json={"content": "# Pwned\n"})
+
+        assert r.status_code == 403, r.text
+        # Bob's persona must be untouched.
+        assert (bob / "SOUL.md").read_text(encoding="utf-8") == before
+
+    def test_cross_profile_soul_read_refused(self, isolated_home, monkeypatch):
+        (isolated_home / "bob" / "SOUL.md").write_text("# Bob\n", encoding="utf-8")
+
+        with self._client(monkeypatch, isolated=True) as c:
+            r = c.get("/api/profiles/bob/soul")
+
+        assert r.status_code == 403, r.text
+
+    def test_isolated_default_profile_blocks_named_profiles(
+        self, tmp_path, monkeypatch
+    ):
+        """An isolated server scoped to the DEFAULT profile must still refuse
+        cross-profile persona access (#91330 P1)."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        bob = profiles_root / "bob"
+        bob.mkdir(parents=True, exist_ok=True)
+        (bob / "SOUL.md").write_text("# Bob\n", encoding="utf-8")
+        # Isolated server running as the default (root) profile.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+        with self._client(monkeypatch, isolated=True) as c:
+            r = c.put("/api/profiles/bob/soul", json={"content": "# nope\n"})
+
+        assert r.status_code == 403, r.text
+        assert (bob / "SOUL.md").read_text(encoding="utf-8") == "# Bob\n"
+
+    def test_same_profile_soul_still_works(self, isolated_home, monkeypatch):
+        with self._client(monkeypatch, isolated=True) as c:
+            put = c.put("/api/profiles/alice/soul", json={"content": SOUL})
+            get = c.get("/api/profiles/alice/soul")
+
+        assert put.status_code == 200, put.text
+        assert get.status_code == 200, get.text
+        assert get.json()["content"] == SOUL
+
+    def test_machine_dashboard_keeps_cross_profile_access(self, tmp_path, monkeypatch):
+        """Control: the default machine dashboard is intentionally machine-wide
+        and must not start refusing cross-profile SOUL edits."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        bob = profiles_root / "bob"
+        bob.mkdir(parents=True, exist_ok=True)
+        # Machine dashboard runs from the root home, NOT isolated.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+        with self._client(monkeypatch, isolated=False) as c:
+            r = c.put("/api/profiles/bob/soul", json={"content": "# ok\n"})
+
+        assert r.status_code == 200, r.text
+        assert (bob / "SOUL.md").read_text(encoding="utf-8") == "# ok\n"
+
+    def test_cross_profile_endpoints_gated_in_isolated(self, isolated_home, monkeypatch):
+        """DELETE/rename/model/export for another profile are refused from an
+        isolated server — the full isolation boundary, not just SOUL.md."""
+        (isolated_home / "bob" / "SOUL.md").write_text("# Bob\n", encoding="utf-8")
+
+        with self._client(monkeypatch, isolated=True) as c:
+            d = c.delete("/api/profiles/bob")
+            x = c.post("/api/profiles/bob/export", json={})
+
+        assert d.status_code == 403, d.text
+        assert x.status_code == 403, x.text
+
+    def test_create_with_clone_from_sibling_refused(self, isolated_home, monkeypatch):
+        """Adversarial witness (#91330 review, stop-the-line bypass): an
+        isolated server must not read a sibling profile through
+        ``POST /api/profiles`` ``clone_from`` — cloning copies the source's
+        config/.env/SOUL/skills into a new profile the client controls."""
+        bob = isolated_home / "bob"
+        bob.mkdir(parents=True, exist_ok=True)
+        sentinel = "SECRET_SENTINEL_NEVER_COPY_ME=1\n"
+        (bob / ".env").write_text(sentinel, encoding="utf-8")
+        (bob / "SOUL.md").write_text("# Bob\n", encoding="utf-8")
+
+        with self._client(monkeypatch, isolated=True) as c:
+            r = c.post(
+                "/api/profiles",
+                json={"name": "evil", "clone_from": "bob"},
+            )
+
+        assert r.status_code == 403, r.text
+        # No destination profile was created...
+        assert not (isolated_home / "evil").exists()
+        # ...and the sentinel never left Bob.
+        found = [str(p) for p in isolated_home.rglob("*") if p.is_file() and sentinel in p.read_text(encoding="utf-8", errors="ignore")]
+        assert found == [str(bob / ".env")], f"sentinel leaked to: {found}"
+
+    def test_create_clone_all_implicit_default_refused(self, tmp_path, monkeypatch):
+        """The implicit clone-all source ('default') is also authority-bearing:
+        an isolated server scoped to a named profile must not full-copy the
+        machine default profile without ever naming it."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir(parents=True, exist_ok=True)
+        profiles_root = hermes_root / "profiles"
+        default_profile = hermes_root  # root HERMES_HOME *is* the default profile
+        sentinel = "DEFAULT_SECRET_SENTINEL=1\n"
+        (default_profile / ".env").write_text(sentinel, encoding="utf-8")
+        (profiles_root / "alice").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(profiles_root / "alice"))
+
+        with self._client(monkeypatch, isolated=True) as c:
+            r = c.post("/api/profiles", json={"name": "evil", "clone_all": True})
+
+        assert r.status_code == 403, r.text
+        assert not (profiles_root / "evil").exists()
+
+    def test_import_refused_when_isolated(self, isolated_home, monkeypatch):
+        """Archive import creates a full profile directory — machine-global
+        control-plane mutation, refused on an isolated server."""
+        with self._client(monkeypatch, isolated=True) as c:
+            r = c.post("/api/profiles/import", json={"archive": "/tmp/nope.tar.gz"})
+
+        assert r.status_code == 403, r.text
+
+    def test_active_switch_refused_when_isolated(self, isolated_home, monkeypatch):
+        """Switching the machine-wide active profile regains authority over
+        other profiles' CLI/gateway routing — refused when isolated."""
+        with self._client(monkeypatch, isolated=True) as c:
+            r = c.post("/api/profiles/active", json={"name": "bob"})
+
+        assert r.status_code == 403, r.text
+
+    def test_control_plane_works_on_machine_dashboard(self, tmp_path, monkeypatch):
+        """Control: the unified machine dashboard keeps profile creation and
+        active-profile switching (intentional machine-wide management)."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        profiles_root.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+        with self._client(monkeypatch, isolated=False) as c:
+            r = c.post("/api/profiles", json={"name": "fresh"})
+
+        assert r.status_code == 200, r.text
+
+    def test_cross_profile_endpoints_work_on_machine_dashboard(
+        self, tmp_path, monkeypatch
+    ):
+        """Control: the unified machine dashboard keeps cross-profile
+        management (delete/export) — the boundary only bites when isolated."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        (profiles_root / "bob").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+        with self._client(monkeypatch, isolated=False) as c:
+            d = c.delete("/api/profiles/bob")
+
+        # Machine dashboard may delete another profile.
+        assert d.status_code == 200, d.text
+        assert not (profiles_root / "bob").exists()
+
+class TestIsolatedIdentityAliasing:
+    """Adversarial witnesses for the fail-open identity-aliasing repair
+    (#91330 review, re-review 2026-08-31).
+
+    ``get_active_profile_name()`` returns the ordinary strings ``"custom"``
+    (unrecognized HERMES_HOME) and ``"default"`` (derivation failure), and both
+    are valid real profile ids. The isolation guard must therefore authorize by
+    canonical *resolved path*, never by a profile-name string: a server with an
+    unrecognized home must not be able to prove any named sibling is in scope.
+    """
+
+    @contextlib.contextmanager
+    def _client(self, monkeypatch, *, isolated: bool, hermes_home: str):
+        """A TestClient with the shared app scoped as isolated or not, with an
+        explicit launch home (the canonical authority start_server stores)."""
+        monkeypatch.setenv("HERMES_HOME", hermes_home)
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "soul-test-token")
+        from hermes_cli import web_server
+        from hermes_constants import get_hermes_home
+
+        prev = getattr(web_server.app.state, "isolated", None)
+        had = hasattr(web_server.app.state, "isolated")
+        prev_scope = getattr(web_server.app.state, "isolated_scope_dir", None)
+        had_scope = hasattr(web_server.app.state, "isolated_scope_dir")
+        web_server.app.state.isolated = isolated
+        web_server.app.state.isolated_scope_dir = get_hermes_home().resolve()
+        c = TestClient(web_server.app, raise_server_exceptions=False)
+        c.headers["Authorization"] = "Bearer soul-test-token"
+        try:
+            with c:
+                yield c
+        finally:
+            if had:
+                web_server.app.state.isolated = prev
+            else:
+                delattr(web_server.app.state, "isolated")
+            if had_scope:
+                web_server.app.state.isolated_scope_dir = prev_scope
+            else:
+                delattr(web_server.app.state, "isolated_scope_dir")
+
+    def test_unrecognized_home_cannot_alias_onto_profile_named_custom(
+        self, tmp_path, monkeypatch
+    ):
+        """A real profile literally named ``custom`` must NOT become
+        reachable just because ``get_active_profile_name()`` returns the
+        ``"custom"`` sentinel for an unrecognized launch home."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        custom = profiles_root / "custom"
+        custom.mkdir(parents=True, exist_ok=True)
+        (custom / "SOUL.md").write_text("# Real custom profile\n", encoding="utf-8")
+        (custom / ".env").write_text("REAL_CUSTOM_SECRET=1\n", encoding="utf-8")
+        # Launch home is an arbitrary directory that is neither the default
+        # root (~/.hermes) nor a  ~/.hermes/profiles/<name> path. The runtime
+        # identifies such a home with the sentinel "custom" — the same string
+        # as this real profile's id. Force the sentinel to make the witness
+        # explicit even if resolution internals change.
+        tenant_home = tmp_path / ".hermes" / "tenant-a"
+        tenant_home.mkdir(parents=True, exist_ok=True)
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "custom")
+
+        with self._client(
+            monkeypatch, isolated=True, hermes_home=str(tenant_home)
+        ) as c:
+            r = c.get("/api/profiles/custom/soul")
+
+        assert r.status_code == 403, r.text
+        # The real profile's data must be untouched either way.
+        assert (custom / "SOUL.md").read_text(encoding="utf-8") == "# Real custom profile\n"
+
+        with self._client(
+            monkeypatch, isolated=True, hermes_home=str(tenant_home)
+        ) as c:
+            x = c.post("/api/profiles/custom/export", json={})
+
+        assert x.status_code == 403, x.text
+
+    def test_derivation_failure_cannot_alias_onto_default(
+        self, tmp_path, monkeypatch
+    ):
+        """A scope-derivation exception must not silently authorize requests
+        for ``default`` (the old ``_current_profile_name`` fallback returned
+        the string ``"default"``, which is a real profile id)."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        (profiles_root).mkdir(parents=True, exist_ok=True)
+        tenant_home = tmp_path / ".hermes" / "tenant-b"
+        tenant_home.mkdir(parents=True, exist_ok=True)
+        import hermes_cli.profiles as profiles_mod
+
+        def boom():
+            raise RuntimeError("active-profile derivation failed")
+
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", boom)
+
+        with self._client(
+            monkeypatch, isolated=True, hermes_home=str(tenant_home)
+        ) as c:
+            r = c.get("/api/profiles/default/soul")
+
+        assert r.status_code == 403, r.text
+
+    def test_same_profile_still_succeeds_by_path(self, tmp_path, monkeypatch):
+        """Control: a request for the exact profile the server was launched
+        with still succeeds (path equality), even when the name string would
+        be a sentinel in the old scheme."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        alice = profiles_root / "alice"
+        alice.mkdir(parents=True, exist_ok=True)
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "alice")
+
+        with self._client(
+            monkeypatch, isolated=True, hermes_home=str(alice)
+        ) as c:
+            put = c.put("/api/profiles/alice/soul", json={"content": SOUL})
+            get = c.get("/api/profiles/alice/soul")
+
+        assert put.status_code == 200, put.text
+        assert get.status_code == 200, get.text
+        assert get.json()["content"] == SOUL
+
+    def test_machine_dashboard_unaffected(self, tmp_path, monkeypatch):
+        """Control: with isolation off (the unified machine dashboard), the
+        same custom-named profile stays reachable — the boundary only bites
+        when --isolated is set."""
+        monkeypatch.setenv("HOME", str(tmp_path))
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        custom = profiles_root / "custom"
+        custom.mkdir(parents=True, exist_ok=True)
+        import hermes_cli.profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "custom")
+
+        with self._client(
+            monkeypatch, isolated=False, hermes_home=str(tmp_path / ".hermes")
+        ) as c:
+            put = c.put("/api/profiles/custom/soul", json={"content": SOUL})
+
+        assert put.status_code == 200, put.text
+        assert (custom / "SOUL.md").read_text(encoding="utf-8") == SOUL
+
+
+class TestIsolatedAggregateScope:
+    """Alice/Bob matrix for the aggregate + list read surfaces (#91330 review,
+    re-review 2026-08-31): an isolated server pinned to Alice must narrow every
+    aggregate/list read to Alice, 403 explicit sibling selectors BEFORE any
+    I/O, and never open Bob's ``state.db``."""
+
+    @contextlib.contextmanager
+    def _client(self, monkeypatch, *, isolated: bool, hermes_home: str):
+        monkeypatch.setenv("HERMES_HOME", hermes_home)
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "soul-test-token")
+        from hermes_cli import web_server
+        from hermes_constants import get_hermes_home
+
+        prev = getattr(web_server.app.state, "isolated", None)
+        had = hasattr(web_server.app.state, "isolated")
+        prev_scope = getattr(web_server.app.state, "isolated_scope_dir", None)
+        had_scope = hasattr(web_server.app.state, "isolated_scope_dir")
+        web_server.app.state.isolated = isolated
+        web_server.app.state.isolated_scope_dir = get_hermes_home().resolve()
+        c = TestClient(web_server.app, raise_server_exceptions=False)
+        c.headers["Authorization"] = "Bearer soul-test-token"
+        try:
+            with c:
+                yield c
+        finally:
+            if had:
+                web_server.app.state.isolated = prev
+            else:
+                delattr(web_server.app.state, "isolated")
+            if had_scope:
+                web_server.app.state.isolated_scope_dir = prev_scope
+            else:
+                delattr(web_server.app.state, "isolated_scope_dir")
+
+    def _opened_db_paths(self, monkeypatch, tmp_path):
+        """Record every state.db the routes open via a fake SessionDB."""
+        import hermes_state
+
+        opened = []
+
+        class _FakeDB:
+            def __init__(self, db_path, read_only=False):
+                opened.append(str(db_path))
+
+            def list_sessions_rich(self, **kwargs):
+                return []
+
+            def session_count(self, **kwargs):
+                return 0
+
+            def usage_totals(self):
+                return {}
+
+            def find_pr_url_messages(self, ids):
+                return []
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(hermes_state, "SessionDB", _FakeDB)
+        return opened
+
+    def _seed(self, tmp_path):
+        profiles_root = tmp_path / ".hermes" / "profiles"
+        for name in ("alice", "bob"):
+            home = profiles_root / name
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "state.db").write_bytes(b"\x00" * 8)
+        return profiles_root
+
+    def test_list_profiles_narrows_to_pinned(self, tmp_path, monkeypatch):
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        import hermes_cli.profiles as profiles_mod
+
+        def fake_list_profiles():
+            from types import SimpleNamespace
+
+            return [
+                SimpleNamespace(name="alice", path=str(alice)),
+                SimpleNamespace(name="bob", path=str(profiles_root / "bob")),
+                SimpleNamespace(name="default", path=str(tmp_path / ".hermes")),
+            ]
+
+        monkeypatch.setattr(profiles_mod, "list_profiles", fake_list_profiles)
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            r = c.get("/api/profiles")
+
+        assert r.status_code == 200, r.text
+        names = [p["name"] for p in r.json()["profiles"]]
+        assert names == ["alice"], f"sibling profiles leaked: {names}"
+
+    def test_sessions_all_clamped_to_pinned_db_only(self, tmp_path, monkeypatch):
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        opened = self._opened_db_paths(monkeypatch, tmp_path)
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            r = c.get("/api/profiles/sessions?profile=all")
+
+        assert r.status_code == 200, r.text
+        assert str(alice / "state.db") in opened
+        assert not any("bob" in p for p in opened), f"Bob's DB opened: {opened}"
+
+    def test_sessions_explicit_sibling_403_before_io(self, tmp_path, monkeypatch):
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        opened = self._opened_db_paths(monkeypatch, tmp_path)
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            r = c.get("/api/profiles/sessions?profile=bob")
+
+        assert r.status_code == 403, r.text
+        # The 403 must fire before any sibling I/O: Bob's state.db is never
+        # opened (the only open recorded is the app's own test home, which is
+        # a startup side effect, not a route target).
+        assert not any("bob" in p for p in opened), f"Bob's DB opened: {opened}"
+
+    def test_sidebar_pinned_only_and_sibling_403(self, tmp_path, monkeypatch):
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        opened = self._opened_db_paths(monkeypatch, tmp_path)
+
+        try:
+            with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+                ok = c.get("/api/profiles/sessions/sidebar")
+                bad = c.get("/api/profiles/sessions/sidebar?recents_profile=bob")
+        finally:
+            # The sidebar response is cached per-request-args in a short-TTL
+            # single-flight cache keyed ONLY on the request parameters (not on
+            # HERMES_HOME / db contents), so a later test in the same process
+            # calling the same endpoint shape would be served this test's
+            # stale (alice-scoped) payload. Clear it so sibling tests see a
+            # fresh scan under their own HERMES_HOME.
+            from hermes_cli.web_routers import profiles as _profiles_mod
+
+            try:
+                _profiles_mod.get_profiles_sessions_sidebar.cache_clear()
+            except AttributeError:
+                pass
+
+        assert ok.status_code == 200, ok.text
+        assert bad.status_code == 403, bad.text
+
+    def test_projects_tree_pinned_only(self, tmp_path, monkeypatch):
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        opened = self._opened_db_paths(monkeypatch, tmp_path)
+        import tui_gateway.server as gateway_server
+
+        monkeypatch.setattr(
+            gateway_server,
+            "_build_project_tree",
+            lambda *a, **k: ({"projects": [], "scoped_session_ids": []}, None),
+        )
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            r = c.get("/api/profiles/projects/tree")
+
+        assert r.status_code == 200, r.text
+        assert str(alice / "state.db") in opened
+        assert not any("bob" in p for p in opened), f"Bob's DB opened: {opened}"
+
+    def test_pull_requests_pinned_only(self, tmp_path, monkeypatch):
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        opened = self._opened_db_paths(monkeypatch, tmp_path)
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            r = c.post("/api/profiles/sessions/pull-requests", json={"ids": ["s1"]})
+
+        assert r.status_code == 200, r.text
+        assert str(alice / "state.db") in opened
+        assert not any("bob" in p for p in opened), f"Bob's DB opened: {opened}"
+
+    def test_sessions_query_clamped(self, tmp_path, monkeypatch):
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+        opened = self._opened_db_paths(monkeypatch, tmp_path)
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            ok = c.get("/api/sessions?profile=all")
+            bad = c.get("/api/sessions?profile=bob")
+
+        assert ok.status_code == 200, ok.text
+        assert bad.status_code == 403, bad.text
+        assert not any("bob" in p for p in opened), f"Bob's DB opened: {opened}"
+
+    def test_status_and_messaging_sibling_403(self, tmp_path, monkeypatch):
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            all_ok = c.get("/api/status?profile=all")
+            sibling = c.get("/api/status?profile=bob")
+            msg_sibling = c.get("/api/messaging/platforms?profile=bob")
+
+        assert all_ok.status_code == 200, all_ok.text
+        assert sibling.status_code == 403, sibling.text
+        assert msg_sibling.status_code == 403, msg_sibling.text

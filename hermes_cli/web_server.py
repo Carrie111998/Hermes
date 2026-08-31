@@ -3771,6 +3771,10 @@ def _merge_profile_gateway_platforms(
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
     status_scope = None
+    # An isolated backend answers only for its pinned profile — explicit
+    # sibling selectors 403 before any config/env/gateway read (#91330
+    # review, consolidation owner).
+    profile = _clamp_profile_query_for_isolated(profile, allow_all=True)
     requested_profile = (profile or "").strip()
     # Plain /api/status stays the machine-level public liveness probe. The
     # dashboard adds ?profile= when its management switcher targets another
@@ -10647,6 +10651,10 @@ async def cancel_telegram_onboarding(pairing_id: str):
 
 @app.get("/api/messaging/platforms")
 async def get_messaging_platforms(profile: Optional[str] = None):
+    # An isolated backend answers only for its pinned profile — explicit
+    # sibling selectors 403 before any channel-credential/env read (#91330
+    # review, consolidation owner).
+    profile = _clamp_profile_query_for_isolated(profile, allow_all=True)
     # Profile-scoped so the dashboard's global profile switcher shows the
     # TARGET profile's channel credentials/state, not the root install's.
     # load_env() honors the HERMES_HOME contextvar override; the gateway
@@ -15011,7 +15019,131 @@ def _fallback_profile_dicts(profiles_mod) -> List[Dict[str, Any]]:
                 "has_alias": False,
             })
 
+    # An isolated server must not even surface sibling profiles in the list.
+    if _is_isolated_server():
+        scope = _isolated_scope_dir()
+        pinned = _profile_name_for_scope(scope)
+        if pinned is None:
+            return []
+        profiles = [p for p in profiles if p.get("name") == pinned]
+
     return profiles
+
+
+def _is_isolated_server() -> bool:
+    """True when this server was launched with ``--isolated``.
+
+    Threaded from the ``--isolated`` flag through :func:`start_server` into
+    ``app.state.isolated``. Defaults to False so a server that never ran
+    ``start_server`` (e.g. a bare TestClient without the helper setting it)
+    is treated as the unified machine dashboard, which is the safe
+    non-restricting default.
+    """
+    return bool(getattr(app.state, "isolated", False))
+
+
+def _isolated_scope_dir() -> Optional[Path]:
+    """The canonical resolved HERMES_HOME this isolated server is scoped to.
+
+    Captured once in :func:`start_server` at launch as an immutable path on
+    ``app.state`` (#91330 review: "capture the canonical isolated launch
+    authority once in start_server() and store that immutable identity/path
+    in app.state"). Falls back to the process's current ``HERMES_HOME`` when
+    ``start_server`` never ran (tests set ``app.state.isolated`` directly);
+    ``get_hermes_home()`` is process-stable so the fallback is deterministic.
+
+    Comparing by *resolved path* rather than profile-name string is exactly
+    what closes the aliasing bypass: ``get_active_profile_name()`` returns the
+    sentinels ``"custom"`` / ``"default"`` for an unrecognized home or a
+    derivation failure, and those strings are also valid real profile names —
+    a name-based equality check could therefore alias an isolated server onto
+    a sibling profile and pass ``_assert_profile_in_scope``.
+    """
+    stored = getattr(app.state, "isolated_scope_dir", None)
+    if stored is not None:
+        return Path(stored).resolve()
+    if not _is_isolated_server():
+        return None
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home().resolve()
+
+
+def _profile_name_for_scope(scope_dir: Optional[Path]) -> Optional[str]:
+    """Map a resolved HERMES_HOME to its profile name, or ``None``.
+
+    Returns ``"default"`` for the root home, the profile name for a home under
+    ``~/.hermes/profiles/<name>``, and ``None`` for any unrecognized/ambiguous
+    home. ``None`` is the fail-closed signal: an isolated server with no
+    unambiguous principal may not prove any named profile is in scope, so it
+    is denied rather than inferred to be one.
+    """
+    if scope_dir is None:
+        return None
+    from hermes_cli import profiles as profiles_mod
+
+    scope = Path(scope_dir).resolve()
+    if scope == profiles_mod._get_default_hermes_home().resolve():
+        return "default"
+    profiles_root = profiles_mod._get_profiles_root().resolve()
+    try:
+        rel = scope.relative_to(profiles_root)
+        if len(rel.parts) == 1 and profiles_mod._PROFILE_ID_RE.match(rel.parts[0]):
+            return rel.parts[0]
+    except ValueError:
+        pass
+    return None
+
+
+def _clamp_profile_query_for_isolated(profile: Optional[str], *, allow_all: bool = False) -> Optional[str]:
+    """Clamp or reject a ``profile`` query param against the isolated scope.
+
+    The unified machine dashboard is intentionally cross-profile and returns
+    ``profile`` unchanged. An isolated server answers only for its pinned
+    profile: ``profile=all`` (a dashboard-sidebar convenience meaning "all
+    sessions for this backend") is clamped to the pinned profile, an explicit
+    sibling selector is rejected with 403 *before any I/O*, and the pinned
+    profile passes through. ``None``/``""``/``"current"`` mean the backend's
+    own profile and pass through unchanged.
+
+    Identity is the canonical resolved launch path stored on ``app.state`` at
+    :func:`start_server` — never a profile-name string (the ``"custom"`` /
+    ``"default"`` sentinels of ``get_active_profile_name()`` collide with real
+    profile names and would alias a sibling onto the isolation boundary).
+    """
+    if not _is_isolated_server():
+        return profile
+    requested = (profile or "").strip()
+    if not requested or requested.lower() == "current":
+        return profile
+    if allow_all and requested.lower() == "all":
+        # "all sessions" on an isolated backend means "this profile's
+        # sessions", not "every profile on disk".
+        scope = _isolated_scope_dir()
+        name = _profile_name_for_scope(scope)
+        if name is None:
+            raise HTTPException(
+                status_code=403,
+                detail="This dashboard is isolated but has no unambiguous scoped profile.",
+            )
+        return name
+
+    from hermes_cli import profiles as profiles_mod
+    try:
+        requested_canon = profiles_mod.normalize_profile_name(requested)
+        profiles_mod.validate_profile_name(requested_canon)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    scope = _isolated_scope_dir()
+    requested_dir = profiles_mod.get_profile_dir(requested_canon).resolve()
+    if scope is not None and scope == requested_dir:
+        return requested_canon
+    shown = _profile_name_for_scope(scope) if scope is not None else "(unknown)"
+    raise HTTPException(
+        status_code=403,
+        detail=f"This dashboard is isolated to '{shown}'; refusing profile '{requested_canon}'.",
+    )
 
 
 def _resolve_profile_dir(name: str) -> Path:
@@ -19557,6 +19689,7 @@ def start_server(
     allow_public: bool = False,
     initial_profile: str = "",
     headless: bool = False,
+    isolated: bool = False,
     ssh_session_token: Optional[str] = None,
     ssh_owner_nonce: Optional[str] = None,
 ):
@@ -19571,11 +19704,29 @@ def start_server(
     build and no SPA mount (mount_spa() honours ``HERMES_SERVE_HEADLESS``), so
     the banner announces the bind rather than a browser URL.
 
+    ``isolated`` marks a server launched with ``--isolated``: it is scoped
+    to a single profile (its own HERMES_HOME) and must not read, mutate,
+    export, or delete another profile's data (enforced by the per-profile
+    guard ``_assert_profile_in_scope`` on the profiles router). The unified
+    machine dashboard (isolated=False) remains a machine-wide management
+    surface.
+
     ``ssh_session_token`` and ``ssh_owner_nonce`` are process-local Desktop SSH
     bootstrap state. Neither is persisted or exported to child processes.
     """
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
+    app.state.isolated = bool(isolated)
+    # Capture the canonical launch authority once, as an immutable path. The
+    # isolated scope must be an identity this process was actually launched
+    # with — never re-derived at request time from a string that can alias a
+    # sibling profile ("custom"/"default" sentinels) (#91330 review).
+    if isolated:
+        from hermes_constants import get_hermes_home
+
+        app.state.isolated_scope_dir = get_hermes_home().resolve()
+    else:
+        app.state.isolated_scope_dir = None
 
     # Raise RLIMIT_NOFILE for dashboard-mode starts that don't route through
     # the `serve` path in main.py (which applies the same floor). Canonical

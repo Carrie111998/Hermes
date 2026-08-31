@@ -42,6 +42,7 @@ manage_router = APIRouter()
 
 # Late-bound web_server helpers (resolved at call time; cycle-safe,
 # monkeypatch-transparent).
+_clamp_profile_query_for_isolated = late("_clamp_profile_query_for_isolated")
 _cron_default_profile = late("_cron_default_profile")
 _cron_profile_home = late("_cron_profile_home")
 _import_sessions_for_profile = late("_import_sessions_for_profile")
@@ -118,6 +119,10 @@ def get_sessions(
     Rows omit ``system_prompt``/``model_config`` (the payload-dominating
     fields no list UI reads) unless ``full=1`` is passed.
     """
+    # An isolated backend answers only for its pinned profile — an explicit
+    # sibling selector 403s before any session DB is opened (#91330 review,
+    # consolidation owner).
+    profile = _clamp_profile_query_for_isolated(profile, allow_all=True)
     if archived not in ("exclude", "only", "include"):
         raise HTTPException(
             status_code=400,
@@ -223,6 +228,9 @@ async def search_sessions(
     """
     if not q or not q.strip():
         return {"results": []}
+    # An isolated backend searches only its pinned profile's session DB —
+    # a sibling selector 403s before any FTS read (#91330 review).
+    profile = _clamp_profile_query_for_isolated(profile, allow_all=True)
     try:
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
@@ -470,8 +478,11 @@ async def bulk_delete_sessions_endpoint(body: BulkDeleteSessions):
             status_code=400,
             detail="ids must contain at most 500 entries",
         )
+    # Isolated backend: sibling profile targets are refused before I/O.
+    target_profile = _clamp_profile_query_for_isolated(body.profile, allow_all=True)
+
     def _delete() -> int:
-        db = _open_session_db_for_profile(body.profile, read_only=False)
+        db = _open_session_db_for_profile(target_profile, read_only=False)
         try:
             return db.delete_sessions(body.ids)
         finally:
@@ -497,8 +508,11 @@ async def import_sessions_endpoint(request: Request):
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid session import payload") from exc
 
+    # Isolated backend: importing into a sibling profile's session DB is
+    # refused before I/O.
+    target_profile = _clamp_profile_query_for_isolated(body.profile, allow_all=True)
     try:
-        result = await asyncio.to_thread(_import_sessions_for_profile, body.profile, body.sessions)
+        result = await asyncio.to_thread(_import_sessions_for_profile, target_profile, body.sessions)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -515,6 +529,9 @@ async def count_empty_sessions_endpoint(profile: Optional[str] = None):
     UI hides the affordance so users aren't presented with a button
     that does nothing. Cheap, single-COUNT query.
     """
+    # Isolated backend: the count is for its pinned profile only.
+    profile = _clamp_profile_query_for_isolated(profile, allow_all=True)
+
     def _count() -> int:
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
@@ -550,6 +567,9 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     prune-on-startup pass. Matching that pre-existing trade-off keeps
     the two delete endpoints' DB-vs-disk behaviour consistent.
     """
+    # Isolated backend: the sweep is for its pinned profile only.
+    profile = _clamp_profile_query_for_isolated(profile, allow_all=True)
+
     def _delete() -> int:
         db = _open_session_db_for_profile(profile, read_only=False)
         try:
@@ -568,6 +588,8 @@ async def get_session_stats(profile: Optional[str] = None):
     Registered before ``/api/sessions/{session_id}`` so the literal ``stats``
     path isn't captured as a session id by the parameterized route.
     """
+    # Isolated backend: stats are for its pinned profile only.
+    profile = _clamp_profile_query_for_isolated(profile, allow_all=True)
     db = _open_session_db_for_profile(profile, read_only=True)
     try:
         total = db.session_count(include_archived=True)
