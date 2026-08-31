@@ -214,7 +214,6 @@ class TestStaleBridgeHandshake:
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch("aiohttp.ClientSession", mock_client), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
-             patch("plugins.platforms.whatsapp.adapter.asyncio.create_task", side_effect=lambda coro: (coro.close(), MagicMock())[1]), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.create_task", side_effect=lambda coro: (coro.close(), MagicMock())[1]) as mock_task, \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
              patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
