@@ -803,6 +803,21 @@ def cmd_mcp_test(args):
     headers = cfg.get("headers", {})
     if auth_type == "oauth":
         _info("Auth: OAuth 2.1 PKCE")
+    elif auth_type == "service_account":
+        sa = cfg.get("service_account") or {}
+        token_url = sa.get("token_url", "(token_url not set)")
+        client_id = sa.get("client_id", "?")
+        username = sa.get("username", "?")
+        password_env = sa.get("password_env", "?")
+        _info(f"Auth: service account (M2M OAuth)")
+        _info(f"  token_url:    {token_url}")
+        _info(f"  client_id:    {client_id}")
+        _info(f"  username:     {username}")
+        _info(f"  password_env: {password_env}  (value read from env at connect time)")
+        if sa.get("scope"):
+            _info(f"  scope:        {sa['scope']}")
+        if sa.get("client_secret_env"):
+            _info(f"  client_secret_env: {sa['client_secret_env']}  (value read from env)")
     elif headers:
         for k, v in headers.items():
             if isinstance(v, str) and ("key" in k.lower() or "auth" in k.lower()):
