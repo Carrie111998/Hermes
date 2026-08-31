@@ -574,6 +574,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
              "--provider <name>). Cleared together with the model.",
     )
 
+    # --- set-reasoning (per-task reasoning override) ---
+    p_set_reasoning = sub.add_parser(
+        "set-reasoning",
+        help="Set or clear a task's reasoning-effort override "
+             "(takes effect on the next dispatch)",
+    )
+    p_set_reasoning.add_argument("task_id")
+    p_set_reasoning.add_argument(
+        "effort",
+        help="Reasoning effort to pin (none, minimal, low, medium, high, "
+             "xhigh, max, ultra) or 'inherit' to clear the override",
+    )
+
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
         "reclaim",
@@ -1193,6 +1206,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "set-model": _cmd_set_model,
+            "set-reasoning": _cmd_set_reasoning,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -2039,6 +2053,31 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     else:
         print(f"Cleared model override on {args.task_id} "
               "(worker uses its profile default)")
+    return 0
+
+
+def _cmd_set_reasoning(args: argparse.Namespace) -> int:
+    raw_effort = args.effort.strip().lower()
+    effort = (
+        None
+        if raw_effort in {"inherit", "default", "-", "null"}
+        else raw_effort
+    )
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_reasoning_effort(conn, args.task_id, effort)
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if effort is None:
+        print(f"Cleared reasoning effort on {args.task_id} "
+              "(worker uses its profile default)")
+    else:
+        print(f"Set reasoning effort on {args.task_id}: {effort} "
+              "(applies on next dispatch)")
     return 0
 
 
