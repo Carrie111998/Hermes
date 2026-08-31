@@ -578,6 +578,18 @@ def _steady_state_decision(
         if key[0] == filename and key[2] == group_name
     }
 
+    if group_name.startswith("unknown:"):
+        current = {
+            root_id: _value_for_group(observation, group_name)
+            for root_id, observation in observations.items()
+        }
+        return None, RegistryConflict(
+            filename=filename,
+            group_name=group_name,
+            reason="unknown_field_unclassified",
+            candidates=MappingProxyType(current),
+        )
+
     # Missing replicas have no observation but retain a root-specific baseline.  Current
     # deltas are derived only from extant files; creation uses the accepted composite.
     for root_id, observation in observations.items():
@@ -586,14 +598,6 @@ def _steady_state_decision(
         baseline = baseline_index[(filename, root_id, group_name)]
         if value != baseline.value_json:
             changed[root_id] = value
-
-    if group_name.startswith("unknown:"):
-        return None, RegistryConflict(
-            filename=filename,
-            group_name=group_name,
-            reason="unknown_field_unclassified",
-            candidates=MappingProxyType(current),
-        )
 
     if group_name.startswith("protected:"):
         if changed:

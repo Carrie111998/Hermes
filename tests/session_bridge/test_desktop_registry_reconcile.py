@@ -349,34 +349,21 @@ def test_steady_state_merges_disjoint_replica_changes(tmp_path: Path) -> None:
     assert not plan.conflicts
 
 
-def test_steady_state_unknown_key_change_is_quarantined_and_preserved(
+def test_new_unknown_key_after_baseline_is_quarantined_and_preserved(
     tmp_path: Path,
 ) -> None:
     a, b, c = (tmp_path / name for name in ("a", "b", "c"))
     for root in (a, b, c):
-        _write_record(root, "local_one", mtime_ns=100, futureDesktopField="present")
+        _write_record(root, "local_one", mtime_ns=100)
     initial = build_registry_sync_plan(_scan(a, b, c), baselines=())
-    classified_baselines = tuple(initial.proposed_baselines) + tuple(
-        RegistryBaseline(
-            filename="local_one.json",
-            root_id=root_id,
-            group_name="unknown:futureDesktopField",
-            value_json=json.dumps(
-                {"state": "present", "value": "present"},
-                separators=(",", ":"),
-            ),
-            revision=1,
-        )
-        for root_id in initial.scan.roots
-    )
 
-    for root in (a, b):
+    for root, value in ((a, "from-a"), (b, "from-b")):
         path = root / "local_one.json"
         record = json.loads(path.read_text(encoding="utf-8"))
-        del record["futureDesktopField"]
+        record["futureDesktopField"] = value
         path.write_text(json.dumps(record), encoding="utf-8")
 
-    plan = build_registry_sync_plan(_scan(a, b, c), baselines=classified_baselines)
+    plan = build_registry_sync_plan(_scan(a, b, c), baselines=initial.proposed_baselines)
 
     conflict = next(
         item
@@ -388,9 +375,15 @@ def test_steady_state_unknown_key_change_is_quarantined_and_preserved(
         "local_one.json"
     ].desired_groups
     assert not plan.records["local_one.json"].mutations
-    assert json.loads((c / "local_one.json").read_text(encoding="utf-8"))[
+    assert "futureDesktopField" not in json.loads(
+        (c / "local_one.json").read_text(encoding="utf-8")
+    )
+    assert json.loads((a / "local_one.json").read_text(encoding="utf-8"))[
         "futureDesktopField"
-    ] == "present"
+    ] == "from-a"
+    assert json.loads((b / "local_one.json").read_text(encoding="utf-8"))[
+        "futureDesktopField"
+    ] == "from-b"
 
 
 def test_steady_state_protected_linkage_change_is_quarantined(
