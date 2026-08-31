@@ -230,12 +230,15 @@ import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { resolveHudWindowing } from './hud-windowing'
 import {
+  fetchWithGuardedRedirects,
   HostRateLimiter,
+  type HttpHopResponse,
   type LinkPreviewIo,
   type LinkPreviewResult,
   LinkPreviewStore,
   PREVIEW_HOST_SPACING_MS,
   PREVIEW_MAX_CONCURRENT,
+  PREVIEW_MAX_REDIRECTS,
   PREVIEW_TTL_MS,
   type PreviewPersistence,
   resolveLinkPreview
@@ -5340,7 +5343,6 @@ const titleInflight = new Map()
 const TITLE_CACHE_LIMIT = 500
 const TITLE_BYTE_BUDGET = 96 * 1024
 const TITLE_TIMEOUT_MS = 5000
-const TITLE_MAX_REDIRECTS = 3
 
 // Browser-shaped UA — many bot-walled sites (GetYourGuide, Cloudflare-protected
 // pages) refuse anything that doesn't look like a real Chrome.
@@ -5414,22 +5416,40 @@ function parseHtmlTitle(html) {
   return raw ? decodeHtmlEntities(raw).replace(/\s+/g, ' ').trim() : ''
 }
 
-function fetchHtmlTitleWithCurl(rawUrl: string): Promise<string> {
+// ─── Tier-1 page fetch (one resolver for the title fetcher AND link previews) ─
+// curl is driven ONE HOP at a time and every hop is re-validated by
+// fetchWithGuardedRedirects (link-preview.ts). The old `--location` followed
+// any 30x to an arbitrary destination with no guard, which turned a vetted
+// public link into a fetch of loopback/RFC1918/169.254.x.x. `--include` puts
+// the status line and headers on stdout so the hop loop can read them; the
+// byte budget covers the header block too, which keeps the cap honest.
+// TITLE_TIMEOUT_MS is the budget for the WHOLE walk — the same wall clock the
+// single `--max-time` governed before.
+
+function splitHopResponse(raw: string): HttpHopResponse {
+  const separator = raw.indexOf('\r\n\r\n')
+
+  if (separator < 0) {
+    // No header block: malformed response, treat as a transport failure.
+    return { status: 0, location: '', body: '' }
+  }
+
+  const head = raw.slice(0, separator)
+  const statusLine = head.split('\n')[0] ?? ''
+  const status = Number(statusLine.match(/\b(\d{3})\b/)?.[1] ?? 0)
+  const location = head.match(/^location:[ \t]*(.*)$/im)?.[1]?.trim() ?? ''
+
+  return { status, location, body: raw.slice(separator + 4) }
+}
+
+function curlOneHop(url: string, timeoutMs: number): Promise<HttpHopResponse> {
   return new Promise(resolve => {
-    const url = String(rawUrl || '').trim()
-
-    if (!url) {
-      return resolve('')
-    }
-
     const args = [
       '--silent',
       '--show-error',
-      '--location',
-      '--max-redirs',
-      String(TITLE_MAX_REDIRECTS),
+      '--include',
       '--max-time',
-      String(Math.max(2, Math.ceil(TITLE_TIMEOUT_MS / 1000))),
+      String(Math.max(1, Math.ceil(timeoutMs / 1000))),
       '--connect-timeout',
       '4',
       '--user-agent',
@@ -5445,7 +5465,7 @@ function fetchHtmlTitleWithCurl(rawUrl: string): Promise<string> {
     ]
 
     const child = spawn('curl', args, hiddenWindowsChildOptions({ stdio: ['ignore', 'pipe', 'ignore'] }))
-    const chunks = []
+    const chunks: Buffer[] = []
     let bytes = 0
 
     child.stdout.on('data', chunk => {
@@ -5460,15 +5480,45 @@ function fetchHtmlTitleWithCurl(rawUrl: string): Promise<string> {
       bytes += next.length
     })
 
-    child.on('error', () => resolve(''))
-    child.on('close', () => {
-      if (!chunks.length) {
-        return resolve('')
-      }
-
-      resolve(parseHtmlTitle(Buffer.concat(chunks).toString('utf8')))
-    })
+    child.on('error', () => resolve({ status: 0, location: '', body: '' }))
+    child.on('close', () => resolve(splitHopResponse(Buffer.concat(chunks).toString('utf8'))))
   })
+}
+
+function resolveHostAddresses(hostname: string): Promise<string[]> {
+  return new Promise(resolve => {
+    try {
+      dns.lookup(hostname, { all: true }, (error, addresses) => {
+        resolve(error || !addresses?.length ? [] : addresses.map(address => address.address))
+      })
+    } catch {
+      resolve([])
+    }
+  })
+}
+
+async function fetchPageHtmlWithCurl(rawUrl: string): Promise<string> {
+  const url = String(rawUrl || '').trim()
+
+  if (!url) {
+    return ''
+  }
+
+  const deadline = Date.now() + TITLE_TIMEOUT_MS
+
+  const result = await fetchWithGuardedRedirects(
+    url,
+    {
+      fetchOnce: hopUrl => curlOneHop(hopUrl, deadline - Date.now()),
+      resolveHost: resolveHostAddresses
+    },
+    { maxRedirects: PREVIEW_MAX_REDIRECTS }
+  )
+
+  // Refusals (private redirect hop, exhausted redirect budget) and transport
+  // failures both surface as '' — the same miss signal the old curl error
+  // leg produced, so tier 2 and the envelope see nothing new.
+  return result.ok ? result.html : ''
 }
 
 function getLinkTitleSession() {
@@ -5607,9 +5657,9 @@ function fetchLinkTitle(rawUrl) {
     return titleInflight.get(key)
   }
 
-  const pending = fetchHtmlTitleWithCurl(url)
+  const pending = fetchPageHtmlWithCurl(url)
     .catch(() => '')
-    .then(value => usableTitle((value || '').slice(0, 240)))
+    .then(value => usableTitle(parseHtmlTitle(value).slice(0, 240)))
     .then(
       async value => value || usableTitle(((await fetchHtmlTitleWithRenderer(url).catch(() => '')) || '').slice(0, 240))
     )
@@ -5626,63 +5676,13 @@ function fetchLinkTitle(rawUrl) {
 }
 
 // ─── Link previews (D7 click-to-expand unfurl) ───────────────────────────────
-// The policy (SSRF guard, per-host pacing, cache, field caps) lives in
-// link-preview.ts; this is its I/O and its IPC surface, mirroring how the
-// favicon ladder wires resolveFavicon into main.ts. Tier 1 reuses the exact
-// curl request the title fetcher makes, but keeps the whole byte-budgeted
-// document so og/meta tags survive; tier 2 is the existing hidden-window
-// renderer for pages that only render their title with JS.
-
-function fetchLinkHtml(rawUrl: string): Promise<string> {
-  return new Promise(resolve => {
-    const url = String(rawUrl || '').trim()
-
-    if (!url) {
-      return resolve('')
-    }
-
-    const args = [
-      '--silent',
-      '--show-error',
-      '--location',
-      '--max-redirs',
-      String(TITLE_MAX_REDIRECTS),
-      '--max-time',
-      String(Math.max(2, Math.ceil(TITLE_TIMEOUT_MS / 1000))),
-      '--connect-timeout',
-      '4',
-      '--user-agent',
-      TITLE_USER_AGENT,
-      '--header',
-      'Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.5',
-      '--header',
-      'Accept-Language: en-US,en;q=0.7',
-      '--header',
-      'Accept-Encoding: identity',
-      '--raw',
-      url
-    ]
-
-    const child = spawn('curl', args, hiddenWindowsChildOptions({ stdio: ['ignore', 'pipe', 'ignore'] }))
-    const chunks = []
-    let bytes = 0
-
-    child.stdout.on('data', chunk => {
-      if (bytes >= TITLE_BYTE_BUDGET) {
-        return
-      }
-
-      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
-      const remaining = TITLE_BYTE_BUDGET - bytes
-      const next = buffer.length > remaining ? buffer.subarray(0, remaining) : buffer
-      chunks.push(next)
-      bytes += next.length
-    })
-
-    child.on('error', () => resolve(''))
-    child.on('close', () => resolve(chunks.length ? Buffer.concat(chunks).toString('utf8') : ''))
-  })
-}
+// The policy (SSRF guard, per-hop redirect validation, per-host pacing, cache,
+// field caps) lives in link-preview.ts; this is its I/O and its IPC surface,
+// mirroring how the favicon ladder wires resolveFavicon into main.ts. Tier 1
+// shares fetchPageHtmlWithCurl with the title fetcher — same guarded hops, but
+// the whole byte-budgeted document survives so og/meta tags are readable;
+// tier 2 is the existing hidden-window renderer for pages that only render
+// their title with JS.
 
 const LINK_PREVIEW_CACHE_PATH = path.join(app.getPath('userData'), 'link-preview-cache.json')
 
@@ -5709,18 +5709,9 @@ const previewStore = new LinkPreviewStore(previewPersistence, { ttlMs: PREVIEW_T
 const previewLimiter = new HostRateLimiter(PREVIEW_HOST_SPACING_MS, PREVIEW_MAX_CONCURRENT)
 
 const previewIo: LinkPreviewIo = {
-  fetchHtml: fetchLinkHtml,
+  fetchHtml: fetchPageHtmlWithCurl,
   fetchRenderedTitle: fetchHtmlTitleWithRenderer,
-  resolveHost: hostname =>
-    new Promise(resolve => {
-      try {
-        dns.lookup(hostname, { all: true }, (error, addresses) => {
-          resolve(error || !addresses?.length ? [] : addresses.map(address => address.address))
-        })
-      } catch {
-        resolve([])
-      }
-    })
+  resolveHost: resolveHostAddresses
 }
 
 async function fetchLinkPreview(rawUrl: string): Promise<LinkPreviewResult> {

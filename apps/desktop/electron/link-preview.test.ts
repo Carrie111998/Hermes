@@ -5,6 +5,7 @@ import { afterEach, describe, test, vi } from 'vitest'
 import {
   canonicalPreviewKey,
   decodeHtmlEntities,
+  fetchWithGuardedRedirects,
   HostRateLimiter,
   isPrivateAddress,
   isPrivateHostname,
@@ -389,5 +390,170 @@ describe('resolveLinkPreview', () => {
     const result = await resolveLinkPreview(PAGE_URL, io, makeDeps(io))
 
     assert.deepEqual(result, { ok: false, reason: 'private-url' })
+  })
+})
+
+describe('fetchWithGuardedRedirects', () => {
+  const PUBLIC_IP = '93.184.216.34'
+
+  function hopIo(
+    hops: Record<string, { status: number; location?: string; body?: string }>,
+    options: { addresses?: string[] } = {}
+  ) {
+    const requested: string[] = []
+
+    return {
+      requested,
+      fetchOnce: async (url: string) => {
+        requested.push(url)
+        const hop = hops[url]
+
+        if (!hop) {
+          throw new Error(`unexpected hop: ${url}`)
+        }
+
+        return { status: hop.status, location: hop.location ?? '', body: hop.body ?? '' }
+      },
+      resolveHost: async () => options.addresses ?? [PUBLIC_IP]
+    }
+  }
+
+  const HTML = '<title>Final Page</title>'
+
+  test('no redirects: single hop, html and url returned', async () => {
+    const io = hopIo({ 'https://example.com/a': { status: 200, body: HTML } })
+    const result = await fetchWithGuardedRedirects('https://example.com/a', io)
+
+    assert.ok(result.ok)
+    assert.equal(result.url, 'https://example.com/a')
+    assert.equal(result.html, HTML)
+    assert.deepEqual(io.requested, ['https://example.com/a'])
+  })
+
+  test('public-to-public redirect chain is followed and reports the final URL', async () => {
+    const io = hopIo({
+      'https://example.com/a': { status: 302, location: 'https://cdn.example.org/b' },
+      'https://cdn.example.org/b': { status: 301, location: '/c' },
+      'https://cdn.example.org/c': { status: 200, body: HTML }
+    })
+
+    const result = await fetchWithGuardedRedirects('https://example.com/a', io)
+
+    assert.ok(result.ok)
+    assert.equal(result.url, 'https://cdn.example.org/c')
+    assert.equal(result.html, HTML)
+    assert.deepEqual(io.requested, [
+      'https://example.com/a',
+      'https://cdn.example.org/b',
+      'https://cdn.example.org/c'
+    ])
+  })
+
+  test('redirect to loopback is refused and the private host is never contacted', async () => {
+    const io = hopIo({
+      'https://example.com/a': { status: 302, location: 'http://127.0.0.1:8080/admin' }
+    })
+
+    const result = await fetchWithGuardedRedirects('https://example.com/a', io)
+
+    assert.deepEqual(result, { ok: false, reason: 'private-url' })
+    assert.deepEqual(io.requested, ['https://example.com/a'], 'only the initial hop may be requested')
+  })
+
+  test('redirect to link-local metadata address is refused', async () => {
+    const io = hopIo({
+      'https://example.com/a': { status: 302, location: 'http://169.254.169.254/latest/meta-data/' }
+    })
+
+    const result = await fetchWithGuardedRedirects('https://example.com/a', io)
+
+    assert.deepEqual(result, { ok: false, reason: 'private-url' })
+    assert.deepEqual(io.requested, ['https://example.com/a'])
+  })
+
+  test('redirect whose hostname resolves to a private address is refused', async () => {
+    let calls = 0
+
+    const io = hopIo(
+      {
+        'https://example.com/a': { status: 302, location: 'https://rebind.example.net/x' },
+        'https://rebind.example.net/x': { status: 200, body: HTML }
+      },
+      {}
+    )
+
+    io.resolveHost = async () => {
+      calls += 1
+
+      return calls > 1 ? ['10.0.0.9'] : [PUBLIC_IP]
+    }
+
+    const result = await fetchWithGuardedRedirects('https://example.com/a', io)
+
+    assert.deepEqual(result, { ok: false, reason: 'private-url' })
+    assert.deepEqual(io.requested, ['https://example.com/a'])
+  })
+
+  test('redirect to a non-http scheme is refused', async () => {
+    const io = hopIo({
+      'https://example.com/a': { status: 302, location: 'file:///etc/passwd' }
+    })
+
+    const result = await fetchWithGuardedRedirects('https://example.com/a', io)
+
+    assert.deepEqual(result, { ok: false, reason: 'private-url' })
+    assert.deepEqual(io.requested, ['https://example.com/a'])
+  })
+
+  test('localhost-named redirect target is refused by name', async () => {
+    const io = hopIo({
+      'https://example.com/a': { status: 302, location: 'https://localhost:3000/x' }
+    })
+
+    const result = await fetchWithGuardedRedirects('https://example.com/a', io)
+
+    assert.deepEqual(result, { ok: false, reason: 'private-url' })
+    assert.deepEqual(io.requested, ['https://example.com/a'])
+  })
+
+  test('more redirects than the budget allow is an error, not a fetch', async () => {
+    const io = hopIo({
+      'https://example.com/a': { status: 302, location: 'https://example.com/b' },
+      'https://example.com/b': { status: 302, location: 'https://example.com/c' },
+      'https://example.com/c': { status: 302, location: 'https://example.com/d' },
+      'https://example.com/d': { status: 302, location: 'https://example.com/e' }
+    })
+
+    const result = await fetchWithGuardedRedirects('https://example.com/a', io)
+
+    assert.deepEqual(result, { ok: false, reason: 'error' })
+    assert.equal(io.requested.length, 4)
+  })
+
+  test('initial private URL is refused before any request', async () => {
+    const io = hopIo({})
+    const result = await fetchWithGuardedRedirects('http://127.0.0.1:9222/json', io)
+
+    assert.deepEqual(result, { ok: false, reason: 'private-url' })
+    assert.deepEqual(io.requested, [])
+  })
+
+  test('transport failure mid-chain is an empty final body, never a throw', async () => {
+    const io = hopIo({
+      'https://example.com/a': { status: 302, location: 'https://example.com/b' }
+    })
+
+    io.fetchOnce = async (url: string) => {
+      if (url === 'https://example.com/b') {
+        throw new Error('curl died')
+      }
+
+      return { status: 302, location: 'https://example.com/b', body: '' }
+    }
+
+    const result = await fetchWithGuardedRedirects('https://example.com/a', io)
+
+    assert.ok(result.ok)
+    assert.equal(result.html, '')
   })
 })

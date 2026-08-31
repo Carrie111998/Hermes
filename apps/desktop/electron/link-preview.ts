@@ -267,6 +267,136 @@ function isDottedQuad(value: string): boolean {
   return DOTTED_QUAD_RE.test(value)
 }
 
+/** Redirects the guarded fetcher may follow — the old curl --max-redirs 3. */
+export const PREVIEW_MAX_REDIRECTS = 3
+
+/** One HTTP hop: a single response, with redirect following left to the caller. */
+export interface HttpHopResponse {
+  /** Status code; 0 means transport failure (an empty final body). */
+  status: number
+  /** Raw Location header value — possibly relative — or ''. */
+  location: string
+  /** Response body with the header block stripped. */
+  body: string
+}
+
+export interface GuardedRedirectIo {
+  /** Exactly one HTTP request; must never follow redirects on its own. */
+  fetchOnce: (url: string) => Promise<HttpHopResponse>
+  /** Resolved addresses for a hostname; [] when resolution fails. */
+  resolveHost: (hostname: string) => Promise<string[]>
+}
+
+export type GuardedRedirectResult =
+  | { ok: true; url: string; html: string }
+  | { ok: false; reason: LinkPreviewFailureReason }
+
+/**
+ * One hop's full SSRF verdict: scheme, hostname guard, and where the name
+ * actually resolves. The DNS half is the point — a redirect to a fresh
+ * attacker-controlled name that answers with an RFC1918/loopback address is
+ * exactly the doorway the initial-URL guard closes; without per-hop
+ * re-validation it stays wide open.
+ */
+async function guardHop(url: URL, io: GuardedRedirectIo): Promise<LinkPreviewFailureReason | null> {
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    return 'private-url'
+  }
+
+  if (isPrivateHostname(url.hostname)) {
+    return 'private-url'
+  }
+
+  let addresses: string[] = []
+
+  try {
+    addresses = await io.resolveHost(url.hostname)
+  } catch {
+    addresses = []
+  }
+
+  if (!addresses.length || addresses.some(isPrivateAddress)) {
+    return 'private-url'
+  }
+
+  return null
+}
+
+/**
+ * The tier-1 page fetch with the SSRF guard applied to EVERY hop.
+ *
+ * `curl --location` followed redirects with no re-validation, so a public URL
+ * answering 302 → http://127.0.0.1/ (or 169.254.169.254, or any RFC1918 name)
+ * was fetched and its title/description handed to the renderer — the guard on
+ * the initial URL proved only that the FIRST hop was safe. This walks the
+ * chain one hop at a time instead: each Location target must be http(s), pass
+ * the hostname guard, and resolve to public addresses before it is requested,
+ * with at most PREVIEW_MAX_REDIRECTS hops. Everything else about the fetch
+ * (timeouts, byte budget, UA) stays in the injected fetchOnce.
+ */
+export async function fetchWithGuardedRedirects(
+  rawUrl: string,
+  io: GuardedRedirectIo,
+  options: { maxRedirects?: number } = {}
+): Promise<GuardedRedirectResult> {
+  const maxRedirects = options.maxRedirects ?? PREVIEW_MAX_REDIRECTS
+
+  let current: URL
+
+  try {
+    current = new URL(String(rawUrl || '').trim())
+  } catch {
+    return { ok: false, reason: 'error' }
+  }
+
+  const firstRefusal = await guardHop(current, io)
+
+  if (firstRefusal) {
+    return { ok: false, reason: firstRefusal }
+  }
+
+  let redirectsFollowed = 0
+
+  for (;;) {
+    let response: HttpHopResponse
+
+    try {
+      response = await io.fetchOnce(current.toString())
+    } catch {
+      // Transport failure ends the walk; the empty body is the caller's miss signal.
+      return { ok: true, url: current.toString(), html: '' }
+    }
+
+    const location = (response.location || '').trim()
+    const isRedirect = response.status >= 300 && response.status < 400 && location !== ''
+
+    if (!isRedirect) {
+      return { ok: true, url: current.toString(), html: response.body }
+    }
+
+    if (redirectsFollowed >= maxRedirects) {
+      return { ok: false, reason: 'error' }
+    }
+
+    let next: URL
+
+    try {
+      next = new URL(location, current)
+    } catch {
+      return { ok: false, reason: 'error' }
+    }
+
+    const nextRefusal = await guardHop(next, io)
+
+    if (nextRefusal) {
+      return { ok: false, reason: nextRefusal }
+    }
+
+    current = next
+    redirectsFollowed += 1
+  }
+}
+
 /**
  * Per-host pacing plus a global concurrency cap.
  *
