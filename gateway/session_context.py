@@ -141,6 +141,19 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# Whether the bound HERMES_SESSION_CHAT_ID is one the CLIENT can address
+# again — the precondition for gateway.wake's /v1/chat/completions self-post
+# to deliver a background completion anywhere the requester will actually
+# look (#98619). "1" means wake-capable: the requester chose this id
+# explicitly (X-Hermes-Session-Id on the API server, a native API session, a
+# /v1/runs id) and can resume or reload it. "" means explicitly NOT
+# wake-capable: a fingerprint-derived chat id from a header-less
+# OpenAI-compatible client, where the wake either hard-fails (no
+# API_SERVER_KEY) or lands in a session whose history the client never
+# reloads. _UNSET means the binding never declared it; readers treat that
+# as "" (fail closed) rather than trusting the id by existence alone.
+_SESSION_WAKE_CAPABLE: ContextVar = ContextVar("HERMES_SESSION_WAKE_CAPABLE", default=_UNSET)
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -157,6 +170,7 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_SESSION_WAKE_CAPABLE": _SESSION_WAKE_CAPABLE,
     "HERMES_BROWSER_CONTROL_PRINCIPAL": _BROWSER_CONTROL_PRINCIPAL,
     "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY": _BROWSER_CONTROL_TRANSPORT_FAMILY,
     "HERMES_CRON_SESSION": _CRON_SESSION,
@@ -242,6 +256,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
+    wake_capable: str = "1",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -261,6 +276,13 @@ def set_session_vars(
     ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
     ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
     and ``""`` explicitly marks a non-cron session while masking leaked env.
+
+    ``wake_capable`` declares whether the bound chat id is one the client can
+    address again ("1") or a fingerprint-derived id a header-less client will
+    never reload (""). Binders that don't say otherwise keep "1" — the
+    historical assumption; only the API server's derived-id path opts out
+    (#98619). ``delegate_task``'s background gate reads it via
+    ``get_session_env("HERMES_SESSION_WAKE_CAPABLE")`` and fails closed.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -286,6 +308,7 @@ def set_session_vars(
         _BROWSER_CONTROL_PRINCIPAL.set(browser_control_principal),
         _BROWSER_CONTROL_TRANSPORT_FAMILY.set(browser_control_transport_family),
         _CRON_SESSION.set(cron_session),
+        _SESSION_WAKE_CAPABLE.set(wake_capable),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
     ]
     try:
@@ -324,6 +347,7 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_UI_SESSION_ID,
         _SESSION_MESSAGE_ID,
         _SESSION_PROFILE,
+        _SESSION_WAKE_CAPABLE,
         _BROWSER_CONTROL_PRINCIPAL,
         _BROWSER_CONTROL_TRANSPORT_FAMILY,
         _CRON_SESSION,

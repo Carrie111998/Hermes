@@ -140,6 +140,62 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     assert evt["origin_session_id"] == "raw-sid-7"
 
 
+def test_apiserver_derived_session_id_stays_synchronous(monkeypatch):
+    """#98619: a bound-but-derived chat id (header-less OpenAI-compatible
+    client, no X-Hermes-Session-Id) must NOT dispatch background — the wake
+    self-post would hard-fail (no API_SERVER_KEY) or land in a session whose
+    history the client never reloads. A session id merely existing is not
+    wake-capable; the binding must declare it."""
+    dt = _patch_delegate(monkeypatch)
+    set_session_vars(
+        platform="api_server",
+        chat_id="fingerprint-hex-0123456789abcdef",
+        session_key="fingerprint-hex-0123456789abcdef",
+        session_id="fingerprint-hex-0123456789abcdef",
+        wake_capable="",
+        async_delivery=False,
+    )
+
+    out = dt.delegate_task(
+        goal="bg derived", context="ctx",
+        background=True, parent_agent=_fake_parent(),
+    )
+    parsed = json.loads(out)
+    assert parsed.get("status") != "dispatched", parsed
+    assert "SYNCHRONOUSLY" in parsed.get("note", "")
+    assert process_registry.completion_queue.empty()
+
+
+def test_apiserver_wake_capability_unbound_fails_closed(monkeypatch):
+    """#98619 fail-closed: a session binding that never declared wake
+    capability (the var left at its _UNSET sentinel, with no os.environ
+    fallback) must not enable background dispatch, even with a chat id
+    bound — trust is declared, not assumed."""
+    dt = _patch_delegate(monkeypatch)
+    monkeypatch.delenv("HERMES_SESSION_WAKE_CAPABLE", raising=False)
+    set_session_vars(
+        platform="api_server",
+        chat_id="raw-sid-9",
+        session_key="raw-sid-9",
+        session_id="raw-sid-9",
+        async_delivery=False,
+    )
+    # Drop just this var back to "never declared" — the state a future
+    # binding path would leave if it forgot the flag.
+    import gateway.session_context as sc
+
+    sc._VAR_MAP["HERMES_SESSION_WAKE_CAPABLE"].set(sc._UNSET)
+
+    out = dt.delegate_task(
+        goal="bg undeclared", context="ctx",
+        background=True, parent_agent=_fake_parent(),
+    )
+    parsed = json.loads(out)
+    assert parsed.get("status") != "dispatched", parsed
+    assert "SYNCHRONOUSLY" in parsed.get("note", "")
+    assert process_registry.completion_queue.empty()
+
+
 # ---------------------------------------------------------------------------
 # _current_origin_session_id — the clobber-proof origin capture helper
 # ---------------------------------------------------------------------------

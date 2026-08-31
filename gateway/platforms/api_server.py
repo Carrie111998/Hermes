@@ -5275,6 +5275,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                # #98619: only an explicitly provided X-Hermes-Session-Id is
+                # wake-capable (the header is 403-gated on API_SERVER_KEY, so
+                # the wake self-post can authenticate and the client reads
+                # response headers). A fingerprint-derived id from a
+                # header-less client must keep delegate_task's forced-sync
+                # fallback — the wake would hard-fail or land unread.
+                wake_capable=("1" if provided_session_id else ""),
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -5296,6 +5303,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                wake_capable=("1" if provided_session_id else ""),
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -7215,6 +7223,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: str = "",
         browser_control_principal: str = "",
         browser_control_transport_family: str = "",
+        wake_capable: str = "1",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -7225,6 +7234,15 @@ class APIServerAdapter(BasePlatformAdapter):
         forgetting to mark the channel as non-delivering. There is no
         ``async_delivery`` parameter to get wrong; the stateless HTTP path can
         never wake the agent after the turn ends, on ANY route.
+
+        ``wake_capable`` is the separate #98619 gate: "1" means the bound
+        chat id is one the client can address again (explicit
+        X-Hermes-Session-Id, a native API session, a /v1/runs id), so the
+        wake self-post can deliver a background delegation somewhere the
+        client will read it; "" means fingerprint-derived (header-less
+        client) — delegate_task keeps its forced-sync fallback there.
+        Defaults to "1" so entry points whose clients hold the id keep
+        today's behavior.
 
         Returns reset tokens; pass them to ``clear_session_vars`` in a
         ``finally`` block (the binding is request-scoped and must not outlive
@@ -7242,6 +7260,7 @@ class APIServerAdapter(BasePlatformAdapter):
             browser_control_transport_family=browser_control_transport_family,
             async_delivery=False,
             cron_session="",
+            wake_capable=wake_capable,
         )
 
     async def _run_agent(
@@ -7265,6 +7284,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        wake_capable: str = "1",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7285,6 +7305,10 @@ class APIServerAdapter(BasePlatformAdapter):
         active the completed agent's actual provider/model must match the
         locked selection or the turn fails, and the response carries
         sanitized ``runtime`` metadata reporting actual vs requested.
+
+        *wake_capable* threads through to ``_bind_api_server_session`` —
+        pass "" when the effective session id is fingerprint-derived so
+        background delegations keep the forced-sync fallback (#98619).
 
         If *agent_ref* is a one-element list, the AIAgent instance is stored
         at ``agent_ref[0]`` before ``run_conversation`` begins.  This allows
@@ -7319,6 +7343,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     browser_control_transport_family=(
                         request_browser_control_transport_family
                     ),
+                    wake_capable=wake_capable,
                 )
                 agent = None
                 try:

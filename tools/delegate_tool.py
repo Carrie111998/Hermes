@@ -4033,7 +4033,10 @@ def delegate_task(
     # id before the background-dispatch code below would read it. The
     # request-scoped chat_id binding (the raw X-Hermes-Session-Id on
     # api_server) is untouched by child construction, so read it here and
-    # thread it through the dispatch.
+    # thread it through the dispatch. The wake-capability flag rides the same
+    # request-scoped binding and is captured here for the same reason — and
+    # fails closed: a binding that never declared it (or a read error) leaves
+    # the session treated as non-wake-capable (#98619).
     from tools.async_delegation import _current_origin_session_id
 
     _origin_wake_sid = _current_origin_session_id()
@@ -4041,8 +4044,12 @@ def delegate_task(
         from gateway.session_context import get_session_env
 
         _origin_ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "")
+        _origin_wake_capable = (
+            get_session_env("HERMES_SESSION_WAKE_CAPABLE", "") == "1"
+        )
     except Exception:
         _origin_ui_session_id = ""
+        _origin_wake_capable = False
     _origin_owner_transport, _origin_owner_session_record = (
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
@@ -4344,21 +4351,35 @@ def delegate_task(
             # ApiServerAdapter._bind_api_server_session), gateway.wake can
             # still reach the session by self-POSTing /v1/chat/completions
             # with that id in X-Hermes-Session-Id once the batch completes.
-            # Only fall back to forced-sync execution when there is truly no
-            # session id to wake. Uses the origin captured before child
+            # Fall back to forced-sync execution when there is truly no
+            # session id to wake, OR when the bound id is not wake-capable
+            # (#98619): a fingerprint-derived id from a header-less
+            # OpenAI-compatible client makes the self-post hard-fail (no
+            # API_SERVER_KEY) or land in a session whose history the client
+            # never reloads, so the result would be undeliverable by
+            # construction. Uses the origin captured before child
             # construction (see _origin_wake_sid above) — reading
             # HERMES_SESSION_ID here would return the subagent's internal id.
             _wake_sid = _origin_wake_sid
-            if _wake_sid:
+            if _wake_sid and _origin_wake_capable:
                 logger.info(
                     "delegate_task: async delivery unsupported on this "
-                    "session, but a session id is bound (%s) — dispatching "
-                    "in the background and waking the session via self-post "
-                    "when it completes instead of forcing synchronous "
-                    "execution.",
+                    "session, but a wake-capable session id is bound (%s) — "
+                    "dispatching in the background and waking the session "
+                    "via self-post when it completes instead of forcing "
+                    "synchronous execution.",
                     _wake_sid,
                 )
                 _async_ok = True
+            elif _wake_sid:
+                logger.info(
+                    "delegate_task: session id %s is bound but not "
+                    "wake-capable (fingerprint-derived for a header-less "
+                    "client — the wake self-post cannot deliver where the "
+                    "client will read it, #98619) — running the batch "
+                    "synchronously instead.",
+                    _wake_sid,
+                )
 
         if not _async_ok:
             logger.info(
