@@ -610,7 +610,13 @@ def _load_interim_assistant_messages() -> bool:
 
 
 def _notify_session_boundary(
-    event_type: str, session_id: str | None, platform: str | None = None
+    event_type: str,
+    session_id: str | None,
+    platform: str | None = None,
+    *,
+    reason: str = "session_boundary",
+    old_session_id: str | None = None,
+    new_session_id: str | None = None,
 ) -> None:
     """Fire session lifecycle hooks with CLI parity."""
     try:
@@ -626,6 +632,9 @@ def _notify_session_boundary(
                 event_type,
                 session_id=session_id,
                 platform=_resolve_agent_platform(platform),
+                reason=reason,
+                old_session_id=old_session_id,
+                new_session_id=new_session_id,
             )
     except Exception:
         pass
@@ -2634,6 +2643,7 @@ def _compute_host_turn_frame(
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
         "cwd": _session_cwd(session),
+        "explicit_cwd": bool(session.get("explicit_cwd")),
         "profile_home": session.get("profile_home") or "",
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
@@ -3318,7 +3328,14 @@ def _start_agent_build(sid: str, session: dict) -> None:
             with _sessions_lock:
                 if sid in _sessions:
                     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-            _notify_session_boundary("on_session_reset", key, _session_source(current))
+            _notify_session_boundary(
+                "on_session_reset",
+                key,
+                _session_source(current),
+                reason="session_start",
+                old_session_id=None,
+                new_session_id=key,
+            )
 
             info = _session_info(agent, current)
             cfg_warn = _probe_config_health(_load_cfg())
@@ -3562,6 +3579,13 @@ def _session_cwd(session: dict | None) -> str:
     return _completion_cwd()
 
 
+def _authoritative_session_cwd(session: dict | None) -> str:
+    """Return the session cwd only when its workspace provenance is proven."""
+    if not session or not session.get("explicit_cwd"):
+        return ""
+    return str(session.get("cwd") or "").strip()
+
+
 # Sources whose launch directory is an artifact of how the app was started, not
 # a workspace the user picked. Everything else is terminal-started: the process
 # runs in a directory the user deliberately cd'd into.
@@ -3663,7 +3687,8 @@ def _display_session_cwd(session: dict | None) -> str:
     healed = _heal_dead_cwd(cwd)
     if healed and healed != cwd and session is not None:
         session["cwd"] = healed
-        _persist_session_cwd_and_schedule_git_meta(session, healed)
+        if _persisted_session_cwd(session):
+            _persist_session_cwd_and_schedule_git_meta(session, healed)
 
     return healed
 
@@ -4457,22 +4482,6 @@ def _save_cfg(cfg: dict):
             _cfg_mtime = None
 
 
-def _cwd_for_session_key(session_key: str) -> str:
-    """Reverse-map session_key to the session's logical cwd.
-
-    Snapshots ``_sessions`` first: concurrent RPC handlers mutate it from the
-    thread pool, so iterating the live view risks ``RuntimeError: dictionary
-    changed size during iteration``.
-    """
-    if not session_key:
-        return ""
-    with _sessions_lock:
-        for sess in list(_sessions.values()):
-            if sess.get("session_key") == session_key:
-                return str(sess.get("cwd") or "")
-    return ""
-
-
 def _set_session_context(
     session_key: str,
     cwd: str | None = None,
@@ -4486,7 +4495,12 @@ def _set_session_context(
         # reverse-map returns "" and would clear the cwd override. Callers that
         # know the parent workspace pass it explicitly so spawned agents inherit
         # it instead of falling back to the gateway launch dir.
-        resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
+        # ``session["cwd"]`` also carries the execution fallback used by tools
+        # and completion.  That fallback is process/profile configuration, not
+        # proof that this conversation selected a workspace.  Only an explicit
+        # caller cwd (ephemeral child tasks) or a session marked explicit may
+        # enter the authoritative session ContextVar consumed by lifecycle hooks.
+        resolved = cwd if cwd is not None else ""
         source = _resolve_session_platform()
         browser_control_principal = ""
         browser_control_transport_family = ""
@@ -4503,6 +4517,8 @@ def _set_session_context(
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
+                    if cwd is None and sess.get("explicit_cwd"):
+                        resolved = str(sess.get("cwd") or "")
                     source = _session_source(sess)
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
@@ -5584,7 +5600,7 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
     # turns restore the stored bytes without change, because the turn
     # prologue rebuilds only when _cached_system_prompt is None.
     session_tokens = _set_session_context(
-        session_key, cwd=_session_cwd(session)
+        session_key, cwd=_authoritative_session_cwd(session)
     )
     try:
         prompt = agent._build_system_prompt(None)
@@ -6454,7 +6470,9 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
     # session_id/key, so the DB-backed history and (epoch-refreshed) system
     # prompt carry over; only tool definitions and prompt bytes change.
     try:
-        tokens = _set_session_context(sid, cwd=_session_cwd(session))
+        tokens = _set_session_context(
+            sid, cwd=_authoritative_session_cwd(session)
+        )
         try:
             new_agent = _make_agent(
                 sid,
@@ -9007,6 +9025,7 @@ def _init_session(
     history: list,
     cols: int = 80,
     cwd: str | None = None,
+    explicit_cwd: bool = False,
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
@@ -9026,6 +9045,7 @@ def _init_session(
             "attached_images": [],
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
+            "explicit_cwd": explicit_cwd,
             "cols": cols,
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
@@ -9075,12 +9095,13 @@ def _init_session(
                 with _sessions_lock:
                     if sid in _sessions:
                         _sessions[sid]["cwd"] = row["cwd"]
+                        _sessions[sid]["explicit_cwd"] = True
             else:
                 try:
-                    _cwd = _sessions[sid]["cwd"]
-                    if hasattr(db, "update_session_cwd"):
+                    workspace = _persisted_session_cwd(_sessions[sid])
+                    if workspace and hasattr(db, "update_session_cwd"):
                         _persist_session_cwd_and_schedule_git_meta(
-                            _sessions[sid], _cwd, db=db
+                            _sessions[sid], workspace, db=db
                         )
                 except Exception:
                     logger.debug(
@@ -9125,7 +9146,14 @@ def _init_session(
     with _sessions_lock:
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-    _notify_session_boundary("on_session_reset", key, _session_source(_sessions.get(sid, {})))
+    _notify_session_boundary(
+        "on_session_reset",
+        key,
+        _session_source(_sessions.get(sid, {})),
+        reason="session_start",
+        old_session_id=None,
+        new_session_id=key,
+    )
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
     _schedule_mcp_late_refresh(sid, agent)
 
@@ -10421,6 +10449,7 @@ def _deferred_session_record(
     *,
     cols: int,
     cwd: str,
+    explicit_cwd: bool,
     history: list,
     lease,
     source: str = "tui",
@@ -10447,7 +10476,7 @@ def _deferred_session_record(
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
         "edit_snapshots": {},
-        "explicit_cwd": False,
+        "explicit_cwd": explicit_cwd,
         "history": history,
         "history_lock": threading.Lock(),
         "history_version": 0,

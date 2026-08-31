@@ -599,9 +599,8 @@ def _(rid, params: dict) -> dict:
                 target, exc,
             )
 
-        profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
-            profile_home
-        )
+        stored_resume_cwd = str(found.get("cwd") or "").strip()
+        profile_resume_cwd = stored_resume_cwd or _profile_configured_cwd(profile_home)
 
         def _reuse_live_payload(sid: str, session: dict) -> dict:
             payload = _live_session_payload(
@@ -682,6 +681,7 @@ def _(rid, params: dict) -> dict:
                 target,
                 cols=cols,
                 cwd=cwd,
+                explicit_cwd=bool(stored_resume_cwd),
                 history=history,
                 lease=lease,
                 source=source,
@@ -753,6 +753,7 @@ def _(rid, params: dict) -> dict:
                 target,
                 cols=cols,
                 cwd=cwd,
+                explicit_cwd=bool(stored_resume_cwd),
                 history=[],
                 lease=lease,
                 source=source,
@@ -851,6 +852,7 @@ def _(rid, params: dict) -> dict:
                 target,
                 cols=cols,
                 cwd=cwd,
+                explicit_cwd=bool(stored_resume_cwd),
                 history=history,
                 lease=lease,
                 source=source,
@@ -992,6 +994,7 @@ def _(rid, params: dict) -> dict:
                         history,
                         cols=cols,
                         cwd=profile_resume_cwd,
+                        explicit_cwd=bool(stored_resume_cwd),
                         session_db=db,
                         source=source,
                     )
@@ -3215,7 +3218,7 @@ def _(rid, params: dict) -> dict:
                 # thing that surfaces TUI branches. See issue #20856.
                 model_config={"_branched_from": old_key},
                 parent_session_id=old_key,
-                cwd=_session_cwd(session),
+                cwd=_persisted_session_cwd(session),
                 # The branch stays on its parent's profile. Explicit stamp (not
                 # just the parent-backfill) so it holds even when the parent row
                 # predates the profile_name column. Launch-profile branches are
@@ -3314,6 +3317,7 @@ def _(rid, params: dict) -> dict:
                 list(history),
                 cols=session.get("cols", 80),
                 cwd=_session_cwd(session),
+                explicit_cwd=bool(session.get("explicit_cwd")),
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,

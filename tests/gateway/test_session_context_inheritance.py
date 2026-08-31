@@ -36,6 +36,8 @@ from gateway.session_context import (
     _UNSET,
     _VAR_MAP,
     async_delivery_supported,
+    clear_session_vars,
+    get_session_env,
     reset_session_vars,
     set_session_vars,
 )
@@ -146,6 +148,58 @@ def test_reset_session_vars_closes_inheritance_leak():
     # B's own session still binds correctly after the reset window.
     assert captured["bound"]["HERMES_SESSION_CHAT_ID"] == "FOREIGN_CHAT"
     assert captured["bound"]["HERMES_SESSION_KEY"] == FOREIGN["session_key"]
+
+
+def test_nested_session_context_restores_outer_identity_and_cwd(tmp_path):
+    from agent.runtime_cwd import authoritative_session_cwd
+
+    outer_cwd = tmp_path / "outer"
+    inner_cwd = tmp_path / "inner"
+    outer_cwd.mkdir()
+    inner_cwd.mkdir()
+
+    outer_tokens = set_session_vars(
+        session_key="outer-session", cwd=str(outer_cwd)
+    )
+    try:
+        inner_tokens = set_session_vars(
+            session_key="inner-session", cwd=str(inner_cwd)
+        )
+        try:
+            assert get_session_env("HERMES_SESSION_KEY") == "inner-session"
+            assert authoritative_session_cwd() == str(inner_cwd)
+        finally:
+            clear_session_vars(inner_tokens)
+
+        assert get_session_env("HERMES_SESSION_KEY") == "outer-session"
+        assert authoritative_session_cwd() == str(outer_cwd)
+    finally:
+        clear_session_vars(outer_tokens)
+
+
+def test_nested_session_context_restores_cron_workdir_without_session_key(
+    tmp_path,
+):
+    from agent.runtime_cwd import authoritative_session_cwd
+
+    outer_cwd = tmp_path / "cron-workdir"
+    inner_cwd = tmp_path / "inner"
+    outer_cwd.mkdir()
+    inner_cwd.mkdir()
+
+    outer_tokens = set_session_vars(session_key="", cwd=str(outer_cwd))
+    try:
+        inner_tokens = set_session_vars(
+            session_key="inner-session", cwd=str(inner_cwd)
+        )
+        try:
+            assert authoritative_session_cwd() == str(inner_cwd)
+        finally:
+            clear_session_vars(inner_tokens)
+
+        assert authoritative_session_cwd() == str(outer_cwd)
+    finally:
+        clear_session_vars(outer_tokens)
 
 
 # ---------------------------------------------------------------------------

@@ -48,6 +48,47 @@ def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
     assert _default_workers() == 8
 
 
+def test_compute_host_reconstruction_preserves_workspace_proof(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    captured = {}
+    agent = object()
+    host = object.__new__(ComputeHost)
+    host._transport = object()
+
+    monkeypatch.setattr(server, "_make_agent", lambda *_args, **_kwargs: agent)
+    monkeypatch.setattr(server, "_transfer_db_to_agent", lambda *_args: False)
+
+    def _init_session(sid, key, built_agent, history, **kwargs):
+        captured.update(kwargs)
+        server._sessions[sid] = {
+            "session_key": key,
+            "agent": built_agent,
+            "history": history,
+        }
+
+    monkeypatch.setattr(server, "_init_session", _init_session)
+    try:
+        session = host._ensure_server_session(
+            server,
+            {
+                "sid": "compute-sid",
+                "session_key": "compute-key",
+                "cwd": str(workspace),
+                "explicit_cwd": True,
+                "history": [],
+            },
+        )
+    finally:
+        server._sessions.pop("compute-sid", None)
+
+    assert captured["cwd"] == str(workspace)
+    assert captured["explicit_cwd"] is True
+    assert session["session_key"] == "compute-key"
+
+
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "prompt.submit": "turn-path",

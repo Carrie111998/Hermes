@@ -538,6 +538,7 @@ class ComputeHost:
                 session["cols"] = int(frame.get("cols") or 80)
             if frame.get("cwd"):
                 session["cwd"] = str(frame.get("cwd"))
+            session["explicit_cwd"] = bool(frame.get("explicit_cwd"))
             if frame.get("profile_home"):
                 session["profile_home"] = str(frame.get("profile_home"))
             if isinstance(frame.get("attached_images"), list):
@@ -602,6 +603,7 @@ class ComputeHost:
                     list(history),
                     cols=int(frame.get("cols") or 80),
                     cwd=str(frame.get("cwd") or "") or None,
+                    explicit_cwd=bool(frame.get("explicit_cwd")),
                     session_db=session_db,
                     source=frame.get("source"),
                 )
@@ -624,6 +626,7 @@ class ComputeHost:
                 "attached_images": [],
                 "image_counter": 0,
                 "cwd": str(frame.get("cwd") or os.getcwd()),
+                "explicit_cwd": bool(frame.get("explicit_cwd")),
                 "cols": int(frame.get("cols") or 80),
                 "slash_worker": None,
                 "show_reasoning": server._load_show_reasoning(),

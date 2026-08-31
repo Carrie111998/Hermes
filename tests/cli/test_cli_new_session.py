@@ -140,6 +140,37 @@ def _prepare_cli_with_active_session(tmp_path):
     return cli
 
 
+def test_classic_cli_turn_binds_resolved_workspace(monkeypatch, tmp_path):
+    from agent.runtime_cwd import authoritative_session_cwd
+    import cli as cli_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    observed = []
+
+    class FakeAgent:
+        def run_conversation(self, **kwargs):
+            observed.append((authoritative_session_cwd(), kwargs))
+            return {"final_response": "ok"}
+
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("TERMINAL_CWD", str(workspace))
+    monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
+
+    result = cli_module._run_conversation_with_authoritative_workspace(
+        FakeAgent(), user_message="hello", conversation_history=[]
+    )
+
+    assert result == {"final_response": "ok"}
+    assert observed == [
+        (
+            str(workspace),
+            {"user_message": "hello", "conversation_history": []},
+        )
+    ]
+    assert authoritative_session_cwd() == ""
+
+
 @pytest.fixture(autouse=True)
 def _reset_session_id_context():
     from gateway.session_context import _UNSET, _VAR_MAP

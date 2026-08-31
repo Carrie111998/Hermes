@@ -7,6 +7,17 @@ from typing import Any, List
 
 logger = logging.getLogger(__name__)
 
+# Machine-readable producer seal for governed plugins. Consumers must inspect
+# this production module instead of inferring support from hook names or tests.
+# An explicit reset edge includes initial construction as ``None -> new``.
+# Desktop close/create is ``finalize(old)`` followed by ``None -> new``; it is
+# not a replacement edge and consumers must not infer one from process state.
+CORTEX_PLUGIN_PRODUCER_CONTRACT = (
+    "pre_llm.authoritative_workspace.v1",
+    "pre_llm.desktop_session_workspace.v1",
+    "session_reset.explicit_edge.v1",
+)
+
 
 def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     """Notify first-party observers, then invoke compatibility plugin hooks."""

@@ -5022,6 +5022,23 @@ class _SeededQueryMessage:
         return self.text
 
 
+def _run_conversation_with_authoritative_workspace(agent, **kwargs):
+    """Run one classic local-CLI turn with its launch workspace bound."""
+    if (
+        os.environ.get("_HERMES_GATEWAY") == "1"
+        or os.environ.get("TERMINAL_ENV", "local").strip().lower() != "local"
+    ):
+        return agent.run_conversation(**kwargs)
+
+    from agent.runtime_cwd import reset_session_cwd, set_session_cwd
+
+    token = set_session_cwd(os.environ.get("TERMINAL_CWD") or os.getcwd())
+    try:
+        return agent.run_conversation(**kwargs)
+    finally:
+        reset_session_cwd(token)
+
+
 def _should_seed_interactive(query, image, quiet: bool, oneshot: bool) -> bool:
     """Whether a ``-q/--image`` invocation should seed an interactive session.
 
@@ -10114,7 +10131,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         flush_tool_summary()
         _cli_visible_print()
     
-    def _notify_session_boundary(self, event_type: str) -> None:
+    def _notify_session_boundary(
+        self,
+        event_type: str,
+        *,
+        old_session_id: str | None = None,
+        new_session_id: str | None = None,
+    ) -> None:
         """Fire a session-boundary plugin hook (on_session_finalize or on_session_reset).
 
         Non-blocking — errors are caught and logged.  Safe to call from any
@@ -10124,13 +10147,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             from hermes_cli.lifecycle import finalize_session, invoke_hook
 
             context = {
-                "session_id": self.agent.session_id if self.agent else None,
+                "session_id": (
+                    new_session_id
+                    or (self.agent.session_id if self.agent else None)
+                ),
                 "platform": getattr(self, "platform", None) or "cli",
                 "reason": (
                     "new_session"
                     if event_type == "on_session_reset"
                     else "session_boundary"
                 ),
+                "old_session_id": old_session_id,
+                "new_session_id": new_session_id,
             }
             if event_type == "on_session_finalize":
                 finalize_session(**context)
@@ -10416,7 +10444,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         )
             except Exception:
                 pass
-            self._notify_session_boundary("on_session_reset")
+            self._notify_session_boundary(
+                "on_session_reset",
+                old_session_id=old_session_id,
+                new_session_id=self.session_id,
+            )
 
         if not silent:
             if title:
@@ -17019,7 +17051,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
                 self._pending_one_turn_model_restore = None
                 try:
-                    result = self.agent.run_conversation(
+                    result = _run_conversation_with_authoritative_workspace(
+                        self.agent,
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
                         stream_callback=stream_callback,
@@ -21430,7 +21463,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     max_turns = task.goal_max_turns or _DEF_TURNS
 
     def _run_turn(prompt: str) -> str:
-        result = cli.agent.run_conversation(
+        result = _run_conversation_with_authoritative_workspace(
+            cli.agent,
             user_message=prompt,
             conversation_history=cli.conversation_history,
         )
@@ -22012,7 +22046,8 @@ def main(
                         # from display.tool_progress at construction).
                         cli.agent.tool_progress_mode = "off"
                         try:
-                            result = cli.agent.run_conversation(
+                            result = _run_conversation_with_authoritative_workspace(
+                                cli.agent,
                                 user_message=effective_query,
                                 conversation_history=cli.conversation_history,
                             )

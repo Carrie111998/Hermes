@@ -161,7 +161,11 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
     launcher = tmp_path / "apps" / "desktop"
     launcher.mkdir(parents=True)
 
-    server._sessions[sid] = {"session_key": session_key, "cwd": str(project)}
+    server._sessions[sid] = {
+        "session_key": session_key,
+        "cwd": str(project),
+        "explicit_cwd": True,
+    }
     monkeypatch.delenv("TERMINAL_CWD", raising=False)
     monkeypatch.chdir(launcher)
 
@@ -340,6 +344,25 @@ def test_compute_host_explicit_images_do_not_clear_later_attachment(monkeypatch)
 
     assert response["result"]["status"] == "streaming"
     assert session["attached_images"] == ["/tmp/c.png"]
+
+
+def test_compute_host_turn_frame_preserves_workspace_proof(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    explicit = _session(cwd=str(workspace), explicit_cwd=True)
+    fallback = _session(cwd=str(workspace), explicit_cwd=False)
+
+    explicit_frame = server._compute_host_turn_frame(
+        "explicit-rid", "explicit-sid", explicit, "turn"
+    )
+    fallback_frame = server._compute_host_turn_frame(
+        "fallback-rid", "fallback-sid", fallback, "turn"
+    )
+
+    assert explicit_frame["cwd"] == str(workspace)
+    assert explicit_frame["explicit_cwd"] is True
+    assert fallback_frame["cwd"] == str(workspace)
+    assert fallback_frame["explicit_cwd"] is False
 
 
 def test_prompt_submit_unknown_session_logs_warning(caplog):
@@ -681,6 +704,182 @@ def test_session_context_explicit_cwd_for_ephemeral_task(monkeypatch, tmp_path):
         assert resolve_agent_cwd() == project
     finally:
         server._clear_session_context(tokens)
+
+
+def test_prompt_background_does_not_promote_parent_fallback_cwd(
+    monkeypatch, tmp_path
+):
+    import sys
+    import types
+
+    fallback = tmp_path / "configured-fallback"
+    fallback.mkdir()
+    captured = []
+
+    class _ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    class _Agent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, **_kwargs):
+            return {"final_response": "done"}
+
+    session = _session(
+        session_key="parent-key",
+        cwd=str(fallback),
+        explicit_cwd=False,
+        agent=types.SimpleNamespace(),
+    )
+    server._sessions["parent"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        server,
+        "_set_session_context",
+        lambda session_key, cwd=None, **_kwargs: captured.append(
+            (session_key, cwd)
+        )
+        or [],
+    )
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(sys.modules, "run_agent", types.SimpleNamespace(AIAgent=_Agent))
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "background",
+                "method": "prompt.background",
+                "params": {"session_id": "parent", "text": "work"},
+            }
+        )
+    finally:
+        server._sessions.pop("parent", None)
+
+    assert "result" in response, response
+    assert captured[0][0].startswith("bg_")
+    assert captured[0][1] == ""
+
+
+def test_preview_restart_does_not_promote_parent_fallback_cwd(
+    monkeypatch, tmp_path
+):
+    import sys
+    import types
+
+    fallback = tmp_path / "configured-fallback"
+    fallback.mkdir()
+    captured = []
+
+    class _ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    class _Agent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def run_conversation(self, **_kwargs):
+            return {"final_response": "done"}
+
+    session = _session(
+        session_key="parent-key",
+        cwd=str(fallback),
+        explicit_cwd=False,
+        agent=types.SimpleNamespace(),
+    )
+    server._sessions["parent"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        server,
+        "_set_session_context",
+        lambda session_key, cwd=None, **_kwargs: captured.append(
+            (session_key, cwd)
+        )
+        or [],
+    )
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(sys.modules, "run_agent", types.SimpleNamespace(AIAgent=_Agent))
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "preview",
+                "method": "preview.restart",
+                "params": {
+                    "session_id": "parent",
+                    "url": "http://localhost:3000",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("parent", None)
+
+    assert "result" in response, response
+    assert captured[0][0].startswith("preview_")
+    assert captured[0][1] == ""
+
+
+def test_deferred_session_record_preserves_workspace_proof(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    explicit = server._deferred_session_record(
+        "stored-session",
+        cols=80,
+        cwd=str(workspace),
+        explicit_cwd=True,
+        history=[],
+        lease=None,
+    )
+    fallback = server._deferred_session_record(
+        "fallback-session",
+        cols=80,
+        cwd=str(workspace),
+        explicit_cwd=False,
+        history=[],
+        lease=None,
+    )
+
+    assert explicit["explicit_cwd"] is True
+    assert fallback["explicit_cwd"] is False
+
+
+def test_display_cwd_healing_does_not_persist_fallback_workspace(
+    monkeypatch, tmp_path
+):
+    fallback = tmp_path / "vanished-worktree"
+    healed = tmp_path / "repo"
+    healed.mkdir()
+    persisted = []
+    session = {
+        "session_key": "desktop-unbound",
+        "source": "desktop",
+        "cwd": str(fallback),
+        "explicit_cwd": False,
+    }
+
+    monkeypatch.setattr(server, "_is_local_terminal_backend", lambda: True)
+    monkeypatch.setattr(server, "_heal_dead_cwd", lambda _cwd: str(healed))
+    monkeypatch.setattr(
+        server,
+        "_persist_session_cwd_and_schedule_git_meta",
+        lambda target, cwd: persisted.append((target, cwd)),
+    )
+
+    assert server._display_session_cwd(session) == str(healed)
+    assert session["cwd"] == str(healed)
+    assert session["explicit_cwd"] is False
+    assert persisted == []
 
 
 def _write_profile_cfg(home: Path, cwd: str | None) -> Path:
@@ -5653,7 +5852,9 @@ def test_init_session_fires_reset_hook(monkeypatch):
     monkeypatch.setattr(
         server,
         "_notify_session_boundary",
-        lambda event, session_id, *_args: hooks.append((event, session_id)),
+        lambda event, session_id, *_args, **kwargs: hooks.append(
+            (event, session_id, kwargs)
+        ),
     )
 
     import tools.approval as _approval
@@ -5670,9 +5871,90 @@ def test_init_session_fires_reset_hook(monkeypatch):
             history=[],
             cols=80,
         )
-        assert ("on_session_reset", "session-key") in hooks
+        assert (
+            "on_session_reset",
+            "session-key",
+            {
+                "reason": "session_start",
+                "old_session_id": None,
+                "new_session_id": "session-key",
+            },
+        ) in hooks
     finally:
         server._sessions.pop(sid, None)
+
+
+def test_desktop_close_then_create_emits_exact_boundary_identities(monkeypatch):
+    boundaries = []
+
+    class _FakeWorker:
+        def __init__(self, key, model, profile_home=None):
+            self.key = key
+
+        def close(self):
+            return None
+
+    def _agent(session_id):
+        return types.SimpleNamespace(
+            model="x",
+            session_id=session_id,
+            _session_messages=[],
+            close=lambda: None,
+        )
+
+    monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        server,
+        "_notify_session_boundary",
+        lambda event, session_id, *_args, **kwargs: boundaries.append(
+            (event, session_id, kwargs)
+        ),
+    )
+
+    import tools.approval as _approval
+
+    monkeypatch.setattr(_approval, "register_gateway_notify", lambda key, cb: None)
+    monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
+    monkeypatch.setattr(_approval, "unregister_gateway_notify", lambda key: None)
+
+    try:
+        server._init_session(
+            "old-sid", "old-key", _agent("old-key"), history=[], cols=80
+        )
+        closed = server._methods["session.close"](
+            "close", {"session_id": "old-sid"}
+        )
+        assert closed["result"]["closed"] is True
+        server._init_session(
+            "new-sid", "new-key", _agent("new-key"), history=[], cols=80
+        )
+
+        assert boundaries == [
+            (
+                "on_session_reset",
+                "old-key",
+                {
+                    "reason": "session_start",
+                    "old_session_id": None,
+                    "new_session_id": "old-key",
+                },
+            ),
+            ("on_session_finalize", "old-key", {}),
+            (
+                "on_session_reset",
+                "new-key",
+                {
+                    "reason": "session_start",
+                    "old_session_id": None,
+                    "new_session_id": "new-key",
+                },
+            ),
+        ]
+    finally:
+        server._sessions.pop("old-sid", None)
+        server._sessions.pop("new-sid", None)
 
 
 def test_session_title_creates_row_and_sets_immediately_when_not_ready(monkeypatch):
@@ -7037,6 +7319,107 @@ def _configure_immediate_prompt_run(
     monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_args: False)
     monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
     monkeypatch.setattr(server, "_get_db", lambda: None)
+
+
+def test_prompt_turn_emits_each_desktop_session_workspace(monkeypatch, tmp_path):
+    """Desktop ingress must keep pre-LLM workspace envelopes session-local."""
+    from agent.runtime_cwd import authoritative_session_cwd
+    from hermes_cli import lifecycle
+    from tests.agent.test_turn_context import _FakeAgent, _build
+
+    original_set_session_context = server._set_session_context
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "_set_session_context", original_set_session_context)
+    monkeypatch.setattr(
+        server, "_sync_agent_compression_with_config", lambda *_args: None
+    )
+    monkeypatch.setattr(server, "_sync_bot_capabilities", lambda *_args: None)
+
+    envelopes = []
+
+    def capture_hook(event, **kwargs):
+        if event == "pre_llm_call":
+            envelopes.append(kwargs)
+        return []
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", capture_hook)
+
+    class _TurnAgent(_FakeAgent):
+        def __init__(self, session_id):
+            super().__init__()
+            self.session_id = session_id
+            self.platform = "tui"
+
+        def clear_interrupt(self):
+            return None
+
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            **_kwargs,
+        ):
+            _build(
+                self,
+                user_message=prompt,
+                conversation_history=conversation_history,
+                task_id=self.session_id,
+                stream_callback=stream_callback,
+            )
+            return {"final_response": "", "messages": []}
+
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    fallback = tmp_path / "configured-fallback"
+    project_a.mkdir()
+    project_b.mkdir()
+    fallback.mkdir()
+    monkeypatch.setenv("TERMINAL_CWD", str(fallback))
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    created = server._methods["session.create"]("create-unbound", {"source": "desktop"})
+    unbound_sid = created["result"]["session_id"]
+    unbound_key = created["result"]["stored_session_id"]
+    unbound_session = server._sessions[unbound_sid]
+    assert unbound_session["explicit_cwd"] is False
+    assert unbound_session["cwd"] == str(fallback)
+    unbound_session.update(
+        agent=_TurnAgent(unbound_key),
+        running=True,
+    )
+
+    cases = [
+        ("desktop-a", "session-a", str(project_a)),
+        ("desktop-b", "session-b", str(project_b)),
+    ]
+
+    try:
+        for sid, session_key, cwd in cases:
+            session = _session(
+                session_key=session_key,
+                agent=_TurnAgent(session_key),
+                running=True,
+                cwd=cwd,
+                explicit_cwd=True,
+                source="desktop",
+            )
+            server._sessions[sid] = session
+            server._run_prompt_submit("rid", sid, session, "turn")
+            server._sessions.pop(sid, None)
+        server._run_prompt_submit("rid", unbound_sid, unbound_session, "turn")
+    finally:
+        for sid, _, _ in cases:
+            server._sessions.pop(sid, None)
+        server._sessions.pop(unbound_sid, None)
+
+    assert [(item["session_id"], item["cwd"]) for item in envelopes] == [
+        ("session-a", str(project_a)),
+        ("session-b", str(project_b)),
+        (unbound_key, ""),
+    ]
+    assert authoritative_session_cwd() == ""
 
 
 def test_run_prompt_submit_binds_exact_steer_authority_and_resets_contextvars(
@@ -14988,6 +15371,7 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
             seen["created"] = new_key
             seen["parent"] = kwargs.get("parent_session_id")
             seen["profile_name"] = kwargs.get("profile_name")
+            seen["created_cwd"] = kwargs.get("cwd")
 
         def append_message(self, **kwargs):
             seen["msgs"].append(kwargs)
@@ -15022,7 +15406,7 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         "running": False,
         "cols": 80,
         "profile_home": str(profile_home),
-        "source": "tui",
+        "source": "desktop",
         "agent": FakeAgent(),
         "created_at": 1.0,
         "last_active": 1.0,
@@ -15055,6 +15439,7 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         assert "result" in resp, resp
         assert seen.get("created")
         assert seen.get("parent") == "parent-key"
+        assert seen.get("created_cwd") is None
         # The branch row is self-describing: stamped with the parent's owning
         # profile, not left NULL for aggregators to mis-tag as "default".
         assert seen.get("profile_name") == "mlperf"
@@ -21422,6 +21807,78 @@ def test_persist_live_session_system_prompt_binds_session_cwd(monkeypatch, tmp_p
     expected = f"Current working directory: {session_cwd}"
     assert result["cached"] == expected, result["cached"]
     assert persisted["prompt"] == expected, persisted["prompt"]
+
+
+def test_persist_live_session_system_prompt_keeps_fallback_cwd_unbound(tmp_path):
+    from agent.runtime_cwd import authoritative_session_cwd
+
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    observed = []
+
+    class FakeAgent:
+        session_id = "fallback-session"
+        _cached_system_prompt = None
+
+        def _build_system_prompt(self, _system_message=None):
+            observed.append(authoritative_session_cwd())
+            return "prompt"
+
+    class FakeDB:
+        def update_system_prompt(self, _session_id, _prompt):
+            pass
+
+    agent = FakeAgent()
+    agent._session_db = FakeDB()
+    session = {
+        "agent": agent,
+        "session_key": "fallback-session",
+        "cwd": str(fallback),
+        "explicit_cwd": False,
+        "source": "desktop",
+    }
+
+    server._persist_live_session_system_prompt(session)
+
+    assert observed == [""]
+
+
+def test_bot_capability_rebuild_keeps_fallback_cwd_unbound(monkeypatch, tmp_path):
+    import tools.bot_mode_probe as bot_mode_probe
+
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    captured = []
+
+    old_agent = types.SimpleNamespace(_session_title_hint="Bot Chat")
+    new_agent = types.SimpleNamespace()
+    session = {
+        "agent": old_agent,
+        "session_key": "bot-session",
+        "cwd": str(fallback),
+        "explicit_cwd": False,
+        "source": "desktop",
+        "bot_caps_seen": "old",
+    }
+
+    monkeypatch.setattr(bot_mode_probe, "capability_fingerprint", lambda _home: "new")
+    monkeypatch.setattr(
+        server,
+        "_set_session_context",
+        lambda session_key, cwd=None, **_kwargs: captured.append(
+            (session_key, cwd)
+        )
+        or [],
+    )
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_make_agent", lambda *_args, **_kwargs: new_agent)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("model", "provider"))
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    server._sync_bot_capabilities("bot-sid", session)
+
+    assert captured == [("bot-sid", "")]
+    assert session["agent"] is new_agent
 
 
 def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):

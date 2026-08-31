@@ -46,6 +46,11 @@ def set_session_cwd(cwd: str | None) -> Token:
     return _SESSION_CWD.set((cwd or "").strip())
 
 
+def reset_session_cwd(token: Token) -> None:
+    """Restore the cwd value that preceded a nested session binding."""
+    _SESSION_CWD.reset(token)
+
+
 def clear_session_cwd() -> None:
     _SESSION_CWD.set("")
 
@@ -55,6 +60,15 @@ def _session_cwd_override() -> str:
     if value is _UNSET:
         return ""
     return str(value).strip()
+
+
+def authoritative_session_cwd() -> str:
+    """Return the explicitly bound session cwd, or empty when unproven.
+
+    Lifecycle and plugin attribution must not use ``TERMINAL_CWD`` or the
+    process cwd. One gateway process can serve many concurrent workspaces.
+    """
+    return _session_cwd_override()
 
 
 def resolve_agent_cwd() -> Path:
