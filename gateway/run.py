@@ -315,6 +315,8 @@ def _estimate_hygiene_tokens(
     user_config: Any,
 ) -> int:
     """Estimate the active route's request shape for session hygiene."""
+    from agent.model_metadata import estimate_messages_tokens_rough
+
     return estimate_messages_tokens_rough(
         history,
         include_reasoning_content=_hygiene_needs_reasoning_echo(

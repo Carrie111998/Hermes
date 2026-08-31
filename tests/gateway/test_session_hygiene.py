@@ -221,14 +221,33 @@ class TestPromptTokenSnapshotTrust:
 
 
 def test_hygiene_reasoning_echo_honors_custom_provider_opt_in():
-    from gateway.run import _hygiene_needs_reasoning_echo
+    from gateway.run import _estimate_hygiene_tokens
 
-    assert _hygiene_needs_reasoning_echo(
+    history = [
+        {
+            "role": "assistant",
+            "content": "answer",
+            "reasoning": "r" * 20_000,
+            "reasoning_content": "r" * 20_000,
+        }
+    ]
+    strict_tokens = _estimate_hygiene_tokens(
+        history,
+        "custom",
+        "unknown-thinking-model",
+        "https://custom.example/v1",
+        {},
+    )
+    echo_tokens = _estimate_hygiene_tokens(
+        history,
         "custom",
         "unknown-thinking-model",
         "https://custom.example/v1",
         {"model": {"reasoning_echo": True}},
-    ) is True
+    )
+
+    assert strict_tokens < 100
+    assert echo_tokens > 5_000
 
 
 class TestSessionHygieneWarnThreshold:
