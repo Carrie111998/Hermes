@@ -438,6 +438,11 @@ def test_every_dispatcher_kanban_var_is_identity_gated():
         "HERMES_KANBAN_BRANCH",
         "HERMES_KANBAN_GOAL_MODE",
         "HERMES_KANBAN_GOAL_MAX_TURNS",
+        # PR #90820 B2 / Round 3 — strict-readonly mode is a behaviour knob
+        # that pins the worker's reduced toolset; it does not change the
+        # board/task identity the dispatcher claims against, so it belongs
+        # here and not in KANBAN_ENV_KEYS.
+        "HERMES_KANBAN_STRICT_READONLY",
     }
     uncovered = injected - set(KANBAN_ENV_KEYS) - behaviour_only
     assert not uncovered, (

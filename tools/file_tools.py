@@ -10,6 +10,7 @@ import posixpath
 import sys
 import threading
 from pathlib import Path, PurePosixPath
+from typing import Optional
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import (
@@ -484,6 +485,18 @@ def _rewrite_v4a_patch_paths_for_host(
     Header patterns mirror ``patch_parser`` (``\\s*`` after ``***`` accepts the
     no-space ``***Update File:`` form) and cover ``Move File: src -> dst``.
     Only applied when *file_ops* targets the host filesystem.
+
+    .. note::
+
+        PR #90820 B3 / Round 3 — this rewriter is the LEGACY text-based
+        fallback kept for callers that still receive raw patch text. The
+        preferred path is :func:`_rewrite_v4a_operations_for_host`, which
+        operates on already-parsed ``PatchOperation`` objects so the
+        validation gate and the host-execution path consume the SAME
+        parsed identity (no double parsing of `` -> ``).
+
+    Returns the rewritten patch text (or the original text when file_ops
+    does not target the host).
     """
     if not _file_ops_uses_host_paths(file_ops):
         return patch
@@ -519,6 +532,45 @@ def _rewrite_v4a_patch_paths_for_host(
         flags=_re.MULTILINE,
     )
     return patch
+
+
+def _rewrite_v4a_operations_for_host(
+    operations: list,
+    path_to_resolved: dict,
+    file_ops,
+) -> list:
+    """Rewrite parsed V4A operations to host-resolved paths.
+
+    PR #90820 B3 / Round 3 — preferred path over
+    :func:`_rewrite_v4a_patch_paths_for_host` because it operates on
+    already-parsed ``PatchOperation`` objects: validation and host
+    execution consume the SAME parsed identity (single source of truth
+    for source/destination), so a path containing literal `` -> `` in a
+    filename can't desynchronize the two layers.
+
+    For every operation:
+
+    * ``Update`` / ``Add`` / ``Delete``: rewrite ``op.file_path`` to the
+      resolved absolute path when present in ``path_to_resolved``.
+    * ``Move``: rewrite both ``op.file_path`` (source) and ``op.new_path``
+      (destination) via the SAME ``path_to_resolved`` lookup. Whitespace
+      inside either side is preserved verbatim — the resolver never
+      re-parses `` -> ``, it consumes the already-parsed identities.
+
+    Returns the operations list (same objects, mutated in place — call
+    sites that need to keep the originals should pass a copy).
+    """
+    if not _file_ops_uses_host_paths(file_ops):
+        return operations
+
+    for op in operations:
+        if op.file_path in path_to_resolved:
+            op.file_path = path_to_resolved[op.file_path]
+        # Move ops carry a destination in op.new_path.
+        new_path = getattr(op, "new_path", None)
+        if new_path and new_path in path_to_resolved:
+            op.new_path = path_to_resolved[new_path]
+    return operations
 
 
 def _is_blocked_device_path(path: str) -> bool:
@@ -1579,6 +1631,45 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     return file_ops
 
 
+def _resolve_strict_workspace_target(
+    path: str, task_id: str = "default",
+) -> tuple[Optional[str], Optional[str]]:
+    """Return the execution path for a strict mutation, or a denial string.
+
+    The returned canonical path is passed unchanged to the execution layer.
+    This is an additional restriction to SessionWritePolicy and intentionally
+    does not consult or replace that retained session authority.
+    """
+    if os.environ.get("HERMES_KANBAN_STRICT_READONLY") != "1":
+        return None, None
+    workspace = os.environ.get("HERMES_KANBAN_WORKSPACE", "").strip()
+    if not workspace:
+        return None, (
+            "strict-readonly worker: HERMES_KANBAN_STRICT_READONLY=1 but "
+            "HERMES_KANBAN_WORKSPACE is unset; cannot validate the "
+            "target against a workspace. Refusing the mutation."
+        )
+    try:
+        ws_root = Path(workspace).expanduser().resolve(strict=True)
+        if not ws_root.is_dir():
+            raise ValueError("workspace is not a directory")
+        execution_path = str(_resolve_path_for_task(path, task_id))
+        target = Path(execution_path).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, (
+            f"strict-readonly worker: cannot resolve mutation target {path!r} "
+            f"against workspace {workspace!r} ({exc}); refusing the mutation."
+        )
+    try:
+        target.relative_to(ws_root)
+    except ValueError:
+        return None, (
+            f"strict-readonly worker: target {target} is outside the authorized "
+            f"workspace {ws_root}. Refusing the mutation."
+        )
+    return str(target), None
+
+
 def clear_file_ops_cache(task_id: str = None):
     """Clear the file operations cache."""
     with _file_ops_lock:
@@ -2246,6 +2337,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     the schema — the mirror rejection error teaches it. The cross-PROFILE
     guard this flag was named for is removed (profiles are not isolated).
     """
+    strict_resolved, strict_err = _resolve_strict_workspace_target(path, task_id)
+    if strict_err:
+        return tool_error(strict_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -2272,10 +2366,13 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # Resolve once for the registry lock + stale check.  Failures here
         # fall back to the legacy path — write proceeds, per-task staleness
         # check below still runs.
-        try:
-            _resolved = str(_resolve_path_for_task(path, task_id))
-        except Exception:
-            _resolved = None
+        if strict_resolved:
+            _resolved = strict_resolved
+        else:
+            try:
+                _resolved = str(_resolve_path_for_task(path, task_id))
+            except Exception:
+                _resolved = None
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
@@ -2344,9 +2441,19 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     if path:
         _paths_to_check.append(path)
         _content_write_paths.append(path)
+    # PR #90820 B3 / Round 3 — parse the V4A patch ONCE here so the
+    # validation gate (sensitive paths, traversal, content-write list) and
+    # the host-execution path consume the SAME parsed operation identity.
+    # Do not independently re-parse " -> " in three layers.
+    _parsed_v4a_ops: list = []
+    _v4a_parse_error: Optional[str] = None
     if mode == "patch" and patch:
-        import re as _re
+        from tools import patch_parser
+        _parsed_v4a_ops, _v4a_parse_error = patch_parser.parse_v4a_patch(patch)
+        if _v4a_parse_error:
+            return tool_error(f"V4A parse error: {_v4a_parse_error}")
         from tools.path_security import has_traversal_component
+
         def _reject_v4a_traversal(v4a_path: str) -> str | None:
             # V4A path headers come from patch CONTENT, not the explicit
             # ``path=`` arg — so they're more attacker-influenceable (skill
@@ -2365,30 +2472,39 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 )
             return None
 
-        # ``\s*`` (not ``\s+``) after ``***`` matches patch_parser leniency:
-        # it accepts ``***Update File:`` with no space after the asterisks
-        # (patch_parser.py uses ``\*\*\*\s*Update\s+File:``). Requiring a space
-        # here let a no-space header parse + apply while skipping this check.
-        for _m in _re.finditer(r'^\*\*\*\s*(Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
-            _op = _m.group(1)
-            v4a_path = _m.group(2).strip()
-            _err = _reject_v4a_traversal(v4a_path)
-            if _err:
-                return _err
-            _paths_to_check.append(v4a_path)
-            if _op in ("Update", "Add"):
-                _content_write_paths.append(v4a_path)
-        # ``*** Move File: src -> dst`` is a valid V4A op (patch_parser.py:114)
-        # but was never extracted, so a Move targeting /etc/crontab skipped the
-        # sensitive-path pre-check. Check BOTH endpoints, and run them through
-        # the same ``..`` traversal rejection as the other headers.
-        for _m in _re.finditer(r'^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$', patch, _re.MULTILINE):
-            for v4a_path in (_m.group(1).strip(), _m.group(2).strip()):
+        # Iterate the parsed operations. Each carries BOTH identity
+        # fields (``file_path`` always; ``new_path`` for Move) so we don't
+        # have to split " -> " ourselves — that's the B3 contract.
+        from tools.patch_parser import OperationType as _OpType
+        for _op in _parsed_v4a_ops:
+            _op_value = _op.operation.value if hasattr(_op.operation, "value") else str(_op.operation)
+            if _op_value == "move":
+                # Both endpoints get the same validation pass.
+                for v4a_path in (_op.file_path, _op.new_path or ""):
+                    if not v4a_path:
+                        continue
+                    _err = _reject_v4a_traversal(v4a_path)
+                    if _err:
+                        return _err
+                    _paths_to_check.append(v4a_path)
+            else:
+                v4a_path = _op.file_path
                 _err = _reject_v4a_traversal(v4a_path)
                 if _err:
                     return _err
                 _paths_to_check.append(v4a_path)
+                if _op_value in ("update", "add"):
+                    _content_write_paths.append(v4a_path)
+    # Strict containment is evaluated before every other write policy and the
+    # canonical result below becomes the exact execution identity.  V4A paths
+    # remain parsed once: this loop consumes the parsed operation fields only.
+    _strict_resolved_by_path: dict[str, str] = {}
     for _p in _paths_to_check:
+        _strict_resolved, _strict_err = _resolve_strict_workspace_target(_p, task_id)
+        if _strict_err:
+            return tool_error(_strict_err)
+        if _strict_resolved:
+            _strict_resolved_by_path[_p] = _strict_resolved
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
@@ -2415,10 +2531,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         _resolved_paths: list[str] = []
         _seen: set[str] = set()
         for _p in _paths_to_check:
-            try:
-                _r = str(_resolve_path_for_task(_p, task_id))
-            except Exception:
-                _r = None
+            _r = _strict_resolved_by_path.get(_p)
+            if _r is None:
+                try:
+                    _r = str(_resolve_path_for_task(_p, task_id))
+                except Exception:
+                    _r = None
             if _r and _r not in _seen:
                 _resolved_paths.append(_r)
                 _seen.add(_r)
@@ -2437,10 +2555,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             stale_warnings: list[str] = []
             _path_to_resolved: dict[str, str] = {}
             for _p in _paths_to_check:
-                try:
-                    _r = str(_resolve_path_for_task(_p, task_id))
-                except Exception:
-                    _r = None
+                _r = _strict_resolved_by_path.get(_p)
+                if _r is None:
+                    try:
+                        _r = str(_resolve_path_for_task(_p, task_id))
+                    except Exception:
+                        _r = None
                 _path_to_resolved[_p] = _r
                 _cross = file_state.check_stale(task_id, _r) if _r else None
                 _sw = _cross or _check_file_staleness(_p, task_id)
@@ -2468,15 +2588,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                # Rewrite V4A headers to the resolved absolute paths so the
-                # shell layer patches the exact files the tool layer resolved
-                # (locked/reported). Without this a relative header re-resolves
-                # against the shell's cwd, which can differ from the workspace
-                # (git-worktree cwd bug) — landing the edit elsewhere.
-                patch_for_ops = _rewrite_v4a_patch_paths_for_host(
-                    patch, _path_to_resolved, file_ops
+                # PR #90820 B3 / Round 3 — the parsed V4A operations were
+                # already produced at the top of patch_tool (single source
+                # of truth). Rewrite each operation's host-resolved paths
+                # using the SAME parsed identities — no text re-parsing of
+                # " -> " here. Validation identity == execution identity.
+                _rewrite_v4a_operations_for_host(
+                    _parsed_v4a_ops, _path_to_resolved, file_ops
                 )
-                result = file_ops.patch_v4a(patch_for_ops)
+                from tools.patch_parser import apply_v4a_operations
+                result = apply_v4a_operations(_parsed_v4a_ops, file_ops)
             else:
                 return tool_error(f"Unknown mode: {mode}")
 

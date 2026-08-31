@@ -2969,11 +2969,15 @@ class CLICommandsMixin:
 
         review_skills = "skill_manage" in getattr(agent, "valid_tool_names", set())
         try:
+            # /refine is an explicit user request: it bypasses the
+            # skip_background_review central choke point so a user with
+            # --skip-background-review can still force a focused review.
             agent._spawn_background_review(
                 messages_snapshot=snapshot,
                 review_memory=True,
                 review_skills=review_skills,
                 focus=focus or None,
+                automatic=False,
             )
         except Exception as exc:
             _cprint(f"  /refine failed to start: {exc}")

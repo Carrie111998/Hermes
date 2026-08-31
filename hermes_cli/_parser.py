@@ -550,6 +550,17 @@ def build_top_level_parser():
         default=argparse.SUPPRESS,
         help="Bypass all dangerous command approval prompts (use at your own risk)",
     )
+    chat_parser.add_argument(
+        "--skip-background-review",
+        action="store_true",
+        default=False,
+        dest="skip_background_review",
+        help=(
+            "Skip the automatic post-turn background review fork "
+            "(memory/skill review). Same effect as auxiliary.background_review.enabled: false. "
+            "Explicit /refine still runs."
+        ),
+    )
     _inherited_flag(
         chat_parser,
         "--pass-session-id",

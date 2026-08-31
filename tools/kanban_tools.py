@@ -212,6 +212,77 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     return None
 
 
+def _resolve_authoritative_board(explicit_board: Optional[str]) -> Optional[str]:
+    """Return the board slug that ``_connect(board=...)`` must use.
+
+    Strict board authority contract (PR #90820 B1):
+
+    * When ``HERMES_KANBAN_BOARD`` env var is set (dispatcher-pinned worker),
+      it is authoritative. An explicit ``board`` arg MUST either match it
+      (the user is being explicit about the same board) or be omitted
+      (the user trusts the dispatcher pin). A CONFLICTING explicit board
+      is rejected via :func:`_check_board_authority` BEFORE this function
+      is called — this resolver assumes the call site already passed
+      that gate.
+
+    * When ``HERMES_KANBAN_BOARD`` is not set, an explicit ``board`` arg
+      wins; otherwise we fall through to :func:`get_current_board` (the
+      legacy ``current`` symlink chain) so non-strict callers (CLI,
+      dashboard, orchestrator profiles without a pin) keep ordinary
+      behavior.
+
+    Returns the slug to use, or ``None`` only when both the env pin is
+    absent AND the explicit arg is absent AND no current board exists
+    (a fresh install).
+    """
+    from hermes_cli import kanban_db as kb
+
+    env_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    env_norm = kb._normalize_board_slug(env_board) if env_board else None
+    explicit_norm = (
+        kb._normalize_board_slug(explicit_board) if explicit_board else None
+    )
+
+    if env_norm:
+        # Strict mode: env pin is authoritative. The caller already ran
+        # _check_board_authority, so explicit_norm is either None or
+        # equal to env_norm — either way env_norm wins.
+        return env_norm
+    # Non-strict: explicit wins, else current board.
+    if explicit_norm:
+        return explicit_norm
+    return kb.get_current_board()
+
+
+def _check_board_authority(explicit_board: Optional[str]) -> Optional[str]:
+    """Strict-mode guard for tool handlers that take a ``board=`` arg.
+
+    Returns ``None`` when the caller may proceed (the resolved board
+    matches the authoritative pin), or a tool-error string when the
+    explicit ``board`` arg conflicts with ``HERMES_KANBAN_BOARD`` and
+    must be rejected.
+
+    Non-strict behavior (no env pin) is unaffected — returns ``None``
+    and the caller proceeds with its legacy resolution chain.
+    """
+    env_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    if not env_board:
+        return None  # Non-strict: any board is fine.
+    if not explicit_board:
+        return None  # Omitted → env pin is authoritative.
+    from hermes_cli import kanban_db as kb
+    env_norm = kb._normalize_board_slug(env_board)
+    explicit_norm = kb._normalize_board_slug(explicit_board)
+    if env_norm and explicit_norm and env_norm != explicit_norm:
+        return tool_error(
+            f"kanban board conflict: HERMES_KANBAN_BOARD is pinned to "
+            f"{env_norm!r} but the tool call requested {explicit_norm!r}. "
+            f"Workers cannot cross boards. Drop the explicit board= arg, "
+            f"or unset HERMES_KANBAN_BOARD to use the explicit board."
+        )
+    return None
+
+
 def _connect(board: Optional[str] = None):
     """Import + connect lazily so the module imports cleanly in non-kanban
     contexts (e.g. test rigs that import every tool module).
@@ -1149,9 +1220,15 @@ def _handle_attach(args: dict, **kw) -> str:
     except (binascii.Error, ValueError) as e:
         return tool_error(f"content_base64 is not valid base64: {e}")
     content_type = args.get("content_type")
-    board = args.get("board")
+    board_arg = args.get("board")
+    # B1 — strict board authority: reject conflicting explicit board
+    # against HERMES_KANBAN_BOARD env pin BEFORE any DB write.
+    board_conflict_err = _check_board_authority(board_arg)
+    if board_conflict_err:
+        return board_conflict_err
+    authoritative_board = _resolve_authoritative_board(board_arg)
     try:
-        _, conn = _connect(board=board)
+        _, conn = _connect(board=authoritative_board)
         try:
             att_id = kb.store_attachment_bytes(
                 conn,
@@ -1160,7 +1237,7 @@ def _handle_attach(args: dict, **kw) -> str:
                 data,
                 content_type=content_type,
                 uploaded_by="agent",
-                board=board,
+                board=authoritative_board,
             )
             return _ok(task_id=tid, attachment_id=att_id, size=len(data))
         finally:
@@ -1269,7 +1346,13 @@ def _handle_attach_url(args: dict, **kw) -> str:
         leaf = unquote(urlparse(url).path.rsplit("/", 1)[-1]).strip()
         filename = leaf or "download"
     content_type = args.get("content_type")
-    board = args.get("board")
+    board_arg = args.get("board")
+    # B1 — strict board authority: reject conflicting explicit board
+    # against HERMES_KANBAN_BOARD env pin BEFORE any DB write / fetch.
+    board_conflict_err = _check_board_authority(board_arg)
+    if board_conflict_err:
+        return board_conflict_err
+    authoritative_board = _resolve_authoritative_board(board_arg)
     try:
         data, fetched_ct = _download_url_with_cap(url, kb.KANBAN_ATTACHMENT_MAX_BYTES)
     except ValueError as e:
@@ -1278,7 +1361,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
         logger.exception("kanban_attach_url download failed")
         return tool_error(f"kanban_attach_url: failed to fetch {url}: {e}")
     try:
-        _, conn = _connect(board=board)
+        _, conn = _connect(board=authoritative_board)
         try:
             att_id = kb.store_attachment_bytes(
                 conn,
@@ -1287,7 +1370,7 @@ def _handle_attach_url(args: dict, **kw) -> str:
                 data,
                 content_type=content_type or fetched_ct,
                 uploaded_by="agent",
-                board=board,
+                board=authoritative_board,
             )
             return _ok(task_id=tid, attachment_id=att_id, size=len(data))
         finally:
