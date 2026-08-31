@@ -121,10 +121,29 @@ def fake_clock(monkeypatch):
 # ============================================================================
 
 class TestPulseSocketReachable:
+    @staticmethod
+    def _socket_path(tmp_path):
+        candidate = tmp_path / "pulse" / "native"
+        if len(os.fsencode(candidate)) >= 100:
+            candidate = (
+                Path("/tmp")
+                / f"hv-{os.getpid()}-{id(tmp_path):x}"
+                / "pulse"
+                / "native"
+            )
+        return candidate
+
+    @staticmethod
+    def _cleanup_socket_path(sock_path):
+        sock_path.unlink(missing_ok=True)
+        if str(sock_path).startswith("/tmp/hv-"):
+            sock_path.parent.rmdir()
+            sock_path.parent.parent.rmdir()
+
     def test_stale_socket_file_not_reachable(self, monkeypatch, tmp_path):
         """A socket file with no listener should not count as reachable."""
         import socket as _socket
-        sock_path = tmp_path / "pulse" / "native"
+        sock_path = self._socket_path(tmp_path)
         sock_path.parent.mkdir(parents=True)
         # Create + bind, then close so the path is a stale socket file.
         s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
@@ -132,14 +151,17 @@ class TestPulseSocketReachable:
         s.close()
         monkeypatch.delenv("PULSE_SERVER", raising=False)
         monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
-        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(sock_path.parent.parent))
         from tools.voice_mode import _pulse_socket_reachable
-        assert _pulse_socket_reachable() is False
+        try:
+            assert _pulse_socket_reachable() is False
+        finally:
+            self._cleanup_socket_path(sock_path)
 
     def test_listening_socket_reachable_via_xdg_runtime(self, monkeypatch, tmp_path):
         """A live PulseAudio-style socket under XDG_RUNTIME_DIR is reachable (#35622)."""
         import socket as _socket
-        sock_path = tmp_path / "pulse" / "native"
+        sock_path = self._socket_path(tmp_path)
         sock_path.parent.mkdir(parents=True)
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         server.bind(str(sock_path))
@@ -147,11 +169,12 @@ class TestPulseSocketReachable:
         try:
             monkeypatch.delenv("PULSE_SERVER", raising=False)
             monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
-            monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+            monkeypatch.setenv("XDG_RUNTIME_DIR", str(sock_path.parent.parent))
             from tools.voice_mode import _pulse_socket_reachable
             assert _pulse_socket_reachable() is True
         finally:
             server.close()
+            self._cleanup_socket_path(sock_path)
 
 class TestDetectAudioEnvironment:
     def test_clean_environment_is_available(self, monkeypatch):
@@ -1414,6 +1437,7 @@ class TestWSL2PowerShellFallback:
             return m
 
         with patch("tools.voice_mode._is_wsl2_env", return_value=True), \
+             patch("tools.voice_mode.platform.system", return_value="Linux"), \
              patch("tools.voice_mode._import_audio", side_effect=ImportError), \
              patch("tools.voice_mode.shutil.which",
                    side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay", "sh") else (x if x.startswith("/") else None)), \
@@ -1459,13 +1483,8 @@ class TestWSL2PowerShellFallback:
                 return f"C:\\Temp\\{wsl_path.split('/')[-1]}\n".encode()
             return b""
 
-        def _fake_open(path, *args, **kwargs):
-            if str(path) == "/proc/version":
-                import io
-                return io.StringIO("Linux Microsoft WSL2")
-            return open(path, *args, **kwargs)
-
-        with patch("builtins.open", side_effect=_fake_open), \
+        with patch("tools.voice_mode._is_wsl2_env", return_value=True), \
+             patch("tools.voice_mode.platform.system", return_value="Linux"), \
              patch("shutil.which", side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay") else None), \
              patch("subprocess.check_output", side_effect=_capture_check_output), \
              patch("subprocess.Popen", return_value=MagicMock(returncode=0, wait=lambda **k: 0)), \

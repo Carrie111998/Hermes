@@ -110,6 +110,7 @@ def test_idle_exactly_at_threshold():
 import os
 import socket as _socket
 import threading
+from pathlib import Path
 
 
 from gateway.scale_to_zero import (  # noqa: E402 - grouped with their section
@@ -124,7 +125,13 @@ _FLY_ENV = {FLY_APP_NAME_ENV: "hermes-agent-stg-test", FLY_MACHINE_ID_ENV: "d891
 
 def _fake_flaps(tmp_path, status_line, capture):
     """One-shot unix-socket HTTP server standing in for flaps."""
-    sock_path = str(tmp_path / "fly-api.sock")
+    socket_candidate = tmp_path / "fly-api.sock"
+    # Darwin's sockaddr_un.sun_path is only 104 bytes; pytest's descriptive
+    # temp directories routinely exceed it.  Keep the unique pytest path when
+    # possible and use a short, per-process fallback otherwise.
+    if len(os.fsencode(socket_candidate)) >= 100:
+        socket_candidate = Path("/tmp") / f"hf-{os.getpid()}-{id(capture):x}.sock"
+    sock_path = str(socket_candidate)
     server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
     server.bind(sock_path)
     server.listen(1)
@@ -144,6 +151,10 @@ def _fake_flaps(tmp_path, status_line, capture):
                 f"HTTP/1.1 {status_line}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}".encode()
             )
         server.close()
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
 
     t = threading.Thread(target=serve, daemon=True)
     t.start()

@@ -41,6 +41,9 @@ def test_guest_barriers_apply_configured_synchronous(monkeypatch, tmp_path):
 
 
 def test_guest_barriers_leave_synchronous_alone_when_unset(monkeypatch, tmp_path):
+    # This contract covers platforms without the mandatory Darwin FULL floor;
+    # macOS behavior is pinned separately in test_state_synchronous_pragma.py.
+    monkeypatch.setattr(hermes_state.sys, "platform", "linux")
     _config(monkeypatch, {})
     conn = sqlite3.connect(tmp_path / "state.db")
     try:

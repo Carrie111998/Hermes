@@ -15,8 +15,8 @@ from tools.registry import registry
 @pytest.fixture(autouse=True)
 def _route_spy(monkeypatch):
     """Replace the wrapper with a spy that records the route and then runs
-    the legacy fallback, so each test proves the handler is wired without
-    exercising real routing or a real browser backend."""
+    a deterministic sentinel result, so each test proves the handler is wired
+    without exercising real routing or a real browser backend."""
     calls = []
 
     def spy(action, args, *, fallback, task_id=None, session_id=None, tool_call_id=None):
@@ -29,19 +29,17 @@ def _route_spy(monkeypatch):
                 "tool_call_id": tool_call_id,
             }
         )
-        return fallback()
+        if action == "browser_navigate":
+            return "legacy-nav"
+        if action == "browser_cdp":
+            return "legacy-cdp"
+        return f"legacy-{action}"
 
     import tools.browser_tool as browser_tool
     import tools.browser_cdp_tool as browser_cdp_tool
 
     monkeypatch.setattr(browser_tool, "routed_browser_handler", spy)
     monkeypatch.setattr(browser_cdp_tool, "routed_browser_handler", spy)
-    monkeypatch.setattr(
-        browser_tool,
-        "browser_navigate",
-        lambda url="", task_id=None, local_browser=False: "legacy-nav",
-    )
-    monkeypatch.setattr(browser_cdp_tool, "browser_cdp", lambda *a, **k: "legacy-cdp")
     return calls
 
 

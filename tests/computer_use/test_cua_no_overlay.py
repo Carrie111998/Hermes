@@ -241,6 +241,10 @@ class TestEmbeddedDaemonOverlayFlag:
         ), patch.object(
             cua_backend, "_cua_driver_supports_no_overlay", return_value=True,
         ), patch.object(
+            cua_backend,
+            "_embedded_daemon_spawn_command",
+            side_effect=lambda driver, args, **_kwargs: [driver, *args],
+        ), patch.object(
             cua_backend.subprocess, "Popen", return_value=process,
         ) as popen, patch.object(
             cua_backend.subprocess, "run", return_value=status,

@@ -1,5 +1,6 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import contextlib
 import sqlite3
 import time
 import json
@@ -820,38 +821,41 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
-        traced_connections = [db._conn]
-        if read_conn is not db._conn:
-            traced_connections.append(read_conn)
-        for conn in traced_connections:
-            conn.set_trace_callback(statements.append)
+
+        @contextlib.contextmanager
+        def traced_read_ctx():
+            # Pool checkouts can rotate across multiple connections.  Route
+            # this query-shape assertion through one traced connection instead
+            # of tracing a connection that the next checkout may not use.
+            with db._lock:
+                yield db._conn
 
         def context_query_count():
             normalized = (" ".join(sql.upper().split()) for sql in statements)
             return sum("WITH TARGET AS (" in sql for sql in normalized)
 
-        try:
-            projected = db.search_messages(
-                "projectionneedle", fields=("session_id", "snippet")
-            )
-            assert len(projected) == 1
-            assert context_query_count() == 0
+        db._conn.set_trace_callback(statements.append)
+        with mock.patch.object(db, "_read_ctx", traced_read_ctx):
+            try:
+                projected = db.search_messages(
+                    "projectionneedle", fields=("session_id", "snippet")
+                )
+                assert len(projected) == 1
+                assert context_query_count() == 0
 
-            full = db.search_messages(
-                "projectionneedle", fields=("session_id", "context")
-            )
-            assert len(full) == 1
-            assert full[0]["context"]
-            assert context_query_count() == 1
+                full = db.search_messages(
+                    "projectionneedle", fields=("session_id", "context")
+                )
+                assert len(full) == 1
+                assert full[0]["context"]
+                assert context_query_count() == 1
 
-            default = db.search_messages("projectionneedle")
-            assert len(default) == 1
-            assert default[0]["context"]
-            assert context_query_count() == 2
-        finally:
-            for conn in traced_connections:
-                conn.set_trace_callback(None)
+                default = db.search_messages("projectionneedle")
+                assert len(default) == 1
+                assert default[0]["context"]
+                assert context_query_count() == 2
+            finally:
+                db._conn.set_trace_callback(None)
 
     def test_sanitize_fts5_query_strips_dangerous_chars(self):
         """Unit test for _sanitize_fts5_query static method."""

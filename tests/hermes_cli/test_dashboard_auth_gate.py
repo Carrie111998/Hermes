@@ -96,6 +96,10 @@ def _stub_uvicorn_run(monkeypatch):
     import uvicorn
     captured: dict = {"kwargs": {}}
 
+    # Auth-gate tests exercise application state, not the real bind preflight.
+    # A developer may legitimately have a dashboard on the default port.
+    monkeypatch.setattr(web_server, "_port_bind_conflict", lambda *_args: False)
+
     class _FakeConfig:
         loaded = True
         host = "127.0.0.1"
