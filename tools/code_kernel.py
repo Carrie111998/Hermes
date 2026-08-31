@@ -1,7 +1,7 @@
 """Session-persistent Python kernels for execute_code.
 
 With ``code_execution.kernel_mode: session``, execute_code keeps one Python
-child process alive per (task, mode, interpreter, cwd, tool-set) and feeds it
+child process alive per (profile, task, mode, interpreter, cwd, tool-set) and feeds it
 one code cell per call, so variables, imports, and loaded data survive across
 calls::
 
@@ -363,9 +363,23 @@ def _resolve_owner(task_id: str) -> str:
     return owner
 
 
+def _profile_scope() -> str:
+    """Return the canonical profile identity that owns a session kernel."""
+    from hermes_constants import get_hermes_home
+
+    return str(get_hermes_home().expanduser().resolve())
+
+
 def _kernel_key(owner: str, mode: str, child_python: str, child_cwd: str,
                 sandbox_tools: frozenset) -> Tuple:
-    return (owner or "", mode, child_python, child_cwd, tuple(sorted(sandbox_tools)))
+    return (
+        owner or "",
+        _profile_scope(),
+        mode,
+        child_python,
+        child_cwd,
+        tuple(sorted(sandbox_tools)),
+    )
 
 
 def shutdown_all_kernels() -> None:
@@ -386,8 +400,13 @@ def shutdown_kernels_for_owner(owner: str) -> None:
     """
     if not owner:
         return
+    profile_scope = _profile_scope()
     with _KERNELS_LOCK:
-        doomed = [key for key in _KERNELS if key[0] == owner]
+        doomed = [
+            key
+            for key in _KERNELS
+            if key[0] == owner and key[1] == profile_scope
+        ]
         kernels = [_KERNELS.pop(key) for key in doomed]
     for kernel in kernels:
         _teardown(kernel)

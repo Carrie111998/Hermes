@@ -21,7 +21,7 @@ child process are rebuilt on top of it:
    call respawns fresh and says so — never a hung poll loop, because every
    wait is bounded by the cell timeout.
 
-Same invariants as local: owner = approval session key with the
+Same invariants as local: profile-scoped owner = approval session key with the
 ``::child::{id}`` qualifier for delegated children (imported from
 tools.code_kernel — one resolver, cannot drift), same generated tool stubs,
 same output post-processing in the caller. ``reset=true`` kills and
@@ -159,7 +159,9 @@ class RemoteKernel:
 
 
 def _kernel_key(owner: str, env_type: str, task_env_id: str) -> Tuple:
-    return (owner, "remote", env_type, task_env_id)
+    from tools.code_kernel import _profile_scope
+
+    return (owner, _profile_scope(), "remote", env_type, task_env_id)
 
 
 def _is_alive(kernel: RemoteKernel) -> bool:
@@ -212,8 +214,15 @@ def shutdown_remote_kernels_for_owner(owner: str) -> None:
     local kernels, so /new and session close reap both kinds."""
     if not owner:
         return
+    from tools.code_kernel import _profile_scope
+
+    profile_scope = _profile_scope()
     with _REMOTE_KERNELS_LOCK:
-        doomed = [k for k in _REMOTE_KERNELS if k[0] == owner]
+        doomed = [
+            k
+            for k in _REMOTE_KERNELS
+            if k[0] == owner and k[1] == profile_scope
+        ]
         kernels = [_REMOTE_KERNELS.pop(k) for k in doomed]
     for kernel in kernels:
         _kill(kernel)

@@ -204,6 +204,30 @@ class TestDeathDetection(RemoteKernelBase):
 
 
 class TestOwnershipIsolation(RemoteKernelBase):
+    def test_profiles_with_same_task_get_distinct_remote_kernels(self):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        def run_in_profile(profile_home):
+            token = set_hermes_home_override(profile_home)
+            try:
+                return _run(env, task="shared-task")
+            finally:
+                reset_hermes_home_override(token)
+
+        env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell()]))
+        first = run_in_profile("/tmp/remote-kernel-profile-a")
+        second = run_in_profile("/tmp/remote-kernel-profile-b")
+
+        assert first is not None
+        assert second is not None
+        self.assertFalse(first["kernel"]["reused"])
+        self.assertFalse(second["kernel"]["reused"])
+        self.assertEqual(len(_REMOTE_KERNELS), 2)
+        self.assertEqual(sum(1 for c in env.commands if "nohup" in c), 2)
+
     def test_delegated_children_get_their_own_remote_kernels(self):
         """Same invariant as local (#94647 review fix): the child context
         qualifier must key a DIFFERENT remote kernel."""
@@ -226,6 +250,34 @@ class TestOwnershipIsolation(RemoteKernelBase):
         self.assertEqual(len(_REMOTE_KERNELS), 1)
         remaining_owner = next(iter(_REMOTE_KERNELS))[0]
         self.assertEqual(remaining_owner, "owner-b")
+
+    def test_profile_disposal_preserves_same_owner_in_other_profile(self):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        def in_profile(profile_home, callback):
+            token = set_hermes_home_override(profile_home)
+            try:
+                return callback()
+            finally:
+                reset_hermes_home_override(token)
+
+        env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell()]))
+        profile_a = "/tmp/remote-kernel-cleanup-profile-a"
+        profile_b = "/tmp/remote-kernel-cleanup-profile-b"
+        in_profile(profile_a, lambda: _run(env, task="shared-owner"))
+        in_profile(profile_b, lambda: _run(env, task="shared-owner"))
+
+        in_profile(
+            profile_a,
+            lambda: shutdown_remote_kernels_for_owner("shared-owner"),
+        )
+
+        self.assertEqual(len(_REMOTE_KERNELS), 1)
+        remaining_key = next(iter(_REMOTE_KERNELS))
+        self.assertEqual(remaining_key[1], os.path.realpath(profile_b))
 
 
 class TestDispatchIntegration(unittest.TestCase):
