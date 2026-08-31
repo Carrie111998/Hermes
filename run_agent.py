@@ -1788,12 +1788,20 @@ class AIAgent:
         stripped = content.rstrip()
         if not stripped:
             return False
+        # VS15/VS16 presentation modifiers (e.g. 🎖️ = U+1F396 + U+FE0F) are
+        # invisible tail codepoints below 0x1F300, so an emoji-with-style
+        # ending reads as unnatural. Judge by the last VISIBLE character.
+        unstyled = re.sub(r"[\ufe0e\ufe0f]+$", "", stripped)
+        if unstyled:
+            stripped = unstyled
         if stripped.endswith("```"):
             return True
         if stripped.endswith('^'):
             return True
+        # '|' and '%' close markdown tables and percent figures — complete
+        # response endings (e.g. status boards ending in '|').
         last = stripped[-1]
-        if last in '.!?:)"\']}。！？：）】」』》^':
+        if last in ".!?:)\"']}。！？：）】」』》^%|%":
             return True
         # Emoji ranges (Misc Symbols, Dingbats, Emoticons, Supplemental, etc.)
         if ord(last) >= 0x1F300:
