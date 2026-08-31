@@ -2054,6 +2054,11 @@ class FeishuAdapter(BasePlatformAdapter):
         been delivered as a new message — without this, a failed final edit
         leaves the truncated ``▉``-suffixed preview on screen next to the
         complete answer (duplicate content).
+
+        ``chat_id`` is required by the base adapter contract and callers pass
+        it positionally, but Feishu's recall API addresses a message purely by
+        ``message_id`` (``DELETE /im/v1/messages/{message_id}``) — it does not
+        scope deletion to a chat, so ``chat_id`` is intentionally unused.
         """
         if not self._client:
             return False
