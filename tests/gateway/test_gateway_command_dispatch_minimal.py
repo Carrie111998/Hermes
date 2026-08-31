@@ -98,7 +98,9 @@ def _make_runner():
     runner._should_send_telegram_lobby_reminder = lambda _source: False
     runner._check_slash_access = lambda _source, _command: None
     runner._begin_session_run_generation = lambda _key: 1
-    runner._release_running_agent_state = lambda key: runner._running_agents.pop(key, None)
+    runner._release_running_agent_state = lambda key: runner._running_agents.pop(
+        key, None
+    )
     return runner, adapter
 
 
@@ -127,3 +129,29 @@ async def test_idle_queue_sends_payload_as_next_turn(command_text):
     assert captured["key"] == build_session_key(_make_source())
     assert captured["generation"] == 1
     assert runner._running_agents == {}
+
+
+@pytest.mark.asyncio
+async def test_non_control_event_cannot_execute_forwarded_gateway_command():
+    runner, _adapter = _make_runner()
+    captured = {}
+
+    async def fake_handle_message_with_agent(event, source, key, generation):
+        captured["text"] = event.text
+        return {"final_response": "agent handled it", "messages": []}
+
+    runner._handle_message_with_agent = fake_handle_message_with_agent
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=_make_source(),
+        message_id="m-route",
+        internal=True,
+        allow_gateway_control=False,
+    )
+    assert event.text == "/restart"
+
+    result = await runner._handle_message(event)
+
+    assert result == {"final_response": "agent handled it", "messages": []}
+    assert captured["text"] == "/restart"

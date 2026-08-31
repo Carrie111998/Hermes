@@ -244,6 +244,39 @@ class TestReplyToText:
         assert event.reply_to_message_id is None
         assert event.reply_to_text is None
 
+    @pytest.mark.asyncio
+    async def test_route_authorization_disables_gateway_control(
+        self, reply_text_adapter
+    ):
+        message = _make_message(content="forwarded conversational content")
+        route = SimpleNamespace(authorization=object(), profile="limited")
+        reply_text_adapter.gateway_runner = SimpleNamespace(
+            _profile_name_for_source=lambda _source: "limited"
+        )
+        reply_text_adapter._matched_profile_route = lambda **_kwargs: route
+
+        await reply_text_adapter._handle_message(message, route_authorized=True)
+
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.allow_gateway_control is False
+
+    @pytest.mark.asyncio
+    async def test_route_authorization_profile_mismatch_is_rejected(
+        self, reply_text_adapter
+    ):
+        message = _make_message(content="forwarded conversational content")
+        route = SimpleNamespace(authorization=object(), profile="other-profile")
+        reply_text_adapter.gateway_runner = SimpleNamespace(
+            _profile_name_for_source=lambda _source: "limited"
+        )
+        reply_text_adapter._matched_profile_route = lambda **_kwargs: route
+
+        assert (
+            await reply_text_adapter._handle_message(message, route_authorized=True)
+            is False
+        )
+        reply_text_adapter.handle_message.assert_not_awaited()
+
 
     @pytest.mark.asyncio
     async def test_reference_with_empty_resolved_content(self, reply_text_adapter):

@@ -275,7 +275,7 @@ async def _wait_for_ready_or_bot_exit(
 
 def _needs_server_members_intent(
     allowed_user_ids: set[str] | list[str] | None,
-    allowed_role_ids: set[str] | list[str] | None,
+    allowed_role_ids: set[str | int] | list[str | int] | None,
 ) -> bool:
     """Return True when Hermes must request Discord's Server Members intent.
 
@@ -299,8 +299,8 @@ def _format_privileged_intents_guidance(*, needs_members: bool) -> str:
     ]
     if needs_members:
         lines.append(
-            "  - Server Members Intent (required for username allowlists "
-            "and/or DISCORD_ALLOWED_ROLES)"
+            "  - Server Members Intent (required for username allowlists, "
+            "DISCORD_ALLOWED_ROLES, and/or profile route roles)"
         )
     lines.extend(
         [
@@ -1348,7 +1348,7 @@ class DiscordAdapter(BasePlatformAdapter):
             intents.guild_messages = True
             intents.members = _needs_server_members_intent(
                 self._allowed_user_ids,
-                self._allowed_role_ids,
+                set(self._allowed_role_ids) | self._profile_route_role_ids(),
             )
             intents.voice_states = True
 
@@ -1550,42 +1550,124 @@ class DiscordAdapter(BasePlatformAdapter):
             guidance = _format_privileged_intents_guidance(
                 needs_members=_needs_server_members_intent(
                     getattr(self, "_allowed_user_ids", None),
-                    getattr(self, "_allowed_role_ids", None),
+                    set(getattr(self, "_allowed_role_ids", None) or set())
+                    | self._profile_route_role_ids(),
                 )
             )
             return ("discord_intents_required", guidance, False)
         return ("discord_connect_error", f"Discord startup failed: {error}", True)
+
+    def _matched_profile_route(self, *, guild: Any, channel: Any):
+        """Return the multiplex route for a Discord channel, if one matches."""
+        runner = getattr(self, "gateway_runner", None)
+        config = getattr(runner, "config", None)
+        if not getattr(config, "multiplex_profiles", False):
+            return None
+        routes = getattr(config, "profile_routes", None)
+        if not routes or channel is None:
+            return None
+
+        from gateway.profile_routing import match_profile_route
+
+        is_thread = isinstance(channel, discord.Thread)
+        chat_id = getattr(channel, "id", None)
+        parent_chat_id = self._get_parent_channel_id(channel) if is_thread else None
+        guild_id = getattr(guild, "id", None)
+        return match_profile_route(
+            routes,
+            platform="discord",
+            guild_id=str(guild_id) if guild_id is not None else None,
+            chat_id=str(chat_id) if chat_id is not None else None,
+            thread_id=str(chat_id) if is_thread and chat_id is not None else None,
+            parent_chat_id=str(parent_chat_id) if parent_chat_id is not None else None,
+        )
+
+    def _route_authorizes_discord_user(
+        self, route: Any, *, user_id: str, author: Any, guild: Any
+    ) -> tuple[bool, bool]:
+        """Return ``(authorized, via_role)`` for a matched route policy."""
+        policy = getattr(route, "authorization", None)
+        if policy is None:
+            return False, False
+        if user_id in policy.allowed_users:
+            return True, False
+        if guild is None or not policy.allowed_roles:
+            return False, False
+
+        roles = getattr(author, "roles", None) or []
+        author_guild = getattr(author, "guild", None)
+        if getattr(author_guild, "id", None) == getattr(guild, "id", None):
+            if any(getattr(role, "id", None) in policy.allowed_roles for role in roles):
+                return True, True
+
+        try:
+            member = guild.get_member(int(user_id))
+        except (AttributeError, TypeError, ValueError):
+            member = None
+        member_guild = getattr(member, "guild", None)
+        if getattr(member_guild, "id", None) != getattr(guild, "id", None):
+            return False, False
+        member_roles = getattr(member, "roles", None) or []
+        if any(getattr(role, "id", None) in policy.allowed_roles for role in member_roles):
+            return True, True
+        return False, False
+
+    def _profile_route_role_ids(self) -> set[int]:
+        """Collect Discord route roles so connect requests Members Intent."""
+        runner = getattr(self, "gateway_runner", None)
+        config = getattr(runner, "config", None)
+        if not getattr(config, "multiplex_profiles", False):
+            return set()
+        roles: set[int] = set()
+        for route in getattr(config, "profile_routes", None) or []:
+            if not getattr(route, "enabled", True):
+                continue
+            if getattr(route, "platform", "") != "discord":
+                continue
+            policy = getattr(route, "authorization", None)
+            if policy is not None:
+                roles.update(policy.allowed_roles)
+        return roles
 
     def _discord_message_admission(
         self,
         message: Any,
         *,
         claim: bool,
-    ) -> tuple[bool, bool]:
-        """Return ``(admitted, role_authorized)`` for one Discord event."""
+    ) -> tuple[bool, bool, bool]:
+        """Return ``(admitted, role_authorized, route_authorized)``."""
         message_id = str(getattr(message, "id", ""))
         if claim:
             if self._dedup.is_duplicate(message_id):
-                return False, False
+                return False, False, False
         elif self._dedup.contains(message_id):
-            return False, False
+            return False, False, False
         if message.author == self._client.user:
-            return False, False
+            return False, False, False
         if message.type not in {discord.MessageType.default, discord.MessageType.reply}:
-            return False, False
+            return False, False, False
 
         role_authorized = False
+        route_authorized = False
+        route_policy = None
         if getattr(message.author, "bot", False):
+            # Route-scoped grants are human principal lists. Do not let a
+            # transport-wide bot allowance bypass a limited route's policy.
+            bot_route = self._matched_profile_route(
+                guild=getattr(message, "guild", None), channel=message.channel
+            )
+            if getattr(bot_route, "authorization", None) is not None:
+                return False, False, False
             allow_bots = self._get_allow_bots()
             if allow_bots == "none":
-                return False, False
+                return False, False, False
             if allow_bots == "mentions" and not self._self_is_explicitly_mentioned(message):
-                return False, False
+                return False, False, False
             if (
                 self._discord_bots_require_inline_mention()
                 and not self._self_is_raw_mentioned(message)
             ):
-                return False, False
+                return False, False, False
         else:
             msg_guild = getattr(message, "guild", None)
             is_dm = isinstance(message.channel, discord.DMChannel) or msg_guild is None
@@ -1595,16 +1677,50 @@ class DiscordAdapter(BasePlatformAdapter):
                 parent_id = self._get_parent_channel_id(message.channel)
                 if parent_id:
                     msg_channel_ids.add(parent_id)
-            if not self._is_allowed_user(
-                str(message.author.id),
-                message.author,
-                guild=msg_guild,
-                is_dm=is_dm,
-                channel_ids=msg_channel_ids,
-            ):
-                self._warn_if_fail_closed_default()
-                return False, False
-            role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
+            route = self._matched_profile_route(guild=msg_guild, channel=message.channel)
+            route_policy = getattr(route, "authorization", None)
+            if route_policy is not None:
+                admitted, _via_role = self._route_authorizes_discord_user(
+                    route,
+                    user_id=str(message.author.id),
+                    author=message.author,
+                    guild=msg_guild,
+                )
+                if not admitted:
+                    return False, False, False
+                globally_authorized = self._is_allowed_user(
+                    str(message.author.id),
+                    message.author,
+                    guild=msg_guild,
+                    is_dm=is_dm,
+                    channel_ids=msg_channel_ids,
+                )
+                route_authorized = not globally_authorized
+                if globally_authorized:
+                    role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
+                route_text = str(getattr(message, "content", "") or "")
+                client_user = getattr(getattr(self, "_client", None), "user", None)
+                client_user_id = getattr(client_user, "id", None)
+                if client_user_id is not None:
+                    route_text = route_text.replace(f"<@{client_user_id}>", "")
+                    route_text = route_text.replace(f"<@!{client_user_id}>", "")
+                if route_text.strip().startswith("/") and not globally_authorized:
+                    # Route grants are conversational only. Gateway control
+                    # commands remain exclusive to the global transport policy.
+                    return False, False, False
+                # Keep route-local transport provenance separate from the
+                # legacy global-role grant carried by role_authorized.
+            else:
+                if not self._is_allowed_user(
+                    str(message.author.id),
+                    message.author,
+                    guild=msg_guild,
+                    is_dm=is_dm,
+                    channel_ids=msg_channel_ids,
+                ):
+                    self._warn_if_fail_closed_default()
+                    return False, False, False
+                role_authorized = bool(getattr(self, "_allowed_role_ids", set()))
 
         raw_self_mention = self._self_is_explicitly_mentioned(message)
         if not isinstance(message.channel, discord.DMChannel) and (
@@ -1615,7 +1731,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 for mentioned in message.mentions
             )
             if other_bots_mentioned and not raw_self_mention:
-                return False, False
+                return False, False, False
             ignore_no_mention = os.getenv(
                 "DISCORD_IGNORE_NO_MENTION", "true"
             ).lower() in {"true", "1", "yes"}
@@ -1626,9 +1742,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 free_channels = self._discord_free_response_channels()
                 channel_keys = self._discord_channel_keys(message, parent_id)
                 if "*" not in free_channels and not (channel_keys & free_channels):
-                    return False, False
+                    return False, False, False
 
-        return True, role_authorized
+        return True, role_authorized, route_authorized
 
     async def _dispatch_discord_message(self, message: Any) -> bool:
         """Apply Discord ingress policy and dispatch one live event."""
@@ -1637,14 +1753,15 @@ class DiscordAdapter(BasePlatformAdapter):
                 await asyncio.wait_for(self._ready_event.wait(), timeout=30.0)
             except asyncio.TimeoutError:
                 pass
-        admitted, role_authorized = self._discord_message_admission(
+        admitted, role_authorized, route_authorized = self._discord_message_admission(
             message, claim=True,
         )
         if not admitted:
             return False
-        return await self._handle_message(
-            message, role_authorized=role_authorized,
-        )
+        kwargs = {"role_authorized": role_authorized}
+        if route_authorized:
+            kwargs["route_authorized"] = True
+        return await self._handle_message(message, **kwargs)
 
     # ------------------------------------------------------------------
     # gateway_platform_event fire-sites (#64176)
@@ -2702,16 +2819,18 @@ class DiscordAdapter(BasePlatformAdapter):
                 and not self._self_is_explicitly_mentioned(message)
             ):
                 return False
-        admitted, role_authorized = self._discord_message_admission(
+        admitted, role_authorized, route_authorized = self._discord_message_admission(
             message, claim=False,
         )
         if not admitted:
             return False
-        return await self._handle_message(
-            message,
-            role_authorized=role_authorized,
-            recovered=True,
-        )
+        kwargs = {
+            "role_authorized": role_authorized,
+            "recovered": True,
+        }
+        if route_authorized:
+            kwargs["route_authorized"] = True
+        return await self._handle_message(message, **kwargs)
 
     async def _iter_missed_message_backfill_candidates(self, channel_ids: set[str]):
         if not self._client:
@@ -5245,7 +5364,10 @@ class DiscordAdapter(BasePlatformAdapter):
             return (False, "missing interaction.user")
 
         user_id = str(user.id)
-        # Pass guild + is_dm so role check is scoped to the originating
+        # Slash commands remain behind the transport's global allowlist. Route-
+        # scoped principals may converse with their limited profile, but cannot
+        # invoke gateway control-plane commands such as /restart or /sethome.
+        # Pass guild + is_dm so role checks are scoped to the originating
         # guild and cross-guild DM bypass (#12136) can't land via the
         # slash surface either.
         interaction_guild = getattr(interaction, "guild", None)
@@ -6422,6 +6544,8 @@ class DiscordAdapter(BasePlatformAdapter):
         # For forum threads, inherit the parent forum's topic.
         chat_topic = self._get_effective_topic(interaction.channel, is_thread=is_thread)
 
+        parent_id = self._get_parent_channel_id(interaction.channel) if is_thread else None
+        guild_id = getattr(getattr(interaction, "guild", None), "id", None)
         source = self.build_source(
             chat_id=str(interaction.channel_id),
             chat_name=chat_name,
@@ -6430,11 +6554,13 @@ class DiscordAdapter(BasePlatformAdapter):
             user_name=interaction.user.display_name,
             thread_id=thread_id,
             chat_topic=chat_topic,
+            guild_id=str(guild_id) if guild_id is not None else None,
+            parent_chat_id=parent_id or None,
+            role_authorized=False,
         )
 
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
         channel_id = str(interaction.channel_id)
-        parent_id = str(getattr(getattr(interaction, "channel", None), "parent_id", "") or "")
         return MessageEvent(
             text=text,
             message_type=msg_type,
@@ -8078,6 +8204,7 @@ class DiscordAdapter(BasePlatformAdapter):
         message: DiscordMessage,
         role_authorized: bool = False,
         *,
+        route_authorized: bool = False,
         recovered: bool = False,
     ) -> bool:
         """Handle one Discord message and report whether it reached dispatch."""
@@ -8293,12 +8420,33 @@ class DiscordAdapter(BasePlatformAdapter):
             parent_chat_id=parent_channel_id,
             message_id=str(message.id),
             role_authorized=role_authorized,
+            transport_authorized=route_authorized,
             auto_thread_created=auto_threaded_channel is not None,
             auto_thread_initial_name=(
                 getattr(auto_threaded_channel, "_hermes_auto_thread_initial_name", None)
                 or self._derive_auto_thread_name(message.content or "")
             ) if auto_threaded_channel is not None else None,
         )
+
+        if route_authorized:
+            # Authorization and routing must agree on the same winning route.
+            # A mismatch or second-pass matcher failure is denied before the
+            # event reaches gateway hooks, session lookup, or an agent run.
+            matched_route = self._matched_profile_route(
+                guild=guild,
+                channel=message.channel,
+            )
+            if (
+                getattr(matched_route, "authorization", None) is None
+                or getattr(source, "profile", None) != getattr(matched_route, "profile", None)
+                or getattr(source, "profile_route_rejected", False)
+            ):
+                logger.warning(
+                    "[%s] Rejecting Discord route authorization/profile mismatch for %s",
+                    self.name,
+                    getattr(message, "id", "unknown"),
+                )
+                return False
 
         # Build media URLs -- download image attachments to local cache so the
         # vision tool can access them reliably (Discord CDN URLs can expire).
@@ -8545,6 +8693,7 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            allow_gateway_control=not route_authorized,
         )
 
         # Track thread participation so the bot won't require @mention for

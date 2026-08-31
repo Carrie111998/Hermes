@@ -52,6 +52,14 @@ class ProfileRouteRejected(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ProfileRouteAuthorization:
+    """Principals admitted only when their profile route matches."""
+
+    allowed_users: tuple[str, ...] = ()
+    allowed_roles: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class ProfileRoute:
     """A single routing rule that maps a platform scope to a profile."""
 
@@ -62,6 +70,7 @@ class ProfileRoute:
     chat_id: Optional[str] = None
     thread_id: Optional[str] = None
     enabled: bool = True
+    authorization: Optional[ProfileRouteAuthorization] = None
 
     @property
     def specificity(self) -> int:
@@ -106,6 +115,56 @@ class ProfileRoute:
         return True
 
 
+def _parse_discord_snowflakes(values: Any, *, route_name: str, field_name: str) -> frozenset[str]:
+    """Validate one route-scoped Discord principal list."""
+    if not isinstance(values, (list, tuple)):
+        raise ValueError(
+            f"profile route {route_name!r} authorization.{field_name} must be a list"
+        )
+    normalized = frozenset(str(value).strip() for value in values)
+    if any(not value.isdigit() or int(value) <= 0 for value in normalized):
+        raise ValueError(
+            f"profile route {route_name!r} authorization.{field_name} "
+            "must contain positive decimal Discord IDs"
+        )
+    return normalized
+
+
+def _parse_route_authorization(
+    entry: Dict[str, Any], *, name: str, platform: str
+) -> Optional[ProfileRouteAuthorization]:
+    """Parse an optional fail-closed transport authorization policy."""
+    if "authorization" not in entry:
+        return None
+    raw = entry.get("authorization")
+    if not isinstance(raw, dict):
+        raise ValueError(f"profile route {name!r} authorization must be a mapping")
+    if platform != "discord":
+        raise ValueError(
+            f"profile route {name!r} authorization is currently supported only for discord"
+        )
+    unknown = set(raw) - {"allowed_users", "allowed_roles"}
+    if unknown:
+        raise ValueError(
+            f"profile route {name!r} authorization has unknown field(s): "
+            f"{', '.join(sorted(unknown))}"
+        )
+    users = _parse_discord_snowflakes(
+        raw.get("allowed_users", []), route_name=name, field_name="allowed_users"
+    )
+    roles = _parse_discord_snowflakes(
+        raw.get("allowed_roles", []), route_name=name, field_name="allowed_roles"
+    )
+    if roles and not entry.get("guild_id"):
+        raise ValueError(
+            f"profile route {name!r} authorization.allowed_roles requires guild_id"
+        )
+    return ProfileRouteAuthorization(
+        allowed_users=tuple(sorted(users)),
+        allowed_roles=tuple(sorted(int(role_id) for role_id in roles)),
+    )
+
+
 def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRoute]:
     """Parse profile_routes from config.yaml into ProfileRoute objects.
 
@@ -121,6 +180,11 @@ def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRou
         platform = entry.get("platform", "")
         profile = entry.get("profile", "")
         if not platform or not profile:
+            if "authorization" in entry:
+                raise ValueError(
+                    f"profile route {name or '<unnamed>'!r} with authorization "
+                    "requires platform and profile"
+                )
             logger.warning(
                 "Skipping profile route %s: missing platform or profile",
                 name,
@@ -135,18 +199,52 @@ def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRou
             )
             profile = normalize_profile_name(profile)
             validate_profile_name(profile)
-        except (ValueError, ImportError):
+        except (ValueError, ImportError) as exc:
+            if "authorization" in entry:
+                raise ValueError(
+                    f"profile route {name or '<unnamed>'!r} with authorization "
+                    f"has invalid profile name {profile!r}"
+                ) from exc
             logger.warning("Skipping profile route %s: invalid profile name %r", name, profile)
             continue
+        authorization = _parse_route_authorization(
+            entry, name=name or profile, platform=platform
+        )
+        route_ids = {
+            discriminator: entry.get(discriminator)
+            for discriminator in ("guild_id", "chat_id", "thread_id")
+        }
+        if authorization is not None:
+            if "enabled" in entry and not isinstance(entry["enabled"], bool):
+                raise ValueError(
+                    f"profile route {name or profile!r} authorization requires enabled to be boolean"
+                )
+            for discriminator in ("guild_id", "chat_id", "thread_id"):
+                value = entry.get(discriminator)
+                if value is None:
+                    continue
+                normalized = str(value).strip()
+                if not normalized.isdigit() or int(normalized) <= 0:
+                    raise ValueError(
+                        f"profile route {name or profile!r} {discriminator} must be a "
+                        "positive decimal Discord ID when authorization is configured"
+                    )
+                route_ids[discriminator] = normalized
+        if authorization is not None and profile == "default":
+            raise ValueError(
+                f"profile route {name or profile!r} authorization cannot grant "
+                "access to the privileged default profile"
+            )
         routes.append(
             ProfileRoute(
                 name=name,
                 platform=platform,
                 profile=profile,
-                guild_id=entry.get("guild_id"),
-                chat_id=entry.get("chat_id"),
-                thread_id=entry.get("thread_id"),
+                guild_id=route_ids["guild_id"],
+                chat_id=route_ids["chat_id"],
+                thread_id=route_ids["thread_id"],
                 enabled=entry.get("enabled", True),
+                authorization=authorization,
             )
         )
     # Sort: most specific first so the first match wins.

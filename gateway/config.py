@@ -1030,8 +1030,9 @@ class GatewayConfig:
     session_store_max_age_days: int = 90
 
     # Profile-based routing: route specific guilds/channels/threads to
-    # different profiles. See gateway/profile_routing.py. Each entry is a
-    # dict with: name, platform, profile, and optional guild_id/chat_id/thread_id.
+    # different profiles. See gateway/profile_routing.py. Each entry has name,
+    # platform, profile, optional guild_id/chat_id/thread_id, and an optional
+    # Discord-only route-scoped authorization mapping.
     profile_routes: list = field(default_factory=list)
 
     def __post_init__(self) -> None:

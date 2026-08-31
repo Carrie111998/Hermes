@@ -3,6 +3,7 @@
 import pytest
 from gateway.profile_routing import (
     ProfileRoute,
+    ProfileRouteAuthorization,
     parse_profile_routes,
     match_profile_route,
 )
@@ -49,6 +50,138 @@ class TestParseProfileRoutes:
     def test_empty(self):
         assert parse_profile_routes(None) == []
         assert parse_profile_routes([]) == []
+
+    def test_discord_route_authorization_is_normalized(self):
+        routes = parse_profile_routes([{
+            "name": "forum",
+            "platform": "discord",
+            "profile": "limited",
+            "guild_id": "111",
+            "chat_id": "222",
+            "authorization": {
+                "allowed_users": ["42", 42],
+                "allowed_roles": ["555"],
+            },
+        }])
+
+        assert routes[0].authorization == ProfileRouteAuthorization(
+            allowed_users=("42",),
+            allowed_roles=(555,),
+        )
+
+    @pytest.mark.parametrize(
+        "authorization",
+        [
+            "open",
+            {"allowed_users": "42"},
+            {"allowed_users": None},
+            {"allowed_roles": None},
+            {"allowed_roles": ["not-a-snowflake"]},
+            {"unknown": []},
+        ],
+    )
+    def test_malformed_authorization_fails_closed(self, authorization):
+        with pytest.raises(ValueError):
+            parse_profile_routes([{
+                "name": "forum",
+                "platform": "discord",
+                "profile": "limited",
+                "guild_id": "111",
+                "authorization": authorization,
+            }])
+
+    def test_role_authorization_requires_guild_scope(self):
+        with pytest.raises(ValueError, match="requires guild_id"):
+            parse_profile_routes([{
+                "name": "forum",
+                "platform": "discord",
+                "profile": "limited",
+                "chat_id": "222",
+                "authorization": {"allowed_roles": ["555"]},
+            }])
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("enabled", "false"),
+            ("guild_id", "not-an-id"),
+            ("chat_id", 0),
+            ("thread_id", -1),
+        ],
+    )
+    def test_authorized_route_discriminators_are_strict(self, field, value):
+        route = {
+            "name": "forum",
+            "platform": "discord",
+            "profile": "limited",
+            "guild_id": "111",
+            "chat_id": "222",
+            "authorization": {"allowed_users": ["42"]},
+        }
+        route[field] = value
+
+        with pytest.raises(ValueError):
+            parse_profile_routes([route])
+
+    def test_authorization_on_unsupported_platform_fails_closed(self):
+        with pytest.raises(ValueError, match="only for discord"):
+            parse_profile_routes([{
+                "name": "chat",
+                "platform": "telegram",
+                "profile": "limited",
+                "chat_id": "222",
+                "authorization": {"allowed_users": ["42"]},
+            }])
+
+    def test_authorization_cannot_target_default_profile(self):
+        with pytest.raises(ValueError, match="privileged default profile"):
+            parse_profile_routes([{
+                "name": "unsafe",
+                "platform": "discord",
+                "profile": "default",
+                "guild_id": "111",
+                "authorization": {"allowed_users": ["42"]},
+            }])
+
+    @pytest.mark.parametrize(
+        "route",
+        [
+            {
+                "name": "missing-profile",
+                "platform": "discord",
+                "authorization": {},
+            },
+            {
+                "name": "invalid-profile",
+                "platform": "discord",
+                "profile": "../default",
+                "authorization": {},
+            },
+        ],
+    )
+    def test_authorized_route_never_skips_invalid_target(self, route):
+        with pytest.raises(ValueError):
+            parse_profile_routes([route])
+
+    def test_gateway_config_round_trip_preserves_authorization(self):
+        from gateway.config import GatewayConfig
+
+        config = GatewayConfig.from_dict({
+            "multiplex_profiles": True,
+            "profile_routes": [{
+                "name": "forum",
+                "platform": "discord",
+                "profile": "limited",
+                "guild_id": "111",
+                "authorization": {
+                    "allowed_users": ["42"],
+                    "allowed_roles": ["555"],
+                },
+            }],
+        })
+
+        restored = GatewayConfig.from_dict(config.to_dict())
+        assert restored.profile_routes == config.profile_routes
 
 
 class TestMatchProfileRoute:

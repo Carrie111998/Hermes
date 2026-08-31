@@ -7327,6 +7327,7 @@ class BasePlatformAdapter(ABC):
         parent_chat_id: Optional[str] = None,
         message_id: Optional[str] = None,
         role_authorized: bool = False,
+        transport_authorized: bool = False,
         auto_thread_created: bool = False,
         auto_thread_initial_name: Optional[str] = None,
     ) -> SessionSource:
@@ -7373,9 +7374,10 @@ class BasePlatformAdapter(ABC):
                 profile_route_rejected = True
             except Exception:
                 logger.warning(
-                    "Profile resolution failed for %s/%s, defaulting to active profile",
+                    "Profile resolution failed for %s/%s; rejecting ingress",
                     self.platform, chat_id, exc_info=True,
                 )
+                profile_route_rejected = True
 
         source = SessionSource(
             platform=self.platform,
@@ -7402,6 +7404,7 @@ class BasePlatformAdapter(ABC):
         # SessionSource.to_dict(). The live receiving adapter is authoritative
         # for this turn even when profile_routes selects a different runtime.
         source._transport_adapter_ref = weakref.ref(self)
+        source._transport_authorized = transport_authorized is True
         # Keep this transport-only fail-closed signal out of SessionSource
         # serialization/session identity. The shared gateway handler consumes it
         # before auth, hooks, or session setup, so every adapter drops matched

@@ -383,9 +383,11 @@ async def test_dispatch_thread_session_builds_thread_event(adapter):
 
 
 def test_build_slash_event_preserves_thread_context(adapter):
+    channel = _FakeThreadChannel(channel_id=555, name="Planning")
     interaction = SimpleNamespace(
-        channel=_FakeThreadChannel(channel_id=555, name="Planning"),
+        channel=channel,
         channel_id=555,
+        guild=channel.guild,
         user=SimpleNamespace(display_name="Jezza", id=42),
     )
 
@@ -395,6 +397,8 @@ def test_build_slash_event_preserves_thread_context(adapter):
     assert event.source.chat_id == "555"
     assert event.source.chat_type == "thread"
     assert event.source.thread_id == "555"
+    assert event.source.guild_id == "1"
+    assert event.source.parent_chat_id == "100"
     assert "TestGuild" in event.source.chat_name
 
 

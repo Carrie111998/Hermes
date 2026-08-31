@@ -266,6 +266,9 @@ gateway:
       guild_id: "1234567890"
       chat_id: "9876543210"
       profile: acme-support
+      authorization:
+        allowed_users: ["184587051943985152"]
+        allowed_roles: ["112233445566778899"]
 
     # A Telegram group (no guild concept — chat_id only)
     - name: tg-group
@@ -287,6 +290,15 @@ target profile is not installed or is outside `multiplex_profile_allowlist`,
 the gateway rejects that ingress and logs the route and target. It does not run
 the default profile. Traffic that matches no route keeps the historical
 default-profile behavior.
+
+Discord routes may optionally include `authorization.allowed_users` and
+`authorization.allowed_roles` lists. These positive decimal Discord IDs grant
+access only to conversational messages for the matched route, replacing the
+bot's global allowlist there without widening it anywhere else. Role grants
+require `guild_id` and are checked only in the originating guild; they never
+authorize DMs. Route grants cannot target `default`, and slash/text gateway
+commands remain restricted to the bot's global allowlist. Invalid route
+authorization fails configuration loading rather than silently opening access.
 
 ## Start, stop, or restart all gateways at once
 

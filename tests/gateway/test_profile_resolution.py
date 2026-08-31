@@ -1,6 +1,7 @@
 """Tests for GatewayRunner._resolve_profile_home_for_source — profile resolution logic."""
 
 import logging
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -234,6 +235,25 @@ class TestNonDiscordProfileRouting:
         source = adapter.build_source(chat_id="route-chat", chat_type="group")
         assert source.profile is None
 
+    def test_route_matching_error_rejects_instead_of_defaulting(
+        self, mock_runner, telegram_source
+    ):
+        mock_runner.config.profile_routes = [
+            ProfileRoute(
+                name="worker-route",
+                platform="telegram",
+                profile="worker",
+                chat_id="route-chat",
+            )
+        ]
+
+        with patch(
+            "gateway.profile_routing.match_profile_route",
+            side_effect=RuntimeError("matcher failed"),
+        ):
+            with pytest.raises(ProfileRouteRejected, match="route-matching-error"):
+                mock_runner._profile_name_for_source(telegram_source)
+
 
 class TestGatewayRunnerInjection:
     """``BasePlatformAdapter`` declares ``gateway_runner`` so the gateway's
@@ -266,6 +286,33 @@ def _stub_adapter(platform: Platform, runner) -> "_StubAdapter":
     a.platform = platform
     a.gateway_runner = runner
     return a
+
+
+def test_transport_authorization_requires_live_registered_adapter():
+    adapter = _stub_adapter(Platform.DISCORD, None)
+    source = adapter.build_source(
+        chat_id="222",
+        chat_type="thread",
+        user_id="42",
+        transport_authorized=True,
+    )
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._profile_adapters = {}
+    runner.pairing_store = None
+
+    with patch.dict(
+        os.environ,
+        {
+            "DISCORD_ALLOWED_USERS": "",
+            "DISCORD_ALLOW_ALL_USERS": "false",
+            "GATEWAY_ALLOW_ALL_USERS": "false",
+        },
+        clear=False,
+    ):
+        assert runner._is_user_authorized(source) is True
+        restored = SessionSource.from_dict(source.to_dict())
+        assert runner._is_user_authorized(restored) is False
 
 
 class TestAdapterToSessionKeyIntegration:

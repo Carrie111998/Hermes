@@ -38,6 +38,11 @@ profile_routes:
     guild_id: "1234567890"
     chat_id: "9876543210"
     profile: support-profile
+    # Optional: let these Discord principals send conversational messages only
+    # when this route matches. The global bot allowlist still applies elsewhere.
+    authorization:
+      allowed_users: ["184587051943985152"]
+      allowed_roles: ["112233445566778899"]
 
   # Pin a Telegram group to a profile (Telegram has no guild_id — chat_id only).
   - name: tg-group
@@ -65,6 +70,27 @@ profile_routes:
 | `chat_id` | no | Channel/group/DM id. |
 | `thread_id` | no | Thread id within a channel. |
 | `enabled` | no | Default `true`; set `false` to disable a route without removing it. |
+| `authorization` | no | Discord-only route-scoped conversational user/role grants. |
+
+### Route-scoped Discord authorization
+
+An optional `authorization` mapping lets one Discord bot expose a limited
+profile to users or roles only in the guild/channel/thread matched by that
+route. It **replaces** the transport's global user/role allowlist for matching
+conversational messages; it does not widen access elsewhere.
+
+- `allowed_users` and `allowed_roles` must be lists of positive decimal Discord IDs.
+- Role grants require the route to declare `guild_id`; role membership is checked
+  only in the originating guild and never authorizes DMs.
+- Route grants cannot target the privileged `default` profile.
+- Native slash commands and text gateway commands remain behind the transport's
+  global allowlist, so route-granted users cannot invoke `/restart`, `/sethome`,
+  or other gateway control operations.
+- Malformed authorization fails gateway configuration loading instead of silently
+  opening or skipping the route. An explicitly matched route whose target profile
+  is unavailable is still rejected without falling back to the default profile.
+- With no `authorization` field, existing route and global-allowlist behavior is
+  unchanged. With an empty `authorization: {}`, the matching route admits nobody.
 
 ## Matching rules
 
@@ -94,7 +120,8 @@ If no route matches, the message uses the default/active profile.
 
 ## How it works at runtime
 
-1. An inbound message arrives at a platform adapter.
+1. An inbound message arrives at a platform adapter. Discord resolves any route
+   authorization before dispatch; rejected principals never create an agent session.
 2. `BasePlatformAdapter.build_source` builds the `SessionSource` for the message. Every
    adapter carries a back-reference to the running `GatewayRunner`
    (`gateway_runner`, injected in `gateway/run.py`), so it asks the runner to resolve the

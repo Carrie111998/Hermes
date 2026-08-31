@@ -17987,10 +17987,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _paused_notice is not None:
                 _estop_allow = False
                 _estop_cmd = None
-                try:
-                    _estop_cmd = event.get_command()
-                except Exception:
-                    _estop_cmd = None
+                if event.allow_gateway_control:
+                    try:
+                        _estop_cmd = event.get_command()
+                    except Exception:
+                        _estop_cmd = None
                 if _estop_cmd:
                     try:
                         from hermes_cli.commands import (
@@ -18314,7 +18315,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # resolver _dispatch_busy_slash_command below — no per-command
             # if-chain here.
             from hermes_cli.commands import resolve_command as _resolve_cmd_inner
-            _evt_cmd = event.get_command()
+            _evt_cmd = event.get_command() if allow_gateway_control else None
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
             # /status and /context are intentionally pre-gate so users
@@ -18386,7 +18387,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             running_agent = _ra_state.turn.agent if _ra_state else None
             if running_agent is _AGENT_PENDING_SENTINEL:
                 # Agent is being set up but not ready yet.
-                if event.get_command() == "stop":
+                if _evt_cmd == "stop":
                     # Force-clean the sentinel so the session is unlocked.
                     self._release_running_agent_state(_quick_key)
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
@@ -18513,8 +18514,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # which is read by _run_agent. Removed to prevent unbounded growth.
             return None
 
-        # Check for commands
-        command = event.get_command()
+        # Check for commands. Transport-scoped chat grants deliberately cannot
+        # reach gateway control even if an adapter normalized plain language or
+        # forwarded snapshot content into a slash-shaped message.
+        command = event.get_command() if allow_gateway_control else None
 
         from hermes_cli.commands import (
             GATEWAY_KNOWN_COMMANDS,
@@ -29549,12 +29552,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 thread_id=getattr(source, "thread_id", None),
                 parent_chat_id=getattr(source, "parent_chat_id", None),
             )
-        except Exception:
+        except Exception as exc:
             logger.warning(
-                "Profile route matching failed for %s/%s, falling back to default",
+                "Profile route matching failed for %s/%s; rejecting ingress",
                 source.platform, source.chat_id, exc_info=True,
             )
-            return None
+            raise ProfileRouteRejected("route-matching-error") from exc
         if matched:
             try:
                 served = {name for name, _home in _multiplex_profile_homes(config)}

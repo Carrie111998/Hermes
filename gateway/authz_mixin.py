@@ -587,6 +587,17 @@ class GatewayAuthorizationMixin:
         ):
             return True
 
+        # Route-scoped transport authorization is deliberately distinct from
+        # role_authorized: a route may grant either a user ID or a guild role.
+        # The live adapter-reference check in this gate prevents serialized or
+        # forged sources from asserting this in-process admission result.
+        if (
+            allow_adapter_delegation
+            and getattr(source, "_transport_authorized", False) is True
+            and self._registered_transport_adapter(source) is not None
+        ):
+            return True
+
         # Check pairing store. A pairing entry is a first-class authorization
         # grant, created only by a trusted operator approving a pairing code
         # (hermes gateway pairing approve / the authenticated dashboard) — an
