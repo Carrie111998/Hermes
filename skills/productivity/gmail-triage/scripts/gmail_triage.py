@@ -1041,7 +1041,8 @@ def doctor(home: Path, config: dict[str, Any]) -> dict[str, Any]:
         request.add_header("Authorization", f"Bearer {memory.api_key}")
     try:
         with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
-            version = json.loads(response.read()).get("version", "")
+            payload = json.loads(response.read())
+            version = payload.get("version") or payload.get("api_version") or ""
     except Exception:
         version = ""
     import yaml

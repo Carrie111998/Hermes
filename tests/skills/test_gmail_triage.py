@@ -469,6 +469,42 @@ def test_main_doctor_fails_closed_when_a_dependency_is_unhealthy(tmp_path, monke
     assert '"status": "error"' in capsys.readouterr().out
 
 
+def test_doctor_accepts_current_hindsight_api_version(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("timezone: America/Sao_Paulo\n")
+    (home / "hindsight").mkdir()
+    hindsight = home / "hindsight/config.json"
+    hindsight.write_text('{"api_url":"http://127.0.0.1:8888","bank_id":"test"}')
+    hindsight.chmod(0o600)
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b'{"api_version":"0.9.2"}'
+
+    profile = types.SimpleNamespace(execute=lambda: {"emailAddress": triage.REQUIRED_ACCOUNT})
+    service = types.SimpleNamespace(users=lambda: types.SimpleNamespace(getProfile=lambda **kwargs: profile))
+    monkeypatch.setattr(triage, "_google_service", lambda unused: service)
+    monkeypatch.setattr(triage.urllib.request, "urlopen", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(
+        triage.subprocess,
+        "run",
+        lambda *args, **kwargs: types.SimpleNamespace(returncode=0, stdout='{"status":"success"}'),
+    )
+    report = triage.doctor(home, {
+        "account": triage.REQUIRED_ACCOUNT,
+        "calendar_cli": "/bin/false",
+        "script_sha256": "hash",
+    })
+    assert report["hindsight_ok"] is True
+
+
 def test_main_dry_run_requires_expected_calendar_decision(tmp_path, monkeypatch, capsys):
     home = tmp_path / ".hermes"
     home.mkdir()
