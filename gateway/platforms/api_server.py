@@ -1560,6 +1560,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self,
             store_factory=RunIdempotencyStore,
         )
+        # Opt-in OpenAI-compatible streaming interactions. Each request owns
+        # an isolated pending-question map addressed by an opaque interaction
+        # id; the API key is required before an entry can be created.
+        self._interactive_sessions: Dict[str, Dict[str, Any]] = {}
+        self._interactive_sessions_lock = threading.RLock()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
@@ -2246,6 +2251,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
+            ("POST", "/v1/interactions/{interaction_id}/response", self._handle_interaction_response),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
             ("DELETE", "/v1/responses/{response_id}", self._handle_delete_response),
             # Generic platform HTTP event callback ingress. Authenticated by
@@ -2820,6 +2826,8 @@ class APIServerAdapter(BasePlatformAdapter):
         confirmed_runtime_lock: bool = False,
         room_dispatch: Optional[Dict[str, Any]] = None,
         room_execution_policy: Optional[Dict[str, Any]] = None,
+        interactive: bool = False,
+        clarify_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3086,6 +3094,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        if interactive and "clarify" not in enabled_toolsets:
+            enabled_toolsets.append("clarify")
+
         max_iterations = _current_max_iterations()
         if room_dispatch is not None:
             from gateway.hosted_room_execution_policy import RoomExecutionPolicy
@@ -3131,6 +3142,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
             "tool_complete_callback": tool_complete_callback,
+            "clarify_callback": clarify_callback if interactive else None,
             "session_db": self._ensure_session_db(),
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
@@ -3158,6 +3170,226 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # HTTP Handlers
     # ------------------------------------------------------------------
+
+    def _interactive_request_mode(self, body: Dict[str, Any], stream: bool):
+        """Resolve the opt-in interaction flag and its fail-closed preflight."""
+        hermes_options = body.get("hermes")
+        interactive = bool(
+            isinstance(hermes_options, dict)
+            and _coerce_request_bool(hermes_options.get("interactive"), default=False)
+        )
+        if interactive and not stream:
+            return interactive, web.json_response(
+                _openai_error(
+                    "Hermes interactive requests require stream=true.",
+                    code="interactive_requires_stream",
+                ),
+                status=400,
+            )
+        if interactive and not self._api_key:
+            return interactive, web.json_response(
+                _openai_error(
+                    "Hermes interactive requests require a configured API server key.",
+                    err_type="gateway_auth_error",
+                    code="interactive_auth_required",
+                ),
+                status=403,
+            )
+        return interactive, None
+
+    def _begin_interactive_session(self, interaction_id: str, stream_q) -> Any:
+        """Register one isolated streaming interaction and return its clarify callback."""
+        from gateway.run import _load_gateway_config
+        from tools.clarify_gateway import resolve_clarify_timeout
+
+        state: Dict[str, Any] = {
+            "stream_q": stream_q,
+            "pending": {},
+            "approval_session_key": f"interaction:{interaction_id}",
+            "request_profile": _api_request_profile.get(),
+            "clarify_timeout": resolve_clarify_timeout(_load_gateway_config()),
+        }
+        with self._interactive_sessions_lock:
+            self._interactive_sessions[interaction_id] = state
+
+        def _clarify(question, choices, multi_select=False, questions=None):
+            from tools.clarify_tool import TIMEOUT_RESPONSE
+
+            request_id = f"clarify_{uuid.uuid4().hex}"
+            pending = {
+                "event": threading.Event(),
+                "kind": "clarify",
+                "result": None,
+                "batch": bool(questions),
+            }
+            with self._interactive_sessions_lock:
+                current = self._interactive_sessions.get(interaction_id)
+                if current is not state:
+                    return TIMEOUT_RESPONSE
+                state["pending"][request_id] = pending
+
+            payload = {
+                "type": "hermes.clarify.request",
+                "interaction_id": interaction_id,
+                "request_id": request_id,
+                "question": question or "",
+                "choices": choices,
+                "multi_select": bool(multi_select),
+            }
+            if questions:
+                payload["questions"] = questions
+            stream_q.put_threadsafe(("__interaction__", payload))
+
+            timeout = state["clarify_timeout"]
+            deadline = None if timeout is None or float(timeout) <= 0 else time.monotonic() + float(timeout)
+            try:
+                from tools.environments.base import touch_activity_if_due
+            except Exception:  # pragma: no cover - optional environment helper
+                touch_activity_if_due = None
+            activity_state = {"last_touch": time.monotonic(), "start": time.monotonic()}
+            while True:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    break
+                if pending["event"].wait(timeout=1.0 if remaining is None else min(1.0, remaining)):
+                    break
+                if touch_activity_if_due is not None:
+                    touch_activity_if_due(activity_state, "waiting for API clarify response")
+            with self._interactive_sessions_lock:
+                state["pending"].pop(request_id, None)
+            if not pending["event"].is_set():
+                return TIMEOUT_RESPONSE
+            return pending["result"]
+
+        return _clarify
+
+    def _interaction_approval_notify(self, interaction_id: str, stream_q):
+        """Build the approval-core notifier for one interactive stream."""
+        def _notify(approval_data: Dict[str, Any]) -> None:
+            event = dict(approval_data or {})
+            if "command" in event:
+                from gateway.run import _redact_approval_command
+
+                event["command"] = _redact_approval_command(event.get("command"))
+            request_id = str(event.get("request_id") or f"approval_{uuid.uuid4().hex}")
+            choices = _approval_event_choices(
+                smart_denied=bool(event.get("smart_denied")),
+                allow_session=event.get("allow_session") is not False,
+                allow_permanent=event.get("allow_permanent") is not False,
+            )
+            with self._interactive_sessions_lock:
+                state = self._interactive_sessions.get(interaction_id)
+                if state is None:
+                    return
+                state["pending"][request_id] = {
+                    "kind": "approval",
+                    "choices": choices,
+                }
+            event.update({
+                "type": "hermes.approval.request",
+                "interaction_id": interaction_id,
+                "request_id": request_id,
+                "choices": choices,
+            })
+            stream_q.put_threadsafe(("__interaction__", event))
+
+        return _notify
+
+    def _close_interactive_session(self, interaction_id: Optional[str]) -> None:
+        if not interaction_id:
+            return
+        with self._interactive_sessions_lock:
+            state = self._interactive_sessions.pop(interaction_id, None)
+            pending = list((state or {}).get("pending", {}).values())
+        approval_session_key = (state or {}).get("approval_session_key")
+        if approval_session_key:
+            from tools.approval import unregister_gateway_notify
+
+            unregister_gateway_notify(approval_session_key)
+        for entry in pending:
+            event = entry.get("event")
+            if event is not None:
+                if entry.get("kind") == "clarify" and entry.get("result") is None:
+                    from tools.clarify_tool import TIMEOUT_RESPONSE
+
+                    entry["result"] = TIMEOUT_RESPONSE
+                event.set()
+
+    async def _handle_interaction_response(self, request: "web.Request") -> "web.Response":
+        """Resolve one pending prompt from an opt-in OpenAI-compatible stream."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        interaction_id = request.match_info["interaction_id"]
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        response_type = str(body.get("type") or "")
+        if response_type not in {"approval", "clarify"}:
+            return web.json_response(
+                _openai_error("Unsupported interaction response type.", code="invalid_interaction_type"),
+                status=400,
+            )
+        request_id = str(body.get("request_id") or "").strip()
+        with self._interactive_sessions_lock:
+            state = self._interactive_sessions.get(interaction_id)
+            if state is not None and state.get("request_profile") != _api_request_profile.get():
+                state = None
+            pending = (state or {}).get("pending", {}).get(request_id)
+            if pending is None or pending.get("kind") != response_type:
+                return web.json_response(
+                    _openai_error("Interaction request is not pending.", code="interaction_not_pending"),
+                    status=409 if state is not None else 404,
+                )
+            if response_type == "approval":
+                raw_choice = str(body.get("choice") or "").strip().lower()
+                choice = {"approve": "once", "approved": "once", "allow": "once"}.get(
+                    raw_choice, raw_choice
+                )
+                if choice not in pending["choices"]:
+                    return web.json_response(
+                        _openai_error("Approval choice was not offered.", code="invalid_approval_choice"),
+                        status=400,
+                    )
+                from tools.approval import resolve_gateway_approval
+
+                resolved = resolve_gateway_approval(
+                    state["approval_session_key"],
+                    choice,
+                    request_id=request_id,
+                )
+                if resolved <= 0:
+                    return web.json_response(
+                        _openai_error("Approval is no longer pending.", code="interaction_not_pending"),
+                        status=409,
+                    )
+                state["pending"].pop(request_id, None)
+                return web.json_response({
+                    "object": "hermes.interaction.response",
+                    "interaction_id": interaction_id,
+                    "request_id": request_id,
+                    "accepted": True,
+                    "choice": choice,
+                })
+            if pending["event"].is_set():
+                return web.json_response(
+                    _openai_error("Interaction request is not pending.", code="interaction_not_pending"),
+                    status=409,
+                )
+            if pending.get("batch"):
+                pending["result"] = {
+                    "answers": body.get("answers") if isinstance(body.get("answers"), dict) else {},
+                    "timed_out": _coerce_request_bool(body.get("timed_out"), default=False),
+                }
+            else:
+                pending["result"] = body.get("response", "")
+            pending["event"].set()
+        return web.json_response({
+            "object": "hermes.interaction.response",
+            "interaction_id": interaction_id,
+            "request_id": request_id,
+            "accepted": True,
+        })
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
@@ -3355,6 +3587,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "openai_stream_interactions": True,
                 "session_resources": True,
                 "model_options": True,
                 "session_chat": True,
@@ -3404,6 +3637,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "model_options": {"method": "GET", "path": "/api/model/options"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
+                "interaction_response": {
+                    "method": "POST",
+                    "path": "/v1/interactions/{interaction_id}/response",
+                },
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
@@ -5063,6 +5300,9 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        interactive, interaction_error = self._interactive_request_mode(body, stream)
+        if interaction_error is not None:
+            return interaction_error
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -5192,6 +5432,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
         if stream:
             _stream_q = ThreadSafeAsyncQueue()
+            interaction_id = f"int_{uuid.uuid4().hex}" if interactive else None
+            clarify_callback = (
+                self._begin_interactive_session(interaction_id, _stream_q)
+                if interaction_id
+                else None
+            )
+            approval_session_key = f"interaction:{interaction_id}" if interaction_id else None
+            approval_notify_callback = (
+                self._interaction_approval_notify(interaction_id, _stream_q)
+                if interaction_id
+                else None
+            )
 
             def _on_delta(delta):
                 # Filter out None — the agent fires stream_delta_callback(None)
@@ -5273,6 +5525,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                interactive=interactive,
+                clarify_callback=clarify_callback,
+                approval_session_key=approval_session_key,
+                approval_notify_callback=approval_notify_callback,
                 **agent_overrides,
                 route=route,
             ))
@@ -5280,11 +5536,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put_nowait(None))
 
-            return await self._write_sse_chat_completion(
-                request, completion_id, model_name, created, _stream_q,
-                agent_task, agent_ref, session_id=session_id,
-                gateway_session_key=gateway_session_key,
-            )
+            try:
+                return await self._write_sse_chat_completion(
+                    request, completion_id, model_name, created, _stream_q,
+                    agent_task, agent_ref, session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                )
+            finally:
+                self._close_interactive_session(interaction_id)
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
@@ -5474,6 +5733,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__interaction__":
+                    payload = item[1]
+                    await response.write(
+                        _sse_frame(
+                            payload,
+                            event=str(payload.get("type") or "hermes.interaction"),
+                        )
+                    )
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -5945,6 +6212,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
+                    elif tag == "__interaction__":
+                        await _write_event(
+                            str(payload.get("type") or "hermes.interaction"),
+                            payload,
+                        )
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
                     _batch_buf.append(it)
@@ -6334,6 +6606,9 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = stored_session_id or str(uuid.uuid4())
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        interactive, interaction_error = self._interactive_request_mode(body, stream)
+        if interaction_error is not None:
+            return interaction_error
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(
             body,
@@ -6354,6 +6629,18 @@ class APIServerAdapter(BasePlatformAdapter):
             # agent runs so frontends can render text deltas and tool
             # calls in real time.  See _write_sse_responses for details.
             _stream_q = ThreadSafeAsyncQueue()
+            interaction_id = f"int_{uuid.uuid4().hex}"
+            clarify_callback = (
+                self._begin_interactive_session(interaction_id, _stream_q)
+                if interactive
+                else None
+            )
+            approval_session_key = f"interaction:{interaction_id}" if interactive else None
+            approval_notify_callback = (
+                self._interaction_approval_notify(interaction_id, _stream_q)
+                if interactive
+                else None
+            )
 
             def _on_delta(delta):
                 # None from the agent is a CLI box-close signal, not EOS.
@@ -6402,6 +6689,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                interactive=interactive,
+                clarify_callback=clarify_callback,
+                approval_session_key=approval_session_key,
+                approval_notify_callback=approval_notify_callback,
                 **agent_overrides,
                 route=route,
             ))
@@ -6413,22 +6704,25 @@ class APIServerAdapter(BasePlatformAdapter):
             model_name = body.get("model", self._model_name)
             created_at = int(time.time())
 
-            return await self._write_sse_responses(
-                request=request,
-                response_id=response_id,
-                model=model_name,
-                created_at=created_at,
-                stream_q=_stream_q,
-                agent_task=agent_task,
-                agent_ref=agent_ref,
-                conversation_history=conversation_history,
-                user_message=user_message,
-                instructions=instructions,
-                conversation=conversation,
-                store=store,
-                session_id=session_id,
-                gateway_session_key=gateway_session_key,
-            )
+            try:
+                return await self._write_sse_responses(
+                    request=request,
+                    response_id=response_id,
+                    model=model_name,
+                    created_at=created_at,
+                    stream_q=_stream_q,
+                    agent_task=agent_task,
+                    agent_ref=agent_ref,
+                    conversation_history=conversation_history,
+                    user_message=user_message,
+                    instructions=instructions,
+                    conversation=conversation,
+                    store=store,
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                )
+            finally:
+                self._close_interactive_session(interaction_id if interactive else None)
 
         async def _compute_response():
             return await self._run_agent(
@@ -7265,6 +7559,10 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        interactive: bool = False,
+        clarify_callback=None,
+        approval_session_key: Optional[str] = None,
+        approval_notify_callback=None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7309,6 +7607,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _run():
             from gateway.session_context import clear_session_vars
+            from tools.approval import (
+                register_gateway_notify,
+                reset_current_session_key,
+                set_current_session_key,
+                unregister_gateway_notify,
+            )
 
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
@@ -7321,7 +7625,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                 )
                 agent = None
+                approval_token = None
                 try:
+                    if approval_session_key and approval_notify_callback:
+                        approval_token = set_current_session_key(approval_session_key)
+                        register_gateway_notify(approval_session_key, approval_notify_callback)
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
@@ -7336,6 +7644,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        interactive=interactive,
+                        clarify_callback=clarify_callback,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
@@ -7477,6 +7787,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
                     )
                 finally:
+                    if approval_session_key and approval_notify_callback:
+                        unregister_gateway_notify(approval_session_key)
+                    if approval_token is not None:
+                        reset_current_session_key(approval_token)
                     # Turn finished (success, auth failure, or crash) — clear
                     # ownership markers so a disconnect landing after this
                     # point can't reap background work this turn left

@@ -30,6 +30,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
+    ThreadSafeAsyncQueue,
     _IdempotencyCache,
     _derive_chat_session_id,
     _hermes_version,
@@ -39,6 +40,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from tools import approval as approval_mod
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +228,47 @@ class TestAdapterInit:
         assert captured["checkpoint_max_total_size_mb"] == 321
         assert captured["checkpoint_max_file_size_mb"] == 4
 
+    def test_create_agent_enables_clarify_only_for_interactive_request(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "api_key": "test-key",
+                "base_url": None,
+                "provider": None,
+                "api_mode": None,
+                "command": None,
+                "args": [],
+            },
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "test/model")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_fallback_model", lambda: None)
+        monkeypatch.setattr("gateway.run.GatewayRunner._load_reasoning_config", lambda _model: {})
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools",
+            lambda *_: {"terminal"},
+        )
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        clarify_callback = MagicMock()
+
+        adapter._create_agent(
+            session_id="api-session",
+            interactive=True,
+            clarify_callback=clarify_callback,
+        )
+
+        assert "clarify" in captured["enabled_toolsets"]
+        assert captured["clarify_callback"] is clarify_callback
+
 
 # ---------------------------------------------------------------------------
 # Auth checking
@@ -316,6 +359,10 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
+    app.router.add_post(
+        "/v1/interactions/{interaction_id}/response",
+        adapter._handle_interaction_response,
+    )
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
     app.router.add_delete("/v1/responses/{response_id}", adapter._handle_delete_response)
     app.router.add_post(
@@ -323,6 +370,19 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
         adapter._handle_platform_event_callback,
     )
     return app
+
+
+async def _read_sse_event(resp, expected_event: str) -> dict:
+    """Read a bounded SSE stream until one named event arrives."""
+    for _ in range(100):
+        raw = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+        if not raw:
+            break
+        if raw.decode().strip() != f"event: {expected_event}":
+            continue
+        data_line = await asyncio.wait_for(resp.content.readline(), timeout=2.0)
+        return json.loads(data_line.decode().removeprefix("data: "))
+    raise AssertionError(f"SSE event {expected_event!r} was not emitted")
 
 
 class _FakeGoogleChatAdapter:
@@ -356,6 +416,57 @@ def auth_adapter():
 
 
 class TestAgentExecution:
+    @pytest.mark.asyncio
+    async def test_run_agent_bridges_approval_core_to_interactive_notifier(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+        captured = {}
+        approval_session_key = "interaction:test"
+
+        def _notify(data):
+            captured.update(data)
+            approval_mod.resolve_gateway_approval(
+                approval_session_key,
+                "once",
+                request_id=data["request_id"],
+            )
+
+        def _run_conversation(**_kwargs):
+            with patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={
+                    "approvals": {"mode": "manual", "timeout": 2},
+                    "security": {"tirith_enabled": False},
+                },
+            ), patch(
+                "tools.approval.detect_dangerous_command",
+                return_value=(True, "recursive delete", "recursive-delete"),
+            ):
+                captured["decision"] = approval_mod.check_all_command_guards(
+                    "rm -rf build",
+                    "local",
+                )
+            return {"final_response": "ok"}
+
+        mock_agent.run_conversation.side_effect = _run_conversation
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="clean",
+                conversation_history=[],
+                session_id="session-approval",
+                interactive=True,
+                approval_session_key=approval_session_key,
+                approval_notify_callback=_notify,
+            )
+
+        assert captured["decision"]["approved"] is True, captured
+        assert captured["command"] == "rm -rf build"
+        with approval_mod._lock:
+            assert approval_session_key not in approval_mod._gateway_queues
+            assert approval_session_key not in approval_mod._gateway_notify_cbs
+
     @pytest.mark.asyncio
     async def test_run_agent_uses_session_id_as_task_id(self, adapter):
         mock_agent = MagicMock()
@@ -878,9 +989,14 @@ class TestCapabilitiesEndpoint:
                 "durable": True,
                 "retention_seconds": 86400,
             }
+            assert data["features"]["openai_stream_interactions"] is True
             assert data["features"]["model_options"] is True
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
+            assert data["endpoints"]["interaction_response"] == {
+                "method": "POST",
+                "path": "/v1/interactions/{interaction_id}/response",
+            }
             assert data["endpoints"]["model_options"] == {"method": "GET", "path": "/api/model/options"}
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
@@ -978,6 +1094,208 @@ class TestToolsetsEndpoint:
 
 
 class TestChatCompletionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_interactive_requires_streaming(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "hermes": {"interactive": True},
+                },
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            data = await resp.json()
+
+        assert resp.status == 400
+        assert data["error"]["code"] == "interactive_requires_stream"
+
+    @pytest.mark.asyncio
+    async def test_interactive_requires_configured_api_key(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                    "hermes": {"interactive": True},
+                },
+            )
+            data = await resp.json()
+
+        assert resp.status == 403
+        assert data["error"]["code"] == "interactive_auth_required"
+
+    @pytest.mark.asyncio
+    async def test_interactive_disconnect_returns_clarify_timeout(self, auth_adapter):
+        from tools.clarify_tool import TIMEOUT_RESPONSE
+
+        stream_q = ThreadSafeAsyncQueue()
+        callback = auth_adapter._begin_interactive_session("int_disconnect", stream_q)
+        pending = asyncio.create_task(
+            asyncio.to_thread(callback, "Continue?", ["yes", "no"])
+        )
+
+        tag, _payload = await asyncio.wait_for(stream_q.get(), timeout=1.0)
+        assert tag == "__interaction__"
+        auth_adapter._close_interactive_session("int_disconnect")
+
+        assert await asyncio.wait_for(pending, timeout=1.0) == TIMEOUT_RESPONSE
+        assert auth_adapter._interactive_sessions == {}
+
+    @pytest.mark.asyncio
+    async def test_interactive_responses_are_isolated_per_stream(self, auth_adapter):
+        queues = [ThreadSafeAsyncQueue(), ThreadSafeAsyncQueue()]
+        callbacks = [
+            auth_adapter._begin_interactive_session("int_one", queues[0]),
+            auth_adapter._begin_interactive_session("int_two", queues[1]),
+        ]
+        pending = [
+            asyncio.create_task(asyncio.to_thread(callbacks[0], "First?", None)),
+            asyncio.create_task(asyncio.to_thread(callbacks[1], "Second?", None)),
+        ]
+        first = (await asyncio.wait_for(queues[0].get(), timeout=1.0))[1]
+        second = (await asyncio.wait_for(queues[1].get(), timeout=1.0))[1]
+
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            crossed = await cli.post(
+                "/v1/interactions/int_one/response",
+                json={
+                    "type": "clarify",
+                    "request_id": second["request_id"],
+                    "response": "wrong stream",
+                },
+                headers={"Authorization": "Bearer sk-secret"},
+            )
+            assert crossed.status == 409
+
+            for interaction_id, payload, answer in (
+                ("int_one", first, "one"),
+                ("int_two", second, "two"),
+            ):
+                accepted = await cli.post(
+                    f"/v1/interactions/{interaction_id}/response",
+                    json={
+                        "type": "clarify",
+                        "request_id": payload["request_id"],
+                        "response": answer,
+                    },
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert accepted.status == 200
+
+        assert await asyncio.gather(*pending) == ["one", "two"]
+        auth_adapter._close_interactive_session("int_one")
+        auth_adapter._close_interactive_session("int_two")
+        assert auth_adapter._interactive_sessions == {}
+
+    @pytest.mark.asyncio
+    async def test_interactive_clarify_round_trip_over_sse(self, auth_adapter):
+        app = _create_app(auth_adapter)
+
+        async def _mock_run_agent(**kwargs):
+            answer = await asyncio.to_thread(
+                kwargs["clarify_callback"],
+                "Which environment?",
+                ["staging", "production"],
+                multi_select=False,
+            )
+            kwargs["stream_delta_callback"](f"selected:{answer}")
+            return (
+                {"final_response": f"selected:{answer}", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "deploy"}],
+                        "stream": True,
+                        "hermes": {"interactive": True},
+                    },
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert resp.status == 200
+
+                event_data = await _read_sse_event(resp, "hermes.clarify.request")
+
+                answer_resp = await cli.post(
+                    f"/v1/interactions/{event_data['interaction_id']}/response",
+                    json={
+                        "type": "clarify",
+                        "request_id": event_data["request_id"],
+                        "response": "staging",
+                    },
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert answer_resp.status == 200
+                stream_body = (await resp.text())
+
+        assert "selected:staging" in stream_body
+        assert auth_adapter._interactive_sessions == {}
+
+    @pytest.mark.asyncio
+    async def test_interactive_approval_round_trip_over_sse(self, auth_adapter):
+        app = _create_app(auth_adapter)
+
+        async def _mock_run_agent(**kwargs):
+            request_id = "approval-test-request"
+            entry = approval_mod._ApprovalEntry({
+                "request_id": request_id,
+                "command": "rm -rf build",
+                "description": "recursive delete",
+                "pattern_keys": ["recursive-delete"],
+            })
+            with approval_mod._lock:
+                approval_mod._gateway_queues[kwargs["approval_session_key"]] = [entry]
+            kwargs["approval_notify_callback"](entry.data)
+            assert await asyncio.to_thread(entry.event.wait, 5.0)
+            kwargs["stream_delta_callback"](f"decision:{entry.result}")
+            return (
+                {"final_response": f"decision:{entry.result}", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "clean build"}],
+                        "stream": True,
+                        "hermes": {"interactive": True},
+                    },
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert resp.status == 200
+
+                event_data = await _read_sse_event(resp, "hermes.approval.request")
+                assert event_data["choices"] == ["once", "session", "always", "deny"]
+
+                approval_resp = await cli.post(
+                    f"/v1/interactions/{event_data['interaction_id']}/response",
+                    json={
+                        "type": "approval",
+                        "request_id": event_data["request_id"],
+                        "choice": "once",
+                    },
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert approval_resp.status == 200
+                stream_body = await resp.text()
+
+        assert "decision:once" in stream_body
+        assert auth_adapter._interactive_sessions == {}
+
     @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)
@@ -1334,6 +1652,53 @@ class TestDeriveChatSessionId:
 
 
 class TestResponsesEndpoint:
+
+    @pytest.mark.asyncio
+    async def test_stream_interactive_clarify_round_trip(self, auth_adapter):
+        app = _create_app(auth_adapter)
+
+        async def _mock_run_agent(**kwargs):
+            answer = await asyncio.to_thread(
+                kwargs["clarify_callback"],
+                "Which region?",
+                ["us-east", "eu-west"],
+                multi_select=False,
+            )
+            kwargs["stream_delta_callback"](f"region:{answer}")
+            return (
+                {"final_response": f"region:{answer}", "messages": [], "api_calls": 1},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "test",
+                        "input": "deploy",
+                        "stream": True,
+                        "hermes": {"interactive": True},
+                    },
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert resp.status == 200
+                event_data = await _read_sse_event(resp, "hermes.clarify.request")
+
+                answer_resp = await cli.post(
+                    f"/v1/interactions/{event_data['interaction_id']}/response",
+                    json={
+                        "type": "clarify",
+                        "request_id": event_data["request_id"],
+                        "response": "eu-west",
+                    },
+                    headers={"Authorization": "Bearer sk-secret"},
+                )
+                assert answer_resp.status == 200
+                stream_body = await resp.text()
+
+        assert "region:eu-west" in stream_body
+        assert auth_adapter._interactive_sessions == {}
 
 
     @pytest.mark.asyncio

@@ -112,6 +112,33 @@ Uploaded files (`file` / `input_file` / `file_id`) and non-image `data:` URLs re
 - **Chat Completions**: Hermes emits `event: hermes.tool.progress` for tool-start visibility without polluting persisted assistant text.
 - **Responses**: Hermes emits spec-native `function_call` and `function_call_output` output items during the SSE stream, so clients can render structured tool UI in real time.
 
+#### Interactive approvals and clarification
+
+Hermes-aware clients can opt into interactive prompts on either OpenAI-compatible endpoint by sending `"stream": true` and `"hermes": {"interactive": true}`. This mode requires a configured API server key; non-streaming interactive requests return `400`, and interactive requests to a server without a key return `403`. Requests without this opt-in keep the existing unattended approval behavior and do not expose the `clarify` tool.
+
+An interactive stream may emit either of these custom SSE events:
+
+- `event: hermes.approval.request` — includes `interaction_id`, `request_id`, the redacted command and description, and the permitted `choices` (`once`, `session`, `always`, or `deny` as allowed by the command guard).
+- `event: hermes.clarify.request` — includes `interaction_id`, `request_id`, the question, choices, `multi_select`, and optional batched `questions`.
+
+Answer the prompt with the same Bearer authentication used for the stream:
+
+```http
+POST /v1/interactions/{interaction_id}/response
+Authorization: Bearer <API_SERVER_KEY>
+Content-Type: application/json
+```
+
+```json
+{"type": "approval", "request_id": "approval_...", "choice": "once"}
+```
+
+```json
+{"type": "clarify", "request_id": "clarify_...", "response": "staging"}
+```
+
+For batched clarification, send `"answers": {"q0": "...", "q1": ["..."]}` instead of `response`. Approval and clarify waits retain their configured timeouts. Timeout, disconnect, hardline blocklist, and deny rules remain fail-closed; this protocol does not bypass or weaken command guards.
+
 ### POST /v1/responses
 
 OpenAI Responses API format. Supports server-side conversation state via `previous_response_id` — the server stores full conversation history (including tool calls and results) so multi-turn context is preserved without the client managing it.
