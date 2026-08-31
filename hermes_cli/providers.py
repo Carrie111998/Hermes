@@ -806,6 +806,13 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
     if not isinstance(entry, dict):
         return None
 
+    # Respect providers.<name>.enabled: false — a deliberately disabled
+    # provider must not be resolvable via any path, including the explicit
+    # --provider flag.  Without this check, resolve_provider_full() returned
+    # the provider definition regardless of the enabled setting (#99089).
+    if entry.get("enabled") is False:
+        return None
+
     # Extract fields
     display_name = entry.get("name", "") or name
     api_url = entry.get("api", "") or entry.get("url", "") or entry.get("base_url", "") or ""
