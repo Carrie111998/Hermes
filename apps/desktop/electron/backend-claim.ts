@@ -153,6 +153,18 @@ export interface BackendOutputTail {
     stderr?: { on: (event: 'data', listener: (chunk: unknown) => void) => unknown } | null
   }): void
   append(chunk: unknown): void
+  /**
+   * Register an observer for every chunk this tail receives, on both streams.
+   * Returns an unsubscribe function.
+   *
+   * The tail is the only listener attached at spawn time, and a Node stream in
+   * flowing mode delivers each chunk exactly once to the listeners that exist
+   * when it is emitted — a listener attached later never sees it. Anything that
+   * has to read the child's output (the port-announcement scanner) therefore
+   * reads it through here instead of racing to attach a second `data` listener
+   * of its own after the claim (#96315).
+   */
+  observe(listener: (chunk: string) => void): () => void
   /** The buffered tail (most recent `limit` characters), or ''. */
   text(): string
   /** Human-readable suffix for error messages, or '' when nothing buffered. */
@@ -169,12 +181,25 @@ export const DEFAULT_OUTPUT_TAIL_LIMIT = 8192
  */
 export function createBackendOutputTail(limit: number = DEFAULT_OUTPUT_TAIL_LIMIT): BackendOutputTail {
   let buffer = ''
+  const observers = new Set<(chunk: string) => void>()
 
   const append = (chunk: unknown) => {
-    buffer += String(chunk)
+    const text = String(chunk)
+    buffer += text
 
     if (buffer.length > limit) {
       buffer = buffer.slice(buffer.length - limit)
+    }
+
+    // Observers see the raw chunk, not the ring buffer, so a burst of output
+    // larger than `limit` can never evict a line before it has been scanned.
+    // An observer must not be able to break output buffering for the others.
+    for (const observer of observers) {
+      try {
+        observer(text)
+      } catch {
+        /* observer faults are never the child's problem */
+      }
     }
   }
 
@@ -183,6 +208,13 @@ export function createBackendOutputTail(limit: number = DEFAULT_OUTPUT_TAIL_LIMI
     attach(child) {
       child.stdout?.on('data', append)
       child.stderr?.on('data', append)
+    },
+    observe(listener) {
+      observers.add(listener)
+
+      return () => {
+        observers.delete(listener)
+      }
     },
     text() {
       return buffer
