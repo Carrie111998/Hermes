@@ -31,7 +31,7 @@ nemo-relay = false
 
 [manifest]
 overrides = [
-    { name = "cryptography", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'", specifier = ">=50,<51" },
+    { name = "cryptography", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'", specifier = "==50.0.0" },
     { name = "cryptography", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'", specifier = "==48.0.1" },
     { name = "pynacl", specifier = ">=1.6,<1.7" },
 ]

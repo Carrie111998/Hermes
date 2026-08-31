@@ -407,9 +407,9 @@ override-dependencies = [
   # and its three advisories (see the cryptography pin in
   # [project].dependencies). The package uses cryptography only to sign
   # requests with RSA and AES, and that API did not break in 49 or 50.
-  # Remove this override when alibabacloud-tea-openapi lifts the cap. Keep the
-  # Intel macOS marker aligned with the direct dependency above.
-  "cryptography>=50,<51; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+  # Remove this override when alibabacloud-tea-openapi lifts the cap. Keep both
+  # exact versions and their markers aligned with the direct dependencies above.
+  "cryptography==50.0.0; sys_platform != 'darwin' or platform_machine != 'x86_64'",
   "cryptography==48.0.1; sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
 exclude-newer = "14 days"
