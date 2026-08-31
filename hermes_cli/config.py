@@ -5579,6 +5579,234 @@ def _coerce_float(value: str):
     return f
 
 
+# ── Write-time model-slug validation (#97656) ───────────────────────────────
+# ``hermes config set`` used to accept ANY string for a model-routing leaf key
+# (model.default, delegation.model, auxiliary.<task>.model) with no check that
+# the value exists in the target provider's catalog. A mistyped slug
+# (e.g. ``upstage/solar-pro-4`` vs the real ``upstage/solar-pro4``) wrote
+# silently and only surfaced as per-task HTTP 400s days later. This is a
+# write-time WARNING + confirmation, never a hard block: custom endpoints,
+# pre-announced models, and scripted writes all keep working. The companion
+# hard gate for agent-initiated writes is tracked separately (#97652).
+
+
+def _model_routing_provider_key(key: str) -> Optional[str]:
+    """Return the sibling ``<...>.provider`` config path for a model-routing
+    leaf key, or None when *key* is not a model-routing leaf key at all.
+
+    Model-routing leaf keys are ``model.default`` (plus the bare ``model``
+    singular shorthand), ``delegation.model``, and ``auxiliary.<task>.model``.
+    The returned path is the sibling ``provider`` key whose value selects the
+    catalog the model id must come from.
+    """
+    segs = key.strip().lower().split(".")
+    if not segs:
+        return None
+    # Model-routing leaf keys are ``<...>.model`` plus the ``model`` /
+    # ``model.default`` dual (the mapping stores the id at ``model.default``).
+    if segs[-1] != "model" and segs != ["model", "default"]:
+        return None
+    if segs in (["model"], ["model", "default"]):
+        return "model.provider"
+    if segs == ["delegation", "model"]:
+        return "delegation.provider"
+    if len(segs) == 3 and segs[0] == "auxiliary":
+        return "auxiliary.%s.provider" % segs[1]
+    return None
+
+
+def _config_node(container: Any, path: str) -> Any:
+    """Walk *container* by dotted *path*, returning the node or ``None``."""
+    node = container
+    for seg in path.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(seg)
+    return node
+
+
+def _provider_for_config_path(provider_key: str) -> str:
+    """Read a provider config path from the merged config as a stripped string.
+
+    ``delegation.provider`` and ``auxiliary.<task>.provider`` may be *explicitly*
+    set to ``''`` to mean "inherit the parent provider" (delegation defaults to
+    ``''``; auxiliary tasks default to the ``auto`` sentinel).  An empty leaf
+    therefore falls back to the global ``model.provider`` so a delegation /
+    auxiliary model slug is validated against the provider that actually
+    resolves it.  ``model.provider`` is the root of the chain and has nothing
+    to fall back to.
+    """
+    try:
+        cfg = load_config()
+    except Exception:
+        return ""
+    node = _config_node(cfg, provider_key)
+    value = node.strip() if isinstance(node, str) else ""
+    if not value and provider_key != "model.provider":
+        parent = _config_node(cfg, "model.provider")
+        value = parent.strip() if isinstance(parent, str) else ""
+    return value
+
+
+def _provider_skips_catalog_validation(provider: str) -> bool:
+    """Return True when *provider* must not be checked against a catalog.
+
+    Empty, sentinel (``auto``/``custom``/``moa``/``none``), and user-defined
+    custom providers are skipped: a custom endpoint may legitimately serve
+    models absent from any catalog, and ``auto``/empty resolve dynamically
+    (the opposite of a fixed catalog-membership check).
+    """
+    raw = (provider or "").strip()
+    if not raw:
+        return True
+    lower = raw.lower()
+    if lower in {"auto", "custom", "moa", "none", "local"} or lower.startswith("custom:"):
+        return True
+    try:
+        from hermes_cli.models import normalize_provider
+        normalized = normalize_provider(raw)
+    except Exception:
+        normalized = lower
+    if normalized in {"auto", "custom", "moa", "none", "local"}:
+        return True
+    try:
+        from hermes_cli.runtime_provider import has_named_custom_provider
+        if has_named_custom_provider(raw):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _slug_in_catalog(value: str, catalog: List[str], provider: str = "") -> bool:
+    """Exact (case-insensitive) membership of *value* in *catalog*.
+
+    OpenRouter per-request routing variants (``model:nitro`` / ``:floor`` /
+    ``:exacto`` / ``:online``) are valid on any base id though not separate
+    catalog SKUs, so for OpenRouter their base id is also checked.  Those
+    suffixes are OpenRouter-specific, so they only widen membership when the
+    provider is OpenRouter — a ``:variant`` slug for any other provider keeps
+    the exact-match result.
+    """
+    ids = {str(m).strip().lower() for m in catalog}
+    v = value.strip().lower()
+    if v in ids:
+        return True
+    if provider:
+        try:
+            from hermes_cli.models import normalize_provider, _openrouter_variant_base
+            if normalize_provider(provider) == "openrouter":
+                base = _openrouter_variant_base(value)
+                if base and base.strip().lower() in ids:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _print_model_slug_warning(value: str, provider: str, catalog: List[str]) -> None:
+    """Print the ``not in catalog`` warning plus up to three close matches."""
+    matches: list[str] = []
+    try:
+        from difflib import get_close_matches
+        matches = get_close_matches(value, [str(m) for m in catalog], n=3, cutoff=0.6)
+    except Exception:
+        matches = []
+    # Warnings belong on stderr — non-TTY scripts/agents see them without the
+    # message being misread as part of the printed success line.
+    print(color(f"⚠ \"{value}\" is not in provider \"{provider}\"'s catalog.", Colors.YELLOW),
+          file=sys.stderr)
+    if matches:
+        print(color(f"  Did you mean: {', '.join(matches)}", Colors.YELLOW),
+              file=sys.stderr)
+
+
+def _is_interactive() -> bool:
+    """True only when BOTH stdin and stdout are TTYs (a real terminal session).
+
+    ``input()`` needs a readable console AND its prompt must reach the user.
+    When stdout is redirected (agent pipes, subprocess capture, CI) the y/N
+    prompt would be silently swallowed, so the interactive confirm path is
+    disabled and the read stays non-interactive (warn-only, fail-open).
+    """
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except Exception:
+        return False
+
+
+def _model_key_for_provider_path(provider_key: str) -> Optional[str]:
+    """Return the sibling ``<...>.model`` config path for a model-routing
+    provider key, or None when *provider_key* is not a model-routing provider
+    key.  This is the inverse of ``_model_routing_provider_key``: setting a
+    provider re-validates the sibling model value written earlier."""
+    segs = provider_key.strip().lower().split(".")
+    if segs == ["model", "provider"]:
+        return "model.default"
+    if segs == ["delegation", "provider"]:
+        return "delegation.model"
+    if len(segs) == 3 and segs[0] == "auxiliary" and segs[2] == "provider":
+        return "auxiliary.%s.model" % segs[1]
+    return None
+
+
+def _warn_if_slug_not_in_catalog(value: str, provider: str) -> bool:
+    """Print the ``not in provider catalog`` warning for *value* against
+    *provider's* catalog.  Returns True when the slug is genuinely absent
+    (warning printed).  Fails open — never raises — and silently proceeds for
+    unknown/custom/empty providers, empty/cold catalogs, and lookup errors.
+    Used for the write-time warning as well as the provider-set follow-up.
+    """
+    try:
+        if _provider_skips_catalog_validation(provider):
+            return False
+        from hermes_cli.models import cached_provider_model_ids
+        catalog = cached_provider_model_ids(provider)
+        if not catalog:
+            return False  # cold / unresolvable catalog → fail open
+        if _slug_in_catalog(value, catalog, provider):
+            return False
+        _print_model_slug_warning(value, provider, catalog)
+        return True
+    except Exception:
+        return False
+
+
+def _validate_model_slug_for_write(key: str, value: Any, *, force: bool) -> bool:
+    """Warn (and optionally confirm) when a model-routing slug is absent from
+    the target provider's cached catalog.  Returns True when the write should
+    be ABORTED.  Never raises: any error path (unknown/custom provider, empty
+    catalog, network failure, unreadable config) silently proceeds so
+    ``config set`` stays available.
+
+    Behavior:
+      * known slug                 → no warning, proceed.
+      * unknown slug, interactive  → warning + y/N confirm; N aborts.
+      * unknown slug, non-TTY      → warning to stderr, proceed (fail-open).
+      * ``--force``                → warnings print, prompt skipped.
+      * custom/empty provider      → skipped (no validation).
+    """
+    try:
+        provider_key = _model_routing_provider_key(key)
+        if provider_key is None:
+            return False  # not a model-routing leaf key
+        raw_value = str(value).strip() if value is not None else ""
+        if not raw_value:
+            return False  # empty/cleared value has nothing to validate
+        provider = _provider_for_config_path(provider_key)
+        if not _warn_if_slug_not_in_catalog(raw_value, provider):
+            return False  # known slug, or provider/catalog skip → proceed
+        if force:
+            return False
+        if not _is_interactive():
+            return False  # scripts / agents: warn only, proceed
+        reply = input("  Set anyway? [y/N] ")
+        return reply.strip().lower() not in {"y", "yes"}
+    except Exception:
+        # Fail open: validation must never make ``config set`` unavailable.
+        return False
+
+
 def set_config_value(key: str, value: str, force: bool = False):
     """Set a configuration value.
 
@@ -5784,6 +6012,30 @@ def set_config_value(key: str, value: str, force: bool = False):
                     file=sys.stderr,
                 )
                 sys.exit(1)
+    # Write-time model-slug validation (#97656): warn (and, on an interactive
+    # TTY, confirm) when a model-routing value isn't in the provider's cached
+    # catalog. Fails open — never blocks the write — so custom endpoints and
+    # scripted writes keep working. Returns True when the user declined.
+    if _validate_model_slug_for_write(key, value, force=force):
+        _provider_key = _model_routing_provider_key(key) or ""
+        _provider_for_abort = _provider_for_config_path(_provider_key)
+        print(
+            f"✗ Aborted: '{key}' was not set (model not in provider "
+            f"\"{_provider_for_abort}\"'s catalog).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    # Provider-set follow-up (#97656): setting a model-routing provider key
+    # (model.provider / delegation.provider / auxiliary.<task>.provider) when a
+    # sibling model value already exists. The model may have been written while
+    # the provider was still empty (validation correctly skipped it), so now
+    # that the provider is known re-check the sibling against its catalog.
+    # Warn-only and fail-open — never blocks the provider write.
+    _sibling_model_key = _model_key_for_provider_path(key)
+    if _sibling_model_key:
+        _sibling_model_val = _config_node(user_config, _sibling_model_key)
+        if isinstance(_sibling_model_val, str) and _sibling_model_val.strip():
+            _warn_if_slug_not_in_catalog(_sibling_model_val.strip(), coerced_value)
     _set_nested(user_config, key, value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
