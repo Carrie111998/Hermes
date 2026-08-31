@@ -31,6 +31,7 @@ those rules surfaces before a Mission Control deploy.
 from __future__ import annotations
 
 import logging
+from urllib.parse import quote
 
 import pytest
 
@@ -250,6 +251,102 @@ class TestOAuthRedirectUriRespectsPrefix:
         parsed = urlparse(redirect_uri)
         assert parsed.netloc == "fly-app.fly.dev"
         assert parsed.path == "/auth/callback"
+
+
+# ---------------------------------------------------------------------------
+# /auth/callback: the post-login landing redirect carries the prefix
+# ---------------------------------------------------------------------------
+
+
+class TestPostLoginLandingCarriesPrefix:
+    """The final 302 of the OAuth flow must stay under the mount prefix.
+
+    ``landing`` comes from the ``next=`` value stored in the PKCE cookie,
+    which the gate encoded as a *back-end-relative* path (the proxy
+    already stripped the prefix before forwarding). Redirecting there
+    verbatim sends the browser to ``/chat`` instead of ``/hermes/chat``
+    — a 404 behind the proxy, reading to the user as "login failed"
+    even though the session was minted fine (#99123).
+    """
+
+    PREFIX_HEADERS = {"x-forwarded-prefix": "/hermes"}
+
+    @staticmethod
+    def _drive_callback(client, headers, next_path=""):
+        """Walk /login → provider button → IDP → /auth/callback like a
+        real browser (mirrors TestAuthCallbackNext in
+        test_dashboard_auth_401_reauth.py) and return the callback's
+        final 302 response.
+
+        TestClient semantics (same as
+        test_cookies_read_back_round_trip_through_prefix below): the
+        client sees the literal back-end paths, so a PKCE cookie set
+        with ``Path=/hermes`` is not replayed by its jar onto the
+        unprefixed ``/auth/callback`` request — a real browser hitting
+        ``/hermes/auth/callback`` WOULD send it. We therefore round-trip
+        the PKCE cookie by hand via an explicit ``Cookie`` header."""
+        login_path = "/login"
+        if next_path:
+            login_path = f"/login?next={quote(next_path, safe='')}"
+        r_login = client.get(
+            login_path, headers=headers, follow_redirects=False
+        )
+        assert r_login.status_code == 200
+        body = r_login.text
+        i = body.find('class="provider-btn"')
+        assert i != -1, "no provider button in /login HTML"
+        h = body.find('href="', i) + len('href="')
+        j = body.find('"', h)
+        href = body[h:j]
+        r_to_idp = client.get(
+            href, headers=headers, follow_redirects=False
+        )
+        assert r_to_idp.status_code == 302
+        state = r_to_idp.headers["location"].split("state=")[1]
+        pkce_set = next(
+            c for c in r_to_idp.headers.get_list("set-cookie")
+            if "hermes_session_pkce" in c
+        )
+        pkce_kv = pkce_set.split(";", 1)[0]
+        callback_headers = dict(headers or {})
+        callback_headers["cookie"] = pkce_kv
+        return client.get(
+            f"/auth/callback?code=stub_code&state={state}",
+            headers=callback_headers,
+            follow_redirects=False,
+        )
+
+    def test_landing_with_next_carries_prefix(self, gated_app_proxied):
+        r = self._drive_callback(
+            gated_app_proxied, self.PREFIX_HEADERS, next_path="/sessions"
+        )
+        assert r.status_code == 302
+        assert r.headers["location"] == "/hermes/sessions", (
+            f"post-login landing escaped the prefix: "
+            f"{r.headers['location']!r}"
+        )
+
+    def test_default_landing_root_carries_prefix(self, gated_app_proxied):
+        """No ``next=`` → landing is ``/``; behind a proxy that must be
+        ``/hermes/`` (bare ``/`` hits the proxy root, not the mount)."""
+        r = self._drive_callback(gated_app_proxied, self.PREFIX_HEADERS)
+        assert r.status_code == 302
+        assert r.headers["location"] == "/hermes/", (
+            f"post-login default landing escaped the prefix: "
+            f"{r.headers['location']!r}"
+        )
+
+    def test_landing_stays_unprefixed_on_direct_deploy(
+        self, gated_app_direct
+    ):
+        r = self._drive_callback(
+            gated_app_direct, headers=None, next_path="/sessions"
+        )
+        assert r.status_code == 302
+        assert r.headers["location"] == "/sessions", (
+            f"direct deploy gained a spurious prefix: "
+            f"{r.headers['location']!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
