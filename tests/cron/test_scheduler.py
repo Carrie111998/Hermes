@@ -1822,6 +1822,29 @@ class TestParallelTick:
     """Verify that tick() runs due jobs concurrently and isolates ContextVars."""
 
     @pytest.fixture(autouse=True)
+    def _isolate_scheduler_state(self):
+        """Reset module-level scheduler state to avoid xdist cross-test contamination."""
+        import cron.scheduler as sched
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._running_job_ids.clear()
+        sched._running_fire_owners.clear()
+        sched._running_since.clear()
+        sched._running_futures.clear()
+        sched._forced_release_count = 0
+        sched._forced_releases.clear()
+        yield
+        sched._shutdown_parallel_pool()
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._running_job_ids.clear()
+        sched._running_fire_owners.clear()
+        sched._running_since.clear()
+        sched._running_futures.clear()
+        sched._forced_release_count = 0
+        sched._forced_releases.clear()
+
+    @pytest.fixture(autouse=True)
     def _isolate_tick_lock(self, tmp_path):
         """Point the tick file lock at a per-test temp dir to avoid xdist contention."""
         lock_dir = tmp_path / "cron"
