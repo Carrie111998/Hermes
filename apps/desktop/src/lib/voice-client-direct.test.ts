@@ -167,13 +167,14 @@ describe('transcribeAudioClientDirect', () => {
     const api = mockDesktopApi({ ok: true, stt: directStt, tts: relay })
     setApiRequestConnection('ambient-source')
     setApiRequestProfile('ambient-profile')
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('tile transcript', { status: 200 })))
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('tile transcript', { status: 200 }))
+    )
 
     await transcribeAudioClientDirect(new Blob(['x']), { connectionId: 'tile-source', profile: 'tile-profile' })
 
-    expect(api).toHaveBeenCalledWith(
-      expect.objectContaining({ connectionId: 'tile-source', profile: 'tile-profile' })
-    )
+    expect(api).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'tile-source', profile: 'tile-profile' }))
   })
 
   it('returns null (relay) when the provider is not client-callable', async () => {
@@ -268,9 +269,7 @@ describe('directTtsConfig', () => {
 
     await directTtsConfig({ connectionId: 'tile-source', profile: 'tile-profile' })
 
-    expect(api).toHaveBeenCalledWith(
-      expect.objectContaining({ connectionId: 'tile-source', profile: 'tile-profile' })
-    )
+    expect(api).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'tile-source', profile: 'tile-profile' }))
   })
 })
 

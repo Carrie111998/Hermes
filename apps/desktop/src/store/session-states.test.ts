@@ -157,18 +157,18 @@ describe('resetTileRuntimeBindings', () => {
 
     expect($sessionTiles.get()[0]).toMatchObject({ ownerGeneration: 1, ownerRoute, storedSessionId: 'stored-a' })
     expect($sessionTiles.get()[0]).not.toHaveProperty('runtimeId')
-    expect(
-      patchSessionTileForOwnerGeneration('stored-a', 0, { runtimeId: 'runtime-stale-zero' }, ownerRoute)
-    ).toBe(false)
+    expect(patchSessionTileForOwnerGeneration('stored-a', 0, { runtimeId: 'runtime-stale-zero' }, ownerRoute)).toBe(
+      false
+    )
 
     // A reconnect while the replacement resume is still in flight has no
     // runtime binding to clear, but must invalidate that generation too.
     resetTileRuntimeBindings()
 
     expect($sessionTiles.get()[0]).toMatchObject({ ownerGeneration: 2, ownerRoute, storedSessionId: 'stored-a' })
-    expect(
-      patchSessionTileForOwnerGeneration('stored-a', 1, { runtimeId: 'runtime-stale-one' }, ownerRoute)
-    ).toBe(false)
+    expect(patchSessionTileForOwnerGeneration('stored-a', 1, { runtimeId: 'runtime-stale-one' }, ownerRoute)).toBe(
+      false
+    )
     expect($sessionTiles.get()[0]).not.toHaveProperty('runtimeId')
   })
 

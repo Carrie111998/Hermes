@@ -192,10 +192,7 @@ export function transcriptFromOpenAiMultipartBody(body: string): string {
  * re-running the same request through the gateway would just fail again
  * slower and hide the real error.
  */
-export async function transcribeAudioClientDirect(
-  audio: Blob,
-  ownerRoute?: VoiceOwnerRoute
-): Promise<null | string> {
+export async function transcribeAudioClientDirect(audio: Blob, ownerRoute?: VoiceOwnerRoute): Promise<null | string> {
   const config = await fetchVoiceClientConfig(ownerRoute)
   const stt = config?.stt
 

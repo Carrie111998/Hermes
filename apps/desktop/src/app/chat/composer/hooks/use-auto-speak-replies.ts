@@ -96,9 +96,7 @@ export function useAutoSpeakReplies({
           currentPlayback.status === 'idle'
         ) {
           const isCurrent = () =>
-            active &&
-            ownOwnershipGeneration === ownershipGeneration &&
-            !latest.current.conversationActive
+            active && ownOwnershipGeneration === ownershipGeneration && !latest.current.conversationActive
 
           void playSpeechText(reply.text, {
             isCurrent,

@@ -242,10 +242,7 @@ describe('composer queue drain IPC', () => {
     }) as any
 
     expect(migrated.queues.source).toBeUndefined()
-    expect(migrated.queues.target.map((entry: any) => entry.text)).toEqual([
-      'already at target',
-      'held by peer Stop'
-    ])
+    expect(migrated.queues.target.map((entry: any) => entry.text)).toEqual(['already at target', 'held by peer Stop'])
     expect(migrated.parks).toEqual({ target: true })
   })
 
@@ -422,10 +419,7 @@ describe('composer queue drain IPC', () => {
     ).toThrow('changed after the handoff commit')
 
     const current = coordinator.mutate({ operation: { type: 'read' }, seed })
-    expect(current.queues.target?.map((entry: any) => entry.text)).toEqual([
-      'from source',
-      'concurrent target enqueue'
-    ])
+    expect(current.queues.target?.map((entry: any) => entry.text)).toEqual(['from source', 'concurrent target enqueue'])
   })
 
   it('retains an unfinished handoff transaction across coordinator restart', () => {

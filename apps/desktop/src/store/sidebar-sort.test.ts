@@ -46,18 +46,14 @@ describe('$sidebarSessionRankIds', () => {
     ])
     setSidebarOrdering('tokens')
 
-    expect($sidebarSessionRankIds.get()).toEqual(
-      ['big', 'small'].map(id => sessionRowIdentity(session(id, {})))
-    )
+    expect($sidebarSessionRankIds.get()).toEqual(['big', 'small'].map(id => sessionRowIdentity(session(id, {}))))
   })
 
   it('ranks by creation, newest first — the sidebar orders by recency elsewhere', () => {
     $sessions.set([session('older', { started_at: 1 }), session('newer', { started_at: 9 })])
     setSidebarOrdering('created')
 
-    expect($sidebarSessionRankIds.get()).toEqual(
-      ['newer', 'older'].map(id => sessionRowIdentity(session(id, {})))
-    )
+    expect($sidebarSessionRankIds.get()).toEqual(['newer', 'older'].map(id => sessionRowIdentity(session(id, {}))))
   })
 
   it('leaves the default view unranked, and hands back the same array each time', () => {

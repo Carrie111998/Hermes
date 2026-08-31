@@ -43,7 +43,11 @@ import {
   setMessages,
   setTurnStartedAt
 } from '@/store/session'
-import { requestForSessionProfile, type SessionOwnerRoute, type SessionOwnerScope } from '@/store/session-request-router'
+import {
+  requestForSessionProfile,
+  type SessionOwnerRoute,
+  type SessionOwnerScope
+} from '@/store/session-request-router'
 import { $sessionStates, isSessionRemote } from '@/store/session-states'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
@@ -552,8 +556,7 @@ export function usePromptActions({
     (storedSessionId: string): string => {
       const owner = ownerForStoredSession(storedSessionId)
 
-      const lineageOwner =
-        typeof owner === 'string' ? { connectionId: 'local', profile: owner } : (owner ?? undefined)
+      const lineageOwner = typeof owner === 'string' ? { connectionId: 'local', profile: owner } : (owner ?? undefined)
 
       const durableId = resolveComposerSessionKey(storedSessionId, $sessions.get(), lineageOwner) ?? storedSessionId
 
@@ -577,8 +580,7 @@ export function usePromptActions({
         return requestForSessionProfile(owner, requestGateway, method, params, timeoutMs)
       }
 
-      const connectionId =
-        ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || '' : ''
+      const connectionId = ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || '' : ''
 
       if (connectionId) {
         return requestGatewayForAgent(connectionId, 'default', method, params, timeoutMs)
@@ -823,8 +825,7 @@ export function usePromptActions({
       const owner = storedSessionId ? ownerForStoredSession(storedSessionId) : undefined
 
       const targetRequest: GatewayRequest = owner
-        ? (method, params = {}, timeoutMs) =>
-            requestForSessionProfile(owner, requestGateway, method, params, timeoutMs)
+        ? (method, params = {}, timeoutMs) => requestForSessionProfile(owner, requestGateway, method, params, timeoutMs)
         : requestGateway
 
       await withSessionNotFoundResume(
@@ -876,8 +877,7 @@ export function usePromptActions({
       const owner = storedSessionId ? ownerForStoredSession(storedSessionId) : undefined
 
       const targetRequest: GatewayRequest = owner
-        ? (method, params = {}, timeoutMs) =>
-            requestForSessionProfile(owner, requestGateway, method, params, timeoutMs)
+        ? (method, params = {}, timeoutMs) => requestForSessionProfile(owner, requestGateway, method, params, timeoutMs)
         : requestGateway
 
       // Accepted whether the live turn was redirected in place or queued for
@@ -1000,8 +1000,7 @@ export function usePromptActions({
       const owner = storedSessionId ? ownerForStoredSession(storedSessionId) : undefined
 
       const targetRequest: GatewayRequest = owner
-        ? (method, params = {}, timeoutMs) =>
-            requestForSessionProfile(owner, requestGateway, method, params, timeoutMs)
+        ? (method, params = {}, timeoutMs) => requestForSessionProfile(owner, requestGateway, method, params, timeoutMs)
         : requestGateway
 
       return runRewindSubmit(
@@ -1024,13 +1023,7 @@ export function usePromptActions({
         rebindRowIds
       )
     },
-    [
-      activeSessionIdRef,
-      ownerForStoredSession,
-      recoveryKeyForStoredSession,
-      requestGateway,
-      selectedStoredSessionIdRef
-    ]
+    [activeSessionIdRef, ownerForStoredSession, recoveryKeyForStoredSession, requestGateway, selectedStoredSessionIdRef]
   )
 
   const reloadFromMessage = useCallback(

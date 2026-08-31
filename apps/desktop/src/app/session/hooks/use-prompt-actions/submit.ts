@@ -240,7 +240,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         ? decodeComposerStorageScopeKey(submittedStorageScopeKey)
         : null
 
-      const submittedOwnerRoute = submittedStorageScope?.format === 'canonical' ? submittedStorageScope.owner : undefined
+      const submittedOwnerRoute =
+        submittedStorageScope?.format === 'canonical' ? submittedStorageScope.owner : undefined
 
       // A read-only stored-transcript open (#94724: owner unresolvable under
       // registry topology) has no routable live runtime — refuse the send
@@ -299,10 +300,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           // not. Trust the explicit tile runtime unless that exact owner's tile
           // has a different live binding. Missing/unbound is unknown, not a
           // mismatch, and must not retarget an owner-B kickoff onto owner A.
-          const exactRuntimeId = runtimeIdForExactSessionTile(
-            options.storedSessionId,
-            submittedStorageScope.owner
-          )
+          const exactRuntimeId = runtimeIdForExactSessionTile(options.storedSessionId, submittedStorageScope.owner)
 
           if (exactRuntimeId && exactRuntimeId !== options.sessionId) {
             sessionId = exactRuntimeId

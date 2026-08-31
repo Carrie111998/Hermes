@@ -3,10 +3,7 @@ import {
   type PreparedSessionDraftHandoff,
   prepareSessionDraftHandoff
 } from './composer'
-import {
-  type PreparedQueuedPromptsMigration,
-  prepareQueuedPromptsMigrationExact
-} from './composer-queue'
+import { type PreparedQueuedPromptsMigration, prepareQueuedPromptsMigrationExact } from './composer-queue'
 import {
   finalizeComposerQueueDrainHandoff,
   prepareComposerQueueDrainHandoff,
@@ -43,10 +40,10 @@ function validMigrationPair(from: string, to: string): boolean {
 
   return Boolean(
     fromScope &&
-      toScope &&
-      from !== to &&
-      fromScope.owner.connectionId === toScope.owner.connectionId &&
-      fromScope.owner.profile === toScope.owner.profile
+    toScope &&
+    from !== to &&
+    fromScope.owner.connectionId === toScope.owner.connectionId &&
+    fromScope.owner.profile === toScope.owner.profile
   )
 }
 
@@ -146,9 +143,7 @@ function performComposerStorageMigration(intent: ComposerStorageMigrationIntent)
     removeMigrationIntent(intent)
   } catch (error) {
     if (error === SIMULATED_RENDERER_CRASH || aliasPublished) {
-      throw error === SIMULATED_RENDERER_CRASH
-        ? new Error('simulated renderer crash after queue commit')
-        : error
+      throw error === SIMULATED_RENDERER_CRASH ? new Error('simulated renderer crash after queue commit') : error
     }
 
     let rollbackFailure: unknown

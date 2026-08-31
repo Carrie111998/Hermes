@@ -259,6 +259,7 @@ export function markSessionUnreadFinished(
       ? sessionRowIdentity(row)
       : ownerQualifiedSessionIdentity(ownerRoute.connectionId, ownerRoute.profile, storedSessionId)
     : storedSessionId
+
   const current = $unreadFinishedSessionIds.get()
 
   if (!current.includes(transientId)) {
@@ -524,8 +525,7 @@ function recomputeUnread(): void {
     return Boolean(bucket?.includes(durableId) || (!row.connection_id && bucket?.includes(row.id)))
   }
 
-  const paintIdentity = (row: SessionInfo): string =>
-    row.connection_id ? sessionRowIdentity(row) : row.id
+  const paintIdentity = (row: SessionInfo): string => (row.connection_id ? sessionRowIdentity(row) : row.id)
 
   // Watermark + marker unread for chat and cron rows. The exact selected row
   // stays quiet; a same-id twin owned by another connection remains eligible.

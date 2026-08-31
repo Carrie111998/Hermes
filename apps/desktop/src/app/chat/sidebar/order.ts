@@ -126,7 +126,10 @@ export function rankSessions<T extends { id: string }>(sessions: T[], rankIds?: 
     return sessions
   }
 
-  const identityBySession = new Map(sessions.map(session => [session, sessionRowIdentity(session as unknown as SessionInfo)]))
+  const identityBySession = new Map(
+    sessions.map(session => [session, sessionRowIdentity(session as unknown as SessionInfo)])
+  )
+
   const identities = new Set(identityBySession.values())
   const byRawId = new Map<string, string[]>()
 

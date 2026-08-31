@@ -291,13 +291,7 @@ export function useVoiceConversation({
     }
 
     // enabled/muted/busy or an interleaved turn may have changed while we waited.
-    if (
-      !isCurrent() ||
-      !enabledRef.current ||
-      mutedRef.current ||
-      busyRef.current ||
-      statusRef.current !== 'idle'
-    ) {
+    if (!isCurrent() || !enabledRef.current || mutedRef.current || busyRef.current || statusRef.current !== 'idle') {
       return
     }
 

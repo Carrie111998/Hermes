@@ -103,9 +103,11 @@ const visibleChatAddress = (): ComposerAddress | null => {
     return null
   }
 
-  return surfaceAddress(surfaces[0]) ?? {
-    target: surfaces[0]?.dataset.composerTarget as ComposerTarget
-  }
+  return (
+    surfaceAddress(surfaces[0]) ?? {
+      target: surfaces[0]?.dataset.composerTarget as ComposerTarget
+    }
+  )
 }
 
 const uniqueVisibleAddress = (target: ComposerTarget): ComposerAddress | null => {
@@ -394,7 +396,11 @@ export const requestComposerSubmit = (
 
   const resolved = resolve(target, requestedSurfaceId ?? undefined)
   const resolvedTarget = resolved.target
-  const surfaceId = requestedSurfaceId === undefined ? (resolved.surfaceId ?? getVisibleComposerSurfaceId(resolvedTarget)) : requestedSurfaceId
+
+  const surfaceId =
+    requestedSurfaceId === undefined
+      ? (resolved.surfaceId ?? getVisibleComposerSurfaceId(resolvedTarget))
+      : requestedSurfaceId
 
   // Fail closed: without an exact visible surface identity, broadcasting a
   // submit could make more than one keep-alive/new-chat composer claim it.

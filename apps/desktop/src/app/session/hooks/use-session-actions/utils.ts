@@ -1346,8 +1346,7 @@ export function legacySessionAliasesForOwner(
   }
 
   return aliases.filter(
-    alias =>
-      !rows.some(session => sessionMatchesStoredId(session, alias) && !sessionMatchesOwner(session, provenOwner))
+    alias => !rows.some(session => sessionMatchesStoredId(session, alias) && !sessionMatchesOwner(session, provenOwner))
   )
 }
 

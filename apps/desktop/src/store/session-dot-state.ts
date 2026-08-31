@@ -152,7 +152,8 @@ export const $sessionDotStateById = computed(
     for (const session of sessions) {
       const identity = sessionRowIdentity(session)
 
-      const entry = unreadWriteGuard.get(identity) ??
+      const entry =
+        unreadWriteGuard.get(identity) ??
         (rowCountById.get(session.id) === 1 ? unreadWriteGuard.get(session.id) : undefined)
 
       if (entry && Date.now() - entry.at < UNREAD_WRITE_GUARD_MS) {

@@ -108,11 +108,8 @@ export async function reconcileTileTranscripts({
   const tiles = tilesOverride ?? $sessionTiles.get()
   const requestId = ++requestSequenceRef.current
 
-  const signatureKeyFor = (
-    tileIdentity: string,
-    ownerGeneration: number,
-    runtimeSessionId: string
-  ): string => `tile:${JSON.stringify([tileIdentity, ownerGeneration, runtimeSessionId])}`
+  const signatureKeyFor = (tileIdentity: string, ownerGeneration: number, runtimeSessionId: string): string =>
+    `tile:${JSON.stringify([tileIdentity, ownerGeneration, runtimeSessionId])}`
 
   // The signature belongs to one exact runtime binding, not merely to the
   // durable tile. Rebinds must hydrate even when storage still has the same
@@ -512,8 +509,7 @@ export function rehydrateLiveSessionStatuses(
     // accepted turn appears in active_list. Preserve only that bounded window;
     // a current idle row after the grace is authoritative terminal recovery.
     const withinPreStartGrace =
-      typeof existing?.turnStartedAt === 'number' &&
-      nowMs - existing.turnStartedAt < PRE_TURN_LIVE_SETTLE_GRACE_MS
+      typeof existing?.turnStartedAt === 'number' && nowMs - existing.turnStartedAt < PRE_TURN_LIVE_SETTLE_GRACE_MS
 
     const optimisticPreStart = Boolean(
       status === 'idle' &&

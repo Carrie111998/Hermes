@@ -451,7 +451,7 @@ export function SessionTilePane({
           resumingOwnerGenerationRef.current = null
         }
       })
-  }, [delegateRevision, gatewayOpen, ownerGeneration, ownerRoute, runtimeId, storedSessionId, tile?.error])
+  }, [delegateRevision, gatewayOpen, identity, ownerGeneration, ownerRoute, runtimeId, storedSessionId, tile?.error])
 
   // The gateway (re)opening invalidates any latched error — it likely came
   // from a not-yet-open gateway or the previous connection. Clearing it

@@ -107,13 +107,7 @@ import { RemoteFolderPicker } from '../right-sidebar/files/remote-picker'
 import { resetProjectTreeState } from '../right-sidebar/files/use-project-tree'
 import { PersistentTerminal } from '../right-sidebar/terminal/persistent'
 import { closeAllTerminals } from '../right-sidebar/terminal/terminals'
-import {
-  CRON_ROUTE,
-  navigateToWorkspacePage,
-  routeSessionId,
-  SETTINGS_ROUTE,
-  syncWorkspaceRoute
-} from '../routes'
+import { CRON_ROUTE, navigateToWorkspacePage, routeSessionId, SETTINGS_ROUTE, syncWorkspaceRoute } from '../routes'
 import { SessionPickerOverlay } from '../session-picker-overlay'
 import { SessionSwitcher } from '../session-switcher'
 import { useBackgroundQueueDrain } from '../session/hooks/use-background-queue-drain'
@@ -1001,10 +995,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // close GESTURE (⌘-click / middle-click) — the strip reads the closer, not
   // the `uncloseable` flag, so the pane stays undismissable either way.
   useEffect(() => {
-    registerPaneCloser('workspace', () =>
-      void closeWorkspaceTab((id, ownerRoute) =>
-        openSession(id, navigate, 'main', { ownerRoute, workspaceMode: 'sessions' })
-      )
+    registerPaneCloser(
+      'workspace',
+      () =>
+        void closeWorkspaceTab((id, ownerRoute) =>
+          openSession(id, navigate, 'main', { ownerRoute, workspaceMode: 'sessions' })
+        )
     )
 
     return () => registerPaneCloser('workspace')

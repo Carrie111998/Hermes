@@ -226,10 +226,7 @@ export class ComposerPersistenceCoordinator {
 
       const pending = from ? (nextState.queues[from] ?? []) : []
 
-      if (
-        existingMigration &&
-        (existingMigration.fromScopeKey !== from || existingMigration.toScopeKey !== to)
-      ) {
+      if (existingMigration && (existingMigration.fromScopeKey !== from || existingMigration.toScopeKey !== to)) {
         throw new Error('Composer persistence transaction identity collision')
       }
 
@@ -241,7 +238,9 @@ export class ComposerPersistenceCoordinator {
         throw new Error('Composer persistence scope is reserved by another handoff')
       }
 
-      result = existingMigration ? existingMigration.sourceQueue.length > 0 : Boolean(from && to && from !== to && pending.length)
+      result = existingMigration
+        ? existingMigration.sourceQueue.length > 0
+        : Boolean(from && to && from !== to && pending.length)
 
       if (!existingMigration && from && to && from !== to && transactionId) {
         nextState.migrations![transactionId] = {

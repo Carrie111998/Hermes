@@ -21,12 +21,7 @@ import {
   requestComposerFocus,
   requestComposerInsert
 } from '../focus'
-import {
-  type ComposerScope,
-  ComposerScopeProvider,
-  ComposerSurfaceProvider,
-  MAIN_COMPOSER_SCOPE
-} from '../scope'
+import { type ComposerScope, ComposerScopeProvider, ComposerSurfaceProvider, MAIN_COMPOSER_SCOPE } from '../scope'
 
 import { useComposerDraft } from './use-composer-draft'
 

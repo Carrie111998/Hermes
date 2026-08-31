@@ -27,7 +27,9 @@ vi.mock('@/store/gateway', async importActual => ({
 }))
 
 const { getLatestSessionMessages } = await import('@/hermes')
-const { requestGatewayForAgent, requestGatewayForProfile, retainGatewayForSessionTurn } = await import('@/store/gateway')
+
+const { requestGatewayForAgent, requestGatewayForProfile, retainGatewayForSessionTurn } =
+  await import('@/store/gateway')
 
 const row = (over: Partial<SessionInfo>): SessionInfo =>
   ({

@@ -19,6 +19,16 @@ const hermesApi = vi.mocked(client.hermesApi)
 beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(client.getApiRequestConnection).mockReturnValue('prometheus')
+  vi.mocked(client.capabilityScoped).mockImplementation(scope => {
+    if (scope && typeof scope === 'object') {
+      return {
+        ...(scope.connectionId?.trim() ? { connectionId: scope.connectionId.trim() } : {}),
+        ...(scope.profile?.trim() ? { profile: scope.profile.trim() } : {})
+      }
+    }
+
+    return typeof scope === 'string' && scope.trim() ? { profile: scope.trim() } : {}
+  })
 })
 
 describe('deleteSession profile scoping', () => {
@@ -105,6 +115,7 @@ describe('setSessionArchived profile scoping', () => {
 
   it('routes an owner-qualified archive while serializing its profile name', async () => {
     hermesApi.mockResolvedValue({ ok: true } as never)
+    vi.mocked(client.capabilityScoped).mockReturnValue({ connectionId: 'source-a', profile: 'worker' })
 
     await setSessionArchived('sess-owner', true, { connectionId: 'source-a', profile: 'worker' })
 
@@ -156,6 +167,7 @@ describe('setSessionPinnedRemote / setSessionUnreadRemote profile scoping', () =
 
   it('routes an owner-qualified unread update while serializing its profile name', async () => {
     hermesApi.mockResolvedValue({ ok: true } as never)
+    vi.mocked(client.capabilityScoped).mockReturnValue({ connectionId: 'source-b', profile: 'worker' })
 
     await setSessionUnreadRemote('sess-owner', true, { connectionId: 'source-b', profile: 'worker' })
 

@@ -1,9 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import {
-  ComposerPersistenceCoordinator,
-  type ComposerPersistenceState
-} from '../../electron/composer-queue-drain-ipc'
+import { ComposerPersistenceCoordinator, type ComposerPersistenceState } from '../../electron/composer-queue-drain-ipc'
 
 import {
   clearSessionDraft,

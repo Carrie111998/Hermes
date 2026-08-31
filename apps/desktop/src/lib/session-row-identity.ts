@@ -6,8 +6,7 @@ type SessionIdentityRow = Pick<SessionInfo, '_lineage_root_id' | 'connection_id'
 export const normalizeSessionRowConnection = (connectionId: null | string | undefined): string =>
   connectionId?.trim() || 'local'
 
-export const normalizeSessionRowProfile = (profile: null | string | undefined): string =>
-  profile?.trim() || 'default'
+export const normalizeSessionRowProfile = (profile: null | string | undefined): string => profile?.trim() || 'default'
 
 /** One unambiguous owner-qualified identity for every rendered session row.
  * The lineage root keeps the identity stable across compression tip rotation. */
@@ -52,8 +51,7 @@ export function sessionRowForOwner(
 
   return candidates.find(
     row =>
-      normalizeSessionRowConnection(row.connection_id) ===
-        normalizeSessionRowConnection(ownerRoute.connectionId) &&
+      normalizeSessionRowConnection(row.connection_id) === normalizeSessionRowConnection(ownerRoute.connectionId) &&
       normalizeSessionRowProfile(row.profile) === normalizeSessionRowProfile(ownerRoute.profile)
   )
 }

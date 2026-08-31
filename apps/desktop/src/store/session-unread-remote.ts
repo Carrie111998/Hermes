@@ -32,10 +32,7 @@ export const UNREAD_WRITE_GUARD_MS = 10_000
 
 /** id -> the value we wrote and when. Guarded rows outrank list pages. */
 export const $unreadWriteGuard = atom<
-  Map<
-    string,
-    { at: number; optimistic?: boolean; ownerRoute?: SessionOwnerRoute; storedId?: string; value: boolean }
-  >
+  Map<string, { at: number; optimistic?: boolean; ownerRoute?: SessionOwnerRoute; storedId?: string; value: boolean }>
 >(new Map())
 
 function matchesOwner(

@@ -2129,12 +2129,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
   })
 
   it.each([
-    [
-      'send',
-      '/audit-only',
-      { message: 'expanded queued send', type: 'send' },
-      'expanded queued send'
-    ],
+    ['send', '/audit-only', { message: 'expanded queued send', type: 'send' }, 'expanded queued send'],
     [
       'skill',
       '/work stay on owner B',

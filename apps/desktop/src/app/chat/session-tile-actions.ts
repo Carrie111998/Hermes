@@ -132,7 +132,13 @@ interface SessionTileActionsArgs {
   storedSessionId: string
 }
 
-export function useSessionTileActions({ ownerRoute, requestGateway, runtimeId, scope, storedSessionId }: SessionTileActionsArgs) {
+export function useSessionTileActions({
+  ownerRoute,
+  requestGateway,
+  runtimeId,
+  scope,
+  storedSessionId
+}: SessionTileActionsArgs) {
   const { t } = useI18n()
   const copy = t.desktop
 
@@ -195,8 +201,7 @@ export function useSessionTileActions({ ownerRoute, requestGateway, runtimeId, s
   const recoveryKey = useCallback((): string => {
     const owner = readOwner()
 
-    const lineageOwner =
-      typeof owner === 'string' ? { connectionId: 'local', profile: owner } : (owner ?? undefined)
+    const lineageOwner = typeof owner === 'string' ? { connectionId: 'local', profile: owner } : (owner ?? undefined)
 
     const durableId =
       resolveComposerSessionKey(storedIdRef.current, $sessions.get(), lineageOwner) ?? storedIdRef.current

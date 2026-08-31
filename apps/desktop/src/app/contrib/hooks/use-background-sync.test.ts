@@ -303,8 +303,11 @@ describe('active transcript refresh', () => {
     publishSessionState('runtime-owner-b', createClientSessionState(sharedStoredId))
     vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('same persisted answer', sharedStoredId) as never)
 
-    const updateSessionState = vi.fn((runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) =>
-      updater($sessionStates.get()[runtimeId] ?? createClientSessionState(sharedStoredId))
+    const updateSessionState = vi.fn(
+      (
+        runtimeId: string,
+        updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>
+      ) => updater($sessionStates.get()[runtimeId] ?? createClientSessionState(sharedStoredId))
     )
 
     await reconcileTileTranscriptsForTest({
@@ -321,7 +324,10 @@ describe('active transcript refresh', () => {
       connectionId: ownerB.connectionId,
       profile: ownerB.targetProfile
     })
-    expect(updateSessionState.mock.calls.map(([runtimeId]) => runtimeId)).toEqual(['runtime-owner-a', 'runtime-owner-b'])
+    expect(updateSessionState.mock.calls.map(([runtimeId]) => runtimeId)).toEqual([
+      'runtime-owner-a',
+      'runtime-owner-b'
+    ])
   })
 
   it('lets the newest reconciliation pass finish every tile without an older pass invalidating it', async () => {
@@ -369,7 +375,10 @@ describe('active transcript refresh', () => {
     const states = new Map<string, ReturnType<typeof createClientSessionState>>()
 
     const updateSessionState = vi.fn(
-      (runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) => {
+      (
+        runtimeId: string,
+        updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>
+      ) => {
         const next = updater($sessionStates.get()[runtimeId] ?? createClientSessionState(null))
         states.set(runtimeId, next)
 
@@ -402,8 +411,8 @@ describe('active transcript refresh', () => {
       ].sort()
     )
 
-    vi.mocked(getLatestSessionMessages).mockImplementation(async storedId =>
-      transcript(storedId === storedA ? 'new A' : 'new B', storedId) as never
+    vi.mocked(getLatestSessionMessages).mockImplementation(
+      async storedId => transcript(storedId === storedA ? 'new A' : 'new B', storedId) as never
     )
     updateSessionState.mockClear()
     await reconcileTileTranscriptsForTest(args)
@@ -420,7 +429,10 @@ describe('active transcript refresh', () => {
     const refreshMessagingSessions = vi.fn(async () => undefined)
 
     const updateSessionState = vi.fn(
-      (runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) => {
+      (
+        runtimeId: string,
+        updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>
+      ) => {
         const next = updater(
           $sessionStates.get()[runtimeId] ??
             createClientSessionState(runtimeId === idleRuntimeId ? idleStoredId : tileStoredId)
@@ -516,9 +528,7 @@ describe('active transcript refresh', () => {
 
     let activeListCalls = 0
 
-    let resolveRecoveredList!: (value: {
-      sessions: Array<{ id: string; session_key: string; status: 'idle' }>
-    }) => void
+    let resolveRecoveredList!: (value: { sessions: Array<{ id: string; session_key: string; status: 'idle' }> }) => void
 
     const recoveredList = new Promise<{
       sessions: Array<{ id: string; session_key: string; status: 'idle' }>
@@ -623,9 +633,7 @@ describe('active transcript refresh', () => {
     await waitFor(() =>
       expect(requestGatewayMock.mock.calls.filter(([method]) => method === 'session.active_list')).toHaveLength(3)
     )
-    await waitFor(() =>
-      expect(canonicalState).toMatchObject({ awaitingResponse: false, busy: false, turnLive: false })
-    )
+    await waitFor(() => expect(canonicalState).toMatchObject({ awaitingResponse: false, busy: false, turnLive: false }))
     await waitFor(() =>
       expect(canonicalState.messages.at(-1)?.parts[0]).toMatchObject({ text: 'recovered final answer' })
     )
@@ -637,9 +645,7 @@ describe('active transcript refresh', () => {
     const staleRuntimeId = 'runtime-from-stale-connection'
     const staleStoredId = 'stored-from-stale-connection'
 
-    let resolveStaleList!: (value: {
-      sessions: Array<{ id: string; session_key: string; status: 'working' }>
-    }) => void
+    let resolveStaleList!: (value: { sessions: Array<{ id: string; session_key: string; status: 'working' }> }) => void
 
     const staleList = new Promise<{
       sessions: Array<{ id: string; session_key: string; status: 'working' }>
@@ -736,8 +742,10 @@ describe('active transcript refresh', () => {
     const requestGateway = requestGatewayMock as never
 
     const updateSessionState = vi.fn(
-      (runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) =>
-        updater($sessionStates.get()[runtimeId] ?? createClientSessionState(tileStoredId))
+      (
+        runtimeId: string,
+        updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>
+      ) => updater($sessionStates.get()[runtimeId] ?? createClientSessionState(tileStoredId))
     )
 
     const stable = {
@@ -817,7 +825,10 @@ describe('active transcript refresh', () => {
     } as never)
 
     const updateSessionState = vi.fn(
-      (runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) => {
+      (
+        runtimeId: string,
+        updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>
+      ) => {
         const next = updater($sessionStates.get()[runtimeId] ?? createClientSessionState(tileStoredId))
 
         publishSessionState(runtimeId, next)
@@ -864,7 +875,10 @@ describe('active transcript refresh', () => {
     } as never)
 
     const updateSessionState = vi.fn(
-      (_runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) => {
+      (
+        _runtimeId: string,
+        updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>
+      ) => {
         canonicalState = updater(canonicalState)
         publishSessionState(tileRuntimeId, canonicalState)
 
@@ -1112,8 +1126,10 @@ describe('active transcript refresh', () => {
     vi.mocked(getLatestSessionMessages).mockResolvedValue(transcript('persisted answer', tileStoredId) as never)
 
     const updateSessionState = vi.fn(
-      (runtimeId: string, updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>) =>
-        updater($sessionStates.get()[runtimeId] ?? createClientSessionState(tileStoredId))
+      (
+        runtimeId: string,
+        updater: (state: ReturnType<typeof createClientSessionState>) => ReturnType<typeof createClientSessionState>
+      ) => updater($sessionStates.get()[runtimeId] ?? createClientSessionState(tileStoredId))
     )
 
     const args = { requestSequenceRef: { current: 0 }, signatureRef, updateSessionState }
@@ -1537,9 +1553,13 @@ describe('rehydrateLiveSessionStatuses', () => {
     const storedId = 'stored-turn-live-only'
     const scopeKey = 'turn-live-only-scope'
 
-    rehydrateLiveSessionStatuses({
-      sessions: [{ id: runtimeId, session_key: storedId, status: 'working' }]
-    }, Date.now(), scopeKey)
+    rehydrateLiveSessionStatuses(
+      {
+        sessions: [{ id: runtimeId, session_key: storedId, status: 'working' }]
+      },
+      Date.now(),
+      scopeKey
+    )
     publishSessionState(runtimeId, {
       ...createClientSessionState(storedId),
       turnLive: true

@@ -2,11 +2,7 @@ import type { SessionOwnerScope } from '@/store/session-request-router'
 
 import { resolveSessionProfile } from '../use-session-actions/utils'
 
-import {
-  canonicalSessionResumeIdentity,
-  singleFlightSessionResume,
-  takeRecoveredRuntime
-} from './single-flight-resume'
+import { canonicalSessionResumeIdentity, singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
 import type { GatewayRequest } from './utils'
 
 /**

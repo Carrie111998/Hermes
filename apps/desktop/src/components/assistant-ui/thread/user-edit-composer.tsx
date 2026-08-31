@@ -242,9 +242,8 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
       setFocusRequestId(id => id + 1)
     })
 
-    const offInsert = onComposerInsertRequest(
-      { surfaceId: editSurfaceId, target: 'edit' },
-      ({ mode, text }) => appendExternalText(text, mode)
+    const offInsert = onComposerInsertRequest({ surfaceId: editSurfaceId, target: 'edit' }, ({ mode, text }) =>
+      appendExternalText(text, mode)
     )
 
     return () => {

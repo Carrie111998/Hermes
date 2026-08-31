@@ -1023,6 +1023,7 @@ export function ChatBar({
   const botChat = useStoresSelector([$botChatSessionIds, $sessionStates, $sessionTiles], () =>
     isBotChatSession(sessionId)
   )
+
   const dragActive = !actionsDisabled && dropDragActive
 
   // Branch / worktree hand-offs (CodingStatusRow). Owns the worktree open +

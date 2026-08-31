@@ -201,9 +201,11 @@ describe('session owner hints', () => {
   })
 
   it('pins only connection-tagged rows and leaves primary SSH rows ambient', () => {
-    expect(
-      sessionOwnerRouteFromRow(session({ connection_id: 'source-a', profile: 'worker' }))
-    ).toEqual({ connectionId: 'source-a', profile: 'worker', targetProfile: 'worker' })
+    expect(sessionOwnerRouteFromRow(session({ connection_id: 'source-a', profile: 'worker' }))).toEqual({
+      connectionId: 'source-a',
+      profile: 'worker',
+      targetProfile: 'worker'
+    })
     expect(sessionOwnerRouteFromRow(session({ profile: 'default' }))).toBeUndefined()
     expect(sessionOwnerRouteFromRow(session({ connection_id: '  ', profile: 'default' }))).toBeUndefined()
   })
@@ -426,7 +428,13 @@ describe('mergeSessionPage', () => {
 
   it('does not inherit local metadata when an untagged id also exists remotely', () => {
     const previous = [
-      session({ connection_id: 'local', id: 'local-remote-twin', last_active: 50, profile: 'worker', title: 'Local title' }),
+      session({
+        connection_id: 'local',
+        id: 'local-remote-twin',
+        last_active: 50,
+        profile: 'worker',
+        title: 'Local title'
+      }),
       session({
         connection_id: 'homelab',
         id: 'local-remote-twin',

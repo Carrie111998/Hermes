@@ -187,10 +187,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
   return useCallback(
     async (
       rawCommand: string,
-      options?: Pick<
-        SubmitTextOptions,
-        'composerStorageScope' | 'fromQueue' | 'sessionId' | 'storedSessionId'
-      > & {
+      options?: Pick<SubmitTextOptions, 'composerStorageScope' | 'fromQueue' | 'sessionId' | 'storedSessionId'> & {
         recordInput?: boolean
       }
     ) => {

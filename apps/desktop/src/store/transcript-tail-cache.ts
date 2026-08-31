@@ -300,9 +300,7 @@ export function dropTranscriptTailsForOwner(
   const connectionIds = new Set(connectionId === 'local' ? ['', 'local'] : [connectionId])
 
   const profiles = new Set(
-    [ownerRoute.profile, ownerRoute.targetProfile]
-      .map(profile => profile?.trim() || '')
-      .filter(Boolean)
+    [ownerRoute.profile, ownerRoute.targetProfile].map(profile => profile?.trim() || '').filter(Boolean)
   )
 
   const store = storage()

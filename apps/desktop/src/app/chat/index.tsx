@@ -56,6 +56,7 @@ import {
   $sessions,
   getSessionOwnerHint,
   resolveComposerSessionKey,
+  sessionMatchesStoredId,
   sessionPinId,
   shouldMigrateComposerScope
 } from '@/store/session'

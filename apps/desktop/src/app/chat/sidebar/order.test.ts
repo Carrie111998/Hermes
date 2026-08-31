@@ -83,9 +83,10 @@ describe('rankSessions', () => {
     const ownerA = { connection_id: 'source-a', id: 'shared', profile: 'worker' } as SessionInfo
     const ownerB = { connection_id: 'source-b', id: 'shared', profile: 'worker' } as SessionInfo
 
-    expect(
-      rankSessions([ownerA, ownerB], [sessionRowIdentity(ownerB), sessionRowIdentity(ownerA)])
-    ).toEqual([ownerB, ownerA])
+    expect(rankSessions([ownerA, ownerB], [sessionRowIdentity(ownerB), sessionRowIdentity(ownerA)])).toEqual([
+      ownerB,
+      ownerA
+    ])
   })
 })
 

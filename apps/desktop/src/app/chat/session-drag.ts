@@ -177,9 +177,7 @@ export function startSessionDrag(
 
       if (pos === 'center' && host.chat) {
         split = null
-        link = surface
-          ? { surfaceId: surface.composerSurfaceId, target: surface.composerTarget }
-          : { target: 'main' }
+        link = surface ? { surfaceId: surface.composerSurfaceId, target: surface.composerTarget } : { target: 'main' }
       } else if (pos === 'center') {
         // A preview/page zone has no composer to link to — its center stacks
         // the session as a tab, same as dropping on the strip's tail.

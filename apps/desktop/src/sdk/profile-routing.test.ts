@@ -31,10 +31,12 @@ vi.mock('@/store/session', async () => {
     $gatewayState: atom('open'),
     $messages: atom([]),
     $messagingSessions: atom([]),
+    $primarySessionOwnerIntent: atom(null),
     $selectedStoredSessionId: atom(null),
     $sessions: atom([]),
     $unreadFinishedSessionIds: atom([]),
     lineageAliases: (storedId: string) => [storedId],
+    getSessionOwnerHint: vi.fn(() => undefined),
     rememberedSessionProfile: (_sessions: unknown, _sessionId: null | string, activeProfile: null | string) =>
       (activeProfile ?? '').trim() || 'default',
     requestSessionResume: vi.fn(),

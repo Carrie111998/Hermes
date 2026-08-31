@@ -345,7 +345,10 @@ describe('useSessionTileActions sleep/wake session recovery', () => {
       await Promise.all([cancelA, submitB])
     })
 
-    const resumeCalls = vi.mocked(requestGatewayForAgent).mock.calls.filter(([, , method]) => method === 'session.resume')
+    const resumeCalls = vi
+      .mocked(requestGatewayForAgent)
+      .mock.calls.filter(([, , method]) => method === 'session.resume')
+
     expect(resumeCalls).toHaveLength(2)
     expect(resumeCalls.map(([connectionId]) => connectionId)).toEqual(
       expect.arrayContaining([ownerA.connectionId, ownerB.connectionId])

@@ -238,7 +238,15 @@ export function useComposerDraft({
       setFocusRequestId(id => id + 1)
     }
 
-    const handleInsert = ({ mode, target: requested, text }: { mode: ComposerInsertMode; target: ComposerTarget; text: string }) => {
+    const handleInsert = ({
+      mode,
+      target: requested,
+      text
+    }: {
+      mode: ComposerInsertMode
+      target: ComposerTarget
+      text: string
+    }) => {
       if (!actionsDisabledRef.current && requested === target) {
         appendExternalText(text, mode)
       }

@@ -609,9 +609,9 @@ export function mergeSessionPage(
     // Establish uniqueness before any normalized exact lookup so local metadata
     // cannot win merely because `undefined` connection_id normalizes to `local`.
     const prev = session.connection_id?.trim()
-      ? prevById.get(identity(session)) ??
+      ? (prevById.get(identity(session)) ??
         prevByLineage.get(lineageIdentity(session)) ??
-        uniqueUntaggedPrevious(previous, session)
+        uniqueUntaggedPrevious(previous, session))
       : uniqueUntaggedPrevious(previous, session)
 
     // User-send stamps last_active before the DB flushes the user row
@@ -1213,9 +1213,7 @@ function unreadFamilyIdentities(storedSessionId: string, ownerRoute?: SessionOwn
       normalizeSessionRowProfile(row.profile) === profile
   )
 
-  return lineageAliases(storedSessionId, ownerRows).map(id =>
-    ownerQualifiedSessionIdentity(connectionId, profile, id)
-  )
+  return lineageAliases(storedSessionId, ownerRows).map(id => ownerQualifiedSessionIdentity(connectionId, profile, id))
 }
 
 /** A new turn started for this session: the read baseline only guarded the
@@ -1260,10 +1258,7 @@ export const setSelectedStoredSessionId = (next: Updater<string | null>) => {
  *  baseline so a later completion that settles BEFORE this view is not
  *  re-lit. Must be callable before any focus short-circuit (openSession top)
  *  so re-clicking an already-visible session still clears its dot. */
-export const markSessionRead = (
-  storedSessionId: string | null | undefined,
-  ownerRoute?: SessionOwnerRoute
-) => {
+export const markSessionRead = (storedSessionId: string | null | undefined, ownerRoute?: SessionOwnerRoute) => {
   if (!storedSessionId) {
     return
   }

@@ -192,9 +192,7 @@ describe('useHudHandoff', () => {
     $primarySessionOwnerIntent.set({ ownerRoute: ownerA, storedSessionId: 'shared' })
     renderHook(() => useHudHandoff({ navigate, resumeSession }))
 
-    act(() =>
-      emitHudChanged?.({ newChatGeneration: null, open: false, ownerRoute: null, sessionId: 'shared' })
-    )
+    act(() => emitHudChanged?.({ newChatGeneration: null, open: false, ownerRoute: null, sessionId: 'shared' }))
 
     expect($primarySessionOwnerIntent.get()).toEqual({ ownerRoute: ownerA, storedSessionId: 'shared' })
     expect(navigate).not.toHaveBeenCalled()
