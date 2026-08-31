@@ -11,6 +11,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 
 import json
 from typing import Any, Dict
+from urllib.parse import urlsplit
 
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.reasoning_effort import (
@@ -24,8 +25,95 @@ from agent.reasoning_effort import (
 )
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
+from agent.tool_name_aliases import TOOL_SEARCH_WIRE_ALIAS, reject_reserved_wire_tool_name
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+
+# xAI's chat-completions API reserves the function name ``tool_search`` for
+# its own server-side tool and rejects any request declaring a client
+# function with that name (HTTP 400 "The function name tool_search is
+# reserved for the tool_search tool", #95003). The Tool Search bridge
+# (tools/tool_search.py) assembles its client-side discovery tool under the
+# same literal name for every provider, so Grok providers are unusable
+# whenever the bridge is active. Mirror the web_search treatment in
+# transports/codex.py (_rename_client_web_search_for_xai): alias the wire
+# declaration and map the alias back in normalize_response. The shared wire
+# alias comes from ``agent.tool_name_aliases`` so both transports stay
+# consistent.
+_XAI_TOOL_SEARCH_ALIAS = TOOL_SEARCH_WIRE_ALIAS
+
+
+def _is_xai_target(params: dict[str, Any]) -> bool:
+    provider = str(params.get("provider") or params.get("provider_name") or "")
+    if provider.strip().lower() in {"xai", "xai-oauth"}:
+        return True
+    base_url = str(params.get("base_url") or "").strip()
+    try:
+        return (urlsplit(base_url).hostname or "").lower() == "api.x.ai"
+    except ValueError:
+        return False
+
+
+def _rename_tool_search_bridge_for_xai(
+    tools: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Rename the client ``tool_search`` bridge declaration to a wire alias.
+
+    Only the wire name changes: descriptions, schemas, and the other two
+    bridge names (``tool_describe`` / ``tool_call`` — not reserved by xAI)
+    pass through untouched. The alias is mapped back to ``tool_search`` in
+    ``normalize_response`` before dispatch.
+    """
+    for tool in tools:
+        if isinstance(tool, dict):
+            name = (tool.get("function") or {}).get("name")
+            if isinstance(name, str):
+                reject_reserved_wire_tool_name(name)
+
+    rewritten: list[dict[str, Any]] = []
+    for tool in tools:
+        if (
+            isinstance(tool, dict)
+            and (tool.get("function") or {}).get("name") == "tool_search"
+        ):
+            aliased = dict(tool)
+            aliased["function"] = {**tool["function"], "name": _XAI_TOOL_SEARCH_ALIAS}
+            rewritten.append(aliased)
+        else:
+            rewritten.append(tool)
+    return rewritten
+
+
+def _rename_replayed_tool_search_for_xai(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Alias canonical tool-search calls in replayed assistant history."""
+    rewritten: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            rewritten.append(message)
+            continue
+        tool_calls = message.get("tool_calls")
+        if message.get("role") != "assistant" or not isinstance(tool_calls, list):
+            rewritten.append(message)
+            continue
+
+        calls: list[Any] = []
+        changed = False
+        for tool_call in tool_calls:
+            function = tool_call.get("function") if isinstance(tool_call, dict) else None
+            if isinstance(function, dict) and function.get("name") == "tool_search":
+                calls.append(
+                    {
+                        **tool_call,
+                        "function": {**function, "name": _XAI_TOOL_SEARCH_ALIAS},
+                    }
+                )
+                changed = True
+            else:
+                calls.append(tool_call)
+        rewritten.append({**message, "tool_calls": calls} if changed else message)
+    return rewritten
 
 
 def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
@@ -527,6 +615,11 @@ class ChatCompletionsTransport(ProviderTransport):
         # Gemini targets and stripped for strict non-Gemini providers.
         sanitized = self.convert_messages(messages, model=model)
 
+        if _is_xai_target(params):
+            sanitized = _rename_replayed_tool_search_for_xai(sanitized)
+            if tools:
+                tools = _rename_tool_search_bridge_for_xai(tools)
+
         # ── Provider profile: single-path when present ──────────────────
         _profile = params.get("provider_profile")
         if _profile:
@@ -925,6 +1018,13 @@ class ChatCompletionsTransport(ProviderTransport):
                 # preserve an explicit blank name for Hermes's recovery path.
                 if tc_function is None or function_name is None:
                     continue
+                # Map the xAI wire alias back to the bridge's real name.
+                # Unconditional is correct here: ``hermes_tool_search`` only
+                # exists on the wire because _rename_tool_search_bridge_for_xai
+                # put it there (xAI rejects the literal ``tool_search``), so
+                # any model call carrying the alias is a bridge invocation.
+                if function_name == _XAI_TOOL_SEARCH_ALIAS:
+                    function_name = "tool_search"
                 function_arguments = getattr(tc_function, "arguments", None)
                 # Preserve provider-specific extras on the tool call.
                 # Gemini 3 thinking models attach extra_content with

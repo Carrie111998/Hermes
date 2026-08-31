@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
+from agent.tool_name_aliases import reject_reserved_wire_tool_name
 from hermes_constants import hermes_home_key
 
 logger = logging.getLogger(__name__)
@@ -784,6 +785,7 @@ class ToolRegistry:
         registrations that would shadow an existing tool from a different
         toolset are rejected to prevent accidental overwrites.
         """
+        reject_reserved_wire_tool_name(name)
         handler_owner = self._plugin_owner_of(handler)
         caller_owner = self._plugin_namespace_of_module(self._caller_module())
         owner = caller_owner or handler_owner
@@ -1087,6 +1089,9 @@ class ToolRegistry:
                         "using static schema",
                         name, exc,
                     )
+            schema_name = schema_with_name.get("name")
+            if isinstance(schema_name, str):
+                reject_reserved_wire_tool_name(schema_name)
             result.append({"type": "function", "function": schema_with_name})
         return result
 
