@@ -280,6 +280,84 @@ class TestDiscordStreamingTTS:
         )
 
     @pytest.mark.asyncio
+    async def test_native_48k_stereo_pcm_reaches_mixer_in_fifo_order(self):
+        from gateway.platforms.base import AudioFormat
+        from plugins.platforms.discord.adapter import _DiscordStreamingTTSHandle
+
+        adapter = _make_adapter()
+        mixer = vm.VoiceMixer()
+        vc = _VoiceClientState(mixer)
+        adapter._voice_clients[111] = vc
+        adapter._voice_text_channels[111] = 222
+        adapter._voice_mixers[111] = mixer
+        adapter._cancel_voice_timeout = MagicMock()
+        source = bytes(range(256)) * 15  # exactly one 48kHz stereo 20ms frame
+
+        handle = await adapter.begin_streaming_tts("222", AudioFormat(48000, 2, 2))
+        assert isinstance(handle, _DiscordStreamingTTSHandle)
+        for chunk in (source[:1], source[1:138], source[138:]):
+            await adapter.write_streaming_tts(handle, chunk)
+        await adapter.finish_streaming_tts(handle)
+
+        handle.child.fade_frames = 0
+        frame = mixer.read()
+        assert len(frame) == len(source)
+        np.testing.assert_array_equal(
+            np.frombuffer(frame, dtype=np.int16), np.frombuffer(source, dtype=np.int16)
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_after_begin_fails_consumer_before_audio_for_fallback(self):
+        from gateway.streaming_tts_consumer import StreamingTTSConsumer
+        from plugins.platforms.discord.adapter import _DiscordStreamingTTSHandle
+
+        class SingleChunkStreamer:
+            sample_rate = 24000
+            channels = 1
+            sample_width = 2
+
+            def stream(self, text):
+                del text
+                yield b"\x01\x00" * 32
+
+        adapter = _make_adapter()
+        mixer = vm.VoiceMixer()
+        vc = _VoiceClientState(mixer)
+        adapter._voice_clients[111] = vc
+        adapter._voice_text_channels[111] = 222
+        adapter._voice_mixers[111] = mixer
+        adapter._cancel_voice_timeout = MagicMock()
+
+        with patch("tools.tts_streaming.resolve_streaming_provider", return_value=SingleChunkStreamer()):
+            consumer = StreamingTTSConsumer(adapter, "222", {}, asyncio.get_running_loop())
+            consumer.start()
+            for _ in range(100):
+                if consumer.started:
+                    break
+                await asyncio.sleep(0.01)
+            assert consumer.started is True
+            assert isinstance(consumer._handle, _DiscordStreamingTTSHandle)
+            child = consumer._handle.child
+
+            # The existing voice connection replaces/unlinks the mixer between
+            # begin and the first PCM write.
+            adapter._voice_mixers.pop(111)
+            consumer.on_delta("A complete answer.")
+            consumer.finish()
+            completed = await consumer.wait_complete(timeout=1.0)
+
+        # The consumer's pre-audio failure state keeps whole-file fallback
+        # eligible; the obsolete child receives neither PCM nor activation.
+        assert completed is False
+        assert consumer.completed is False
+        assert consumer.audible is False
+        assert consumer.suppress_whole_file is False
+        assert child.drained is True
+        assert child._aborted is True
+        assert child._activated is False
+        assert mixer.speech_active is False
+
+    @pytest.mark.asyncio
     async def test_unavailable_or_stale_voice_state_declines_streaming(self):
         from gateway.platforms.base import AudioFormat
 

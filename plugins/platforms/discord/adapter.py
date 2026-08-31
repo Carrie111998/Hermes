@@ -4295,7 +4295,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return
         current = self._resolve_streaming_voice_mixer(handle.chat_id)
         if current is None or current[0] != handle.guild_id or current[1] is not handle.mixer:
-            return
+            await self.abort_streaming_tts(handle, error="Discord voice mixer is no longer active")
+            raise RuntimeError("Discord voice mixer is no longer active")
         pcm = self._discord_streaming_pcm(handle, chunk)
         if not pcm:
             return
