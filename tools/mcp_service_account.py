@@ -23,9 +23,9 @@ Configuration in config.yaml::
 
 Secret values (password, client_secret) are **never** stored in
 config.yaml. Only the environment-variable *names* appear there; the
-values are read at runtime from the process environment (which is
-populated from the active profile's ``.env`` file before any MCP
-connection is made).
+values are read at runtime via ``agent.secret_scope.get_secret`` which
+honours the active profile's isolated secret scope under multiplexing and
+falls back to ``os.environ`` in single-profile mode.
 
 Token caching
 -------------
@@ -72,6 +72,8 @@ import threading as _threading
 from pathlib import Path
 from typing import Any, Optional
 
+from agent.secret_scope import get_secret as _get_scoped_secret
+
 logger = logging.getLogger(__name__)
 
 # ── How many seconds before nominal expiry to proactively renew the token.
@@ -84,6 +86,7 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # ---------------------------------------------------------------------------
 # httpx Auth base — resolved from the SDK's own httpx distribution
 # ---------------------------------------------------------------------------
+
 
 def _resolve_auth_base() -> type:
     """Return the ``Auth`` base class from the MCP SDK's httpx distribution.
@@ -98,6 +101,7 @@ def _resolve_auth_base() -> type:
     """
     try:
         from mcp.client import streamable_http as _transport
+
         _mod = getattr(_transport, "httpx2", None) or getattr(_transport, "httpx", None)
         if _mod is not None and hasattr(_mod, "Auth"):
             return _mod.Auth
@@ -106,9 +110,11 @@ def _resolve_auth_base() -> type:
     # Fallback: httpx2 then httpx
     try:
         import httpx2 as _h
+
         return _h.Auth
     except ImportError:
         import httpx as _h  # type: ignore[no-redef]
+
         return _h.Auth
 
 
@@ -133,9 +139,7 @@ def validate_service_account_config(name: str, cfg: dict) -> list[str]:
     required = ("token_url", "client_id", "username", "password_env")
     for field in required:
         if not cfg.get(field):
-            errors.append(
-                f"MCP server '{name}': service_account.{field} is required"
-            )
+            errors.append(f"MCP server '{name}': service_account.{field} is required")
 
     token_url = cfg.get("token_url", "")
     if token_url and not str(token_url).startswith(("https://", "http://")):
@@ -155,14 +159,17 @@ def validate_service_account_config(name: str, cfg: dict) -> list[str]:
 
 
 def _resolve_password(cfg: dict, server_name: str) -> str:
-    """Fetch the service-account password from the configured source.
+    """Fetch the service-account password from the active profile secret scope.
 
-    Currently supports only ``password_env`` (an environment-variable name).
-    The variable must be set in the process environment (populated from the
-    active profile's ``.env`` before MCP connections are established).
+    Reads the env-var named in ``password_env`` via ``agent.secret_scope.get_secret``
+    so the active profile's isolated scope is honoured under multiplexing. Falls
+    back to ``os.environ`` in single-profile mode (when no secret scope is
+    installed and multiplexing is inactive).
 
-    Raises ``ValueError`` with a non-secret message if the env var is missing
-    or empty.
+    Raises ``ValueError`` with a non-secret message if the secret is missing or
+    empty. In multiplex mode with no scope installed, ``get_secret`` raises
+    ``UnscopedSecretError`` (a ``RuntimeError`` subclass) before this function
+    constructs its own error — that propagates as-is to the caller.
     """
     env_name = cfg.get("password_env", "")
     if not env_name:
@@ -174,29 +181,32 @@ def _resolve_password(cfg: dict, server_name: str) -> str:
             f"MCP service-account '{server_name}': password_env "
             f"'{env_name}' is not a valid environment-variable name"
         )
-    value = os.environ.get(str(env_name), "")
+    value = _get_scoped_secret(str(env_name)) or ""
     if not value:
         raise ValueError(
             f"MCP service-account '{server_name}': environment variable "
             f"'{env_name}' is not set or is empty. "
-            f"Set it in your shell or in $HERMES_HOME/.env before connecting."
+            f"Set it in the profile's $HERMES_HOME/.env before connecting."
         )
     return value
 
 
 def _resolve_client_secret(cfg: dict) -> Optional[str]:
-    """Return the optional client secret, or None if not configured."""
+    """Return the optional client secret from the profile secret scope, or None."""
     env_name = cfg.get("client_secret_env", "")
     if not env_name:
         return None
-    return os.environ.get(str(env_name)) or None
+    return _get_scoped_secret(str(env_name)) or None
 
 
 # ---------------------------------------------------------------------------
 # Token cache (disk)
 # ---------------------------------------------------------------------------
 
-def _get_sa_token_path(server_name: str, hermes_home: Optional[str | Path] = None) -> Path:
+
+def _get_sa_token_path(
+    server_name: str, hermes_home: Optional[str | Path] = None
+) -> Path:
     """Return the path to the service-account token cache file.
 
     Kept in the same ``mcp-tokens`` directory as OAuth tokens so directory
@@ -204,6 +214,7 @@ def _get_sa_token_path(server_name: str, hermes_home: Optional[str | Path] = Non
     this file from the OAuth ``.json`` file for the same server name.
     """
     from tools.mcp_oauth import _get_token_dir, _safe_filename
+
     return _get_token_dir(hermes_home) / f"{_safe_filename(server_name)}-sa.json"
 
 
@@ -219,6 +230,7 @@ def _read_token_cache(path: Path) -> dict | None:
 def _write_token_cache(path: Path, data: dict) -> None:
     """Atomically write token cache to *path* with mode 0o600."""
     from hermes_constants import secure_parent_dir
+
     path.parent.mkdir(parents=True, exist_ok=True)
     secure_parent_dir(path)
     tmp = path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
@@ -436,6 +448,7 @@ class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
         self._server_name = server_name
         self._cfg = dict(sa_config)
         from hermes_constants import get_hermes_home
+
         self._hermes_home = str(
             Path(hermes_home).expanduser().resolve(strict=False)
             if hermes_home is not None
@@ -463,7 +476,8 @@ class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
         except OSError as exc:
             logger.warning(
                 "MCP service-account '%s': failed to write token cache: %s",
-                self._server_name, exc,
+                self._server_name,
+                exc,
             )
 
     def _get_cached_token(self) -> Optional[_CachedToken]:
@@ -597,9 +611,9 @@ class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
         # handle both mcp 1.x (httpx) and mcp 2.x (httpx2) at runtime.
         try:
             from mcp.client import streamable_http as _transport
-            _httpx_mod = (
-                getattr(_transport, "httpx2", None)
-                or getattr(_transport, "httpx", None)
+
+            _httpx_mod = getattr(_transport, "httpx2", None) or getattr(
+                _transport, "httpx", None
             )
         except ImportError:
             _httpx_mod = None

@@ -19,6 +19,7 @@ Tests cover:
 - Profile/home cache isolation (two homes → separate caches)
 - Backwards compatibility: header auth and browser OAuth modes still work
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -36,6 +37,7 @@ import pytest
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_sa_config(
     *,
@@ -104,14 +106,17 @@ class _FakeHttpxClient:
 # Config validation
 # ---------------------------------------------------------------------------
 
+
 class TestValidateServiceAccountConfig:
     def test_valid_config(self):
         from tools.mcp_service_account import validate_service_account_config
+
         cfg = _make_sa_config()
         assert validate_service_account_config("srv", cfg) == []
 
     def test_missing_required_fields(self):
         from tools.mcp_service_account import validate_service_account_config
+
         errors = validate_service_account_config("srv", {})
         assert any("token_url" in e for e in errors)
         assert any("client_id" in e for e in errors)
@@ -120,24 +125,28 @@ class TestValidateServiceAccountConfig:
 
     def test_invalid_password_env_name(self):
         from tools.mcp_service_account import validate_service_account_config
+
         cfg = _make_sa_config(password_env="bad name!")
         errors = validate_service_account_config("srv", cfg)
         assert any("password_env" in e for e in errors)
 
     def test_invalid_client_secret_env_name(self):
         from tools.mcp_service_account import validate_service_account_config
+
         cfg = _make_sa_config(client_secret_env="bad name!")
         errors = validate_service_account_config("srv", cfg)
         assert any("client_secret_env" in e for e in errors)
 
     def test_invalid_token_url_scheme(self):
         from tools.mcp_service_account import validate_service_account_config
+
         cfg = _make_sa_config(token_url="ftp://bad.example/token")
         errors = validate_service_account_config("srv", cfg)
         assert any("token_url" in e for e in errors)
 
     def test_not_a_dict(self):
         from tools.mcp_service_account import validate_service_account_config
+
         errors = validate_service_account_config("srv", "string")  # type: ignore
         assert errors
 
@@ -146,14 +155,17 @@ class TestValidateServiceAccountConfig:
 # Password resolution
 # ---------------------------------------------------------------------------
 
+
 class TestResolvePassword:
     def test_reads_from_env(self, monkeypatch):
         from tools.mcp_service_account import _resolve_password
+
         monkeypatch.setenv("MY_PASS", "secret123")
         assert _resolve_password({"password_env": "MY_PASS"}, "srv") == "secret123"
 
     def test_missing_env_raises_with_env_name_not_value(self, monkeypatch):
         from tools.mcp_service_account import _resolve_password
+
         monkeypatch.delenv("MISSING_VAR", raising=False)
         with pytest.raises(ValueError) as exc:
             _resolve_password({"password_env": "MISSING_VAR"}, "srv")
@@ -164,6 +176,7 @@ class TestResolvePassword:
 
     def test_no_password_env_raises(self):
         from tools.mcp_service_account import _resolve_password
+
         with pytest.raises(ValueError, match="password_env is required"):
             _resolve_password({}, "srv")
 
@@ -171,6 +184,7 @@ class TestResolvePassword:
 # ---------------------------------------------------------------------------
 # Token acquisition — first call
 # ---------------------------------------------------------------------------
+
 
 class TestFirstTokenAcquisition:
     @pytest.mark.asyncio
@@ -182,6 +196,7 @@ class TestFirstTokenAcquisition:
             ServiceAccountAuth,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -196,8 +211,10 @@ class TestFirstTokenAcquisition:
         request.status_code = 200
 
         # Patch the httpx client constructor used inside async_auth_flow
-        with patch("tools.mcp_service_account.ServiceAccountAuth._exchange_service_account",
-                   new=AsyncMock(return_value=_parse_token("TOKEN_A"))):
+        with patch(
+            "tools.mcp_service_account.ServiceAccountAuth._exchange_service_account",
+            new=AsyncMock(return_value=_parse_token("TOKEN_A")),
+        ):
             gen = auth.async_auth_flow(request)
             sent_request = await gen.__anext__()
             # Feed a 200 response — no retry needed
@@ -218,6 +235,7 @@ class TestFirstTokenAcquisition:
             ServiceAccountAuth,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -250,15 +268,19 @@ class TestFirstTokenAcquisition:
         assert "scope" in form
 
 
-def _parse_token(access_token: str, expires_in: int = 3600, refresh_token: str | None = None):
+def _parse_token(
+    access_token: str, expires_in: int = 3600, refresh_token: str | None = None
+):
     """Build a _CachedToken for test use."""
     from tools.mcp_service_account import _CachedToken
+
     return _CachedToken(access_token, time.time() + expires_in, refresh_token)
 
 
 # ---------------------------------------------------------------------------
 # Token caching
 # ---------------------------------------------------------------------------
+
 
 class TestTokenCaching:
     @pytest.mark.asyncio
@@ -270,6 +292,7 @@ class TestTokenCaching:
             ServiceAccountAuth,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -282,7 +305,9 @@ class TestTokenCaching:
             exchange_count += 1
             return _parse_token("CACHED_TOK")
 
-        with patch.object(ServiceAccountAuth, "_exchange_service_account", _fake_exchange):
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _fake_exchange
+        ):
             # First request
             for _ in range(2):
                 req = MagicMock()
@@ -308,6 +333,7 @@ class TestTokenCaching:
             _CachedToken,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -322,7 +348,9 @@ class TestTokenCaching:
             exchange_count += 1
             return _parse_token("FRESH_TOK")
 
-        with patch.object(ServiceAccountAuth, "_exchange_service_account", _fake_exchange):
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _fake_exchange
+        ):
             req = MagicMock()
             req.headers = {}
             gen = auth.async_auth_flow(req)
@@ -348,6 +376,7 @@ class TestTokenCaching:
             _PROACTIVE_RENEW_BUFFER_SECONDS,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -361,7 +390,9 @@ class TestTokenCaching:
         async def _fake_exchange(self_inner, http_client):
             return _parse_token("RENEWED_TOK")
 
-        with patch.object(ServiceAccountAuth, "_exchange_service_account", _fake_exchange):
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _fake_exchange
+        ):
             req = MagicMock()
             req.headers = {}
             gen = auth.async_auth_flow(req)
@@ -385,6 +416,7 @@ class TestTokenCaching:
             _get_sa_token_path,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -393,7 +425,9 @@ class TestTokenCaching:
         async def _fake_exchange(self_inner, http_client):
             return _parse_token("DISK_TOK")
 
-        with patch.object(ServiceAccountAuth, "_exchange_service_account", _fake_exchange):
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _fake_exchange
+        ):
             req = MagicMock()
             req.headers = {}
             gen = auth.async_auth_flow(req)
@@ -425,14 +459,18 @@ class TestTokenCaching:
             _write_token_cache,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         # Write a valid token cache manually
         cache_path = _get_sa_token_path("srv", tmp_path)
-        _write_token_cache(cache_path, {
-            "access_token": "COLD_TOK",
-            "expires_at": time.time() + 3600,
-        })
+        _write_token_cache(
+            cache_path,
+            {
+                "access_token": "COLD_TOK",
+                "expires_at": time.time() + 3600,
+            },
+        )
 
         exchange_count = 0
 
@@ -444,7 +482,9 @@ class TestTokenCaching:
         cfg = _make_sa_config()
         auth = ServiceAccountAuth("srv", cfg, hermes_home=tmp_path)
 
-        with patch.object(ServiceAccountAuth, "_exchange_service_account", _fake_exchange):
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _fake_exchange
+        ):
             req = MagicMock()
             req.headers = {}
             gen = auth.async_auth_flow(req)
@@ -464,9 +504,12 @@ class TestTokenCaching:
 # Refresh-token path
 # ---------------------------------------------------------------------------
 
+
 class TestRefreshTokenPath:
     @pytest.mark.asyncio
-    async def test_refresh_token_used_before_service_account(self, tmp_path, monkeypatch):
+    async def test_refresh_token_used_before_service_account(
+        self, tmp_path, monkeypatch
+    ):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("TEST_SA_PASSWORD", "pw")
 
@@ -475,6 +518,7 @@ class TestRefreshTokenPath:
             _CachedToken,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -495,7 +539,9 @@ class TestRefreshTokenPath:
 
         with (
             patch.object(ServiceAccountAuth, "_exchange_refresh_token", _fake_refresh),
-            patch.object(ServiceAccountAuth, "_exchange_service_account", _fake_exchange),
+            patch.object(
+                ServiceAccountAuth, "_exchange_service_account", _fake_exchange
+            ),
         ):
             req = MagicMock()
             req.headers = {}
@@ -524,6 +570,7 @@ class TestRefreshTokenPath:
             _CachedToken,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -538,7 +585,9 @@ class TestRefreshTokenPath:
 
         with (
             patch.object(ServiceAccountAuth, "_exchange_refresh_token", _fake_refresh),
-            patch.object(ServiceAccountAuth, "_exchange_service_account", _fake_exchange),
+            patch.object(
+                ServiceAccountAuth, "_exchange_service_account", _fake_exchange
+            ),
         ):
             req = MagicMock()
             req.headers = {}
@@ -558,6 +607,7 @@ class TestRefreshTokenPath:
 # 401 retry
 # ---------------------------------------------------------------------------
 
+
 class TestFourOhOneRetry:
     @pytest.mark.asyncio
     async def test_401_triggers_retry_with_new_token(self, tmp_path, monkeypatch):
@@ -569,6 +619,7 @@ class TestFourOhOneRetry:
             _CachedToken,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -580,7 +631,9 @@ class TestFourOhOneRetry:
         async def _fake_exchange(self_inner, http_client):
             return _parse_token("FRESH_TOK")
 
-        with patch.object(ServiceAccountAuth, "_exchange_service_account", _fake_exchange):
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _fake_exchange
+        ):
             req = MagicMock()
             req.headers = {}
             gen = auth.async_auth_flow(req)
@@ -608,6 +661,7 @@ class TestFourOhOneRetry:
 # Concurrent refresh deduplication
 # ---------------------------------------------------------------------------
 
+
 class TestConcurrentRefresh:
     @pytest.mark.asyncio
     async def test_concurrent_requests_only_one_exchange(self, tmp_path, monkeypatch):
@@ -618,6 +672,7 @@ class TestConcurrentRefresh:
             ServiceAccountAuth,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -641,7 +696,9 @@ class TestConcurrentRefresh:
             except StopAsyncIteration:
                 pass
 
-        with patch.object(ServiceAccountAuth, "_exchange_service_account", _slow_exchange):
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _slow_exchange
+        ):
             await asyncio.gather(*[_run_one() for _ in range(5)])
 
         # Only one exchange should have fired (others waited on the lock and
@@ -653,6 +710,7 @@ class TestConcurrentRefresh:
 # Error cases
 # ---------------------------------------------------------------------------
 
+
 class TestErrorCases:
     @pytest.mark.asyncio
     async def test_missing_password_env_raises_actionable_error(
@@ -661,7 +719,11 @@ class TestErrorCases:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.delenv("NO_SUCH_ENV", raising=False)
 
-        from tools.mcp_service_account import ServiceAccountAuth, _clear_refresh_locks_for_tests
+        from tools.mcp_service_account import (
+            ServiceAccountAuth,
+            _clear_refresh_locks_for_tests,
+        )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config(password_env="NO_SUCH_ENV")
@@ -676,7 +738,11 @@ class TestErrorCases:
         assert "NO_SUCH_ENV" in msg
         # No secret should appear — env var is not set so there's nothing to leak,
         # but let's verify the message structure is about the missing var name.
-        assert "not set" in msg.lower() or "missing" in msg.lower() or "empty" in msg.lower()
+        assert (
+            "not set" in msg.lower()
+            or "missing" in msg.lower()
+            or "empty" in msg.lower()
+        )
 
     @pytest.mark.asyncio
     async def test_malformed_token_response_raises_clear_error(
@@ -690,6 +756,7 @@ class TestErrorCases:
             _clear_refresh_locks_for_tests,
             _post_token_request,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -716,13 +783,16 @@ class TestErrorCases:
             ServiceAccountAuth,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
         auth = ServiceAccountAuth("srv", cfg, hermes_home=tmp_path)
 
         async def _bad_post(http_client, token_url, form, server_name):
-            raise ValueError(f"MCP service-account '{server_name}': token endpoint returned HTTP 500")
+            raise ValueError(
+                f"MCP service-account '{server_name}': token endpoint returned HTTP 500"
+            )
 
         with patch("tools.mcp_service_account._post_token_request", _bad_post):
             req = MagicMock()
@@ -736,11 +806,10 @@ class TestErrorCases:
 # No secrets in logs
 # ---------------------------------------------------------------------------
 
+
 class TestNoSecretsInLogs:
     @pytest.mark.asyncio
-    async def test_password_not_in_logs_or_errors(
-        self, tmp_path, monkeypatch, caplog
-    ):
+    async def test_password_not_in_logs_or_errors(self, tmp_path, monkeypatch, caplog):
         secret_password = "super_secret_hunter2"
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("TEST_SA_PASSWORD", secret_password)
@@ -749,6 +818,7 @@ class TestNoSecretsInLogs:
             ServiceAccountAuth,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -758,7 +828,9 @@ class TestNoSecretsInLogs:
             return _parse_token("TOK")
 
         with caplog.at_level(logging.DEBUG, logger="tools.mcp_service_account"):
-            with patch.object(ServiceAccountAuth, "_exchange_service_account", _fake_exchange):
+            with patch.object(
+                ServiceAccountAuth, "_exchange_service_account", _fake_exchange
+            ):
                 req = MagicMock()
                 req.headers = {}
                 gen = auth.async_auth_flow(req)
@@ -776,9 +848,7 @@ class TestNoSecretsInLogs:
             )
 
     @pytest.mark.asyncio
-    async def test_access_token_not_in_logs(
-        self, tmp_path, monkeypatch, caplog
-    ):
+    async def test_access_token_not_in_logs(self, tmp_path, monkeypatch, caplog):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("TEST_SA_PASSWORD", "pw")
 
@@ -786,6 +856,7 @@ class TestNoSecretsInLogs:
             ServiceAccountAuth,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         secret_token = "very_secret_access_token_xyz"
@@ -796,7 +867,9 @@ class TestNoSecretsInLogs:
             return _parse_token(secret_token)
 
         with caplog.at_level(logging.DEBUG, logger="tools.mcp_service_account"):
-            with patch.object(ServiceAccountAuth, "_exchange_service_account", _fake_exchange):
+            with patch.object(
+                ServiceAccountAuth, "_exchange_service_account", _fake_exchange
+            ):
                 req = MagicMock()
                 req.headers = {}
                 gen = auth.async_auth_flow(req)
@@ -818,6 +891,7 @@ class TestNoSecretsInLogs:
 # Profile / home isolation
 # ---------------------------------------------------------------------------
 
+
 class TestProfileIsolation:
     @pytest.mark.asyncio
     async def test_two_profiles_separate_caches(self, tmp_path, monkeypatch):
@@ -828,6 +902,7 @@ class TestProfileIsolation:
             _get_sa_token_path,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         home_a = tmp_path / "profile-a"
@@ -841,7 +916,9 @@ class TestProfileIsolation:
             tokens_issued.append(tok)
             return _parse_token(tok)
 
-        with patch.object(ServiceAccountAuth, "_exchange_service_account", _fake_exchange):
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _fake_exchange
+        ):
             for home in (home_a, home_b):
                 auth = ServiceAccountAuth("srv", cfg, hermes_home=home)
                 req = MagicMock()
@@ -871,18 +948,25 @@ class TestProfileIsolation:
 # Backwards compatibility — header and oauth modes still work
 # ---------------------------------------------------------------------------
 
+
 class TestBackwardsCompatibility:
     def test_header_mode_config_unchanged(self):
         """auth: header config still passes through mcp_config helpers."""
         from hermes_cli.mcp_config import _bearer_auth_headers, _env_key_for_server
+
         key = _env_key_for_server("myserver")
         headers = _bearer_auth_headers("myserver")
         assert headers == {"Authorization": f"Bearer ${{{key}}}"}
 
-    def test_service_account_mode_does_not_break_oauth_manager(self, tmp_path, monkeypatch):
+    def test_service_account_mode_does_not_break_oauth_manager(
+        self, tmp_path, monkeypatch
+    ):
         """build_service_account_auth is independent of MCPOAuthManager."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        from tools.mcp_service_account import build_service_account_auth, validate_service_account_config
+        from tools.mcp_service_account import (
+            build_service_account_auth,
+            validate_service_account_config,
+        )
         from tools.mcp_oauth_manager import get_manager
 
         cfg = _make_sa_config()
@@ -893,6 +977,7 @@ class TestBackwardsCompatibility:
 
     def test_build_service_account_auth_raises_on_bad_config(self):
         from tools.mcp_service_account import build_service_account_auth
+
         with pytest.raises(ValueError):
             build_service_account_auth("srv", {})  # missing required fields
 
@@ -900,6 +985,7 @@ class TestBackwardsCompatibility:
 # ---------------------------------------------------------------------------
 # Token cache file permissions
 # ---------------------------------------------------------------------------
+
 
 class TestTokenCacheFilePermissions:
     @pytest.mark.asyncio
@@ -912,6 +998,7 @@ class TestTokenCacheFilePermissions:
             _get_sa_token_path,
             _clear_refresh_locks_for_tests,
         )
+
         _clear_refresh_locks_for_tests()
 
         cfg = _make_sa_config()
@@ -920,7 +1007,9 @@ class TestTokenCacheFilePermissions:
         async def _fake_exchange(self_inner, http_client):
             return _parse_token("TOK")
 
-        with patch.object(ServiceAccountAuth, "_exchange_service_account", _fake_exchange):
+        with patch.object(
+            ServiceAccountAuth, "_exchange_service_account", _fake_exchange
+        ):
             req = MagicMock()
             req.headers = {}
             gen = auth.async_auth_flow(req)
@@ -935,3 +1024,221 @@ class TestTokenCacheFilePermissions:
         cache_path = _get_sa_token_path("srv", tmp_path)
         mode = cache_path.stat().st_mode & 0o777
         assert mode == 0o600, f"Expected 0600, got {oct(mode)}"
+
+
+# ---------------------------------------------------------------------------
+# Profile secret-scope isolation (multiplexing bug fix)
+# ---------------------------------------------------------------------------
+
+
+class TestProfileSecretScopeIsolation:
+    """Verify _resolve_password/_resolve_client_secret use the profile scope."""
+
+    def teardown_method(self, _method):
+        from agent.secret_scope import set_multiplex_active
+
+        set_multiplex_active(False)
+
+    # -- _resolve_password ----------------------------------------------------
+
+    def test_reads_from_active_scope_not_environ(self, monkeypatch):
+        """Scope value takes priority over os.environ in non-multiplex mode."""
+        from agent.secret_scope import set_secret_scope, reset_secret_scope
+        from tools.mcp_service_account import _resolve_password
+
+        monkeypatch.setenv("TEST_SA_PASSWORD", "environ_value")
+        token = set_secret_scope({"TEST_SA_PASSWORD": "scope_value"})
+        try:
+            result = _resolve_password({"password_env": "TEST_SA_PASSWORD"}, "srv")
+        finally:
+            reset_secret_scope(token)
+        assert result == "scope_value"
+
+    def test_non_multiplex_no_scope_falls_through_to_environ(self, monkeypatch):
+        """Non-multiplex + no scope: falls back to os.environ (backwards compat)."""
+        from tools.mcp_service_account import _resolve_password
+
+        monkeypatch.setenv("TEST_SA_PASSWORD", "from_environ")
+        assert (
+            _resolve_password({"password_env": "TEST_SA_PASSWORD"}, "srv")
+            == "from_environ"
+        )
+
+    def test_multiplex_no_scope_raises_unscoped_error(self, monkeypatch):
+        """Multiplex active + no scope → UnscopedSecretError (fail closed)."""
+        from agent.secret_scope import set_multiplex_active, UnscopedSecretError
+        from tools.mcp_service_account import _resolve_password
+
+        monkeypatch.setenv("TEST_SA_PASSWORD", "should_not_be_read")
+        set_multiplex_active(True)
+        with pytest.raises(UnscopedSecretError):
+            _resolve_password({"password_env": "TEST_SA_PASSWORD"}, "srv")
+
+    def test_multiplex_scope_miss_raises_value_error_not_environ(self, monkeypatch):
+        """Multiplex + scope installed but key absent → ValueError, not os.environ leak."""
+        from agent.secret_scope import (
+            set_multiplex_active,
+            set_secret_scope,
+            reset_secret_scope,
+        )
+        from tools.mcp_service_account import _resolve_password
+
+        monkeypatch.setenv("TEST_SA_PASSWORD", "should_not_leak")
+        set_multiplex_active(True)
+        token = set_secret_scope({})  # scope present but empty
+        try:
+            with pytest.raises(ValueError, match="TEST_SA_PASSWORD"):
+                _resolve_password({"password_env": "TEST_SA_PASSWORD"}, "srv")
+        finally:
+            reset_secret_scope(token)
+
+    def test_profile_ab_password_isolation_via_scopes(self):
+        """Profile A and B each obtain their own password from their respective scopes."""
+        from agent.secret_scope import set_secret_scope, reset_secret_scope
+        from tools.mcp_service_account import _resolve_password
+
+        cfg = {"password_env": "AUTHENTIK_APP_PASSWORD"}
+        results = []
+        for pw in ("pw_for_profile_a", "pw_for_profile_b"):
+            token = set_secret_scope({"AUTHENTIK_APP_PASSWORD": pw})
+            try:
+                results.append(_resolve_password(cfg, "toolhive"))
+            finally:
+                reset_secret_scope(token)
+        assert results == ["pw_for_profile_a", "pw_for_profile_b"]
+
+    # -- _resolve_client_secret -----------------------------------------------
+
+    def test_client_secret_reads_from_scope(self, monkeypatch):
+        """client_secret_env is also read from the profile scope, not os.environ."""
+        from agent.secret_scope import set_secret_scope, reset_secret_scope
+        from tools.mcp_service_account import _resolve_client_secret
+
+        monkeypatch.setenv("MY_CLIENT_SECRET", "environ_secret")
+        token = set_secret_scope({"MY_CLIENT_SECRET": "scope_secret"})
+        try:
+            result = _resolve_client_secret({"client_secret_env": "MY_CLIENT_SECRET"})
+        finally:
+            reset_secret_scope(token)
+        assert result == "scope_secret"
+
+    def test_client_secret_scope_miss_in_multiplex_returns_none(self, monkeypatch):
+        """Multiplex + scope missing client_secret_env → None, not environ leak."""
+        from agent.secret_scope import (
+            set_multiplex_active,
+            set_secret_scope,
+            reset_secret_scope,
+        )
+        from tools.mcp_service_account import _resolve_client_secret
+
+        monkeypatch.setenv("MY_CLIENT_SECRET", "should_not_leak")
+        set_multiplex_active(True)
+        token = set_secret_scope({})
+        try:
+            result = _resolve_client_secret({"client_secret_env": "MY_CLIENT_SECRET"})
+            assert result is None
+        finally:
+            reset_secret_scope(token)
+
+    # -- full auth-flow with scoped password ----------------------------------
+
+    @pytest.mark.asyncio
+    async def test_auth_flow_uses_scoped_password_not_environ(
+        self, tmp_path, monkeypatch
+    ):
+        """ServiceAccountAuth acquires token using the profile scope password."""
+        from agent.secret_scope import set_secret_scope, reset_secret_scope
+        from tools.mcp_service_account import (
+            ServiceAccountAuth,
+            _clear_refresh_locks_for_tests,
+        )
+
+        _clear_refresh_locks_for_tests()
+
+        # Password absent from environ — must come entirely from scope.
+        monkeypatch.delenv("AUTHENTIK_ZUG_APP_PASSWORD", raising=False)
+
+        captured_forms: list[dict] = []
+
+        async def _capture_post(http_client, token_url, form, server_name):
+            captured_forms.append(dict(form))
+            return _fake_token_response("SCOPED_TOKEN")
+
+        cfg = _make_sa_config(password_env="AUTHENTIK_ZUG_APP_PASSWORD")
+        auth = ServiceAccountAuth("toolhive", cfg, hermes_home=tmp_path)
+
+        scope_token = set_secret_scope({"AUTHENTIK_ZUG_APP_PASSWORD": "zug_scope_pw"})
+        try:
+            with patch("tools.mcp_service_account._post_token_request", _capture_post):
+                req = MagicMock()
+                req.headers = {}
+                gen = auth.async_auth_flow(req)
+                sent = await gen.__anext__()
+                resp = MagicMock()
+                resp.status_code = 200
+                try:
+                    await gen.asend(resp)
+                except StopAsyncIteration:
+                    pass
+        finally:
+            reset_secret_scope(scope_token)
+
+        assert sent.headers["Authorization"] == "Bearer SCOPED_TOKEN"
+        assert captured_forms[0]["password"] == "zug_scope_pw"
+        # Sanity: the scoped password must not appear in the Authorization header.
+        assert "zug_scope_pw" not in sent.headers["Authorization"]
+
+    @pytest.mark.asyncio
+    async def test_cache_path_isolation_separate_hermes_homes(
+        self, tmp_path, monkeypatch
+    ):
+        """Two profiles with the same server name use separate cache files."""
+        from tools.mcp_service_account import (
+            ServiceAccountAuth,
+            _get_sa_token_path,
+            _clear_refresh_locks_for_tests,
+        )
+
+        _clear_refresh_locks_for_tests()
+
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+        cfg = _make_sa_config()
+
+        async def _fake_exchange_a(self_inner, http_client):
+            return _parse_token("TOKEN_PROFILE_A")
+
+        async def _fake_exchange_b(self_inner, http_client):
+            return _parse_token("TOKEN_PROFILE_B")
+
+        for home, fake_exchange in (
+            (home_a, _fake_exchange_a),
+            (home_b, _fake_exchange_b),
+        ):
+            auth = ServiceAccountAuth("srv", cfg, hermes_home=home)
+            monkeypatch.setenv("TEST_SA_PASSWORD", "pw")
+            with patch.object(
+                ServiceAccountAuth, "_exchange_service_account", fake_exchange
+            ):
+                req = MagicMock()
+                req.headers = {}
+                gen = auth.async_auth_flow(req)
+                await gen.__anext__()
+                resp = MagicMock()
+                resp.status_code = 200
+                try:
+                    await gen.asend(resp)
+                except StopAsyncIteration:
+                    pass
+
+        path_a = _get_sa_token_path("srv", home_a)
+        path_b = _get_sa_token_path("srv", home_b)
+        assert path_a.exists() and path_b.exists()
+        assert path_a != path_b
+        import json as _json
+
+        assert _json.loads(path_a.read_text())["access_token"] == "TOKEN_PROFILE_A"
+        assert _json.loads(path_b.read_text())["access_token"] == "TOKEN_PROFILE_B"
+        # Modes must be 0600
+        assert (path_a.stat().st_mode & 0o777) == 0o600
+        assert (path_b.stat().st_mode & 0o777) == 0o600
