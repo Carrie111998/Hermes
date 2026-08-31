@@ -61,7 +61,6 @@ import {
   forgetSessionOwnerHintsForConnection,
   setConnection,
   setCurrentBranch,
-  setCurrentCwd,
   setCurrentCwdTransient,
   setSessionsLoading
 } from '@/store/session'

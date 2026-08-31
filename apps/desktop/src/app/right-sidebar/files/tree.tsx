@@ -7,6 +7,7 @@ import { TreeSkeleton } from '@/components/chat/skeletons'
 import { Codicon } from '@/components/ui/codicon'
 import { markRightPanePerf } from '@/debug/right-pane-events'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
+import { isUnderPath } from '@/lib/path-compare'
 import { cn } from '@/lib/utils'
 import { type RepoChangeKind, repoChangeKindForPath } from '@/store/coding-status'
 import { $renamingPath, beginInlineRename } from '@/store/file-actions'
@@ -107,6 +108,16 @@ export function ProjectTree({
     async (absPath: string) => {
       const root = cwd.replace(/[\\/]+$/, '')
       const target = absPath.replace(/[\\/]+$/, '')
+
+      // A reveal request can outlive a session/profile transition. Never allow
+      // a request for the previous workspace to select a path outside the tree
+      // currently mounted; the old implementation fell through to select()
+      // against the new tree, which made stale reveals look like no-ops and
+      // could leave the wrong workspace visually active.
+      if (!isUnderPath(root, target)) {
+        return
+      }
+
       const rel = target.startsWith(root) ? target.slice(root.length).replace(/^[\\/]+/, '') : ''
       const segments = rel.split(/[\\/]/).filter(Boolean)
 
