@@ -1041,6 +1041,169 @@ def room_state(
     return state
 
 
+def room_replication_manifest(
+    db_path: Path | str,
+    *,
+    room_id: Any,
+    include_disbanded: bool = False,
+) -> dict[str, Any]:
+    """Return the atomic baseline required by a passive room-log follower.
+
+    This does not grant authority or write a replica. It proves the room
+    snapshot plus contiguous log pages can identify the gateway that owned
+    every authority epoch before a future promotion policy is considered.
+    """
+
+    room_id = _validate_identifier(
+        room_id,
+        label="room_id",
+        max_chars=MAX_ROOM_ID_CHARS,
+    )
+    with _transaction(db_path) as conn:
+        room = conn.execute(
+            """SELECT room_id, name, members_json, authority_gateway_id,
+                      authority_epoch, next_seq, revision, created_at, updated_at,
+                      disbanded_at
+                 FROM hosted_rooms
+                WHERE room_id=? AND (disbanded_at IS NULL OR ?)""",
+            (room_id, int(include_disbanded)),
+        ).fetchone()
+        if room is None:
+            _raise_room_not_found(conn, room_id)
+        claims = conn.execute(
+            """SELECT authority_epoch, payload_json
+                 FROM hosted_room_events
+                WHERE room_id=? AND kind='authority.claimed'
+                ORDER BY authority_epoch DESC, seq DESC""",
+            (room_id,),
+        ).fetchall()
+        event_epochs = {
+            int(row["authority_epoch"])
+            for row in conn.execute(
+                """SELECT DISTINCT authority_epoch
+                     FROM hosted_room_events
+                    WHERE room_id=? AND authority_epoch IS NOT NULL""",
+                (room_id,),
+            ).fetchall()
+        }
+
+    current_gateway = str(room["authority_gateway_id"])
+    current_epoch = int(room["authority_epoch"])
+    claims_by_epoch: dict[int, dict[str, Any]] = {}
+    for claim in claims:
+        epoch = int(claim["authority_epoch"])
+        if epoch in claims_by_epoch:
+            raise AuthorityConflictError("authority epoch has multiple claim events")
+        payload = json.loads(str(claim["payload_json"]))
+        if not isinstance(payload, dict):
+            raise AuthorityConflictError("authority claim payload is invalid")
+        claims_by_epoch[epoch] = payload
+
+    lineage: list[dict[str, Any]] = []
+    gateway = current_gateway
+    for epoch in range(current_epoch, 1, -1):
+        claim = claims_by_epoch.get(epoch)
+        if (
+            claim is None
+            or claim.get("authority_gateway_id") != gateway
+            or claim.get("authority_epoch") != epoch
+        ):
+            raise AuthorityConflictError("authority claim lineage is incomplete")
+        lineage.append({"authority_epoch": epoch, "authority_gateway_id": gateway})
+        gateway = _validate_identifier(
+            claim.get("previous_gateway_id"),
+            label="previous_gateway_id",
+            max_chars=MAX_ACTOR_ID_CHARS,
+        )
+    lineage.append({"authority_epoch": 1, "authority_gateway_id": gateway})
+    lineage.reverse()
+
+    lineage_epochs = {entry["authority_epoch"] for entry in lineage}
+    if not event_epochs <= lineage_epochs:
+        raise AuthorityConflictError("event authority epoch is outside the room lineage")
+
+    baseline = _room_from_row(room)
+    baseline["latest_seq"] = int(room["next_seq"]) - 1
+    return {
+        "schema_version": 1,
+        "room": baseline,
+        "authority_lineage": lineage,
+    }
+
+
+def validate_replica_events(manifest: Any, events: Any) -> None:
+    """Validate one complete contiguous replay against its atomic manifest."""
+
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+        raise HostedRoomError("room replication manifest is invalid")
+    room = manifest.get("room")
+    lineage = manifest.get("authority_lineage")
+    if not isinstance(room, dict) or not isinstance(lineage, list):
+        raise HostedRoomError("room replication manifest is invalid")
+    room_id = _validate_identifier(
+        room.get("room_id"),
+        label="room_id",
+        max_chars=MAX_ROOM_ID_CHARS,
+    )
+    latest_seq = room.get("latest_seq")
+    if isinstance(latest_seq, bool) or not isinstance(latest_seq, int) or latest_seq < 0:
+        raise HostedRoomError("room replication manifest cursor is invalid")
+    if not isinstance(events, list) or len(events) != latest_seq:
+        raise HostedRoomError("room replica log is incomplete")
+
+    authority_by_epoch: dict[int, str] = {}
+    for entry in lineage:
+        if not isinstance(entry, dict):
+            raise HostedRoomError("room replication authority lineage is invalid")
+        epoch = entry.get("authority_epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+            raise HostedRoomError("room replication authority lineage is invalid")
+        if epoch in authority_by_epoch:
+            raise HostedRoomError("room replication authority lineage is invalid")
+        authority_by_epoch[epoch] = _validate_identifier(
+            entry.get("authority_gateway_id"),
+            label="authority_gateway_id",
+            max_chars=MAX_ACTOR_ID_CHARS,
+        )
+    current_epoch = room.get("authority_epoch")
+    if (
+        isinstance(current_epoch, bool)
+        or not isinstance(current_epoch, int)
+        or set(authority_by_epoch) != set(range(1, current_epoch + 1))
+        or authority_by_epoch[current_epoch] != room.get("authority_gateway_id")
+    ):
+        raise HostedRoomError("room replication authority lineage is invalid")
+    claim_epochs: set[int] = set()
+    for expected_seq, event in enumerate(events, start=1):
+        if (
+            not isinstance(event, dict)
+            or event.get("room_id") != room_id
+            or event.get("seq") != expected_seq
+        ):
+            raise HostedRoomError("room replica log is not contiguous")
+        epoch = event.get("authority_epoch")
+        if epoch is not None and (
+            isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or epoch not in authority_by_epoch
+        ):
+            raise HostedRoomError("room replica event authority is unknown")
+        if event.get("kind") == "authority.claimed":
+            payload = event.get("payload")
+            if (
+                not isinstance(payload, dict)
+                or not isinstance(epoch, int)
+                or payload.get("authority_epoch") != epoch
+                or payload.get("authority_gateway_id") != authority_by_epoch.get(epoch)
+                or payload.get("previous_gateway_id")
+                != authority_by_epoch.get(epoch - 1)
+            ):
+                raise HostedRoomError("room replica authority claim is invalid")
+            claim_epochs.add(epoch)
+    if claim_epochs != set(range(2, current_epoch + 1)):
+        raise HostedRoomError("room replica authority claim is incomplete")
+
+
 def claim_authority(
     db_path: Path | str,
     *,

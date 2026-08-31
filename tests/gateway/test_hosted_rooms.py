@@ -283,6 +283,7 @@ def test_authority_claim_fences_stale_gateway_events(tmp_path):
     assert repeated["seq"] == first["seq"]
     assert repeated["idempotent"] is True
 
+
     with pytest.raises(rooms.AuthorityConflictError, match="stale"):
         _append(
             db,
@@ -329,6 +330,79 @@ def test_authority_claim_fences_stale_gateway_events(tmp_path):
         payload={"text": "current result"},
     )
     assert current_member["authority_epoch"] == 2
+
+
+def test_room_log_materializes_a_lossless_replication_baseline(tmp_path):
+    db = tmp_path / "state.db"
+    _create(db, room_id="replicated-room")
+    rooms.append_event(
+        db,
+        room_id="replicated-room",
+        event_id="user-1",
+        kind="message.user",
+        actor=USER,
+        authority_gateway_id="gateway-a",
+        authority_epoch=1,
+        payload={"text": "first"},
+    )
+    rooms.claim_authority(
+        db,
+        room_id="replicated-room",
+        expected_gateway_id="gateway-a",
+        expected_epoch=1,
+        new_gateway_id="gateway-b",
+        event_id="claim-gateway-b",
+    )
+    rooms.append_event(
+        db,
+        room_id="replicated-room",
+        event_id="member-2",
+        kind="message.member",
+        actor={"kind": "member", "id": "ops"},
+        authority_gateway_id="gateway-b",
+        authority_epoch=2,
+        payload={"member_id": "ops", "text": "second"},
+    )
+    rooms.claim_authority(
+        db,
+        room_id="replicated-room",
+        expected_gateway_id="gateway-b",
+        expected_epoch=2,
+        new_gateway_id="gateway-c",
+        event_id="claim-gateway-c",
+    )
+
+    manifest = json.loads(
+        json.dumps(
+            rooms.room_replication_manifest(db, room_id="replicated-room")
+        )
+    )
+    events = []
+    cursor = 0
+    while True:
+        page = rooms.read_events(
+            db,
+            room_id="replicated-room",
+            since_seq=cursor,
+            limit=2,
+        )
+        events.extend(page["events"])
+        cursor = page["cursor"]
+        if not page["has_more"]:
+            break
+
+    rooms.validate_replica_events(manifest, events)
+    assert manifest["room"]["latest_seq"] == len(events) == 4
+    assert manifest["authority_lineage"] == [
+        {"authority_epoch": 1, "authority_gateway_id": "gateway-a"},
+        {"authority_epoch": 2, "authority_gateway_id": "gateway-b"},
+        {"authority_epoch": 3, "authority_gateway_id": "gateway-c"},
+    ]
+
+    tampered = [dict(event) for event in events]
+    tampered[1] = {**tampered[1], "authority_epoch": 3}
+    with pytest.raises(rooms.HostedRoomError, match="authority claim"):
+        rooms.validate_replica_events(manifest, tampered)
 
 
 def test_concurrent_authority_claim_has_one_winner(tmp_path):
