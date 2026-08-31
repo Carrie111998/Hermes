@@ -684,10 +684,11 @@ class EmailAdapter(BasePlatformAdapter):
         return imap
 
     def _connect_smtp(self) -> smtplib.SMTP:
-        """Create an SMTP connection, selecting the correct protocol for the port.
+        """Create an SMTP connection using the configured transport mode.
 
-        Port 465 uses implicit TLS (``SMTP_SSL``).  All other ports use
-        ``SMTP`` + ``STARTTLS``.
+        By default port 465 uses implicit TLS (``SMTP_SSL``), while other
+        ports use ``SMTP`` + ``STARTTLS``.  ``EMAIL_SMTP_SECURITY`` can
+        explicitly select implicit TLS, STARTTLS, or plaintext.
 
         When the host resolves to an IPv6 address that is unreachable
         (common on networks without IPv6 routing), the default connection can
@@ -695,8 +696,8 @@ class EmailAdapter(BasePlatformAdapter):
         failures through an IPv4-only socket path, without mutating global
         resolver state.  TLS verification errors are not retried.
 
-        Returns a connected SMTP object with TLS established — callers
-        can proceed directly to ``login()``.
+        Returns a connected SMTP object with the requested transport ready;
+        callers can proceed directly to ``login()``.
         """
         ctx = self._tls_context(self._smtp_tls_verify)
         host = self._smtp_host

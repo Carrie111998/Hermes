@@ -85,7 +85,7 @@ class TestMailSecurityModes(unittest.TestCase):
         "EMAIL_SMTP_PORT": "1025",
         "EMAIL_SMTP_SECURITY": "starttls",
         "EMAIL_SMTP_TLS_VERIFY": "false",
-    })
+    }, clear=True)
     def test_starttls_uses_plain_clients_and_unverified_contexts(self):
         from gateway.config import PlatformConfig
         from plugins.platforms.email.adapter import EmailAdapter
@@ -126,7 +126,7 @@ class TestMailSecurityModes(unittest.TestCase):
         "EMAIL_SMTP_PORT": "1025",
         "EMAIL_SMTP_SECURITY": "starttls",
         "EMAIL_SMTP_TLS_VERIFY": "false",
-    })
+    }, clear=True)
     def test_standalone_sender_honors_starttls_without_delivery(self):
         from plugins.platforms.email.adapter import _standalone_send
 
@@ -148,6 +148,60 @@ class TestMailSecurityModes(unittest.TestCase):
             ssl.CERT_NONE,
         )
         smtp.send_message.assert_called_once()
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_IMAP_HOST": "127.0.0.1",
+        "EMAIL_IMAP_SECURITY": "plain",
+        "EMAIL_SMTP_HOST": "127.0.0.1",
+        "EMAIL_SMTP_SECURITY": "plain",
+    }, clear=True)
+    def test_plain_mode_skips_tls_for_imap_and_smtp(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        adapter = EmailAdapter(PlatformConfig(enabled=True))
+        imap = MagicMock()
+        smtp = MagicMock()
+        with patch("imaplib.IMAP4", return_value=imap), \
+             patch("imaplib.IMAP4_SSL") as imap_ssl_cls, \
+             patch("smtplib.SMTP", return_value=smtp), \
+             patch("smtplib.SMTP_SSL") as smtp_ssl_cls:
+            self.assertIs(adapter._connect_imap(), imap)
+            self.assertIs(adapter._connect_smtp(), smtp)
+
+        imap_ssl_cls.assert_not_called()
+        imap.starttls.assert_not_called()
+        smtp_ssl_cls.assert_not_called()
+        smtp.starttls.assert_not_called()
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_IMAP_HOST": "127.0.0.1",
+        "EMAIL_IMAP_SECURITY": "invalid",
+        "EMAIL_SMTP_HOST": "127.0.0.1",
+        "EMAIL_SMTP_SECURITY": "invalid",
+    }, clear=True)
+    def test_invalid_modes_fail_before_opening_connections(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        adapter = EmailAdapter(PlatformConfig(enabled=True))
+        with patch("imaplib.IMAP4") as imap_cls, \
+             patch("imaplib.IMAP4_SSL") as imap_ssl_cls, \
+             patch("smtplib.SMTP") as smtp_cls, \
+             patch("smtplib.SMTP_SSL") as smtp_ssl_cls:
+            with self.assertRaisesRegex(ValueError, "EMAIL_IMAP_SECURITY"):
+                adapter._connect_imap()
+            with self.assertRaisesRegex(ValueError, "EMAIL_SMTP_SECURITY"):
+                adapter._connect_smtp()
+
+        imap_cls.assert_not_called()
+        imap_ssl_cls.assert_not_called()
+        smtp_cls.assert_not_called()
+        smtp_ssl_cls.assert_not_called()
 
 
 class TestMessageIdDomain(unittest.TestCase):
