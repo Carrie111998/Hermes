@@ -117,6 +117,12 @@ updates:
 Update backups protect an in-place update. If you're migrating your whole setup to different hardware, use `hermes backup` + `hermes import` instead — see [Exporting Hermes to another machine](/reference/faq#exporting-hermes-to-another-machine) and [`hermes backup` vs `hermes profile export`](/reference/faq#hermes-backup-vs-hermes-profile-export).
 :::
 
+The dedicated local-CDP browser profile under `chrome-debug/` is intentionally
+excluded. It contains live Chromium sockets, locked databases, and machine-bound
+browser state that cannot be copied consistently while the browser is running.
+If you need to preserve a signed-in browser profile, close Chromium and back up
+that directory separately.
+
 ### Windows: another `hermes.exe` is running
 
 On Windows, `hermes update` will refuse to run if it detects another `hermes.exe` process holding the venv's entry-point executable open — most commonly the Hermes Desktop app's spawned backend, an open `hermes` REPL in another terminal, or a running gateway:
