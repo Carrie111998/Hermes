@@ -3864,6 +3864,10 @@ class CompressionSessionBusyError(RuntimeError):
     """A non-owner tried to write while compression owns the session."""
 
 
+class CompressionMetadataConflictError(RuntimeError):
+    """Transactional state metadata changed before compression publication."""
+
+
 class SessionCompressionInProgressError(CompressionSessionBusyError):
     """A concurrent writer collided with a *live* compression lock.
 
@@ -7047,6 +7051,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         require_compression_lease: bool = True,
         watermark: Optional[int] = None,
         watermark_ceiling: Optional[int] = None,
+        state_meta_changes: Optional[List[Tuple[str, Optional[str], str]]] = None,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -7069,6 +7074,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The caller captures ``MAX(id)`` immediately BEFORE that flush; only
         rows in ``(watermark, watermark_ceiling]`` are foreign concurrent
         tail. ``None`` = unbounded (no internal flush happened).
+
+        *state_meta_changes* extends the same publication transaction with
+        exact compare-and-set replacements. Compression uses this to move a
+        persistent goal with the child: either the session split and every
+        goal row commit together, or none of them do.
         """
         def _do(conn):
             lock_row = conn.execute(
@@ -7097,6 +7107,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise RuntimeError(f"Compression parent already ended: {parent_session_id}")
             if not messages:
                 raise RuntimeError("Compression child handoff must not be empty")
+
+            for key, expected, _replacement in state_meta_changes or []:
+                row = conn.execute(
+                    "SELECT value FROM state_meta WHERE key = ?", (key,)
+                ).fetchone()
+                current = None if row is None else row[0]
+                if current != expected:
+                    raise CompressionMetadataConflictError(
+                        "state metadata changed before compression publication"
+                    )
+            for key, _expected, replacement in state_meta_changes or []:
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, replacement),
+                )
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
 
             conn.execute(
