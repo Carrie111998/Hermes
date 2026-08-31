@@ -471,6 +471,94 @@ class TestSensitiveCopyMovePattern:
             assert dangerous is False, cmd
 
 
+class TestEnvrcAndProjectEnvInPlaceEdits:
+    """``.envrc`` and ``sed -i`` on project env/config must require approval.
+
+    Two separate gaps, both against files the read guard already refuses to
+    read by basename (``_BLOCKED_PROJECT_ENV_BASENAMES``):
+
+    1. ``_PROJECT_ENV_PATH`` matched ``.env`` and its dotted variants, but the
+       suffix group requires a leading ``.``, so ``.envrc`` matched only its
+       ``.env`` prefix and the write-target boundary anchors rejected the
+       partial match. Every write vector was ungated. ``.envrc`` is shell that
+       direnv sources on cd, so a write to it is arbitrary code execution.
+    2. No ``sed -i`` rule covered project paths — the in-place rules use
+       ``_USER_SENSITIVE_WRITE_TARGET``, which omits them — so
+       ``sed -i 's/KEY=.*/KEY=stolen/' .env`` mutated a secret-bearing file.
+    """
+
+    def test_envrc_write_vectors_are_gated(self):
+        for path in ("~/.envrc", "./.envrc", "app/.envrc", ".envrc"):
+            for vector in (
+                "echo x >> {p}",
+                "echo x > {p}",
+                "echo x | tee -a {p}",
+                "cp /tmp/evil {p}",
+                "mv /tmp/evil {p}",
+                "install -m600 /tmp/c {p}",
+                "sed -i 's/a/b/' {p}",
+            ):
+                command = vector.format(p=path)
+                dangerous, key, _ = detect_dangerous_command(command)
+                assert dangerous is True, command
+                assert key is not None, command
+
+    def test_sed_in_place_on_project_env_is_gated(self):
+        for command in (
+            "sed -i 's/KEY=.*/KEY=stolen/' .env",
+            "sed -i '' 's/a/b/' app/.env",
+            "sed --in-place 's/a/b/' ./.env.production",
+            "sed -i 's/a/b/' app/.envrc",
+        ):
+            dangerous, key, _ = detect_dangerous_command(command)
+            assert dangerous is True, command
+            assert key is not None, command
+
+    def test_env_variants_still_gated(self):
+        """The pre-existing ``.env`` / ``.env.*`` coverage must survive the
+        regex change that added the ``rc`` alternative."""
+        for command in (
+            "echo x >> .env",
+            "cp /tmp/evil app/.env",
+            "echo x > ~/.env.local",
+            "install -m600 /tmp/c ./.env.production",
+        ):
+            dangerous, key, _ = detect_dangerous_command(command)
+            assert dangerous is True, command
+
+    def test_near_miss_env_names_stay_safe(self):
+        """The ``rc`` alternative must not swallow unrelated names."""
+        for command in (
+            "echo x >> ~/.environment",
+            "echo x >> .env-sample",
+            "echo x >> .envrc.example",
+            "cp a.txt ~/.envoy/config",
+            "echo x >> notes.envrc.md",
+        ):
+            dangerous, key, _ = detect_dangerous_command(command)
+            assert dangerous is False, command
+            assert key is None, command
+
+    def test_ordinary_sed_and_env_reads_stay_safe(self):
+        """The new in-place rule must not gate unrelated edits, and reading a
+        project env file is not a write."""
+        for command in (
+            "sed -i 's/a/b/' README.md",
+            "sed -i 's/a/b/' src/main.py",
+            "sed --in-place 's/a/b/' docs/guide.txt",
+            "sed -i 's/a/b/' docker-compose.yaml",
+            "sed -i 's/a/b/' .github/workflows/ci.yml",
+            "sed -n '1,5p' .env",
+            "sed 's/a/b/' .env > /tmp/out",
+            # A non-Hermes config.yaml is ordinary application config. Scoping
+            # the in-place rule to env files (not the full project target) keeps
+            # TestHermesConfigWriteProtection's contract intact.
+            "sed -i 's/a/b/' /srv/app/config.yaml",
+        ):
+            dangerous, key, _ = detect_dangerous_command(command)
+            assert dangerous is False, command
+
+
 class TestSensitiveInPlaceEditPattern:
     """Detect in-place edits to user startup and credential files."""
 
