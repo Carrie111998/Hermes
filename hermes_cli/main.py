@@ -5053,6 +5053,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_scan_dashboard_processes",
     ),
     "hermes_cli.update_cmd": (
+        "_abort_if_update_index_locked",
         "_abort_dependency_sync_if_self_locked",
         "_add_upstream_remote",
         "_apply_pending_fleet_restart_catchup",
@@ -5145,6 +5146,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_surviving_gateway_pids_after_failed_restart",
         "_sync_fork_with_upstream",
         "_sync_with_upstream_if_needed",
+        "_update_index_lock_path",
         "_update_node_dependencies",
         "_update_via_zip",
         "_upgrade_pip_before_lazy_refresh",
