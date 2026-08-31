@@ -223,6 +223,19 @@ class TestStderrTail:
         assert mcp_tool._read_mcp_stderr_tail(0) == ""
         assert mcp_tool._read_mcp_stderr_tail(None) == ""
 
+    def test_tail_read_failure_emits_debug_signal(self, monkeypatch, tmp_path, caplog):
+        from tools import mcp_tool
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        # The empty-string return is pinned above; the read failure must also
+        # leave a debug breadcrumb so a missing stderr tail is explainable.
+        with caplog.at_level(logging.DEBUG, logger="tools.mcp_tool"):
+            assert mcp_tool._read_mcp_stderr_tail(0) == ""
+        assert any(
+            "mcp stderr tail unavailable" in record.message
+            for record in caplog.records
+        )
+
 
 # ── run() parks startup crashes without the retry ladder ────────────────────
 

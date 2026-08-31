@@ -273,6 +273,9 @@ def _read_mcp_stderr_tail(
         lines = [line.strip() for line in chunk.splitlines() if line.strip()]
         return "\n".join(lines[-max_lines:])
     except Exception:
+        logger.debug(
+            "mcp stderr tail unavailable (offset=%s)", start_offset, exc_info=True
+        )
         return ""
 
 # ---------------------------------------------------------------------------
