@@ -661,6 +661,39 @@ class TestSessionIsolation:
         ids = {ev.source.chat_id for ev in captured_events}
         assert len(ids) == 2, "Each delivery must have a unique session chat_id"
 
+    @pytest.mark.asyncio
+    async def test_route_session_key_reuses_session_for_matching_events(self):
+        """A route may bind repeated events to one stable conversation."""
+        routes = {
+            "youtrack": {
+                "secret": _INSECURE_NO_AUTH,
+                "prompt": "issue {id}",
+                "session_key": "{id}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        captured_events = []
+
+        async def _capture(event):
+            captured_events.append(event)
+
+        adapter.handle_message = _capture
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            for delivery_id in ("youtrack-1", "youtrack-2"):
+                response = await cli.post(
+                    "/webhooks/youtrack",
+                    json={"id": "MMA-6"},
+                    headers={"X-GitHub-Delivery": delivery_id},
+                )
+                assert response.status == 202
+
+        await asyncio.sleep(0.05)
+        assert [event.source.chat_id for event in captured_events] == [
+            "webhook:youtrack:MMA-6",
+            "webhook:youtrack:MMA-6",
+        ]
+
 
 # ===================================================================
 # Silence-marker suppression

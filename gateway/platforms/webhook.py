@@ -921,9 +921,29 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=502,
             )
 
-        # Use delivery_id in session key so concurrent webhooks on the
-        # same route get independent agent runs (not queued/interrupted).
-        session_chat_id = f"webhook:{route_name}:{delivery_id}"
+        # A route may opt into a stable session component, rendered from the
+        # payload (for example, a YouTrack issue ID).  Valid stable keys bind
+        # subsequent events for that entity to the same conversation; all
+        # other routes keep the delivery-scoped, concurrent one-shot default.
+        stable_session_key = ""
+        session_key_template = route_config.get("session_key")
+        if isinstance(session_key_template, str) and session_key_template:
+            candidate = self._render_prompt(
+                session_key_template, payload, event_type, route_name
+            )
+            if re.fullmatch(r"[A-Za-z0-9._-]{1,128}", candidate):
+                stable_session_key = candidate
+            else:
+                logger.warning(
+                    "[webhook] Invalid stable session key for route %s; "
+                    "using delivery-scoped session",
+                    route_name,
+                )
+
+        # Use delivery_id by default so concurrent webhooks on the same route
+        # get independent agent runs rather than being queued or interrupted.
+        session_component = stable_session_key or delivery_id
+        session_chat_id = f"webhook:{route_name}:{session_component}"
 
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
@@ -955,6 +975,7 @@ class WebhookAdapter(BasePlatformAdapter):
             source=source,
             raw_message=payload,
             message_id=delivery_id,
+            metadata={"webhook_stable_session": bool(stable_session_key)},
         )
 
         logger.info(
@@ -988,25 +1009,13 @@ class WebhookAdapter(BasePlatformAdapter):
     async def on_processing_complete(
         self, event: "MessageEvent", outcome: Any
     ) -> None:
-        """Close the per-delivery webhook session once its run finishes.
+        """Close one-shot webhook sessions after their agent runs finish.
 
-        A webhook delivery is one-shot: the ``delivery_id`` is baked into the
-        session key, so the session will never receive a second turn.  Mirror
-        the cron completion path (``cron/scheduler.py`` →
-        ``end_session(..., "cron_complete")``) by marking the session ended
-        when the run completes.  Without this, webhook sessions keep
-        ``ended_at`` NULL forever; ``SessionDB.prune_sessions`` only reaps
-        rows with ``ended_at`` set, so unclosed webhook sessions accumulate
-        unbounded and drive state.db bloat (the ghost-session leak).
-
-        This hook is the one seam that runs at the TRUE end of the run:
-        ``BasePlatformAdapter._process_message_background`` fires it after the
-        message handler returns, on the success, failure, and cancellation
-        paths alike — so error runs are reaped too.  (``handle_message`` is
-        fire-and-forget; wrapping IT closes before the run even starts.)
-        ``end_session()`` is first-reason-wins and no-ops on an already-ended
-        row, so this never clobbers a ``compression``/``agent_close`` reason.
+        Routes with a valid ``session_key`` render a stable conversation key
+        and deliberately remain open for future events for the same entity.
         """
+        if event.metadata.get("webhook_stable_session"):
+            return
         await self._end_webhook_session(event, event.source.chat_id)
 
     async def _end_webhook_session(
