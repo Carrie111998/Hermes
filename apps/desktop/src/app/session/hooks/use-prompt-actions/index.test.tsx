@@ -1002,6 +1002,105 @@ describe('usePromptActions /compress', () => {
   })
 })
 
+describe('usePromptActions /btw', () => {
+  beforeEach(() => {
+    setSessions(() => [sessionInfo()])
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('starts a side question via prompt.btw and does not use slash.exec', async () => {
+    const seeds: Record<string, unknown>[] = []
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.btw') {
+        return { task_id: 'btw_abc123' } as never
+      }
+
+      throw new Error(`unexpected method: ${method}`)
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => seeds.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/btw hello')
+
+    expect(requestGateway).toHaveBeenCalledWith('prompt.btw', {
+      session_id: RUNTIME_SESSION_ID,
+      text: 'hello'
+    })
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    const texts = renderedSeedTexts(seeds)
+    expect(texts.some(text => text.includes('Side question: "hello"'))).toBe(true)
+    expect(texts.some(text => text.includes('Answering from a snapshot of this conversation'))).toBe(true)
+  })
+
+  it('prints usage when /btw has no question', async () => {
+    const seeds: Record<string, unknown>[] = []
+    const requestGateway = vi.fn(async (method: string) => {
+      throw new Error(`unexpected method: ${method}`)
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => seeds.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/btw')
+
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect(renderedSeedTexts(seeds).some(text => text.includes('Usage: /btw <question>'))).toBe(true)
+  })
+
+  it('falls back to slash.exec when an older gateway lacks prompt.btw', async () => {
+    const seeds: Record<string, unknown>[] = []
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.btw') {
+        throw new Error('method not found: prompt.btw')
+      }
+
+      if (method === 'slash.exec') {
+        return {
+          output:
+            'Side question: "hello"\nAnswering from a snapshot of this conversation — the current work continues.'
+        } as never
+      }
+
+      throw new Error(`unexpected method: ${method}`)
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => seeds.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/btw hello')
+
+    expect(requestGateway).toHaveBeenCalledWith('prompt.btw', expect.objectContaining({ text: 'hello' }))
+    expect(requestGateway).toHaveBeenCalledWith('slash.exec', expect.objectContaining({ command: 'btw hello' }))
+    expect(renderedSeedTexts(seeds).some(text => text.includes('Side question: "hello"'))).toBe(true)
+  })
+})
+
 describe('usePromptActions exec fallback error reporting', () => {
   beforeEach(() => {
     setSessions(() => [sessionInfo()])

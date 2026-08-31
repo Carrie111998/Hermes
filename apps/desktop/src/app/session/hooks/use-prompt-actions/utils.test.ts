@@ -7,8 +7,11 @@ import {
   acquireSubmitInFlight,
   appendText,
   base64FromDataUrl,
+  BTW_USAGE,
   clearSessionRecentlyInterrupted,
   clearSubmitInFlight,
+  formatBtwCompleteNotice,
+  formatBtwStartedNotice,
   friendlyRemoteAttachError,
   type GatewayRequest,
   imageFilenameFromPath,
@@ -414,6 +417,21 @@ describe('slashStatusText', () => {
 
   it('omits empty output', () => {
     expect(slashStatusText('/clear', '   ')).toBe('slash:/clear')
+  })
+})
+
+describe('btw notice helpers', () => {
+  it('formats the started ack with a truncated preview', () => {
+    expect(formatBtwStartedNotice('hello')).toBe(
+      'Side question: "hello"\nAnswering from a snapshot of this conversation — the current work continues.'
+    )
+    expect(formatBtwStartedNotice('x'.repeat(61))).toContain('..."')
+    expect(BTW_USAGE).toContain('Usage: /btw <question>')
+  })
+
+  it('formats a successful answer and a worker error', () => {
+    expect(formatBtwCompleteNotice('hello', 'It was in foo.py')).toBe('/btw: "hello"\n\nIt was in foo.py')
+    expect(formatBtwCompleteNotice('hello', 'error: boom')).toBe('/btw failed: "hello"\nboom')
   })
 })
 
