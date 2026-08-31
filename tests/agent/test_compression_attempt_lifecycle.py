@@ -19,6 +19,7 @@ collapsed lean compaction to one auxiliary request per attempt:
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import os
 import threading
@@ -32,6 +33,7 @@ from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.conversation_compression import (
     CompressionCommitFence,
     _claim_compressor_attempt,
+    _join_cancelled_worker_async,
     compress_context,
     compression_blocked_transiently,
     run_compress_context_with_progress_timeout,
@@ -168,6 +170,84 @@ class TestWorkerTeardownOnCeiling:
         assert worker_finished.wait(timeout=2)
         # Late result was fence-poisoned, never adopted.
         assert msgs == [{"role": "user", "content": "keep"}]
+
+
+class TestAsyncWorkerTeardownOnCeiling:
+    """Async counterpart of ``TestWorkerTeardownOnCeiling`` above: pins
+    ``_join_cancelled_worker_async``, the bounded-grace join a host running
+    inside a coroutine (gateway session hygiene) uses instead of
+    ``_join_cancelled_worker``'s blocking ``concurrent.futures.Future.result``
+    join — a host that awaited a plain ``loop.run_in_executor`` future was
+    never joined at all on the total-ceiling path, so a genuinely quick
+    worker's lease stayed retained for the rest of the process's lifetime
+    exactly like a permanently stuck one."""
+
+    @pytest.mark.asyncio
+    async def test_cooperative_worker_joined_within_grace(self):
+        worker_done = threading.Event()
+
+        def cooperative_worker():
+            time.sleep(0.05)
+            worker_done.set()
+            return "late"
+
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, cooperative_worker)
+
+        exited = await _join_cancelled_worker_async(future, grace_seconds=2.0)
+
+        assert exited is True, (
+            "a cooperative worker that exits well within grace must be "
+            "reported as joined so the host can release the lease early"
+        )
+        assert worker_done.is_set()
+        # asyncio.shield must leave the future itself untouched: a caller
+        # (deferred agent cleanup) can still await/observe it afterward.
+        assert await future == "late"
+
+    @pytest.mark.asyncio
+    async def test_uninterruptible_worker_is_not_joined_within_grace(self):
+        release = threading.Event()
+        worker_finished = threading.Event()
+
+        def stuck_worker():
+            release.wait(timeout=5.0)
+            worker_finished.set()
+            return "late"
+
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, stuck_worker)
+
+        started = time.monotonic()
+        exited = await _join_cancelled_worker_async(future, grace_seconds=0.1)
+        elapsed = time.monotonic() - started
+
+        assert exited is False
+        assert not worker_finished.is_set()
+        # Bounded: must not have waited for the full worker duration.
+        assert elapsed < 1.0, "join did not return within its own grace bound"
+        # asyncio.shield must have kept a timeout from cancelling the
+        # underlying future — it must still be joinable/awaitable later.
+        assert not future.done()
+
+        release.set()
+        assert await future == "late"
+        assert worker_finished.is_set()
+
+    @pytest.mark.asyncio
+    async def test_worker_exception_counts_as_exited(self):
+        def raising_worker():
+            raise RuntimeError("boom")
+
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(None, raising_worker)
+
+        exited = await _join_cancelled_worker_async(future, grace_seconds=2.0)
+
+        assert exited is True, (
+            "a worker that raised has provably exited and must count as "
+            "joined, mirroring _join_cancelled_worker's sync contract"
+        )
 
 
 class TestDurableAttemptBackoff:
