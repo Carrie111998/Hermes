@@ -3544,13 +3544,22 @@ def estimate_tokens_rough(text: str) -> int:
     return dense + ((sparse + 3) // 4)
 
 
-def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
+def estimate_messages_tokens_rough(
+    messages: List[Dict[str, Any]],
+    *,
+    include_reasoning_content: Optional[bool] = None,
+) -> int:
     """Rough token estimate for a message list (pre-flight only).
 
     Image parts (base64 PNG/JPEG) are counted as a flat ~1500 tokens per
     image — the Anthropic pricing model — instead of counting raw base64
     character length. Without this, a single ~1MB screenshot would be
     estimated at ~250K tokens and trigger premature context compression.
+
+    ``include_reasoning_content`` mirrors provider replay policy when known:
+    ``True`` promotes/pads reasoning for echo-required routes, ``False`` strips
+    it for strict routes, and ``None`` conservatively counts one persisted
+    reasoning representation without double-counting aliases.
 
     Per-message results are memoized (see ``_estimate_message_tokens_cached``)
     keyed on a deep *identity fingerprint* of the message, so re-walking a
@@ -3561,7 +3570,11 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     _IMAGE_TOKEN_COST = 1500
     total = 0
     for msg in messages:
-        total += _estimate_message_tokens_cached(msg, _IMAGE_TOKEN_COST)
+        total += _estimate_message_tokens_cached(
+            msg,
+            _IMAGE_TOKEN_COST,
+            include_reasoning_content=include_reasoning_content,
+        )
     return total
 
 
@@ -3613,21 +3626,32 @@ def _msg_fingerprint(value: Any, pins: list) -> Any:
     raise ValueError("unfingerprintable message value")
 
 
-def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
+def _estimate_message_tokens_cached(
+    msg: Any,
+    image_cost: int,
+    *,
+    include_reasoning_content: Optional[bool] = None,
+) -> int:
     try:
         pins: list = []
-        key = _msg_fingerprint(msg, pins)
+        key = (include_reasoning_content, _msg_fingerprint(msg, pins))
         hash(key)
     except Exception:
         return (
-            _estimate_message_tokens_without_images(msg)
+            _estimate_message_tokens_without_images(
+                msg,
+                include_reasoning_content=include_reasoning_content,
+            )
             + _count_image_tokens(msg, image_cost)
         )
     cached = _MSG_TOKENS_CACHE.get(key)
     if cached is not None:
         return cached[1]
     tokens = (
-        _estimate_message_tokens_without_images(msg)
+        _estimate_message_tokens_without_images(
+            msg,
+            include_reasoning_content=include_reasoning_content,
+        )
         + _count_image_tokens(msg, image_cost)
     )
     _MSG_TOKENS_CACHE[key] = (pins, tokens)
@@ -3665,10 +3689,14 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     return count * cost_per_image
 
 
-def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
+def _wire_message_shadow(
+    msg: Dict[str, Any],
+    *,
+    include_reasoning_content: Optional[bool] = None,
+) -> Dict[str, Any]:
     """Shadow of a message holding only what the provider actually receives.
 
-    Two adjustments to the raw persisted dict:
+    Adjustments to the raw persisted dict:
 
     * ``api_content`` is a SUBSTITUTE for ``content``, not an addition to it.
       ``turn_context.substitute_api_content()`` pops the sidecar and overwrites
@@ -3682,6 +3710,10 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
       touching ``content``, so a shadow that substituted unconditionally
       would UNDERcount those rows — the dangerous direction, since it makes
       compaction fire too late and the turn dies on a hard context error.
+    * ``reasoning`` is trajectory-only and is never sent directly. Provider
+      routes that require thinking echo-back promote it to
+      ``reasoning_content``; strict routes strip both fields. The shadow
+      mirrors that policy without counting duplicate persisted copies.
     * Base64 image payloads are replaced with a placeholder; they are charged
       separately at a flat rate by ``_count_image_tokens``, and counting their
       raw chars here would massively overestimate usage.
@@ -3692,9 +3724,38 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
         and bool(sidecar)
         and msg.get("role") in ("user", "assistant")
     )
+    effective_reasoning_content: Optional[str] = None
+    if include_reasoning_content is True and msg.get("role") == "assistant":
+        existing_reasoning_content = msg.get("reasoning_content")
+        if isinstance(existing_reasoning_content, str):
+            effective_reasoning_content = existing_reasoning_content or " "
+        else:
+            normalized_reasoning = msg.get("reasoning")
+            if isinstance(normalized_reasoning, str) and normalized_reasoning:
+                effective_reasoning_content = (
+                    " " if msg.get("tool_calls") else normalized_reasoning
+                )
+            else:
+                effective_reasoning_content = " "
+    elif include_reasoning_content is None:
+        existing_reasoning_content = msg.get("reasoning_content")
+        if isinstance(existing_reasoning_content, str):
+            effective_reasoning_content = existing_reasoning_content
+        else:
+            normalized_reasoning = msg.get("reasoning")
+            if isinstance(normalized_reasoning, str) and normalized_reasoning:
+                effective_reasoning_content = normalized_reasoning
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
-        if k in ("_anthropic_content_blocks", "reasoning_details") or k in PERSISTENCE_ONLY_MESSAGE_FIELDS:
+        if (
+            k in (
+                "_anthropic_content_blocks",
+                "reasoning",
+                "reasoning_content",
+                "reasoning_details",
+            )
+            or k in PERSISTENCE_ONLY_MESSAGE_FIELDS
+        ):
             continue
         if k == "api_content":
             # Always popped before the request is built; only counted when it
@@ -3724,6 +3785,8 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
                 shadow[k] = v
         else:
             shadow[k] = v
+    if effective_reasoning_content is not None:
+        shadow["reasoning_content"] = effective_reasoning_content
     return shadow
 
 
@@ -3738,11 +3801,22 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
     return len(str(_wire_message_shadow(msg)))
 
 
-def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
+def _estimate_message_tokens_without_images(
+    msg: Dict[str, Any],
+    *,
+    include_reasoning_content: Optional[bool] = None,
+) -> int:
     """Token estimate for a message shadow with image payloads stripped."""
     if not isinstance(msg, dict):
         return estimate_tokens_rough(str(msg))
-    return estimate_tokens_rough(str(_wire_message_shadow(msg)))
+    return estimate_tokens_rough(
+        str(
+            _wire_message_shadow(
+                msg,
+                include_reasoning_content=include_reasoning_content,
+            )
+        )
+    )
 
 
 def estimate_request_tokens_rough(
@@ -3750,6 +3824,7 @@ def estimate_request_tokens_rough(
     *,
     system_prompt: str = "",
     tools: Optional[List[Dict[str, Any]]] = None,
+    include_reasoning_content: Optional[bool] = None,
 ) -> int:
     """Rough token estimate for a full chat-completions request.
 
@@ -3763,7 +3838,10 @@ def estimate_request_tokens_rough(
     if system_prompt:
         total += estimate_tokens_rough(system_prompt)
     if messages:
-        total += estimate_messages_tokens_rough(messages)
+        total += estimate_messages_tokens_rough(
+            messages,
+            include_reasoning_content=include_reasoning_content,
+        )
     if tools:
         total += _estimate_tools_tokens_rough(tools)
     return total

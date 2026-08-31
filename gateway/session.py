@@ -807,8 +807,12 @@ class SessionEntry:
     estimated_cost_usd: float = 0.0
     cost_status: str = "unknown"
     
-    # Last API-reported prompt tokens (for accurate compression pre-check)
+    # Last API-reported prompt tokens (for accurate compression pre-check).
+    # Model + capture time make the snapshot route-comparable; legacy entries
+    # without either field deliberately fall back to a rough wire estimate.
     last_prompt_tokens: int = 0
+    last_prompt_tokens_model: Optional[str] = None
+    last_prompt_tokens_at: Optional[datetime] = None
     
     # Set when a session was created because the previous one expired;
     # consumed once by the message handler to inject a notice into context
@@ -887,6 +891,12 @@ class SessionEntry:
             "cache_write_tokens": self.cache_write_tokens,
             "total_tokens": self.total_tokens,
             "last_prompt_tokens": self.last_prompt_tokens,
+            "last_prompt_tokens_model": self.last_prompt_tokens_model,
+            "last_prompt_tokens_at": (
+                self.last_prompt_tokens_at.isoformat()
+                if self.last_prompt_tokens_at
+                else None
+            ),
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
             "expiry_finalized": self.expiry_finalized,
@@ -953,6 +963,14 @@ class SessionEntry:
             active_turn_token = None
             active_turn_started_at = None
 
+        last_prompt_tokens_at = None
+        _lpta = data.get("last_prompt_tokens_at")
+        if _lpta:
+            try:
+                last_prompt_tokens_at = datetime.fromisoformat(_lpta)
+            except (TypeError, ValueError):
+                last_prompt_tokens_at = None
+
         session_key = data["session_key"]
         session_id = data["session_id"]
 
@@ -988,6 +1006,8 @@ class SessionEntry:
             cache_write_tokens=data.get("cache_write_tokens", 0),
             total_tokens=data.get("total_tokens", 0),
             last_prompt_tokens=data.get("last_prompt_tokens", 0),
+            last_prompt_tokens_model=data.get("last_prompt_tokens_model"),
+            last_prompt_tokens_at=last_prompt_tokens_at,
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
             expiry_finalized=data.get("expiry_finalized", data.get("memory_flushed", False)),
@@ -1004,6 +1024,33 @@ class SessionEntry:
             prev_session_id=data.get("prev_session_id"),
             model_override=sanitize_model_override(data.get("model_override")),
         )
+
+
+def trusted_prompt_token_snapshot(
+    entry: SessionEntry,
+    current_model: Any,
+) -> Optional[int]:
+    """Return a provider prompt snapshot only for the route that captured it.
+
+    Legacy snapshots have neither model nor capture time and therefore fail
+    closed to the current route's rough wire estimate. Model comparison is
+    case-insensitive because provider catalogs may vary only in slug casing.
+    """
+    try:
+        tokens = int(entry.last_prompt_tokens or 0)
+    except (TypeError, ValueError):
+        return None
+    captured_model = str(entry.last_prompt_tokens_model or "").strip().lower()
+    active_model = str(current_model or "").strip().lower()
+    if (
+        tokens <= 0
+        or not captured_model
+        or not active_model
+        or captured_model != active_model
+        or not isinstance(entry.last_prompt_tokens_at, datetime)
+    ):
+        return None
+    return tokens
 
 
 def build_channel_continuity_note(
@@ -3025,6 +3072,7 @@ class SessionStore:
         self,
         session_key: str,
         last_prompt_tokens: int = None,
+        last_prompt_tokens_model: Optional[str] = None,
         touch_activity: bool = True,
     ) -> None:
         """Update lightweight session metadata after an interaction.
@@ -3041,6 +3089,12 @@ class SessionStore:
                 entry.updated_at = _now()
             if last_prompt_tokens is not None:
                 entry.last_prompt_tokens = last_prompt_tokens
+                if last_prompt_tokens > 0 and last_prompt_tokens_model:
+                    entry.last_prompt_tokens_model = str(last_prompt_tokens_model)
+                    entry.last_prompt_tokens_at = _now()
+                else:
+                    entry.last_prompt_tokens_model = None
+                    entry.last_prompt_tokens_at = None
             # Snapshot peer fields while still holding _lock: a concurrent
             # reset/heal may rewrite the entry, and mixing old and new
             # fields would record a torn peer row.

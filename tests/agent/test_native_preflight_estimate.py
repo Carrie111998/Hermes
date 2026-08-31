@@ -100,6 +100,31 @@ def test_preflight_wrapper_falls_back_to_generic_when_ineligible():
     assert _preflight_request_tokens(agent, messages, "") == generic
 
 
+def test_generic_preflight_uses_active_reasoning_replay_policy():
+    thinking = "hidden reasoning " * 10_000
+    messages = [
+        {
+            "role": "assistant",
+            "content": "visible answer",
+            "reasoning": thinking,
+            "reasoning_content": thinking,
+        }
+    ]
+    strict_agent = _codex_agent(
+        api_mode="chat_completions",
+        _needs_thinking_reasoning_pad=lambda: False,
+    )
+    echo_agent = _codex_agent(
+        api_mode="chat_completions",
+        _needs_thinking_reasoning_pad=lambda: True,
+    )
+
+    strict = _preflight_request_tokens(strict_agent, messages, "")
+    echo = _preflight_request_tokens(echo_agent, messages, "")
+
+    assert strict < echo / 100
+
+
 # ── Mid-turn pre-API guard parity (#96995) ────────────────────────────────
 # The mid-turn guard in conversation_loop must measure the same pruned wire
 # payload the turn-prologue preflight does (#96644/#96155); before #96995 it

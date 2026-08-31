@@ -122,6 +122,45 @@ class TestEstimateMessagesTokensRough:
         # substituted (which would undercount the real request).
         assert result >= (len(big_sidecar) // 4) * 0.9
 
+    def test_reasoning_estimate_matches_provider_replay_policy(self):
+        """Storage-only reasoning must not inflate request pressure.
+
+        ``reasoning`` is never sent directly. ``reasoning_content`` is only
+        replayed to providers that require thinking echo-back, so callers that
+        know the active route can exclude it without dropping visible content.
+        """
+        visible = "answer"
+        thinking = "private chain " * 10_000
+        message = {
+            "role": "assistant",
+            "content": visible,
+            "reasoning": thinking,
+            "reasoning_content": thinking,
+        }
+        baseline = estimate_messages_tokens_rough(
+            [{"role": "assistant", "content": visible}]
+        )
+
+        assert estimate_messages_tokens_rough(
+            [message], include_reasoning_content=False
+        ) == baseline
+        assert estimate_messages_tokens_rough(
+            [message], include_reasoning_content=True
+        ) > baseline
+        assert estimate_messages_tokens_rough(
+            [
+                {
+                    "role": "assistant",
+                    "content": visible,
+                    "reasoning": thinking,
+                }
+            ],
+            include_reasoning_content=True,
+        ) > baseline
+        assert estimate_messages_tokens_rough(
+            [{"role": "assistant", "content": visible, "reasoning": thinking}]
+        ) > baseline
+
     def test_non_string_api_content_does_not_displace_content(self):
         """Only a sidecar shape the wire actually substitutes may displace content.
 

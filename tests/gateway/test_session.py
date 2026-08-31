@@ -409,6 +409,30 @@ class TestSessionStoreRewriteTranscript:
         s = SessionStore(sessions_dir=tmp_path, config=config)
         return s
 
+    def test_update_session_stamps_and_clears_prompt_snapshot(self, store):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="prompt-snapshot",
+            chat_type="dm",
+        )
+        entry = store.get_or_create_session(source)
+
+        store.update_session(
+            entry.session_key,
+            last_prompt_tokens=12_345,
+            last_prompt_tokens_model="provider/model-a",
+        )
+
+        stamped = store._entries[entry.session_key]
+        assert stamped.last_prompt_tokens == 12_345
+        assert stamped.last_prompt_tokens_model == "provider/model-a"
+        assert isinstance(stamped.last_prompt_tokens_at, datetime)
+
+        store.update_session(entry.session_key, last_prompt_tokens=0)
+        cleared = store._entries[entry.session_key]
+        assert cleared.last_prompt_tokens_model is None
+        assert cleared.last_prompt_tokens_at is None
+
     def test_rewrite_replaces_transcript(self, store, tmp_path):
         session_id = "test_session_1"
         store._db.create_session(session_id=session_id, source="test")
