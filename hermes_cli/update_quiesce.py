@@ -143,15 +143,29 @@ def relaunch_authority(runtime: Any) -> str:
 def verify_inventory_complete(plan: Any) -> list:
     """Return the runtimes to quiesce, or raise when the plan is unusable.
 
-    Fail-closed: a plan that could not be collected at all, or a runtime
-    row with no PID (nothing to stop, nothing to confirm) or no relaunch
-    authority (stoppable but unrecoverable) means the update cannot
-    honour its restart obligation and must not mutate the checkout.
+    Fail-closed: a plan that could not be collected at all, one whose
+    discovery probes did not all answer, or a runtime row with no PID
+    (nothing to stop, nothing to confirm) or no relaunch authority
+    (stoppable but unrecoverable) means the update cannot honour its
+    restart obligation and must not mutate the checkout.
+
+    Validating only the surviving rows is precisely the fail-open hole
+    this guards: a collector that raised contributes zero rows, so a
+    fleet of live runtimes and an empty machine are the same picture. An
+    empty ``runtimes`` list authorizes mutation only when completeness is
+    positively established — every probe answered.
     """
     if plan is None:
         raise QuiesceAbort(
             "refusing to mutate: the pre-update runtime inventory is missing, "
             "so running Hermes runtimes cannot be proven stopped"
+        )
+    discovery_errors = [str(e) for e in (getattr(plan, "discovery_errors", None) or [])]
+    if discovery_errors:
+        raise QuiesceAbort(
+            "refusing to mutate: the runtime inventory is incomplete — these "
+            "discovery probes did not answer, so live Hermes runtimes may be "
+            "undiscovered: " + "; ".join(discovery_errors)
         )
     runtimes = list(getattr(plan, "runtimes", None) or [])
     incomplete: list[str] = []
@@ -214,7 +228,10 @@ def run_pre_mutation_quiesce(
 
     Order is the contract: isolation first (a non-isolated updater must
     not even *start* stopping runtimes, since the first stop can kill
-    it), inventory completeness second, stops last.
+    it), inventory completeness second, the durable restart-pending
+    record third, stops last. Everything that can fail is therefore
+    checked while the fleet is still untouched — an abort here needs no
+    restore, because nothing has been stopped yet.
     """
     global _authorized
     _authorized = None
@@ -233,7 +250,22 @@ def run_pre_mutation_quiesce(
     # updater killed mid-phase would otherwise leave a fleet that cannot be
     # reconstructed — the exact "interrupted after quiesce" case.
     if persist_state and runtimes:
-        write_restart_pending_state(runtimes, expected_sha=expected_sha)
+        try:
+            persisted = write_restart_pending_state(
+                runtimes, expected_sha=expected_sha
+            )
+        except Exception as exc:
+            raise QuiesceAbort(
+                "refusing to mutate: the durable restart-pending record could "
+                f"not be written ({exc}) — an updater interrupted after the "
+                "stops would leave a fleet nothing can restore"
+            ) from exc
+        if not persisted:
+            raise QuiesceAbort(
+                "refusing to mutate: the durable restart-pending record could "
+                "not be written — an updater interrupted after the stops "
+                "would leave a fleet nothing can restore"
+            )
 
     quiesced: list[int] = []
     for runtime in runtimes:
@@ -471,8 +503,11 @@ def write_restart_pending_state(runtimes, *, expected_sha: str = "") -> bool:
             _os.fsync(handle.fileno())
         _os.replace(tmp, path)
         return True
-    except OSError as exc:
-        logger.debug("Could not write restart-pending state: %s", exc)
+    except Exception as exc:
+        # The return value is the ONLY signal a caller gets, and the quiesce
+        # phase turns a False into an abort — so swallowing the exception
+        # here must never be mistaken for a successful write.
+        logger.warning("Could not write restart-pending state: %s", exc)
         return False
 
 
@@ -666,21 +701,34 @@ def undischarged_records(state: Optional[dict], outcomes: Sequence) -> list:
     return remaining
 
 
-def discharge_relaunched_records(state: Optional[dict], outcomes: Sequence) -> None:
+def discharge_relaunched_records(state: Optional[dict], outcomes: Sequence) -> bool:
     """Shrink the durable record to what is still owed a relaunch.
 
     The relaunch runs twice by design — once in the update's restart
     phase, once from ``cmd_update``'s command-boundary backstop — so an
     incomplete first pass must not leave a fully-relaunched record for
     the second pass to act on again.
+
+    Returns whether the shrink landed on disk. ``False`` leaves the older,
+    larger record in place: over-reporting what is still owed is the safe
+    direction (the relaunch mechanisms it names are idempotent), whereas
+    treating a failed write as a discharge would silently drop the
+    obligation.
     """
     remaining = undischarged_records(state, outcomes)
     if not remaining:
         clear_restart_pending_state()
-        return
-    write_restart_pending_state(
+        return True
+    written = write_restart_pending_state(
         remaining, expected_sha=str((state or {}).get("expected_sha") or "")
     )
+    if not written:
+        logger.warning(
+            "Could not shrink the restart-pending record; %d runtime(s) stay "
+            "recorded as owed a relaunch",
+            len(remaining),
+        )
+    return bool(written)
 
 
 def relaunch_is_complete(outcomes: Sequence) -> bool:

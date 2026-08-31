@@ -127,9 +127,13 @@ class TestSupervisedStopIsFailClosed:
             "gateway.status.terminate_pid",
             lambda pid, force=False: terminated.append(pid),
         )
-
-        assert (
-            update_cmd._stop_runtime_for_quiesce(self._runtime(unit="", scope=""))
-            is True
+        # Stopping by PID means proving the PID is still that runtime.
+        monkeypatch.setattr(
+            "hermes_cli.process_identity._pid_alive_matches",
+            lambda pid, create: True,
         )
+        runtime = self._runtime(unit="", scope="")
+        runtime.detail["start_time"] = 111.0
+
+        assert update_cmd._stop_runtime_for_quiesce(runtime) is True
         assert terminated == [4242]

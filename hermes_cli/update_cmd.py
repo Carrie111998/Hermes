@@ -3266,6 +3266,58 @@ def _runtime_pid_alive(pid: int) -> bool:
         return True
 
 
+def _desktop_supervisor_is_gone(runtime) -> bool:
+    """Is the Desktop app that supervises *runtime* provably no longer there?
+
+    Fail-closed: ``False`` unless the recorded spawner ``(pid, create_time)``
+    is provably dead. A missing or unprovable identity counts as "still
+    supervising" — signalling the backend under a live Desktop is answered
+    by a respawn onto pre-update code.
+    """
+    detail = getattr(runtime, "detail", None) or {}
+    if not isinstance(detail, dict):
+        return False
+    spawner_pid = detail.get("spawner_pid")
+    if not isinstance(spawner_pid, int) or spawner_pid <= 0:
+        return False
+    try:
+        from hermes_cli.process_identity import _pid_alive_matches
+
+        alive = _pid_alive_matches(spawner_pid, detail.get("spawner_create"))
+    except Exception as exc:
+        logger.debug("Desktop spawner probe failed for %s: %s", spawner_pid, exc)
+        return False
+    return alive is False
+
+
+def _runtime_identity_still_matches(runtime) -> bool:
+    """Does *runtime*'s PID still name the process the plan inventoried?
+
+    A PID is a reusable name: between the inventory pass and the stop the
+    kernel can reap the runtime and hand the number to anything else on
+    the box. Only the recorded ``(pid, start_time)`` pair distinguishes
+    the two, so this fails CLOSED — no recorded start time, or a probe
+    that cannot answer, is not proof of identity and must not be
+    signalled.
+    """
+    pid = getattr(runtime, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    detail = getattr(runtime, "detail", None) or {}
+    if not isinstance(detail, dict):
+        return False
+    start_time = detail.get("start_time")
+    if start_time is None:
+        return False
+    try:
+        from hermes_cli.process_identity import _pid_alive_matches
+
+        return _pid_alive_matches(pid, float(start_time)) is True
+    except Exception as exc:
+        logger.debug("Runtime identity probe failed for %s: %s", pid, exc)
+        return False
+
+
 def _stop_runtime_for_quiesce(runtime) -> bool:
     """Stop one inventoried runtime by its EXACT recorded authority.
 
@@ -3282,6 +3334,22 @@ def _stop_runtime_for_quiesce(runtime) -> bool:
     pid = getattr(runtime, "pid", None)
     unit = str(getattr(runtime, "unit", "") or "")
     scope = str(getattr(runtime, "unit_scope", "") or "")
+    from hermes_cli import update_quiesce
+
+    if str(getattr(runtime, "supervisor", "") or "") == "desktop":
+        # The Desktop app is a supervisor we cannot drive: there is no unit
+        # to stop and no handle to suspend, so any stop we perform is a
+        # plain kill that Desktop answers with a fresh backend — inside the
+        # mutation window, on pre-update code, under a new PID the old-PID
+        # exit check will never look at. Refuse unless Desktop itself is
+        # provably gone.
+        if not _desktop_supervisor_is_gone(runtime):
+            raise update_quiesce.QuiesceAbort(
+                "the Hermes Desktop app still supervises this backend and "
+                "would respawn it onto pre-update code during the update — "
+                "quit Hermes Desktop (or stop the backend from Desktop), "
+                "then retry"
+            )
     if unit and scope == "scm":
         # Windows SCM: the update's own pause machinery owns these, and it
         # already ran. Treat an SCM-supervised runtime as stopped once its
@@ -3299,6 +3367,12 @@ def _stop_runtime_for_quiesce(runtime) -> bool:
         return _run_supervisor_command(stop_argv)
     if not isinstance(pid, int) or pid <= 0:
         return False
+    if not _runtime_identity_still_matches(runtime):
+        raise update_quiesce.QuiesceAbort(
+            f"PID {pid} no longer identifies the inventoried runtime (the "
+            "kernel may have recycled it onto an unrelated process) — "
+            "re-run the update so the fleet is inventoried afresh"
+        )
     try:
         from gateway.status import terminate_pid
 
@@ -3438,9 +3512,22 @@ def _quiesce_exit_budget() -> float:
 
 
 def _escalate_runtime_stop(runtime) -> None:
-    """Force-stop a runtime that ignored the graceful stop."""
+    """Force-stop a runtime that ignored the graceful stop.
+
+    Re-checks identity first, and for the same reason the graceful stop
+    does — more urgently, in fact: this is SIGKILL, and by now the
+    graceful stop has had a full drain budget to succeed, which is
+    exactly the window in which the PID could have been freed and reused.
+    """
     pid = getattr(runtime, "pid", None)
     if not isinstance(pid, int) or pid <= 0:
+        return
+    if not _runtime_identity_still_matches(runtime):
+        logger.debug(
+            "Not escalating PID %s: it no longer identifies the inventoried "
+            "runtime",
+            pid,
+        )
         return
     try:
         from gateway.status import terminate_pid
@@ -3647,9 +3734,13 @@ def _respawn_recorded_runtime(argv: str, record: dict):
 def _probe_relaunched_runtime_sha(record: dict) -> str | None:
     """Ask the replacement which source SHA it is actually running.
 
-    Falls back to the on-disk checkout SHA when a runtime publishes no
-    code stamp — a relaunch from a fresh interpreter can only be running
-    what is on disk.
+    ``None`` when the runtime publishes no stamp, and deliberately NOT
+    the on-disk checkout SHA: the checkout reads as updated whether the
+    replacement came up on the new graph, came up on a stale venv, or
+    never came up at all. Substituting it turned this check into "the
+    files changed" — the one thing that was never in doubt — so an
+    unstamped runtime is an unverified runtime, and the caller keeps its
+    relaunch obligation open.
     """
     try:
         from gateway.status import read_runtime_status
@@ -3662,7 +3753,7 @@ def _probe_relaunched_runtime_sha(record: dict) -> str | None:
             return str(status["code_sha"])
     except Exception as exc:
         logger.debug("Runtime SHA probe failed: %s", exc)
-    return _current_checkout_sha()
+    return None
 
 
 def _format_concurrent_instances_message(

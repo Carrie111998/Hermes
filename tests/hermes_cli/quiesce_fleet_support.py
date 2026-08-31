@@ -116,14 +116,25 @@ def join_argv(argv) -> str:
 
 
 def record(runtime: Runtime, *, kind: str = "gateway", profile: str = "default"):
-    """A plan row whose ONLY relaunch authority is the recorded argv."""
+    """A plan row whose ONLY relaunch authority is the recorded argv.
+
+    Carries the live child's real ``start_time``, exactly as
+    ``collect_runtime_inventory`` would: the stop phase refuses to signal
+    a PID it cannot re-identify, so a row without it is not a row the
+    production path would ever act on.
+    """
+    import psutil
+
     return RuntimeRecord(
         kind=kind,
         profile=profile,
         pid=runtime.pid,
         supervisor="manual",
         restart_via="manual",
-        detail={"argv": join_argv(runtime.argv)},
+        detail={
+            "argv": join_argv(runtime.argv),
+            "start_time": float(psutil.Process(runtime.pid).create_time()),
+        },
     )
 
 

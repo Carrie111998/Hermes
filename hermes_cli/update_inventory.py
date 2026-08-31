@@ -76,6 +76,11 @@ class UpdatePlan:
     expected_version: Optional[str] = None
     profiles: list = field(default_factory=list)
     runtimes: list = field(default_factory=list)  # list[RuntimeRecord]
+    # Discovery probes that did NOT answer. Non-empty means the runtime
+    # list is a lower bound, not the fleet: a swallowed collector failure
+    # is indistinguishable from "no runtimes here", so the quiesce phase
+    # refuses to mutate on it (see ``verify_inventory_complete``).
+    discovery_errors: list = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -309,12 +314,44 @@ def describe_restart_mechanism(mechanism: str, profile: str) -> str:
     return "hermes gateway restart"
 
 
+def _process_start_time(pid: int) -> Optional[float]:
+    """Process start time for *pid*, or ``None`` when unreadable.
+
+    A PID is a name the kernel reuses; ``(pid, start_time)`` is identity.
+    Capturing it pre-mutation is what lets the stop phase prove the PID
+    it is about to signal is still the runtime the plan inventoried, and
+    not a bystander that inherited the number.
+    """
+    try:
+        import psutil
+
+        return float(psutil.Process(int(pid)).create_time())
+    except Exception as exc:
+        logger.debug("Start-time probe failed for %s: %s", pid, exc)
+        return None
+
+
+def _record_discovery_failure(plan: UpdatePlan, probe: str, exc: BaseException) -> None:
+    """Note that a runtime-discovery probe did not answer.
+
+    The rows a broken collector would have produced are invisible — they
+    look exactly like an empty fleet. Recording the failure is what lets
+    :func:`update_quiesce.verify_inventory_complete` tell "nothing is
+    running" apart from "we could not look", and refuse to mutate the
+    checkout in the second case.
+    """
+    logger.debug("%s failed: %s", probe, exc)
+    plan.discovery_errors.append(f"{probe}: {exc}")
+
+
 def collect_runtime_inventory() -> UpdatePlan:
     """Build the pre-update plan. Read-only; never raises.
 
     Every collector degrades independently — a probe failure yields fewer
-    rows, not an exception. The result is embeddable in the update receipt
-    and printable via :func:`print_update_plan`.
+    rows, not an exception — but the failure itself is recorded in
+    ``plan.discovery_errors`` so the fleet is never silently understated.
+    The result is embeddable in the update receipt and printable via
+    :func:`print_update_plan`.
     """
     plan = UpdatePlan()
 
@@ -384,7 +421,7 @@ def collect_runtime_inventory() -> UpdatePlan:
                     profile_homes.append((entry.name, entry))
         plan.profiles = [name for name, _ in profile_homes]
     except Exception as exc:
-        logger.debug("Profile enumeration failed: %s", exc)
+        _record_discovery_failure(plan, "profile enumeration", exc)
 
     # --- service-managed PIDs (fleet-wide) ---------------------------------
     service_pids: set = set()
@@ -393,7 +430,7 @@ def collect_runtime_inventory() -> UpdatePlan:
 
         service_pids = _get_service_pids(all_profiles=True) or set()
     except Exception as exc:
-        logger.debug("Service-PID probe failed: %s", exc)
+        _record_discovery_failure(plan, "service-PID probe", exc)
 
     # --- SCM-supervised gateway PIDs (Windows) ------------------------------
     # find_windows_gateway_services() maps validated gateway PIDs through
@@ -410,7 +447,9 @@ def collect_runtime_inventory() -> UpdatePlan:
             for service in find_windows_gateway_services()
         }
     except Exception as exc:
-        logger.debug("Windows SCM service-ownership probe failed: %s", exc)
+        _record_discovery_failure(
+            plan, "Windows SCM service-ownership probe", exc
+        )
 
     # --- per-profile gateways (PID files + runtime status stamps) ----------
     seen_pids: set[int] = set()
@@ -489,7 +528,7 @@ def collect_runtime_inventory() -> UpdatePlan:
                 )
             )
     except Exception as exc:
-        logger.debug("Gateway-state inventory failed: %s", exc)
+        _record_discovery_failure(plan, "gateway-state inventory", exc)
 
     # PID-file mapped gateways not covered by a runtime-status record
     try:
@@ -512,7 +551,7 @@ def collect_runtime_inventory() -> UpdatePlan:
                 )
             )
     except Exception as exc:
-        logger.debug("PID-file gateway inventory failed: %s", exc)
+        _record_discovery_failure(plan, "PID-file gateway inventory", exc)
 
     # Serve/dashboard backends from the spawn ledger (#63206). These are the
     # runtimes the gateway collectors above can never see: a manually
@@ -537,6 +576,24 @@ def collect_runtime_inventory() -> UpdatePlan:
             has_live_spawner = spawner_is_dead(entry) is False
             supervisor = "desktop" if has_live_spawner else "manual-serve"
             profile = str(entry.get("profile") or "default")
+            detail = {
+                "argv": entry.get("argv") or "",
+                "host": entry.get("host") or "",
+                "port": entry.get("port"),
+            }
+            create_time = entry.get("create_time")
+            if isinstance(create_time, (int, float)):
+                detail["start_time"] = float(create_time)
+            # The supervisor's own forge-proof identity. The stop phase
+            # re-checks it before signalling: a Desktop app that is still
+            # alive answers the kill with a fresh backend on pre-update
+            # code, and that respawn lands INSIDE the mutation window
+            # where the old-PID exit check cannot see it (the replacement
+            # has a different PID).
+            spawner_pid = entry.get("spawner_pid")
+            if isinstance(spawner_pid, int) and spawner_pid > 0:
+                detail["spawner_pid"] = spawner_pid
+                detail["spawner_create"] = entry.get("spawner_create")
             plan.runtimes.append(
                 RuntimeRecord(
                     kind=str(purpose),
@@ -544,15 +601,13 @@ def collect_runtime_inventory() -> UpdatePlan:
                     pid=pid,
                     supervisor=supervisor,
                     restart_via=_restart_mechanism(supervisor, profile),
-                    detail={
-                        "argv": entry.get("argv") or "",
-                        "host": entry.get("host") or "",
-                        "port": entry.get("port"),
-                    },
+                    detail=detail,
                 )
             )
     except Exception as exc:
-        logger.debug("Serve/dashboard ledger inventory failed: %s", exc)
+        _record_discovery_failure(
+            plan, "serve/dashboard ledger inventory", exc
+        )
 
     _attach_supervisor_identities(plan)
     return plan
@@ -587,6 +642,14 @@ def _attach_supervisor_identities(plan: UpdatePlan) -> None:
             pid = runtime.pid
             if not isinstance(pid, int) or pid <= 0:
                 continue
+            # Forge-proof process identity, captured while the runtime is
+            # still alive — the stop phase revalidates against it before
+            # signalling. Collectors that already know it (the spawn
+            # ledger live-verifies its own) keep their value.
+            if runtime.detail.get("start_time") is None:
+                start_time = _process_start_time(pid)
+                if start_time is not None:
+                    runtime.detail["start_time"] = start_time
             identity = capture_supervisor_identity(
                 pid,
                 launchd_labels=launchd_labels,
@@ -613,7 +676,7 @@ def _attach_supervisor_identities(plan: UpdatePlan) -> None:
                     runtime.supervisor, runtime.profile
                 )
     except Exception as exc:
-        logger.debug("Supervisor-identity capture failed: %s", exc)
+        _record_discovery_failure(plan, "supervisor-identity capture", exc)
 
 
 def print_update_plan(plan: UpdatePlan) -> None:
