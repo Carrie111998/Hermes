@@ -158,10 +158,23 @@ class RemoteKernel:
     cell_seq: int = 0
 
 
-def _kernel_key(owner: str, env_type: str, task_env_id: str) -> Tuple:
+def _kernel_key(
+    owner: str,
+    env_type: str,
+    env: Any,
+    sandbox_tools: frozenset,
+) -> Tuple:
+    """Return the stable session and environment identity for kernel reuse."""
     from tools.code_kernel import _profile_scope
 
-    return (owner, _profile_scope(), "remote", env_type, task_env_id)
+    return (
+        owner,
+        _profile_scope(),
+        "remote",
+        env_type,
+        id(env),
+        tuple(sorted(sandbox_tools)),
+    )
 
 
 def _is_alive(kernel: RemoteKernel) -> bool:
@@ -199,6 +212,32 @@ def _kill(kernel: RemoteKernel) -> None:
         )
     except Exception:
         logger.debug("remote kernel dir cleanup failed", exc_info=True)
+
+
+def _reap_idle_unlocked(idle_timeout: int) -> List[RemoteKernel]:
+    """Pop idle remote kernels; callers kill them outside the registry lock."""
+    now = time.monotonic()
+    doomed = [
+        key
+        for key, kernel in _REMOTE_KERNELS.items()
+        if now - kernel.last_used > max(1, idle_timeout)
+    ]
+    return [_REMOTE_KERNELS.pop(key) for key in doomed]
+
+
+def _evict_over_cap_unlocked(keep: Tuple) -> List[RemoteKernel]:
+    """Pop least-recently-used remote kernels beyond the configured cap."""
+    from tools.code_kernel import _lifecycle_limits
+
+    cap, _ = _lifecycle_limits()
+    if len(_REMOTE_KERNELS) <= cap:
+        return []
+    by_age = sorted(
+        (key for key in _REMOTE_KERNELS if key != keep),
+        key=lambda key: _REMOTE_KERNELS[key].last_used,
+    )
+    doomed = by_age[: len(_REMOTE_KERNELS) - cap]
+    return [_REMOTE_KERNELS.pop(key) for key in doomed]
 
 
 def shutdown_all_remote_kernels() -> None:
@@ -336,12 +375,15 @@ def execute_in_remote_kernel(
     from tools.thread_context import propagate_context_to_thread
 
     owner = _resolve_owner(task_env_id)
-    key = _kernel_key(owner, env_type, task_env_id)
+    key = _kernel_key(owner, env_type, env, sandbox_tools)
     state_lost = False
     state_reset = False
 
     with _REMOTE_KERNELS_LOCK:
+        expired = _reap_idle_unlocked(idle_exit)
         kernel = _REMOTE_KERNELS.get(key)
+    for doomed in expired:
+        _kill(doomed)
 
     if kernel is not None and reset:
         with _REMOTE_KERNELS_LOCK:
@@ -369,6 +411,9 @@ def execute_in_remote_kernel(
             return None  # fail open to per-call
         with _REMOTE_KERNELS_LOCK:
             _REMOTE_KERNELS[key] = kernel
+            evicted = _evict_over_cap_unlocked(keep=key)
+        for doomed in evicted:
+            _kill(doomed)
 
     kernel.last_used = time.monotonic()
     kernel.cell_seq += 1

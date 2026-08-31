@@ -11,6 +11,7 @@ state_lost/state_reset reporting, fail-open, and owner isolation.
 import json
 import os
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -84,6 +85,7 @@ def _run(
     session_id="",
     enabled_toolsets=None,
     disabled_toolsets=None,
+    idle_exit=1800,
 ):
     return execute_in_remote_kernel(
         code, env=env, env_type="ssh", task_env_id=task,
@@ -91,6 +93,7 @@ def _run(
         max_tool_calls=5, reset=reset, session_id=session_id,
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
+        idle_exit=idle_exit,
     )
 
 
@@ -202,8 +205,65 @@ class TestDeathDetection(RemoteKernelBase):
         # The kernel was actually killed on the remote.
         self.assertTrue(any("kill " in c for c in env.commands))
 
+    def test_idle_registry_entries_are_reaped_before_next_lookup(self):
+        env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell()]))
+
+        with patch(
+            "tools.approval.get_current_session_key",
+            side_effect=("owner-a", "owner-b"),
+        ):
+            first = _run(env, task="turn-a", idle_exit=1)
+            assert first is not None
+            first_kernel = next(iter(_REMOTE_KERNELS.values()))
+            first_kernel.last_used = time.monotonic() - 10
+            second = _run(env, task="turn-b", idle_exit=1)
+
+        assert second is not None
+        self.assertEqual(len(_REMOTE_KERNELS), 1)
+        self.assertEqual(next(iter(_REMOTE_KERNELS))[0], "owner-b")
+
+    def test_registry_evicts_lru_kernels_over_configured_cap(self):
+        env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell(), _cell()]))
+
+        with patch(
+            "tools.approval.get_current_session_key",
+            side_effect=("owner-a", "owner-b", "owner-c"),
+        ), patch(
+            "tools.code_execution_tool._load_config",
+            return_value={
+                "max_session_kernels": 2,
+                "kernel_idle_timeout": 1800,
+            },
+        ):
+            _run(env, task="turn-a")
+            _run(env, task="turn-b")
+            _run(env, task="turn-c")
+
+        self.assertEqual(len(_REMOTE_KERNELS), 2)
+        self.assertEqual(
+            {key[0] for key in _REMOTE_KERNELS},
+            {"owner-b", "owner-c"},
+        )
+
 
 class TestOwnershipIsolation(RemoteKernelBase):
+    def test_same_session_reuses_remote_kernel_across_turn_task_ids(self):
+        env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell(execution_count=2)]))
+
+        with patch(
+            "tools.approval.get_current_session_key",
+            return_value="shared-conversation",
+        ):
+            first = _run(env, task="turn-1")
+            second = _run(env, task="turn-2")
+
+        assert first is not None
+        assert second is not None
+        self.assertFalse(first["kernel"]["reused"])
+        self.assertTrue(second["kernel"]["reused"])
+        self.assertEqual(len(_REMOTE_KERNELS), 1)
+        self.assertEqual(sum(1 for command in env.commands if "nohup" in command), 1)
+
     def test_profiles_with_same_task_get_distinct_remote_kernels(self):
         from hermes_constants import (
             reset_hermes_home_override,
