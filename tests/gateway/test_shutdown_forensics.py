@@ -114,6 +114,10 @@ class TestSpawnAsyncDiagnostic:
         contents = log_path.read_text(encoding="utf-8", errors="replace")
         assert "shutdown diagnostic" in contents
         assert "SIGTERM" in contents
+        assert "--- process snapshot (top 60 by cpu) ---" in contents
+        assert "PID" in contents
+        assert "--- load ---" in contents
+        assert "=== end ===" in contents
 
 
 # ---------------------------------------------------------------------------
