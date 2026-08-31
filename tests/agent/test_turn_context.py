@@ -210,6 +210,15 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_warm_prompt_runs_bot_capability_refresh_check():
+    agent = _FakeAgent()
+    refresh = MagicMock()
+
+    _build(agent, refresh_warm_bot_chat_prompt=refresh)
+
+    refresh.assert_called_once_with(agent, None)
+
+
 def test_user_message_preserves_platform_event_timestamp():
     agent = _FakeAgent()
 

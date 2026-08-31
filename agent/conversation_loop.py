@@ -971,75 +971,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # exception applied to capabilities. Prompts without the stamp
         # (every non-Bot-Chat session) never take this branch, and the check
         # fails closed to "reuse" so a probe failure can't burn cache.
-        _bot_stale = False
-        try:
-            from tools.bot_mode_probe import (
-                BOT_CHAT_TITLE,
-                stored_bot_chat_prompt_needs_upgrade,
-                stored_prompt_capability_stale,
-            )
-
-            _home_for_epoch = None
-            try:
-                from agent.system_prompt import _agent_home
-
-                _home_for_epoch = _agent_home(agent)
-            except Exception:
-                pass
-            _bot_stale = stored_prompt_capability_stale(stored_prompt, _home_for_epoch)
-            if not _bot_stale and getattr(agent, "_bot_mode_protocol", True):
-                # Legacy upgrade: a Bot Chat whose prompt predates the epoch
-                # mechanism (no stamp, no protocol) gets ONE migration
-                # rebuild — otherwise pre-existing bots would never learn
-                # the messaging protocol. Title-gated so ordinary unstamped
-                # sessions (i.e. all of them) never take this path; the
-                # rebuilt prompt carries the stamp, so it cannot re-fire.
-                _t = str(getattr(agent, "_session_title_hint", "") or "").strip()
-                if not _t and agent._session_db and agent.session_id:
-                    try:
-                        _t = str(agent._session_db.get_session_title(agent.session_id) or "").strip()
-                    except Exception:
-                        _t = ""
-                if _t == BOT_CHAT_TITLE:
-                    _bot_stale = stored_bot_chat_prompt_needs_upgrade(stored_prompt, _home_for_epoch)
-        except Exception:
-            _bot_stale = False
-        if _bot_stale:
-            logger.info(
-                "Bot Chat capability epoch changed for session %s; rebuilding "
-                "system prompt to adopt the new capability surface (one-time "
-                "prefix-cache break).",
-                agent.session_id,
-            )
-            agent._session_title_hint = "Bot Chat"
-            # The skills index inside the prompt comes from a two-layer cache
-            # (in-process LRU + disk snapshot) that doesn't watch the skills
-            # dir; a capability refresh must rebuild THROUGH it or a freshly
-            # installed skill stays invisible in the new prompt.
-            try:
-                from agent.prompt_builder import clear_skills_system_prompt_cache
-
-                clear_skills_system_prompt_cache(clear_snapshot=True)
-            except Exception:
-                pass
-            agent._cached_system_prompt = agent._build_system_prompt(system_message)
-            agent._bot_capability_refreshed = True
-            # Persist the refreshed prompt so the NEXT turn restores the new
-            # bytes verbatim — the cache break is once per capability change,
-            # never per turn. (on_session_start deliberately not re-fired:
-            # this is a continuation, not a new session.)
-            if agent._session_db:
-                try:
-                    agent._session_db.update_system_prompt(
-                        agent.session_id, agent._cached_system_prompt
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Session DB update_system_prompt failed after Bot Chat "
-                        "capability refresh (session=%s): %s. The refresh will "
-                        "re-fire next turn.",
-                        agent.session_id, exc,
-                    )
+        if _bot_chat_prompt_needs_refresh(agent, stored_prompt):
+            _refresh_bot_chat_prompt(agent, system_message)
             return
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
@@ -1132,6 +1065,71 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 "%s. Subsequent turns will rebuild the system prompt and "
                 "miss the prefix cache.",
                 agent.session_id, exc,
+            )
+
+
+def _bot_chat_prompt_needs_refresh(agent, prompt: str) -> bool:
+    """Return whether a Bot Chat prompt must adopt current capabilities."""
+    try:
+        from tools.bot_mode_probe import (
+            BOT_CHAT_TITLE,
+            stored_bot_chat_prompt_needs_upgrade,
+            stored_prompt_capability_stale,
+        )
+
+        home = None
+        try:
+            from agent.system_prompt import _agent_home
+
+            home = _agent_home(agent)
+        except Exception:
+            pass
+        if stored_prompt_capability_stale(prompt, home):
+            return True
+        if not getattr(agent, "_bot_mode_protocol", True):
+            return False
+        title = str(getattr(agent, "_session_title_hint", "") or "").strip()
+        if not title and agent._session_db and agent.session_id:
+            try:
+                title = str(agent._session_db.get_session_title(agent.session_id) or "").strip()
+            except Exception:
+                title = ""
+        return title == BOT_CHAT_TITLE and stored_bot_chat_prompt_needs_upgrade(prompt, home)
+    except Exception:
+        # A failed probe must preserve the prompt cache rather than turn every
+        # Bot Chat turn into a rebuild.
+        return False
+
+
+def _refresh_bot_chat_prompt(agent, system_message) -> None:
+    """Rebuild and persist a warm Bot Chat prompt after capability drift."""
+    logger.info(
+        "Bot Chat capability epoch changed for session %s; rebuilding system "
+        "prompt to adopt the new capability surface (one-time prefix-cache break).",
+        agent.session_id,
+    )
+    agent._session_title_hint = "Bot Chat"
+    # The skills index has an in-process and disk cache; clear both so a newly
+    # installed skill is visible in the refreshed prompt.
+    try:
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+    except Exception:
+        pass
+    agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    agent._bot_capability_refreshed = True
+    if agent._session_db:
+        try:
+            agent._session_db.update_system_prompt(
+                agent.session_id, agent._cached_system_prompt
+            )
+        except Exception as exc:
+            logger.warning(
+                "Session DB update_system_prompt failed after Bot Chat capability "
+                "refresh (session=%s): %s. The refresh will re-fire next turn.",
+                agent.session_id,
+                exc,
             )
 
 
@@ -1991,6 +1989,13 @@ def run_conversation(
         set_session_context=set_session_context,
         set_current_write_origin=set_current_write_origin,
         ra=_ra,
+        refresh_warm_bot_chat_prompt=lambda a, sm: (
+            _refresh_bot_chat_prompt(a, sm)
+            if _bot_chat_prompt_needs_refresh(
+                a, getattr(a, "_cached_system_prompt", "")
+            )
+            else None
+        ),
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),

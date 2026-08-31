@@ -525,6 +525,7 @@ def build_turn_context(
     set_current_write_origin,
     ra,
     moa_active: bool = False,
+    refresh_warm_bot_chat_prompt=None,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
@@ -820,6 +821,11 @@ def build_turn_context(
     # ── System prompt (cached per session for prefix caching) ──
     if agent._cached_system_prompt is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
+    elif refresh_warm_bot_chat_prompt is not None:
+        # Gateway/Desktop agents stay warm across turns. Check the capability
+        # epoch even when the prompt is already cached so Bot Chat picks up
+        # user-initiated skill/toolset/MCP changes on the next message.
+        refresh_warm_bot_chat_prompt(agent, system_message)
 
     active_system_prompt = agent._cached_system_prompt
 
