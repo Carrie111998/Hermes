@@ -52,6 +52,7 @@ from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
+    mark_interrupted_tool_tail,
     _repair_tool_call_arguments,
     coalesce_tool_call_id,
     _sanitize_messages_non_ascii,
@@ -3635,7 +3636,7 @@ def run_conversation(
                                 break
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
-                            close_interrupted_tool_sequence(messages, _interrupt_text)
+                            mark_interrupted_tool_tail(messages)
                             agent._persist_session(messages, conversation_history)
                             agent.clear_interrupt()
                             return {
@@ -5404,7 +5405,7 @@ def run_conversation(
                         break
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
-                    close_interrupted_tool_sequence(messages, _interrupt_text)
+                    mark_interrupted_tool_tail(messages)
                     agent._persist_session(messages, conversation_history)
                     agent.clear_interrupt()
                     return {
@@ -6824,7 +6825,7 @@ def run_conversation(
                             break
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
-                        close_interrupted_tool_sequence(messages, _interrupt_text)
+                        mark_interrupted_tool_tail(messages)
                         agent._persist_session(messages, conversation_history)
                         agent.clear_interrupt()
                         return {
@@ -8142,7 +8143,7 @@ def run_conversation(
                                     f"Operation interrupted: retrying empty response from model "
                                     f"(retry {agent._empty_content_retries}/{_empty_retry_budget})."
                                 )
-                                close_interrupted_tool_sequence(messages, _interrupt_text)
+                                mark_interrupted_tool_tail(messages)
                                 agent._persist_session(messages, conversation_history)
                                 agent.clear_interrupt()
                                 return {
