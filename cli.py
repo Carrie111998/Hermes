@@ -13820,6 +13820,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             summarize_compress_preview,
         )
         from agent.conversation_compression import (
+            MANUAL_TRIGGER_REASON,
             finalize_context_engine_compression_notification,
         )
 
@@ -13921,6 +13922,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     approx_tokens=approx_tokens,
                     focus_topic=focus_topic or None,
                     force=True,
+                    trigger_reason=MANUAL_TRIGGER_REASON,
                     defer_context_engine_notification=True,
                 )
 

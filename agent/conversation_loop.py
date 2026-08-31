@@ -2847,6 +2847,7 @@ def run_conversation(
                 system_message,
                 approx_tokens=request_pressure_tokens,
                 task_id=effective_task_id,
+                trigger_reason="pre_api_pressure",
             )
             if messages is _pre_api_input and (
                 compression_skipped_due_to_lock(agent)
@@ -5531,6 +5532,7 @@ def run_conversation(
                             messages, system_message,
                             approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                             task_id=effective_task_id,
+                            trigger_reason="tier_reduction",
                         )
                         conversation_history = conversation_history_after_compression(
                             agent, messages, conversation_history
@@ -5827,6 +5829,7 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
+                        trigger_reason="overflow_413",
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -6003,6 +6006,7 @@ def run_conversation(
                                 messages, system_message,
                                 approx_tokens=request_input_estimate,
                                 task_id=effective_task_id,
+                                trigger_reason="output_cap",
                             )
                             if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                                 compression_attempts -= 1
@@ -6166,6 +6170,7 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
                         task_id=effective_task_id,
+                        trigger_reason="overflow_context",
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
                         # #69870 lock-skip: the provider proved the request
@@ -7791,6 +7796,7 @@ def run_conversation(
                         messages, system_message,
                         approx_tokens=_real_tokens,
                         task_id=effective_task_id,
+                        trigger_reason="post_tool_threshold",
                     )
                     if (
                         messages is _post_tool_input
