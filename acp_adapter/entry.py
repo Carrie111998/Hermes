@@ -284,20 +284,23 @@ def main(argv: list[str] | None = None) -> None:
     # Any failure here is intentionally swallowed -- the memory provider load
     # is retried (and any real error surfaced) later during normal agent
     # construction; this is purely a warm-up to avoid the threading hazard.
-    try:
-        from hermes_cli.config import load_config as _load_config_for_warmup
+    if sys.platform == "win32":
+        try:
+            from hermes_cli.config import load_config as _load_config_for_warmup
 
-        _mem_cfg = (_load_config_for_warmup() or {}).get("memory") or {}
-        _mem_provider_name = str(_mem_cfg.get("provider") or "").strip()
-        if _mem_provider_name:
-            from plugins.memory import load_memory_provider as _warmup_load_provider
+            _mem_cfg = (_load_config_for_warmup() or {}).get("memory") or {}
+            _mem_provider_name = str(_mem_cfg.get("provider") or "").strip()
+            if _mem_provider_name:
+                from plugins.memory import (
+                    warmup_import_memory_provider_module as _warmup_import,
+                )
 
-            _warmup_load_provider(_mem_provider_name)
-    except Exception:
-        logger.debug(
-            "Eager memory provider warm-up import failed (non-fatal)",
-            exc_info=True,
-        )
+                _warmup_import(_mem_provider_name)
+        except Exception:
+            logger.debug(
+                "Eager memory provider warm-up import failed (non-fatal)",
+                exc_info=True,
+            )
 
     if os.environ.get("HERMES_ACP_SKIP_CONFIGURED_MCP", "").strip() != "1":
         try:

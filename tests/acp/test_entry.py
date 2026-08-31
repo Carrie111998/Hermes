@@ -66,13 +66,13 @@ def test_main_eagerly_imports_memory_provider_before_other_threads(monkeypatch):
     call_order = []
 
     async def fake_run_agent(agent, **kwargs):
-        pass
+        call_order.append(("acp.run_agent", kwargs.get("use_unstable_protocol")))
 
     def fake_load_config():
         return {"memory": {"provider": "mnemosyne"}}
 
-    def fake_load_memory_provider(name):
-        call_order.append(("load_memory_provider", name))
+    def fake_warmup(name):
+        call_order.append(("warmup_import_memory_provider_module", name))
         return None
 
     def fake_start_background_mcp_discovery(*, logger, thread_name):
@@ -80,10 +80,11 @@ def test_main_eagerly_imports_memory_provider_before_other_threads(monkeypatch):
 
     monkeypatch.setattr(entry, "_setup_logging", lambda: None)
     monkeypatch.setattr(entry, "_load_env", lambda: None)
+    monkeypatch.setattr(entry.sys, "platform", "win32")
     monkeypatch.setenv("HERMES_ACP_SKIP_CONFIGURED_MCP", "")
     monkeypatch.setattr("hermes_cli.config.load_config", fake_load_config)
     monkeypatch.setattr(
-        "plugins.memory.load_memory_provider", fake_load_memory_provider
+        "plugins.memory.warmup_import_memory_provider_module", fake_warmup
     )
     monkeypatch.setattr(
         "hermes_cli.mcp_startup.start_background_mcp_discovery",
@@ -94,8 +95,9 @@ def test_main_eagerly_imports_memory_provider_before_other_threads(monkeypatch):
     entry.main([])
 
     assert call_order == [
-        ("load_memory_provider", "mnemosyne"),
+        ("warmup_import_memory_provider_module", "mnemosyne"),
         ("start_background_mcp_discovery",),
+        ("acp.run_agent", True),
     ], (
         "The memory provider warm-up import must run BEFORE MCP discovery "
         "starts its background thread — reordering this reopens the "
@@ -112,10 +114,11 @@ def test_main_skips_memory_provider_warmup_when_no_provider_configured(monkeypat
 
     monkeypatch.setattr(entry, "_setup_logging", lambda: None)
     monkeypatch.setattr(entry, "_load_env", lambda: None)
+    monkeypatch.setattr(entry.sys, "platform", "win32")
     monkeypatch.setenv("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
     monkeypatch.setattr(
-        "plugins.memory.load_memory_provider",
+        "plugins.memory.warmup_import_memory_provider_module",
         lambda name: warmup_calls.append(name),
     )
     monkeypatch.setattr(acp, "run_agent", fake_run_agent)
@@ -123,6 +126,72 @@ def test_main_skips_memory_provider_warmup_when_no_provider_configured(monkeypat
     entry.main([])
 
     assert warmup_calls == []
+
+
+def test_main_skips_memory_provider_warmup_on_non_windows(monkeypatch):
+    """Warm-up is Windows-only; other platforms stay lazy."""
+    warmup_calls = []
+
+    async def fake_run_agent(agent, **kwargs):
+        pass
+
+    monkeypatch.setattr(entry, "_setup_logging", lambda: None)
+    monkeypatch.setattr(entry, "_load_env", lambda: None)
+    monkeypatch.setattr(entry.sys, "platform", "linux")
+    monkeypatch.setenv("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"memory": {"provider": "mnemosyne"}},
+    )
+    monkeypatch.setattr(
+        "plugins.memory.warmup_import_memory_provider_module",
+        lambda name: warmup_calls.append(name),
+    )
+    monkeypatch.setattr(acp, "run_agent", fake_run_agent)
+
+    entry.main([])
+
+    assert warmup_calls == []
+
+
+def test_main_continues_when_warmup_import_fails(monkeypatch):
+    """Warm-up errors are swallowed so startup proceeds."""
+    call_order = []
+
+    async def fake_run_agent(agent, **kwargs):
+        call_order.append(("acp.run_agent", kwargs.get("use_unstable_protocol")))
+
+    def fake_load_config():
+        return {"memory": {"provider": "mnemosyne"}}
+
+    def failing_warmup(name):
+        call_order.append(("warmup_import_memory_provider_module", name))
+        raise RuntimeError("boom")
+
+    def fake_start_background_mcp_discovery(*, logger, thread_name):
+        call_order.append(("start_background_mcp_discovery",))
+
+    monkeypatch.setattr(entry, "_setup_logging", lambda: None)
+    monkeypatch.setattr(entry, "_load_env", lambda: None)
+    monkeypatch.setattr(entry.sys, "platform", "win32")
+    monkeypatch.setenv("HERMES_ACP_SKIP_CONFIGURED_MCP", "")
+    monkeypatch.setattr("hermes_cli.config.load_config", fake_load_config)
+    monkeypatch.setattr(
+        "plugins.memory.warmup_import_memory_provider_module", failing_warmup
+    )
+    monkeypatch.setattr(
+        "hermes_cli.mcp_startup.start_background_mcp_discovery",
+        fake_start_background_mcp_discovery,
+    )
+    monkeypatch.setattr(acp, "run_agent", fake_run_agent)
+
+    entry.main([])
+
+    assert call_order == [
+        ("warmup_import_memory_provider_module", "mnemosyne"),
+        ("start_background_mcp_discovery",),
+        ("acp.run_agent", True),
+    ]
 
 
 
