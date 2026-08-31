@@ -119,29 +119,127 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
 
 
 
-def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
+def test_mutating_and_unknown_tools_also_trip_no_progress_on_identical_success():
+    # Regression test for the live 2026-07-29 loop: a session re-ran the same
+    # `terminal` command ~40 times getting the same exit-0 output, and the
+    # guardrail never fired because no-progress tracking only covered tools
+    # on a read-only allowlist. Identical args + identical result means no
+    # progress regardless of whether the tool mutates.
     controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
+        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=3)
     )
+    terminal_args = {"command": "grep -r foo /etc"}
+    terminal_result = '{"output":"same matches","exit_code":0,"error":null}'
+
+    first = controller.after_call("terminal", terminal_args, terminal_result, failed=False)
+    second = controller.after_call("terminal", terminal_args, terminal_result, failed=False)
+    third = controller.after_call("terminal", terminal_args, terminal_result, failed=False)
+
+    assert first.action == "allow"
+    assert [second.action, third.action] == ["warn", "warn"]
+    assert {second.code, third.code} == {"no_progress_warning"}
+
+    custom_first = controller.after_call("custom_tool", {"x": 1}, "ok", failed=False)
+    custom_second = controller.after_call("custom_tool", {"x": 1}, "ok", failed=False)
+    assert custom_first.action == "allow"
+    assert custom_second.action == "warn"
+    assert custom_second.code == "no_progress_warning"
+
+
+def test_hard_stop_blocks_terminal_no_progress_loop():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=3,
+        )
+    )
+    args = {"command": "grep -r foo /etc"}
+    result = '{"output":"same matches","exit_code":0,"error":null}'
 
     for _ in range(3):
-        assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
-        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
-        assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
-        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
+        assert controller.before_call("terminal", args).action == "allow"
+        controller.after_call("terminal", args, result, failed=False)
+
+    blocked = controller.before_call("terminal", args)
+    assert blocked.action == "block"
+    assert blocked.code == "no_progress_block"
+    assert blocked.count == 3
 
 
+def test_no_progress_streak_resets_when_result_changes():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=3,
+        )
+    )
+    args = {"command": "curl -s http://localhost/health"}
+
+    controller.after_call("terminal", args, '{"output":"starting","exit_code":0,"error":null}', failed=False)
+    controller.after_call("terminal", args, '{"output":"starting","exit_code":0,"error":null}', failed=False)
+    controller.after_call("terminal", args, '{"output":"ready","exit_code":0,"error":null}', failed=False)
+    controller.after_call("terminal", args, '{"output":"ready","exit_code":0,"error":null}', failed=False)
+
+    # Two identical results in a row is only a streak of 2 — below block.
+    assert controller.before_call("terminal", args).action == "allow"
 
 
+def test_non_string_result_skips_no_progress_tracking_without_crashing():
+    # tool_executor can hand structured multimodal results (dicts) to
+    # after_call; _result_hash is only defined on str, so these must bypass
+    # no-progress tracking rather than crash on .encode().
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=3,
+        )
+    )
+    args = {"url": "https://example.com/page"}
+    multimodal_result = {
+        "content": [
+            {"type": "text", "text": "page snapshot"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ]
+    }
+
+    decisions = [
+        controller.after_call("read_url", args, multimodal_result, failed=False)
+        for _ in range(5)
+    ]
+
+    assert [d.action for d in decisions] == ["allow"] * 5
+    assert controller._no_progress == {}
+    # Fallback classifier likewise has no textual signal to work with.
+    assert classify_tool_failure("read_url", multimodal_result) == (False, "")
+
+
+def test_non_string_result_breaks_existing_no_progress_streak():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=3)
+    )
+    args = {"command": "cat /tmp/out.txt"}
+    result = '{"output":"same","exit_code":0,"error":null}'
+
+    controller.after_call("terminal", args, result, failed=False)
+    warned = controller.after_call("terminal", args, result, failed=False)
+    assert warned.action == "warn"
+
+    # A structured result with identical args resets the streak...
+    controller.after_call("terminal", args, {"content": [{"type": "text", "text": "same"}]}, failed=False)
+
+    # ...so the next identical string result restarts at 1, below the warn
+    # threshold (a streak of 3 would have warned again).
+    restarted = controller.after_call("terminal", args, result, failed=False)
+    assert restarted.action == "allow"
+    assert restarted.count == 1
 
 
 # ── Per-turn runaway-loop caps (Claude Code v2.1.212, Week 29) ──────────────
 
 from agent.tool_guardrails import LoopCapConfig  # noqa: E402
-
-
-
-
 
 
 def test_loop_cap_zero_disables_and_junk_falls_back():
