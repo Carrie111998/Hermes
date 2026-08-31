@@ -376,24 +376,37 @@ def check_systemd_timing_alignment(
     for flag in (["--user"], []):
         try:
             result = subprocess.run(
-                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
+                [
+                    "systemctl",
+                    *flag,
+                    "show",
+                    unit_name,
+                    "--property=LoadState",
+                    "--property=TimeoutStopUSec",
+                ],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=2.0,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
         if result.returncode != 0:
             continue
-        # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
+        properties = {}
         for line in result.stdout.splitlines():
-            if line.startswith("TimeoutStopUSec="):
-                value = line.split("=", 1)[1].strip()
-                # Try numeric microseconds first
-                if value.isdigit():
-                    timeout_us = int(value)
-                else:
-                    timeout_us = parse_systemd_duration_to_us(value)
-                if timeout_us is not None:
-                    break
+            if "=" in line:
+                key, value = line.split("=", 1)
+                properties[key] = value.strip()
+        # ``systemctl show`` can succeed for a nonexistent unit and emit the
+        # manager's default TimeoutStopUSec.  Do not let that phantom value
+        # mask a real unit with the same name in the other manager scope.
+        if properties.get("LoadState") != "loaded":
+            continue
+        # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
+        value = properties.get("TimeoutStopUSec", "")
+        # Try numeric microseconds first
+        if value.isdigit():
+            timeout_us = int(value)
+        else:
+            timeout_us = parse_systemd_duration_to_us(value)
         if timeout_us is not None:
             break
 
