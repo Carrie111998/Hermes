@@ -155,6 +155,19 @@ _SUCCESS_EVENT_TYPES = frozenset(
         EventType.DEVFLOW_RUN_COMPLETED,
         EventType.DEVFLOW_BUILD_SUCCEEDED,
         EventType.NOTIFICATION_DELIVERED,
+        # Monodirectional good news, same argument as the monodirectional
+        # failures above but in the other direction (2026-08-31 UNKNOWN-header
+        # sweep): CRITIC_AUTO_APPLIED exists only when a critic proposal was
+        # applied -- a rejected proposal never emits it -- and was reaching
+        # Telegram headed "UNKNOWN". `failed` still wins over success in the
+        # precedence order, so a payload with real failure evidence is
+        # unaffected. CRON_BARRIER_CLEARED is deliberately NOT here despite
+        # the same monodirectional shape: it is a WARN-class governance flag
+        # that wakes Diego to review a protection being lifted, and a green
+        # SUCCEEDED header would read "nothing to see" on exactly that alert.
+        # It stays UNKNOWN (see _VERDICT_EXEMPT in test_routing_policy) and
+        # formatting._STATEMENT_TYPES suppresses the label.
+        EventType.CRITIC_AUTO_APPLIED,
     }
 )
 
@@ -193,7 +206,14 @@ _FAILED_VALUES = frozenset(
 # "diverted" is the successful mitigation: the fallback model took the call,
 # so the system is running-but-worse rather than broken. Calling it FAILED
 # would cry wolf on the very path that saved the request.
-_DEGRADED_VALUES = frozenset({"degraded", "partial", "impaired", "diverted"})
+# "drifting" is CODE_DRIFT's detection status (code_drift producer emits
+# status:"drifting" while stale code runs, "resolved" when it stops) --
+# stale code running is a degraded posture, not a hard failure, and until
+# 2026-08-31 the detection direction fell through to UNKNOWN while only
+# the resolution read green (19 UNKNOWN CODE_DRIFT headers in one log
+# window). Value-level, not type-level, for the same reason as
+# MODEL_RATE_LIMITED: the type is bidirectional.
+_DEGRADED_VALUES = frozenset({"degraded", "partial", "impaired", "diverted", "drifting"})
 _PENDING_VALUES = frozenset(
     {"pending", "awaiting_approval", "awaiting_decision", "blocked"}
 )
@@ -406,6 +426,74 @@ def evaluate_outcome(event: Event) -> OutcomeVerdict:
             failed.append(_evidence("transition_failed", "payload.after", payload.get("after")))
         elif _after in _DEGRADED_VALUES:
             degraded.append(_evidence("transition_degraded", "payload.after", payload.get("after")))
+
+    # A burst that still contains a probe going DOWN is bad news, for the
+    # same reason a recovery-only burst is good news: the state lives in the
+    # ``transitions`` list, which the generic ``after`` rule above never
+    # reads. _is_recovery_transition covered the green direction in
+    # 2026-08-19's fix; the red direction kept falling through to UNKNOWN
+    # (18 "UNKNOWN WATCHDOG_BURST" Telegram headers in one log window,
+    # 2026-08-31). Classified through the same value sets `after` uses, so
+    # "degraded" stays DEGRADED and "unknown" (probe skipped) stays out of
+    # both -- an all-skipped sweep still reads UNKNOWN, which is honest.
+    if event.event_type is EventType.WATCHDOG_BURST:
+        _transitions = [
+            t for t in (payload.get("transitions") or []) if isinstance(t, dict)
+        ]
+        _burst_down = [
+            t for t in _transitions if _normalized(t.get("after", "")) in _FAILED_VALUES
+        ]
+        _burst_degraded = [
+            t for t in _transitions if _normalized(t.get("after", "")) in _DEGRADED_VALUES
+        ]
+        if _burst_down:
+            failed.append(
+                _evidence("burst_transitions_down", "payload.transitions", len(_burst_down))
+            )
+        elif _burst_degraded:
+            degraded.append(
+                _evidence(
+                    "burst_transitions_degraded", "payload.transitions", len(_burst_degraded)
+                )
+            )
+
+    # The watchdog daily is a fleet-state REPORT whose probes_total/healthy/
+    # degraded/down counters are its content, and none of them is a
+    # _VALUE_FIELDS key, so every daily read UNKNOWN regardless of content.
+    # A clean sweep -> SUCCEEDED (green marks the good days). A day WITH
+    # unhealthy probes deliberately yields NO evidence here: a DEGRADED
+    # verdict carries priority_floor=HIGH, and the WATCHDOG_DAILY design
+    # (pinned by tests/events/test_telegram_notifier.py's
+    # TestWatchdogDailySummary) is that the heartbeat stays NORMAL and never
+    # impersonates an incident -- the individual outages already fired their
+    # own burst/transition alerts. Those days fall through to UNKNOWN, whose
+    # label formatting._STATEMENT_TYPES suppresses; the counts are in the body.
+    if event.event_type is EventType.WATCHDOG_DAILY:
+        _down = payload.get("down")
+        _deg = payload.get("degraded")
+        _counts_valid = all(
+            isinstance(v, (int, float)) and not isinstance(v, bool)
+            for v in (_down, _deg)
+        )
+        if _counts_valid and _down == 0 and _deg == 0:
+            succeeded.append(
+                _evidence("watchdog_daily_all_healthy", "payload.down", _down)
+            )
+
+    # CURATOR_DAILY carries a literal `degraded` BOOLEAN (curator's own
+    # self-assessment of the nightly run), which the generic value-field scan
+    # cannot see -- _VALUE_FIELDS reads strings, and `degraded` is not one of
+    # its keys anyway. True -> DEGRADED, False -> SUCCEEDED, absent -> UNKNOWN.
+    if event.event_type is EventType.CURATOR_DAILY:
+        _curator_degraded = payload.get("degraded")
+        if _curator_degraded is True:
+            degraded.append(
+                _evidence("curator_self_degraded", "payload.degraded", True)
+            )
+        elif _curator_degraded is False:
+            succeeded.append(
+                _evidence("curator_run_clean", "payload.degraded", False)
+            )
 
     # BOOT_SUMMARY severity comes from the FAILED STEP COUNT, never from
     # `state`. `state` reports whether the boot SEQUENCE completed, not

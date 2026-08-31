@@ -181,6 +181,43 @@ def test_format_header_for_agent_error():
     assert format_header(e) == "🟠 ⚠️ AGENT_ERROR — mailbox:sentinel · 05:02 UTC"
 
 
+def test_statement_types_suppress_unknown_label_only():
+    """Fact-announcement types never render 'UNKNOWN <TYPE>' (2026-08-31 sweep).
+
+    Only the UNKNOWN label is suppressed; a statement whose payload carries
+    real evidence still renders its determined state.
+    """
+    from events.formatting import _STATEMENT_TYPES
+
+    for et in sorted(_STATEMENT_TYPES, key=lambda t: t.type_string):
+        e = _make_event(et, source="test")
+        route = classify(e)
+        header = format_header(e, verdict=route.verdict)
+        assert "UNKNOWN" not in header, f"{et.type_string}: {header}"
+
+    # Determined states still render: a relayed mailbox message whose payload
+    # says failed keeps its FAILED label.
+    e = _make_event(
+        EventType.MAILBOX_MESSAGE,
+        payload={"message_type": "NOTIFICATION", "from": "scout", "to": "main",
+                 "status": "failed"},
+    )
+    route = classify(e)
+    assert "FAILED" in format_header(e, verdict=route.verdict)
+
+
+def test_stage_transition_header_has_no_unknown_label():
+    e = _make_event(
+        EventType.STAGE_TRANSITION,
+        source="mailbox:tailor",
+        payload={"prior_stage": "archived", "new_stage": "approved"},
+    )
+    route = classify(e)
+    assert format_header(e, verdict=route.verdict) == (
+        "🟡 ➡️ STAGE_TRANSITION — mailbox:tailor · 05:02 UTC"
+    )
+
+
 def test_format_header_user_inbound_message_is_received_ack():
     """The user's own mirrored message renders as an acknowledgement.
 
@@ -1277,11 +1314,14 @@ class TestAgentNoteHeaderOmitsUnknownVerdict:
         assert "FAILED" in format_header(event, verdict=verdict)
 
     @pytest.mark.parametrize("et", [EventType.JOB_DISCOVERED,
-                                    EventType.STAGE_TRANSITION,
+                                    EventType.CRON_STARTED,
                                     EventType.GATEWAY_HEALTH])
     def test_other_event_types_still_show_unknown(self, et):
         """No collateral change: UNKNOWN on an operation IS information — the
-        result could not be established. Only a note has no result to report."""
+        result could not be established. Only a statement (_STATEMENT_TYPES)
+        has no result to report. STAGE_TRANSITION moved from this control
+        list into _STATEMENT_TYPES in the 2026-08-31 UNKNOWN-header sweep;
+        CRON_STARTED replaces it as an operation-shaped control."""
         event = _make_event(et, payload={})
         verdict = classify(event).verdict
         assert verdict.state is OutcomeState.UNKNOWN, "precondition"

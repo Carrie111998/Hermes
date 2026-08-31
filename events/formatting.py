@@ -148,25 +148,60 @@ _STATE_LABELS = {
 }
 
 
+# Statement types: announcements of a fact, with no operation behind them
+# whose result could be "unknown". For these, an UNKNOWN verdict label reads
+# as a determination that FAILED rather than one that was never called for,
+# so the label is suppressed — the type name already says everything the
+# header can say. Membership is enumerated with a reason per type, NOT
+# derived, because for an operation — a cron run, a probe, a delivery —
+# UNKNOWN is real information (the result could not be established) and
+# suppressing it would hide a signal. Only the UNKNOWN label is suppressed:
+# a statement whose payload carries real evidence (a failed relay, a blocked
+# stage) still shows FAILED/PENDING/etc, and the DOT is untouched either way
+# (header_dot() derives it separately via marker_for_verdict()).
+_STATEMENT_TYPES = frozenset(
+    {
+        # The original one-type exception (2026-08-19, found by the AGENT_NOTE
+        # live delivery test): a note is a statement by an agent.
+        EventType.AGENT_NOTE,
+        # 2026-08-31 UNKNOWN-header sweep — the remaining members, each a
+        # fact-announcement observed rendering "UNKNOWN <TYPE>" in Telegram:
+        # a job moved stages (the move already happened; 237 headers),
+        EventType.STAGE_TRANSITION,
+        # a VIP job was discovered (the type name IS the news; 34 headers),
+        EventType.JOB_VIP_DISCOVERED,
+        # a PR exists now (review-needed is a separate PENDING type),
+        EventType.DEVFLOW_PR_OPENED,
+        # a work ticket was filed for the devflow AGENT to pick up — not
+        # PENDING, which means "awaiting the human",
+        EventType.DEVFLOW_WORK_REQUESTED,
+        # a relayed agent→agent mailbox message: the relay's own outcome
+        # lives in NOTIFICATION_DELIVERED/FAILED events, not here,
+        EventType.MAILBOX_MESSAGE,
+        # a deliberate, already-completed operator action (barrier lift): the
+        # WARN routing wakes Diego for governance review, and no outcome
+        # state describes the lift itself — FAILED/DEGRADED would paint an
+        # authorized lift red, PENDING claims someone still must act, and
+        # SUCCEEDED would read "nothing to see" on a review alert
+        # (reasoning inherited from _VERDICT_EXEMPT in test_routing_policy),
+        EventType.CRON_BARRIER_CLEARED,
+        # the daily fleet report on a day WITH unhealthy probes: outcomes.py
+        # deliberately leaves it UNKNOWN (a DEGRADED verdict would floor
+        # priority to HIGH, and the heartbeat must never impersonate an
+        # incident — TestWatchdogDailySummary pins that design). Clean days
+        # read SUCCEEDED and never reach this suppression.
+        EventType.WATCHDOG_DAILY,
+    }
+)
+
+
 def _label_is_noise(event: Event, verdict: OutcomeVerdict) -> bool:
     """True iff the verdict label says nothing worth a word in the header.
 
-    Exactly one case (2026-08-19, found by the AGENT_NOTE live delivery test —
-    no offline assertion covered it): an agent note carrying no status/outcome
-    key evaluates to UNKNOWN and rendered as "UNKNOWN AGENT_NOTE", which reads
-    as a determination that FAILED rather than one that was never called for.
-    A note is a statement; it has no operation behind it to have an outcome.
-
-    Deliberately NOT generalised to every type. For an operation — a cron run,
-    a probe, a delivery — UNKNOWN is real information: the result could not be
-    established, which is the distinction the failure-wins outcome contract
-    exists to preserve. Suppressing it there would hide a signal, so this stays
-    a one-type exception rather than becoming a rule about UNKNOWN.
-
-    The DOT is untouched: header_dot() derives it separately via
-    marker_for_verdict(), so a note keeps its priority colour.
+    See _STATEMENT_TYPES for the membership contract: statements suppress
+    only the UNKNOWN label; every determined state still renders.
     """
-    return (event.event_type is EventType.AGENT_NOTE
+    return (event.event_type in _STATEMENT_TYPES
             and verdict.state is OutcomeState.UNKNOWN)
 
 

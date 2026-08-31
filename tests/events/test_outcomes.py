@@ -177,6 +177,10 @@ def test_degraded_outranks_pending_and_success():
         (EventType.NOTIFICATION_DELIVERED, OutcomeState.SUCCEEDED),
         (EventType.GATEWAY_STARTED, OutcomeState.RECOVERED),
         (EventType.WATCHDOG_RECOVERED, OutcomeState.RECOVERED),
+        # Monodirectional good news (2026-08-31 UNKNOWN-header sweep): an
+        # applied critic proposal exists only as a completed action.
+        # CRON_BARRIER_CLEARED stays UNKNOWN by design (see _VERDICT_EXEMPT).
+        (EventType.CRITIC_AUTO_APPLIED, OutcomeState.SUCCEEDED),
     ],
 )
 def test_explicit_event_types_are_outcome_evidence(event_type, state):
@@ -331,6 +335,112 @@ def test_watchdog_burst_skips_only_is_not_recovered():
     )
 
     assert verdict.state is not OutcomeState.RECOVERED
+
+
+def test_watchdog_burst_with_down_transition_is_failed():
+    """The red mirror of the recovery-only rule (2026-08-31 UNKNOWN sweep).
+
+    A burst carrying a probe that went DOWN is the alert the type exists
+    for; it fell through to UNKNOWN because the state lives in the
+    ``transitions`` list, which the generic ``after`` rule never reads.
+    """
+    verdict = evaluate_outcome(
+        _burst(
+            [
+                {"after": "down", "tier": "critical"},
+                {"after": "healthy", "tier": "optional"},
+            ]
+        )
+    )
+
+    assert verdict.state is OutcomeState.FAILED
+    assert any(item.code == "burst_transitions_down" for item in verdict.evidence)
+
+
+def test_watchdog_burst_degraded_only_is_degraded():
+    verdict = evaluate_outcome(_burst([{"after": "degraded", "tier": "important"}]))
+
+    assert verdict.state is OutcomeState.DEGRADED
+
+
+def test_watchdog_burst_skips_only_stays_unknown():
+    """probe skipped ("unknown") is not a verdict in either direction."""
+    verdict = evaluate_outcome(
+        _burst([{"after": "unknown", "tier": "critical"}])
+    )
+
+    assert verdict.state is OutcomeState.UNKNOWN
+
+
+def test_code_drift_drifting_is_degraded():
+    """CODE_DRIFT detection (status:"drifting") is a degraded posture.
+
+    The resolution direction (status:"resolved") already read RECOVERED via
+    _RECOVERED_VALUES; the detection direction fell through to UNKNOWN.
+    """
+    verdict = evaluate_outcome(
+        _event({"status": "drifting", "ahead_count": 9}, event_type=EventType.CODE_DRIFT)
+    )
+
+    assert verdict.state is OutcomeState.DEGRADED
+
+
+def test_watchdog_daily_with_down_probes_stays_unknown():
+    """A daily WITH unhealthy probes deliberately yields no verdict.
+
+    DEGRADED would floor priority to HIGH, and the heartbeat must never
+    impersonate an incident (TestWatchdogDailySummary pins that design);
+    formatting._STATEMENT_TYPES suppresses the UNKNOWN label instead.
+    """
+    verdict = evaluate_outcome(
+        _event(
+            {"probes_total": 102, "healthy": 94, "degraded": 4, "down": 4},
+            event_type=EventType.WATCHDOG_DAILY,
+        )
+    )
+
+    assert verdict.state is OutcomeState.UNKNOWN
+
+
+def test_watchdog_daily_all_healthy_is_succeeded():
+    verdict = evaluate_outcome(
+        _event(
+            {"probes_total": 102, "healthy": 102, "degraded": 0, "down": 0},
+            event_type=EventType.WATCHDOG_DAILY,
+        )
+    )
+
+    assert verdict.state is OutcomeState.SUCCEEDED
+
+
+def test_watchdog_daily_without_counters_stays_unknown():
+    verdict = evaluate_outcome(
+        _event({"watchdog_type": "watchdog_daily"}, event_type=EventType.WATCHDOG_DAILY)
+    )
+
+    assert verdict.state is OutcomeState.UNKNOWN
+
+
+def test_curator_daily_degraded_flag():
+    """CURATOR_DAILY's literal `degraded` boolean is its self-assessment."""
+    assert (
+        evaluate_outcome(
+            _event({"degraded": True}, event_type=EventType.CURATOR_DAILY)
+        ).state
+        is OutcomeState.DEGRADED
+    )
+    assert (
+        evaluate_outcome(
+            _event({"degraded": False}, event_type=EventType.CURATOR_DAILY)
+        ).state
+        is OutcomeState.SUCCEEDED
+    )
+    assert (
+        evaluate_outcome(
+            _event({"mode": "nightly"}, event_type=EventType.CURATOR_DAILY)
+        ).state
+        is OutcomeState.UNKNOWN
+    )
 
 
 @pytest.mark.parametrize(
