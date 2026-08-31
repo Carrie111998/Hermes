@@ -22,6 +22,7 @@
     Badge, Button, Input, Label, Select, SelectOption,
   } = SDK.components;
   const { useState, useEffect, useCallback, useMemo, useRef } = SDK.hooks;
+  const useHostNavigate = SDK.hooks.useNavigate;
   const { cn, timeAgo } = SDK.utils;
 
   // Newer host dashboards expose a DS-styled Checkbox on the plugin SDK.
@@ -324,19 +325,33 @@
     return `${url.pathname}${params.toString() ? `?${params}` : ""}${url.hash}`;
   }
 
-  function replaceKanbanUrl(board, taskId) {
+  function hostRouterLocation(location) {
+    const basePath = String(SDK.basePath || "").replace(/\/+$/, "");
+    if (!basePath) return location;
+    if (location === basePath) return "/";
+    if (location.indexOf(`${basePath}/`) === 0) return location.slice(basePath.length);
+    return location;
+  }
+
+  function replaceKanbanUrl(navigate, board, taskId) {
     try {
       const next = buildKanbanLocation(board, taskId);
       const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-      if (next !== current) window.history.replaceState(window.history.state, "", next);
+      if (next !== current) {
+        if (navigate) navigate(hostRouterLocation(next), { replace: true });
+        else window.history.replaceState(null, "", next);
+      }
     } catch (_e) { /* URL/history unavailable (for example, an embedded preview) */ }
   }
 
-  function pushKanbanUrl(board, taskId) {
+  function pushKanbanUrl(navigate, board, taskId) {
     try {
       const next = buildKanbanLocation(board, taskId);
       const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-      if (next !== current) window.history.pushState(window.history.state, "", next);
+      if (next !== current) {
+        if (navigate) navigate(hostRouterLocation(next));
+        else window.history.pushState(null, "", next);
+      }
     } catch (_e) { /* URL/history unavailable (for example, an embedded preview) */ }
   }
 
@@ -683,13 +698,18 @@
 
   function KanbanPage() {
     const { t } = useI18n();
+    // Static feature detection keeps older dashboard hosts compatible while
+    // production hosts route every write through BrowserRouter.
+    const hostNavigate = useHostNavigate ? useHostNavigate() : null;
     const kanbanDialogs = useKanbanDialogs(t);
     const initialUrlSelectionRef = useRef(null);
     if (initialUrlSelectionRef.current === null) {
       initialUrlSelectionRef.current = readKanbanUrlSelection();
     }
     const [board, setBoard] = useState(() =>
-      initialUrlSelectionRef.current.board || readSelectedBoard() || null);
+      initialUrlSelectionRef.current.board
+        || (initialUrlSelectionRef.current.task ? null : readSelectedBoard())
+        || null);
     const [boardList, setBoardList] = useState([]);      // [{slug, name, counts, ...}]
     const [showNewBoard, setShowNewBoard] = useState(false);
     const [showBoardSettings, setShowBoardSettings] = useState(false);
@@ -744,6 +764,7 @@
     const navigationGenerationRef = useRef(0);
     const locatorRequestGenerationRef = useRef(0);
     const detailRequestGenerationRef = useRef(0);
+    const taskLookupRequestRef = useRef(null);
     const navigationSourceRef = useRef("initial");
     // Increment for both committed selections and synchronous transitions.
     // The request generation prevents A -> B -> A from accepting the first
@@ -763,8 +784,8 @@
       setPendingTaskIsBoardQualified(false);
       setDeepLinkNotice(null);
       setSelectedTaskId(taskId);
-      pushKanbanUrl(board, taskId);
-    }, [board]);
+      pushKanbanUrl(hostNavigate, board, taskId);
+    }, [board, hostNavigate]);
 
     const closeTask = useCallback(function () {
       navigationGenerationRef.current += 1;
@@ -774,8 +795,8 @@
       setPendingTaskIsBoardQualified(false);
       setDeepLinkNotice(null);
       setSelectedTaskId(null);
-      pushKanbanUrl(board, null);
-    }, [board]);
+      pushKanbanUrl(hostNavigate, board, null);
+    }, [board, hostNavigate]);
 
     // --- load config once ---------------------------------------------------
     useEffect(function () {
@@ -846,7 +867,13 @@
             boardRequestGenerationRef.current += 1;
             setBoard(resolvedBoard);
             writeSelectedBoard(resolvedBoard);
-            if (navigationSourceRef.current !== "pop") replaceKanbanUrl(resolvedBoard, null);
+            // An unqualified task is authoritative until its global lookup
+            // settles. Do not let a stored/current-board bootstrap turn it
+            // into a board-qualified link or discard it in the interim.
+            if (navigationSourceRef.current !== "pop"
+                && !pendingTaskId && !selectedTaskId) {
+              replaceKanbanUrl(hostNavigate, resolvedBoard, null);
+            }
             return;
           }
           if (!boards.some(function (item) { return item.slug === requestedBoard; })) {
@@ -863,20 +890,22 @@
             currentBoardRef.current = fallbackBoard;
             boardRequestGenerationRef.current += 1;
             setBoard(fallbackBoard);
-            replaceKanbanUrl(fallbackBoard, null);
+            if (navigationSourceRef.current !== "pop") {
+              replaceKanbanUrl(hostNavigate, fallbackBoard, null);
+            }
             return;
           }
           writeSelectedBoard(requestedBoard);
           if (initialUrlSelectionRef.current.legacyTask
               && navigationSourceRef.current !== "pop") {
-            replaceKanbanUrl(requestedBoard, pendingTaskId || selectedTaskId);
+            replaceKanbanUrl(hostNavigate, requestedBoard, pendingTaskId || selectedTaskId);
           } else if (!pendingTaskId && !selectedTaskId
               && navigationSourceRef.current !== "pop") {
-            replaceKanbanUrl(requestedBoard, null);
+            replaceKanbanUrl(hostNavigate, requestedBoard, null);
           }
         })
         .catch(function () { /* non-fatal */ });
-    }, [board, pendingTaskId, selectedTaskId]);
+    }, [board, pendingTaskId, selectedTaskId, hostNavigate]);
 
     useEffect(function () { loadBoardList(); }, [loadBoardList]);
 
@@ -947,8 +976,10 @@
       };
     }, [loadBoard]);
 
-    // Resolve against the selected board first. Only a miss uses the global
-    // locator, whose ambiguity response prevents opening an arbitrary match.
+    // Board-qualified links may use visible board data directly. Task-only
+    // links always use the global locator so duplicate ids stay ambiguous.
+    // The request is keyed to navigation identity and shared across board-data
+    // refreshes; WebSocket reloads must never fan out an all-board scan.
     useEffect(function () {
       const requestedTaskId = pendingTaskId;
       if (!requestedTaskId || !boardData || !board) return undefined;
@@ -967,16 +998,44 @@
       };
       if (task && pendingTaskIsBoardQualified) {
         setPendingTaskId(null);
+        setPendingTaskIsBoardQualified(false);
+        if (task.status === "archived") {
+          setSelectedTaskId(null);
+          setDeepLinkNotice(`Card ${requestedTaskId} is archived.`);
+          if (navigationSourceRef.current !== "pop") {
+            replaceKanbanUrl(hostNavigate, requestedBoard, null);
+          }
+          return undefined;
+        }
         setSelectedTaskId(task.id);
         setDeepLinkNotice(null);
-        if (navigationSourceRef.current !== "pop") replaceKanbanUrl(requestedBoard, task.id);
+        if (navigationSourceRef.current !== "pop") {
+          replaceKanbanUrl(hostNavigate, requestedBoard, task.id);
+        }
         return undefined;
       }
 
       const lookupUrl = pendingTaskIsBoardQualified
         ? withBoard(`${API}/tasks/${encodeURIComponent(requestedTaskId)}`, requestedBoard)
         : `${API}/tasks/locate/${encodeURIComponent(requestedTaskId)}`;
-      SDK.fetchJSON(lookupUrl)
+      const lookupKey = [
+        navigationGeneration,
+        requestedBoard,
+        requestedTaskId,
+        pendingTaskIsBoardQualified ? "qualified" : "global",
+      ].join(":");
+      let lookupRequest = taskLookupRequestRef.current;
+      if (!lookupRequest || lookupRequest.key !== lookupKey) {
+        lookupRequest = { key: lookupKey, promise: SDK.fetchJSON(lookupUrl) };
+        taskLookupRequestRef.current = lookupRequest;
+        const clearRequest = function () {
+          if (taskLookupRequestRef.current === lookupRequest) {
+            taskLookupRequestRef.current = null;
+          }
+        };
+        lookupRequest.promise.then(clearRequest, clearRequest);
+      }
+      lookupRequest.promise
         .then(function (result) {
           if (!isCurrent()) return;
           const targetBoard = pendingTaskIsBoardQualified ? requestedBoard : (result && result.board);
@@ -991,9 +1050,11 @@
             setPendingTaskId(null);
             setPendingTaskIsBoardQualified(false);
             setSelectedTaskId(requestedTaskId);
-            setDeepLinkNotice(`Card ${requestedTaskId} is outside the current filters.`);
+            setDeepLinkNotice(task
+              ? null
+              : `Card ${requestedTaskId} is outside the current filters.`);
             if (navigationSourceRef.current !== "pop") {
-              replaceKanbanUrl(requestedBoard, requestedTaskId);
+              replaceKanbanUrl(hostNavigate, requestedBoard, requestedTaskId);
             }
             return;
           }
@@ -1004,6 +1065,10 @@
           boardRequestGenerationRef.current += 1;
           setBoard(targetBoard);
           writeSelectedBoard(targetBoard);
+          // Reuse the successful global locator. Once the target board loads,
+          // visible data or the board-qualified detail endpoint completes the
+          // open without another global request.
+          setPendingTaskIsBoardQualified(true);
           setSelectedTaskId(null);
           setDeepLinkNotice(null);
           setSearch("");
@@ -1013,19 +1078,30 @@
         })
         .catch(function (err) {
           if (!isCurrent()) return;
-          setPendingTaskId(null);
-          setPendingTaskIsBoardQualified(false);
           setSelectedTaskId(null);
           const message = String(err && err.message ? err.message : err);
-          setDeepLinkNotice(message.includes("ambiguous")
+          const isAmbiguous = message.includes("409:") || message.includes("ambiguous");
+          const isArchived = message.includes("is archived");
+          const isMissing = message.includes("404:") || message.includes("task not found");
+          if (!isAmbiguous && !isArchived && !isMissing) {
+            setDeepLinkNotice(
+              `Could not load card ${requestedTaskId}. The link was kept; retry by refreshing.`,
+            );
+            return;
+          }
+          setPendingTaskId(null);
+          setPendingTaskIsBoardQualified(false);
+          setDeepLinkNotice(isAmbiguous
             ? `Card ${requestedTaskId} is ambiguous across active boards.`
-            : message.includes("is archived")
+            : isArchived
               ? `Card ${requestedTaskId} is archived.`
               : `Card ${requestedTaskId} was not found or is archived.`);
-          replaceKanbanUrl(requestedBoard, null);
+          if (navigationSourceRef.current !== "pop") {
+            replaceKanbanUrl(hostNavigate, requestedBoard, null);
+          }
         });
       return function () { cancelled = true; };
-    }, [board, boardData, pendingTaskId, pendingTaskIsBoardQualified]);
+    }, [board, boardData, pendingTaskId, pendingTaskIsBoardQualified, hostNavigate]);
 
     // --- WebSocket ---------------------------------------------------------
     useEffect(function () {
@@ -1463,14 +1539,14 @@
       setPendingTaskIsBoardQualified(false);
       setSelectedTaskId(null);
       setDeepLinkNotice(null);
-      pushKanbanUrl(nextSlug, null);
+      pushKanbanUrl(hostNavigate, nextSlug, null);
       // Reset filters so stale search/tenant/assignee don't persist across boards.
       setSearch("");
       setTenantFilter("");
       setAssigneeFilter("");
       setIncludeArchived(false);
       clearSelected();
-    }, [board, clearSelected]);
+    }, [board, clearSelected, hostNavigate]);
 
     const createNewBoard = useCallback(function (payload) {
       return SDK.fetchJSON(`${API}/boards`, {

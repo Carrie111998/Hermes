@@ -193,6 +193,34 @@ def test_locate_task_excludes_archived_boards(client):
     assert response.status_code == 404
 
 
+def test_locate_task_does_not_recreate_board_archived_after_discovery(
+    client, monkeypatch
+):
+    kb.create_board("retired-during-locate")
+    created = client.post(
+        "/api/plugins/kanban/tasks?board=retired-during-locate",
+        json={"title": "Racing card"},
+    ).json()["task"]
+    plugin_api = sys.modules["hermes_dashboard_plugin_kanban_test"]
+    original_open = plugin_api._existing_board_conn
+    archived_after_discovery = False
+
+    def archive_before_open(board):
+        nonlocal archived_after_discovery
+        if board == "retired-during-locate" and not archived_after_discovery:
+            archived_after_discovery = True
+            kb.remove_board(board, archive=True)
+        return original_open(board)
+
+    monkeypatch.setattr(plugin_api, "_existing_board_conn", archive_before_open)
+
+    response = client.get(f"/api/plugins/kanban/tasks/locate/{created['id']}")
+
+    assert response.status_code == 404
+    assert archived_after_discovery
+    assert not kb.board_dir("retired-during-locate").exists()
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")

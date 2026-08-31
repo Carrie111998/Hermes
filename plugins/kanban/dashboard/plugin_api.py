@@ -136,6 +136,27 @@ def _conn(board: Optional[str] = None):
     return kanban_db.connect(board=board)
 
 
+def _existing_board_conn(board: str) -> Optional[sqlite3.Connection]:
+    """Open an existing board database without creating or migrating it.
+
+    The cross-board locator is a read-only discovery path.  Going through
+    :func:`_conn` here would let ``connect`` recreate a board that was archived
+    after ``list_boards`` returned its snapshot.  SQLite's ``mode=ro`` makes
+    disappearance between path resolution and open a clean miss instead.
+    """
+    path = kanban_db.kanban_db_path(board=board)
+    try:
+        conn = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro",
+            uri=True,
+        )
+    except sqlite3.OperationalError:
+        return None
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON")
+    return conn
+
+
 # ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
@@ -527,10 +548,16 @@ def locate_task(task_id: str):
     matches = []
     for meta in kanban_db.list_boards(include_archived=False):
         slug = meta["slug"]
-        conn = _conn(board=slug)
+        conn = _existing_board_conn(slug)
+        if conn is None:
+            continue
         try:
             task = kanban_db.get_task(conn, task_id)
-            if task is not None and task.status != "archived":
+            if (
+                task is not None
+                and task.status != "archived"
+                and kanban_db.board_exists(slug)
+            ):
                 matches.append({
                     "board": slug,
                     "task": {

@@ -1,7 +1,10 @@
 // @vitest-environment jsdom
-import React, { act, type ComponentType, type ReactNode } from "react";
+import React, { act, useContext, type ComponentType, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { BrowserRouter, useNavigate } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ProfileProvider } from "@/contexts/ProfileProvider";
+import { ProfileContext } from "@/contexts/profile-context";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -54,9 +57,12 @@ function Checkbox({ checked, onCheckedChange, ...props }: Record<string, unknown
 }
 
 class FakeWebSocket {
+  static instances: FakeWebSocket[] = [];
   onopen: (() => void) | null = null;
   onmessage: ((event: { data: string }) => void) | null = null;
   onclose: (() => void) | null = null;
+  constructor() { FakeWebSocket.instances.push(this); }
+  emit(data: unknown) { this.onmessage?.({ data: JSON.stringify(data) }); }
   close() {}
 }
 
@@ -71,6 +77,7 @@ Object.assign(window, {
       useRef: React.useRef,
       useContext: React.useContext,
       createContext: React.createContext,
+      useNavigate,
     },
     components: {
       Card: element("section"),
@@ -138,7 +145,7 @@ function detail(
 }
 
 function board(value: BoardFixture) {
-  const statuses = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"];
+  const statuses = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"];
   return {
     columns: statuses.map((status) => ({
       name: status,
@@ -212,7 +219,32 @@ async function renderKanban(path: string) {
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
-  await act(async () => root.render(<KanbanPage />));
+  await act(async () => root.render(
+    <BrowserRouter>
+      <KanbanPage />
+    </BrowserRouter>,
+  ));
+}
+
+function ProfileSwitcher() {
+  const { setProfile } = useContext(ProfileContext);
+  return <button onClick={() => setProfile("research")}>Use research profile</button>;
+}
+
+async function renderProductionShell(path: string) {
+  window.history.replaceState({}, "", path);
+  window.__HERMES_PLUGIN_SDK__!.basePath = "/dashboard";
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+  await act(async () => root.render(
+    <BrowserRouter basename="/dashboard">
+      <ProfileProvider>
+        <KanbanPage />
+        <ProfileSwitcher />
+      </ProfileProvider>
+    </BrowserRouter>,
+  ));
 }
 
 async function click(target: Element) {
@@ -250,7 +282,10 @@ function card(id: string) {
 }
 
 beforeEach(() => {
+  vi.restoreAllMocks();
   vi.clearAllMocks();
+  FakeWebSocket.instances = [];
+  window.__HERMES_PLUGIN_SDK__!.basePath = "";
   window.localStorage.clear();
   document.body.innerHTML = "";
   installApi();
@@ -276,7 +311,11 @@ describe("Kanban browser deep links", () => {
 
     await act(async () => root.unmount());
     root = createRoot(container);
-    await act(async () => root.render(<KanbanPage />));
+    await act(async () => root.render(
+      <BrowserRouter>
+        <KanbanPage />
+      </BrowserRouter>,
+    ));
     await waitForText("Ops task");
   });
 
@@ -288,9 +327,60 @@ describe("Kanban browser deep links", () => {
     expect(container.querySelector(".hermes-kanban-drawer")).not.toBeNull();
     expect(window.localStorage.getItem("hermes.kanban.selectedBoard")).toBe("ops");
     expect(window.location.search).toBe("?profile=work&board=ops&task=t_ops");
-    expect(
-      fetchJSON.mock.calls.some(([url]) => String(url).endsWith("/tasks/locate/t_ops")),
-    ).toBe(true);
+    expect(fetchJSON.mock.calls.filter(
+      ([url]) => String(url).endsWith("/tasks/locate/t_ops"),
+    )).toHaveLength(1);
+    expect(container.textContent).not.toContain("outside the current filters");
+  });
+
+  it("keeps router state synchronized through the production profile shell and basename", async () => {
+    await renderProductionShell(
+      "/dashboard/kanban?profile=work&view=compact&board=ops",
+    );
+    await waitForText("Ops task");
+    const push = vi.spyOn(window.history, "pushState");
+
+    await click(card("t_ops"));
+    await vi.waitFor(() => expect(container.querySelector(".hermes-kanban-drawer")).not.toBeNull());
+    expect(window.location.pathname).toBe("/dashboard/kanban");
+    expect(window.location.search).toBe(
+      "?profile=work&view=compact&board=ops&task=t_ops",
+    );
+    expect(push).toHaveBeenCalledTimes(1);
+
+    const switcher = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent === "Use research profile",
+    );
+    if (!switcher) throw new Error("missing profile switcher");
+    await click(switcher);
+    await vi.waitFor(() => expect(window.location.search).toContain("profile=research"));
+
+    expect(window.location.pathname).toBe("/dashboard/kanban");
+    expect(window.location.search).toContain("view=compact");
+    expect(window.location.search).toContain("board=ops");
+    expect(window.location.search).toContain("task=t_ops");
+    expect(container.querySelector(".hermes-kanban-drawer")).not.toBeNull();
+  });
+
+  it("preserves a task-only target while ignoring a stale stored board", async () => {
+    let resolveLookup!: (value: unknown) => void;
+    const pendingLookup = new Promise((resolve) => { resolveLookup = resolve; });
+    window.localStorage.setItem("hermes.kanban.selectedBoard", "deleted");
+    const implementation = fetchJSON.getMockImplementation();
+    fetchJSON.mockImplementation((rawUrl: string, init?: RequestInit) => {
+      if (rawUrl.endsWith("/tasks/locate/t_ops")) return pendingLookup;
+      return implementation?.(rawUrl, init);
+    });
+
+    await renderKanban("/kanban?profile=work&task=t_ops");
+    await vi.waitFor(() => expect(fetchJSON.mock.calls.some(
+      ([url]) => String(url).endsWith("/tasks/locate/t_ops"),
+    )).toBe(true));
+    expect(window.location.search).toBe("?profile=work&task=t_ops");
+
+    await act(async () => resolveLookup({ board: "ops", task: opsTask }));
+    await waitForText("Ops task");
+    expect(window.location.search).toBe("?profile=work&board=ops&task=t_ops");
   });
 
   it("canonicalizes legacy task_id and preserves the bare-route localStorage fallback", async () => {
@@ -304,7 +394,11 @@ describe("Kanban browser deep links", () => {
     await act(async () => root.unmount());
     window.history.replaceState({}, "", "/kanban?profile=work");
     root = createRoot(container);
-    await act(async () => root.render(<KanbanPage />));
+    await act(async () => root.render(
+      <BrowserRouter>
+        <KanbanPage />
+      </BrowserRouter>,
+    ));
     await waitForText("Ops task");
     expect(container.querySelector(".hermes-kanban-drawer")).toBeNull();
     expect(window.location.search).toBe("?profile=work&board=ops");
@@ -353,6 +447,51 @@ describe("Kanban browser deep links", () => {
     expect(window.localStorage.getItem("hermes.kanban.selectedBoard")).not.toBe("missing");
   });
 
+  it.each([
+    ["invalid board", "/kanban?board=missing&task=t_lost", "Board missing was not found"],
+    ["missing task", "/kanban?board=ops&task=t_lost", "was not found or is archived"],
+    ["archived task", "/kanban?board=default&task=t_archived", "is archived"],
+    ["ambiguous task", "/kanban?task=t_problem", "ambiguous across active boards"],
+  ])("does not write history while traversing a %s destination", async (_kind, path, notice) => {
+    const archived = task("t_archived", "Archived task", "archived");
+    installApi({
+      boards: [
+        { slug: "default", tasks: [defaultTask, archived] },
+        { slug: "ops", tasks: [opsTask] },
+      ],
+      locate: new Map<string, unknown>([
+        ["t_problem", new Error('409: {"detail":"task id is ambiguous across active boards"}')],
+      ]),
+    });
+    window.history.replaceState({}, "", "/kanban?board=default");
+    window.history.pushState({}, "", path);
+    window.history.pushState({}, "", "/kanban?board=ops");
+    await renderKanban("/kanban?board=ops");
+    await waitForText("Ops task");
+    const push = vi.spyOn(window.history, "pushState");
+    const replace = vi.spyOn(window.history, "replaceState");
+
+    const backEvent = new Promise((resolve) =>
+      window.addEventListener("popstate", resolve, { once: true }),
+    );
+    window.history.back();
+    await act(async () => backEvent);
+    await waitForText(notice);
+
+    expect(push).not.toHaveBeenCalled();
+    expect(replace).not.toHaveBeenCalled();
+    expect(window.location.search).toBe(new URL(path, window.location.origin).search);
+
+    const forwardEvent = new Promise((resolve) =>
+      window.addEventListener("popstate", resolve, { once: true }),
+    );
+    window.history.forward();
+    await act(async () => forwardEvent);
+    await waitForText("Ops task");
+    expect(push).not.toHaveBeenCalled();
+    expect(replace).not.toHaveBeenCalled();
+  });
+
   it("opens a board-qualified active task outside the visible columns via detail", async () => {
     const implementation = fetchJSON.getMockImplementation();
     fetchJSON.mockImplementation((rawUrl: string, init?: RequestInit) => {
@@ -389,7 +528,87 @@ describe("Kanban browser deep links", () => {
     expect(window.location.search).toBe("?board=default");
   });
 
-  it("uses pushState for user open/close and restores the drawer with Back/Forward", async () => {
+  it.each([
+    ["transport", new Error("Failed to fetch")],
+    ["server", new Error('500: {"detail":"temporary failure"}')],
+    ["corrupt response", { unexpected: true }],
+  ])("keeps a %s lookup failure retryable without changing the URL", async (_kind, failure) => {
+    installApi({ locate: new Map([["t_ops", failure]]) });
+    await renderKanban("/kanban?profile=work&task=t_ops");
+
+    await waitForText("Could not load card t_ops");
+    expect(container.querySelector(".hermes-kanban-drawer")).toBeNull();
+    expect(window.location.search).toBe("?profile=work&task=t_ops");
+    expect(container.textContent).toContain("retry");
+  });
+
+  it("keeps a transient board-qualified detail failure retryable", async () => {
+    const implementation = fetchJSON.getMockImplementation();
+    fetchJSON.mockImplementation((rawUrl: string, init?: RequestInit) => {
+      const url = new URL(rawUrl, window.location.origin);
+      if (url.pathname.endsWith("/board") && url.searchParams.get("board") === "ops") {
+        return Promise.resolve(board({ slug: "ops", tasks: [] }));
+      }
+      if (rawUrl.includes("/tasks/t_ops?board=ops")) {
+        return Promise.reject(new Error('500: {"detail":"temporary failure"}'));
+      }
+      return implementation?.(rawUrl, init);
+    });
+    await renderKanban("/kanban?board=ops&task=t_ops");
+
+    await waitForText("Could not load card t_ops");
+    expect(container.querySelector(".hermes-kanban-drawer")).toBeNull();
+    expect(window.location.search).toBe("?board=ops&task=t_ops");
+  });
+
+  it("deduplicates a pending locator across WebSocket board refreshes", async () => {
+    let resolveLookup!: (value: unknown) => void;
+    const pendingLookup = new Promise((resolve) => { resolveLookup = resolve; });
+    const implementation = fetchJSON.getMockImplementation();
+    fetchJSON.mockImplementation((rawUrl: string, init?: RequestInit) => {
+      if (rawUrl.endsWith("/tasks/locate/t_ops")) return pendingLookup;
+      return implementation?.(rawUrl, init);
+    });
+    await renderKanban("/kanban?task=t_ops");
+    await vi.waitFor(() => expect(fetchJSON.mock.calls.filter(
+      ([url]) => String(url).endsWith("/tasks/locate/t_ops"),
+    )).toHaveLength(1));
+    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(0));
+    const push = vi.spyOn(window.history, "pushState");
+    const replace = vi.spyOn(window.history, "replaceState");
+
+    await act(async () => {
+      FakeWebSocket.instances.at(-1)?.emit({
+        cursor: 1,
+        events: [{ id: 1, task_id: "t_default" }],
+      });
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    });
+    expect(fetchJSON.mock.calls.filter(
+      ([url]) => String(url).endsWith("/tasks/locate/t_ops"),
+    )).toHaveLength(1);
+    expect(window.location.search).toBe("?task=t_ops");
+    expect(container.querySelector(".hermes-kanban-drawer")).toBeNull();
+    expect(container.textContent).not.toContain("Could not load card");
+    expect(window.localStorage.getItem("hermes.kanban.selectedBoard")).toBe("default");
+    expect(push).not.toHaveBeenCalled();
+    expect(replace).not.toHaveBeenCalled();
+
+    await act(async () => resolveLookup({ board: "ops", task: opsTask }));
+    await waitForText("Ops task");
+    expect(fetchJSON.mock.calls.filter(
+      ([url]) => String(url).endsWith("/tasks/locate/t_ops"),
+    )).toHaveLength(1);
+    expect(container.querySelector(".hermes-kanban-drawer")).not.toBeNull();
+    expect(container.textContent).not.toContain("outside the current filters");
+    expect(container.textContent).not.toContain("Could not load card");
+    expect(window.localStorage.getItem("hermes.kanban.selectedBoard")).toBe("ops");
+    expect(window.location.search).toBe("?board=ops&task=t_ops");
+    expect(push).not.toHaveBeenCalled();
+    expect(replace).toHaveBeenCalledTimes(1);
+  });
+
+  it("uses pushState for open/close and performs zero writes across Back/Back/Forward", async () => {
     await renderKanban("/kanban?board=ops");
     await waitForText("Ops task");
     const push = vi.spyOn(window.history, "pushState");
@@ -406,14 +625,34 @@ describe("Kanban browser deep links", () => {
     await click(close);
     expect(push).toHaveBeenCalledTimes(2);
     expect(window.location.search).toBe("?board=ops");
+    push.mockClear();
+    replace.mockClear();
 
-    const backEvent = new Promise((resolve) =>
+    const firstBack = new Promise((resolve) =>
       window.addEventListener("popstate", resolve, { once: true }),
     );
     window.history.back();
-    await act(async () => backEvent);
+    await act(async () => firstBack);
     await vi.waitFor(() => expect(container.querySelector(".hermes-kanban-drawer")).not.toBeNull());
-    expect(push).toHaveBeenCalledTimes(2);
+    expect(window.location.search).toBe("?board=ops&task=t_ops");
+
+    const secondBack = new Promise((resolve) =>
+      window.addEventListener("popstate", resolve, { once: true }),
+    );
+    window.history.back();
+    await act(async () => secondBack);
+    await vi.waitFor(() => expect(container.querySelector(".hermes-kanban-drawer")).toBeNull());
+    expect(window.location.search).toBe("?board=ops");
+
+    const forward = new Promise((resolve) =>
+      window.addEventListener("popstate", resolve, { once: true }),
+    );
+    window.history.forward();
+    await act(async () => forward);
+    await vi.waitFor(() => expect(container.querySelector(".hermes-kanban-drawer")).not.toBeNull());
+    expect(window.location.search).toBe("?board=ops&task=t_ops");
+    expect(push).not.toHaveBeenCalled();
+    expect(replace).not.toHaveBeenCalled();
   });
 
   it.each(["shade", "Escape"])("pushes board-only history when closing by %s", async (method) => {
@@ -555,7 +794,7 @@ describe("Kanban browser deep links", () => {
     expect(window.location.search).toBe("?board=ops&task=t_ops");
   });
 
-  it("copies the absolute canonical link and exposes fallback failure", async () => {
+  it("copies the actual drawer identity with profile context and exposes fallback failure", async () => {
     const writeText = vi.fn(async () => undefined);
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
@@ -563,6 +802,9 @@ describe("Kanban browser deep links", () => {
     });
     await renderKanban("/kanban?profile=work&board=ops&task=t_ops&search=ignored");
     await waitForText("Ops task");
+    // Deliberately desynchronize the address bar without notifying the plugin.
+    // Copy Link must use the mounted drawer's props, not these stale URL ids.
+    window.history.replaceState({}, "", "/kanban?profile=work&board=default&task=t_wrong");
     const copy = Array.from(container.querySelectorAll("button")).find((button) =>
       button.textContent?.includes("Copy link"),
     );
