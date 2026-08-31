@@ -156,7 +156,9 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     setRefreshing(true)
 
     try {
-      const sessions = (await listAllProfileSessions(30, 1)).sessions
+      const sessions = (
+        await listAllProfileSessions(30, 1, 'exclude', 'recent', 'all', {}, { signal: controller.signal })
+      ).sessions
 
       const { artifacts: nextArtifacts, failures } = await loadArtifactsForSessions(
         sessions,

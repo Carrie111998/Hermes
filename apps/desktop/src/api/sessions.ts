@@ -112,7 +112,8 @@ export async function listAllProfileSessions(
   archived: 'exclude' | 'include' | 'only' = 'exclude',
   order: 'created' | 'recent' = 'recent',
   profile: 'all' | (string & {}) = 'all',
-  filter: SessionSourceFilter = {}
+  filter: SessionSourceFilter = {},
+  options: { signal?: AbortSignal } = {}
 ): Promise<PaginatedSessions> {
   const sourceParam = filter.source ? `&source=${encodeURIComponent(filter.source)}` : ''
 
@@ -125,6 +126,7 @@ export async function listAllProfileSessions(
     path:
       `/api/profiles/sessions?limit=${limit}&offset=0&min_messages=${Math.max(0, minMessages)}` +
       `&archived=${archived}&order=${order}&profile=${encodeURIComponent(profile)}${sourceParam}${excludeParam}`,
+    ...(options.signal ? { signal: options.signal } : {}),
     timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
   })
 
@@ -393,7 +395,13 @@ function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
 export function getSessionMessages(
   id: string,
   profile?: ProfileScope,
-  page: { limit?: number; offset?: number; order?: 'latest' | 'oldest'; includeCompacted?: boolean } = {}
+  page: {
+    limit?: number
+    offset?: number
+    order?: 'latest' | 'oldest'
+    includeCompacted?: boolean
+    signal?: AbortSignal
+  } = {}
 ): Promise<SessionMessagesResponse> {
   const query = new URLSearchParams()
 
@@ -423,7 +431,8 @@ export function getSessionMessages(
 
   return hermesApi<SessionMessagesResponse>({
     ...sessionScope,
-    path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`
+    path: `/api/sessions/${encodeURIComponent(id)}/messages${suffix}`,
+    ...(page.signal ? { signal: page.signal } : {})
   })
 }
 
@@ -540,7 +549,8 @@ export async function getAllSessionMessages(
         limit: pageSize,
         offset,
         order: 'oldest',
-        includeCompacted: true
+        includeCompacted: true,
+        signal: options.signal
       }),
       options.signal
     )
