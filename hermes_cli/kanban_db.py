@@ -3166,7 +3166,44 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
-def create_task(
+@dataclass(frozen=True)
+class TaskCreation:
+    """Outcome of :func:`create_task_result`: the task id, and how it was reached.
+
+    ``created`` is recorded by the branch that produced the id — ``True``
+    only where the ``INSERT`` succeeded, ``False`` only where the
+    idempotency lookup adopted an existing row. Callers must not re-derive
+    it from ``created_at`` / title / status: a same-second adoption is
+    indistinguishable from a fresh insert by any of those.
+    """
+
+    task_id: str
+    created: bool
+
+    @property
+    def disposition(self) -> str:
+        """``"created"`` or ``"existing"`` — the wire form of :attr:`created`."""
+        return "created" if self.created else "existing"
+
+
+def _existing_idempotent_task_id(
+    conn: sqlite3.Connection, idempotency_key: str
+) -> Optional[str]:
+    """Return the newest non-archived task id carrying ``idempotency_key``.
+
+    ``archived`` is excluded on purpose: archiving retires a key, so a
+    create after an archive is a genuine new task rather than a duplicate.
+    """
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ? "
+        "AND status != 'archived' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (idempotency_key,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def create_task_result(
     conn: sqlite3.Connection,
     *,
     title: str,
@@ -3194,10 +3231,15 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
-) -> str:
+) -> TaskCreation:
     """Create a new task and optionally link it under parent tasks.
 
-    Returns the new task id.  Status is ``ready`` when there are no
+    Returns a :class:`TaskCreation` carrying the task id and whether this
+    call inserted it (``created``) or adopted an existing same-key row.
+    :func:`create_task` is the back-compatible wrapper that returns the
+    bare id; use this one when the caller has to report the difference.
+
+    Status is ``ready`` when there are no
     parents (or all parents already ``done``), otherwise ``todo``.
     If ``triage=True``, status is forced to ``triage`` regardless of
     parents — a specifier/triager is expected to promote the task to
@@ -3404,20 +3446,14 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
+    # Idempotency fast path — an already-visible duplicate costs no write
+    # lock. This lookup alone is NOT authoritative: two concurrent creators
+    # can both miss here. The re-check under BEGIN IMMEDIATE inside the
+    # insert loop below is what settles the race.
     if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
+        existing_id = _existing_idempotent_task_id(conn, idempotency_key)
+        if existing_id:
+            return TaskCreation(task_id=existing_id, created=False)
 
     now = int(time.time())
 
@@ -3449,6 +3485,19 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
+                # Authoritative idempotency check. ``BEGIN IMMEDIATE``
+                # serializes writers, so a racer that committed while we
+                # were queueing for the write lock is visible here and we
+                # adopt its row instead of inserting a second one. Without
+                # this, N concurrent creators sharing one key produced N
+                # rows and N "created" answers.
+                if idempotency_key:
+                    existing_id = _existing_idempotent_task_id(
+                        conn, idempotency_key
+                    )
+                    if existing_id:
+                        return TaskCreation(task_id=existing_id, created=False)
+
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3566,13 +3615,79 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
-            return task_id
+            return TaskCreation(task_id=task_id, created=True)
         except sqlite3.IntegrityError:
             if attempt == 1:
                 raise
             # Retry with a fresh id.
             continue
     raise RuntimeError("unreachable")
+
+
+def create_task(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    body: Optional[str] = None,
+    assignee: Optional[str] = None,
+    created_by: Optional[str] = None,
+    workspace_kind: str = "scratch",
+    workspace_path: Optional[str] = None,
+    branch_name: Optional[str] = None,
+    tenant: Optional[str] = None,
+    priority: int = 0,
+    parents: Iterable[str] = (),
+    triage: bool = False,
+    idempotency_key: Optional[str] = None,
+    max_runtime_seconds: Optional[int] = None,
+    skills: Optional[Iterable[str]] = None,
+    max_retries: Optional[int] = None,
+    model_override: Optional[str] = None,
+    provider_override: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    goal_mode: bool = False,
+    goal_max_turns: Optional[int] = None,
+    initial_status: str = "running",
+    session_id: Optional[str] = None,
+    board: Optional[str] = None,
+    project_id: Optional[str] = None,
+    project_source_task_id: Optional[str] = None,
+) -> str:
+    """Create a task and return its id — see :func:`create_task_result`.
+
+    Identical semantics and parameters; this is the plain-``str`` form the
+    board's callers already use. Reach for :func:`create_task_result` only
+    when the caller must report whether the row was inserted or adopted
+    from a matching ``idempotency_key``.
+    """
+    return create_task_result(
+        conn,
+        title=title,
+        body=body,
+        assignee=assignee,
+        created_by=created_by,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+        branch_name=branch_name,
+        tenant=tenant,
+        priority=priority,
+        parents=parents,
+        triage=triage,
+        idempotency_key=idempotency_key,
+        max_runtime_seconds=max_runtime_seconds,
+        skills=skills,
+        max_retries=max_retries,
+        model_override=model_override,
+        provider_override=provider_override,
+        reasoning_effort=reasoning_effort,
+        goal_mode=goal_mode,
+        goal_max_turns=goal_max_turns,
+        initial_status=initial_status,
+        session_id=session_id,
+        board=board,
+        project_id=project_id,
+        project_source_task_id=project_source_task_id,
+    ).task_id
 
 
 def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> list[str]:

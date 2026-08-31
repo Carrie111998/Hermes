@@ -1663,7 +1663,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         return 2
     with kb.connect_closing() as conn:
-        task_id = kb.create_task(
+        creation = kb.create_task_result(
             conn,
             title=args.title,
             body=args.body,
@@ -1687,10 +1687,23 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
         )
+        task_id = creation.task_id
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
-        print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
+        # `disposition` is "created" or "existing" — the DB layer's own
+        # record of which branch produced this id, so an automation caller
+        # can tell a fresh insert from an --idempotency-key adoption
+        # without guessing from timestamps. Every pre-existing task key is
+        # preserved alongside it.
+        payload = _task_to_dict(task)
+        payload["disposition"] = creation.disposition
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
     else:
+        # The wording of this line is load-bearing: the gateway parses
+        # "Created t_abcd" out of it to auto-subscribe the originating chat
+        # to the new task's events (gateway/slash_commands.py). Deduped
+        # creates subscribe too, so the text stays identical for both
+        # dispositions; --json is the channel that distinguishes them.
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
 
         # Warn when the task would sit in `ready` because no dispatcher is
