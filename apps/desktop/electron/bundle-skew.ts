@@ -10,15 +10,16 @@
  * Bot Mode update" reports).
  *
  * Detection: the packaged build carries install-stamp.json with the commit
- * it was built from. If commits touching `apps/desktop/` exist in the source
- * tree AFTER that stamp commit, the running renderer is provably missing
- * desktop changes the installed runtime has:
+ * it was built from. If commits touching the runtime paths of apps/desktop
+ * exist in the source tree AFTER that stamp commit, the running renderer is
+ * provably missing desktop changes the installed runtime has:
  *
- *   git rev-list --count <stampCommit>..HEAD -- apps/desktop
+ *   git rev-list --count <stampCommit>..HEAD -- <RUNTIME_PATHS>
  *
- * Scoping to `apps/desktop/` keeps this quiet for the common case where the
- * repo advances with agent-only changes — a shell built before those is not
- * stale in any way the user can see.
+ * Scoping to runtime paths keeps this quiet for the common cases where the
+ * repo advances without user-visible desktop changes — agent-only commits
+ * elsewhere in the repo, or docs / e2e spec / config churn under
+ * apps/desktop that never reaches the shipped renderer or main process.
  *
  * Fail-quiet by design: no stamp (dev runs), a fallback all-zero stamp
  * (non-git build), an unknown commit (stamp predates a shallow clone's
@@ -35,7 +36,7 @@ export interface BundleSkewStamp {
 }
 
 export interface BundleSkewResult {
-  /** Commits under apps/desktop/ between the build stamp and HEAD (null = unknowable). */
+  /** Commits behind on runtime desktop paths between the build stamp and HEAD (null = unknowable). */
   desktopCommitsBehind: null | number
   /** True only on positive proof that the renderer predates desktop changes in the tree. */
   outOfSync: boolean
@@ -45,6 +46,22 @@ export type RunGit = (
   args: string[],
   options: { cwd: string }
 ) => Promise<{ code: number; stderr: string; stdout: string }>
+
+/**
+ * The apps/desktop paths that actually reach the user: renderer sources,
+ * main-process sources, the HTML entry, the public/ assets Vite copies into
+ * the bundle, app icons and the packaging config. Docs, e2e specs, scratch
+ * scripts and dev tooling never reach the shipped app.
+ */
+const RUNTIME_PATHS = [
+  'apps/desktop/src',
+  'apps/desktop/electron',
+  'apps/desktop/index.html',
+  'apps/desktop/public',
+  'apps/desktop/assets',
+  'apps/desktop/package.json',
+  'apps/desktop/vite.config.ts'
+] as const
 
 const NOT_STALE: BundleSkewResult = { desktopCommitsBehind: null, outOfSync: false }
 
@@ -63,9 +80,12 @@ export async function detectBundleSkew(
   }
 
   try {
-    const result = await runGit(['rev-list', '--count', `${stamp.commit}..HEAD`, '--', 'apps/desktop'], {
-      cwd: repoRoot
-    })
+    const result = await runGit(
+      ['rev-list', '--count', `${stamp.commit}..HEAD`, '--', ...RUNTIME_PATHS],
+      {
+        cwd: repoRoot
+      }
+    )
 
     if (result.code !== 0) {
       return NOT_STALE
