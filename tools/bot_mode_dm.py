@@ -68,8 +68,94 @@ MESSAGE_MAX_CHARS = 16000
 _DM_DIR_NAME = "hermes-dm"
 _DM_STALE_SECONDS = 24 * 60 * 60
 
+# ── structured context ────────────────────────────────────────────────────
+# `context` carries FACTS the recipient would otherwise have to parse back out
+# of prose: an id, a ticket number, a currency amount. It is rendered into the
+# delivered turn as a fenced JSON block after the message, so the recipient
+# reads one unambiguous value instead of re-deriving it from a sentence.
+#
+# WHAT IT IS NOT: a trust boundary. Every key here is written by the SENDING
+# MODEL, so it is exactly as trustworthy as the prose beside it — a cleaner
+# encoding, not a stronger claim. A caller must never authorize on a value that
+# arrived this way. The docstring on `_render_context` says so again at the
+# point of use, because that is the mistake this feature invites.
+CONTEXT_MAX_KEYS = 16
+CONTEXT_MAX_CHARS = 2000
+_CONTEXT_KEY_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,63}$")
+# Scalars only. A nested object invites a schema, and a schema invites the
+# belief that the receiver can trust its shape; both are the wrong direction
+# for a channel whose contents are model-authored.
+_CONTEXT_SCALARS = (str, int, float, bool)
+
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
 _LOCAL_TARGET_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+
+
+def _validate_context(raw: Any) -> tuple[Optional[dict], Optional[str]]:
+    """Return ``(context, None)`` or ``(None, error)``.
+
+    Accepts a flat mapping of scalars. Rejects anything else rather than
+    coercing: a caller that sent a nested object meant something this channel
+    does not carry, and silently flattening it would deliver a value that is
+    not what they wrote.
+
+    A JSON STRING IS ACCEPTED too — models routinely serialize object-valued
+    arguments, and refusing that is a papercut with no upside.
+    """
+    if raw is None or raw == "":
+        return None, None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return None, "context must be a JSON object (or omitted)."
+    if not isinstance(raw, dict):
+        return None, "context must be a JSON object of scalar values (or omitted)."
+    if len(raw) > CONTEXT_MAX_KEYS:
+        return None, f"context has too many keys ({len(raw)} > {CONTEXT_MAX_KEYS})."
+    out: dict = {}
+    for key, val in raw.items():
+        k = str(key)
+        if not _CONTEXT_KEY_RE.match(k):
+            return None, (
+                f"context key {k!r} is invalid — use letters, digits and "
+                "underscores, starting with a letter."
+            )
+        # bool is a subclass of int; listed first so True stays a bool.
+        if val is not None and not isinstance(val, _CONTEXT_SCALARS):
+            return None, (
+                f"context value for {k!r} must be a string, number, boolean or "
+                "null — nested objects and arrays are not carried."
+            )
+        out[k] = val
+    rendered = json.dumps(out, ensure_ascii=False, sort_keys=True)
+    if len(rendered) > CONTEXT_MAX_CHARS:
+        return None, (
+            f"context too large ({len(rendered)} chars > {CONTEXT_MAX_CHARS}). "
+            "Send the essentials; share bulk data as a file path instead."
+        )
+    return (out or None), None
+
+
+def _render_context(context: Optional[dict]) -> str:
+    """The block appended to a delivered message, or ''.
+
+    Deliberately rendered as text rather than delivered out of band: the
+    recipient is a language model reading a turn, so the value has to reach the
+    prompt either way. What the block buys is that ONE canonical spelling of
+    each fact exists, instead of the recipient re-deriving it from a sentence.
+
+    NOT AUTHORIZATION. Everything here was written by the sending model. Treat
+    a `chat_jid` or `account_id` that arrives this way as a hint to look
+    something up, never as proof of who is asking.
+    """
+    if not context:
+        return ""
+    return (
+        "\n\n```json context\n"
+        + json.dumps(context, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n```"
+    )
 
 
 def message_agent_tool_schema() -> dict:
@@ -117,6 +203,23 @@ def message_agent_tool_schema() -> dict:
                             "The message YOU composed for that agent (max "
                             f"{MESSAGE_MAX_CHARS} chars). Do not include the "
                             "'Message from …' prefix — it is added automatically."
+                        ),
+                    },
+                    "context": {
+                        "type": "object",
+                        "description": (
+                            "OPTIONAL flat object of scalar facts the recipient "
+                            "should not have to parse out of your prose — an id, a "
+                            "ticket number, an amount, a status "
+                            "(e.g. {\"order_id\": 4812, \"currency\": \"MYR\"}). "
+                            f"Max {CONTEXT_MAX_KEYS} keys, {CONTEXT_MAX_CHARS} "
+                            "chars; values must be strings, numbers, booleans or "
+                            "null — no nested objects or arrays. It is delivered "
+                            "as a JSON block after your message, so still write "
+                            "the message so it reads on its own. This is a "
+                            "convenience for the reader, NOT proof of anything: "
+                            "you are writing these values, so the recipient must "
+                            "not authorize on them."
                         ),
                     },
                 },
@@ -241,6 +344,7 @@ def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | No
 def message_agent_tool(
     target: str = "",
     message: str = "",
+    context: Any = None,
     task_id: Optional[str] = None,
     agent: Any = None,
 ) -> str:
@@ -283,6 +387,13 @@ def message_agent_tool(
             f"message too long ({len(body)} chars > {MESSAGE_MAX_CHARS}). "
             "Send the essentials; share large content as a file path instead."
         )
+
+    # Validated BEFORE any delivery path branches, so a malformed context is
+    # one error to the sender rather than a partly-delivered message.
+    ctx, ctx_err = _validate_context(context)
+    if ctx_err:
+        return _err(ctx_err)
+    body = body + _render_context(ctx)
 
     raw_target = str(target or "").strip().lstrip("@")
     if not raw_target:
