@@ -226,3 +226,16 @@ function clusterId(rows: SidebarListRow[]): string {
 export function reorderableRowIds(rows: SidebarListRow[]): string[] {
   return rows.flatMap(row => (row.kind === 'session' && !row.entry.branchStem ? [row.entry.session.id] : []))
 }
+
+/**
+ * Merge a drag order computed from the currently visible rows back into the
+ * complete order. Collapsed calendar groups are deliberately absent from the
+ * dnd-kit list; keeping their slots here prevents a drag in an expanded group
+ * from silently dropping the hidden sessions from persisted manual order.
+ */
+export function mergeVisibleReorderIds(allIds: readonly string[], visibleIds: readonly string[]): string[] {
+  const visible = new Set(visibleIds)
+  let visibleIndex = 0
+
+  return allIds.map(id => (visible.has(id) ? (visibleIds[visibleIndex++] ?? id) : id))
+}
