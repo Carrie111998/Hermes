@@ -203,9 +203,9 @@ class TestQuoteCommandTtsPlaceholderEdgeCases:
         rendered = _quote_command_tts_placeholder('a$b"c', '"')
         assert rendered == 'a\\$b\\"c'
 
+    @SKIP_NT
     def test_bare_context_quotes_for_posix(self):
-        if sys.platform != "win32":
-            assert _quote_command_tts_placeholder("/tmp/a b", None) == "'/tmp/a b'"
+        assert _quote_command_tts_placeholder("/tmp/a b", None) == "'/tmp/a b'"
 
 
 # ---------------------------------------------------------------------------

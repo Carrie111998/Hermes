@@ -495,7 +495,7 @@ class TestSplitTextForTts:
         text = "First sentence here. Second sentence is longer than the cap! Short."
         chunks = tts_tool._split_text_for_tts(text, 20)
         assert all(0 < len(c) <= 20 for c in chunks)
-        assert "".join(chunks).replace(" ", " ")  # sanity: non-empty
+        assert "".join(chunks)
 
 
 # ---------------------------------------------------------------------------

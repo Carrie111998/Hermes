@@ -419,8 +419,9 @@ def test_stream_chunked_darwin_plays_via_tempfile(fake_voice_mode, monkeypatch):
         tts_tool, "_resolve_max_text_length", lambda provider, tts_config=None, **kw: 10
     )
 
-    # Sanity guard: this branch is the macOS output_stream=None route.
-    assert tts_tool.platform.system() == "Darwin"
+    # Force the macOS output_stream=None route on any OS: with system()=="Darwin"
+    # the code never creates an OutputStream and plays through temp WAVs.
+    monkeypatch.setattr(tts_tool.platform, "system", lambda: "Darwin")
 
     text_queue = queue.Queue()
     stop = threading.Event()
