@@ -1695,9 +1695,19 @@
               onChange: function (e) { setReassignProfile(e.target.value); },
             },
               h("option", { value: "" }, "(unassigned)"),
-              (assignees || []).map(function (a) {
-                return h("option", { key: a, value: a }, a);
-              }),
+              (function () {
+                const list = (assignees || []).slice();
+                if (reassignProfile && list.indexOf(reassignProfile) === -1) {
+                  list.push(reassignProfile);
+                }
+                if (defaultReassignProfile && list.indexOf(defaultReassignProfile) === -1) {
+                  list.push(defaultReassignProfile);
+                }
+                list.sort();
+                return list.map(function (a) {
+                  return h("option", { key: a, value: a }, a);
+                });
+              })(),
             ),
           )
         : null,

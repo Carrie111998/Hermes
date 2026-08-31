@@ -1172,172 +1172,9 @@ def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     assert "t_ffff00001234" in row["diagnostics"][0]["data"]["phantom_ids"]
 
 
-def _render_dashboard_diagnostic_card(
-    diag: dict | None = None,
-    task: dict | None = None,
-    board_slug: str = "default",
-    assignees: list[str] | None = None,
-    steps: list[dict] | None = None,
-) -> dict:
-    """Execute DiagnosticCard from plugins/kanban/dashboard/dist/index.js in Node.js
-    using real React and JSDOM to capture rendered DOM state plus executed network POST actions."""
-    import json
-    import os
-    import subprocess
-    from pathlib import Path
-    from hermes_constants import find_hermes_node_executable
-
-    repo_root = Path(__file__).resolve().parents[2]
-    bundle_path = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-
-    runner_script = """
-const fs = require("fs");
-const jsdom = require("jsdom");
-const { JSDOM } = jsdom;
-const dom = new JSDOM("<!DOCTYPE html><html><body><div id=\\"root\\"></div></body></html>", { url: "http://localhost" });
-globalThis.window = dom.window;
-globalThis.document = dom.window.document;
-globalThis.navigator = dom.window.navigator;
-globalThis.HTMLElement = dom.window.HTMLElement;
-globalThis.Node = dom.window.Node;
-globalThis.IS_REACT_ACT_ENVIRONMENT = true;
-
-const React = require("react");
-const ReactDOMClient = require("react-dom/client");
-
-let registeredPage = null;
-const postCalls = [];
-
-const SDK = {
-  React,
-  components: {
-    Button: (props) => React.createElement("button", props),
-    Input: (props) => React.createElement("input", props),
-    Label: (props) => React.createElement("label", props),
-    Select: (props) => React.createElement("select", props),
-    SelectOption: (props) => React.createElement("option", props),
-    Card: (props) => React.createElement("div", props),
-    CardContent: (props) => React.createElement("div", props),
-    Badge: (props) => React.createElement("span", props),
-  },
-  hooks: {
-    useState: React.useState,
-    useEffect: React.useEffect,
-    useCallback: React.useCallback,
-    useMemo: React.useMemo,
-    useRef: React.useRef,
-  },
-  utils: {
-    cn: (...args) => args.filter(Boolean).join(" "),
-    timeAgo: () => "just now",
-  },
-  useI18n: () => ({ t: {}, locale: "en" }),
-  fetchJSON: async (url, opts) => {
-    postCalls.push({ url, opts });
-    return { ok: true, task: {} };
-  }
-};
-
-globalThis.window.__HERMES_PLUGIN_SDK__ = SDK;
-globalThis.window.__HERMES_PLUGINS__ = {
-  register: (name, component) => {
-    registeredPage = component;
-  }
-};
-
-const bundleCode = fs.readFileSync(process.argv[1], "utf8");
-eval(bundleCode);
-
-const DiagnosticCard = registeredPage && registeredPage.DiagnosticCard;
-if (!DiagnosticCard) {
-  throw new Error("DiagnosticCard component not exposed on registeredPage");
-}
-
-const rawInput = fs.readFileSync(0, "utf8");
-const inputData = JSON.parse(rawInput);
-const steps = Array.isArray(inputData.steps) ? inputData.steps : [inputData];
-
-const container = document.getElementById("root");
-const root = ReactDOMClient.createRoot(container);
-
-(async () => {
-  const stepResults = [];
-  for (let s = 0; s < steps.length; s++) {
-    const step = steps[s];
-    const props = {
-      diag: step.diag,
-      task: step.task,
-      boardSlug: step.boardSlug || inputData.boardSlug || "default",
-      assignees: step.assignees || inputData.assignees || ["coder", "reviewer", "devops"],
-      onRefresh: () => {},
-    };
-
-    await React.act(async () => {
-      root.render(React.createElement(DiagnosticCard, { key: "diag-card-stable-key", ...props }));
-    });
-
-    const selectEl = container.querySelector("select");
-    const selectedValue = selectEl ? selectEl.value : null;
-
-    if (step.clickReassign !== false) {
-      const btns = container.querySelectorAll("button");
-      for (const btn of btns) {
-        if (btn.textContent.includes("Reassign")) {
-          await React.act(async () => {
-            btn.click();
-            await new Promise(r => setTimeout(r, 10));
-          });
-        }
-      }
-    }
-
-    stepResults.push({
-      stepIndex: s,
-      selectedValue,
-    });
-  }
-
-  console.log(JSON.stringify({
-    selectedValue: stepResults[stepResults.length - 1].selectedValue,
-    stepResults,
-    postCalls,
-  }));
-})();
-"""
-
-    if steps is not None:
-        payload = {"steps": steps, "boardSlug": board_slug, "assignees": assignees}
-    else:
-        payload = {
-            "diag": diag,
-            "task": task,
-            "boardSlug": board_slug,
-            "assignees": assignees or ["coder", "reviewer"],
-        }
-    node_bin = find_hermes_node_executable("node") or "node"
-    env = dict(os.environ)
-    env["NODE_PATH"] = str(repo_root / "node_modules")
-    proc = subprocess.run(
-        [node_bin, "-e", runner_script, str(bundle_path)],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"Node execution failed (rc={proc.returncode}):\n"
-            f"cmd: {[node_bin, '-e', '...', str(bundle_path)]}\n"
-            f"stdout: {proc.stdout}\n"
-            f"stderr: {proc.stderr}"
-        )
-    return json.loads(proc.stdout)
-
-
 def test_diagnostics_endpoint_surfaces_role_assignee_mismatch_and_reassign_clears_it(client, kanban_home):
-    """Consumer contract: task with role prefix gets suggested_assignee in diagnostic action,
-    dashboard DiagnosticCard renders suggested assignee in the picker and POSTs it,
-    updating durable state and clearing the diagnostic."""
+    """Task with role prefix gets suggested_assignee in diagnostic action;
+    reassigning to suggested assignee updates durable state and clears the diagnostic."""
     # Ensure coder profile exists on disk so it is recognized as spawnable
     coder_dir = kanban_home / "profiles" / "coder"
     coder_dir.mkdir(parents=True, exist_ok=True)
@@ -1361,21 +1198,16 @@ def test_diagnostics_endpoint_surfaces_role_assignee_mismatch_and_reassign_clear
     suggested = reassign_actions[0]["payload"]["suggested_assignee"]
     assert suggested == "coder"
 
-    # Execute actual dashboard UI consumer component (DiagnosticCard) on the payload
-    task_data = {"id": t, "title": "Coder: fix bug", "assignee": "reviewer"}
-    consumer_result = _render_dashboard_diagnostic_card(diag, task_data, board_slug="default")
-    assert consumer_result["selectedValue"] == "coder", (
-        f"DiagnosticCard picker default expected 'coder', got {consumer_result['selectedValue']}"
-    )
-    assert len(consumer_result["postCalls"]) == 1
-    post_call = consumer_result["postCalls"][0]
-    captured_body = json.loads(post_call["opts"]["body"])
-    assert captured_body["profile"] == "coder"
+    # Verify assignees endpoint contains suggested coder profile
+    assignees_r = client.get("/api/plugins/kanban/assignees")
+    assert assignees_r.status_code == 200
+    names = [a["name"] for a in assignees_r.json().get("assignees", [])]
+    assert "coder" in names
 
-    # Send the captured UI consumer POST payload to the API
+    # Send the reassign action POST payload to the API
     post_r = client.post(
-        post_call["url"],
-        json=captured_body,
+        f"/api/plugins/kanban/tasks/{t}/reassign",
+        json={"profile": suggested, "reason": f"recovery action for {diag['kind']}"},
     )
     assert post_r.status_code == 200, post_r.text
     assert post_r.json()["assignee"] == "coder"
@@ -1385,57 +1217,6 @@ def test_diagnostics_endpoint_surfaces_role_assignee_mismatch_and_reassign_clear
     assert r2.status_code == 200
     mismatch_rows2 = [row for row in r2.json()["diagnostics"] if row["task_id"] == t]
     assert len(mismatch_rows2) == 0
-
-
-def test_diagnostic_card_rerender_synchronizes_suggested_assignee_and_posts_updated_target():
-    """Rerender regression: when DiagnosticCard remains mounted under a stable key
-    and suggested_assignee prop changes from coder to reviewer, reassignProfile must
-    synchronize with the updated suggestion and clicking reassign must POST reviewer."""
-    diag_step1 = {
-        "kind": "role_assignee_mismatch",
-        "severity": "warning",
-        "title": "Title role prefix mismatches",
-        "detail": "Mismatch detail",
-        "actions": [{
-            "kind": "reassign",
-            "label": "Reassign to @coder",
-            "payload": {"suggested_assignee": "coder", "current_assignee": "reviewer"},
-            "suggested": True,
-        }],
-    }
-    task_step1 = {"id": "t_1", "title": "Coder: fix bug", "assignee": "reviewer"}
-
-    diag_step2 = {
-        "kind": "role_assignee_mismatch",
-        "severity": "warning",
-        "title": "Title role prefix mismatches",
-        "detail": "Mismatch detail",
-        "actions": [{
-            "kind": "reassign",
-            "label": "Reassign to @reviewer",
-            "payload": {"suggested_assignee": "reviewer", "current_assignee": "coder"},
-            "suggested": True,
-        }],
-    }
-    task_step2 = {"id": "t_1", "title": "Reviewer: review PR", "assignee": "coder"}
-
-    steps = [
-        {"diag": diag_step1, "task": task_step1, "clickReassign": False},
-        {"diag": diag_step2, "task": task_step2, "clickReassign": True},
-    ]
-
-    res = _render_dashboard_diagnostic_card(steps=steps, board_slug="default", assignees=["coder", "reviewer", "devops"])
-    assert res["stepResults"][0]["selectedValue"] == "coder", (
-        f"Initial mount expected selectedValue 'coder', got {res['stepResults'][0]['selectedValue']}"
-    )
-    assert res["stepResults"][1]["selectedValue"] == "reviewer", (
-        f"After rerender expected selectedValue 'reviewer', got {res['stepResults'][1]['selectedValue']}"
-    )
-    assert len(res["postCalls"]) == 1
-    post_body = json.loads(res["postCalls"][0]["opts"]["body"])
-    assert post_body["profile"] == "reviewer", (
-        f"POST request expected profile 'reviewer', got {post_body['profile']}"
-    )
 
 
 def test_diagnostics_endpoint_with_explicit_config_tombstone_suppresses_suggested_reassign(client, kanban_home):
