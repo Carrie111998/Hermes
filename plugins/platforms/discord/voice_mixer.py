@@ -413,6 +413,10 @@ class VoiceMixer(discord.AudioSource):
             if self._closed:
                 return SILENCE_FRAME
 
+            self._streaming_speech = [
+                child for child in self._streaming_speech if not child.finished
+            ]
+
             np = _require_numpy()
             acc: "Optional[np.ndarray]" = None
 
@@ -428,7 +432,11 @@ class VoiceMixer(discord.AudioSource):
                             self._discard_finished_streaming_child_locked(child)
                         continue
                     acc = frame if acc is None else acc + frame
-                    still_live.append(child)
+                    if child.finished:
+                        if isinstance(child, StreamingMixerChild):
+                            self._discard_finished_streaming_child_locked(child)
+                    else:
+                        still_live.append(child)
                 self._speech = still_live
                 if not self._speech and self._speech_active:
                     self._begin_duck_release_locked()

@@ -77,6 +77,37 @@ class TestVoiceMixerCore:
         assert child.drained is True
         assert child.read_frame() is None
 
+    def test_final_padded_streaming_frame_removes_active_child_on_same_read(self):
+        mixer = vm.VoiceMixer()
+        child = mixer.begin_streaming_speech(fade_in_ms=0)
+        partial = b"\x03\x00" * 10
+        child.write(partial)
+        child.finish()
+
+        frame = mixer.read()
+
+        np.testing.assert_array_equal(
+            np.frombuffer(frame, dtype=np.int16),
+            np.frombuffer(
+                partial + b"\x00" * (vm.FRAME_SIZE - len(partial)), dtype=np.int16
+            ),
+        )
+        assert mixer.speech_active is False
+        assert child not in mixer._speech
+        assert child not in mixer._streaming_speech
+
+    def test_read_discards_finished_never_activated_stream_only(self):
+        mixer = vm.VoiceMixer()
+        unfinished = mixer.begin_streaming_speech(fade_in_ms=0)
+        finished = mixer.begin_streaming_speech(fade_in_ms=0)
+        finished.finish()
+
+        mixer.read()
+
+        assert finished not in mixer._streaming_speech
+        assert unfinished in mixer._streaming_speech
+        assert mixer.speech_active is False
+
     def test_streaming_child_abort_wakes_writer_blocked_at_capacity(self):
         mixer = vm.VoiceMixer()
         child = mixer.begin_streaming_speech(fade_in_ms=0)
