@@ -118,7 +118,13 @@ def test_generate_posts_native_gemini_payload_and_caches_inline_image(
     endpoint, = post.call_args.args
     assert endpoint.endswith("/models/gemini-2.5-flash-image:generateContent")
     assert post.call_args.kwargs["params"] == {"key": "google-test-key"}
+    assert post.call_args.kwargs["headers"]["x-goog-api-key"] == "google-test-key"
     payload = post.call_args.kwargs["json"]
+    assert payload["contents"] == [{"role": "user", "parts": [{"text": "a red kite"}]}]
+    assert payload["generationConfig"] == {
+        "responseModalities": ["TEXT", "IMAGE"],
+        "imageConfig": {"aspectRatio": "9:16"},
+    }
     assert payload["contents"] == [{"role": "user", "parts": [{"text": "a red kite"}]}]
     assert payload["generationConfig"] == {
         "responseModalities": ["IMAGE"],
