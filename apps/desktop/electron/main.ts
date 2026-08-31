@@ -29,10 +29,12 @@ import {
   shell,
   systemPreferences
 } from 'electron'
+import type { MenuItemConstructorOptions } from 'electron'
 
 import { classifyActiveRuntime } from './active-runtime-state'
 import { destroyKeepaliveAgents, downloadAgentFor, jsonAgentFor, withRetry } from './api-transport'
 import { appIconCandidates, resolveAppIcon } from './app-icon'
+import { applicationWindowMenu } from './application-menu'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import {
   type BackendOutputTail,
@@ -6494,7 +6496,7 @@ function sendWindowStateChanged(nextIsFullscreen?: boolean, target = mainWindow)
 }
 
 function buildApplicationMenu() {
-  const template = []
+  const template: MenuItemConstructorOptions[] = []
 
   const checkForUpdatesItem = {
     label: 'Check for Updates…',
@@ -6612,12 +6614,7 @@ function buildApplicationMenu() {
       { role: 'togglefullscreen' }
     ]
   })
-  template.push({
-    label: 'Window',
-    submenu: IS_MAC
-      ? [{ role: 'minimize' }, { role: 'zoom' }, { role: 'front' }]
-      : [{ role: 'minimize' }, { role: 'close' }]
-  })
+  template.push(applicationWindowMenu(process.platform))
   template.push({
     label: 'Help',
     role: 'help',
