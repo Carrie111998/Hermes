@@ -49,6 +49,7 @@ import itertools
 import json
 from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
+from datetime import datetime
 from functools import wraps
 import logging
 import os
@@ -1418,7 +1419,9 @@ try:
         pause_job as _cron_pause,
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
+        read_job_output as _cron_read_output,
     )
+    from cron.executions import list_executions as _cron_list_executions
     from cron.scheduler import (
         CronSchedulerRegistrationError as _CronSchedulerRegistrationError,
         create_job_with_scheduler_registration as _cron_create,
@@ -1433,6 +1436,8 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_read_output = None
+    _cron_list_executions = None
 
     class _CronSchedulerRegistrationError(RuntimeError):
         pass
@@ -2264,6 +2269,9 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
             ("POST", "/api/jobs/{job_id}/resume", self._handle_resume_job),
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job),
+            ("GET", "/api/jobs/{job_id}/executions", self._handle_list_job_executions),
+            ("GET", "/api/jobs/{job_id}/output", self._handle_get_job_output),
+            ("GET", "/api/jobs/{job_id}/output/{timestamp}", self._handle_get_job_output),
             ("POST", "/v1/runs", self._handle_runs),
             ("GET", "/v1/runs/{run_id}", self._handle_get_run),
             ("GET", "/v1/runs/{run_id}/events", self._handle_run_events),
@@ -6816,6 +6824,63 @@ class APIServerAdapter(BasePlatformAdapter):
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_list_job_executions(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/{job_id}/executions?limit=&before= — durable run history."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        job_id, id_err = self._check_job_id(request)
+        if id_err:
+            return id_err
+        try:
+            job = _cron_get(job_id)
+            if not job:
+                return web.json_response({"error": "Job not found"}, status=404)
+            limit_raw = request.query.get("limit")
+            try:
+                limit = int(limit_raw) if limit_raw is not None else 50
+            except ValueError:
+                return web.json_response({"error": "limit must be an integer"}, status=400)
+            limit = max(1, min(limit, 500))
+            before = request.query.get("before") or None
+            if before is not None:
+                try:
+                    datetime.fromisoformat(before)
+                except ValueError:
+                    return web.json_response({"error": "before must be an ISO-format timestamp"}, status=400)
+            executions = _cron_list_executions(
+                job_id=job_id, limit=limit, before_claimed_at=before,
+            )
+            return web.json_response({"executions": executions})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_get_job_output(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/{job_id}/output[/{timestamp}] — a saved run's output text."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        job_id, id_err = self._check_job_id(request)
+        if id_err:
+            return id_err
+        try:
+            job = _cron_get(job_id)
+            if not job:
+                return web.json_response({"error": "Job not found"}, status=404)
+            timestamp = request.match_info.get("timestamp")
+            output = _cron_read_output(job_id, timestamp)
+            if output is None:
+                return web.json_response({"error": "Output not found"}, status=404)
+            return web.json_response({"output": output})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
