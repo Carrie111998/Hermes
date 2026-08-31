@@ -2462,6 +2462,7 @@ def test_load_enabled_toolsets_folds_project_into_focus_posture(monkeypatch):
 
 
 def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "mcp-off")
     monkeypatch.setitem(
         sys.modules,
@@ -2498,6 +2499,7 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
 
 
 def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, capsys):
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "nope")
     monkeypatch.setitem(
         sys.modules,
