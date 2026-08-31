@@ -31,7 +31,10 @@ _PROFILES_MODULE = "hermes_cli.profiles"
 
 
 def _make_adapter(client: MagicMock | None = None) -> DiscordAdapter:
-    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    # Pin the watchdog interval to the default regardless of any local
+    # config.yaml — __init__ reads discord.activity_check_interval_seconds.
+    with patch(f"{_CONFIG_MODULE}.read_raw_config", return_value={}):
+        adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._client = client
     adapter._last_activity_state = None
     return adapter
@@ -284,12 +287,45 @@ class TestApplyActivity:
         call_kwargs = discord.Activity.call_args.kwargs
         assert len(call_kwargs["details"]) == 128
 
-    def test_missing_model_left_as_empty(self):
+    def test_missing_model_empty_state_cleared_not_sent(self):
+        """Regression: state "{{model}}" with no model.default renders empty;
+        Discord rejects empty activity names, so the adapter must skip the
+        API call (and, if a prior activity exists, clear it) instead of
+        retrying every watchdog cycle with a swallowed 400."""
         client = self._do_apply(
             {"enabled": True, "type": "watching", "state": "{{model}}"},
             {},
         )
-        self._assert_activity_created("watching", "")
+        assert client.change_presence.await_count == 0
+        assert discord.Activity.call_count == 0
+
+    def test_empty_state_clears_prior_activity(self):
+        async def _test():
+            client = _client_with_async_presence()
+            adapter = _make_adapter(client)
+            adapter._last_activity_state = ("watching", "old-model", "")
+            with patch(f"{_CONFIG_MODULE}.read_raw_config",
+                       return_value=_mock_discord_cfg({
+                           "enabled": True, "type": "watching",
+                           "state": "{{model}}"
+                       })):
+                with patch(f"{_CONFIG_MODULE}.load_config_readonly", return_value={}):
+                    with patch(f"{_PROFILES_MODULE}.get_active_profile_name",
+                               return_value="default"):
+                        await adapter._apply_activity()
+            client.change_presence.assert_awaited_with(activity=None)
+            # Second pass: diff guard sees the same empty state, no API call.
+            with patch(f"{_CONFIG_MODULE}.read_raw_config",
+                       return_value=_mock_discord_cfg({
+                           "enabled": True, "type": "watching",
+                           "state": "{{model}}"
+                       })):
+                with patch(f"{_CONFIG_MODULE}.load_config_readonly", return_value={}):
+                    with patch(f"{_PROFILES_MODULE}.get_active_profile_name",
+                               return_value="default"):
+                        await adapter._apply_activity()
+            assert client.change_presence.await_count == 1
+        asyncio.run(_test())
 
     def test_unknown_type_does_not_crash(self):
         client = self._do_apply(
@@ -435,6 +471,29 @@ class TestWatchdogDiffGuard:
 # _refresh_discord_activity tests
 
 
+class TestActivityWatchdogInterval:
+
+    def test_default_interval_is_60(self):
+        adapter = _make_adapter()
+        assert adapter._activity_watchdog_interval == 60
+
+    def test_interval_configurable(self):
+        adapter = _make_adapter()
+        with patch(f"{_CONFIG_MODULE}.read_raw_config",
+                   return_value={"discord": {"activity_check_interval_seconds": 300}}):
+            assert adapter._load_discord_int_config(
+                "activity_check_interval_seconds", 60, minimum=5
+            ) == 300
+
+    def test_interval_clamped_to_minimum(self):
+        adapter = _make_adapter()
+        with patch(f"{_CONFIG_MODULE}.read_raw_config",
+                   return_value={"discord": {"activity_check_interval_seconds": 1}}):
+            assert adapter._load_discord_int_config(
+                "activity_check_interval_seconds", 60, minimum=5
+            ) == 5
+
+
 class TestRefreshDiscordActivity:
 
     def test_noop_when_no_adapters(self):
@@ -475,7 +534,7 @@ class TestRefreshDiscordActivity:
             runner._refresh_discord_activity()
             await asyncio.sleep(0)
 
-        asyncio.get_event_loop().run_until_complete(_run())
+        asyncio.run(_run())
         adapter._apply_activity.assert_awaited_once()
 
 

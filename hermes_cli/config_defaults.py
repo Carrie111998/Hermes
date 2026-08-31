@@ -2451,6 +2451,9 @@ DEFAULT_CONFIG = {
             "state": "{{model}}",    # Text shown after the verb; supports {{model}} and {{profile}} templates
             "details": ""            # Secondary info line; supports the same templates
         },
+        # How often (seconds) the activity watchdog re-reads config and
+        # re-syncs presence. 5s floor. Raise in rate-limit-sensitive setups.
+        "activity_check_interval_seconds": 60,
         # Voice-channel audio effects (the continuous mixer). OFF by default.
         # When enabled, the bot installs a software mixer on the outgoing voice
         # stream so a low ambient "thinking" bed, verbal acknowledgements, and

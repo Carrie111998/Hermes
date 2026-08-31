@@ -559,7 +559,7 @@ See the [Session Model](#session-model-in-discord) section above for the full im
 
 **Type:** object — **Default:** `activity.enabled: false`
 
-Sets a custom rich presence activity (status) that appears under the bot name in Discord. Disabled by default — set `enabled: true` to activate. Applied on connect, and a background watchdog re-checks the config every 60 seconds, so edits to `discord.activity` (or a model switch) pick up without a restart; the presence is only re-sent to Discord when the rendered text actually changes.
+Sets a custom rich presence activity (status) that appears under the bot name in Discord. Disabled by default — set `enabled: true` to activate. Applied on connect, and a background watchdog re-checks the config every 60 seconds (configurable via `discord.activity_check_interval_seconds`, minimum 5s), so edits to `discord.activity` (or a model switch) pick up without a restart; the presence is only re-sent to Discord when the rendered text actually changes.
 
 ```yaml
 discord:
@@ -576,7 +576,7 @@ discord:
   - `{{profile}}` — The profile the gateway is running as (inferred from the active profile, e.g. `coder`). Non-standard `HERMES_HOME` directories render as the literal string `custom`.
 - **`details`** — Optional secondary info line under the activity text; supports the same templates.
 
-Rendered `state` and `details` are truncated to 128 characters (Discord's API limit), so long `{{model}}` values won't cause presence updates to fail.
+Rendered `state` and `details` are truncated to 128 characters (Discord's API limit), so long `{{model}}` values won't cause presence updates to fail. If the rendered `state` is empty (e.g. `state: "{{model}}"` with no `model.default` configured), the presence is cleared and no update is sent — Discord rejects empty activity names, and the adapter won't retry until the rendered text changes.
 
 **Example:** Show "Playing gpt-4o" under the bot name:
 

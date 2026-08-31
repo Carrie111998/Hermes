@@ -1150,9 +1150,11 @@ class DiscordAdapter(BasePlatformAdapter):
         self._liveness_task: Optional[asyncio.Task] = None
         self._liveness_notification_task: Optional[asyncio.Task] = None
         # Background watchdog that keeps the presence activity in sync with
-        # config.yaml changes (model, profile).  Default 60s interval.
+        # config.yaml changes (model, profile).
         self._activity_watchdog_task: Optional[asyncio.Task] = None
-        self._activity_watchdog_interval = 60.0
+        self._activity_watchdog_interval = self._load_discord_int_config(
+            "activity_check_interval_seconds", 60, minimum=5
+        )
         self._last_activity_state: Optional[Tuple[str, str, str]] = None  # (type, rendered state, rendered details)
         # True while disconnect() is intentionally closing discord.py. The
         # bot task's done callback uses this to distinguish an operator/service
@@ -4519,6 +4521,24 @@ class DiscordAdapter(BasePlatformAdapter):
         model_name, profile_name = self._activity_template_vars()
         rendered = self._render_activity_templates(state, model_name, profile_name)
         rendered_details = self._render_activity_templates(details, model_name, profile_name)
+
+        if not rendered:
+            # Discord rejects presence updates with an empty activity name —
+            # e.g. state is "{{model}}" and no model.default is configured.
+            # Diff-guard first so the watchdog doesn't re-clear (or retry a
+            # swallowed API error) every cycle while the state stays empty.
+            empty_key = (atype, "", rendered_details)
+            if empty_key == self._last_activity_state:
+                return
+            if self._last_activity_state is not None:
+                # _clear_activity resets the cache; set the guard key after.
+                await self._clear_activity()
+            self._last_activity_state = empty_key
+            logger.debug(
+                "[%s] Activity state rendered empty — clearing/leaving presence",
+                self.name,
+            )
+            return
 
         cache_key = (atype, rendered, rendered_details)
         if cache_key == self._last_activity_state:

@@ -140,8 +140,8 @@ class GatewaySlashCommandsMixin:
         try:
             apply_activity = getattr(adapter, "_apply_activity", None)
             if callable(apply_activity):
-                # Run off the event loop so a slow Discord API call
-                # doesn't block the model-switch confirmation.
+                # Fire-and-forget on the loop so the switch reply isn't
+                # awaited against the presence update.
                 asyncio.create_task(apply_activity())
         except Exception:
             logger.debug("Discord activity refresh failed", exc_info=True)
