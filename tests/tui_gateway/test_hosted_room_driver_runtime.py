@@ -1349,6 +1349,73 @@ def test_retry_uses_runtime_session_id_returned_by_resume(db: Path):
     assert observed == {"history": runtime_id, "info": runtime_id}
 
 
+def test_retry_indeterminate_reroutes_on_worker_race(db: Path, monkeypatch):
+    """The background reconcile pass can transition the task concurrently
+    with an explicit Retry call. retry_indeterminate() must re-read and
+    re-route on a transient StaleTaskError instead of surfacing it, mirroring
+    cancel()'s established routing-retry contract."""
+    identity = _identity()
+    now = [100.0]
+
+    def clock():
+        return now[0]
+
+    old_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="old-process",
+        ttl_seconds=1,
+        clock=clock,
+    )
+    _admit(db, identity)
+    state.start_task(
+        db,
+        identity,
+        old_lease,
+        expected_cancel_generation=0,
+        clock=clock,
+    )
+    now[0] = 102.0
+    recovery_lease = state.acquire_lease(
+        db,
+        room_id=ROOM_ID,
+        gateway_id=BINDING.gateway_id,
+        authority_epoch=BINDING.authority_epoch,
+        process_generation="recovery-process",
+        ttl_seconds=30,
+        clock=clock,
+    )
+    state.recover_room(db, recovery_lease, clock=clock)
+    state.release_lease(db, recovery_lease, clock=clock)
+
+    rpc = FakeSessionRPC(auto_complete=False)
+    rpc.add_session(active=False, task_id=identity.task_id)
+    runtime = _runtime(db, rpc, clock=clock)
+
+    real_requeue = state.requeue_indeterminate_task
+    calls = {"n": 0}
+
+    def flaky_requeue(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Simulate the background reconcile worker winning the race on
+            # this generation between retry_indeterminate()'s read and its
+            # write attempt.
+            raise state.StaleTaskError("worker moved the task first")
+        return real_requeue(*args, **kwargs)
+
+    monkeypatch.setattr(state, "requeue_indeterminate_task", flaky_requeue)
+
+    retried = runtime.retry_indeterminate(identity)
+
+    assert calls["n"] == 2
+    assert retried["status"] == "queued"
+    task = state.get_task(db, identity)
+    assert task["status"] == "queued"
+
+
 def test_retry_reconciles_terminal_remote_cancellation_without_new_generation(
     db: Path,
 ):
