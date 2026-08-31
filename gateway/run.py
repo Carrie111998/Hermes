@@ -10996,13 +10996,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         restart_source = self._restart_command_source if self._restart_requested else None
 
         action = "restarting" if self._restart_requested else "shutting down"
-        hint = (
-            "Your current task will be interrupted. "
-            "Send any message after restart and I'll try to resume where you left off."
-            if self._restart_requested
-            else "Your current task will be interrupted."
-        )
-        msg = f"⚠️ Gateway {action} — {hint}"
+        msg = f"⚠️ Gateway {action}."
+        if active:
+            drain_seconds = max(
+                float(getattr(self, "_restart_drain_timeout", 0.0) or 0.0), 0.0
+            )
+            if drain_seconds > 0:
+                hint = (
+                    f"I'll wait up to {drain_seconds:g} seconds for your current task "
+                    "to finish. If the gateway stops before it finishes, I'll resume it "
+                    "automatically when the gateway returns."
+                )
+            else:
+                hint = (
+                    "Your current task may be interrupted. If that happens, I'll "
+                    "resume it automatically when the gateway returns."
+                )
+            msg = f"⚠️ Gateway {action} — {hint}"
 
         notified: set[tuple[str, str, Optional[str]]] = set()
         for session_key in active:
