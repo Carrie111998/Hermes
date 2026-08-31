@@ -19,14 +19,13 @@ sanitizes to the byte-identical text. These tests cover the dedup:
 
 import concurrent.futures
 from datetime import datetime
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, SendResult
 from gateway.run import (
     _GATEWAY_PROVIDER_ERROR_AUTH_REPLY,
     _GATEWAY_PROVIDER_ERROR_RATE_LIMIT_REPLY,
@@ -154,7 +153,7 @@ class TestStatusBridgeRecording:
     def test_successful_fallback_send_records_the_rewritten_reply(self, monkeypatch):
         runner, ctx = _turn_runner(_FallbackAdapter())
         sent = _stub_scheduler(
-            monkeypatch, SimpleNamespace(success=True, message_id="77"),
+            monkeypatch, SendResult(success=True, message_id="77"),
         )
 
         runner._status_callback_sync("status", RAW_RATE_LIMIT_STATUS)
@@ -166,7 +165,7 @@ class TestStatusBridgeRecording:
 
     def test_failed_send_records_nothing(self, monkeypatch):
         runner, ctx = _turn_runner(_FallbackAdapter())
-        _stub_scheduler(monkeypatch, SimpleNamespace(success=False, message_id=None))
+        _stub_scheduler(monkeypatch, SendResult(success=False, message_id=None, error="flood wait"))
 
         runner._status_callback_sync("status", RAW_RATE_LIMIT_STATUS)
 
@@ -176,7 +175,7 @@ class TestStatusBridgeRecording:
         """The gateway cannot assume an editable/ephemeral bubble persists, so
         the final response must keep flowing on these adapters."""
         runner, ctx = _turn_runner(_EditableAdapter())
-        _stub_scheduler(monkeypatch, SimpleNamespace(success=True, message_id="78"))
+        _stub_scheduler(monkeypatch, SendResult(success=True, message_id="78"))
 
         runner._status_callback_sync("status", RAW_RATE_LIMIT_STATUS)
 
@@ -185,7 +184,7 @@ class TestStatusBridgeRecording:
     def test_ordinary_status_text_records_nothing(self, monkeypatch):
         runner, ctx = _turn_runner(_FallbackAdapter())
         sent = _stub_scheduler(
-            monkeypatch, SimpleNamespace(success=True, message_id="79"),
+            monkeypatch, SendResult(success=True, message_id="79"),
         )
 
         runner._status_callback_sync("status", "reading the config file")
@@ -198,7 +197,7 @@ class TestStatusBridgeRecording:
         turn (own ctx) never inherits or consumes another turn's record."""
         runner_a, ctx_a = _turn_runner(_FallbackAdapter(), chat_id="-1001")
         runner_b, ctx_b = _turn_runner(_FallbackAdapter(), chat_id="-2002")
-        _stub_scheduler(monkeypatch, SimpleNamespace(success=True, message_id="80"))
+        _stub_scheduler(monkeypatch, SendResult(success=True, message_id="80"))
 
         runner_a._status_callback_sync("status", RAW_RATE_LIMIT_STATUS)
 
