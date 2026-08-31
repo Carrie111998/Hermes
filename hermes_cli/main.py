@@ -5093,6 +5093,24 @@ _LAZY_COMMAND_EXPORTS = {
         "_handoff_reapable_backend_pids",
         "_ledger_reapable_backend_pids",
         "_purge_stale_hermes_modules",
+        "_quiesce_fleet_before_mutation",
+        "_update_tree_is_dirty",
+        "_escalate_runtime_stop",
+        "_restart_supervised_unit",
+        "_run_supervisor_command",
+        "_supervised_restart_command",
+        "_supervised_stop_command",
+        "_relaunch_quiesced_runtimes",
+        "_relaunch_fleet_after_zip_update",
+        "_release_startup_barrier_after_update",
+        "_open_startup_barrier_for_relaunch",
+        "_require_quiesced",
+        "_respawn_recorded_runtime",
+        "_probe_relaunched_runtime_sha",
+        "_runtime_pid_alive",
+        "_stop_runtime_for_quiesce",
+        "_stop_windows_gateway_service",
+        "_restore_windows_gateway_service",
         "_format_venv_python_holders_message",
         "_gateway_prompt",
         "_get_origin_url",
@@ -10866,6 +10884,27 @@ def cmd_update(args):
             pass
         _update_handoff_exit_code = 0
     finally:
+        # Backstop for the pre-mutation quiesce: the impl stops the whole
+        # fleet before it can know whether anything will actually change,
+        # and it has many early ``sys.exit`` paths (no-op update, fetch
+        # failure, venv-holder refusal). Whatever happened above, a fleet
+        # we stopped must not be left down. No-op when the restart phase
+        # already relaunched everything (it clears the durable record) or
+        # when nothing was quiesced.
+        try:
+            _self()._relaunch_quiesced_runtimes()
+        except Exception as _relaunch_exc:
+            logger.debug(
+                "Command-boundary relaunch of quiesced runtimes failed: %s",
+                _relaunch_exc,
+            )
+        # Mutation and relaunch cleanup are both behind us now, so the
+        # shared-checkout startup barrier can go. This is the ONLY release
+        # point on the success path: releasing earlier would reopen the
+        # window a runtime could start into. Owner-scoped, so an early-exit
+        # boundary that never took a barrier — or one whose work went to a
+        # detached child — leaves the live lease alone.
+        _self()._release_startup_barrier_after_update()
         _update_lock.release()
         _finalize_update_output(_update_io_state)
         # Windows hand-off child (#93581): the re-exec'd venv child cannot

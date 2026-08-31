@@ -168,6 +168,21 @@ class LedgerEntry:
     host: str = ""
     port: Optional[int] = None
     profile: str = ""
+    # The FULL argv as a list. ``argv`` above is a lossy human-readable
+    # rendering of it — a joined string cannot round-trip an argument that
+    # contains whitespace, and it used to be truncated at ten tokens, which
+    # is exactly where `--host`/`--port`/`--profile` sit on a slightly longer
+    # command. A relauncher must use this list and hand it to the OS verbatim.
+    argv_list: Optional[list] = None
+    # The HERMES_HOME this runtime was running under. The relaunch sets it in
+    # the replacement's environment; without a producer here that lookup found
+    # nothing and the replacement silently inherited the updater's home.
+    hermes_home: str = ""
+    # The source SHA this process is running, stamped by the process ITSELF.
+    # For serve/dashboard backends — which do not write gateway_state.json —
+    # this is the only runtime-kind-correct proof that a replacement came up
+    # on post-update code.
+    code_sha: str = ""
 
 
 def _ledger_path() -> Path:
@@ -205,6 +220,16 @@ def _read_ledger(path: Path) -> Optional[list[dict]]:
     return [e for e in parsed if isinstance(e, dict)]
 
 
+class LedgerUnreadable(RuntimeError):
+    """The spawn ledger exists but could not be read as a roster.
+
+    Raised only for ``strict`` readers — the ones whose next act depends on
+    the roster being the whole truth (the pre-mutation update inventory).
+    Everyone else keeps the lenient, self-healing behaviour: quarantine the
+    file and carry on with an empty list.
+    """
+
+
 def _quarantine_ledger(path: Path) -> None:
     parked = path.with_suffix(path.suffix + ".corrupt")
     try:
@@ -231,6 +256,401 @@ def _pid_alive_matches(pid: int, create_time: Optional[float]) -> Optional[bool]
         return None
 
 
+# ---------------------------------------------------------------------------
+# Shared-checkout startup barrier
+# ---------------------------------------------------------------------------
+#
+# ``hermes update`` quiesces the fleet, re-inventories it at the gate, and
+# sweeps again after the stops. That closes every window the updater can
+# SEE. It cannot close the one it cannot: a runtime launched between the
+# final recollection and the first byte written to the checkout was in no
+# inventory, so it was never stopped, and it spends the whole mutation
+# importing from a tree that is being replaced underneath it. Re-collecting
+# harder only narrows a TOCTOU; the starter has to participate.
+#
+# So the updater takes a durable lease before its final inventory and every
+# startup path checks it before initializing anything. The lease is a file
+# next to the spawn ledger — the same machine-root scope the ledger already
+# has — because the updater that finishes the job is frequently NOT the
+# process that started it (the Windows hand-off child, a ``systemd-run``
+# scope), and in-memory authorization does not survive that boundary.
+
+STARTUP_BARRIER_FILENAME = "update-startup-barrier.json"
+
+#: How long a lease stays honoured when its owner cannot be probed at all.
+#: A provably-live owner keeps its barrier past this; the TTL exists only so
+#: an updater killed so hard that even its identity is unreadable cannot
+#: wedge every startup on the machine forever.
+STARTUP_BARRIER_TTL = 1800.0
+#: How long a startup waits for an active barrier before refusing. Long
+#: enough to absorb an ordinary update's mutation window, short enough that
+#: a supervisor's start timeout is not what surfaces the problem.
+STARTUP_BARRIER_WAIT_TIMEOUT = 90.0
+STARTUP_BARRIER_POLL_INTERVAL = 0.25
+#: Operator override for the wait budget, in seconds. A site whose
+#: supervisor start timeout is tighter than ours needs to be able to say so
+#: — and a `0` turns the barrier into a pure refusal.
+STARTUP_BARRIER_WAIT_ENV = "HERMES_STARTUP_BARRIER_WAIT_SECONDS"
+
+#: Startups are blocked in ``mutating`` only. Once the checkout is whole
+#: again the updater flips the lease to ``relaunching``: it still owns the
+#: record (that is what makes recovery possible), but a fresh interpreter
+#: reading the NEW tree is precisely what the relaunch phase needs next —
+#: blocking there would deadlock the update against its own restarts.
+BARRIER_PHASE_MUTATING = "mutating"
+BARRIER_PHASE_RELAUNCHING = "relaunching"
+
+_BARRIER_LOCK = threading.Lock()
+#: ``(pid, create_time)`` of the lease THIS process wrote, or ``None``.
+_barrier_owner_token: Optional[tuple] = None
+
+
+class StartupBarrierActive(RuntimeError):
+    """A shared-checkout mutation is in progress; startup must not proceed."""
+
+
+def machine_id() -> str:
+    """Host identity, so a shared Hermes root cannot block other machines."""
+    try:
+        return platform.node() or "unknown-machine"
+    except Exception:
+        return "unknown-machine"
+
+
+def _default_barrier_wait() -> float:
+    """The wait budget, honouring the operator override. Never raises."""
+    raw = os.environ.get(STARTUP_BARRIER_WAIT_ENV, "")
+    if raw.strip():
+        try:
+            return max(float(raw), 0.0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "ignoring unparsable %s=%r", STARTUP_BARRIER_WAIT_ENV, raw
+            )
+    return STARTUP_BARRIER_WAIT_TIMEOUT
+
+
+def _barrier_path() -> Path:
+    """Machine-root barrier path (shared by every profile of this install)."""
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        return Path(get_default_hermes_root()) / STARTUP_BARRIER_FILENAME
+    except Exception:
+        from hermes_cli.config import get_hermes_home
+
+        return Path(get_hermes_home()) / STARTUP_BARRIER_FILENAME
+
+
+def _read_barrier(path: Path) -> tuple:
+    """``(record, readable)``. ``(None, True)`` means no lease is held.
+
+    ``readable`` is ``False`` for a file that exists but is not a lease —
+    the state a startup must treat as "an update may be running", never as
+    "no update is running".
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, True
+    except OSError:
+        return None, False
+    if not text.strip():
+        return None, True
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return None, False
+    if not isinstance(parsed, dict):
+        return None, False
+    return parsed, True
+
+
+def _barrier_owner_is_gone(record: dict, now: float) -> bool:
+    """Is this lease recoverable? Proof required, absence of evidence is not.
+
+    ``True`` only when the owner is provably dead, or when it cannot be
+    probed at all AND the lease has outlived its TTL. A live owner is never
+    expired out from under a slow update.
+    """
+    owner_pid = record.get("owner_pid")
+    if isinstance(owner_pid, int) and owner_pid > 0:
+        alive = _pid_alive_matches(owner_pid, record.get("owner_create"))
+        if alive is True:
+            return False
+        if alive is False:
+            return True
+    # Unprovable owner (no pid recorded, psutil unavailable, another user's
+    # process): the TTL is the only escape, and a lease with no readable
+    # expiry keeps blocking.
+    try:
+        return float(now) >= float(record.get("expires_at"))
+    except (TypeError, ValueError):
+        return False
+
+
+def _recover_barrier(path: Path) -> None:
+    """Drop a lease whose owner is provably gone. Best-effort."""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    except Exception:  # pragma: no cover - defensive
+        pass
+
+
+def _barrier_applies_to(record: dict, profile: str, project_root) -> bool:
+    """Is this lease about THIS checkout, on THIS machine, for THIS profile?"""
+    if str(record.get("install") or "") != install_id(project_root):
+        return False
+    if str(record.get("machine") or "") != machine_id():
+        return False
+    profiles = record.get("profiles")
+    if isinstance(profiles, (list, tuple)) and profiles:
+        # A narrower, profile-scoped lease. An unnamed startup is still
+        # covered: we cannot show it is one of the profiles left running.
+        if profile and str(profile) not in [str(p) for p in profiles]:
+            return False
+    return True
+
+
+def startup_barrier_reason(
+    purpose: str,
+    *,
+    profile: str = "",
+    project_root: Optional[Path] = None,
+    now: Optional[float] = None,
+) -> str:
+    """Why *purpose* must not start right now, or ``""`` when it may.
+
+    Never raises: an unreadable lease answers with a reason (fail closed),
+    not with an exception the caller's ``except Exception`` would swallow
+    into "carry on".
+    """
+    try:
+        path = _barrier_path()
+    except Exception as exc:  # pragma: no cover - defensive
+        return (
+            f"refusing to start {purpose}: the update startup barrier could "
+            f"not be located ({exc}), so a shared-checkout update cannot be "
+            "ruled out"
+        )
+    record, readable = _read_barrier(path)
+    if not readable:
+        return (
+            f"refusing to start {purpose}: the update startup barrier at "
+            f"{path} is unreadable, so a `hermes update` mutating the shared "
+            "checkout cannot be ruled out. Remove the file once you have "
+            "confirmed no update is running"
+        )
+    if record is None:
+        return ""
+    try:
+        if not _barrier_applies_to(record, profile, project_root):
+            return ""
+        if str(record.get("phase") or BARRIER_PHASE_MUTATING) != (
+            BARRIER_PHASE_MUTATING
+        ):
+            return ""
+        stamp = time.time() if now is None else float(now)
+        if _barrier_owner_is_gone(record, stamp):
+            _recover_barrier(path)
+            return ""
+    except Exception as exc:  # pragma: no cover - defensive
+        return (
+            f"refusing to start {purpose}: the update startup barrier at "
+            f"{path} could not be evaluated ({exc})"
+        )
+    owner = record.get("owner_pid")
+    return (
+        f"refusing to start {purpose}: `hermes update` (pid {owner}) is "
+        "mutating the shared checkout this process would import from. "
+        "Startup is held until the update releases the barrier"
+    )
+
+
+def await_startup_clearance(
+    purpose: str,
+    *,
+    profile: str = "",
+    project_root: Optional[Path] = None,
+    timeout: Optional[float] = None,
+    poll_interval: float = STARTUP_BARRIER_POLL_INTERVAL,
+    monotonic=time.monotonic,
+    sleep=time.sleep,
+    on_wait: Optional[object] = None,
+) -> None:
+    """Block until the checkout is stable, then return — or refuse.
+
+    Waiting is the friendly half: an ordinary update's mutation window is
+    seconds, and a supervised gateway that waits it out comes back on the
+    new code with no restart loop. Refusing is the half that matters:
+    whatever happens, this process does not initialize against a checkout
+    somebody is rewriting.
+    """
+    budget = _default_barrier_wait() if timeout is None else max(float(timeout), 0.0)
+    deadline = monotonic() + budget
+    announced = False
+    while True:
+        reason = startup_barrier_reason(
+            purpose, profile=profile, project_root=project_root
+        )
+        if not reason:
+            return
+        if monotonic() >= deadline:
+            raise StartupBarrierActive(reason)
+        if on_wait is not None and not announced:
+            announced = True
+            try:
+                on_wait(reason)  # type: ignore[operator]
+            except Exception:
+                pass
+        sleep(max(float(poll_interval), 0.0))
+
+
+def _barrier_record_is_ours(record: dict) -> bool:
+    owner_pid = record.get("owner_pid")
+    if not isinstance(owner_pid, int) or owner_pid != os.getpid():
+        return False
+    recorded = record.get("owner_create")
+    mine = _own_create_time()
+    if recorded is None or mine is None:
+        return True
+    try:
+        return abs(float(recorded) - float(mine)) < 2.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _write_barrier_record(path: Path, payload: dict) -> bool:
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        os.replace(tmp, path)
+        return True
+    except Exception as exc:
+        logger.warning("could not write the update startup barrier: %s", exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def acquire_startup_barrier(
+    *,
+    profiles=(),
+    project_root: Optional[Path] = None,
+    reason: str = "",
+    ttl: float = STARTUP_BARRIER_TTL,
+) -> bool:
+    """Take the lease that holds every startup off this checkout.
+
+    ``False`` — never an exception — when the lease belongs to someone
+    else, or when the file cannot be read or written. Every one of those is
+    "we cannot prove we are the only mutator", and the caller's answer to
+    that is to abort before touching anything.
+
+    ``profiles`` narrows the lease; the empty default means the whole
+    checkout, which is what a git/venv mutation actually affects.
+    """
+    global _barrier_owner_token
+    path = _barrier_path()
+    now = time.time()
+    with _BARRIER_LOCK:
+        record, readable = _read_barrier(path)
+        if not readable:
+            logger.warning(
+                "the update startup barrier at %s is unreadable; refusing to "
+                "assume no other update holds it",
+                path,
+            )
+            return False
+        if record is not None and not _barrier_record_is_ours(record):
+            if not _barrier_applies_to(record, "", project_root):
+                # Another install or machine wrote here. Overwriting would
+                # erase a lease we cannot reason about.
+                logger.warning(
+                    "the update startup barrier at %s belongs to another "
+                    "install/machine; refusing to take it over",
+                    path,
+                )
+                return False
+            if not _barrier_owner_is_gone(record, now):
+                return False
+        create = _own_create_time()
+        payload = {
+            "install": install_id(project_root),
+            "machine": machine_id(),
+            "owner_pid": os.getpid(),
+            "owner_create": create,
+            "profiles": [str(p) for p in (profiles or ())],
+            "phase": BARRIER_PHASE_MUTATING,
+            "acquired_at": now,
+            "expires_at": now + max(float(ttl), 0.0),
+            "reason": str(reason or ""),
+        }
+        if not _write_barrier_record(path, payload):
+            return False
+        _barrier_owner_token = (payload["owner_pid"], payload["owner_create"])
+        return True
+
+
+def set_startup_barrier_phase(phase: str) -> bool:
+    """Move OUR lease to *phase*. ``False`` when we do not hold one."""
+    path = _barrier_path()
+    with _BARRIER_LOCK:
+        record, readable = _read_barrier(path)
+        if not readable or record is None:
+            return False
+        if not _barrier_record_is_ours(record):
+            return False
+        record["phase"] = str(phase)
+        return _write_barrier_record(path, record)
+
+
+def release_startup_barrier() -> bool:
+    """Drop OUR lease. Never drops one written by another process.
+
+    That restriction is what makes the command-boundary backstop safe: a
+    parent that handed the update to a detached child must not free the
+    child's lease on its way out.
+    """
+    global _barrier_owner_token
+    path = _barrier_path()
+    with _BARRIER_LOCK:
+        record, readable = _read_barrier(path)
+        if not readable:
+            # Corrupt, and we know we wrote one: leaving it would block every
+            # startup on the machine until the TTL. Ours to clear.
+            if _barrier_owner_token is not None:
+                _recover_barrier(path)
+                _barrier_owner_token = None
+                return True
+            return False
+        if record is None:
+            _barrier_owner_token = None
+            return True
+        if not _barrier_record_is_ours(record):
+            return False
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("could not release the update startup barrier: %s", exc)
+            return False
+        _barrier_owner_token = None
+        return True
+
+
+def forget_startup_barrier_ownership() -> None:
+    """Drop the in-process "we wrote a lease" note (test hygiene)."""
+    global _barrier_owner_token
+    _barrier_owner_token = None
+
+
 def register_self(
     purpose: str,
     *,
@@ -248,7 +668,21 @@ def register_self(
     ``host``/``port``/``profile`` — so the update pipeline can relaunch a
     manually-started serve with its real bind address instead of guessing
     from argv.
+
+    Refuses (``False``, nothing written) while the shared-checkout startup
+    barrier is held. The entry points gate earlier and harder — this is the
+    backstop for any path that reaches registration anyway, and it keeps the
+    updater's final inventory true: a row that appears after the last
+    recollection is a runtime nothing will stop.
     """
+    barrier = startup_barrier_reason(
+        purpose,
+        profile=str((detail or {}).get("profile") or ""),
+        project_root=project_root,
+    )
+    if barrier:
+        logger.warning("%s", barrier)
+        return False
     tag = parse_spawn_tag(os.environ.get(SPAWN_ENV_VAR))
     spawner_pid: Optional[int] = tag.spawner_pid if tag else None
     spawner_create: Optional[float] = tag.spawner_create if tag else None
@@ -290,13 +724,27 @@ def register_self(
     try:
         import sys as _sys
 
-        # 10 tokens (was 6): enough for `hermes serve --host X --port N
-        # --profile P` — the relaunch shapes #63206 needs — while still
-        # bounding pathological argv. Structured detail above is the
-        # canonical identity; argv is the human-readable fallback.
-        entry.argv = " ".join(_sys.argv[:10])
+        # The list is the record; the joined string is kept only so existing
+        # readers (log lines, the dashboard scan's cmdline matcher) keep
+        # working. No truncation: dropping the eleventh token silently
+        # dropped `--port` from longer commands, and a respawn from a
+        # truncated argv is a WRONG process, not a failed one.
+        entry.argv_list = [str(part) for part in _sys.argv]
+        entry.argv = " ".join(entry.argv_list[:10])
     except Exception:
         pass
+    try:
+        from hermes_constants import get_hermes_home
+
+        entry.hermes_home = str(get_hermes_home())
+    except Exception:
+        logger.debug("could not record HERMES_HOME in the spawn ledger", exc_info=True)
+    try:
+        from hermes_cli.build_info import get_code_identity
+
+        entry.code_sha = str(get_code_identity().get("sha") or "")
+    except Exception:
+        logger.debug("could not stamp the running code sha", exc_info=True)
 
     return _append_entry(entry)
 
@@ -384,26 +832,45 @@ def register_child(
     try:
         import psutil
 
-        entry.argv = " ".join(psutil.Process(pid).cmdline()[:10])
+        entry.argv_list = [str(part) for part in psutil.Process(pid).cmdline()]
+        entry.argv = " ".join(entry.argv_list[:10])
     except Exception:
         pass
     return _append_entry(entry)
 
 
-def ledger_entries(*, project_root: Optional[Path] = None) -> list[dict]:
+def ledger_entries(
+    *, project_root: Optional[Path] = None, strict: bool = False
+) -> list[dict]:
     """Live-verified ledger entries for THIS install.
 
     Entries whose ``(pid, create_time)`` no longer matches a live process are
-    excluded (PID reuse reads as dead, thanks to the create-time pair). A
-    corrupt ledger is quarantined and read as empty — identical philosophy to
-    the backend-ownership fix (#89298): never let corruption erase or fake
-    a roster; never let it block the caller either.
+    excluded (PID reuse reads as dead, thanks to the create-time pair).
+
+    Corruption is where the two caller classes part ways. By default a
+    corrupt or unreadable ledger is quarantined and read as empty —
+    identical philosophy to the backend-ownership fix (#89298): never let
+    corruption erase or fake a roster, never let it block a startup reaper
+    either. But "no backends are registered" and "the roster is unreadable"
+    are NOT the same fact, and a caller about to authorize a checkout
+    mutation must not act on the second as if it were the first. Those
+    callers pass ``strict=True`` and get :class:`LedgerUnreadable`.
+
+    A strict read deliberately does NOT quarantine: moving the damaged file
+    aside would make the very next read return a positively-empty roster,
+    turning a fail-closed abort into a fail-open retry.
     """
     want_install = install_id(project_root)
     path = _ledger_path()
     with _LEDGER_LOCK:
         entries = _read_ledger(path)
         if entries is None:
+            if strict:
+                raise LedgerUnreadable(
+                    f"the spawn ledger at {path} is corrupt or unreadable, so "
+                    "the set of running serve/dashboard backends cannot be "
+                    "established"
+                )
             _quarantine_ledger(path)
             return []
     out: list[dict] = []

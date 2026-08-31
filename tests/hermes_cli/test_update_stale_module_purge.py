@@ -24,6 +24,10 @@ import pytest
 from hermes_cli import main as cli_main
 from hermes_cli import update_cmd
 
+# This file is about the purge itself, so it opts out of the autouse stub
+# that neutralizes it for every other test in the package (see conftest).
+pytestmark = pytest.mark.real_module_purge
+
 
 @pytest.fixture(autouse=True)
 def _restore_sys_modules():

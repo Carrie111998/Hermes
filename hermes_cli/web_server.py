@@ -19574,6 +19574,28 @@ def start_server(
     ``ssh_session_token`` and ``ssh_owner_nonce`` are process-local Desktop SSH
     bootstrap state. Neither is persisted or exported to child processes.
     """
+    # Shared-checkout startup barrier (#99450). This is the first statement
+    # for a reason: everything below imports from, binds to, or serves out
+    # of the checkout `hermes update` may be rewriting right now. A backend
+    # that initializes inside that window was in no pre-mutation inventory,
+    # so nothing will stop it and it will serve requests off a torn module
+    # graph. Wait the window out, or refuse before anything exists to tear.
+    from hermes_cli.process_identity import (
+        StartupBarrierActive,
+        await_startup_clearance,
+    )
+
+    try:
+        await_startup_clearance(
+            "serve" if headless else "dashboard",
+            profile=initial_profile or "",
+            on_wait=lambda message: _log.warning("%s", message),
+        )
+    except StartupBarrierActive as exc:
+        _log.error("%s", exc)
+        print(f"✗ {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
 

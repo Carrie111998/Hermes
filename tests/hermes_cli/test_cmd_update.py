@@ -1110,8 +1110,8 @@ class TestNodeRuntimeNpmResolution:
         )
         monkeypatch.setattr(hm, "_refresh_active_memory_provider_dependencies", lambda: None)
         monkeypatch.setattr(hm, "_build_web_ui", lambda *_args: None)
-        monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *_args: None)
-        monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *_args: None)
+        monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *_args, **_kwargs: None)
         monkeypatch.setattr(
             update_cmd,
             "_validate_critical_modules_import",

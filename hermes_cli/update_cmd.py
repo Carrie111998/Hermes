@@ -83,6 +83,14 @@ _STALE_PURGE_PROTECTED = frozenset(
         "hermes_cli.main",
         "hermes_cli.update_cmd",
         "hermes_cli.hermes_logging",
+        # The quiesce is the update, mid-flight. Its module-global holds the
+        # authorization that proved the fleet stopped, and the purge runs
+        # twice — the second time immediately before the relaunch phase. A
+        # fresh import there is a fresh `_authorized = None`: the updater
+        # forgets, between stopping the fleet and bringing it back, that it
+        # ever quiesced. It also wrote the durable restart record with THIS
+        # code, so this is the code that should read it back.
+        "hermes_cli.update_quiesce",
     }
 )
 
@@ -1151,14 +1159,21 @@ def _reload_process_scan_modules() -> None:
 
 
 def _finish_dashboard_update_cleanup(
-    node_failures: list[str], already_restarted_units: "set[str] | None" = None
+    node_failures: list[str],
+    already_restarted_units: "set[str] | None" = None,
+    exclude_pids: "set[int] | None" = None,
 ) -> None:
     """Refresh managed dashboards or stop stale manual ones after an update.
 
-    *already_restarted_units* forwards the systemd unit names (no
-    ``.service`` suffix) that the fleet-restart loop already restarted
-    directly, so a Serve-only install's freshly restarted process isn't
-    found and restarted a second time here (review on #83595).
+    *already_restarted_units* forwards the systemd unit names that the
+    fleet-restart loop already restarted directly, so a Serve-only
+    install's freshly restarted process isn't found and restarted a second
+    time here (review on #83595). Either spelling of the unit name works.
+
+    *exclude_pids* forwards processes the update relaunched itself from a
+    recorded launch argv. The scan matches on cmdline, not on age, so
+    without this the sweep kills the replacements the quiesce phase just
+    started.
     """
     if node_failures:
         print()
@@ -1171,7 +1186,9 @@ def _finish_dashboard_update_cleanup(
     _reload_process_scan_modules()
 
     stop_result = _m()._kill_stale_dashboard_processes(
-        restart_managed=True, already_restarted_units=already_restarted_units
+        restart_managed=True,
+        already_restarted_units=already_restarted_units,
+        exclude_pids=exclude_pids,
     )
     if not stop_result.get("unrecovered"):
         return
@@ -1886,13 +1903,156 @@ def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
     return bool(restored.get("valid"))
 
 
-def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> bool:
+def _post_zip_code_sha() -> str:
+    """The code identity the checkout has NOW, after the overlay landed.
+
+    ``refresh=True`` because ``get_code_identity`` caches per process and
+    this interpreter read it before the overlay replaced the tree.
+    """
+    try:
+        from hermes_cli.build_info import get_code_identity
+
+        return str(get_code_identity(refresh=True).get("sha") or "")
+    except Exception as exc:
+        logger.debug("Post-ZIP code identity could not be read: %s", exc)
+        return ""
+
+
+def _relaunch_fleet_after_zip_update(windows_resume_token=None) -> bool:
+    """Bring the ZIP-quiesced fleet back, and PROVE each replacement.
+
+    The ZIP branch used to return straight from ``_update_via_zip``, leaving
+    the relaunch to ``cmd_update``'s command-boundary backstop. That backstop
+    passes no expected SHA — so every outcome's ``sha_matches`` is false by
+    construction — and swallows what it gets back. The result was a ZIP
+    update that reported success over a fleet nobody had checked.
+
+    Each recorded runtime must come back through its EXACT recorded
+    authority, leave no pre-update PID behind, and report the post-overlay
+    SHA from its own stamp. Anything less returns ``False`` and leaves the
+    durable restart-pending record on disk: an obligation we could not
+    discharge is an obligation, not a rounding error.
+
+    Deliberately does NOT purge this interpreter's module cache first. The
+    replacements are fresh interpreters by construction — a supervisor
+    restart or a respawn is a new process reading the new tree, which is the
+    freshness that matters — while the relaunch machinery running here is
+    the code that WROTE the pending record, and is the right code to read it
+    back.
+    """
+    from hermes_cli import update_quiesce
+
+    try:
+        state = update_quiesce.read_restart_pending_state()
+    except Exception as exc:
+        print(f"  ✗ Could not read the restart-pending record: {exc}")
+        return False
+    if not state or not state.get("runtimes"):
+        return True
+
+    # Paused Windows gateway services come back FIRST, exactly as the git
+    # path orders it: the quiesce record can name a service the pause phase
+    # stopped, and `sc start` on an already-started service is an error, not
+    # a relaunch.
+    try:
+        _m()._resume_windows_gateways_after_update(windows_resume_token)
+    except Exception as exc:
+        print(f"  ✗ Could not resume the paused Windows gateway service(s): {exc}")
+        print("    The quiesced fleet is still recorded as owed a relaunch.")
+        return False
+
+    expected_sha = _post_zip_code_sha()
+    if not expected_sha:
+        print(
+            "  ✗ The updated checkout does not report a code identity, so a "
+            "relaunched runtime cannot be proven to be running it."
+        )
+        print("    The quiesced fleet is still recorded as owed a relaunch.")
+        return False
+
+    print("→ Relaunching the runtimes the update stopped...")
+    outcomes = _m()._relaunch_quiesced_runtimes(expected_sha)
+    if update_quiesce.relaunch_is_complete(outcomes):
+        return True
+    print(
+        "  ✗ The update could not prove every stopped runtime came back on "
+        f"{expected_sha[:8]}."
+    )
+    print(
+        "    They stay recorded as owed a relaunch; rerun `hermes update` "
+        "once their supervisor is healthy."
+    )
+    return False
+
+
+def _finish_zip_update_reporting(
+    *,
+    relaunch_fleet,
+    desktop_build_ok: bool,
+    node_failures,
+) -> bool:
+    """Relaunch the fleet, THEN write the receipt. Returns the fleet verdict.
+
+    Order is the contract. The receipt is this update's durable claim about
+    what happened, and it must not say ``success`` before the fleet it
+    stopped has been proven back on the new code.
+    """
+    fleet_ok = True
+    if relaunch_fleet is not None:
+        try:
+            fleet_ok = bool(relaunch_fleet())
+        except Exception as exc:
+            logger.debug("ZIP-path fleet relaunch failed: %s", exc)
+            print(f"  ✗ The fleet relaunch failed: {exc}")
+            fleet_ok = False
+    try:
+        from hermes_cli.update_receipt import finalize_update_receipt
+
+        finalize_update_receipt(
+            "success"
+            if (desktop_build_ok and not node_failures and fleet_ok)
+            else "partial"
+        )
+    except Exception as _receipt_exc:
+        logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
+    return fleet_ok
+
+
+def _finish_zip_update(
+    *, desktop_build_ok: bool, fleet_ok: bool, gateway_mode: bool
+) -> None:
+    """Report the ZIP update's outcome. Success requires BOTH halves."""
+    if gateway_mode:
+        _write_gateway_update_exit_code(desktop_build_ok and fleet_ok)
+    if not fleet_ok:
+        print()
+        print(
+            "✗ The checkout was updated, but the runtimes this update stopped "
+            "could not be proven back on the new code."
+        )
+        sys.exit(1)
+
+
+def _update_via_zip(
+    args,
+    *,
+    had_desktop_app_before_update: bool = False,
+    relaunch_fleet=None,
+) -> bool:
     """Update Hermes Agent by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
     drivers causing 'Invalid argument' errors on file creation).
 
-    Returns ``False`` when a Desktop rebuild ran and failed; ``True`` otherwise.
+    ``relaunch_fleet`` brings back what the pre-mutation quiesce stopped and
+    answers whether every replacement was proven to be on the new code. It
+    runs before the receipt is finalized, so an unproven fleet cannot be
+    recorded as a successful update.
+
+    Returns ``False`` when a Desktop rebuild ran and failed; ``True``
+    otherwise. The fleet verdict is reported through ``relaunch_fleet``'s
+    own return value, which the caller reads — conflating the two here would
+    turn a fleet failure into a Desktop-build failure in every message.
     """
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
 
@@ -2306,15 +2466,38 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
     _finish_dashboard_update_cleanup(node_failures)
-    try:
-        from hermes_cli.update_receipt import finalize_update_receipt
-
-        finalize_update_receipt(
-            "success" if (desktop_build_ok and not node_failures) else "partial"
-        )
-    except Exception as _receipt_exc:
-        logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
+    # After the dashboard sweep, so it cannot mistake a freshly relaunched
+    # dashboard for a stale one, and before the receipt, so the receipt tells
+    # the truth about the fleet.
+    _finish_zip_update_reporting(
+        relaunch_fleet=relaunch_fleet,
+        desktop_build_ok=desktop_build_ok,
+        node_failures=node_failures,
+    )
     return desktop_build_ok
+
+def _update_tree_is_dirty(git_cmd: list[str], cwd: Path) -> bool:
+    """True when ``git stash`` would actually rewrite the working tree.
+
+    Used only to decide whether the update's quiesce gate has to fire: a
+    clean tree means the stash below is a no-op, and a no-op must not cost
+    the whole fleet a restart. Fails CLOSED (``True``) when the probe
+    cannot answer.
+    """
+    try:
+        status = subprocess.run(
+            git_cmd + ["status", "--porcelain"],
+            cwd=cwd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+        )
+    except Exception as exc:
+        logger.debug("Dirty-tree probe failed: %s", exc)
+        return True
+    if status.returncode != 0:
+        return True
+    return bool((status.stdout or "").strip())
+
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
@@ -3450,6 +3633,802 @@ def _apply_pending_fleet_restart_catchup() -> None:
         return
     print("  ⚠ Fleet restart incomplete. Recover with: hermes gateway restart")
     sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Pre-mutation quiescing (fail-closed)
+# ---------------------------------------------------------------------------
+#
+# The shared checkout is imported by every running Hermes runtime. Moving
+# HEAD (or rewriting site-packages) while those interpreters are alive lets
+# a lazy import pull a NEW module into an OLD module graph — a torn graph
+# the in-process ``_purge_stale_hermes_modules`` cannot help with, because
+# that purge only protects THIS interpreter. So: stop them all first, prove
+# they exited, and only then mutate.
+
+
+def _runtime_pid_alive(pid: int) -> bool:
+    """Cross-platform liveness probe for an inventoried runtime PID."""
+    try:
+        from gateway.status import _pid_exists
+
+        return bool(_pid_exists(int(pid)))
+    except Exception as exc:
+        # Fail closed: an unreadable probe is not proof the process is gone.
+        logger.debug("PID liveness probe failed for %s: %s", pid, exc)
+        return True
+
+
+def _desktop_supervisor_is_gone(runtime) -> bool:
+    """Is the Desktop app that supervises *runtime* provably no longer there?
+
+    Fail-closed: ``False`` unless the recorded spawner ``(pid, create_time)``
+    is provably dead. A missing or unprovable identity counts as "still
+    supervising" — signalling the backend under a live Desktop is answered
+    by a respawn onto pre-update code.
+    """
+    detail = getattr(runtime, "detail", None) or {}
+    if not isinstance(detail, dict):
+        return False
+    spawner_pid = detail.get("spawner_pid")
+    if not isinstance(spawner_pid, int) or spawner_pid <= 0:
+        return False
+    try:
+        from hermes_cli.process_identity import _pid_alive_matches
+
+        alive = _pid_alive_matches(spawner_pid, detail.get("spawner_create"))
+    except Exception as exc:
+        logger.debug("Desktop spawner probe failed for %s: %s", spawner_pid, exc)
+        return False
+    return alive is False
+
+
+def _runtime_identity_still_matches(runtime) -> bool:
+    """Does *runtime*'s PID still name the process the plan inventoried?
+
+    A PID is a reusable name: between the inventory pass and the stop the
+    kernel can reap the runtime and hand the number to anything else on
+    the box. Only the recorded ``(pid, start_time)`` pair distinguishes
+    the two, so this fails CLOSED — no recorded start time, or a probe
+    that cannot answer, is not proof of identity and must not be
+    signalled.
+    """
+    pid = getattr(runtime, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    detail = getattr(runtime, "detail", None) or {}
+    if not isinstance(detail, dict):
+        return False
+    start_time = detail.get("start_time")
+    if start_time is None:
+        return False
+    try:
+        from hermes_cli.process_identity import _pid_alive_matches
+
+        return _pid_alive_matches(pid, float(start_time)) is True
+    except Exception as exc:
+        logger.debug("Runtime identity probe failed for %s: %s", pid, exc)
+        return False
+
+
+def _stop_runtime_for_quiesce(runtime) -> bool:
+    """Stop one inventoried runtime by its EXACT recorded authority.
+
+    A supervised runtime is stopped THROUGH its supervisor
+    (``systemctl stop <unit>``, ``launchctl bootout``) and nothing else: a
+    ``Restart=always`` unit killed by PID is respawned within seconds, on
+    pre-update code, inside the mutation window — which is exactly the
+    generation skew this phase exists to remove, and the old-PID exit
+    check would not catch it (the replacement has a different PID). So a
+    supervisor stop that does not take is a FAILED stop, and the update
+    aborts before mutating. Only an unsupervised runtime is stopped by
+    PID.
+    """
+    pid = getattr(runtime, "pid", None)
+    unit = str(getattr(runtime, "unit", "") or "")
+    scope = str(getattr(runtime, "unit_scope", "") or "")
+    from hermes_cli import update_quiesce
+
+    if str(getattr(runtime, "supervisor", "") or "") == "desktop":
+        # The Desktop app is a supervisor we cannot drive: there is no unit
+        # to stop and no handle to suspend, so any stop we perform is a
+        # plain kill that Desktop answers with a fresh backend — inside the
+        # mutation window, on pre-update code, under a new PID the old-PID
+        # exit check will never look at. Refuse unless Desktop itself is
+        # provably gone.
+        if not _desktop_supervisor_is_gone(runtime):
+            raise update_quiesce.QuiesceAbort(
+                "this serve/dashboard backend is not provably unsupervised: "
+                "the Hermes Desktop app (or whatever spawned it) may still "
+                "be there and would respawn it onto pre-update code during "
+                "the update — quit Hermes Desktop (or stop the backend "
+                "yourself), then retry"
+            )
+    detail = getattr(runtime, "detail", None) or {}
+    if not isinstance(detail, dict):
+        detail = {}
+    if unit and scope == "scm":
+        # Windows SCM: the update's own pause machinery owns these, and it
+        # already ran. Treat an SCM-supervised runtime as stopped once its
+        # PID is gone (the caller verifies that).
+        #
+        # Every exit from this branch is a RETURN, never a fall-through. The
+        # SCM is the authority for this process: killing its PID is answered
+        # by the service manager restarting it on pre-update code, under a
+        # new PID the old-PID exit check never looks at — the exact skew the
+        # supervised-stop rule exists to prevent. A stop we could not perform
+        # is a failed stop.
+        if not _m()._is_windows():
+            logger.debug("Refusing to stop SCM-supervised %s off Windows", unit)
+            return False
+        try:
+            _m()._stop_windows_gateway_service(unit)
+            return True
+        except Exception as exc:
+            logger.debug("sc.exe stop %s failed: %s", unit, exc)
+            return False
+    stop_argv = _supervised_stop_command(
+        unit, scope, domain=str(detail.get("launchd_domain") or "")
+    )
+    if stop_argv is not None:
+        # No PID fallback here — see the docstring. A stop we could not run
+        # (no privileges, missing binary) leaves the supervisor in charge.
+        return _run_supervisor_command(stop_argv)
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if not _runtime_identity_still_matches(runtime):
+        raise update_quiesce.QuiesceAbort(
+            f"PID {pid} no longer identifies the inventoried runtime (the "
+            "kernel may have recycled it onto an unrelated process) — "
+            "re-run the update so the fleet is inventoried afresh"
+        )
+    try:
+        from gateway.status import terminate_pid
+
+        terminate_pid(int(pid), force=False)
+    except Exception as exc:
+        logger.debug("Could not terminate runtime PID %s: %s", pid, exc)
+        return False
+    return True
+
+
+def _systemd_unit_argv(unit: str, scope: str, action: str, *, is_root: bool) -> list:
+    """``systemctl`` argv for *action* on *unit* in *scope*."""
+    cmd = ["systemctl"]
+    if scope == "user":
+        cmd.append("--user")
+    cmd.append("--no-ask-password")
+    if scope == "system" and not is_root:
+        # Non-interactive only: an interactive polkit prompt inside a
+        # captured subprocess flashes and dies before a user can answer.
+        cmd = ["sudo", "-n"] + cmd
+    return cmd + [action, unit]
+
+
+def _current_uid(uid: Optional[int] = None) -> int:
+    if uid is not None:
+        return int(uid)
+    getuid = getattr(os, "getuid", None)
+    return int(getuid()) if getuid else 0
+
+
+def _supervised_stop_command(
+    unit: str,
+    scope: str,
+    *,
+    uid: Optional[int] = None,
+    is_root: Optional[bool] = None,
+    domain: str = "",
+):
+    """Argv that stops *unit* WITHOUT its supervisor respawning it.
+
+    Returns ``None`` for supervisors this function does not drive — the
+    caller then falls back to stopping the PID directly. Pure: the
+    supervisor kind is data on the runtime record, not the host.
+    """
+    if not unit:
+        return None
+    if scope in ("user", "system"):
+        if is_root is None:
+            geteuid = getattr(os, "geteuid", None)
+            is_root = bool(geteuid and geteuid() == 0)
+        return _systemd_unit_argv(unit, scope, "stop", is_root=is_root)
+    if scope == "launchd":
+        # `bootout` UNLOADS the job. `stop`/`kill` would let a KeepAlive
+        # agent respawn immediately — straight back onto pre-update code
+        # inside the mutation window, which is the skew we are removing.
+        #
+        # The DOMAIN is part of the job's identity: a LaunchDaemon lives in
+        # `system`, not in the caller's `gui/<uid>` session, and booting a
+        # label out of a domain it is not in "succeeds" while the job keeps
+        # running. Use the domain the inventory recorded; fall back to the
+        # GUI session only for records written before it was captured.
+        return [
+            "launchctl",
+            "bootout",
+            f"{_launchd_domain(domain, uid)}/{unit}",
+        ]
+    return None
+
+
+def _launchd_domain(domain: str, uid: Optional[int] = None) -> str:
+    """The launchd domain target a job must be addressed in.
+
+    ``domain`` is what the pre-mutation inventory recorded (derived from the
+    directory its plist lives in). Empty means the record predates that
+    capture, and the GUI session is the right default: LaunchAgents are the
+    overwhelmingly common case and the only one the old code handled.
+    """
+    return str(domain or f"gui/{_current_uid(uid)}")
+
+
+def _supervised_restart_command(
+    unit: str,
+    scope: str,
+    *,
+    uid: Optional[int] = None,
+    is_root: Optional[bool] = None,
+    plist: str = "",
+    domain: str = "",
+):
+    """Argv that brings *unit* back from a fresh process. ``None`` if N/A."""
+    if not unit:
+        return None
+    if scope in ("user", "system"):
+        if is_root is None:
+            geteuid = getattr(os, "geteuid", None)
+            is_root = bool(geteuid and geteuid() == 0)
+        return _systemd_unit_argv(unit, scope, "restart", is_root=is_root)
+    if scope == "launchd":
+        domain = _launchd_domain(domain, uid)
+        if plist:
+            # Re-bootstrap the job we booted out; this is the only way back
+            # after an unload.
+            return ["launchctl", "bootstrap", domain, plist]
+        # No recorded plist: the job may still be loaded (an older stop
+        # path), so kickstart is the best available relaunch.
+        return ["launchctl", "kickstart", "-k", f"{domain}/{unit}"]
+    return None
+
+
+def _run_supervisor_command(argv) -> bool:
+    """Run a supervisor argv. False on any failure. Never raises."""
+    if not argv:
+        return False
+    try:
+        result = subprocess.run(
+            list(argv),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug("Supervisor command %s failed: %s", argv, exc)
+        return False
+    if result.returncode != 0:
+        logger.debug(
+            "Supervisor command %s exited %s: %s",
+            argv,
+            result.returncode,
+            (result.stderr or "").strip()[:200],
+        )
+    return result.returncode == 0
+
+
+def _print_quiesce_abort(exc: BaseException) -> None:
+    """Explain why the update refused to touch anything."""
+    print()
+    print("✗ Update aborted before any change was made.")
+    print(f"  {exc}")
+    print()
+    print("  Nothing was fetched, merged, or installed — the checkout is")
+    print("  exactly as it was. Recover by either:")
+    print("    • running the update detached from the gateway: /update")
+    print("    • running `hermes update` from an external shell, outside")
+    print("      any Hermes service's cgroup/process tree")
+    print("    • stopping the listed runtime(s) yourself, then retrying")
+
+
+def _quiesce_exit_budget() -> float:
+    """How long a runtime gets to drain before we escalate.
+
+    Reuses the gateway's own restart drain budget so an in-flight agent
+    turn finishes exactly as it would on ``hermes gateway restart``,
+    instead of being cut short by an update-specific timeout.
+    """
+    try:
+        from hermes_cli.gateway import _get_restart_exit_wait_budget
+
+        return max(float(_get_restart_exit_wait_budget()), 45.0)
+    except Exception as exc:
+        logger.debug("Could not read the gateway drain budget: %s", exc)
+        return 45.0
+
+
+def _escalate_runtime_stop(runtime) -> None:
+    """Force-stop a runtime that ignored the graceful stop.
+
+    Re-checks identity first, and for the same reason the graceful stop
+    does — more urgently, in fact: this is SIGKILL, and by now the
+    graceful stop has had a full drain budget to succeed, which is
+    exactly the window in which the PID could have been freed and reused.
+    """
+    pid = getattr(runtime, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return
+    if not _runtime_identity_still_matches(runtime):
+        logger.debug(
+            "Not escalating PID %s: it no longer identifies the inventoried "
+            "runtime",
+            pid,
+        )
+        return
+    try:
+        from gateway.status import terminate_pid
+
+        terminate_pid(int(pid), force=True)
+    except Exception as exc:
+        logger.debug("Forced stop of %s failed: %s", pid, exc)
+
+
+def _recollect_runtime_inventory():
+    """A fresh read-only fleet inventory, for the pre-mutation gate."""
+    from hermes_cli.update_inventory import collect_runtime_inventory
+
+    return collect_runtime_inventory()
+
+
+def _quiesce_fleet_before_mutation(plan, *, expected_sha: str = ""):
+    """Establish ownership + stop the fleet, or exit before mutating."""
+    from hermes_cli import update_quiesce
+
+    try:
+        report = update_quiesce.run_pre_mutation_quiesce(
+            plan,
+            stop_runtime=lambda runtime: _m()._stop_runtime_for_quiesce(runtime),
+            pid_alive=lambda pid: _m()._runtime_pid_alive(pid),
+            assess_isolation=lambda plan_: update_quiesce.assess_updater_isolation(
+                plan_
+            ),
+            escalate=lambda runtime: _m()._escalate_runtime_stop(runtime),
+            exit_timeout=_quiesce_exit_budget(),
+            expected_sha=expected_sha,
+            on_event=lambda message: print(f"  → {message}"),
+            # The plan above printed the fleet banner minutes ago, before the
+            # fetch and the up-to-date check. Re-inventory HERE, at the moment
+            # the update is actually about to write, or a runtime started in
+            # between is never stopped and keeps importing from the checkout.
+            recollect=_recollect_runtime_inventory,
+        )
+    except update_quiesce.QuiesceAbort as exc:
+        _print_quiesce_abort(exc)
+        try:
+            from hermes_cli.update_receipt import record_step
+
+            record_step("quiesce", False, str(exc))
+        except Exception:
+            pass
+        sys.exit(1)
+    if report.quiesced_pids:
+        print(
+            f"  ✓ Quiesced {len(report.quiesced_pids)} Hermes runtime(s) "
+            "before touching the checkout"
+        )
+    try:
+        from hermes_cli.update_receipt import record_step
+
+        record_step(
+            "quiesce",
+            True,
+            f"stopped={sorted(report.quiesced_pids)}",
+        )
+    except Exception:
+        pass
+    return report
+
+
+def _require_quiesced(what: str, plan=None, *, expected_sha: str = ""):
+    """Gate a mutation site: quiesce the fleet now, or exit before mutating.
+
+    Lazy on purpose. The update cannot know whether it will change
+    anything until after the (read-only) fetch and branch inspection, and
+    an ``already up to date`` run must not bounce every gateway on the
+    box. So each site that is genuinely about to write calls this, and
+    the first such call performs the quiesce; the rest are no-ops.
+    """
+    from hermes_cli import update_quiesce
+
+    report = update_quiesce.authorized_report()
+    if report is not None:
+        return report
+    if plan is not None:
+        return _m()._quiesce_fleet_before_mutation(plan, expected_sha=expected_sha)
+    try:
+        return update_quiesce.assert_mutation_authorized(what)
+    except update_quiesce.QuiesceAbort as exc:
+        _print_quiesce_abort(exc)
+        sys.exit(1)
+
+
+def _open_startup_barrier_for_relaunch() -> bool:
+    """Let the updater's own relaunches through. Never raises."""
+    try:
+        from hermes_cli.process_identity import (
+            BARRIER_PHASE_RELAUNCHING,
+            set_startup_barrier_phase,
+        )
+
+        return bool(set_startup_barrier_phase(BARRIER_PHASE_RELAUNCHING))
+    except Exception as exc:
+        logger.debug("Could not open the startup barrier for relaunch: %s", exc)
+        return False
+
+
+def _release_startup_barrier_after_update() -> bool:
+    """Drop the barrier this process took, once the update is finished.
+
+    Owner-scoped in ``process_identity``, so a command boundary that handed
+    the work to a detached child cannot free the child's lease.
+    """
+    try:
+        from hermes_cli.process_identity import release_startup_barrier
+
+        return bool(release_startup_barrier())
+    except Exception as exc:
+        logger.debug("Could not release the startup barrier: %s", exc)
+        return False
+
+
+def _relaunch_quiesced_runtimes(expected_sha: str = ""):
+    """Bring every quiesced runtime back from a FRESH interpreter.
+
+    Uses the durable record written before the stops, so this works both
+    in the same run and on a retry after an interrupted update. Relaunch
+    goes through the exact recorded unit/label or argv — never a profile
+    substring against a discovery glob, which is how custom units used to
+    be missed entirely.
+    """
+    from hermes_cli import update_quiesce
+
+    state = update_quiesce.read_restart_pending_state()
+    if not state or not state.get("runtimes"):
+        return []
+    # The checkout is whole again, and the next thing we do is start
+    # interpreters against it. Move the startup barrier out of `mutating`
+    # first or the update deadlocks against its own relaunch: every
+    # replacement would consult the lease we are still holding and refuse.
+    # The record stays on disk — it is what a later recovery reads — and
+    # the command boundary removes it once this phase is done.
+    _open_startup_barrier_for_relaunch()
+    if expected_sha:
+        state = dict(state)
+        state["expected_sha"] = expected_sha
+
+    outcomes = update_quiesce.relaunch_recorded_runtimes(
+        state,
+        restart_unit=lambda unit, scope: _m()._restart_supervised_unit(
+            unit, scope, state
+        ),
+        respawn_argv=lambda argv, record: _m()._respawn_recorded_runtime(argv, record),
+        pid_alive=lambda pid: _m()._runtime_pid_alive(pid),
+        probe_sha=lambda record, new_pid: _m()._probe_relaunched_runtime_sha(
+            record, new_pid
+        ),
+        on_event=lambda message: print(f"  → {message}"),
+    )
+    for outcome in outcomes:
+        label = outcome.unit or f"{outcome.kind}[{outcome.profile}]"
+        if outcome.relaunched and outcome.old_pid_gone and outcome.sha_matches:
+            print(f"  ✓ Relaunched {label} @ {(outcome.code_sha or '')[:8]}")
+        elif not outcome.old_pid_gone:
+            print(f"  ✗ {label}: pre-update PID {outcome.old_pid} is still alive")
+        elif not outcome.relaunched:
+            print(f"  ✗ {label}: relaunch failed ({outcome.error or 'unknown'})")
+        else:
+            print(
+                f"  ✗ {label}: replacement reports "
+                f"{(outcome.code_sha or 'unknown')[:8]}, expected "
+                f"{(expected_sha or '')[:8]}"
+            )
+    if update_quiesce.relaunch_is_complete(outcomes):
+        update_quiesce.clear_restart_pending_state()
+    else:
+        # Keep only what is still genuinely down. This function runs twice
+        # per update (restart phase, then the command-boundary backstop in
+        # ``cmd_update``), so leaving an already-relaunched record behind
+        # would have the second pass respawn a duplicate on the same
+        # profile/port.
+        update_quiesce.discharge_relaunched_records(state, outcomes)
+    return outcomes
+
+
+def _restart_supervised_unit(unit: str, scope: str, state: dict | None = None) -> bool:
+    """Bring a supervised runtime back by its EXACT recorded identity."""
+    if not unit:
+        return False
+    if scope == "scm":
+        if not _m()._is_windows():
+            return False
+        try:
+            _m()._restore_windows_gateway_service(unit)
+            return True
+        except Exception as exc:
+            logger.debug("sc.exe start %s failed: %s", unit, exc)
+            return False
+    plist = ""
+    domain = ""
+    for record in (state or {}).get("runtimes") or []:
+        if isinstance(record, dict) and record.get("unit") == unit:
+            detail = record.get("detail")
+            if isinstance(detail, dict):
+                plist = str(detail.get("plist") or "")
+                # The domain the job was booted out of is the only one it can
+                # be bootstrapped back into.
+                domain = str(detail.get("launchd_domain") or "")
+            break
+    return _run_supervisor_command(
+        _supervised_restart_command(unit, scope, plist=plist, domain=domain)
+    )
+
+
+#: The number of argv tokens older ledger entries were truncated at. A legacy
+#: string with exactly this many tokens may have lost everything after it —
+#: including the `--port` a serve backend must come back on — so it is not a
+#: launch authority, it is a guess.
+_LEGACY_ARGV_TOKEN_CAP = 10
+
+
+def _legacy_argv_parts(argv: str):
+    """POSIX-split a legacy joined argv, or ``None`` when it is ambiguous.
+
+    The legacy record was ``" ".join(sys.argv[:10])``, which is lossy in two
+    ways. Truncation is detectable — a string sitting exactly on the cap may
+    be missing arguments. Quoting is the other tell: a plain join never
+    produces quotes, so their presence means the string is not a faithful
+    rendering of the argv and splitting it would invent a different command.
+
+    Respawning the wrong process is worse than not respawning: the caller
+    reports the failure and the operator restarts it, instead of a backend
+    silently coming back on the wrong port or profile.
+
+    The split is POSIX on every OS on purpose. A Windows command line has no
+    faithful inverse of ``list2cmdline``, so a legacy string carrying
+    backslashes or quotes fails the round-trip check and is refused — which
+    is the right answer, and the structured serve/dashboard authority above
+    covers the case that actually matters there.
+    """
+    import shlex
+
+    try:
+        parts = shlex.split(argv)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    if len(parts) >= _LEGACY_ARGV_TOKEN_CAP:
+        logger.debug("Refusing a possibly-truncated legacy argv: %r", argv)
+        return None
+    # The round trip is checked against a PLAIN join, because a plain join is
+    # what produced the string. ``shlex.join`` re-quotes whatever it is given,
+    # so it reproduces a quoted string exactly and accepts the very records
+    # this check exists to refuse — the whole "quoting is the tell" argument
+    # only holds against ``" ".join``. Anything a plain join cannot
+    # regenerate (quotes, runs of whitespace) is not a faithful rendering.
+    if " ".join(parts) != argv.strip():
+        logger.debug("Refusing a legacy argv that does not round-trip: %r", argv)
+        return None
+    return parts
+
+
+def _structured_relaunch_parts(record: dict):
+    """A serve/dashboard launch command built from structured identity.
+
+    ``host``/``port``/``profile`` are recorded as fields, not as text, so
+    they survive spaces and truncation alike. ``None`` when the record is not
+    a serve/dashboard or carries no port.
+    """
+    kind = str(record.get("kind") or "")
+    if kind not in ("serve", "dashboard"):
+        return None
+    detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
+    entry = {
+        "purpose": kind,
+        "profile": record.get("profile") or (detail or {}).get("profile") or "",
+        "host": (detail or {}).get("host") or "",
+        "port": (detail or {}).get("port"),
+    }
+    commands = _m()._serve_relaunch_commands([entry])
+    return commands[0] if commands else None
+
+
+def _recorded_launch_parts(argv: str, record: dict):
+    """The command that brings *record*'s runtime back, or ``None``.
+
+    Authority order — most faithful first:
+
+    1. the lossless recorded argv list, handed to the OS verbatim;
+    2. the structured host/port/profile of a serve/dashboard;
+    3. a legacy joined argv, but only when it is provably unambiguous.
+    """
+    detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
+    argv_list = (detail or {}).get("argv_list")
+    if isinstance(argv_list, (list, tuple)) and argv_list:
+        return [str(part) for part in argv_list]
+    structured = _structured_relaunch_parts(record)
+    if structured:
+        return structured
+    if not argv:
+        return None
+    return _legacy_argv_parts(argv)
+
+
+def _respawn_recorded_runtime(argv: str, record: dict):
+    """Respawn a manually-launched runtime from its recorded launch identity.
+
+    Detached and in a fresh interpreter: the replacement must not inherit
+    this updater's module graph, its process group, or its lifetime.
+
+    Returns ``None`` when nothing faithful was recorded — the caller keeps
+    the relaunch obligation open and reports it, which is the only safe
+    answer when the alternative is starting a DIFFERENT process.
+    """
+    parts = _recorded_launch_parts(argv, record)
+    if not parts:
+        return None
+    env = dict(os.environ)
+    detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
+    home = (detail or {}).get("hermes_home")
+    if home:
+        env["HERMES_HOME"] = str(home)
+    kwargs: dict = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "env": env,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+        )
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(parts, **kwargs)
+    except (OSError, ValueError) as exc:
+        logger.debug("Could not respawn %s: %s", argv, exc)
+        return None
+    return proc.pid
+
+
+#: How long a replacement gets to publish its own code stamp before we call
+#: it unverified. A relaunch returns as soon as the process is CREATED; the
+#: stamp lands when it has booted far enough to write it, which is later.
+RUNTIME_SHA_SETTLE_TIMEOUT = 30.0
+RUNTIME_SHA_POLL_INTERVAL = 0.5
+
+
+def _gateway_stamped_sha(record: dict, new_pid: int | None) -> str | None:
+    """A gateway replacement's own ``gateway_state.json`` stamp.
+
+    The file is keyed by profile, not by process, so the PID inside it is
+    what says WHICH gateway wrote it. Accepting the stamp without that check
+    let the pre-update record (or a co-located gateway that was never
+    stopped) answer for a replacement that had not started.
+    """
+    from gateway.status import read_runtime_status
+    from hermes_cli.profiles import get_profile_dir
+
+    home = get_profile_dir(str(record.get("profile") or "default"))
+    status = read_runtime_status(Path(home) / "gateway_state.json")
+    if not status or not status.get("code_sha"):
+        return None
+    try:
+        stamped_pid = int(status.get("pid"))
+    except (TypeError, ValueError):
+        return None
+    old_pid = record.get("pid")
+    if new_pid is not None:
+        if stamped_pid != int(new_pid):
+            return None
+    elif isinstance(old_pid, int) and stamped_pid == old_pid:
+        # A supervisor relaunch hides the new PID from us, so the weaker
+        # available proof is "not the process we stopped".
+        return None
+    if not _m()._runtime_pid_alive(stamped_pid):
+        return None
+    return str(status["code_sha"])
+
+
+def _ledger_stamped_sha(record: dict, new_pid: int | None) -> str | None:
+    """A serve/dashboard replacement's own spawn-ledger registration.
+
+    These backends never write ``gateway_state.json`` — they self-register
+    in the machine spawn ledger at startup, stamping the source SHA they are
+    running. That registration IS the replacement speaking for itself.
+    """
+    from hermes_cli.process_identity import ledger_entries
+
+    kind = str(record.get("kind") or "")
+    profile = str(record.get("profile") or "")
+    old_pid = record.get("pid")
+    for entry in ledger_entries():
+        if str(entry.get("purpose") or "") != kind:
+            continue
+        sha = str(entry.get("code_sha") or "")
+        if not sha:
+            continue
+        pid = entry.get("pid")
+        if not isinstance(pid, int):
+            continue
+        if new_pid is not None:
+            if pid != int(new_pid):
+                continue
+        else:
+            if isinstance(old_pid, int) and pid == old_pid:
+                continue
+            recorded_profile = str(entry.get("profile") or "")
+            # An empty recorded profile predates the structured fields; it
+            # cannot contradict, so it is allowed to answer.
+            if recorded_profile and profile and recorded_profile != profile:
+                continue
+        return sha
+    return None
+
+
+def _probe_relaunched_runtime_sha(
+    record: dict,
+    new_pid: int | None = None,
+    *,
+    timeout: float | None = None,
+    poll_interval: float | None = None,
+) -> str | None:
+    """Ask the REPLACEMENT which source SHA it is actually running.
+
+    Runtime-kind-correct: a gateway publishes ``gateway_state.json``, a
+    serve/dashboard publishes a spawn-ledger registration. Asking the wrong
+    one produced a permanent ``None`` for serve/dashboard (an obligation
+    that could never discharge) or, worse, let some OTHER gateway's stamp
+    stand in for the replacement.
+
+    ``new_pid`` — when the relaunch was ours to make — is what ties the
+    stamp to the process we started. A supervisor relaunch does not tell us
+    the new PID, so the check degrades to "not the process we stopped",
+    which is still stronger than reading the file blind.
+
+    Bounded polling, because a relaunch returns when the process is created
+    and the stamp lands when it has booted. ``None`` when nothing published
+    inside the window, and deliberately NOT the on-disk checkout SHA: the
+    checkout reads as updated whether the replacement came up on the new
+    graph, came up on a stale venv, or never came up at all.
+    """
+    kind = str(record.get("kind") or "")
+    if kind == "gateway":
+        prove = _gateway_stamped_sha
+    elif kind in ("serve", "dashboard"):
+        prove = _ledger_stamped_sha
+    else:
+        logger.debug("No SHA proof defined for runtime kind %r", kind)
+        return None
+
+    budget = RUNTIME_SHA_SETTLE_TIMEOUT if timeout is None else float(timeout)
+    interval = (
+        RUNTIME_SHA_POLL_INTERVAL if poll_interval is None else float(poll_interval)
+    )
+    deadline = _time.monotonic() + max(budget, 0.0)
+    while True:
+        try:
+            sha = prove(record, new_pid)
+        except Exception as exc:
+            logger.debug("Runtime SHA probe failed: %s", exc)
+            sha = None
+        if sha:
+            return sha
+        if _time.monotonic() >= deadline:
+            return None
+        _time.sleep(max(interval, 0.0))
 
 
 def _format_concurrent_instances_message(
@@ -7338,13 +8317,17 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
             f"  ✓ Restarting {unmapped_relaunched} unmapped Windows gateway process(es)"
         )
 
-def _discard_lockfile_churn(git_cmd, repo_root):
+def _discard_lockfile_churn(git_cmd, repo_root, *, before_mutate=None):
     """Restore tracked ``package-lock.json`` files that npm dirtied locally.
 
     npm rewrites lockfiles non-deterministically at install/build time. On a
     managed install those diffs are never intentional, so we discard them so
     ``hermes update`` sees a clean tree instead of autostashing every run.
     Best-effort; only ever touches files named ``package-lock.json``.
+
+    ``before_mutate`` is invoked only when there is actually something to
+    restore — it is the update's pre-mutation quiesce gate, and a clean
+    tree must not pay for it.
     """
     try:
         diff = subprocess.run(
@@ -7368,6 +8351,8 @@ def _discard_lockfile_churn(git_cmd, repo_root):
         ]
         if not dirty:
             return
+        if before_mutate is not None:
+            before_mutate("npm lockfile restore")
         subprocess.run(
             git_cmd + ["checkout", "--", *dirty],
             cwd=repo_root,
@@ -7380,7 +8365,7 @@ def _discard_lockfile_churn(git_cmd, repo_root):
         # Never let lockfile cleanup block an update.
         pass
 
-def _normalize_managed_eol(git_cmd, repo_root):
+def _normalize_managed_eol(git_cmd, repo_root, *, before_mutate=None):
     """Take a managed checkout off ``core.autocrlf=true`` without leaving it dirty.
 
     Git for Windows ships ``core.autocrlf=true`` in its system config, which
@@ -7464,6 +8449,10 @@ def _normalize_managed_eol(git_cmd, repo_root):
         if eol_only is None:
             return
         if eol_only:
+            # This rewrites tracked working-tree files, so it is a real
+            # checkout mutation and must pass the update's quiesce gate.
+            if before_mutate is not None:
+                before_mutate("line-ending normalization")
             # Pathspec over stdin, not argv: a fully renormalized checkout is
             # thousands of paths, well past the Windows command-line limit.
             subprocess.run(
@@ -8066,11 +9055,33 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # tree dirty — forcing an autostash on every update and making branch
     # switches fragile. Restoring them first lets the common case (only
     # lockfile churn) update with a clean tree.
-    _discard_lockfile_churn(git_cmd, _m().PROJECT_ROOT)
+    # ── Fail-closed pre-mutation quiesce ──────────────────────────────────
+    # Everything from here on can change the checkout or the venv that
+    # every running Hermes runtime imports from. Before the FIRST such
+    # write we establish updater ownership outside the fleet's supervisor
+    # cgroups/process trees, stop every inventoried runtime, and confirm
+    # each old PID is gone. Isolation failure, an incomplete inventory, or
+    # a stop that does not take aborts the update with nothing mutated.
+    #
+    # The gate is threaded through each writing site rather than fired
+    # unconditionally here: a clean, already-up-to-date `hermes update`
+    # writes nothing, and must not bounce the fleet for a no-op.
+    _quiesce_expected_sha = str(getattr(_pre_update_plan, "expected_sha", "") or "")
+
+    def _gate_mutation(what: str):
+        _m()._require_quiesced(
+            what, _pre_update_plan, expected_sha=_quiesce_expected_sha
+        )
+
+    _discard_lockfile_churn(
+        git_cmd, _m().PROJECT_ROOT, before_mutate=_gate_mutation
+    )
     # Same rationale, different generator: line-ending churn is machine-made
     # dirt on a managed checkout, so clear it (and stop generating it) before
     # the stash/branch logic rather than autostashing the entire tree.
-    _normalize_managed_eol(git_cmd, _m().PROJECT_ROOT)
+    _normalize_managed_eol(
+        git_cmd, _m().PROJECT_ROOT, before_mutate=_gate_mutation
+    )
 
     # Detect if we're updating from a fork (before any branch logic)
     origin_url = _m()._get_origin_url(git_cmd, _m().PROJECT_ROOT)
@@ -8082,16 +9093,38 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print()
 
     if use_zip_update:
-        # ZIP-based update for Windows when git is broken
+        # ZIP-based update for Windows when git is broken. It replaces the
+        # checkout wholesale, so it needs the same pre-mutation quiesce as
+        # the git path.
+        _gate_mutation("zip overlay update")
+        # The ZIP path has no restart phase of its own, so the relaunch is
+        # threaded INTO it rather than left to the command-boundary backstop
+        # — that backstop passes no expected SHA and discards its outcomes,
+        # which is how a ZIP update came to report success over a fleet it
+        # had never checked.
+        zip_fleet = {"ok": True}
+
+        def _relaunch_fleet_for_zip() -> bool:
+            zip_fleet["ok"] = _m()._relaunch_fleet_after_zip_update(
+                _windows_gateway_resume
+            )
+            return zip_fleet["ok"]
+
         try:
             desktop_build_ok = _update_via_zip(
                 args,
                 had_desktop_app_before_update=had_desktop_app_before_update,
+                relaunch_fleet=_relaunch_fleet_for_zip,
             )
         finally:
+            # Safety net only: the relaunch above already resumed on the
+            # normal path, and the token makes a second call a no-op.
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
-        if gateway_mode:
-            _write_gateway_update_exit_code(desktop_build_ok)
+        _finish_zip_update(
+            desktop_build_ok=desktop_build_ok,
+            fleet_ok=zip_fleet["ok"],
+            gateway_mode=gateway_mode,
+        )
         return
 
     # Fetch and pull
@@ -8242,6 +9275,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "for update..."
                 )
             # Stash before checkout so uncommitted work isn't lost
+            _gate_mutation("git branch switch")
             auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
             checkout_result = subprocess.run(
                 git_cmd + ["checkout", branch],
@@ -8276,6 +9310,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
         else:
+            # `git stash push` rewrites the working tree. Same-branch case,
+            # same gate as the branch-switch path above.
+            if _m()._update_tree_is_dirty(git_cmd, _m().PROJECT_ROOT):
+                _gate_mutation("git stash")
             auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
 
         prompt_for_restore = (
@@ -8338,6 +9376,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # repo, so "Already up to date!" is fully verified there.
         upstream_checked = True
         if commit_count == 0 and is_fork and branch == "main":
+            # An upstream sync can advance HEAD even when origin matched,
+            # so it is a checkout mutation like any other.
+            _gate_mutation("fork upstream sync")
             pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
             upstream_checked = _m()._sync_with_upstream_if_needed(
                 git_cmd,
@@ -8432,6 +9473,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if handed_off_sync or not healthy:
                 # Self-lock deferral (#86735): the repair rewrites the venv
                 # too — same mapped-extension hazard as the update sync.
+                _gate_mutation("python dependencies (venv repair)")
                 _m()._abort_dependency_sync_if_self_locked(_windows_gateway_resume)
                 _write_update_incomplete_marker()
                 from hermes_cli.managed_uv import ensure_uv
@@ -8533,6 +9575,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Shallow checkout, exact count unrecoverable (offline/rate-limited
             # compare API) — the tips differ, so there IS an update.
             print("→ Updates available (commit count unknown on this shallow checkout)")
+
+        # The checkout is about to move. This is the mutation the whole
+        # quiesce phase exists for: nothing may still be importing from
+        # this tree once HEAD advances.
+        _gate_mutation("git merge")
 
         print("→ Pulling updates...")
         update_succeeded = False
@@ -8805,6 +9852,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # holds a native extension the sync must rewrite, defer NOW — after
         # the code swap, so only the dependency install is pending and the
         # next fresh launch completes it via the marker.
+        _gate_mutation("python dependencies")
         _m()._abort_dependency_sync_if_self_locked(_windows_gateway_resume)
         #
         # Drop the core-install breadcrumb BEFORE touching the venv. If the
@@ -9353,6 +10401,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # freshly-restarted gateways to settle, and the phase's except
         # path forwards it to the update receipt.
         killed_pids: set = set()
+        # PIDs the quiesce phase relaunched itself. The late dashboard
+        # sweep matches on cmdline, not age, so it must skip them.
+        _relaunched_pids: set = set()
 
         # Auto-restart ALL gateways after update.
         # The code update (git pull) is shared across all profiles, so every
@@ -9365,6 +10416,41 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # ImportError and abort this whole phase (2026-08-20 field failure:
         # new gateway.py ← stale cli_output missing line_input).
         _m()._purge_stale_hermes_modules()
+
+        # Relaunch what the pre-mutation quiesce stopped, by its EXACT
+        # recorded supervisor unit/label or launch argv. This runs before
+        # the discovery-glob branches below because those only ever see
+        # `hermes-gateway*` / `hermes-serve*` units — a custom unit
+        # (`acme-dash.service`) is invisible to them, and after the quiesce
+        # there is no live process left for them to find either way.
+        try:
+            for _outcome in _m()._relaunch_quiesced_runtimes(post_pull_sha or "") or ():
+                # Only a relaunch that came back, left no old PID behind AND
+                # reports the post-update SHA counts as coverage. Anything
+                # else is a stale runtime, which is the failure this phase
+                # exists to surface.
+                _ok = (
+                    _outcome.relaunched
+                    and _outcome.old_pid_gone
+                    and _outcome.sha_matches
+                )
+                if _ok and _outcome.unit:
+                    restarted_services.append(_outcome.unit)
+                elif _ok:
+                    relaunched_profiles.append(_outcome.profile)
+                elif _outcome.unit:
+                    failed_or_stale_units.append(_outcome.unit)
+                else:
+                    gateway_fleet_restart_incomplete = True
+                if _outcome.old_pid is not None and _outcome.old_pid_gone:
+                    killed_pids.add(int(_outcome.old_pid))
+                if isinstance(_outcome.new_pid, int):
+                    _relaunched_pids.add(int(_outcome.new_pid))
+        except Exception as _relaunch_exc:
+            logger.debug("Quiesced-runtime relaunch failed: %s", _relaunch_exc)
+            gateway_restart_phase_errors.append(str(_relaunch_exc))
+            gateway_fleet_restart_incomplete = True
+
         try:
             from hermes_cli.gateway import (
                 is_macos,
@@ -9534,10 +10620,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
             except Exception:
                 _drain_budget = 45.0
 
-            failed_or_stale_units = []
-            killed_pids = set()
-            relaunched_profiles = []
-            externally_supervised_profiles = []
+            # NOTE: the four restart bookkeeping collections are initialised
+            # ONCE, above the enclosing try — deliberately. They are already
+            # populated by the quiesced-runtime relaunch that runs before this
+            # block, and re-initialising them here erased every outcome it
+            # recorded (a relaunched runtime read as unaccounted, a failed one
+            # as a clean update). The platform branches below only ever append.
 
             # Record which gateways are running before any stop/drain, so a
             # later failure that leaves the survivor probe empty can still be
@@ -10314,7 +11402,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # #83438) so a Serve-only install's freshly restarted process isn't
         # found and restarted again below (review on #83595).
         _finish_dashboard_update_cleanup(
-            node_failures, already_restarted_units=set(restarted_services)
+            node_failures,
+            already_restarted_units=set(restarted_services),
+            exclude_pids=set(_relaunched_pids),
         )
 
         print()
