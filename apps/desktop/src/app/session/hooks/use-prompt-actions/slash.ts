@@ -52,6 +52,7 @@ import {
   type WakeStatusResponse,
   type WakeStopResponse
 } from '@/store/wake-word'
+import type { SessionMessage } from '@/types/hermes'
 
 import type {
   BrowserManageResponse,
@@ -572,6 +573,49 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             )
 
             sessionId = liveSessionId
+
+            // RC1 indeterminate: worker still running past 120s waiter. Poll durable attempt status.
+            const indeterminateAttemptId = result.attempt_id
+            if (result.status === 'indeterminate' && indeterminateAttemptId) {
+              notify({
+                durationMs: 15_000,
+                id: noticeId,
+                kind: 'info',
+                message: `compressing in background (attempt ${indeterminateAttemptId.slice(0, 8)}…) — polling for result…`
+              })
+              // Poll session.status(attempt_id) a few times to settle into canonical projection
+              const poll = async () => {
+                for (let i = 0; i < 40; i++) {
+                  await new Promise(r => setTimeout(r, 3000))
+                  try {
+                    const st = await requestGateway<Record<string, unknown>>('session.status', {
+                      session_id: sessionId,
+                      attempt_id: indeterminateAttemptId
+                    } as unknown as Record<string, unknown>, 10_000)
+                    const state = String((st as Record<string, unknown>)?.state ?? '')
+                    if (state === 'committed') {
+                      const stale = Boolean((st as Record<string, unknown>)?.stale)
+                      // Fetch authoritative history so the transcript actually disappears
+                      try {
+                        const hist = await requestGateway<{ messages?: SessionMessage[] }>('session.history', { session_id: sessionId } as unknown as Record<string, unknown>, 10_000)
+                        if (Array.isArray(hist?.messages)) {
+                          updateSessionState(sessionId, s => ({ ...s, messages: toChatMessages(hist.messages!) }), storedSessionId)
+                        }
+                      } catch { /* history fetch failed — ignore, notify still fires below */ }
+                      notify({ durationMs: 5_000, id: noticeId, kind: stale ? 'error' : 'success', message: stale ? 'compression superseded by newer rotation' : 'compressed (late settlement)' })
+                      break
+                    }
+                    if (state === 'aborted') {
+                      const reason = String((st as Record<string, unknown>)?.reason ?? 'aborted')
+                      notify({ durationMs: 5_000, id: noticeId, kind: 'error', message: `compression aborted: ${reason}` })
+                      break
+                    }
+                  } catch { /* session.status poll error — continue polling */ }
+                }
+              }
+              poll().catch(() => {})
+              return
+            }
 
             // Replace the transcript with the post-compress history so the
             // summarized bubbles actually disappear. `messages` is the same

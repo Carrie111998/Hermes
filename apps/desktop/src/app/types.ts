@@ -76,6 +76,13 @@ export interface SessionCompressResponse {
     token_line?: string
   }
   usage?: Partial<UsageStats>
+  // RC1: indeterminate response fields (status === 'indeterminate')
+  attempt_id?: string
+  session_key?: string
+  parent_session_id?: string
+  input_watermark?: number
+  input_history_version?: number
+  reason?: string
 }
 
 export interface SessionSteerResponse {

@@ -453,6 +453,9 @@ class HostSupervisor:
             return
         if ftype in {"control.ack", "control.error", "respond.ack", "respond.error", "interrupt.ack", "reload_mcp.ack", "shutdown.ack"}:
             request_id = str(frame.get("request_id") or "")
+            route_name = str(frame.get("route_name") or frame.get("route") or "")
+            # RC1 late-ACK path: waiter already timed out and popped the queue.
+            # Correlate via attempt_id == request_id and perform DB-authoritative projection.
             with self._lock:
                 q = self._pending_controls.get(request_id)
             if q is not None:
@@ -460,7 +463,15 @@ class HostSupervisor:
                     q.put_nowait(frame)
                 except queue.Full:
                     pass
+                return
+            # q is None — waiter gone. If this is a session.compress late ACK, settle via DB.
+            if ftype in {"control.ack", "control.error"} and route_name == "session.compress" and request_id:
+                try:
+                    self._handle_late_compression_ack(request_id, frame)
+                except Exception as _late_exc:
+                    logger.warning("late compression ack handling failed for %s: %s", request_id, _late_exc)
             return
+        # fallback for error with request_id already handled via control.* above
         if ftype == "error" and frame.get("request_id"):
             request_id = str(frame.get("request_id") or "")
             with self._lock:
@@ -547,6 +558,24 @@ class HostSupervisor:
                     logger.exception("compute host respawn failed")
 
         _Thread(target=_respawn, name="compute-host-respawn", daemon=True).start()
+
+    def _handle_late_compression_ack(self, request_id: str, frame: dict[str, Any]) -> None:
+        """RC1: DB-authoritative late settlement for session.compress when waiter gone.
+
+        Attempt_id == request_id. Uses DB as source of truth; duplicate ACKs are idempotent.
+        """
+        try:
+            from tui_gateway import server as _srv  # lazy to avoid circular at import
+
+            # Prefer server's canonical projection helper if present
+            handler = getattr(_srv, "_handle_late_compression_attempt", None)
+            if callable(handler):
+                handler(request_id, frame)
+                return
+            # Fallback: minimal DB lookup + log (server may not have helper yet)
+            logger.info("late compression ack for attempt %s type=%s (no server handler)", request_id, frame.get("type"))
+        except Exception as _e:
+            logger.warning("late compression ack delegate failed %s: %s", request_id, _e)
 
     def _pid_matches_compute_host(self, pid: int) -> bool:
         return is_compute_host_identity(pid)

@@ -2736,6 +2736,34 @@ def _(rid, params: dict) -> dict:
 
 @method("session.status")
 def _(rid, params: dict) -> dict:
+    # RC1: durable attempt status when attempt_id supplied
+    attempt_id = str(params.get("attempt_id") or "").strip() if params else ""
+    if attempt_id:
+        try:
+            from hermes_state import SessionDB as _SDB
+            from agent.compression_attempt import build_attempt_status_response
+            from agent.compression_settlement import project_attempt_to_session
+
+            _sdb = _SDB()
+            out = build_attempt_status_response(_sdb, attempt_id)
+            if out.get("state") == "not_found":
+                return _ok(rid, out)
+
+            # Lazy projection: if committed and positively proven current (stale=False), project
+            stale_val = out.get("stale")
+            if out.get("state") == "committed" and stale_val is False:
+                try:
+                    from tui_gateway import server as _srv
+                    from tui_gateway.server import _restart_slash_worker as _rsw
+                    project_attempt_to_session(
+                        _sdb, attempt_id, getattr(_srv, "_sessions", {}), _rsw
+                    )
+                except Exception:
+                    pass
+
+            return _ok(rid, out)
+        except Exception as _e:
+            return _err(rid, 5001, f"session.status(attempt_id) failed: {_e}")
     session, err = _sess_nowait(params, rid)
     if err:
         return err
@@ -2899,15 +2927,43 @@ def _(rid, params: dict) -> dict:
         sid = str(params.get("session_id") or "")
         focus_topic = str(params.get("focus_topic", "") or "").strip()
         command = "/compress" + (f" {focus_topic}" if focus_topic else "")
+        # RC1: create durable attempt bound to family key + watermark, unified attempt_id == request_id
+        import queue as _queue
+        try:
+            with _session_db(session) as _db:
+                from agent.compression_dispatch import create_attempt_for_dispatch
+                attempt_id, family_key, parent_session_id, input_watermark, input_history_version = (
+                    create_attempt_for_dispatch(_db, session, sid)
+                )
+        except Exception as exc:
+            return _err(rid, 5001, f"compression attempt creation failed: {exc}")
+        # Stash attempt_id on gateway session for late-ack projection correlation
+        try:
+            session["_active_compression_attempt_id"] = attempt_id
+        except Exception:
+            pass
         try:
             ack = _send_compute_host_control(
                 sid,
                 route_name="session.compress",
                 command=command,
+                payload={"request_id": attempt_id},
                 wait=True,
                 timeout=120.0,
             )
+        except _queue.Empty:
+            from agent.compression_dispatch import build_indeterminate_response
+            return _ok(rid, build_indeterminate_response(
+                attempt_id, family_key, parent_session_id, input_watermark, input_history_version
+            ))
         except Exception as exc:
+            # If waiter timed out but not as queue.Empty (wrapper), check message
+            msg = str(exc)
+            if "Empty" in msg or "timed out" in msg.lower():
+                from agent.compression_dispatch import build_indeterminate_response
+                return _ok(rid, build_indeterminate_response(
+                    attempt_id, family_key, parent_session_id, input_watermark, input_history_version
+                ))
             return _err(rid, 5019, f"compute-host compress failed: {exc}")
         if ack.get("type") in {"control.error", "error"}:
             return _err(rid, 4009, str(ack.get("message") or "compute-host compress failed"))
@@ -2950,6 +3006,33 @@ def _(rid, params: dict) -> dict:
 
     sid = params.get("session_id", "")
     focus_topic = str(params.get("focus_topic", "") or "").strip()
+    # RC1 in-process path: if attempt_id already supplied (compute_host forwarded), reuse it;
+    # otherwise create one inline so publish can bind to it (no 120s waiter here)
+    attempt_id_in = str(params.get("attempt_id") or "").strip() or None
+    if attempt_id_in:
+        try:
+            _agent_tmp = session.get("agent")
+            if _agent_tmp is not None:
+                _agent_tmp._active_compression_attempt_id = attempt_id_in
+        except Exception:
+            pass
+    else:
+        # No forwarded attempt — create one for this direct call so settlement binds
+        try:
+            with _session_db(session) as _db_in:
+                from agent.compression_dispatch import create_attempt_for_inline_compress
+                attempt_id_in, _fam_in, _pid_in, _wm_in, _hv_in = (
+                    create_attempt_for_inline_compress(_db_in, session, sid)
+                )
+                try:
+                    _ag2 = session.get("agent")
+                    if _ag2 is not None:
+                        _ag2._active_compression_attempt_id = attempt_id_in
+                except Exception:
+                    pass
+        except Exception as exc:
+            # Hard admission gate: if attempt creation fails, refuse work
+            return _err(rid, 5001, f"compression attempt creation failed: {exc}")
     try:
         from agent.manual_compression_feedback import summarize_manual_compression
         from agent.model_metadata import estimate_request_tokens_rough

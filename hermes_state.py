@@ -73,6 +73,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     is_automatic_end_reason,
     _RESET_END_REASONS,
     _RESET_END_REASONS_SQL,
+    is_automatic_end_reason,
     _ephemeral_child_sql,
     _legacy_reset_child_sql,
     _shape_preview,
@@ -7674,6 +7675,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         lease_ttl_seconds: float = 300.0,
         watermark: Optional[int] = None,
         watermark_ceiling: Optional[int] = None,
+        attempt_id: Optional[str] = None,
+        session_info_json: Optional[str] = None,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -7703,8 +7706,50 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         that stopped due to transient DB failures one final chance to extend
         the lease, preventing wasted compression work. The refresh uses the
         same ``conn`` as the publication, so there is no TOCTOU window.
+
+        When *attempt_id* is provided, terminal settlement is bound to that
+        exact attempt: the row is CAS'd from running→committed inside this
+        same BEGIN IMMEDIATE, so committed-without-child and double-settlement
+        are impossible.
         """
+        # ── Phase 0: Atomic stale_parent_ended abort (separate transaction) ──
+        # If the parent has already ended, we must transition the attempt to
+        # 'aborted' durably BEFORE the main publish transaction.  Using a
+        # separate _execute_write ensures this abort is committed even if the
+        # main transaction later rolls back — preventing the attempt from
+        # being stuck in 'running' with no recovery path.
+        if attempt_id:
+            def _abort_if_parent_ended(conn):
+                prow = conn.execute(
+                    "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                    (parent_session_id,),
+                ).fetchone()
+                if prow is not None and (prow["ended_at"] if isinstance(prow, sqlite3.Row) else prow[0]) is not None:
+                    end_reason = prow["end_reason"] if isinstance(prow, sqlite3.Row) else (prow[1] if len(prow) > 1 else None)
+                    if not is_automatic_end_reason(end_reason):
+                        conn.execute(
+                            "UPDATE compression_attempts SET state='aborted', "
+                            "reason='stale_parent_ended', updated_at=? "
+                            "WHERE attempt_id=? AND state='running'",
+                            (time.time(), attempt_id),
+                        )
+                        return True
+                return False
+            try:
+                aborted = self._execute_write(_abort_if_parent_ended)
+                if aborted:
+                    raise RuntimeError(f"Compression parent already ended: {parent_session_id}")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass  # Best-effort: if abort fails, continue to main transaction
+
         def _do(conn):
+            # ── Pre-CAS validation (lease, parent, attempt state) ────────
+            # These checks run BEFORE the CAS so failure raises BEFORE
+            # any state mutation.  The CAS itself is deferred until after
+            # all validation passes, ensuring a single-commit atomicity
+            # for committed-without-child / stuck-in-aborted是不可能.
             if require_lease_refresh and compression_lock_holder:
                 conn.execute(
                     "UPDATE compression_locks SET expires_at = ? "
@@ -7712,19 +7757,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (time.time() + lease_ttl_seconds, parent_session_id,
                      compression_lock_holder),
                 )
-            lock_row = conn.execute(
-                "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
-                (parent_session_id,),
-            ).fetchone()
-            if require_compression_lease and (
-                lock_row is None
-                or not compression_lock_holder
-                or lock_row["holder"] != compression_lock_holder
-                or float(lock_row["expires_at"]) <= time.time()
-            ):
-                raise CompressionSessionBusyError(
-                    f"Compression lease lost before publication: {parent_session_id}"
-                )
+            if require_compression_lease:
+                lock_row = conn.execute(
+                    "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
+                    (parent_session_id,),
+                ).fetchone()
+                if (
+                    lock_row is None
+                    or not compression_lock_holder
+                    or lock_row["holder"] != compression_lock_holder
+                    or float(lock_row["expires_at"]) <= time.time()
+                ):
+                    raise CompressionSessionBusyError(
+                        f"Compression lease lost before publication: {parent_session_id}"
+                    )
             parent = conn.execute(
                 """SELECT ended_at, end_reason, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
@@ -7759,6 +7805,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise RuntimeError(
                         f"Compression parent already ended: {parent_session_id}"
                     )
+            if attempt_id:
+                arow = conn.execute(
+                    "SELECT state, holder FROM compression_attempts WHERE attempt_id=?",
+                    (attempt_id,),
+                ).fetchone()
+                if arow is None:
+                    raise RuntimeError(f"compression attempt not found: {attempt_id}")
+                astate = arow["state"] if isinstance(arow, sqlite3.Row) else arow[0]
+                if astate != "running":
+                    raise RuntimeError(f"compression attempt not running: {attempt_id} state={astate}")
+            # ── Exactly-once CAS: running → committed ────────────────────
+            # Placed AFTER all validation so the transaction either:
+            #   (a) commits the CAS + child INSERT + parent end atomically, or
+            #   (b) rolls back everything on any failure — no partial state.
+            if attempt_id:
+                now3 = time.time()
+                cur = conn.execute(
+                    "UPDATE compression_attempts SET state='committed', child_session_key=?, updated_at=? "
+                    "WHERE attempt_id=? AND state='running'",
+                    (child_session_id, now3, attempt_id),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError(f"compression attempt concurrently settled: {attempt_id}")
             if not messages:
                 raise RuntimeError("Compression child handoff must not be empty")
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
@@ -7848,6 +7917,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
                 (total_messages, total_tool_calls, child_session_id),
             )
+            if attempt_id:
+                # Fill remaining attempt fields after we know the counts
+                conn.execute(
+                    "UPDATE compression_attempts SET message_count=?, session_info_json=?, updated_at=? "
+                    "WHERE attempt_id=?",
+                    (total_messages, session_info_json, time.time(), attempt_id),
+                )
             updated = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
                 "WHERE id = ? AND ended_at IS NULL",
@@ -8800,6 +8876,53 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if row is None:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
+    # ── RC1 durable compression attempts ──────────────────────────────────
+    # Thin delegations to agent.compression_attempt (bounded module).
+    def create_compression_attempt(
+        self,
+        *,
+        attempt_id: str,
+        session_key: str,
+        parent_session_id: str,
+        input_history_version: int,
+        input_watermark: int,
+        holder: str,
+    ) -> None:
+        from agent.compression_attempt import create_compression_attempt as _create
+        _create(
+            self,
+            attempt_id=attempt_id,
+            session_key=session_key,
+            parent_session_id=parent_session_id,
+            input_history_version=input_history_version,
+            input_watermark=input_watermark,
+            holder=holder,
+        )
+
+    def transition_compression_attempt_to_running(
+        self, attempt_id: str, holder: str
+    ) -> bool:
+        from agent.compression_attempt import transition_to_running as _tr
+        return _tr(self, attempt_id, holder)
+
+    def transition_compression_attempt_pending_to_running(self, attempt_id: str) -> bool:
+        from agent.compression_attempt import transition_pending_to_running as _tr
+        return _tr(self, attempt_id)
+
+    def get_compression_attempt(self, attempt_id: str) -> Optional[Dict[str, Any]]:
+        from agent.compression_attempt import get_compression_attempt as _get
+        return _get(self, attempt_id)
+
+    def _is_compression_attempt_stale(
+        self, attempt: Dict[str, Any] | str
+    ) -> Optional[bool]:
+        from agent.compression_attempt import is_compression_attempt_stale as _stale
+        return _stale(self, attempt)
+
+    def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
+        from agent.compression_attempt import get_compression_lock_holder as _holder
+        return _holder(self, session_id)
 
     def touch_session_activity(
         self,

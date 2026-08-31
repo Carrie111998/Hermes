@@ -7172,6 +7172,15 @@ def _compress_session_history(
     return len(history) - len(compressed), usage
 
 
+def _handle_late_compression_attempt(attempt_id: str, frame: dict) -> None:
+    """RC1: DB-authoritative late projection for committed attempt when waiter gone.
+
+    Delegates to agent.compression_settlement (bounded module).
+    """
+    from agent.compression_settlement import resolve_late_compression_ack
+    resolve_late_compression_ack(attempt_id, frame, _sessions, _restart_slash_worker)
+
+
 def _sync_session_key_after_compress(
     sid: str,
     session: dict,

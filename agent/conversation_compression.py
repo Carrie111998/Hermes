@@ -2188,7 +2188,13 @@ def _compression_lock_holder(agent: Any) -> str:
     same thread (background_review forks run on a worker thread, but
     on machines where compression itself dispatches to a thread pool
     we want each acquire to be unique).
+    RC1: when an active compression attempt_id is present on the agent,
+    use it as the holder so DB lock holder == attempt_id (unified identity).
     """
+    # RC1 unified identity
+    attempt = getattr(agent, "_active_compression_attempt_id", None)
+    if isinstance(attempt, str) and attempt:
+        return attempt
     import threading
     return (
         f"pid={os.getpid()}"
@@ -3527,6 +3533,15 @@ def compress_context(
                             _lock_sid, _wm_err,
                         )
                         _commit_watermark = None
+                    # RC1: mark attempt running after lock acquired
+                    _attempt_id = getattr(agent, "_active_compression_attempt_id", None)
+                    if isinstance(_attempt_id, str) and _attempt_id and _lock_db is not None:
+                        try:
+                            _lock_db.transition_compression_attempt_pending_to_running(
+                                _attempt_id
+                            )
+                        except Exception:
+                            pass
             except Exception as _lock_err:
                 # The method exists and entered its implementation but failed.
                 # Do not mistake an internal AttributeError or TypeError for
@@ -4893,6 +4908,12 @@ def compress_context(
                             else None
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
+                        attempt_id=getattr(agent, "_active_compression_attempt_id", None),
+                        session_info_json=json.dumps(
+                            {"model": getattr(agent, "model", ""), "message_count": len(compressed)}
+                        )
+                        if getattr(agent, "_active_compression_attempt_id", None)
+                        else None,
                     )
                     # For the `already_present` outcome the live-dict stamping is
                     # handled by the run_agent _compress_context wrapper's

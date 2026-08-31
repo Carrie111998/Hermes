@@ -753,11 +753,21 @@ class ComputeHost:
             if route_name == "session.compress":
                 command = str(frame.get("command") or "")
                 focus_topic = command.removeprefix("/compress").strip()
+                attempt_id = str(frame.get("request_id") or request_id or "")
+                # RC1: propagate unified attempt_id to the agent so lock holder == attempt_id
+                try:
+                    _sess = server._sessions.get(sid) if hasattr(server, "_sessions") else None
+                    _ag = _sess.get("agent") if isinstance(_sess, dict) else None
+                    if _ag is not None and attempt_id:
+                        _ag._active_compression_attempt_id = attempt_id
+                except Exception:
+                    pass
                 response = server._methods["session.compress"](
                     request_id,
                     {
                         "session_id": sid,
                         **({"focus_topic": focus_topic} if focus_topic else {}),
+                        **({"attempt_id": attempt_id} if attempt_id else {}),
                     },
                 )
                 if "error" in response:

@@ -10387,17 +10387,17 @@ def test_session_compress_forwards_120_second_budget_to_compute_host(monkeypatch
         server._sessions.pop("sid", None)
 
     assert resp["result"]["status"] == "compressed"
-    assert calls == [
-        (
-            ("sid",),
-            {
-                "route_name": "session.compress",
-                "command": "/compress",
-                "wait": True,
-                "timeout": 120.0,
-            },
-        )
-    ]
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args == ("sid",)
+    assert kwargs["route_name"] == "session.compress"
+    assert kwargs["command"] == "/compress"
+    assert kwargs["wait"] is True
+    assert kwargs["timeout"] == 120.0
+    # RC1: request_id must be present (durable attempt correlation)
+    assert "payload" in kwargs
+    assert isinstance(kwargs["payload"]["request_id"], str)
+    assert len(kwargs["payload"]["request_id"]) > 0
 
 
 def test_session_compress_preserves_compute_host_aborted_summary(monkeypatch):

@@ -544,6 +544,25 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS compression_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    session_key TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL,
+    input_history_version INTEGER NOT NULL,
+    input_watermark INTEGER NOT NULL,
+    holder TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','running','committed','aborted')),
+    reason TEXT,
+    child_session_key TEXT,
+    message_count INTEGER,
+    session_info_json TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_compression_attempts_session_key_state
+    ON compression_attempts(session_key, state);
+
 CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
