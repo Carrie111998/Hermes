@@ -172,7 +172,9 @@ export function useSessionStateCache({
             // rotates here too, and its pane would otherwise keep the stale id
             // (duplicate/differently-titled tabs). Mirrors handleTransition's
             // rekey, which this path can skip when the state updater is a no-op.
-            rekeySessionTile(existing.storedSessionId, storedSessionId ?? '')
+            if (storedSessionId) {
+              rekeySessionTile(existing.storedSessionId, storedSessionId, sessionId)
+            }
 
             // A rotation event needs a real next id — a null/cleared stored id
             // is a detach, not a rotation the route-follow effect should chase.

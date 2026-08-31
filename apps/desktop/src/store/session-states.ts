@@ -82,10 +82,15 @@ export const $sessionStates = atom<Record<string, ClientSessionState>>({})
 // ---------------------------------------------------------------------------
 
 const sessionScopeByRuntimeId = new Map<string, string>()
+const sessionOwnerByRuntimeId = new Map<string, SessionOwnerRoute>()
 
 export function recordSessionEventScope(event: { connectionId?: string; profile?: string; session_id?: string }): void {
   if (event.session_id && event.connectionId) {
     sessionScopeByRuntimeId.set(event.session_id, registryBackendScopeKey(event.connectionId, event.profile))
+    sessionOwnerByRuntimeId.set(event.session_id, {
+      connectionId: event.connectionId,
+      profile: normalizeProfileKey(event.profile)
+    })
   }
 }
 
@@ -364,7 +369,7 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
     // conversation keeps ONE pane (#98622). Not gated on the active runtime:
     // a background tile's conversation rotates too, and its pane would
     // otherwise keep the stale id forever (duplicate/differently-titled tabs).
-    rekeySessionTile(previous.storedSessionId, next.storedSessionId)
+    rekeySessionTile(previous.storedSessionId, next.storedSessionId, runtimeId)
 
     clearSettled(previous.storedSessionId)
     setSessionStalled(previous.storedSessionId, false)
@@ -512,6 +517,7 @@ export function dropSessionState(runtimeId: string) {
   clearWatchdog(runtimeId)
   clearSessionProviderWait(runtimeId)
   sessionScopeByRuntimeId.delete(runtimeId)
+  sessionOwnerByRuntimeId.delete(runtimeId)
 
   const current = $sessionStates.get()
   setSessionStalled(current[runtimeId]?.storedSessionId, false)
@@ -538,6 +544,7 @@ export function clearAllSessionStates() {
   settledExpiry.clear()
   clearAllProviderWaits()
   sessionScopeByRuntimeId.clear()
+  sessionOwnerByRuntimeId.clear()
   $stalledSessionIds.set([])
   $sessionStates.set({})
 }
@@ -911,6 +918,18 @@ function saveTiles(tiles: SessionTile[]) {
   $sessionTiles.set(tiles)
 }
 
+function saveTileBucket(bucket: string, tiles: SessionTile[]) {
+  const stored = tiles.map(toStored)
+
+  if (stored.length > 0) {
+    tilesByProfile[bucket] = stored
+  } else {
+    delete tilesByProfile[bucket]
+  }
+
+  persistTiles()
+}
+
 // Profile switch: surface the new profile's tiles with runtime ids cleared so
 // they re-resume against the now-current gateway. (Fires immediately on
 // subscribe; harmless — the init value already matches.) A secondary window
@@ -925,6 +944,158 @@ export function patchSessionTile(storedSessionId: string, patch: Partial<Session
   saveTiles($sessionTiles.get().map(t => (t.storedSessionId === storedSessionId ? { ...t, ...patch } : t)))
 }
 
+function isSessionOwnerRoute(value: SessionOwnerScope): value is SessionOwnerRoute {
+  return Boolean(value && typeof value === 'object' && 'connectionId' in value)
+}
+
+function sameSessionOwner(left: SessionOwnerScope, right: SessionOwnerScope): boolean {
+  if (isSessionOwnerRoute(left) && isSessionOwnerRoute(right)) {
+    return (
+      left.connectionId.trim() === right.connectionId.trim() &&
+      normalizeProfileKey(left.profile) === normalizeProfileKey(right.profile) &&
+      normalizeProfileKey(left.targetProfile ?? left.profile) === normalizeProfileKey(right.targetProfile ?? right.profile)
+    )
+  }
+
+  if (typeof left === 'string' && typeof right === 'string') {
+    return normalizeProfileKey(left) === normalizeProfileKey(right)
+  }
+
+  return false
+}
+
+function tileWorkspaceMode(tile: SessionTile): WorkspaceMode {
+  return tile.workspaceMode ?? 'sessions'
+}
+
+function tilesShareOwner(left: SessionTile, right: SessionTile): boolean {
+  if (left.workspaceMode && right.workspaceMode && left.workspaceMode !== right.workspaceMode) {
+    return false
+  }
+
+  const workspaceMode = left.workspaceMode ?? right.workspaceMode ?? 'sessions'
+
+  if (workspaceMode === 'bots') {
+    if (left.workspaceOwnerKey && right.workspaceOwnerKey) {
+      return left.workspaceOwnerKey === right.workspaceOwnerKey
+    }
+
+    if (left.ownerRoute && right.ownerRoute) {
+      return sameSessionOwner(left.ownerRoute, right.ownerRoute)
+    }
+
+    return true
+  }
+
+  if (left.ownerRoute && right.ownerRoute) {
+    return sameSessionOwner(left.ownerRoute, right.ownerRoute)
+  }
+
+  return true
+}
+
+function tileBelongsToMain(
+  tile: SessionTile,
+  selectedStoredSessionId: string,
+  tileProfile = profileKey()
+): boolean {
+  if (tileWorkspaceMode(tile) === 'bots') {
+    return false
+  }
+
+  const mainOwner = knownSessionOwner(ownerLookupSessionRows(), selectedStoredSessionId) ?? profileKey()
+
+  if (tile.ownerRoute) {
+    return isSessionOwnerRoute(mainOwner) && sameSessionOwner(tile.ownerRoute, mainOwner)
+  }
+
+  return typeof mainOwner === 'string' && normalizeProfileKey(mainOwner) === normalizeProfileKey(tileProfile)
+}
+
+function mergeSessionTile(previous: SessionTile, next: SessionTile, storedSessionId: string): SessionTile {
+  const merged: SessionTile = { ...previous, storedSessionId }
+
+  if (next.anchor !== undefined) {
+    merged.anchor = next.anchor
+  }
+
+  if (next.before !== undefined) {
+    merged.before = next.before
+  }
+
+  if (next.dir !== undefined) {
+    merged.dir = next.dir
+  }
+
+  if (next.error !== undefined) {
+    merged.error = next.error
+  }
+
+  if (next.ownerRoute !== undefined) {
+    merged.ownerRoute = next.ownerRoute
+  }
+
+  if (next.runtimeId !== undefined) {
+    merged.runtimeId = next.runtimeId
+  }
+
+  if (next.workspaceMode !== undefined) {
+    merged.workspaceMode = next.workspaceMode
+  }
+
+  if (next.workspaceOwnerKey !== undefined) {
+    merged.workspaceOwnerKey = next.workspaceOwnerKey
+  }
+
+  if (next.workspaceTabTitle !== undefined) {
+    merged.workspaceTabTitle = next.workspaceTabTitle
+  }
+
+  return merged
+}
+
+function rekeyTileList(
+  tiles: SessionTile[],
+  tileProfile: string,
+  previousStoredSessionId: string,
+  nextStoredSessionId: string
+): SessionTile[] | null {
+  const stale = tiles.find(t => t.storedSessionId === previousStoredSessionId)
+
+  if (!stale) {
+    return null
+  }
+
+  const selectedStoredSessionId = $selectedStoredSessionId.get()
+
+  const mainOwnsRotation =
+    Boolean(selectedStoredSessionId) &&
+    (selectedStoredSessionId === previousStoredSessionId || selectedStoredSessionId === nextStoredSessionId) &&
+    tileBelongsToMain(stale, selectedStoredSessionId!, tileProfile)
+
+  const nextTile = tiles.find(t => t.storedSessionId === nextStoredSessionId && tilesShareOwner(stale, t))
+
+  if (mainOwnsRotation) {
+    return tiles.filter(t => t !== stale)
+  }
+
+  if (nextTile) {
+    return tiles
+      .map(t => (t === nextTile ? mergeSessionTile(stale, t, nextStoredSessionId) : t))
+      .filter(t => t !== stale)
+  }
+
+  return tiles.map(t => (t === stale ? { ...t, storedSessionId: nextStoredSessionId } : t))
+}
+
+function ownerProfileKey(owner: SessionOwnerScope): string | undefined {
+  if (isSessionOwnerRoute(owner)) {
+    return normalizeProfileKey(owner.profile)
+  }
+
+  return typeof owner === 'string' ? normalizeProfileKey(owner) : undefined
+}
+
 /**
  * Re-home an open tile after auto-compression rotates the conversation's stored
  * id (#98622). Without this, the tile stays keyed on the pre-rotation id while
@@ -936,37 +1107,62 @@ export function patchSessionTile(storedSessionId: string, patch: Partial<Session
  * re-docks the re-keyed tile in the same slot; pane-mirror's wanted-set diff
  * disposes the old pane and adopts the new one from this single change.
  *
- * Two degenerate cases, both resolving to ONE visible surface:
- * - A tile already exists on the new tip → drop the stale one (the surviving
- *   tile represents the conversation; the mirror removes the old pane).
- * - The new tip is already the MAIN selection → drop the stale tile entirely
- *   (a session is either main OR a tile — never both; openSessionTile enforces
- *   the same invariant at open time).
+ * Main-vs-tile reconciliation is scoped to the same Sessions workspace/owner.
+ * Bot tiles and tiles on distinct backend routes remain independent surfaces.
+ * When a rotation arrives for a background runtime, the persisted profile bucket
+ * owning that runtime is updated without replacing the active profile's atom.
  */
-export function rekeySessionTile(previousStoredSessionId: string, nextStoredSessionId: string) {
-  if (!previousStoredSessionId || previousStoredSessionId === nextStoredSessionId) {
+export function rekeySessionTile(
+  previousStoredSessionId: string,
+  nextStoredSessionId: string,
+  runtimeSessionId?: string
+) {
+  if (!previousStoredSessionId || !nextStoredSessionId || previousStoredSessionId === nextStoredSessionId) {
     return
   }
 
-  const tiles = $sessionTiles.get()
-  const stale = tiles.find(t => t.storedSessionId === previousStoredSessionId)
+  const visibleTiles = $sessionTiles.get()
 
-  if (!stale) {
-    return
-  }
+  if (visibleTiles.some(t => t.storedSessionId === previousStoredSessionId)) {
+    const nextTiles = rekeyTileList(visibleTiles, profileKey(), previousStoredSessionId, nextStoredSessionId)
 
-  const nextIsSelected = nextStoredSessionId === $selectedStoredSessionId.get()
-  const nextHasTile = tiles.some(t => t.storedSessionId === nextStoredSessionId)
-
-  if (nextIsSelected || nextHasTile) {
-    saveTiles(tiles.filter(t => t.storedSessionId !== previousStoredSessionId))
+    if (nextTiles) {
+      saveTiles(nextTiles)
+    }
 
     return
   }
 
-  saveTiles(
-    tiles.map(t => (t.storedSessionId === previousStoredSessionId ? { ...t, storedSessionId: nextStoredSessionId } : t))
+  const candidateBuckets = Object.entries(tilesByProfile).filter(([, tiles]) =>
+    tiles.some(t => t.storedSessionId === previousStoredSessionId)
   )
+
+  if (candidateBuckets.length === 0) {
+    return
+  }
+
+  const owner =
+    (runtimeSessionId ? knownOwnerForSession(runtimeSessionId) : undefined) ??
+    knownSessionOwner(ownerLookupSessionRows(), previousStoredSessionId)
+
+  const resolvedProfile = ownerProfileKey(owner)
+
+  const candidate = resolvedProfile
+    ? candidateBuckets.find(([bucket]) => bucket === resolvedProfile)
+    : candidateBuckets.length === 1
+      ? candidateBuckets[0]
+      : undefined
+
+  if (!candidate) {
+    return
+  }
+
+  const [bucket, storedTiles] = candidate
+  const nextTiles = rekeyTileList(storedTiles, bucket, previousStoredSessionId, nextStoredSessionId)
+
+  if (nextTiles) {
+    saveTileBucket(bucket, nextTiles)
+  }
 }
 
 export function sessionTileOwnerRoute(storedSessionId: string): SessionOwnerRoute | undefined {
@@ -1031,6 +1227,7 @@ export function knownOwnerForSession(sessionId: null | string | undefined): Sess
   const storedSessionId = storedSessionIdForRuntimeId(sessionId) ?? sessionId
 
   return (
+    sessionOwnerByRuntimeId.get(sessionId) ??
     sessionTileOwnerRoute(storedSessionId) ??
     getSessionOwnerHint(storedSessionId) ??
     knownSessionOwner(ownerLookupSessionRows(), storedSessionId)
