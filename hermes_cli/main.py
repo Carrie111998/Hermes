@@ -5101,6 +5101,9 @@ _LAZY_COMMAND_EXPORTS = {
         "_supervised_restart_command",
         "_supervised_stop_command",
         "_relaunch_quiesced_runtimes",
+        "_relaunch_fleet_after_zip_update",
+        "_release_startup_barrier_after_update",
+        "_open_startup_barrier_for_relaunch",
         "_require_quiesced",
         "_respawn_recorded_runtime",
         "_probe_relaunched_runtime_sha",
@@ -10895,6 +10898,13 @@ def cmd_update(args):
                 "Command-boundary relaunch of quiesced runtimes failed: %s",
                 _relaunch_exc,
             )
+        # Mutation and relaunch cleanup are both behind us now, so the
+        # shared-checkout startup barrier can go. This is the ONLY release
+        # point on the success path: releasing earlier would reopen the
+        # window a runtime could start into. Owner-scoped, so an early-exit
+        # boundary that never took a barrier — or one whose work went to a
+        # detached child — leaves the live lease alone.
+        _self()._release_startup_barrier_after_update()
         _update_lock.release()
         _finalize_update_output(_update_io_state)
         # Windows hand-off child (#93581): the re-exec'd venv child cannot

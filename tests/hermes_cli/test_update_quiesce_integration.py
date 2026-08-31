@@ -138,9 +138,13 @@ def _patch_update_deps(monkeypatch, tmp_path, events, behind=3):
 
     import hermes_cli.gateway as hermes_gateway
 
-    monkeypatch.setattr(
-        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
-    )
+    # `*a, **k`, not `all_profiles=False`: the restart phase also calls this
+    # with `exclude_pids=` (the PIDs it relaunched itself), and a stub that
+    # rejects the keyword raises straight through the phase's blanket
+    # `except`, which then hands the whole thing to the fresh-interpreter
+    # recovery. That used to be invisible here only because the in-process
+    # module purge dropped this very patch mid-update.
+    monkeypatch.setattr(hermes_gateway, "find_gateway_pids", lambda *a, **k: [])
     monkeypatch.setattr(hermes_gateway, "supports_systemd_services", lambda: False)
     monkeypatch.setattr(
         hermes_gateway, "find_profile_gateway_processes", lambda *a, **k: []

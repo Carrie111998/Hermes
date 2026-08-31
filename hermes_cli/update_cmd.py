@@ -83,6 +83,14 @@ _STALE_PURGE_PROTECTED = frozenset(
         "hermes_cli.main",
         "hermes_cli.update_cmd",
         "hermes_cli.hermes_logging",
+        # The quiesce is the update, mid-flight. Its module-global holds the
+        # authorization that proved the fleet stopped, and the purge runs
+        # twice — the second time immediately before the relaunch phase. A
+        # fresh import there is a fresh `_authorized = None`: the updater
+        # forgets, between stopping the fleet and bringing it back, that it
+        # ever quiesced. It also wrote the durable restart record with THIS
+        # code, so this is the code that should read it back.
+        "hermes_cli.update_quiesce",
     }
 )
 
@@ -1830,13 +1838,156 @@ def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
     return bool(restored.get("valid"))
 
 
-def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> bool:
+def _post_zip_code_sha() -> str:
+    """The code identity the checkout has NOW, after the overlay landed.
+
+    ``refresh=True`` because ``get_code_identity`` caches per process and
+    this interpreter read it before the overlay replaced the tree.
+    """
+    try:
+        from hermes_cli.build_info import get_code_identity
+
+        return str(get_code_identity(refresh=True).get("sha") or "")
+    except Exception as exc:
+        logger.debug("Post-ZIP code identity could not be read: %s", exc)
+        return ""
+
+
+def _relaunch_fleet_after_zip_update(windows_resume_token=None) -> bool:
+    """Bring the ZIP-quiesced fleet back, and PROVE each replacement.
+
+    The ZIP branch used to return straight from ``_update_via_zip``, leaving
+    the relaunch to ``cmd_update``'s command-boundary backstop. That backstop
+    passes no expected SHA — so every outcome's ``sha_matches`` is false by
+    construction — and swallows what it gets back. The result was a ZIP
+    update that reported success over a fleet nobody had checked.
+
+    Each recorded runtime must come back through its EXACT recorded
+    authority, leave no pre-update PID behind, and report the post-overlay
+    SHA from its own stamp. Anything less returns ``False`` and leaves the
+    durable restart-pending record on disk: an obligation we could not
+    discharge is an obligation, not a rounding error.
+
+    Deliberately does NOT purge this interpreter's module cache first. The
+    replacements are fresh interpreters by construction — a supervisor
+    restart or a respawn is a new process reading the new tree, which is the
+    freshness that matters — while the relaunch machinery running here is
+    the code that WROTE the pending record, and is the right code to read it
+    back.
+    """
+    from hermes_cli import update_quiesce
+
+    try:
+        state = update_quiesce.read_restart_pending_state()
+    except Exception as exc:
+        print(f"  ✗ Could not read the restart-pending record: {exc}")
+        return False
+    if not state or not state.get("runtimes"):
+        return True
+
+    # Paused Windows gateway services come back FIRST, exactly as the git
+    # path orders it: the quiesce record can name a service the pause phase
+    # stopped, and `sc start` on an already-started service is an error, not
+    # a relaunch.
+    try:
+        _m()._resume_windows_gateways_after_update(windows_resume_token)
+    except Exception as exc:
+        print(f"  ✗ Could not resume the paused Windows gateway service(s): {exc}")
+        print("    The quiesced fleet is still recorded as owed a relaunch.")
+        return False
+
+    expected_sha = _post_zip_code_sha()
+    if not expected_sha:
+        print(
+            "  ✗ The updated checkout does not report a code identity, so a "
+            "relaunched runtime cannot be proven to be running it."
+        )
+        print("    The quiesced fleet is still recorded as owed a relaunch.")
+        return False
+
+    print("→ Relaunching the runtimes the update stopped...")
+    outcomes = _m()._relaunch_quiesced_runtimes(expected_sha)
+    if update_quiesce.relaunch_is_complete(outcomes):
+        return True
+    print(
+        "  ✗ The update could not prove every stopped runtime came back on "
+        f"{expected_sha[:8]}."
+    )
+    print(
+        "    They stay recorded as owed a relaunch; rerun `hermes update` "
+        "once their supervisor is healthy."
+    )
+    return False
+
+
+def _finish_zip_update_reporting(
+    *,
+    relaunch_fleet,
+    desktop_build_ok: bool,
+    node_failures,
+) -> bool:
+    """Relaunch the fleet, THEN write the receipt. Returns the fleet verdict.
+
+    Order is the contract. The receipt is this update's durable claim about
+    what happened, and it must not say ``success`` before the fleet it
+    stopped has been proven back on the new code.
+    """
+    fleet_ok = True
+    if relaunch_fleet is not None:
+        try:
+            fleet_ok = bool(relaunch_fleet())
+        except Exception as exc:
+            logger.debug("ZIP-path fleet relaunch failed: %s", exc)
+            print(f"  ✗ The fleet relaunch failed: {exc}")
+            fleet_ok = False
+    try:
+        from hermes_cli.update_receipt import finalize_update_receipt
+
+        finalize_update_receipt(
+            "success"
+            if (desktop_build_ok and not node_failures and fleet_ok)
+            else "partial"
+        )
+    except Exception as _receipt_exc:
+        logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
+    return fleet_ok
+
+
+def _finish_zip_update(
+    *, desktop_build_ok: bool, fleet_ok: bool, gateway_mode: bool
+) -> None:
+    """Report the ZIP update's outcome. Success requires BOTH halves."""
+    if gateway_mode:
+        _write_gateway_update_exit_code(desktop_build_ok and fleet_ok)
+    if not fleet_ok:
+        print()
+        print(
+            "✗ The checkout was updated, but the runtimes this update stopped "
+            "could not be proven back on the new code."
+        )
+        sys.exit(1)
+
+
+def _update_via_zip(
+    args,
+    *,
+    had_desktop_app_before_update: bool = False,
+    relaunch_fleet=None,
+) -> bool:
     """Update Hermes Agent by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
     drivers causing 'Invalid argument' errors on file creation).
 
-    Returns ``False`` when a Desktop rebuild ran and failed; ``True`` otherwise.
+    ``relaunch_fleet`` brings back what the pre-mutation quiesce stopped and
+    answers whether every replacement was proven to be on the new code. It
+    runs before the receipt is finalized, so an unproven fleet cannot be
+    recorded as a successful update.
+
+    Returns ``False`` when a Desktop rebuild ran and failed; ``True``
+    otherwise. The fleet verdict is reported through ``relaunch_fleet``'s
+    own return value, which the caller reads — conflating the two here would
+    turn a fleet failure into a Desktop-build failure in every message.
     """
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
 
@@ -2250,14 +2401,14 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
     _finish_dashboard_update_cleanup(node_failures)
-    try:
-        from hermes_cli.update_receipt import finalize_update_receipt
-
-        finalize_update_receipt(
-            "success" if (desktop_build_ok and not node_failures) else "partial"
-        )
-    except Exception as _receipt_exc:
-        logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
+    # After the dashboard sweep, so it cannot mistake a freshly relaunched
+    # dashboard for a stale one, and before the receipt, so the receipt tells
+    # the truth about the fleet.
+    _finish_zip_update_reporting(
+        relaunch_fleet=relaunch_fleet,
+        desktop_build_ok=desktop_build_ok,
+        node_failures=node_failures,
+    )
     return desktop_build_ok
 
 def _update_tree_is_dirty(git_cmd: list[str], cwd: Path) -> bool:
@@ -3659,6 +3810,35 @@ def _require_quiesced(what: str, plan=None, *, expected_sha: str = ""):
         sys.exit(1)
 
 
+def _open_startup_barrier_for_relaunch() -> bool:
+    """Let the updater's own relaunches through. Never raises."""
+    try:
+        from hermes_cli.process_identity import (
+            BARRIER_PHASE_RELAUNCHING,
+            set_startup_barrier_phase,
+        )
+
+        return bool(set_startup_barrier_phase(BARRIER_PHASE_RELAUNCHING))
+    except Exception as exc:
+        logger.debug("Could not open the startup barrier for relaunch: %s", exc)
+        return False
+
+
+def _release_startup_barrier_after_update() -> bool:
+    """Drop the barrier this process took, once the update is finished.
+
+    Owner-scoped in ``process_identity``, so a command boundary that handed
+    the work to a detached child cannot free the child's lease.
+    """
+    try:
+        from hermes_cli.process_identity import release_startup_barrier
+
+        return bool(release_startup_barrier())
+    except Exception as exc:
+        logger.debug("Could not release the startup barrier: %s", exc)
+        return False
+
+
 def _relaunch_quiesced_runtimes(expected_sha: str = ""):
     """Bring every quiesced runtime back from a FRESH interpreter.
 
@@ -3673,6 +3853,13 @@ def _relaunch_quiesced_runtimes(expected_sha: str = ""):
     state = update_quiesce.read_restart_pending_state()
     if not state or not state.get("runtimes"):
         return []
+    # The checkout is whole again, and the next thing we do is start
+    # interpreters against it. Move the startup barrier out of `mutating`
+    # first or the update deadlocks against its own relaunch: every
+    # replacement would consult the lease we are still holding and refuse.
+    # The record stays on disk — it is what a later recovery reads — and
+    # the command boundary removes it once this phase is done.
+    _open_startup_barrier_for_relaunch()
     if expected_sha:
         state = dict(state)
         state["expected_sha"] = expected_sha
@@ -8444,15 +8631,34 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # checkout wholesale, so it needs the same pre-mutation quiesce as
         # the git path.
         _gate_mutation("zip overlay update")
+        # The ZIP path has no restart phase of its own, so the relaunch is
+        # threaded INTO it rather than left to the command-boundary backstop
+        # — that backstop passes no expected SHA and discards its outcomes,
+        # which is how a ZIP update came to report success over a fleet it
+        # had never checked.
+        zip_fleet = {"ok": True}
+
+        def _relaunch_fleet_for_zip() -> bool:
+            zip_fleet["ok"] = _m()._relaunch_fleet_after_zip_update(
+                _windows_gateway_resume
+            )
+            return zip_fleet["ok"]
+
         try:
             desktop_build_ok = _update_via_zip(
                 args,
                 had_desktop_app_before_update=had_desktop_app_before_update,
+                relaunch_fleet=_relaunch_fleet_for_zip,
             )
         finally:
+            # Safety net only: the relaunch above already resumed on the
+            # normal path, and the token makes a second call a no-op.
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
-        if gateway_mode:
-            _write_gateway_update_exit_code(desktop_build_ok)
+        _finish_zip_update(
+            desktop_build_ok=desktop_build_ok,
+            fleet_ok=zip_fleet["ok"],
+            gateway_mode=gateway_mode,
+        )
         return
 
     # Fetch and pull

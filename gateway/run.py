@@ -32847,6 +32847,30 @@ def main():
     os.environ.setdefault("AI_AGENT", "hermes-agent")
     os.environ.setdefault("HERMES_AGENT", "true")
 
+    # Shared-checkout startup barrier (#99450). Before ANY initialization:
+    # while `hermes update` is mutating the checkout this interpreter would
+    # import from, a gateway that starts now spends the mutation window
+    # building a torn module graph — and it was in no inventory, so nothing
+    # will stop it. Wait the window out where we can, refuse where we
+    # cannot. Deliberately NOT wrapped in a bare `except Exception`: the
+    # refusal is the point.
+    try:
+        from hermes_cli.process_identity import (
+            StartupBarrierActive,
+            await_startup_clearance,
+        )
+    except Exception:
+        await_startup_clearance = None
+        StartupBarrierActive = ()
+    if await_startup_clearance is not None:
+        try:
+            await_startup_clearance(
+                "gateway", on_wait=lambda message: print(f"⏳ {message}")
+            )
+        except StartupBarrierActive as exc:
+            print(f"✗ {exc}")
+            raise SystemExit(1) from exc
+
     # Positive process identity: ledger registration + Windows job-object
     # self-attach, so update-time reapers can identify this gateway (and its
     # child tree dies with it on Windows). Best-effort — never blocks startup.

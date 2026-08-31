@@ -243,6 +243,32 @@ def runtime_identity_key(runtime: Any) -> tuple:
     return (data.get("pid"), None if start is None else float(start))
 
 
+def _default_acquire_barrier() -> bool:
+    """Take the durable startup barrier for this checkout. Never raises."""
+    try:
+        from hermes_cli.process_identity import acquire_startup_barrier
+
+        return bool(
+            acquire_startup_barrier(
+                reason="hermes update: shared-checkout mutation"
+            )
+        )
+    except Exception as exc:
+        logger.debug("Startup-barrier acquisition failed: %s", exc)
+        return False
+
+
+def _default_release_barrier() -> bool:
+    """Drop the barrier THIS process took. Never raises."""
+    try:
+        from hermes_cli.process_identity import release_startup_barrier
+
+        return bool(release_startup_barrier())
+    except Exception as exc:
+        logger.debug("Startup-barrier release failed: %s", exc)
+        return False
+
+
 def _collect_gate_plan(recollect: Callable[[], Any], what: str) -> Any:
     """Re-inventory the fleet at the gate. Fails closed on any answer but one."""
     try:
@@ -276,6 +302,8 @@ def run_pre_mutation_quiesce(
     persist_state: bool = True,
     recollect: Optional[Callable[[], Any]] = None,
     max_passes: int = DEFAULT_MAX_QUIESCE_PASSES,
+    acquire_barrier: Optional[Callable[[], bool]] = None,
+    release_barrier: Optional[Callable[[], bool]] = None,
 ) -> QuiesceReport:
     """Establish ownership, stop every runtime, and authorize mutation.
 
@@ -295,9 +323,83 @@ def run_pre_mutation_quiesce(
     is caught too. Runtimes already proven gone are never signalled twice:
     the sweep matches on ``(pid, start_time)``, so a recycled PID reads as
     the new process it is.
+
+    Re-collecting cannot close the window it does not own, though: a
+    runtime started AFTER the last sweep and BEFORE the first write was in
+    no inventory either. So the very first thing this does — before the
+    final inventory, before isolation, before any stop — is take the
+    durable startup barrier every Hermes startup path consults
+    (:func:`hermes_cli.process_identity.acquire_startup_barrier`). From
+    that moment a concurrent gateway/dashboard/serve waits or refuses
+    instead of racing us, so the inventory this gate collects stays true
+    through the mutation. Failing to take it aborts: an unreadable lease,
+    or one another updater holds, both mean we cannot prove we are the only
+    mutator. Any abort below releases it again — nothing was mutated, so
+    nothing may stay blocked. Success KEEPS it; the command boundary
+    releases it after the relaunch cleanup.
     """
     global _authorized
     _authorized = None
+
+    acquire = _default_acquire_barrier if acquire_barrier is None else acquire_barrier
+    release = _default_release_barrier if release_barrier is None else release_barrier
+    try:
+        acquired = bool(acquire())
+    except Exception as exc:
+        raise QuiesceAbort(
+            "refusing to mutate: the shared-checkout startup barrier could "
+            f"not be acquired ({exc}), so runtimes could still start into "
+            "the mutation window"
+        ) from exc
+    if not acquired:
+        raise QuiesceAbort(
+            "refusing to mutate: the shared-checkout startup barrier could "
+            "not be acquired — another update holds it, or it could not be "
+            "read/written. Runtimes could still start into the mutation "
+            "window, so nothing has been touched"
+        )
+    try:
+        return _run_quiesce_under_barrier(
+            plan,
+            stop_runtime=stop_runtime,
+            pid_alive=pid_alive,
+            assess_isolation=assess_isolation,
+            escalate=escalate,
+            exit_timeout=exit_timeout,
+            escalated_exit_timeout=escalated_exit_timeout,
+            poll_interval=poll_interval,
+            on_event=on_event,
+            expected_sha=expected_sha,
+            persist_state=persist_state,
+            recollect=recollect,
+            max_passes=max_passes,
+        )
+    except BaseException:
+        try:
+            release()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Startup-barrier release after abort failed: %s", exc)
+        raise
+
+
+def _run_quiesce_under_barrier(
+    plan: Any,
+    *,
+    stop_runtime: Callable[[Any], bool],
+    pid_alive: Callable[[int], bool],
+    assess_isolation: Callable[..., IsolationResult],
+    escalate: Optional[Callable[[Any], None]],
+    exit_timeout: float,
+    escalated_exit_timeout: float,
+    poll_interval: float,
+    on_event: Optional[Callable[[str], None]],
+    expected_sha: str,
+    persist_state: bool,
+    recollect: Optional[Callable[[], Any]],
+    max_passes: int,
+) -> QuiesceReport:
+    """The quiesce proper — runs only with the startup barrier held."""
+    global _authorized
 
     if recollect is not None:
         # Assess ownership against the fleet we are actually going to stop.
