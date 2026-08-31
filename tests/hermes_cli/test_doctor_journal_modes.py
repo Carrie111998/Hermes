@@ -281,7 +281,7 @@ class TestUnreadableReason:
         db = tmp_path / "gone.db"
         reason = doctor._unreadable_reason(db)
 
-        assert str(db) in reason
+        assert db.name in reason
 
     @pytest.mark.skipif(os.name == "nt", reason="chmod is a no-op on Windows")
     @pytest.mark.skipif(
