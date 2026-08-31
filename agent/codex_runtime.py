@@ -682,7 +682,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 def run_codex_app_server_turn(
     agent,
     *,
-    user_message: str,
+    user_message: Any,
     original_user_message: Any,
     messages: List[Dict[str, Any]],
     effective_task_id: str,
@@ -845,7 +845,29 @@ def run_codex_app_server_turn(
     if turn.projected_messages:
         from agent.message_metadata import append_message
 
-        for projected_message in turn.projected_messages:
+        projected_messages = turn.projected_messages
+        # ``turn/start`` materializes the submitted input as the leading
+        # ``userMessage`` item.  That item is a transport echo, not a second
+        # user action: build_turn_context already appended and persisted the
+        # same input before this early-return runtime was entered. ``run_turn``
+        # records the exact text it serialized into the wire input after rich
+        # content coercion; use that value rather than the original Hermes
+        # shape. Drop only an exact match — normalization here could erase a
+        # distinct user event such as a future turn/steer projection.
+        first_projected = projected_messages[0]
+        submitted_user_text = getattr(turn, "submitted_user_text", None)
+        if submitted_user_text is None and isinstance(user_message, str):
+            # Compatibility for older/mocked TurnResult shapes. Live sessions
+            # always return submitted_user_text.
+            submitted_user_text = user_message
+        if (
+            isinstance(first_projected, dict)
+            and first_projected.get("role") == "user"
+            and first_projected.get("content") == submitted_user_text
+        ):
+            projected_messages = projected_messages[1:]
+
+        for projected_message in projected_messages:
             append_message(messages, projected_message)
 
         # Persist the newly-projected assistant/tool messages ourselves.
@@ -956,8 +978,8 @@ def run_codex_app_server_turn(
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after
-        # messages.extend). The inbound user turn was already flushed at turn
-        # start (turn_context._persist_session) and the flush dedups via
+        # the projection splice). The inbound user turn was already flushed at
+        # turn start (turn_context._persist_session) and the flush dedups via
         # _DB_PERSISTED_MARKER, so state.db ends up with each real message
         # exactly once and session_search / conversation-distill see the full
         # gateway conversation. Report agent_persisted=True so the gateway

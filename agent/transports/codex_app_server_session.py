@@ -72,6 +72,9 @@ class TurnResult:
     error: Optional[str] = None  # Set if turn ended in a non-recoverable error
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
+    # Exact text serialized into the turn/start input item. The runtime uses
+    # this to distinguish Codex's transport echo from a separate user event.
+    submitted_user_text: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
     token_usage_total: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
@@ -515,6 +518,7 @@ class CodexAppServerSession:
         projector = CodexEventProjector()
 
         user_input_text = _coerce_turn_input_text(user_input)
+        result.submitted_user_text = user_input_text
 
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
