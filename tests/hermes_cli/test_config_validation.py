@@ -111,6 +111,10 @@ class TestVoiceSubmitModeValidation:
         )
 
 
+def test_voice_text_suppression_is_opt_in():
+    assert DEFAULT_CONFIG["voice"]["suppress_text"] is False
+
+
 class TestUnknownTopLevelKeys:
     """Arbitrary top-level keys must NOT warn — they are bridged to os.environ.
 
