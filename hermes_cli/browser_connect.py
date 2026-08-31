@@ -265,7 +265,17 @@ def real_profile_data_dir(browser: str, system: str | None = None) -> str | None
         return None
     system = system or platform.system()
     mac_parts, win_parts, linux_name = _real_profile_relparts(browser)
-    home = os.path.expanduser("~")
+    # Use get_real_home() not os.path.expanduser("~").  Under a Hermes profile
+    # (HERMES_HOME = ~/.hermes/profiles/<name>) $HOME is redirected to the
+    # profile's sandboxed home dir; expanduser("~") would then resolve to that
+    # directory (e.g. ~/.hermes/profiles/coder/home) instead of the OS account
+    # home, so the Chromium/Brave profile data directory cannot be found (#98815).
+    # get_real_home() returns the actual OS account home regardless of $HOME.
+    try:
+        from hermes_constants import get_real_home as _get_real_home
+        home = str(_get_real_home())
+    except Exception:
+        home = os.path.expanduser("~")
     if system == "Darwin":
         return posixpath.join(home, "Library", "Application Support", *mac_parts)
     if system == "Windows":
