@@ -2,13 +2,38 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 
 def _normalized_base_url(value: Any) -> str:
     if not isinstance(value, str):
         return ""
-    return value.strip().rstrip("/")
+    raw = value.strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+        if not parts.scheme or not parts.netloc or not parts.hostname:
+            return raw.rstrip("/")
+        host = parts.hostname.lower()
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        if parts.port is not None:
+            host = f"{host}:{parts.port}"
+        userinfo = ""
+        if "@" in parts.netloc:
+            userinfo = parts.netloc.rsplit("@", 1)[0] + "@"
+        return urlunsplit((
+            parts.scheme.lower(),
+            userinfo + host,
+            parts.path.rstrip("/"),
+            parts.query,
+            parts.fragment,
+        ))
+    except ValueError:
+        return raw.rstrip("/")
 
 
 def resolve_entry_api_key(entry: dict[str, Any] | None) -> str | None:
@@ -69,11 +94,25 @@ def _iter_fallback_entries(raw: Any) -> list[dict[str, Any]]:
     return entries
 
 
-def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
+def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str, str]:
+    credential = resolve_entry_api_key(entry)
+    credential_fingerprint = (
+        hashlib.sha256(credential.encode("utf-8")).hexdigest() if credential else ""
+    )
+    if not credential_fingerprint:
+        key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+        if key_env:
+            # An unavailable env value is still an explicit credential
+            # surface. Keep its non-secret source identity so two entries
+            # cannot collapse before the active secret scope can resolve them.
+            credential_fingerprint = f"key-env:{key_env.casefold()}"
+        else:
+            credential_fingerprint = str(entry.get("credential_pool") or "").strip()
     return (
         str(entry.get("provider") or "").strip().lower(),
         str(entry.get("model") or "").strip().lower(),
-        _normalized_base_url(entry.get("base_url")).lower(),
+        _normalized_base_url(entry.get("base_url")),
+        credential_fingerprint,
     )
 
 
@@ -88,7 +127,7 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
 
     config = config or {}
     chain: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
 
     for key in ("fallback_providers", "fallback_model"):
         for entry in _iter_fallback_entries(config.get(key)):

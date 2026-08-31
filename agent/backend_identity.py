@@ -31,10 +31,14 @@ Do not re-implement any comparison inline — extend THIS module instead.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
+
+from agent.failure_scope import is_deterministic_tls_failure_text
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +46,9 @@ logger = logging.getLogger(__name__)
 class FailureScope(Enum):
     """Which identity axis a failure invalidates."""
 
-    #: Timeout, overload/429, connection blip, model-incompatible, invalid
-    #: response: evidence against ONE model deployment only.
+    #: Timeout, overload/429, transient transport blip, model-incompatible,
+    #: invalid response: evidence
+    #: against ONE model deployment only.
     MODEL = "model"
     #: Auth 401 / payment 402: evidence against the shared credential —
     #: every model reached with it is equally dead.
@@ -62,14 +67,20 @@ _REASON_SCOPES = {
     "rate limit": FailureScope.MODEL,
     "model incompatible with route": FailureScope.MODEL,
     "invalid provider response": FailureScope.MODEL,
-    "connection error": FailureScope.MODEL,
+    "endpoint unreachable": FailureScope.ENDPOINT,
+    "dns failure": FailureScope.ENDPOINT,
+    "connection refused": FailureScope.ENDPOINT,
+    "connection blip": FailureScope.MODEL,
     "timeout": FailureScope.MODEL,
 }
 
 
 def classify_failure_scope(reason: Optional[str]) -> FailureScope:
     """Map a human-readable failure reason to the identity axis it kills."""
-    return _REASON_SCOPES.get((reason or "").strip().lower(), FailureScope.MODEL)
+    normalized = (reason or "").strip().lower()
+    if is_deterministic_tls_failure_text(normalized):
+        return FailureScope.ENDPOINT
+    return _REASON_SCOPES.get(normalized, FailureScope.MODEL)
 
 
 def _norm_provider(value: Optional[str]) -> str:
@@ -80,8 +91,62 @@ def _norm_model(value: Optional[str]) -> str:
     return (value or "").strip().lower()
 
 
-def _norm_base_url(value: Optional[str]) -> str:
-    return (value or "").strip().rstrip("/").lower()
+def normalize_base_url(value: Optional[str]) -> str:
+    """Normalize URL authority without changing route-sensitive components.
+
+    This is the shared endpoint canonicalizer. Callers that derive an identity
+    component outside :class:`BackendIdentity` must use this function too so
+    equivalent URL spellings produce equivalent identities.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parts = urlsplit(raw)
+        if not parts.scheme or not parts.netloc:
+            return raw.rstrip("/")
+        userinfo = ""
+        hostport = parts.netloc
+        if "@" in hostport:
+            userinfo, hostport = hostport.rsplit("@", 1)
+            userinfo += "@"
+        host = parts.hostname
+        if not host:
+            return raw.rstrip("/")
+        host = host.lower()
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        try:
+            port = parts.port
+        except ValueError:
+            return raw.rstrip("/")
+        if port is not None:
+            host = f"{host}:{port}"
+        # URL paths and queries can be case-sensitive and can select distinct
+        # tenants/routes. Only the authority host is case-folded. Preserve the
+        # established trailing-slash equivalence for base paths.
+        path = parts.path.rstrip("/")
+        return urlunsplit((
+            parts.scheme.lower(),
+            userinfo + host,
+            path,
+            parts.query,
+            parts.fragment,
+        ))
+    except ValueError:
+        return raw.rstrip("/")
+
+
+# Backwards-compatible private alias for in-module callers and downstream tests.
+_norm_base_url = normalize_base_url
+
+
+def _credential_fingerprint(value: Optional[str]) -> str:
+    """Return a stable, non-secret credential identity."""
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    return "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -96,6 +161,7 @@ class BackendIdentity:
     provider: str = ""
     model: str = ""
     base_url: str = ""
+    credential_id: str = ""
 
     @classmethod
     def build(
@@ -103,11 +169,14 @@ class BackendIdentity:
         provider: Optional[str] = None,
         model: Optional[str] = None,
         base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        credential_id: Optional[str] = None,
     ) -> "BackendIdentity":
         return cls(
             provider=_norm_provider(provider),
             model=_norm_model(model),
-            base_url=_norm_base_url(base_url),
+            base_url=normalize_base_url(base_url),
+            credential_id=_credential_fingerprint(credential_id or api_key),
         )
 
 
@@ -134,28 +203,42 @@ def same_credential_surface(a: BackendIdentity, b: BackendIdentity) -> bool:
 
     Conservative on purpose: an unprovable axis must answer "different"
     (try the candidate — worst case one wasted RTT) rather than "same"
-    (skip — worst case stranded failover). Two distinct custom labels at
-    one URL may carry different per-entry api_keys, so a shared URL alone
-    never proves a shared credential; it is only used as a weak signal
-    when a provider label is missing entirely.
+    (skip — worst case stranded failover). Explicit credential fingerprints
+    take precedence; when either provider label is absent, the same explicit
+    URL remains the established fallback signal.
     """
+    if a.credential_id or b.credential_id:
+        return bool(
+            a.credential_id and b.credential_id and a.credential_id == b.credential_id
+        )
     if a.provider and b.provider:
         # Same label = same configured credential. Different labels =
         # different credential config (first-class registry providers
         # explicitly so — #70893; custom entries can each carry their own
-        # api_key, so sameness is unprovable and we must not skip).
+        # api_key, so sameness is unprovable).
         return a.provider == b.provider
-    # Provider unknown on a side: same explicit URL is the best signal left.
+    # Preserve the base fallback: when a provider label is absent, identical
+    # explicit URLs are the strongest available credential-surface signal.
     return bool(a.base_url and a.base_url == b.base_url)
+
+
+def same_route(a: BackendIdentity, b: BackendIdentity) -> bool:
+    """Return true only for an exactly identical resolved route."""
+    return (
+        a.provider == b.provider
+        and a.model == b.model
+        and a.base_url == b.base_url
+        and a.credential_id == b.credential_id
+    )
 
 
 def same_endpoint(a: BackendIdentity, b: BackendIdentity) -> bool:
     """Do two identities sit behind the endpoint that just went unreachable?"""
     if a.base_url and b.base_url:
         return a.base_url == b.base_url
-    # An unknown base_url inherits the provider default → same provider
-    # label implies the same default endpoint.
-    return bool(a.provider and a.provider == b.provider)
+    # A missing endpoint is unknown at this layer. Do not manufacture a
+    # provider-default resolution and strand an alternate explicit endpoint.
+    return False
 
 
 def same_deployment(a: BackendIdentity, b: BackendIdentity) -> bool:
