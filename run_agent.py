@@ -5824,17 +5824,44 @@ class AIAgent:
 
         singleton_key = str(singleton_now.get("api_key") or "").strip()
         active_key = str(self.api_key or "").strip()
+        adopt_existing_singleton = False
         if singleton_key and active_key and singleton_key != active_key:
-            logger.debug(
-                "%s singleton tokens differ from the active api_key; "
-                "skipping singleton force-refresh to avoid silent account swap. "
-                "Reactive credential rotation should go through the pool.",
-                self.provider,
-            )
-            return False
+            from agent.agent_runtime_helpers import oauth_active_key_is_foreign_pool_entry
+
+            if oauth_active_key_is_foreign_pool_entry(self, active_key):
+                logger.debug(
+                    "%s singleton tokens differ from the active api_key; "
+                    "skipping singleton force-refresh to avoid silent account swap. "
+                    "Reactive credential rotation should go through the pool.",
+                    self.provider,
+                )
+                return False
+            if getattr(self, "_credential_pool", None) is not None:
+                # Live key matches no pool entry: stale in-memory copy of
+                # the singleton (store/pool already reminted). Adopting
+                # that token recovers without spending a second single-use
+                # refresh token. No pool + mismatched keys still skips —
+                # that is the explicit ``api_key=`` / other-account case.
+                logger.info(
+                    "%s active api_key matched no pool entry; adopting "
+                    "current singleton access token without force-refresh",
+                    self.provider,
+                )
+                adopt_existing_singleton = True
+            else:
+                logger.debug(
+                    "%s singleton tokens differ from the active api_key; "
+                    "skipping singleton force-refresh to avoid silent account swap. "
+                    "Reactive credential rotation should go through the pool.",
+                    self.provider,
+                )
+                return False
 
         try:
-            if self.provider == "openai-codex":
+            if adopt_existing_singleton:
+                old_key = active_key
+                creds = singleton_now
+            elif self.provider == "openai-codex":
                 from hermes_cli.auth import resolve_codex_runtime_credentials
 
                 old_key = str(self.api_key or "").strip()

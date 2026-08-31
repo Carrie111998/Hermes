@@ -107,3 +107,84 @@ def test_pool_path_reuses_the_shared_predicate():
     assert "_is_xai_auth_failure" not in recover, (
         "inline duplicate of the predicate is back; the two arms will drift"
     )
+
+
+def test_oauth_active_key_is_foreign_pool_entry():
+    from types import SimpleNamespace
+
+    from agent.agent_runtime_helpers import oauth_active_key_is_foreign_pool_entry
+
+    assert oauth_active_key_is_foreign_pool_entry(SimpleNamespace(_credential_pool=None), "k") is False
+
+    class _Pool:
+        def entries(self):
+            return [SimpleNamespace(runtime_api_key="pooled-key")]
+
+    agent = SimpleNamespace(_credential_pool=_Pool())
+    assert oauth_active_key_is_foreign_pool_entry(agent, "pooled-key") is True
+    assert oauth_active_key_is_foreign_pool_entry(agent, "stale-in-memory") is False
+    assert oauth_active_key_is_foreign_pool_entry(agent, "") is False
+
+
+def test_recover_refreshes_sole_xai_entry_when_expired_key_matches_nothing():
+    """8:34 hole: expired live key matches no pool entry, sole credential.
+
+    try_refresh_matching(hint=expired) returns None; a single-entry pool
+    then refuses to rotate. Recovery must retry without the hint.
+    """
+    from unittest.mock import MagicMock
+
+    from agent.error_classifier import FailoverReason
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        api_key="expired-in-memory-token",
+        base_url="https://api.x.ai/v1",
+        model="grok-4.6",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent.api_mode = "codex_responses"
+    agent.provider = "xai-oauth"
+    agent._interrupt_requested = False
+    agent._credential_pool_entry_id = None
+    agent._swap_credential = MagicMock()
+
+    calls = []
+    refreshed = MagicMock(id="only-entry")
+
+    class _FakePool:
+        provider = "xai-oauth"
+
+        def try_refresh_matching(self, api_key_hint=None, credential_id=None):
+            calls.append({"api_key_hint": api_key_hint, "credential_id": credential_id})
+            if api_key_hint is None and credential_id is None:
+                return refreshed
+            return None
+
+        def mark_exhausted_and_rotate(self, **_kwargs):
+            raise AssertionError("must not rotate when the sole entry can refresh")
+
+        def entries(self):
+            return [MagicMock(id="only-entry", runtime_api_key="fresh-store-token")]
+
+        def has_available(self):
+            return True
+
+        def current(self):
+            return None
+
+    agent._credential_pool = _FakePool()
+    recovered, _ = agent._recover_with_credential_pool(
+        status_code=403,
+        has_retried_429=False,
+        classified_reason=FailoverReason.auth,
+        error_context={"message": REAL_EXPIRED_BODY},
+    )
+
+    assert recovered is True
+    assert calls[0]["api_key_hint"] == "expired-in-memory-token"
+    assert calls[-1] == {"api_key_hint": None, "credential_id": None}
+    agent._swap_credential.assert_called_once_with(refreshed)
+

@@ -1425,6 +1425,107 @@ def test_try_refresh_codex_client_credentials_skips_xai_oauth_when_singleton_dif
     assert agent.api_key == pre_refresh_key
 
 
+def test_try_refresh_codex_client_credentials_adopts_store_token_when_pool_identity_misses(monkeypatch):
+    """Stale in-memory key + pool whose runtime key is the store token.
+
+    This is the 8:34 production hole: the live client still has the expired
+    access token, auth.json/pool already hold a different one, and the
+    account-swap guard used to skip because the strings differ. Adopting
+    the store token must succeed without spending a second refresh token.
+    """
+    agent = _build_xai_oauth_agent(monkeypatch)
+    refresh_calls = {"count": 0}
+    store_token = "store-already-reminted"
+
+    class _Pool:
+        def entries(self):
+            return [SimpleNamespace(id="only", runtime_api_key=store_token)]
+
+    agent._credential_pool = _Pool()
+
+    def _fake_resolve(force_refresh=False, refresh_if_expiring=True, **_):
+        if force_refresh:
+            refresh_calls["count"] += 1
+            return {
+                "api_key": "should-not-force-refresh",
+                "base_url": "https://api.x.ai/v1",
+            }
+        return {
+            "api_key": store_token,
+            "base_url": "https://api.x.ai/v1",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_xai_oauth_runtime_credentials",
+        _fake_resolve,
+    )
+
+    class _ExistingClient:
+        def close(self):
+            pass
+
+    class _RebuiltClient:
+        pass
+
+    rebuilt = {"kwargs": None}
+
+    def _fake_openai(**kwargs):
+        rebuilt["kwargs"] = kwargs
+        return _RebuiltClient()
+
+    monkeypatch.setattr(run_agent, "OpenAI", _fake_openai)
+    existing = _ExistingClient()
+    agent.client = existing
+    retired = {"client": None}
+    monkeypatch.setattr(
+        agent,
+        "_retire_shared_openai_client",
+        lambda client, *, reason: retired.__setitem__("client", client),
+    )
+
+    ok = agent._try_refresh_codex_client_credentials(force=True)
+
+    assert ok is True
+    assert refresh_calls["count"] == 0, "must adopt the store token, not remint"
+    assert agent.api_key == store_token
+    assert rebuilt["kwargs"]["api_key"] == store_token
+    assert retired["client"] is existing
+
+
+def test_try_refresh_codex_client_credentials_still_skips_foreign_pool_entry(monkeypatch):
+    """A live key that belongs to a pooled (non-singleton) credential must
+    not adopt the device_code singleton — that is the original account-swap
+    guard, now keyed off pool membership instead of string inequality."""
+    agent = _build_xai_oauth_agent(monkeypatch)
+    refresh_calls = {"count": 0}
+
+    class _Pool:
+        def entries(self):
+            return [SimpleNamespace(id="manual", runtime_api_key=agent.api_key)]
+
+    agent._credential_pool = _Pool()
+
+    def _fake_resolve(force_refresh=False, refresh_if_expiring=True, **_):
+        if force_refresh:
+            refresh_calls["count"] += 1
+        return {
+            "api_key": "singleton-account-token",
+            "base_url": "https://api.x.ai/v1",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_xai_oauth_runtime_credentials",
+        _fake_resolve,
+    )
+    pre = agent.api_key
+    ok = agent._try_refresh_codex_client_credentials(force=True)
+    assert ok is False
+    assert refresh_calls["count"] == 0
+    assert agent.api_key == pre
+
+
+
+
 
 
 

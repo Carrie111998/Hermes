@@ -1114,6 +1114,32 @@ def is_xai_stale_oauth_error(
     )
 
 
+def oauth_active_key_is_foreign_pool_entry(agent, active_key: str) -> bool:
+    """True when ``active_key`` belongs to a pooled credential.
+
+    Used by the singleton OAuth refresh guard: if the live key is a real
+    pool entry, force-refreshing/adopting the device_code singleton would
+    silently swap accounts. If the live key matches *no* entry, it is a
+    stale in-memory copy (the pool/store already rotated) and adopting
+    the singleton is the recovery, not an account swap.
+    """
+    if not active_key:
+        return False
+    pool = getattr(agent, "_credential_pool", None)
+    if pool is None:
+        return False
+    try:
+        entries = pool.entries()
+    except Exception:
+        return False
+    needle = str(active_key).strip()
+    for entry in entries or ():
+        runtime = str(getattr(entry, "runtime_api_key", "") or "").strip()
+        if runtime and runtime == needle:
+            return True
+    return False
+
+
 def recover_with_credential_pool(
     agent,
     *,
@@ -1397,6 +1423,31 @@ def recover_with_credential_pool(
         if _credential_id:
             refresh_kwargs["credential_id"] = _credential_id
         refreshed = pool.try_refresh_matching(**refresh_kwargs)
+        if (
+            refreshed is None
+            and (agent.provider or "") == "xai-oauth"
+            and is_xai_stale_oauth_error(error_context, status_code)
+        ):
+            # The failed request still carries the expired access token.
+            # After another process remints, that key matches no pool
+            # entry (``runtime_api_key`` is the new token), so
+            # try_refresh_matching(hint=expired) returns None and a
+            # single-entry pool then refuses to rotate — the 8:34 PM
+            # ``identity matched no xai-oauth entry`` hole. Refresh the
+            # only credential instead of giving up.
+            entries = []
+            try:
+                entries_fn = getattr(pool, "entries", None)
+                if callable(entries_fn):
+                    entries = list(entries_fn() or [])
+            except Exception:
+                entries = []
+            if len(entries) == 1:
+                _ra().logger.info(
+                    "xai-oauth stale 403: failed credential identity matched "
+                    "no pool entry; refreshing the only xai-oauth credential"
+                )
+                refreshed = pool.try_refresh_matching()
         if refreshed is not None:
             # ``try_refresh_matching()`` re-mints a fresh OAuth token and reports
             # success even when the upstream keeps rejecting it — a single-entry
