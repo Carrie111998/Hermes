@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import os
 import json
+import os
 import shutil
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -35,7 +36,13 @@ def _pwsh_selection():
     try:
         with patch.dict(
             os.environ,
-            {"TERMINAL_SHELL": "pwsh", "TERMINAL_ENV": "local"},
+            {
+                # scripts/run_tests.sh starts from env -i. PowerShell requires
+                # PATHEXT to dispatch native .exe commands, even by full path.
+                "PATHEXT": os.environ.get("PATHEXT") or ".COM;.EXE;.BAT;.CMD",
+                "TERMINAL_SHELL": "pwsh",
+                "TERMINAL_ENV": "local",
+            },
         ):
             yield
     finally:
@@ -68,6 +75,30 @@ def test_pwsh_selection_is_fixed_for_active_environment(tmp_path):
     assert result["output"].strip() == "Core"
 
 
+def test_pwsh_executable_is_resolved_once_and_frozen_for_environment(tmp_path):
+    import tools.environments.local as local_module
+
+    frozen = r"C:\PowerShell-A\pwsh.exe"
+    with _pwsh_selection(), patch.object(
+        local_module, "resolve_pwsh_executable", return_value=frozen
+    ) as resolve_mock:
+        env = _pwsh_env(tmp_path)
+
+    try:
+        with patch.object(
+            local_module.subprocess,
+            "Popen",
+            side_effect=OSError("expected spawn failure"),
+        ) as popen_mock:
+            with pytest.raises(OSError, match="expected spawn failure"):
+                env.execute("Write-Output never-runs")
+    finally:
+        env.cleanup()
+
+    resolve_mock.assert_called_once_with()
+    assert popen_mock.call_args.args[0][0] == frozen
+
+
 def test_pwsh_preserves_native_program_exit_code(tmp_path):
     with _pwsh_selection():
         env = _pwsh_env(tmp_path)
@@ -96,7 +127,7 @@ def test_pwsh_native_argument_passing_preserves_values(tmp_path):
         try:
             result = env.execute(
                 "python -c \"import json,sys; "
-                "print(json.dumps(sys.argv[1:], ensure_ascii=False))\" "
+                "print(json.dumps(sys.argv[1:]))\" "
                 "'space value' '中文$literal' 'quote\"value'"
             )
         finally:
@@ -108,6 +139,34 @@ def test_pwsh_native_argument_passing_preserves_values(tmp_path):
         "中文$literal",
         'quote"value',
     ]
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (
+            "param([string]$Value = 'parameter-default')\nWrite-Output $Value",
+            "parameter-default",
+        ),
+        (
+            "using namespace System.Text\nWrite-Output ([Encoding]::UTF8.WebName)",
+            "utf-8",
+        ),
+        ("#requires -Version 7.0\nWrite-Output 'requires-ok'", "requires-ok"),
+    ],
+)
+def test_pwsh_file_transport_preserves_top_of_file_semantics(
+    tmp_path, command, expected
+):
+    with _pwsh_selection():
+        env = _pwsh_env(tmp_path)
+        try:
+            result = env.execute(command)
+        finally:
+            env.cleanup()
+
+    assert result["returncode"] == 0
+    assert result["output"].strip() == expected
 
 
 def test_pwsh_success_after_native_failure_returns_success(tmp_path):
@@ -320,6 +379,41 @@ def test_pwsh_timeout_terminates_descendant_processes(tmp_path):
     assert result["returncode"] == 124
     time.sleep(3.5)
     assert not marker.exists(), "PowerShell descendant survived timeout cleanup"
+
+
+def test_pwsh_interrupt_terminates_descendant_processes(tmp_path):
+    from tools.interrupt import set_interrupt
+
+    marker = tmp_path / "interrupted-child-survived.txt"
+    child_code = (
+        "import pathlib,time; time.sleep(3); "
+        f"pathlib.Path({str(marker)!r}).write_text('survived')"
+    )
+    command = (
+        "$p = Start-Process python -PassThru -ArgumentList "
+        f"@('-c', {json.dumps(child_code)}); Wait-Process -Id $p.Id"
+    )
+    owner_tid = threading.get_ident()
+
+    def interrupt_later():
+        time.sleep(0.3)
+        set_interrupt(True, owner_tid)
+
+    interrupter = threading.Thread(target=interrupt_later, daemon=True)
+    with _pwsh_selection():
+        env = _pwsh_env(tmp_path, timeout=10)
+        interrupter.start()
+        try:
+            result = env.execute(command)
+        finally:
+            set_interrupt(False, owner_tid)
+            interrupter.join(timeout=2)
+            env.cleanup()
+
+    assert result["returncode"] == 130
+    assert "interrupted" in result["output"].lower()
+    time.sleep(3.5)
+    assert not marker.exists(), "PowerShell descendant survived interrupt cleanup"
 
 
 def test_pwsh_temp_scripts_are_removed(tmp_path):

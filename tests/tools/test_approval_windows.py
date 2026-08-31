@@ -106,6 +106,25 @@ class TestWindowsDestructiveTier:
         assert not _is_dangerous(cmd), f"should NOT be flagged: {cmd}"
 
 
+class TestPowerShellStructuralForms:
+    @pytest.mark.parametrize("cmd", [
+        "Remove-Item C:\\data `\n  -Force",
+        "$params = @{Path='C:\\data'; Force=$true}; Remove-Item @params",
+        "$command = 'Remove-Item'; & $command C:\\data -Force",
+    ])
+    def test_ambiguous_or_destructive_structural_forms_are_flagged(self, cmd):
+        assert _is_dangerous(cmd), f"should be flagged: {cmd}"
+
+    @pytest.mark.parametrize("cmd", [
+        'Write-Output "Remove-Item C:\\data `\n  -Force"',
+        "$params = @{Path='C:\\data'}; Get-Item @params",
+        "Write-Output '& $command is dynamic invocation syntax'",
+        "& { Get-Date }",
+    ])
+    def test_benign_structural_forms_are_not_flagged(self, cmd):
+        assert not _is_dangerous(cmd), f"should NOT be flagged: {cmd}"
+
+
 class TestWindowsPathVariant:
     """Backslash Windows paths must survive into pattern matching.
 

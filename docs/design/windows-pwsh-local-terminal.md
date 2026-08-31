@@ -1,6 +1,10 @@
 # Native PowerShell for the Windows local terminal backend
 
-Status: investigation and scope-alignment draft. This document records the observed implementation seams on `origin/main` at the start of the feature work. It is not an accepted maintainer design and does not authorize changing remote backend semantics.
+Status: feature-branch design and implementation record. This document records
+the original investigation, the implemented first-increment boundary, the
+implemented merge-scope hardening, and explicitly deferred follow-up
+work. It is not an accepted maintainer design and does not authorize changing
+remote backend semantics.
 
 Feature-branch status: `terminal.shell: bash | pwsh`, the unified resolver,
 selection-aware prompt/tool guidance, and native Windows synchronous PowerShell
@@ -83,8 +87,147 @@ Current background and PTY tests prove that the same frozen shell selection is u
 
 Safety tests should add PowerShell-default cases only where the current Windows approval suite does not already establish the invariant. The test set should include both dangerous constructs that must not fail open and benign constructs that must remain usable without unnecessary approval.
 
-## Open questions before a merge-ready implementation
+## Implemented merge-scope hardening
 
-Maintainer direction is still needed on whether this should extend one of the existing `terminal.shell` pull requests or be submitted independently while preserving applicable contributor work. The session-resume identity rule needs an explicit project-level answer. PowerShell state compatibility beyond environment variables and CWD must be bounded. The expected behavior when `pwsh` is configured but unavailable must be chosen: a clear startup/configuration error is safer than silently switching dialects underneath the prompt.
+The following hardening is implemented within the existing foreground-only
+contract. It does not expand this pull request into background execution, PTY
+support, a general shell framework, or a new session-persistence design.
+
+### Resolve and freeze the PowerShell executable
+
+The foreground adapter resolves the executable when a `LocalEnvironment` is
+created, freezes that path for the environment's lifetime, and reuses it for
+every command. Resolution prefers the existing PATH behavior, then checks
+PowerShell 7's standard Windows install location. A bounded non-interactive
+probe rejects a missing, unrunnable, or non-PowerShell-Core-7 candidate with a
+clear error.
+
+The resolver does not silently fall back to Windows PowerShell 5.1, `cmd.exe`,
+or Bash. Tests prove the candidate order, the standard-path fallback,
+executable-path stability after lookup changes, probe failure, and the absence
+of a cross-dialect fallback. No new user-facing `pwshPath` setting is added.
+
+### Close direct PowerShell approval gaps conservatively
+
+The native PowerShell path makes bare cmdlets, PowerShell line continuation,
+splatting, and call-operator forms ordinary model-generated terminal input.
+The approval audit includes adversarial examples for:
+
+- destructive cmdlets whose flags continue onto another physical line with a
+  PowerShell backtick;
+- high-risk cmdlets whose destructive arguments are supplied through
+  splatting; and
+- dynamic call-operator invocation such as `& $command` where the executable
+  cannot be established statically.
+
+Ambiguous dynamic execution requires approval rather than being classified as
+benign. A detection-only PowerShell continuation normalizer preserves quoted,
+comment, block-comment, and here-string data; conservative rules cover
+destructive splatting and variable call-operator execution. Benign controls
+keep ordinary read-only PowerShell use from prompting indiscriminately. A
+complete PowerShell AST policy engine remains deferred below.
+
+### Pin file-script semantics and lifecycle behavior
+
+The adapter intentionally carries the model command in a UTF-8 `.ps1` file
+instead of prepending setup text to a `-Command` string. Native Windows tests
+pin the resulting top-of-file semantics with representative
+`param(...)`, `using namespace`, and satisfiable `#requires -Version` scripts.
+This makes the reason for the file-based transport observable and prevents a
+future simplification from silently breaking valid PowerShell programs.
+
+Existing tests already cover Unicode output and stdin, native and PowerShell
+exit status, cwd/environment persistence, timeout-driven descendant cleanup,
+and temporary-file cleanup. Those behaviors are not duplicated merely to
+increase test count. A native Windows interruption test also proves that the
+shared lifecycle returns status 130 and terminates descendants before they can
+produce delayed side effects.
+
+### Publish the user-visible configuration contract
+
+The setting is described in the configuration defaults and in matching
+user-facing English and Simplified Chinese FAQ entries. The configuration
+example is:
+
+```yaml
+terminal:
+  shell: pwsh
+```
+
+The documentation states that the option requires PowerShell 7, is limited to
+the native Windows local backend, supports foreground execution only, fails
+closed for background/PTY/notification requests, and requires a Hermes restart
+after a configuration change. It also distinguishes persisted cwd/environment
+state from functions, aliases, modules, jobs, drives, and other runspace state
+that this increment deliberately does not preserve.
+
+## Deferred follow-ups
+
+The items below are useful reference points for later work, not merge criteria
+for the foreground-only increment. Each requires its own design, tests, and
+scope decision before implementation.
+
+### Complete PowerShell-aware approval parsing
+
+Evaluate an in-process or otherwise non-executing PowerShell parser that can
+lower literal command structure for policy checks while leaving dynamic or
+unknown constructs opaque and approval-requiring. The design must cover
+script blocks, providers, splatting, aliases, call operators, and referenced
+scripts without executing model-controlled content during approval. It must
+preserve the existing hardline floor and benign-command behavior.
+
+### Background execution and job ownership
+
+Add a PowerShell-specific argv builder behind the existing process-registry
+seam. Define owner-scoped job registration, output offsets, stdin behavior,
+completion notification, disposal, restart recovery, and the relationship
+between background processes and the foreground cwd/environment snapshot.
+Until those contracts exist, background requests remain fail-closed.
+
+### Persistent PTY and ConPTY support
+
+Design a native Windows terminal backend with readiness and completion
+markers, PSReadLine input-echo removal, bounded scrollback, exact exit-status
+reporting, Ctrl-C semantics, timeout recovery, and mandatory shell reset after
+an uncertain result. A persistent runspace changes the state contract and must
+not be introduced as an incidental extension of foreground spawn-per-call
+execution.
+
+### Windows process-identity fencing
+
+Consider retaining a process creation-time identity alongside each managed
+PID and revalidating it before descendant adoption or `taskkill`. This would
+protect longer-lived background and terminal sessions from PID reuse. The
+current foreground timeout path is short-lived and already covered by a live
+descendant-termination test, so full identity fencing is not a prerequisite
+for this increment.
+
+### Resume-time shell identity
+
+Trace session creation, persistence, restart, and resume before deciding
+whether a resumed conversation keeps its original shell identity or adopts
+the process's current configuration. Any solution must preserve prompt-cache
+stability and define compatibility for sessions created before shell identity
+was recorded.
+
+### Additional executable and state compatibility
+
+A future configuration design may expose an explicit PowerShell executable
+path. Support for Windows PowerShell 5.1 or `cmd.exe` requires separate syntax,
+encoding, capability, and prompt contracts and must never appear as a silent
+fallback from `pwsh`. Persisting functions, aliases, modules, jobs, drives, or
+other runspace state likewise requires a safe serialization and restoration
+contract rather than executable snapshots assembled from untrusted values.
+
+## Remaining maintainer decisions
+
+The implemented behavior when `pwsh` is unavailable is an early, clear error
+with no dialect fallback. Further executable-discovery changes require a new
+scope decision and must preserve that fail-closed policy.
+
+Resume-time shell identity remains a separate project-level decision. State
+compatibility in this increment is bounded to environment variables and cwd;
+expanding it requires an explicit follow-up contract rather than an implicit
+change to this pull request.
 
 The local Windows feature should stop and be re-scoped if it requires changing remote backend shell semantics, introducing a general shell plugin system, adding `cmd.exe`, or migrating existing session storage solely to satisfy an unconfirmed resume policy.

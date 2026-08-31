@@ -508,6 +508,12 @@ _CMDPOS = (
     r'\s*'
 )
 
+# PowerShell command position for bare cmdlets. Unlike ``_CMDPOS``, a backtick
+# is not a command-substitution opener: it is PowerShell's escape character
+# and may continue a physical line. Compound-command starts discovered by the
+# quote-aware marker are rewritten to newlines before these rules run.
+_PWSH_CMDPOS = r'(?:^|&&|\|\||[;\n|])\s*'
+
 # Destructive-path argument matcher for the rm hardline rules.
 #
 # The path token in `rm -rf /` is almost always written quoted in real
@@ -989,7 +995,15 @@ DANGEROUS_PATTERNS = [
     # with -Recurse or -Force. The cmd/powershell-prefixed forms are covered above; this
     # catches the bare form (ACP clients, pwsh-default SSH hosts, or
     # `powershell` invoked earlier in a compound command).
-    (r'\b(?:remove-item|ri|rm|del|erase|rd|rmdir)\b[^\n;|&]*\s-(?:r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?|fo(?:r(?:c(?:e)?)?)?)\b', "PowerShell destructive delete (Remove-Item/alias)"),
+    (_PWSH_CMDPOS + r'(?:remove-item|ri|rm|del|erase|rd|rmdir)\b[^\n;|&]*\s-(?:r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?|fo(?:r(?:c(?:e)?)?)?)\b', "PowerShell destructive delete (Remove-Item/alias)"),
+    # A splatted argument set is opaque to regex policy. A destructive cmdlet
+    # may receive -Force/-Recurse through the hashtable, so fail closed rather
+    # than treating the unknown argument set as benign.
+    (_PWSH_CMDPOS + r'(?:remove-item|ri|rm|del|erase|rd|rmdir)\b[^\n;|&]*\s+@[a-z_][\w:.-]*\b', "PowerShell destructive delete with splatted arguments"),
+    # The call operator with a variable chooses the executable dynamically.
+    # Literal call-operator forms (`& 'tool.exe'`) remain visible to their own
+    # command patterns; only an unresolved variable is conservatively gated.
+    (r'(?:^|&&|\|\||[;\n|])\s*&\s*\$[a-z_][\w:.-]*\b', "PowerShell dynamic call-operator execution"),
     # cmd builtins with destructive switches, bare form: del/erase/rd/rmdir
     # with /s (recurse) or /q (quiet). Requires the switch so `del file.txt`
     # inside a cmd /c string stays covered by the prefixed rule only.
@@ -2364,6 +2378,92 @@ def _mask_quoted_newlines(command: str) -> str:
     return "".join(out)
 
 
+def _collapse_powershell_line_continuations(command: str) -> str:
+    """Collapse unquoted PowerShell backtick-newline continuations.
+
+    This is a detection-only variant. Backticks inside quoted strings,
+    comments, block comments, and here-strings are data and remain untouched,
+    preventing prose or script data from being joined into a runnable-looking
+    destructive command.
+    """
+    if "`" not in command or "\n" not in command:
+        return command
+
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    length = len(command)
+    while i < length:
+        ch = command[i]
+
+        if quote is not None:
+            out.append(ch)
+            if ch == "`" and quote == '"' and i + 1 < length:
+                out.append(command[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                if i + 1 < length and command[i + 1] == quote:
+                    out.append(command[i + 1])
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+
+        if command.startswith("<#", i):
+            end = command.find("#>", i + 2)
+            if end < 0:
+                out.append(command[i:])
+                break
+            out.append(command[i:end + 2])
+            i = end + 2
+            continue
+
+        if ch == "#":
+            end = command.find("\n", i + 1)
+            if end < 0:
+                out.append(command[i:])
+                break
+            out.append(command[i:end + 1])
+            i = end + 1
+            continue
+
+        if ch == "@" and i + 2 < length and command[i + 1] in ("'", '"'):
+            marker = command[i + 1] + "@"
+            opener_end = i + 2
+            if command.startswith("\r\n", opener_end) or command.startswith("\n", opener_end):
+                terminator = re.search(rf'(?m)^{re.escape(marker)}', command[opener_end:])
+                if terminator is None:
+                    out.append(command[i:])
+                    break
+                end = opener_end + terminator.end()
+                out.append(command[i:end])
+                i = end
+                continue
+
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == "`" and i + 1 < length:
+            if command.startswith("\r\n", i + 1):
+                out.append(" ")
+                i += 3
+                continue
+            if command[i + 1] == "\n":
+                out.append(" ")
+                i += 2
+                continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
 def _iter_shell_command_word_spans(command: str):
     """Yield command-position words that may be executable names."""
     for command_start in _iter_shell_command_starts(command):
@@ -2419,6 +2519,19 @@ def _command_detection_variants(command: str):
     grep_safe, _ = _grep_safe_detection_variant(normalized)
     seen = {grep_safe}
     yield grep_safe
+    # PowerShell removes an unquoted backtick plus its following newline
+    # before parsing. Feed that logical line through the same normalization
+    # and quote-aware command-start pipeline, while preserving quoted/comment
+    # data in the raw helper above.
+    pwsh_joined = _collapse_powershell_line_continuations(command)
+    if pwsh_joined != command:
+        pwsh_variant = _normalize_command_for_detection(
+            _mask_quoted_newlines(pwsh_joined)
+        )
+        pwsh_variant, _ = _grep_safe_detection_variant(pwsh_variant)
+        if pwsh_variant not in seen:
+            seen.add(pwsh_variant)
+            yield pwsh_variant
     # Windows-path variant (#69472): normalization treats backslashes as
     # shell escapes and strips them, so `del C:\Users\me\.ssh\id_rsa`
     # reaches the patterns as `del C:Usersme.sshid_rsa` — no path rule can

@@ -31,9 +31,13 @@ is an internal implementation detail of the existing config bridge
 ``TERMINAL_*`` maps).  No new user-facing environment variable is added.
 """
 
+import ntpath
 import os
+import shutil
+import subprocess
 import sys
 import threading
+from collections.abc import Callable
 
 from hermes_constants import is_wsl
 
@@ -59,6 +63,107 @@ class ShellExecutionNotImplementedError(RuntimeError):
     """A valid shell selection reached an execution path that this build has
     not implemented yet.  Raised instead of silently running a different
     shell."""
+
+
+class PwshExecutableNotFoundError(FileNotFoundError):
+    """PowerShell 7 could not be resolved and validated for native execution."""
+
+
+def _windows_path_key(path: str) -> str:
+    """Return a case-insensitive comparison key for a Windows path."""
+    return ntpath.normcase(ntpath.normpath(path))
+
+
+def candidate_pwsh_paths(
+    env: dict | None = None,
+    *,
+    which_fn: Callable[[str], str | None] | None = None,
+) -> tuple[str, ...]:
+    """Return PowerShell 7 executable candidates in deterministic order.
+
+    Existing PATH semantics remain authoritative.  The standard PowerShell 7
+    installation is only a fallback for native Windows installations whose
+    installer did not update the process PATH.  Windows PowerShell 5.1 is not
+    a candidate because selecting ``pwsh`` must never change dialect silently.
+    """
+    env = os.environ if env is None else env
+    which_fn = shutil.which if which_fn is None else which_fn
+    candidates = [which_fn("pwsh"), which_fn("pwsh.exe")]
+    program_files = env.get("ProgramFiles") or r"C:\Program Files"
+    candidates.append(ntpath.join(program_files, "PowerShell", "7", "pwsh.exe"))
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        key = _windows_path_key(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved.append(candidate)
+    return tuple(resolved)
+
+
+def _probe_pwsh_executable(candidate: str) -> bool:
+    """Return whether *candidate* starts a non-interactive PowerShell Core 7+."""
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    probe = (
+        "if ($PSVersionTable.PSEdition -eq 'Core' -and "
+        "$PSVersionTable.PSVersion.Major -ge 7) { exit 0 }; exit 1"
+    )
+    try:
+        result = subprocess.run(
+            [candidate, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", probe],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            creationflags=windows_hide_flags(),
+        )
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
+        return False
+    return result.returncode == 0
+
+
+def resolve_pwsh_executable(
+    env: dict | None = None,
+    *,
+    which_fn: Callable[[str], str | None] | None = None,
+    exists_fn: Callable[[str], bool] | None = None,
+    probe_fn: Callable[[str], bool] | None = None,
+) -> str:
+    """Resolve and validate the PowerShell 7 executable, or fail closed."""
+    env = os.environ if env is None else env
+    which_fn = shutil.which if which_fn is None else which_fn
+    exists_fn = os.path.isfile if exists_fn is None else exists_fn
+    probe_fn = _probe_pwsh_executable if probe_fn is None else probe_fn
+
+    resolved_from_path = {name: which_fn(name) for name in ("pwsh", "pwsh.exe")}
+    path_hits = {
+        _windows_path_key(hit)
+        for hit in resolved_from_path.values()
+        if hit
+    }
+    candidates = candidate_pwsh_paths(
+        env,
+        which_fn=resolved_from_path.get,
+    )
+    checked: list[str] = []
+    for candidate in candidates:
+        checked.append(candidate)
+        if _windows_path_key(candidate) not in path_hits and not exists_fn(candidate):
+            continue
+        if probe_fn(candidate):
+            return candidate
+
+    rendered = ", ".join(checked) if checked else "PATH and the standard install location"
+    raise PwshExecutableNotFoundError(
+        "terminal.shell is 'pwsh', but no runnable PowerShell 7 pwsh.exe was "
+        f"found. Checked: {rendered}. Install PowerShell 7 or add pwsh.exe to PATH; "
+        "Hermes will not fall back to another shell dialect."
+    )
 
 
 def _normalize(value: str) -> str:

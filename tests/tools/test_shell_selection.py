@@ -33,6 +33,57 @@ class TestConstants:
         assert ss.SHELL_ENV_VAR == "TERMINAL_SHELL"
 
 
+class TestPwshExecutableResolution:
+    def test_candidates_prefer_path_then_standard_power_shell_7_location(self):
+        path_hit = r"C:\Tools\PowerShell\pwsh.exe"
+
+        assert ss.candidate_pwsh_paths(
+            env={"ProgramFiles": r"D:\Programs"},
+            which_fn=lambda name: path_hit if name == "pwsh" else None,
+        ) == (
+            path_hit,
+            r"D:\Programs\PowerShell\7\pwsh.exe",
+        )
+
+    def test_candidates_deduplicate_path_hits_case_insensitively(self):
+        assert ss.candidate_pwsh_paths(
+            env={"ProgramFiles": r"C:\Program Files"},
+            which_fn=lambda _name: r"C:\Program Files\PowerShell\7\PWSH.EXE",
+        ) == (r"C:\Program Files\PowerShell\7\PWSH.EXE",)
+
+    def test_resolver_skips_unrunnable_path_hit_and_uses_standard_location(self):
+        path_hit = r"C:\Broken\pwsh.exe"
+        standard = r"C:\Program Files\PowerShell\7\pwsh.exe"
+        probed = []
+
+        def probe(candidate):
+            probed.append(candidate)
+            return candidate == standard
+
+        assert ss.resolve_pwsh_executable(
+            env={"ProgramFiles": r"C:\Program Files"},
+            which_fn=lambda name: path_hit if name == "pwsh" else None,
+            exists_fn=lambda candidate: candidate == standard,
+            probe_fn=probe,
+        ) == standard
+        assert probed == [path_hit, standard]
+
+    def test_resolver_rejects_all_candidates_without_cross_dialect_fallback(self):
+        with pytest.raises(ss.PwshExecutableNotFoundError) as exc_info:
+            ss.resolve_pwsh_executable(
+                env={"ProgramFiles": r"C:\Program Files"},
+                which_fn=lambda _name: None,
+                exists_fn=lambda _candidate: False,
+                probe_fn=lambda _candidate: False,
+            )
+
+        message = str(exc_info.value)
+        assert "PowerShell 7" in message
+        assert "pwsh.exe" in message
+        assert "powershell.exe" not in message.lower()
+        assert "bash" not in message.lower()
+
+
 class TestActiveShellIdentity:
     @pytest.mark.windows_only
     def test_active_identity_is_frozen_for_process_lifetime(self):

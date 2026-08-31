@@ -347,6 +347,31 @@ See [Context Length Detection](../integrations/providers.md#context-length-detec
 
 ### Terminal Issues
 
+#### How do I use PowerShell 7 for native Windows terminal commands?
+
+If Hermes is already running natively on Windows with the local terminal
+backend, you can opt into PowerShell 7 in `~/.hermes/config.yaml`:
+
+```yaml
+terminal:
+  shell: pwsh
+```
+
+Restart Hermes after changing the setting. Hermes resolves and validates a
+PowerShell Core 7+ `pwsh.exe` from PATH or the standard PowerShell 7 install
+location. If it cannot find a runnable PowerShell 7 executable, the terminal
+returns a clear error and does not fall back to Windows PowerShell 5.1, Bash,
+or `cmd.exe`.
+
+This first increment supports synchronous foreground commands only. Background
+execution, PTY sessions, and completion notifications fail closed under a
+`pwsh` selection. WSL and remote/container terminal backends keep their Bash
+contract.
+
+Foreground calls use a fresh PowerShell process while preserving the working
+directory and process environment between calls. Functions, aliases, modules,
+jobs, PowerShell drives, and other runspace state do not persist.
+
 #### Command blocked as dangerous
 
 **Cause:** Hermes detected a potentially destructive command (e.g., `rm -rf`, `DROP TABLE`). This is a safety feature.

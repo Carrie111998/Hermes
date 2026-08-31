@@ -22,6 +22,7 @@ from tools.environments.base import BaseEnvironment, _pipe_stdin
 from tools.environments.shell_selection import (
     SHELL_BASH,
     get_active_shell_name,
+    resolve_pwsh_executable,
 )
 from hermes_cli._subprocess_compat import windows_hide_flags
 
@@ -2016,6 +2017,7 @@ class LocalEnvironment(BaseEnvironment):
         if self.shell_name == SHELL_BASH:
             self.init_session()
         else:
+            self._pwsh_executable = resolve_pwsh_executable()
             self._pwsh_env = _make_run_env(self.env)
             self._pwsh_removed_env: set[str] = set()
 
@@ -2061,12 +2063,6 @@ class LocalEnvironment(BaseEnvironment):
         trailer freezes ``$?``/``$LASTEXITCODE`` immediately after the payload;
         the wrapper reads those values without replacing them first.
         """
-        pwsh = shutil.which("pwsh") or shutil.which("pwsh.exe")
-        if not pwsh:
-            raise FileNotFoundError(
-                "terminal.shell is 'pwsh', but pwsh.exe was not found on PATH"
-            )
-
         safe_cwd = _resolve_safe_cwd(cwd)
         temp_dir = self.get_temp_dir()
         script_fd, script_path = tempfile.mkstemp(
@@ -2196,7 +2192,14 @@ class LocalEnvironment(BaseEnvironment):
         proc = None
         try:
             proc = subprocess.Popen(
-                [pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", script_path],
+                [
+                    self._pwsh_executable,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-File",
+                    script_path,
+                ],
                 text=True,
                 env=run_env,
                 encoding="utf-8",
