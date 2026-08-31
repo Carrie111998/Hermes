@@ -22,14 +22,28 @@ import textwrap
 import pytest
 
 
-def _run_child(hermes_home, body: str) -> subprocess.CompletedProcess:
-    """Import tui_gateway.entry in a fresh interpreter, then run `body`."""
-    script = textwrap.dedent(
-        """
-        import faulthandler, os, signal, threading, time
-        import tui_gateway.entry as entry
-        """
-    ) + textwrap.dedent(body)
+def _run_child(
+    hermes_home, body: str, preamble: str = ""
+) -> subprocess.CompletedProcess:
+    """Import tui_gateway.entry in a fresh interpreter, then run `body`.
+
+    `preamble` runs *before* the import, for tests that need to break
+    something the module-level _enable_faulthandler() call depends on.
+    """
+    script = (
+        textwrap.dedent(
+            """
+            import faulthandler, os, signal, threading, time
+            """
+        )
+        + textwrap.dedent(preamble)
+        + textwrap.dedent(
+            """
+            import tui_gateway.entry as entry
+            """
+        )
+        + textwrap.dedent(body)
+    )
 
     return subprocess.run(
         [sys.executable, "-c", script],
@@ -71,13 +85,24 @@ def test_fatal_signal_writes_native_stack_to_crash_log(tmp_path):
         """,
     )
 
-    # -11 on POSIX; 139 when a shell layer translates it.
-    assert result.returncode in (-11, 139), (
-        f"expected a fatal SIGSEGV, got {result.returncode}: {result.stderr[-2000:]}"
+    # The child must have died on the fault, whatever the platform calls it:
+    # -11/139 on POSIX, an NTSTATUS like 0xC0000005 on Windows.
+    assert result.returncode != 0, (
+        f"child survived a forced fault: {result.stderr[-2000:]}"
     )
+    if os.name == "posix":
+        assert result.returncode in (-11, 139), (
+            f"expected a fatal SIGSEGV, got {result.returncode}: "
+            f"{result.stderr[-2000:]}"
+        )
 
     text = _crash_log_text(tmp_path)
-    assert "Fatal Python error: Segmentation fault" in text
+    # The header wording is platform-specific — POSIX says "Segmentation
+    # fault", Windows reports an access violation. Only the prefix is a
+    # contract; what matters is that a dump was written at all.
+    assert "Fatal Python error:" in text or "fatal exception:" in text, (
+        f"no fatal-signal dump in the crash log: {text[:500]!r}"
+    )
     assert "Bystander" in text or text.count("Thread 0x") >= 2, (
         "dump does not cover non-faulting threads — all_threads was not set"
     )
@@ -150,3 +175,49 @@ def test_unwritable_crash_log_does_not_break_startup(tmp_path):
         f"import died on an unwritable crash log: {result.stderr[-2000:]}"
     )
     assert _emitted(result, "STARTED")
+
+
+def test_failed_enable_does_not_strand_the_crash_log_fd(tmp_path):
+    """If ``faulthandler.enable()`` rejects the handle, close it.
+
+    The handle is a module global so faulthandler can keep writing to it for
+    the process lifetime — which means nothing will ever collect it if enable()
+    bailed. Holding an fd open for a file nothing writes to is a leak.
+    """
+    result = _run_child(
+        tmp_path,
+        """
+        assert entry._FAULTHANDLER_FILE is None, (
+            "handle retained even though enable() failed"
+        )
+        assert _opened and _opened[0].closed, "crash-log fd was left open"
+        print("OK")
+        """,
+        preamble="""
+        # Fail enable() only for the file-backed call entry.py makes, so the
+        # stderr fallback is exercised too.
+        _opened = []
+        _real_open = open
+
+        def _tracking_open(*a, **k):
+            fh = _real_open(*a, **k)
+            if a and str(a[0]).endswith("tui_gateway_crash.log"):
+                _opened.append(fh)
+            return fh
+
+        import builtins
+        builtins.open = _tracking_open
+
+        _real_enable = faulthandler.enable
+
+        def _boom(*a, **k):
+            if "file" in k:
+                raise OSError("simulated enable() rejection")
+            return _real_enable(*a, **k)
+
+        faulthandler.enable = _boom
+        """,
+    )
+
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert _emitted(result, "OK")

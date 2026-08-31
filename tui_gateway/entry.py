@@ -274,6 +274,14 @@ def _enable_faulthandler() -> None:
     try:
         faulthandler.enable(file=_FAULTHANDLER_FILE, all_threads=True)
     except (RuntimeError, ValueError, OSError, AttributeError):
+        # enable() rejected the handle — don't strand an fd nothing will ever
+        # write to for the rest of the process lifetime.
+        try:
+            _FAULTHANDLER_FILE.close()
+        except Exception:
+            pass
+        _FAULTHANDLER_FILE = None
+
         return
 
     _sigusr2 = getattr(signal, "SIGUSR2", None)
