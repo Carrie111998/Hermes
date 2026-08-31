@@ -878,26 +878,34 @@ class HonchoClientConfig:
         """Resolve Honcho session name.
 
         Resolution order:
-          1. Gateway session key (stable per-chat identifier from gateway platforms)
-          2. per-session strategy — Hermes session_id ({timestamp}_{hex}); authoritative,
+          1. Gateway session key + Hermes session_id (stable across restarts,
+             fresh after /new or /reset)
+          2. Gateway session key when no Hermes session_id is available
+          3. per-session strategy — Hermes session_id ({timestamp}_{hex}); authoritative,
              so a generated title never remaps a live conversation
-          3. Manual directory override from sessions map
-          4. Hermes session title (from /title command; non-per-session)
-          5. per-repo strategy — git repo root directory name
-          6. per-directory strategy — directory basename
-          7. global strategy — workspace name
+          4. Manual directory override from sessions map
+          5. Hermes session title (from /title command; non-per-session)
+          6. per-repo strategy — git repo root directory name
+          7. per-directory strategy — directory basename
+          8. global strategy — workspace name
         """
         import re
 
         if not cwd:
             cwd = os.getcwd()
 
-        # Gateway per-chat key wins everywhere — gateways (telegram/discord/…)
-        # need per-chat isolation no cwd/strategy name can provide.
+        # Keep gateway chats isolated while rotating Honcho context at explicit
+        # Hermes session boundaries such as /new and /reset. The Hermes session
+        # id is stable across gateway restarts, so ordinary continuity survives.
         if gateway_session_key:
-            sanitized = re.sub(r'[^a-zA-Z0-9_-]+', '-', gateway_session_key).strip('-')
+            raw_key = (
+                f"{gateway_session_key}-{session_id}"
+                if session_id
+                else gateway_session_key
+            )
+            sanitized = re.sub(r'[^a-zA-Z0-9_-]+', '-', raw_key).strip('-')
             if sanitized:
-                return self._enforce_session_id_limit(sanitized, gateway_session_key)
+                return self._enforce_session_id_limit(sanitized, raw_key)
 
         # per-session: the run's session_id IS the identity — resolve before the
         # cwd map / title so an auto-generated title can't remap a live

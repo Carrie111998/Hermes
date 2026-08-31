@@ -566,21 +566,18 @@ class TestGetHonchoClient:
 
 
 class TestResolveSessionNameGatewayKey:
-    """Regression tests for gateway_session_key priority in resolve_session_name.
+    """Regression tests for gateway session isolation in resolve_session_name."""
 
-    Ensures gateway platforms get stable per-chat Honcho sessions even when
-    sessionStrategy=per-session would otherwise create ephemeral sessions.
-    Regression: plugin refactor 924bc67e dropped gateway key plumbing.
-    """
-
-    def test_gateway_key_overrides_per_session_strategy(self):
-        """gateway_session_key must win over per-session session_id."""
+    def test_gateway_key_includes_session_id(self):
+        """A gateway /new session must not reuse the prior chat's Honcho session."""
         config = HonchoClientConfig(session_strategy="per-session")
         result = config.resolve_session_name(
             session_id="20260412_171002_69bb38",
             gateway_session_key="agent:main:telegram:dm:8439114563",
         )
-        assert result == "agent-main-telegram-dm-8439114563"
+        assert result == (
+            "agent-main-telegram-dm-8439114563-20260412_171002_69bb38"
+        )
 
 
     def test_gateway_key_sanitizes_special_chars(self):
