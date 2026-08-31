@@ -113,6 +113,27 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+# Bound the synthetic device/client identifier we persist in audit records so
+# an attacker-controlled User-Agent header cannot bloat the audit log.
+_MAX_USER_AGENT_LEN = 256
+
+
+def _client_device(request: Request) -> str:
+    """Best-effort synthetic device/client identifier for audit records.
+
+    At the point a refresh failure is audited we have rejected the request
+    *before* resolving any token-derived identity, so no ``user_id`` is
+    available. The only safely-available synthetic client signal is the HTTP
+    ``User-Agent`` header. It is truncated to ``_MAX_USER_AGENT_LEN`` chars to
+    prevent log abuse from an oversized header, and returned as ``""`` when the
+    header is absent.
+    """
+    ua = request.headers.get("user-agent", "")
+    if not ua:
+        return ""
+    return ua[:_MAX_USER_AGENT_LEN]
+
+
 def _prefix(request: Request) -> str:
     """Resolve the X-Forwarded-Prefix header for the active request.
 
@@ -1087,6 +1108,7 @@ async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
         AuditEvent.REFRESH_FAILURE,
         reason="all_providers_rejected_rt",
         ip=_client_ip(request),
+        device=_client_device(request),
     )
     return JSONResponse(
         {
