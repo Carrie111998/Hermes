@@ -479,11 +479,18 @@ def _(rid, params: dict) -> dict:
                                 "stored_session_id": str(live.get("session_key") or ""),
                                 "message_count": len(history),
                                 "messages": [] if omit_messages else _history_to_messages(history),
-                                "info": {
-                                    "model": _resolve_model(),
-                                    "lazy": True,
-                                    "profile_name": profile or "",
-                                },
+                                # Built, not hand-rolled: this is the same
+                                # not-yet-built shape the other lazy paths
+                                # return, and a partial one costs more than the
+                                # missing fields suggest. The desktop reads a
+                                # missing `desktop_contract` as "too old to
+                                # report it" — that is how it detects a genuinely
+                                # stale backend — so an info dict without it
+                                # raises "Backend out of date" on a backend that
+                                # is perfectly current.
+                                "info": _lazy_resume_info(
+                                    _session_cwd(live), profile=profile
+                                ),
                             },
                             live,
                         ),
