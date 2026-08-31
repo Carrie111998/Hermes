@@ -66,6 +66,8 @@ This approach has two advantages over loading everything at startup:
 
 Each subdirectory is checked at most once per session. The discovery also walks up parent directories, so reading `backend/src/main.py` will discover `backend/AGENTS.md` even if `backend/src/` has no context file of its own.
 
+If a visited subdirectory has no `AGENTS.md`, `CLAUDE.md`, or `.cursorrules`, Hermes may include its `README.md` as **contextual documentation**. README content is explicitly labeled as descriptive material, does not override project instructions, and is processed through the same prompt-injection scan and size limit.
+
 :::info
 Subdirectory context files go through the same [security scan](#security-prompt-injection-protection) as startup context files. Malicious files are blocked.
 :::
