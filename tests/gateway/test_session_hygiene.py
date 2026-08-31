@@ -1152,14 +1152,20 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
-    runner.session_store.get_or_create_session.return_value = SessionEntry(
+    session_entry = SessionEntry(
         session_key="agent:main:telegram:private:12345",
         session_id="sess-1",
         created_at=datetime.now(),
         updated_at=datetime.now(),
         platform=Platform.TELEGRAM,
         chat_type="private",
+        last_prompt_tokens=12_345,
+        last_prompt_tokens_model="model-a",
+        last_prompt_tokens_provider="provider-a",
+        last_prompt_tokens_base_url="https://api.example/v1",
+        last_prompt_tokens_at=datetime.now(),
     )
+    runner.session_store.get_or_create_session.return_value = session_entry
     runner.session_store.load_transcript.return_value = _make_history(12, content_size=400)
     runner.session_store.has_any_sessions.return_value = True
     runner.session_store.rewrite_transcript = MagicMock()
@@ -1170,15 +1176,41 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     runner._session_db = async_session_db
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
-    runner._run_agent = AsyncMock(
-        return_value={
+    persisted_entries = []
+
+    def persist_snapshot_reset(
+        _session_key, *, last_prompt_tokens, touch_activity, **_route_identity
+    ):
+        assert last_prompt_tokens == 0
+        if persisted_entries:
+            return
+        assert touch_activity is False
+        session_entry.last_prompt_tokens = 0
+        session_entry.last_prompt_tokens_model = None
+        session_entry.last_prompt_tokens_provider = None
+        session_entry.last_prompt_tokens_base_url = None
+        session_entry.last_prompt_tokens_at = None
+        persisted_entries.append(SessionEntry.from_dict(session_entry.to_dict()))
+
+    runner.session_store.update_session.side_effect = persist_snapshot_reset
+
+    async def run_after_snapshot_invalidation(*_args, **_kwargs):
+        assert persisted_entries, "in-place compaction must persist reset before the turn"
+        assert trusted_prompt_token_snapshot(
+            persisted_entries[-1],
+            "model-a",
+            "provider-a",
+            "https://api.example/v1",
+        ) is None
+        return {
             "final_response": "ok",
             "messages": [],
             "tools": [],
             "history_offset": 0,
             "last_prompt_tokens": 0,
         }
-    )
+
+    runner._run_agent = AsyncMock(side_effect=run_after_snapshot_invalidation)
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(
@@ -1223,6 +1255,11 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     # rewrite_transcript would replace_messages(active_only=False) and DELETE
     # the just-archived rows (#61145). The hygiene handler must skip it.
     runner.session_store.rewrite_transcript.assert_not_called()
+    runner.session_store.update_session.assert_any_call(
+        session_entry.session_key,
+        last_prompt_tokens=0,
+        touch_activity=False,
+    )
     runner._run_agent.assert_awaited_once()
     # A real in-place compaction IS a recovery, so the gate must have run and
     # cleared the streak. This is the positive half of the wiring contract.
@@ -1286,14 +1323,20 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner.session_store = MagicMock()
-    runner.session_store.get_or_create_session.return_value = SessionEntry(
+    session_entry = SessionEntry(
         session_key="agent:main:telegram:private:12345",
         session_id="sess-1",
         created_at=datetime.now(),
         updated_at=datetime.now(),
         platform=Platform.TELEGRAM,
         chat_type="private",
+        last_prompt_tokens=12_345,
+        last_prompt_tokens_model="model-a",
+        last_prompt_tokens_provider="provider-a",
+        last_prompt_tokens_base_url="https://api.example/v1",
+        last_prompt_tokens_at=datetime.now(),
     )
+    runner.session_store.get_or_create_session.return_value = session_entry
     # 12 messages: below default → no compression without override,
     # but above the configured limit of 10 → should compress.
     runner.session_store.load_transcript.return_value = _make_history(12, content_size=40)
@@ -1306,15 +1349,30 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
-    runner._run_agent = AsyncMock(
-        return_value={
+    saved_bindings = []
+    runner.session_store._save.side_effect = lambda: saved_bindings.append(
+        SessionEntry.from_dict(session_entry.to_dict())
+    )
+
+    async def run_after_rotated_binding_persisted(*_args, **_kwargs):
+        assert saved_bindings, "rotation must persist the child binding before the turn"
+        saved = saved_bindings[-1]
+        assert saved.session_id == "sess-1_compressed"
+        assert trusted_prompt_token_snapshot(
+            saved,
+            "model-a",
+            "provider-a",
+            "https://api.example/v1",
+        ) is None
+        return {
             "final_response": "ok",
             "messages": [],
             "tools": [],
             "history_offset": 0,
             "last_prompt_tokens": 0,
         }
-    )
+
+    runner._run_agent = AsyncMock(side_effect=run_after_rotated_binding_persisted)
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(

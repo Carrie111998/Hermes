@@ -21028,7 +21028,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_rotated = False
                                             _hyg_in_place = False
                                         else:
+                                            # Publish the child binding and invalidate the
+                                            # provider snapshot in one durable transition.
+                                            # Persisting the new SID first would leave a
+                                            # restart window where the rewritten transcript
+                                            # still carries the old route's trusted count.
                                             session_entry.session_id = _hyg_new_sid
+                                            session_entry.last_prompt_tokens = 0
+                                            session_entry.last_prompt_tokens_model = None
+                                            session_entry.last_prompt_tokens_provider = None
+                                            session_entry.last_prompt_tokens_base_url = None
+                                            session_entry.last_prompt_tokens_at = None
                                             # The held turn lease follows the
                                             # rotation so an alias key resolving
                                             # the fresh child still serializes
@@ -21044,10 +21054,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             )
 
                                     if _hyg_rotated:
-                                        # Reset stored token count — transcript rewritten
-                                        session_entry.last_prompt_tokens = 0
-                                        session_entry.last_prompt_tokens_model = None
-                                        session_entry.last_prompt_tokens_at = None
                                         history = _compressed
                                         _new_count = len(_compressed)
                                         _new_tokens = estimate_messages_tokens_rough(
@@ -21056,10 +21062,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     elif _hyg_in_place:
                                         # archive_and_compact() already persisted the
                                         # compacted transcript inside _compress_context.
-                                        # Reset counts to match the new active set.
-                                        session_entry.last_prompt_tokens = 0
-                                        session_entry.last_prompt_tokens_model = None
-                                        session_entry.last_prompt_tokens_at = None
+                                        # Invalidate the provider snapshot durably before
+                                        # the user turn starts; a later end-of-turn update
+                                        # is not guaranteed if that turn aborts.
+                                        await self.async_session_store.update_session(
+                                            session_entry.session_key,
+                                            last_prompt_tokens=0,
+                                            touch_activity=False,
+                                        )
                                         history = _compressed
                                         _new_count = len(_compressed)
                                         _new_tokens = estimate_messages_tokens_rough(
