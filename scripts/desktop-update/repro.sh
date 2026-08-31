@@ -97,22 +97,31 @@ case "$MODE" in
     # exits without running an update.
     G="/tmp/hermes-gate-test.$$"
     UNPACKED="$G/hermes-agent/apps/desktop/release/linux-unpacked"
-    mkdir -p "$UNPACKED"
+    PROBE_BIN="$G/bin"
+    mkdir -p "$UNPACKED" "$PROBE_BIN"
     touch "$UNPACKED/hermes" && chmod +x "$UNPACKED/hermes"
+    set_userns_probe() {
+      printf '#!/bin/sh\nexit %s\n' "$1" > "$PROBE_BIN/unshare"
+      chmod +x "$PROBE_BIN/unshare"
+    }
+    set_userns_probe 1
 
     fails=0
     expect() { # name expected actual
       if [ "$2" = "$3" ]; then printf 'ok   %s -> %s\n' "$1" "$3"
       else printf 'FAIL %s -> %s (want %s)\n' "$1" "$3" "$2"; fails=$((fails+1)); fi
     }
-    decide() { bash "$SCRIPT_DIR/posix.sh" --self-test-gate --install-root "$G/hermes-agent" "$@" | cut -d: -f1; }
+    decide() { PATH="$PROBE_BIN:$PATH" bash "$SCRIPT_DIR/posix.sh" --self-test-gate --install-root "$G/hermes-agent" "$@" | cut -d: -f1; }
 
     expect "appimage (not under unpacked)"      skew     "$(decide --relaunch-target /opt/Hermes/hermes)"
     expect "sibling-prefix dir not fooled"      skew     "$(decide --relaunch-target "$UNPACKED-evil/hermes")"
     expect "no chrome-sandbox (namespace)"      relaunch "$(decide --relaunch-target "$UNPACKED/hermes")"
 
     touch "$UNPACKED/chrome-sandbox"
-    expect "sandbox not root/setuid"            manual   "$(decide --relaunch-target "$UNPACKED/hermes")"
+    expect "sandbox not root/setuid, no userns" manual   "$(decide --relaunch-target "$UNPACKED/hermes")"
+    set_userns_probe 0
+    expect "sandbox not root/setuid, userns"    relaunch "$(decide --relaunch-target "$UNPACKED/hermes")"
+    set_userns_probe 1
     expect "opt-out: --sandbox-fallback"        relaunch "$(decide --relaunch-target "$UNPACKED/hermes" --sandbox-fallback)"
     expect "opt-out: --no-sandbox launch arg"   relaunch "$(decide --relaunch-target "$UNPACKED/hermes" -- --no-sandbox)"
     expect "opt-out: ELECTRON_DISABLE_SANDBOX"  relaunch "$(ELECTRON_DISABLE_SANDBOX=1 decide --relaunch-target "$UNPACKED/hermes")"
@@ -120,7 +129,7 @@ case "$MODE" in
     # Result JSON must survive hostile strings (git allows `"` in branch
     # names; messages carry arbitrary text) -- parse it back with python.
     QHOME="$G/qhome"; mkdir -p "$QHOME/hermes-agent"
-    bash "$SCRIPT_DIR/posix.sh" --no-ui --no-marker-cleanup --desktop-pid 0 \
+    bash "$SCRIPT_DIR/posix.sh" --no-ui --no-marker-cleanup --daemonized --desktop-pid 0 \
       --install-root "$QHOME/hermes-agent" --branch 'evil"branch\n$(x)' >/dev/null 2>&1 || true
     if python3 -c "import json,sys; d=json.load(open('$QHOME/.hermes-update-result.json')); sys.exit(0 if d['branch']=='evil\"branch\\\\n\$(x)' and d['ok']==False else 1)"; then
       printf 'ok   result JSON escapes hostile branch/message\n'
@@ -157,7 +166,7 @@ case "$MODE" in
     mkdir -p "$UNPACKED"
     printf '#!/bin/sh\nexit 1\n' > "$UNPACKED/hermes"; chmod +x "$UNPACKED/hermes"
     if [ "$(uname)" != "Darwin" ]; then
-      bash "$SCRIPT_DIR/posix.sh" --no-ui --desktop-pid 0 --install-root "$L/hermes-agent" \
+      bash "$SCRIPT_DIR/posix.sh" --no-ui --daemonized --desktop-pid 0 --install-root "$L/hermes-agent" \
         --relaunch-target "$UNPACKED/hermes" >/dev/null 2>&1 || true
       expect_msg "instant-exit relaunch downgrades to manual" "d['ok']==True and d['manual']==True and 'Reopen Hermes' in d['message']"
     else
@@ -171,10 +180,45 @@ case "$MODE" in
     # 2. gated skew: success result carries the skew message (the manual
     #    event's payload), never a bare "Update complete."
     stub_install
-    bash "$SCRIPT_DIR/posix.sh" --no-ui --desktop-pid 0 --install-root "$L/hermes-agent" \
+    bash "$SCRIPT_DIR/posix.sh" --no-ui --daemonized --desktop-pid 0 --install-root "$L/hermes-agent" \
       --relaunch-target /opt/Hermes/hermes >/dev/null 2>&1 || true
     if [ "$(uname)" != "Darwin" ]; then
       expect_msg "skew outcome surfaces in result message" "d['ok']==True and d['manual']==True and 'was not changed' in d['message']"
+    fi
+
+    # 3. userns-capable Linux relaunch: the gate must carry the same
+    #    --disable-setuid-sandbox switch as the normal CLI launch path. Merely
+    #    changing GATE to relaunch can revive the original "quit and never came
+    #    back" failure on Electron builds that reject a present 0755 helper.
+    if [ "$(uname)" != "Darwin" ]; then
+      stub_install
+      UNPACKED="$L/hermes-agent/apps/desktop/release/linux-unpacked"
+      PROBE_BIN="$L/bin"
+      ARG_LOG="$L/relaunch.args"
+      PID_LOG="$L/relaunch.pid"
+      mkdir -p "$UNPACKED" "$PROBE_BIN"
+      printf '#!/bin/sh\nexit 0\n' > "$PROBE_BIN/unshare"; chmod +x "$PROBE_BIN/unshare"
+      cat > "$UNPACKED/hermes" <<'SH'
+#!/bin/sh
+printf '%s\n' "$@" > "${HERMES_RELAUNCH_ARG_LOG:?}"
+printf '%s\n' "$$" > "${HERMES_RELAUNCH_PID_LOG:?}"
+exec sleep 30
+SH
+      chmod +x "$UNPACKED/hermes"
+      touch "$UNPACKED/chrome-sandbox"
+      PATH="$PROBE_BIN:$PATH" \
+        HERMES_RELAUNCH_ARG_LOG="$ARG_LOG" HERMES_RELAUNCH_PID_LOG="$PID_LOG" \
+        bash "$SCRIPT_DIR/posix.sh" --no-ui --daemonized --desktop-pid 0 \
+          --install-root "$L/hermes-agent" --relaunch-target "$UNPACKED/hermes" \
+          -- --deep-link=test >/dev/null 2>&1 || true
+      disable_count="$(grep -cx -- '--disable-setuid-sandbox' "$ARG_LOG" 2>/dev/null || true)"
+      if [ "$disable_count" = "1" ] && grep -qx -- '--deep-link=test' "$ARG_LOG" 2>/dev/null; then
+        printf 'ok   userns relaunch preserves sandbox and launch args\n'
+      else
+        printf 'FAIL userns relaunch args -> %s\n' "$(tr '\n' ' ' < "$ARG_LOG" 2>/dev/null || echo missing)"
+        fails=$((fails+1))
+      fi
+      [ ! -f "$PID_LOG" ] || kill "$(cat "$PID_LOG")" 2>/dev/null || true
     fi
 
     rm -rf "$L"

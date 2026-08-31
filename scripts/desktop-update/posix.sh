@@ -298,14 +298,23 @@ stop_ui() { # error/manual outcomes keep the window up briefly so a watching
 #     apps/desktop/release/linux-unpacked (anchored, path-segment-aware --
 #     proof the update we just ran replaced the selected executable);
 #   * chrome-sandbox ABSENT is fine (namespace-sandbox build; nothing to
-#     block on), PRESENT means root-owned AND setuid or Electron refuses to
-#     boot ("quit and never came back");
+#     block on), PRESENT means root-owned AND setuid unless a live userns
+#     probe succeeds; that path replays --disable-setuid-sandbox so Chromium
+#     cannot abort on the present-but-unconfigured helper;
 #   * a user sandbox opt-out (ELECTRON_DISABLE_SANDBOX=1/true in our
 #     inherited env, --no-sandbox among the replayed launch args, or the
 #     Desktop vouching via --sandbox-fallback) makes the relaunch safe
 #     despite a failed preflight.
 # Outcomes mirror decideRelaunchOutcome: relaunch | skew | manual.
 GATE="" GATE_MSG=""
+append_relaunch_arg_once() {
+  local wanted="$1" arg
+  for arg in ${RELAUNCH_ARGS[@]+"${RELAUNCH_ARGS[@]}"}; do
+    [ "$arg" = "$wanted" ] && return
+  done
+  RELAUNCH_ARGS+=("$wanted")
+}
+
 linux_gate() {
   local unpacked="$INSTALL_ROOT/apps/desktop/release/linux-unpacked" sb arg
   case "$RELAUNCH_TARGET" in
@@ -316,10 +325,14 @@ linux_gate() {
   sb="$unpacked/chrome-sandbox"
   if [ ! -e "$sb" ]; then GATE=relaunch; return; fi
   if [ -u "$sb" ] && [ "$(stat -c %u "$sb" 2>/dev/null)" = "0" ]; then GATE=relaunch; return; fi
-  # Namespace sandbox usable => Electron never consults the setuid helper,
-  # so a non-root chrome-sandbox does not block relaunch (mirrors the
-  # _desktop_linux_userns_sandbox_available() probe in hermes_cli/main.py).
-  if unshare --user --map-root-user true 2>/dev/null; then GATE=relaunch; return; fi
+  # Namespace sandbox usable => keep the relaunch sandboxed without sudo.
+  # The CLI launch path adds this switch too: a present-but-non-setuid helper
+  # can otherwise make Chromium abort before it selects the namespace sandbox.
+  if unshare --user --map-root-user true 2>/dev/null; then
+    append_relaunch_arg_once --disable-setuid-sandbox
+    GATE=relaunch
+    return
+  fi
 
   case "${ELECTRON_DISABLE_SANDBOX:-}" in 1|true|TRUE|True) GATE=relaunch; return ;; esac
   [ "$SANDBOX_FALLBACK" -eq 1 ] && { GATE=relaunch; return; }
