@@ -358,8 +358,8 @@ class TestDiscordStreamingTTS:
         assert mixer.speech_active is False
 
     @pytest.mark.asyncio
-    async def test_mixer_replaced_during_worker_write_fails_before_audio_for_fallback(self):
-        """A stale child write must fail before the consumer marks it audible."""
+    async def test_mixer_replaced_after_worker_write_suppresses_whole_file_replay(self):
+        """PCM consumed before post-write staleness still suppresses file replay."""
         from gateway.streaming_tts_consumer import StreamingTTSConsumer
         from plugins.platforms.discord.adapter import _DiscordStreamingTTSHandle
 
@@ -370,7 +370,8 @@ class TestDiscordStreamingTTS:
 
             def stream(self, text):
                 del text
-                yield b"\x01\x00" * 32
+                # 480 mono samples upsample to one complete Discord frame.
+                yield b"\xe8\x03" * (vm.FRAME_SIZE // 8)
 
         adapter = _make_adapter()
         mixer = vm.VoiceMixer()
@@ -379,8 +380,7 @@ class TestDiscordStreamingTTS:
         adapter._voice_text_channels[111] = 222
         adapter._voice_mixers[111] = mixer
         adapter._cancel_voice_timeout = MagicMock()
-        write_started = threading.Event()
-        release_write = threading.Event()
+        pcm_consumed = threading.Event()
 
         with patch("tools.tts_streaming.resolve_streaming_provider", return_value=SingleChunkStreamer()):
             consumer = StreamingTTSConsumer(adapter, "222", {}, asyncio.get_running_loop())
@@ -394,28 +394,28 @@ class TestDiscordStreamingTTS:
             child = consumer._handle.child
             original_write = vm.StreamingMixerChild.write
 
-            def blocking_write(self, pcm):
+            def write_consume_then_replace(self, pcm):
+                result = original_write(self, pcm)
                 if self is child:
-                    write_started.set()
-                    if not release_write.wait(timeout=1.0):
-                        raise TimeoutError("test worker write was not released")
-                return original_write(self, pcm)
+                    # The actual child write has queued a full frame and the
+                    # mixer consumes it before the adapter's stale recheck.
+                    assert mixer.read() != vm.SILENCE_FRAME
+                    pcm_consumed.set()
+                    replacement = vm.VoiceMixer()
+                    adapter._voice_mixers[111] = replacement
+                    vc.source = replacement
+                return result
 
-            with patch.object(vm.StreamingMixerChild, "write", blocking_write):
+            with patch.object(vm.StreamingMixerChild, "write", write_consume_then_replace):
                 consumer.on_delta("A complete answer.")
                 consumer.finish()
-                assert await asyncio.to_thread(write_started.wait, 1.0)
-
-                replacement = vm.VoiceMixer()
-                adapter._voice_mixers[111] = replacement
-                vc.source = replacement
-                release_write.set()
                 completed = await consumer.wait_complete(timeout=1.0)
 
+        assert pcm_consumed.is_set()
         assert completed is False
         assert consumer.completed is False
-        assert consumer.audible is False
-        assert consumer.suppress_whole_file is False
+        assert consumer.audible is True
+        assert consumer.suppress_whole_file is True
         assert child.drained is True
         assert child._aborted is True
         assert child._activated is True
