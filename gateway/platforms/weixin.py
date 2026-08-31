@@ -462,7 +462,17 @@ async def _get_updates(
             timeout_ms=timeout_ms,
         )
     except asyncio.TimeoutError:
-        return {"ret": 0, "msgs": [], "get_updates_buf": sync_buf}
+        # Do NOT swallow the TimeoutError.  The 35-second long-poll times out
+        # on every successful empty-inbox cycle — that is expected and returned
+        # as an empty result.  But when the TCP connection is dead (WiFi
+        # reconnect, macOS sleep/wake), the same TimeoutError fires every cycle
+        # silently masking the fact that the socket is gone: _poll_loop's
+        # consecutive_failure counter is never bumped, health stays "connected",
+        # and the gateway becomes a zombie (#23523).
+        #
+        # Re-raise so _poll_loop catches it as an Exception, increments
+        # consecutive_failures, and eventually triggers reconnection.
+        raise
 
 
 async def _send_message(
