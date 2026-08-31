@@ -4198,16 +4198,28 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _resolve_streaming_voice_mixer(self, chat_id: str) -> Optional[Tuple[int, Any]]:
         """Return the connected, currently-installed mixer bound to *chat_id*."""
+        try:
+            from voice_mixer import VoiceMixer
+        except ImportError:
+            from .voice_mixer import VoiceMixer
+
         for guild_id, text_channel_id in getattr(self, "_voice_text_channels", {}).items():
             if str(text_channel_id) != str(chat_id):
                 continue
             voice_client = getattr(self, "_voice_clients", {}).get(guild_id)
             mixer = getattr(self, "_voice_mixers", {}).get(guild_id)
+            if voice_client is None:
+                continue
             try:
-                connected = voice_client is not None and voice_client.is_connected()
+                connected = voice_client.is_connected()
+                active_mixer_output = (
+                    connected
+                    and voice_client.is_playing()
+                    and getattr(voice_client, "source", mixer) is mixer
+                )
             except Exception:
-                connected = False
-            if connected and mixer is not None and hasattr(mixer, "begin_streaming_speech"):
+                active_mixer_output = False
+            if active_mixer_output and isinstance(mixer, VoiceMixer):
                 return guild_id, mixer
         return None
 
