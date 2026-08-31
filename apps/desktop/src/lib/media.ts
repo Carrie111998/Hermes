@@ -99,16 +99,16 @@ export async function resolveMediaDisplaySrc(path: string, owner?: MediaOwner): 
 // remote URLs untouched and route filesystem paths through the Electron media
 // protocol. Its main-process handler reads local files directly or proxies a
 // remote gateway with the connection's bearer/cookie/token authentication.
-export async function resolveMediaPlaybackSrc(path: string): Promise<string> {
+export async function resolveMediaPlaybackSrc(path: string, owner?: MediaOwner): Promise<string> {
   if (isInlineMediaSrc(path)) {
     return path
   }
 
   if (window.hermesDesktop && ['audio', 'video'].includes(mediaKind(path))) {
-    return isRemoteGateway() ? mediaGatewayStreamUrl(path) : mediaStreamUrl(path)
+    return isRemoteGatewayFor(owner) ? mediaGatewayStreamUrl(path, owner) : mediaStreamUrl(path)
   }
 
-  return resolveMediaDisplaySrc(path)
+  return resolveMediaDisplaySrc(path, owner)
 }
 
 // Resolve a media path to a URL the shell can open. Remote mode rewrites
@@ -136,10 +136,10 @@ export function mediaExternalUrl(path: string): string {
 // connections intentionally expose no static token to the renderer, so a bare
 // HTTPS source cannot authenticate reliably. The custom protocol keeps secrets
 // out of renderer URLs while forwarding Range requests to /api/files/stream.
-export function mediaGatewayStreamUrl(path: string): string {
-  const conn = $connection.get()
+export function mediaGatewayStreamUrl(path: string, owner?: MediaOwner): string {
+  const conn = owner || $connection.get()
 
-  if (isRemoteGateway()) {
+  if (isRemoteGatewayFor(owner)) {
     const file = encodeURIComponent(filePathFromMediaPath(path))
 
     const scope = [
@@ -190,6 +190,22 @@ export function filePathFromMediaPath(path: string): string {
 // then live on the gateway machine, not this disk, so we fetch them over the API.
 export function isRemoteGateway(): boolean {
   return $connection.get()?.mode === 'remote'
+}
+
+function isRemoteGatewayFor(owner?: MediaOwner): boolean {
+  if (!owner) {
+    return isRemoteGateway()
+  }
+
+  if (owner.mode) {
+    return owner.mode === 'remote'
+  }
+
+  if (owner.connectionId) {
+    return owner.connectionId !== 'local'
+  }
+
+  return isRemoteGateway()
 }
 
 // Fetch gateway-local media as a data URL via the authenticated desktop FS

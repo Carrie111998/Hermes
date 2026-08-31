@@ -1,9 +1,10 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { mediaMarkdownHref } from '@/lib/media'
 import { $connection } from '@/store/session'
 
-import { MarkdownImage, MarkdownTextContent } from './markdown-text'
+import { MarkdownImage, MarkdownTextContent, TranscriptMediaOwnerProvider } from './markdown-text'
 
 const REMOTE_IMAGE_PATH = '/home/user/project/images/remote-preview.png'
 const REMOTE_IMAGE_DATA_URL = 'data:image/png;base64,cmVtb3RlLWltYWdl'
@@ -49,6 +50,24 @@ describe('MarkdownTextContent remote images', () => {
       path: '/api/fs/read-data-url?path=%2Fhome%2Fuser%2Fproject%2Fimages%2Fremote-preview.png',
       profile: 'remote-work'
     })
+  })
+
+  it('routes transcript video playback through its owner connection', async () => {
+    $connection.set({ connectionId: 'ambient', mode: 'remote', profile: 'ambient' } as never)
+
+    const owner = { connectionId: 'transcript-owner', mode: 'remote' as const, profile: 'transcript-profile' }
+
+    const { container } = render(
+      <TranscriptMediaOwnerProvider value={owner}>
+        <MarkdownTextContent isRunning={false} text={`[clip](${mediaMarkdownHref('/tmp/clip.mp4')})`} />
+      </TranscriptMediaOwnerProvider>
+    )
+
+    await waitFor(() =>
+      expect(container.querySelector('video')?.getAttribute('src')).toBe(
+        'hermes-media://remote/%2Ftmp%2Fclip.mp4?connectionId=transcript-owner&profile=transcript-profile'
+      )
+    )
   })
 })
 

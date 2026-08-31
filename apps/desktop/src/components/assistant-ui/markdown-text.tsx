@@ -224,6 +224,7 @@ function MediaAttachment({ path }: { path: string }) {
   const { open, openFailed } = useOpenMediaFile(path)
   const kind = mediaKind(path)
   const name = mediaName(path)
+  const owner = useContext(TranscriptMediaOwnerContext)
 
   useEffect(() => {
     let cancelled = false
@@ -248,7 +249,7 @@ function MediaAttachment({ path }: { path: string }) {
       }
     }
 
-    void resolveMediaPlaybackSrc(path)
+    void resolveMediaPlaybackSrc(path, owner)
       .then(value => {
         if (value.startsWith('blob:')) {
           objectUrl = value
@@ -273,7 +274,7 @@ function MediaAttachment({ path }: { path: string }) {
         URL.revokeObjectURL(objectUrl)
       }
     }
-  }, [kind, path])
+  }, [kind, owner, path])
 
   if (kind === 'image') {
     return (
