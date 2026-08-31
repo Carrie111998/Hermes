@@ -16402,12 +16402,22 @@ ipcMain.handle('hermes:preview:emulate-device', (event, payload) => {
   try {
     if (!metrics) {
       guest.disableDeviceEmulation()
+      // Back to inheriting the window's zoom, which is what a preview that is
+      // not pretending to be a device should do.
+      guest.setZoomLevel(event.sender.getZoomLevel())
 
       return true
     }
 
     const width = Math.max(1, Math.round(Number(metrics.width) || 0))
     const height = Math.max(1, Math.round(Number(metrics.height) || 0))
+
+    // A guest inherits the window's zoom, and Chromium also REMEMBERS a zoom
+    // per origin for the session — so a page could arrive already zoomed even
+    // at 100%. Either way the emulated viewport would be measured in pixels the
+    // wrong size, and "430px wide" would be a lie. A device preview is only
+    // honest at the device's own scale, so pin it before emulating.
+    guest.setZoomLevel(0)
 
     guest.enableDeviceEmulation({
       // 0 keeps the real device pixel ratio: this emulates a viewport, not a

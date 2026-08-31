@@ -343,7 +343,11 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       }
 
       const box = host.getBoundingClientRect()
-      const { frame, scale } = viewportFit(viewport, { height: box.height, width: box.width })
+      // The pane measures in host CSS pixels; the guest paints in its own. App
+      // zoom is the ratio, so a zoomed window needs it divided back out or the
+      // frame is bigger than the page painted into it — see preview-viewport.ts.
+      const zoom = window.hermesDesktop?.zoom?.factor?.() ?? 1
+      const { frame, scale } = viewportFit(viewport, { height: box.height, width: box.width }, zoom)
       webview.className = 'bg-transparent'
       webview.style.width = `${frame.width}px`
       webview.style.height = `${frame.height}px`
@@ -369,9 +373,13 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     // find-bar.tsx.
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(apply)
     observer?.observe(host)
+    // Ctrl +/-/0 changes the host's CSS pixel without resizing the pane, so the
+    // ResizeObserver never fires — the frame would keep the old zoom's size.
+    const stopZoom = window.hermesDesktop?.zoom?.onChanged?.(() => apply())
 
     return () => {
       observer?.disconnect()
+      stopZoom?.()
       webview?.removeEventListener('dom-ready', apply)
       webview?.removeEventListener('did-navigate', apply)
     }

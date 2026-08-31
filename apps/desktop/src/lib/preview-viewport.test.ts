@@ -94,6 +94,68 @@ describe('viewportFit', () => {
   it('leaves a fitting page at its own size', () => {
     expect(viewportFit(PHONE, { height: 1000, width: 800 })).toEqual({ frame: PHONE, scale: 1 })
   })
+
+  // ── App zoom. The pane measures in host CSS pixels and Chromium paints the
+  // emulated page in the guest's; app zoom is the ratio. Ignoring it shipped a
+  // white band down the right and bottom of every device preview for anyone
+  // who had pressed Ctrl+ — measured in a real guest at 134%: a 430x932 phone
+  // got a 563x1219 widget for a 419x907 paint, exactly 1/1.3446 of it painted.
+  describe('under app zoom', () => {
+    const ZOOM = 1.3445671961657126 // 1.2^1.6239, the level found in zoom-state.json
+
+    it('shrinks the frame by the zoom, so the painted page fills it', () => {
+      const pane = { height: 1000, width: 800 }
+      const { frame, scale } = viewportFit(PHONE, pane, ZOOM)
+
+      // What the guest paints, in guest pixels, is device x scale. The element
+      // is in host pixels, and one host pixel is `zoom` guest pixels — so the
+      // frame has to be that much smaller or the surplus never gets painted.
+      expect(frame.width).toBe(Math.round((PHONE.width * scale) / ZOOM))
+      expect(frame.height).toBe(Math.round((PHONE.height * scale) / ZOOM))
+    })
+
+    it('regression: the frame is NOT the unzoomed size', () => {
+      // The exact bug. Before the fix both branches returned device x scale,
+      // so this assertion is what tells the two apart.
+      const pane = { height: 500, width: 400 }
+      const zoomed = viewportFit(DESKTOP, pane, ZOOM)
+
+      expect(zoomed.frame.width).not.toBe(Math.round(DESKTOP.width * zoomed.scale))
+      expect(zoomed.frame.width).toBeLessThan(Math.round(DESKTOP.width * zoomed.scale))
+    })
+
+    it('still never overflows the pane it was asked to fit', () => {
+      for (const preset of VIEWPORT_PRESETS) {
+        for (const pane of [
+          { height: 560, width: 500 },
+          { height: 337, width: 1201 },
+          { height: 999, width: 333 }
+        ]) {
+          const { frame } = viewportFit(preset, pane, ZOOM)
+
+          expect(frame.width, `${preset.id} in ${pane.width}x${pane.height}`).toBeLessThanOrEqual(pane.width)
+          expect(frame.height, `${preset.id} in ${pane.width}x${pane.height}`).toBeLessThanOrEqual(pane.height)
+        }
+      }
+    })
+
+    it('uses the zoom to fit MORE page, not less', () => {
+      // A zoomed window has more guest pixels than host pixels, so a device
+      // that had to be shrunk at 100% may fit at 1:1 when zoomed in.
+      const pane = { height: 700, width: 340 }
+
+      expect(viewportFit(PHONE, pane, ZOOM).scale).toBeGreaterThan(viewportFit(PHONE, pane).scale)
+    })
+
+    it('treats a missing or nonsense zoom as 100%', () => {
+      const pane = { height: 500, width: 400 }
+      const plain = viewportFit(DESKTOP, pane)
+
+      for (const bad of [0, -2, Number.NaN, Number.POSITIVE_INFINITY]) {
+        expect(viewportFit(DESKTOP, pane, bad)).toEqual(plain)
+      }
+    })
+  })
 })
 
 describe('toWidgetPoint', () => {

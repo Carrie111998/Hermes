@@ -128,15 +128,34 @@ export function fitScale(viewport: { height: number; width: number }, available:
   return Math.max(0.05, Math.floor(scale * 1000) / 1000)
 }
 
-/** The element size that makes the emulated page fill it exactly. */
+/**
+ * The element size that makes the emulated page fill it exactly.
+ *
+ * `zoom` is the HOST window's zoom factor, and it is not optional in practice —
+ * leaving it at 1 while the user has zoomed the app is the bug this parameter
+ * exists to kill. The pane measures itself in host CSS pixels, but Chromium
+ * paints the emulated page in the GUEST's CSS pixels, and app zoom is exactly
+ * the ratio between the two: at 134% the guest widget came out 1.34x larger
+ * than the page painted into it, so a quarter of the frame stayed unpainted —
+ * a white band down the right and along the bottom. Measured in a real guest:
+ * a 430x932 phone reported a 563x1219 widget for a 419x907 paint.
+ *
+ * So: pick the scale against the space expressed in GUEST pixels, then hand the
+ * element back a size in HOST pixels by dividing the zoom out again.
+ */
 export function viewportFit(
   viewport: { height: number; width: number },
-  available: { height: number; width: number }
+  available: { height: number; width: number },
+  zoom = 1
 ): ViewportFit {
-  const scale = fitScale(viewport, available)
+  const z = Number.isFinite(zoom) && zoom > 0 ? zoom : 1
+  const scale = fitScale(viewport, { height: available.height * z, width: available.width * z })
 
   return {
-    frame: { height: Math.round(viewport.height * scale), width: Math.round(viewport.width * scale) },
+    frame: {
+      height: Math.round((viewport.height * scale) / z),
+      width: Math.round((viewport.width * scale) / z)
+    },
     scale
   }
 }
