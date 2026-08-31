@@ -567,6 +567,66 @@ class TestCallbackPortReservation:
 
 
 # ---------------------------------------------------------------------------
+# Configured loopback redirect_uri pins the callback port (#99503)
+# ---------------------------------------------------------------------------
+
+class TestConfiguredRedirectUriPort:
+    """A pinned ``oauth.redirect_uri: http://localhost:<N>/callback`` (no
+    ``oauth.redirect_port``) must make the callback listener bind port ``<N>``,
+    so it matches the port the authorize URL advertises. Before #99503 the
+    listener took an ephemeral port and every approval was lost."""
+
+    def test_loopback_redirect_uri_pins_listener_port(self):
+        import tools.mcp_oauth as mod
+
+        cfg: dict = {"cimd": False, "redirect_uri": "http://localhost:3118/callback"}
+        port = mod._configure_callback_port(cfg)
+
+        assert port == 3118
+        assert cfg["_resolved_port"] == 3118
+        # A fixed, known port is not parked in the ephemeral reservation table.
+        assert 3118 not in mod._reserved_sockets
+        # The advertised redirect_uri and the listener now agree on the port.
+        assert mod._resolve_redirect_uri(cfg, port) == "http://localhost:3118/callback"
+
+    def test_explicit_redirect_port_still_wins(self):
+        import tools.mcp_oauth as mod
+
+        cfg: dict = {
+            "cimd": False,
+            "redirect_port": 49512,
+            "redirect_uri": "http://localhost:3118/callback",
+        }
+        assert mod._configure_callback_port(cfg) == 49512
+
+    def test_proxy_redirect_uri_keeps_ephemeral_listener(self):
+        import tools.mcp_oauth as mod
+
+        cfg: dict = {"cimd": False, "redirect_uri": "https://oauth.example.ts.net/callback"}
+        port = mod._configure_callback_port(cfg)
+        try:
+            # Not derived from the (non-loopback) proxy URL — a real ephemeral pick.
+            assert port not in (0, 3118)
+            assert port in mod._reserved_sockets
+        finally:
+            sock = mod._reserved_sockets.pop(port, None)
+            if sock is not None:
+                sock.close()
+
+    @pytest.mark.parametrize("uri, expected", [
+        ("http://localhost:3118/callback", 3118),
+        ("http://127.0.0.1:8899/callback", 8899),
+        ("https://oauth.example.ts.net/callback", None),  # proxy — independent listener
+        ("http://localhost/callback", None),              # no port
+        ("", None),
+    ])
+    def test_port_from_configured_redirect_uri(self, uri, expected):
+        from tools.mcp_oauth import _port_from_configured_redirect_uri
+
+        assert _port_from_configured_redirect_uri({"redirect_uri": uri} if uri else {}) == expected
+
+
+# ---------------------------------------------------------------------------
 # remove_oauth_tokens
 # ---------------------------------------------------------------------------
 

@@ -304,6 +304,35 @@ def _cached_redirect_port(storage: "HermesTokenStorage | None") -> int | None:
     return None
 
 
+def _port_from_configured_redirect_uri(cfg: dict) -> int | None:
+    """Return the port of a configured loopback ``oauth.redirect_uri``.
+
+    When a server pins ``oauth.redirect_uri: http://localhost:<N>/callback``
+    but no ``oauth.redirect_port``, the authorize URL advertises port ``<N>``
+    (``_resolve_redirect_uri`` returns the configured URI verbatim) while the
+    callback listener would otherwise bind an ephemeral port — the redirect
+    then hits a dead port and login times out. Deriving the port here keeps
+    the listener and the advertised ``redirect_uri`` on the same port. A
+    non-loopback (proxy) ``redirect_uri`` returns ``None`` so those flows keep
+    their independent ephemeral listener.
+    """
+    configured = cfg.get("redirect_uri")
+    if not configured:
+        return None
+    try:
+        parsed = urlparse(str(configured))
+    except (TypeError, ValueError):
+        return None
+    if (
+        parsed.scheme == "http"
+        and parsed.hostname in {"127.0.0.1", "localhost"}
+        and parsed.path == "/callback"
+        and parsed.port is not None
+    ):
+        return int(parsed.port)
+    return None
+
+
 def _cached_redirect_uri(storage: "HermesTokenStorage | None") -> str | None:
     """Return a cached non-loopback redirect URI, if one was registered."""
     if storage is None:
@@ -1547,9 +1576,10 @@ def _configure_callback_port(
 
     Port choice precedence:
     1. explicit ``oauth.redirect_port`` config
-    2. cached client registration redirect URI port
-    3. a pinned CIMD port, when the flow is CIMD-eligible
-    4. newly allocated free port
+    2. port of a configured loopback ``oauth.redirect_uri``
+    3. cached client registration redirect URI port
+    4. a pinned CIMD port, when the flow is CIMD-eligible
+    5. newly allocated free port
 
     A CIMD-eligible flow also records the client_id URL in
     ``cfg['_cimd_url']`` for the provider constructors to forward.
@@ -1580,15 +1610,22 @@ def _configure_callback_port(
         _oauth_port = port
         return port
     requested = int(cfg.get("redirect_port", 0))
-    # Precedence: explicit config port → cached client-registration port →
-    # fresh ephemeral port. The cached port keeps re-auth consistent with the
-    # redirect URI pinned at dynamic client registration (providers reject a
-    # mismatched URI). Only a truly fresh ephemeral pick goes through
-    # _reserve_callback_port(), which keeps the socket bound until
+    # Precedence: explicit config port → port of a configured loopback
+    # redirect_uri → cached client-registration port → fresh ephemeral port.
+    # A configured loopback redirect_uri is what _resolve_redirect_uri puts in
+    # the authorize request, so the listener must bind that same port or the
+    # redirect lands on a dead port (#99503). The cached port keeps re-auth
+    # consistent with the redirect URI pinned at dynamic client registration
+    # (providers reject a mismatched URI). Only a truly fresh ephemeral pick
+    # goes through _reserve_callback_port(), which keeps the socket bound until
     # _wait_for_callback adopts it — closing the select→bind TOCTOU race
-    # (#22161). Explicit and cached ports are fixed, known values and bind
-    # via the reuse_address path instead.
-    port = requested or _cached_redirect_port(storage) or _reserve_callback_port()
+    # (#22161). Fixed, known ports bind via the reuse_address path instead.
+    port = (
+        requested
+        or _port_from_configured_redirect_uri(cfg)
+        or _cached_redirect_port(storage)
+        or _reserve_callback_port()
+    )
     # A cached port can be one of the pinned CIMD ports, left behind by an
     # earlier CIMD login for this server. Claim it so a sibling server's
     # _pick_cimd_port doesn't hand the same port out a second time.
