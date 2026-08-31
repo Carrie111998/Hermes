@@ -3,8 +3,14 @@
 Clarify Tool Module - Interactive Clarifying Questions
 
 Allows the agent to present structured multiple-choice questions or open-ended
-prompts to the user. In CLI mode, choices are navigable with arrow keys. On
-messaging platforms, choices are rendered as a numbered list.
+prompts to the user. In CLI mode, choices are navigable with arrow keys.
+
+Platform rendering per adapter:
+- Telegram: native inline keyboard buttons (one per choice) — each button
+  sends the user's selection back automatically.  Do NOT simulate menus
+  with copy_text buttons or numbered lists (#98911).
+- Discord: native component buttons.
+- Other messaging platforms: numbered list fallback.
 
 Supports both single-select (radio) and multi-select (checkbox) modes via the
 ``multi_select`` parameter.
@@ -47,7 +53,7 @@ def _flatten_choice(c) -> str:
     dict-shaped choices like ``[{"description": "..."}]``. A naive ``str(c)``
     turns the whole dict into its Python repr — ``{'description': '...'}`` —
     which then leaks onto every surface that renders the choice (CLI panel,
-    Discord buttons, Telegram numbered list) AND is returned verbatim as the
+    Discord buttons, Telegram inline buttons) AND is returned verbatim as the
     user's answer. Normalising here, at the one platform-agnostic entry point,
     fixes the whole class in one place instead of per-adapter.
 

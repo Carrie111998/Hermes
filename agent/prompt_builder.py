@@ -821,7 +821,12 @@ PLATFORM_HINTS = {
         "inline; image URLs via ![alt](url) send as photos. Audio: add "
         "[[audio_as_voice]] on its own line to send ANY audio file as a "
         "native voice bubble (non-Opus transcodes automatically); without "
-        "it, .mp3/.m4a arrive as audio files, other formats as documents."
+        "it, .mp3/.m4a arrive as audio files, other formats as documents. "
+        "For multiple-choice questions use the clarify tool — Telegram "
+        "renders each choice as a native inline button that sends the "
+        "user's selection back to you automatically; do NOT simulate "
+        "choice menus with copy_text buttons, numbered lists, or "
+        "Markdown-formatted options (#98911)."
     ),
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "
