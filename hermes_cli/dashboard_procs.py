@@ -91,23 +91,41 @@ def _scan_dashboard_processes(
                 timeout=10,
                 errors="ignore",
             )
-            if result is None or result.returncode != 0 or result.stdout is None:
-                return []
-            current_cmd = ""
-            for line in result.stdout.split("\n"):
-                line = line.strip()
-                if line.startswith("CommandLine="):
-                    current_cmd = line[len("CommandLine=") :]
-                elif line.startswith("ProcessId="):
-                    pid_str = line[len("ProcessId=") :]
-                    if (
-                        any(p in current_cmd for p in patterns)
-                        and int(pid_str) != self_pid
-                    ):
+            if result is not None and result.returncode == 0 and result.stdout is not None:
+                current_cmd = ""
+                for line in result.stdout.split("\n"):
+                    line = line.strip()
+                    if line.startswith("CommandLine="):
+                        current_cmd = line[len("CommandLine=") :]
+                    elif line.startswith("ProcessId="):
+                        pid_str = line[len("ProcessId=") :]
+                        if (
+                            any(p in current_cmd for p in patterns)
+                            and int(pid_str) != self_pid
+                        ):
+                            try:
+                                dashboard_processes.append((int(pid_str), current_cmd))
+                            except ValueError:
+                                pass
+
+            # WMIC is an optional Windows Feature and is absent by default on
+            # current Windows 11. Fall back to psutil (a core dependency) when
+            # the probe fails or yields no Hermes web-server processes.
+            if not dashboard_processes:
+                try:
+                    import psutil
+
+                    for proc in psutil.process_iter(["pid", "cmdline"]):
                         try:
-                            dashboard_processes.append((int(pid_str), current_cmd))
-                        except ValueError:
-                            pass
+                            pid = int(proc.info.get("pid") or 0)
+                            argv = proc.info.get("cmdline") or []
+                            command = subprocess.list2cmdline([str(arg) for arg in argv])
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, TypeError):
+                            continue
+                        if pid != self_pid and any(p in command for p in patterns):
+                            dashboard_processes.append((pid, command))
+                except (ImportError, OSError):
+                    pass
         else:
             # Linux / macOS: scan the process table via ps and match against
             # the same explicit patterns list used on Windows.  Using ps
@@ -372,14 +390,12 @@ def _kill_stale_dashboard_processes(
     Windows: ``taskkill /PID <pid> /F`` since there's no clean SIGTERM
     equivalent for background console apps.
 
-    Manually-started dashboards are not auto-restarted because we don't know
-    the original launch args (--host, --port, --insecure, --tui, --no-open).
-    When ``restart_managed`` is true (the ``hermes update`` path), a detected
-    ``hermes-dashboard.service`` is restarted through systemd; any OTHER
-    killed PID that was supervised by a systemd unit (custom unit names —
-    e.g. a remote backend's ``hermes-serve.service``) has its owning unit
-    restarted after the kill, because systemd treats our SIGTERM as a clean
-    stop and ``Restart=on-failure`` would never fire (#68934).
+    On the update path, fixed-port manually-started backends are respawned
+    from their captured argv on every platform. Ephemeral ``--port 0`` Desktop
+    children remain Desktop-owned and are never resurrected. systemd-managed
+    processes are restarted through their owning unit; this matters because
+    systemd treats our SIGTERM as a clean stop and ``Restart=on-failure`` would
+    never fire (#68934).
 
     *already_restarted_units* names units (no ``.service`` suffix) the
     caller already restarted directly — e.g. ``hermes update``'s systemd
@@ -420,23 +436,25 @@ def _kill_stale_dashboard_processes(
     if not pids:
         return {"matched": [], "killed": [], "failed": []}
 
-    # Before killing, snapshot systemd cgroup info for each PID so we can
-    # restart supervised services after the kill (the cgroup disappears
-    # along with the process).  Only meaningful on Linux, and only when the
-    # caller asked for restarts (the `hermes update` path) — `--stop` must
-    # stay a stop, not a restart.
+    # Before killing, snapshot supervision + argv so update can recover the
+    # exact backend afterward. systemd ownership exists only on POSIX, but
+    # cmdline capture is cross-platform: fixed-port Windows remote serves are
+    # just as persistent as their POSIX counterparts and must survive updates.
     pid_cgroup: dict[int, str | None] = {}
     pid_service: dict[int, str | None] = {}
     pid_cmdline: dict[int, list[str]] = {}
     pid_home: dict[int, str | None] = {}
-    if restart_managed and sys.platform != "win32":
+    if restart_managed:
         for pid in pids:
-            cg_path = _m()._get_pid_cgroup_path(pid)
-            pid_cgroup[pid] = cg_path
-            pid_service[pid] = _m()._get_systemd_service_for_pid(pid)
-            if not pid_service[pid]:
+            if sys.platform != "win32":
+                cg_path = _m()._get_pid_cgroup_path(pid)
+                pid_cgroup[pid] = cg_path
+                pid_service[pid] = _m()._get_systemd_service_for_pid(pid)
+            if not pid_service.get(pid):
                 # Manually-started process: preserve its exact argv so we
-                # can respawn it after the update (#40449, #68934).
+                # can respawn it after the update (#40449). This includes
+                # Windows fixed-port remote serves; port-zero Desktop children
+                # are filtered out by _filter_dashboard_respawn_candidates.
                 # Snapshot HERMES_HOME before the kill so per-profile caps
                 # still work after the process is gone (#78821).
                 cmdline = _m()._dashboard_cmdline_for_pid(pid)
@@ -444,7 +462,7 @@ def _kill_stale_dashboard_processes(
                     pid_cmdline[pid] = cmdline
                     pid_home[pid] = _hermes_home_for_pid(pid)
 
-        if already_restarted_units:
+        if already_restarted_units and sys.platform != "win32":
             # Already handled directly by the caller (e.g. hermes update's
             # systemd fleet-restart loop) — leave these alone instead of
             # killing and re-restarting a process that's already fresh.

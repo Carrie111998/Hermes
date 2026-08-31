@@ -8836,11 +8836,16 @@ def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
     Linux: reads ``/proc/<pid>/cmdline`` (NUL-separated, lossless).
     macOS: falls back to ``ps -o command=`` + shlex (best effort — quoting
     is reconstructed, but hermes launch commands don't embed exotic args).
-    Windows: returns ``None``; taskkill /F gives no graceful window and the
-    desktop app manages its own backend there.
+    Windows: reads argv through psutil, avoiding optional/deprecated WMIC.
     """
     if sys.platform == "win32":
-        return None
+        try:
+            import psutil
+
+            argv = psutil.Process(pid).cmdline()
+            return [str(part) for part in argv] or None
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError, ValueError):
+            return None
     try:
         cmdline_path = f"/proc/{pid}/cmdline"
         if os.path.exists(cmdline_path):

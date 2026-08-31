@@ -170,6 +170,7 @@ class TestFindStaleDashboardPids:
         assert 12345 in pids
 
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="ps-based scan path")
     def test_ps_timeout_returns_empty(self):
         import subprocess as sp
         with patch("subprocess.run", side_effect=sp.TimeoutExpired("ps", 10)):
@@ -289,6 +290,44 @@ class TestKillStaleDashboardWindows:
         assert "✓ stopped PID 12345" in out
         assert "✓ stopped PID 12346" in out
 
+    @pytest.mark.windows_only
+    def test_windows_cmdline_capture_uses_psutil(self):
+        """Windows update recovery preserves argv without relying on WMIC."""
+        live = sys.modules["hermes_cli.main"]
+        argv = [sys.executable, "-m", "hermes_cli.main", "serve", "--port", "9119"]
+        proc = MagicMock()
+        proc.cmdline.return_value = argv
+        with patch("psutil.Process", return_value=proc):
+            assert live._dashboard_cmdline_for_pid(45020) == argv
+
+    @pytest.mark.windows_only
+    def test_update_respawns_fixed_port_manual_serve(self, capsys):
+        """A Windows fixed-port remote backend survives ``hermes update``."""
+        live = sys.modules["hermes_cli.main"]
+        argv = [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "serve",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "9119",
+            "--skip-build",
+        ]
+
+        with patch.object(live, "_restart_managed_dashboard_service", return_value=False), \
+             patch.object(live, "_find_stale_dashboard_pids", return_value=[19176]), \
+             patch.object(live, "_dashboard_cmdline_for_pid", return_value=argv), \
+             patch("hermes_cli.dashboard_procs._hermes_home_for_pid", return_value=None), \
+             patch.object(live, "_respawn_dashboard_processes", return_value=[]) as respawn, \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
+            result = _kill_stale_dashboard_processes(restart_managed=True)
+
+        respawn.assert_called_once_with([argv])
+        assert result["unrecovered"] == []
+        assert "when you're ready" not in capsys.readouterr().out
+
 
 class TestBackCompatAlias:
     """``_warn_stale_dashboard_processes`` is kept as an alias for the
@@ -316,6 +355,30 @@ class TestWindowsWmicEncoding:
     """Regression tests for #17049 — the Windows wmic branch must not crash
     `hermes update` on non-UTF-8 system locales (e.g. cp936 on zh-CN).
     """
+
+    def test_missing_wmic_falls_back_to_psutil(self):
+        """Modern Windows without WMIC must still find fixed-port serves."""
+        proc = MagicMock()
+        proc.info = {
+            "pid": 19176,
+            "cmdline": [
+                sys.executable,
+                "-m",
+                "hermes_cli.main",
+                "serve",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "9119",
+            ],
+        }
+        with patch("sys.platform", "win32"), \
+             patch("hermes_cli._subprocess_compat.bounded_probe_run") as probe, \
+             patch("psutil.process_iter", return_value=[proc]):
+            probe.return_value = None
+            matches = _find_stale_dashboard_pids()
+
+        assert matches == [19176]
 
     def test_wmic_routed_through_bounded_probe_run_with_ignore_errors(self):
         """The wmic scan must go through ``bounded_probe_run`` — which owns
@@ -360,7 +423,8 @@ class TestWindowsWmicEncoding:
         an empty scan, not an AttributeError on result.stdout (#87134)."""
         with patch("sys.platform", "win32"), \
              patch("hermes_cli._subprocess_compat.bounded_probe_run",
-                   return_value=None):
+                   return_value=None), \
+             patch("psutil.process_iter", return_value=[]):
             assert _find_stale_dashboard_pids() == []
 
 
