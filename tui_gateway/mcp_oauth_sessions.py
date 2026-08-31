@@ -409,13 +409,19 @@ def deliver_callback_flow(
     code: Optional[str],
     state: Optional[str],
     error: Optional[str] = None,
+    iss: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Relay a client-captured OAuth redirect into a session's flow.
 
     Remote-backend companion to ``start_flow(client_redirect_uri=...)``: the
     desktop app's loopback listener caught the provider redirect on the USER'S
-    machine and forwards ``code``/``state`` (or ``error``) here. Security
-    properties are unchanged from the gateway-listener path — the underlying
+    machine and forwards ``code``/``state`` (or ``error``) here, plus the
+    RFC 9207 ``iss`` issuer when the provider sent one — mcp 2.0 rejects a
+    response that omits it when the server advertised
+    ``authorization_response_iss_parameter_supported``, so a relay that drops
+    it fails against every such provider exactly like the listener paths did
+    before they preserved it. Security properties are unchanged from the
+    gateway-listener path — the underlying
     ``DashboardOAuthFlow.deliver_callback`` verifies ``state`` against the
     pinned authorization request (constant-time compare) and rejects replays,
     so a forged or replayed relay fails identically to a forged loopback hit.
@@ -431,7 +437,7 @@ def deliver_callback_flow(
 
     flow = rec["flow"]
     try:
-        flow.deliver_callback(code=code, state=state, error=error)
+        flow.deliver_callback(code=code, state=state, error=error, iss=iss)
     except ValueError as exc:
         return {"ok": False, "error_message": str(exc)}
     return {"ok": True, "session_id": session_id}

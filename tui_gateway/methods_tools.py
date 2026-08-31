@@ -2434,8 +2434,10 @@ def _(rid, params: dict) -> dict:
     ``client_redirect_uri``: the desktop app's local loopback listener caught
     the provider redirect on the user's machine and forwards its query params
     here. Params: optional ``profile``, ``name`` (required), ``session_id``
-    (required), ``code``, ``state``, ``error``. Result: ``{ok: true}`` once the
-    callback is accepted (state verified inside the flow bridge), or
+    (required), ``code``, ``state``, ``error``, ``iss`` (the RFC 9207
+    authorization-response issuer, forwarded so iss-enforcing providers accept
+    the relayed response). Result: ``{ok: true}`` once the callback is
+    accepted (state verified inside the flow bridge), or
     ``{ok: false, error_message}`` on mismatch/expiry.
     """
     name = str(params.get("name") or "").strip()
@@ -2456,6 +2458,7 @@ def _(rid, params: dict) -> dict:
             code=str(params.get("code") or "") or None,
             state=str(params.get("state") or "") or None,
             error=str(params.get("error") or "") or None,
+            iss=str(params.get("iss") or "") or None,
         )
         return _ok(rid, result)
     except Exception as e:
