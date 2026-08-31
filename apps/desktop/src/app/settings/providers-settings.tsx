@@ -1,25 +1,15 @@
 import { useStore } from '@nanostores/react'
-import type { ReactNode } from 'react'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
 import { runInTerminal } from '@/app/right-sidebar/store'
-import {
-  FEATURED_ID,
-  FeaturedProviderRow,
-  FireworksProviderRow,
-  OpenRouterProviderRow,
-  ProviderRow,
-  providerTitle,
-  sortProviders
-} from '@/components/onboarding'
+import { FEATURED_ID, FeaturedProviderRow, providerTitle } from '@/components/onboarding'
 import { Button } from '@/components/ui/button'
 import { RowButton } from '@/components/ui/row-button'
 import { SearchField } from '@/components/ui/search-field'
 import { disconnectOAuthProvider, listOAuthProviders } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { Check, ChevronDown, ChevronRight, KeyRound, Loader2, Terminal, Trash2 } from '@/lib/icons'
+import { Check, ChevronRight, KeyRound, Loader2, Terminal, Trash2 } from '@/lib/icons'
 import { normalize } from '@/lib/text'
-import { cn } from '@/lib/utils'
 import { confirm } from '@/store/confirm'
 import { notify, notifyError } from '@/store/notifications'
 import { $desktopOnboarding, startManualLocalEndpoint, startManualProviderOAuth } from '@/store/onboarding'
@@ -34,16 +24,6 @@ import { SettingsContent, SettingsSkeleton } from './primitives'
 // The embedded terminal (and thus the "run disconnect command" path) only
 // exists in the Electron desktop shell, not the web dashboard.
 const canRunInTerminal = () => typeof window !== 'undefined' && Boolean(window.hermesDesktop?.terminal)
-
-// Parallel group headers ("Connected", "Other providers") so the expanded list
-// reads as its own section instead of bleeding into the connected group.
-function GroupLabel({ children }: { children: ReactNode }) {
-  return (
-    <p className="mt-3 px-0.5 text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-tertiary)">
-      {children}
-    </p>
-  )
-}
 
 // Sub-views surfaced as a sidebar subnav: account sign-in vs raw API keys.
 export const PROVIDER_VIEWS = ['accounts', 'keys', 'custom-endpoints'] as const
@@ -115,15 +95,10 @@ function buildProviderKeyGroups(vars: Record<string, EnvVarInfo>): ProviderKeyGr
   return groups.sort((a, b) => a.priority - b.priority || a.name.localeCompare(b.name))
 }
 
-// Deliberately a near-1:1 replica of the first-run onboarding picker
-// (`Picker` in desktop-onboarding-overlay): same recommended card, same
-// Fireworks #2 quick-key row, same provider rows, same "Other providers"
-// disclosure, same OpenRouter quick-key row, and the same bottom-right
-// "I have an API key" affordance. The leaf cards are the exact shared
-// components, so the two surfaces stay visually identical. Selecting a
-// provider hands off to the shared onboarding overlay, which runs that
-// provider's real sign-in flow; the key affordances open the API-key
-// catalog below.
+// Nous-only accounts view: the section exists to sell the Portal subscription
+// (browser sign-in, no API key). Other providers remain reachable through the
+// sibling API-keys tab / "Have an API key instead?" affordance, so they are not
+// listed here — the featured card is the whole section.
 function OAuthPicker({
   disconnecting,
   onDisconnect,
@@ -139,24 +114,15 @@ function OAuthPicker({
 }) {
   const { t } = useI18n()
   const p = t.settings.providers
-  const [showAll, setShowAll] = useState(false)
-  const ordered = useMemo(() => sortProviders(providers), [providers])
 
-  if (ordered.length === 0) {
+  if (providers.length === 0) {
     return null
   }
 
   const select = (p: OAuthProvider) => startManualProviderOAuth(p.id)
 
-  const featured = ordered.find(p => p.id === FEATURED_ID && !p.status?.logged_in) ?? null
-  const rest = featured ? ordered.filter(p => p.id !== FEATURED_ID) : ordered
-  // Keep connected accounts grouped and always visible; only the unconnected
-  // providers hide behind the disclosure, so the page leads with what's set up.
-  // Both lists preserve `sortProviders` order (curated priority, then name).
-  const connected = rest.filter(p => p.status?.logged_in)
-  const others = rest.filter(p => !p.status?.logged_in)
-  const collapsible = others.length > 0
-  const showOthers = !collapsible || showAll
+  const nous = providers.find(p => p.id === FEATURED_ID) ?? null
+  const nousConnected = nous?.status?.logged_in === true
 
   return (
     <section className="mb-5 grid gap-2">
@@ -175,45 +141,29 @@ function OAuthPicker({
       <p className="-mt-2 mb-1 text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
         {p.intro}
       </p>
-      {featured && <FeaturedProviderRow onSelect={select} provider={featured} />}
-      {/* Slot #2 — always visible, matching onboarding / CANONICAL_PROVIDERS. */}
-      <FireworksProviderRow onClick={onWantApiKey} />
-      {connected.length > 0 && (
-        <>
-          <GroupLabel>{p.connected}</GroupLabel>
-          {connected.map(p => (
-            <ConnectedProviderRow
-              disconnecting={disconnecting === p.id}
-              key={p.id}
-              onDisconnect={onDisconnect}
-              onSelect={select}
-              onTerminalDisconnect={onTerminalDisconnect}
-              provider={p}
-            />
-          ))}
-        </>
+      {nous && !nousConnected && <FeaturedProviderRow onSelect={select} provider={nous} />}
+      {nous && nousConnected && (
+        <ConnectedProviderRow
+          disconnecting={disconnecting === nous.id}
+          key={nous.id}
+          onDisconnect={onDisconnect}
+          onSelect={select}
+          onTerminalDisconnect={onTerminalDisconnect}
+          provider={nous}
+        />
       )}
-      {showOthers && (
-        <>
-          {connected.length > 0 && <GroupLabel>{p.otherProviders}</GroupLabel>}
-          {others.map(p => (
-            <ProviderRow key={p.id} onSelect={select} provider={p} />
-          ))}
-          <OpenRouterProviderRow onClick={onWantApiKey} />
-        </>
-      )}
-      {collapsible && (
-        <Button
-          className="py-1 text-[length:var(--conversation-caption-font-size)]"
-          onClick={() => setShowAll(v => !v)}
-          size="inline"
-          type="button"
-          variant="text"
-        >
-          {showAll ? p.collapse : connected.length > 0 ? p.connectAnother : p.otherProviders}
-          <ChevronDown className={cn('size-3.5 transition', showAll && 'rotate-180')} />
-        </Button>
-      )}
+      {providers
+        .filter(p => p.id !== FEATURED_ID && p.status?.logged_in)
+        .map(p => (
+          <ConnectedProviderRow
+            disconnecting={disconnecting === p.id}
+            key={p.id}
+            onDisconnect={onDisconnect}
+            onSelect={select}
+            onTerminalDisconnect={onTerminalDisconnect}
+            provider={p}
+          />
+        ))}
     </section>
   )
 }

@@ -93,6 +93,22 @@ async function renderProvidersSettings() {
 }
 
 describe('ProvidersSettings', () => {
+  it('shows only Nous Portal in the accounts view — no Fireworks row or Other providers disclosure', async () => {
+    // The Connect-an-account section exists for the Portal subscription; every
+    // other provider stays reachable via the API-keys tab. Regression: this
+    // surface used to mirror the full onboarding picker (Fireworks quick-key
+    // row + "Other providers" disclosure listing the whole catalog).
+    await renderProvidersSettings()
+
+    expect(await screen.findByText('Nous Portal')).toBeTruthy()
+    expect(screen.queryByText('Fireworks AI')).toBeNull()
+    expect(screen.queryByText(/Other providers/)).toBeNull()
+    expect(screen.queryByText('OpenRouter')).toBeNull()
+    // MiniMax (the second, logged-out mock provider) must not appear —
+    // the unconnected catalog is what the disclosure used to dump here.
+    expect(screen.queryByText('MiniMax')).toBeNull()
+  })
+
   it('disconnects a connected provider account and refreshes the accounts list', async () => {
     await renderProvidersSettings()
 
