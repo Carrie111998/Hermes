@@ -3488,13 +3488,24 @@ def _run_single_child(
                 logger.debug("Could not remove child from active_children: %s", e)
 
         # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
+        # background processes, httpx clients) so subagent subprocesses do not
+        # outlive the delegation. A timeout stops waiting on the Future but does
+        # not stop its worker, so defer teardown until that worker has exited.
+        def _close_child_resources(_done_future=None) -> None:
+            try:
+                if child is not None and hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug("Failed to close child agent after delegation")
+
         try:
-            if hasattr(child, "close"):
-                child.close()
+            child_future = locals().get("_child_future")
+            if child_future is not None and not child_future.done():
+                child_future.add_done_callback(_close_child_resources)
+            else:
+                _close_child_resources()
         except Exception:
-            logger.debug("Failed to close child agent after delegation")
+            logger.debug("Failed to schedule child-agent cleanup after delegation")
 
         # The AIAgent turn boundary normally closes the child scope itself. This
         # fallback covers failures before that boundary starts, but must not pop
