@@ -188,6 +188,9 @@ async def search_sessions(
     """
     if not q or not q.strip():
         return {"results": []}
+    profile_name: Optional[str] = None
+    if profile:
+        profile_name, _ = _cron_profile_home(profile)
     try:
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
@@ -197,6 +200,7 @@ async def search_sessions(
             include_sources = [source_filter] if source_filter else (source_list or None)
             exclude_list = [s.strip() for s in (exclude_sources or "").split(",") if s.strip()]
             now = time.time()
+            row_profile = profile_name or _cron_default_profile()
 
             # Walk parent_session_id to the compression root, memoized so a
             # chain of compression segments only costs one walk. We deliberately
@@ -284,6 +288,8 @@ async def search_sessions(
                 sid = lineage_tip(root)
                 payload["session_id"] = sid
                 payload["lineage_root"] = root
+                payload["profile"] = row_profile
+                payload["is_default_profile"] = row_profile == "default"
                 try:
                     row = db.get_session_rich_row(sid)
                 except Exception:

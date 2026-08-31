@@ -120,6 +120,8 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
         "results": [
             {
                 "id": "20260603_090200_exact",
+                "profile": "default",
+                "is_default_profile": True,
                 "session_id": "20260603_090200_exact",
                 "lineage_root": "20260603_090200_exact",
                 "snippet": "ID match preview",
@@ -130,6 +132,8 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
             },
             {
                 "id": "content_session",
+                "profile": "default",
+                "is_default_profile": True,
                 "session_id": "content_session",
                 "lineage_root": "content_session",
                 "snippet": "content hit",
