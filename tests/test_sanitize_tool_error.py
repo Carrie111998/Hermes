@@ -9,7 +9,64 @@ cap pathological lengths.
 """
 from __future__ import annotations
 
+import json
+
+import pytest
+
+from agent.redact import (
+    TOOL_SECRET_PLACEHOLDER,
+    redact_tool_boundary_text,
+    redact_tool_boundary_value,
+)
+from agent.secret_scope import reset_secret_scope, set_secret_scope
 from model_tools import _sanitize_tool_error, _TOOL_ERROR_MAX_LEN
+from tools.registry import registry as _registry, tool_error
+
+
+def _synthetic_canaries():
+    """Build completed credential forms only at test runtime."""
+    body = "Q7mP" * 12
+    return {
+        "arbitrary": "stage1b-opaque-" + body,
+        "bearer": "Bear" + "er " + body,
+        "api_key": "s" + "k-" + body,
+        "discord": (
+            "https://discord.com/api/"
+            + "webhooks/"
+            + "1234567890/"
+            + body
+        ),
+        "url_query": (
+            "https://example.invalid/private?access_"
+            + "token="
+            + body
+        ),
+        "authorization": "Author" + "ization: Basic " + body,
+    }
+
+
+@pytest.fixture()
+def synthetic_secret_scope():
+    canaries = _synthetic_canaries()
+    token = set_secret_scope({"STAGE1B_RUNTIME_SECRET": canaries["arbitrary"]})
+    try:
+        yield canaries
+    finally:
+        reset_secret_scope(token)
+
+
+def _generic_registry_target():
+    excluded = {
+        "todo",
+        "memory",
+        "session_search",
+        "delegate_task",
+        "execute_code",
+        "tool_search",
+        "tool_call",
+        "tool_describe",
+    }
+    return next(name for name in _registry.get_all_tool_names() if name not in excluded)
 
 
 class TestRoleTagStripping:
@@ -69,6 +126,180 @@ class TestEnvelope:
     def test_wraps_with_prefix(self):
         out = _sanitize_tool_error("oh no")
         assert out.startswith("[TOOL_ERROR] ")
+
+
+class TestMandatorySecretRedaction:
+    def test_runtime_secret_and_all_pattern_classes_are_fully_redacted(
+        self, synthetic_secret_scope
+    ):
+        raw = " | ".join(synthetic_secret_scope.values())
+
+        out = redact_tool_boundary_text(raw)
+
+        assert TOOL_SECRET_PLACEHOLDER in out
+        for canary in synthetic_secret_scope.values():
+            assert canary not in out
+
+    def test_exception_message_is_redacted(self, synthetic_secret_scope):
+        exc = RuntimeError(synthetic_secret_scope["arbitrary"])
+
+        out = redact_tool_boundary_value(exc)
+
+        assert synthetic_secret_scope["arbitrary"] not in out
+        assert out == TOOL_SECRET_PLACEHOLDER
+
+    def test_context_local_provider_credential_is_redacted_without_env_or_scope(self):
+        from agent.auxiliary_client import reset_runtime_main, set_runtime_main
+
+        provider_secret = "provider-runtime-" + ("T9wC" * 12)
+        runtime_token = set_runtime_main(
+            "synthetic-provider",
+            "synthetic-model",
+            api_key=provider_secret,
+        )
+        try:
+            out = redact_tool_boundary_text("provider rejected " + provider_secret)
+        finally:
+            reset_runtime_main(runtime_token)
+
+        assert provider_secret not in out
+        assert out == "provider rejected " + TOOL_SECRET_PLACEHOLDER
+
+    def test_nested_dict_list_tuple_and_decodable_bytes_are_redacted(
+        self, synthetic_secret_scope
+    ):
+        raw = {
+            "stdout": synthetic_secret_scope["arbitrary"],
+            "stderr": synthetic_secret_scope["authorization"].encode(),
+            synthetic_secret_scope["url_query"]: "secret-bearing mapping key",
+            "nested": [
+                synthetic_secret_scope["api_key"],
+                ({"url": synthetic_secret_scope["discord"]},),
+            ],
+        }
+
+        out = redact_tool_boundary_value(raw)
+        serialized = repr(out)
+
+        for canary in synthetic_secret_scope.values():
+            assert canary not in serialized
+        assert any(TOOL_SECRET_PLACEHOLDER in str(key) for key in out)
+        assert isinstance(out["stderr"], bytes)
+        assert TOOL_SECRET_PLACEHOLDER.encode() in out["stderr"]
+
+    def test_non_utf8_bytes_are_preserved(self):
+        raw = b"\xff\xfe\x00"
+
+        assert redact_tool_boundary_value(raw) is raw
+
+    def test_multiline_stdout_and_stderr_redact_every_line(
+        self, synthetic_secret_scope
+    ):
+        raw = (
+            "stdout=" + synthetic_secret_scope["arbitrary"] + "\n"
+            "stderr=" + synthetic_secret_scope["authorization"] + "\n"
+            "diagnostic=permission denied"
+        )
+
+        out = redact_tool_boundary_text(raw)
+
+        assert synthetic_secret_scope["arbitrary"] not in out
+        assert synthetic_secret_scope["authorization"] not in out
+        assert "diagnostic=permission denied" in out
+
+    def test_idempotent_fixed_placeholder(self, synthetic_secret_scope):
+        once = redact_tool_boundary_text(
+            synthetic_secret_scope["arbitrary"]
+            + " "
+            + synthetic_secret_scope["api_key"]
+        )
+
+        assert redact_tool_boundary_text(once) == once
+        assert once == f"{TOOL_SECRET_PLACEHOLDER} {TOOL_SECRET_PLACEHOLDER}"
+
+    def test_preserves_non_secret_diagnostics(self):
+        raw = (
+            "HTTP 403 during collect stage; PermissionError; "
+            "request=session-safe-id; retry timeout"
+        )
+
+        assert redact_tool_boundary_text(raw) == raw
+
+    def test_force_boundary_ignores_global_redaction_opt_out(
+        self, monkeypatch, synthetic_secret_scope
+    ):
+        import agent.redact as redact_module
+
+        monkeypatch.setattr(redact_module, "_REDACT_ENABLED", False)
+
+        out = redact_tool_boundary_text(synthetic_secret_scope["arbitrary"])
+
+        assert out == TOOL_SECRET_PLACEHOLDER
+
+    def test_tool_error_uses_fixed_mandatory_boundary(self, synthetic_secret_scope):
+        out = tool_error(
+            synthetic_secret_scope["arbitrary"],
+            stderr=synthetic_secret_scope["authorization"],
+        )
+        payload = json.loads(out)
+
+        assert payload["error"] == TOOL_SECRET_PLACEHOLDER
+        assert synthetic_secret_scope["authorization"] not in payload["stderr"]
+        assert TOOL_SECRET_PLACEHOLDER in payload["stderr"]
+
+    def test_registry_exception_result_and_log_are_redacted(
+        self, synthetic_secret_scope, caplog
+    ):
+        target = _generic_registry_target()
+        entry = _registry.get_entry(target)
+        original_handler, original_async = entry.handler, entry.is_async
+
+        def boom(_args, **_kwargs):
+            raise RuntimeError(
+                synthetic_secret_scope["arbitrary"]
+                + " "
+                + synthetic_secret_scope["discord"]
+            )
+
+        entry.handler, entry.is_async = boom, False
+        try:
+            with caplog.at_level("ERROR"):
+                out = _registry.dispatch(target, {})
+        finally:
+            entry.handler, entry.is_async = original_handler, original_async
+
+        combined = out + caplog.text
+        assert synthetic_secret_scope["arbitrary"] not in combined
+        assert synthetic_secret_scope["discord"] not in combined
+        assert "RuntimeError" in combined
+        assert "stack=" in caplog.text
+        assert TOOL_SECRET_PLACEHOLDER in combined
+
+    def test_registry_structured_result_redacts_stdout_stderr_and_nested_values(
+        self, synthetic_secret_scope
+    ):
+        target = _generic_registry_target()
+        entry = _registry.get_entry(target)
+        original_handler, original_async = entry.handler, entry.is_async
+
+        def structured(_args, **_kwargs):
+            return json.dumps(
+                {
+                    "stdout": synthetic_secret_scope["arbitrary"],
+                    "stderr": synthetic_secret_scope["authorization"],
+                    "nested": {"items": [synthetic_secret_scope["api_key"]]},
+                }
+            )
+
+        entry.handler, entry.is_async = structured, False
+        try:
+            out = _registry.dispatch(target, {})
+        finally:
+            entry.handler, entry.is_async = original_handler, original_async
+
+        for canary in synthetic_secret_scope.values():
+            assert canary not in out
+        assert out.count(TOOL_SECRET_PLACEHOLDER) == 3
 
 
 

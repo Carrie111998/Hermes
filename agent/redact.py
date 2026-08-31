@@ -12,6 +12,8 @@ import os
 import re
 import shlex
 import threading
+from collections.abc import Mapping
+from typing import Any
 from urllib.parse import unquote_plus
 
 # Basenames treated as ``.env`` files by _command_reads_env_file. Imported
@@ -1007,6 +1009,230 @@ def redact_sensitive_text(
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
     return text
+
+
+# ---------------------------------------------------------------------------
+# Mandatory tool-result / exception boundary
+# ---------------------------------------------------------------------------
+#
+# Tool results are persisted and replayed into model context.  Unlike ordinary
+# display/log redaction, this boundary is therefore not optional and never
+# preserves a credential prefix or suffix.  The ordinary redactor above keeps
+# that diagnostic context by design; tool-result persistence has the stricter
+# contract below.
+
+TOOL_SECRET_PLACEHOLDER = "[REDACTED_SECRET]"
+_MIN_RUNTIME_SECRET_CHARS = 6
+_TOOL_BEARER_RE = re.compile(
+    r"\b(Bearer\s+)([^\s,;\"']{8,})",
+    re.IGNORECASE,
+)
+_TOOL_DISCORD_WEBHOOK_RE = re.compile(
+    r"https://(?:canary\.)?discord(?:app)?\.com/api/"
+    r"(?:v\d+/)?webhooks/\d+/[A-Za-z0-9._-]{8,}",
+    re.IGNORECASE,
+)
+
+
+def _runtime_loaded_secret_values() -> tuple[str, ...]:
+    """Return in-scope runtime secret values without exposing metadata.
+
+    A multiplexed turn already carries an authoritative profile secret scope;
+    use every non-trivial value in that scope.  Single-profile processes keep
+    credentials in the process environment, where only credential-named keys
+    are considered.  Values are sorted longest-first so overlapping values are
+    replaced deterministically.
+    """
+    values: set[str] = set()
+    try:
+        from agent.secret_scope import current_secret_scope
+
+        scope = current_secret_scope()
+    except Exception:
+        scope = None
+
+    if scope is not None:
+        candidates = list(scope.values())
+    else:
+        candidates = [
+            value
+            for key, value in os.environ.items()
+            if key != "HERMES_REDACT_SECRETS" and _key_has_secret_keyword(key)
+        ]
+
+    # During an active turn, the resolved provider credential is held in the
+    # context-local main runtime.  It may originate from auth.json or OAuth
+    # rather than .env, so it is not necessarily present in either source
+    # above.  The accessor returns an empty value outside an active turn.
+    try:
+        from agent.auxiliary_client import _runtime_main_value
+
+        candidates.append(_runtime_main_value("api_key"))
+    except Exception:
+        pass
+
+    for value in candidates:
+        if not isinstance(value, str):
+            continue
+        if len(value) < _MIN_RUNTIME_SECRET_CHARS:
+            continue
+        if value == TOOL_SECRET_PLACEHOLDER:
+            continue
+        values.add(value)
+    return tuple(sorted(values, key=lambda item: (-len(item), item)))
+
+
+def _redact_tool_url_credentials(text: str) -> str:
+    """Replace credential-bearing URL components with the fixed sentinel."""
+    def _redact_param(match: re.Match) -> str:
+        if _canonical_url_param_name(match.group(2)) not in _SENSITIVE_QUERY_PARAMS:
+            return match.group(0)
+        return f"{match.group(1)}{match.group(2)}={TOOL_SECRET_PLACEHOLDER}"
+
+    def _redact_userinfo(match: re.Match) -> str:
+        return f"{match.group(1)}{TOOL_SECRET_PLACEHOLDER}@"
+
+    text = _STRICT_URL_PARAM_RE.sub(_redact_param, text)
+    return _STRICT_URL_USERINFO_RE.sub(_redact_userinfo, text)
+
+
+def redact_tool_boundary_text(text: Any) -> str:
+    """Redact one text value before logging, persistence, or model replay.
+
+    This is a mandatory egress boundary: it ignores the operator-facing
+    ``security.redact_secrets`` preference and always emits the single fixed
+    sentinel.  Runtime-loaded values are removed first, then recognizable
+    credential forms provide defense in depth.
+    """
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    if not text:
+        return text
+
+    for secret in _runtime_loaded_secret_values():
+        if secret in text:
+            text = text.replace(secret, TOOL_SECRET_PLACEHOLDER)
+
+    if _has_known_prefix_substring(text):
+        text = _mask_control_split_tokens(
+            text,
+            lambda _token: TOOL_SECRET_PLACEHOLDER,
+        )
+        text = _PREFIX_RE.sub(TOOL_SECRET_PLACEHOLDER, text)
+
+    text = _TOOL_DISCORD_WEBHOOK_RE.sub(TOOL_SECRET_PLACEHOLDER, text)
+    text = _TOOL_BEARER_RE.sub(
+        lambda match: match.group(1) + TOOL_SECRET_PLACEHOLDER,
+        text,
+    )
+
+    if "uthorization" in text or "UTHORIZATION" in text:
+        text = _AUTH_HEADER_RE.sub(
+            lambda match: (
+                match.group(1)
+                + (match.group(2) or "")
+                + TOOL_SECRET_PLACEHOLDER
+            ),
+            text,
+        )
+    if ":" in text:
+        text = _SECRET_HEADER_RE.sub(
+            lambda match: match.group(1) + TOOL_SECRET_PLACEHOLDER,
+            text,
+        )
+
+    if "=" in text:
+        def _redact_assignment(match: re.Match) -> str:
+            return (
+                f"{match.group(1)}={match.group(2)}"
+                f"{TOOL_SECRET_PLACEHOLDER}{match.group(2)}"
+            )
+
+        text = _ENV_ASSIGN_RE.sub(_redact_assignment, text)
+        if "://" not in text:
+            text = _ENV_ASSIGN_LOWER_RE.sub(_redact_assignment, text)
+            if _CFG_SECRET_WORD_RE.search(text):
+                text = _CFG_DOTTED_RE.sub(_redact_assignment, text)
+                text = _CFG_ANCHORED_RE.sub(_redact_assignment, text)
+
+    if ":" in text and '"' in text:
+        text = _JSON_FIELD_RE.sub(
+            lambda match: (
+                f'{match.group(1)}: "{TOOL_SECRET_PLACEHOLDER}"'
+            ),
+            text,
+        )
+    if ":" in text and "://" not in text:
+        text = _YAML_ASSIGN_RE.sub(
+            lambda match: (
+                f"{match.group(1)}{match.group(2)}{TOOL_SECRET_PLACEHOLDER}"
+            ),
+            text,
+        )
+
+    if "BEGIN" in text and "PRIVATE KEY" in text:
+        text = _PRIVATE_KEY_RE.sub(TOOL_SECRET_PLACEHOLDER, text)
+    if ":" in text:
+        text = _TELEGRAM_RE.sub(
+            lambda match: (match.group(1) or "")
+            + match.group(2)
+            + ":"
+            + TOOL_SECRET_PLACEHOLDER,
+            text,
+        )
+    if "://" in text:
+        text = _DB_CONNSTR_RE.sub(
+            lambda match: (
+                match.group(1) + TOOL_SECRET_PLACEHOLDER + match.group(3)
+            ),
+            text,
+        )
+        text = _URL_BARE_TOKEN_RE.sub(
+            lambda match: (
+                match.group(1) + TOOL_SECRET_PLACEHOLDER + match.group(3)
+            ),
+            text,
+        )
+    if "eyJ" in text:
+        text = _JWT_RE.sub(TOOL_SECRET_PLACEHOLDER, text)
+
+    return _redact_tool_url_credentials(text)
+
+
+def redact_tool_boundary_value(value: Any) -> Any:
+    """Recursively redact supported tool-result values without mutation.
+
+    Strings and UTF-8-decodable bytes keep their type.  Mapping/list/tuple/set
+    containers keep their shape, and exceptions become diagnostic strings with
+    only their message redacted.  Unsupported objects pass through so this
+    safety layer cannot silently change tool API contracts.
+    """
+    if isinstance(value, str):
+        return redact_tool_boundary_text(value)
+    if isinstance(value, bytes):
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value
+        return redact_tool_boundary_text(decoded).encode("utf-8")
+    if isinstance(value, BaseException):
+        return redact_tool_boundary_text(str(value))
+    if isinstance(value, Mapping):
+        return {
+            redact_tool_boundary_value(key): redact_tool_boundary_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_tool_boundary_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_tool_boundary_value(item) for item in value)
+    if isinstance(value, set):
+        return {redact_tool_boundary_value(item) for item in value}
+    if isinstance(value, frozenset):
+        return frozenset(redact_tool_boundary_value(item) for item in value)
+    return value
 
 
 # Commands whose stdout is an environment-variable dump (KEY=value lines),
