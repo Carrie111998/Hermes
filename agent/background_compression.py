@@ -17,6 +17,13 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+_POST_COMPACTION_STATE_FIELDS = (
+    "last_compression_rough_tokens",
+    "last_prompt_tokens",
+    "last_completion_tokens",
+    "awaiting_real_usage_after_compression",
+)
+
 
 @dataclass
 class BackgroundCompressionJob:
@@ -28,6 +35,11 @@ class BackgroundCompressionJob:
 
 
 def _background_pressure_tokens(compressor: Any) -> int:
+    if (
+        getattr(compressor, "awaiting_real_usage_after_compression", False) is True
+        or getattr(compressor, "last_prompt_tokens", 0) == -1
+    ):
+        return 0
     for name in ("last_prompt_tokens", "last_real_prompt_tokens", "last_compression_rough_tokens"):
         value = getattr(compressor, name, 0)
         if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
@@ -66,6 +78,11 @@ def _run_background_compression(
             job.compressor_state = _snapshot_compressor_attempt_state(
                 worker.context_compressor
             )
+            for name in _POST_COMPACTION_STATE_FIELDS:
+                if hasattr(worker.context_compressor, name):
+                    job.compressor_state[name] = copy.deepcopy(
+                        getattr(worker.context_compressor, name)
+                    )
     except BaseException as exc:
         job.error = exc
         logger.warning(
@@ -193,6 +210,10 @@ def adopt_completed_background_compression(
     agent._db_flush_scan_prefix = None
     agent._flushed_db_message_ids = set()
     agent._session_messages = adopted
+    # The worker crossed the same full compaction boundary as a foreground
+    # rewrite. Its transferred token sentinels suppress another background
+    # launch until real provider usage calibrates the adopted transcript.
+    agent._usage_anchor = None
     # Gateway transcript writers must re-baseline exactly as they do for a
     # foreground in-place boundary. Without this flag they may concatenate the
     # stale pre-compaction SessionEntry history in front of the adopted result.

@@ -106,6 +106,50 @@ def test_background_compaction_splices_durable_tail_without_blocking(tmp_path: P
     assert db.get_messages_as_conversation(session_id) == adopted
 
 
+def test_adoption_suppresses_reschedule_until_fresh_real_usage(tmp_path: Path) -> None:
+    from agent.background_compression import (
+        adopt_completed_background_compression,
+        maybe_start_background_compression,
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "BACKGROUND_USAGE_REBASE"
+    db.create_session(session_id, source="test")
+    history = [
+        {"role": "user", "content": "old question"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "current question"},
+        {"role": "assistant", "content": "current answer"},
+    ]
+    db.append_messages_batch(session_id, history)
+    started = threading.Event()
+    release = threading.Event()
+    agent = _agent_with_blocking_compressor(db, session_id, started, release)
+    agent._usage_anchor = object()
+
+    assert maybe_start_background_compression(agent, history, "system") is True
+    assert started.wait(1.0)
+    release.set()
+    assert agent._background_compression_job.done.wait(3.0)
+
+    adopted = adopt_completed_background_compression(agent, history)
+
+    assert agent.context_compressor.last_compression_rough_tokens > 0
+    assert agent.context_compressor.last_prompt_tokens == -1
+    assert agent.context_compressor.last_completion_tokens == 0
+    assert agent.context_compressor.awaiting_real_usage_after_compression is True
+    assert agent._usage_anchor is None
+    assert maybe_start_background_compression(agent, adopted, "system") is False
+
+    agent.context_compressor.update_from_response(
+        {"prompt_tokens": 80, "completion_tokens": 5}
+    )
+
+    assert agent.context_compressor.awaiting_real_usage_after_compression is False
+    assert maybe_start_background_compression(agent, adopted, "system") is True
+    assert agent._background_compression_job.done.wait(3.0)
+
+
 def test_inflight_job_is_never_adopted_or_started_twice(tmp_path: Path) -> None:
     from agent.background_compression import (
         adopt_completed_background_compression,
