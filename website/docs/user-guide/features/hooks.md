@@ -383,7 +383,7 @@ def register(ctx):
 
 - Callbacks receive **keyword arguments**. Always accept `**kwargs` for forward compatibility.
 - Callback exceptions are logged and skipped; later callbacks continue.
-- If a Python plugin callback on a **timeout-bounded** hook (hot-path observers such as `post_tool_call` / `pre_llm_call`, plus the policy hook `pre_tool_call`) **blocks** longer than `plugins.hook_callback_timeout` (default 30s, set `0` to disable, max 600), it is abandoned without joining the worker so the agent loop continues. Timed-out or still-running `pre_tool_call` callbacks **fail closed** (block the tool); other bounded hooks fail open (skip). Hooks with a documented caller-thread contract (`subagent_stop`) are never moved onto a timeout worker. Shell hooks keep their own per-entry `timeout`.
+- If a Python plugin callback on a **timeout-bounded** hook (hot-path observers such as `post_tool_call` / `pre_llm_call`, plus the policy hooks `pre_tool_call` and `pre_model_call_policy`) **blocks** longer than `plugins.hook_callback_timeout` (default 30s, set `0` to disable, max 600), it is abandoned without joining the worker so the agent loop continues. Timed-out, still-running, or raised policy callbacks **fail closed** (`pre_tool_call` blocks the tool; `pre_model_call_policy` denies the provider request); other bounded hooks fail open (skip). Hooks with a documented caller-thread contract (`subagent_stop`) are never moved onto a timeout worker. Shell hooks keep their own per-entry `timeout`.
 - The catalog below is descriptive: **observers** ignore returns, **transforms** accept the first valid string replacement, and **directive/control** hooks consume documented return shapes. Plugin middleware is a separate registry and surface, not another hook category.
 - Correlation fields such as `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are hook-specific and may be absent. Treat IDs as opaque.
 - Runtime event-name validity comes from `hermes_cli.plugins.VALID_HOOKS`. `hermes hooks list` lists configured shell/outbound hooks, not every available event; `hermes hooks test <event>` reports the valid set only when an invalid event is supplied.
@@ -439,6 +439,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | Hook | Category | Exact timing and return behavior | Explicit payload fields | Privacy / sensitivity |
 |---|---|---|---|---|
 | [`pre_tool_call`](#pre_tool_call) | Directive/control | Once before execution; first valid `block` or `approve` directive wins, and `modify` returns are shallow-merged into the tool arguments. | `tool_name`, `args`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace` | Raw arguments may contain user content, paths, commands, or secrets. |
+| [`pre_model_call_policy`](#pre_model_call_policy) | Fail-closed directive/control | At the final provider callback for primary conversation-loop and centralized auxiliary calls, after request/execution middleware and final preflight; `deny` wins over `pause`, which wins over `allow`. | `policy_schema_version`, `call_kind`, `task_id`, `mission_id`, `auxiliary_task`, `profile`, `session_id`, `turn_id`, `api_request_id`, `call_seq`, `request_attempt`, `platform`, `model`, `provider`, `base_url_host`, `api_mode`, `message_count`, `message_utf8_bytes`, `approx_input_tokens`, `max_output_tokens`, `middleware_trace` | Carries request identity, sanitized route metadata, and size metadata, not prompt content. Python plugins only. |
 | `post_tool_call` | Observer | After blocked, error, or successful result; return ignored. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | Result/error text may contain arbitrary tool or user content and secrets. |
 | `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. |
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
@@ -653,6 +654,27 @@ def track_metrics(tool_name, result, duration_ms=0, **kwargs):
 def register(ctx):
     ctx.register_hook("post_tool_call", track_metrics)
 ```
+
+---
+
+### `pre_model_call_policy`
+
+Fires at the final provider callback for each primary conversation-loop request and each centralized `call_llm` / `async_call_llm` auxiliary attempt. Request middleware, execution middleware, route selection, and final provider preflight have already produced the request that would be sent. It is a Python-plugin-only, fail-closed policy gate; use `pre_api_request` for passive request telemetry and `pre_llm_call` for context injection. Standalone SDK clients created outside those two host-owned execution paths are deliberately outside this contract.
+
+```python
+def enforce_budget(session_id, call_seq, approx_input_tokens,
+                   max_output_tokens, **kwargs):
+    if would_exceed_budget(session_id, approx_input_tokens, max_output_tokens):
+        return {"action": "deny", "message": "Model budget exhausted"}
+    return {"action": "allow"}
+
+def register(ctx):
+    ctx.register_hook("pre_model_call_policy", enforce_budget)
+```
+
+Callbacks may return `allow`, `pause`, or `deny`. All registered callbacks run; `deny` wins over `pause`, and `pause` wins over `allow`. `None` means the callback is not applicable. Every non-`None` result is fully validated before precedence is applied. A timeout, exception, still-running callback, malformed non-`None` result, or dispatcher failure becomes `deny`, and the provider is not called. For a conversation request, `pause` or `deny` ends the turn with `completed=false`, `failed=true`, and `turn_exit_reason=model_policy_<action>` without consuming a model-call iteration. For an auxiliary request, it raises `ModelCallPolicyDenied` directly to the owning caller without provider retry or fallback.
+
+The payload contains stable request identity, sanitized route metadata, and bounded size metadata rather than prompt content. `policy_schema_version` is `1`; `call_kind` is `conversation` or `auxiliary`; `request_attempt` identifies retries of a logical request. `message_utf8_bytes=-1`, `approx_input_tokens=-1`, or `max_output_tokens=-1` means that measurement is unavailable and lets strict policies deny. `base_url_host` contains only the parsed hostname. Dispatcher-launched work maps `task_id` and `mission_id` from `HERMES_KANBAN_TASK` and `HERMES_KANBAN_MISSION`; callers that do not own a mission leave them empty. `profile` is populated from the existing `HERMES_PROFILE` runtime identity when present; auxiliary calls additionally expose their configured task as `auxiliary_task`.
 
 ---
 

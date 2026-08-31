@@ -175,6 +175,11 @@ from agent.model_metadata import (
 )
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
+from hermes_cli.model_call_policy import (
+    ModelCallPolicyDenied,
+    ModelCallPolicyHalt,
+    enforce_pre_model_call_policy,
+)
 from utils import base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
@@ -3565,6 +3570,44 @@ def _relay_auxiliary_metadata(
     }
 
 
+def _enforce_auxiliary_model_call_policy(
+    client: Any,
+    request: dict[str, Any],
+    *,
+    provider: str | None,
+    api_mode: str | None,
+) -> None:
+    """Authorize one final auxiliary provider attempt."""
+    context = _RELAY_AUX_CALL_CONTEXT.get() or {}
+    attempt_count = max(1, int(context.get("attempt_count") or 0))
+    session_id = ""
+    try:
+        from agent.aux_accounting import get_accounting_context
+
+        accounting = get_accounting_context()
+        if accounting is not None:
+            session_id = str(accounting[1] or "")
+    except Exception:
+        pass
+
+    enforce_pre_model_call_policy(
+        request,
+        call_kind="auxiliary",
+        task_id=os.environ.get("HERMES_KANBAN_TASK", ""),
+        mission_id=os.environ.get("HERMES_KANBAN_MISSION", ""),
+        auxiliary_task=str(context.get("task") or "unknown"),
+        profile=os.environ.get("HERMES_PROFILE", ""),
+        session_id=session_id,
+        api_request_id=str(context.get("request_id") or ""),
+        call_seq=attempt_count,
+        request_attempt=attempt_count - 1,
+        model=str(request.get("model") or context.get("model") or ""),
+        provider=str(provider or context.get("provider") or "auxiliary"),
+        base_url=str(getattr(client, "base_url", "") or ""),
+        api_mode=str(api_mode or context.get("api_mode") or "chat_completions"),
+    )
+
+
 def _relay_sync_completion(
     client: Any,
     kwargs: dict[str, Any],
@@ -3575,17 +3618,27 @@ def _relay_sync_completion(
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+
+    def authorized(request: dict[str, Any]) -> Any:
+        _enforce_auxiliary_model_call_policy(
+            client,
+            request,
+            provider=provider,
+            api_mode=api_mode,
+        )
+        return _run_protected_sync_provider_call(callback, request)
+
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
     # transaction on hard cancel without touching the process-shared client.
     if route is None:
-        return _run_protected_sync_provider_call(callback, kwargs)
+        return authorized(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return relay_llm.execute_current(
         kwargs,
-        lambda request: _run_protected_sync_provider_call(callback, request),
+        authorized,
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         metadata=metadata,
@@ -3603,14 +3656,24 @@ async def _relay_async_completion(
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+
+    async def authorized(request: dict[str, Any]) -> Any:
+        _enforce_auxiliary_model_call_policy(
+            client,
+            request,
+            provider=provider,
+            api_mode=api_mode,
+        )
+        return await callback(request)
+
     if route is None:
-        return await callback(kwargs)
+        return await authorized(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return await relay_llm.execute_current_async(
         kwargs,
-        callback,
+        authorized,
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         metadata=metadata,
@@ -3626,14 +3689,24 @@ def _relay_sync_stream(
     api_mode: str | None = None,
 ) -> Any:
     route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+
+    def authorized(request: dict[str, Any]) -> Any:
+        _enforce_auxiliary_model_call_policy(
+            client,
+            request,
+            provider=provider,
+            api_mode=api_mode,
+        )
+        return client.chat.completions.create(**request)
+
     if route is None:
-        return client.chat.completions.create(**kwargs)
+        return authorized(kwargs)
     provider_name, fallback_model, metadata = route
     from agent import relay_llm
 
     return relay_llm.stream_current(
         kwargs,
-        lambda request: client.chat.completions.create(**request),
+        authorized,
         name=provider_name,
         model_name=str(kwargs.get("model") or fallback_model),
         finalizer=dict,
@@ -9807,6 +9880,11 @@ def call_llm(
             semaphore = None
             return _release_sync_semaphore_after_stream(response, stream_semaphore)
         return response
+    except ModelCallPolicyHalt as policy_halt:
+        raise ModelCallPolicyDenied(
+            policy_halt.action,
+            policy_halt.message,
+        ) from None
     finally:
         if latency_info is not None:
             latency_info["summary_generation_ms"] = max(
@@ -10062,6 +10140,12 @@ def _call_llm_impl(
             # Return the provider call directly; the MoA facade converts a
             # completed response into a one-chunk delta iterator at its
             # boundary.
+            _enforce_auxiliary_model_call_policy(
+                client,
+                kwargs,
+                provider=request_provider,
+                api_mode=resolved_api_mode,
+            )
             return client.chat.completions.create(**kwargs)
         return _relay_sync_stream(
             client,
@@ -10707,22 +10791,28 @@ async def async_call_llm(
     if semaphore is not None:
         await semaphore.acquire()
     try:
-        return await _async_call_llm_impl(
-            task=task,
-            provider=provider,
-            model=model,
-            base_url=base_url,
-            api_key=api_key,
-            main_runtime=main_runtime,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            tools=tools,
-            timeout=timeout,
-            extra_body=extra_body,
-            reasoning_config=reasoning_config,
-            route_info=route_info,
-        )
+        try:
+            return await _async_call_llm_impl(
+                task=task,
+                provider=provider,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+                main_runtime=main_runtime,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                timeout=timeout,
+                extra_body=extra_body,
+                reasoning_config=reasoning_config,
+                route_info=route_info,
+            )
+        except ModelCallPolicyHalt as policy_halt:
+            raise ModelCallPolicyDenied(
+                policy_halt.action,
+                policy_halt.message,
+            ) from None
     finally:
         if semaphore is not None:
             semaphore.release()

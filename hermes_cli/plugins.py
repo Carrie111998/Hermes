@@ -65,6 +65,7 @@ from registration_lifecycle import replacement_coordinator
 from utils import env_var_enabled, fast_safe_load
 from hermes_cli.config import cfg_get, load_config_readonly
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION, VALID_MIDDLEWARE
+from hermes_cli.model_call_policy import fail_closed_hook_result
 from hermes_cli.plugin_capabilities import (  # noqa: F401 — re-exported
     CAPABILITY_REGISTRY,
     VALID_CAPABILITY_IDS,
@@ -170,6 +171,10 @@ VALID_HOOKS: Set[str] = {
     # First non-None string wins. Useful for vocabulary/personality transformation.
     "transform_llm_output",
     "pre_llm_call",
+    # Synchronous fail-closed policy gate for the fully assembled provider
+    # request. Unlike pre_llm_call (an additive, fail-open context hook), this
+    # hook may stop a model request by returning allow|pause|deny.
+    "pre_model_call_policy",
     "post_llm_call",
     # Streaming LLM output observer hooks. Fired asynchronously off the token
     # path by agent.plugin_stream_hooks; callbacks observe immutable normalized
@@ -395,6 +400,7 @@ VALID_HOOKS: Set[str] = {
 # have its output silently ignored — registration is refused loudly instead.
 # Support for a shell response shape can lift an event out of this set.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "pre_model_call_policy",
     "transform_api_error_classification",
 }
 
@@ -438,9 +444,12 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "on_session_end",
 }
 
-# Policy hooks: timeout / still-running must fail closed (block the tool).
-# Skipping would let the tool run without a completed policy decision.
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+# Policy hooks: timeout / still-running must fail closed. Skipping would let a
+# tool or provider request run without a completed policy decision.
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {
+    "pre_tool_call",
+    "pre_model_call_policy",
+}
 
 # Documented parent-thread serialization contract — never move the callback
 # body onto a timeout worker (see website/docs/user-guide/features/hooks.md).
@@ -5629,7 +5638,7 @@ class PluginManager:
                                 callback_name,
                             )
                             if fail_closed:
-                                results.append(_pre_tool_call_timeout_block())
+                                results.append(fail_closed_hook_result(hook_name))
                             continue
                         if suppressed_until is not None:
                             self._hook_timeout_suppressed_until.pop(callback_key, None)
@@ -5680,7 +5689,7 @@ class PluginManager:
                             timeout,
                         )
                         if fail_closed:
-                            results.append(_pre_tool_call_timeout_block())
+                            results.append(fail_closed_hook_result(hook_name))
                         continue
                     if "exc" in failure:
                         raise failure["exc"]
@@ -5696,6 +5705,8 @@ class PluginManager:
                     callback_name,
                     exc,
                 )
+                if fail_closed:
+                    results.append(fail_closed_hook_result(hook_name))
         return results
 
     def _subscribe_event(
