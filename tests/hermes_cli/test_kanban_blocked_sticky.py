@@ -176,6 +176,31 @@ def test_non_protocol_failures_keep_existing_retry_semantics(
         assert kb.claim_task(conn, retryable) is not None
 
 
+def test_ordinary_gave_up_recovers_when_failure_limit_increases(
+    kanban_home: Path,
+) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ordinary breaker", assignee="worker")
+        assert kb.claim_task(conn, tid) is not None
+        assert kb._record_task_failure(
+            conn,
+            tid,
+            "temporary worker failure",
+            outcome="spawn_failed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+        assert kb.get_task(conn, tid).status == "blocked"
+
+        gave_up = next(e for e in kb.list_events(conn, tid) if e.kind == "gave_up")
+        assert {"protocol_violations", "protocol_violation_limit"}.isdisjoint(
+            gave_up.payload or {}
+        )
+        assert kb.recompute_ready(conn, failure_limit=2) == 1
+        assert kb.get_task(conn, tid).status == "ready"
+
+
 
 
 # ---------------------------------------------------------------------------
