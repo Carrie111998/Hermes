@@ -6,6 +6,7 @@ import { DropdownMenu, DropdownMenuContent } from '@/components/ui/dropdown-menu
 import {
   $modelVisibilityOpen,
   $visibleModels,
+  emptyProviderSentinelKey,
   modelVisibilityKey,
   setModelVisibilityOpen,
   setVisibleModels
@@ -42,7 +43,7 @@ afterEach(() => {
 
 // A minimal controller — these tests are about the CATALOG's own behaviour
 // (what it lists, what it offers), not about what any host does with a pick.
-function renderMenu() {
+function renderMenu(includeMoa = false) {
   const select = vi.fn()
 
   const controller: ModelMenuController = {
@@ -59,7 +60,7 @@ function renderMenu() {
     <QueryClientProvider client={client}>
       <DropdownMenu open>
         <DropdownMenuContent>
-          <ModelCatalogMenu controller={controller} />
+          <ModelCatalogMenu controller={controller} includeMoa={includeMoa} />
         </DropdownMenuContent>
       </DropdownMenu>
     </QueryClientProvider>
@@ -95,6 +96,27 @@ describe('the catalog owns model curation', () => {
     await vi.waitFor(() => {
       expect(screen.queryByText(/Gemini 3\.1 Pro/i)).not.toBeNull()
     })
+  })
+
+  it('hides MoA presets when Edit Models hides the MoA provider', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        { models: ['gemini-3.1-pro'], name: 'Google', slug: 'google' },
+        { models: ['default', 'insane'], name: 'Mixture of Agents', slug: 'moa' }
+      ]
+    })
+    setVisibleModels(
+      new Set([
+        modelVisibilityKey('google', 'gemini-3.1-pro'),
+        emptyProviderSentinelKey('moa')
+      ])
+    )
+
+    renderMenu(true)
+
+    await screen.findByText(/Gemini 3\.1 Pro/i)
+    expect(screen.queryByText('MoA: default')).toBeNull()
+    expect(screen.queryByText('MoA: insane')).toBeNull()
   })
 
   it('offers Edit Models without the host wiring it up', async () => {
