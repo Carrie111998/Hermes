@@ -89,6 +89,21 @@ def _patch_gateway_discovery():
         yield
 
 
+@pytest.fixture(autouse=True)
+def _patch_python_lockfile_default(request):
+    """By default, assume python lockfile unchanged during update tests unless overridden."""
+    if "TestPythonLockfileTracking" in request.node.nodeid:
+        yield
+        return
+    with patch(
+        "hermes_cli.update_cmd._python_lockfile_changed", return_value=False
+    ), patch(
+        "hermes_cli.update_cmd._reconcile_and_record_python_lockfile",
+        return_value=True,
+    ):
+        yield
+
+
 class TestCmdUpdateNpmLockfileCache:
     @staticmethod
     def _cache_file(hermes_root, project_root):
@@ -1416,3 +1431,250 @@ class TestUpdateNodeDependencies:
         assert cwd_calls, "expected at least one npm call"
         for cwd in cwd_calls:
             assert cwd == tmp_path, f"npm must run from PROJECT_ROOT; got cwd={cwd}"
+
+
+class TestPythonLockfileTracking:
+    """Test Python lockfile digest computation and change detection."""
+
+    @patch("shutil.which", return_value=None)
+    @patch("subprocess.run")
+    def test_current_healthy_checkout_reconciles_without_broad_reinstall(
+        self, mock_run, _mock_which, mock_args
+    ):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd as uc
+
+        mock_run.side_effect = _make_run_side_effect(
+            branch="main", verify_ok=True, commit_count="0"
+        )
+
+        with patch.object(
+            hm,
+            "_get_origin_url",
+            return_value="https://github.com/example/hermes-agent.git",
+        ), patch.object(hm, "_sync_with_upstream_if_needed"), patch.object(
+            uc, "_python_lockfile_changed", return_value=True
+        ), patch.object(
+            uc, "_venv_core_imports_healthy", return_value=(True, "ok")
+        ), patch.object(
+            uc, "_reconcile_and_record_python_lockfile", return_value=True
+        ) as reconcile, patch.object(
+            hm, "_install_python_dependencies_with_optional_fallback"
+        ) as broad_install, patch.object(
+            hm, "_refresh_active_lazy_features"
+        ) as lazy_refresh, patch.object(
+            hm, "_restore_active_tool_dependencies"
+        ) as tool_restore, patch.object(
+            hm, "_abort_dependency_sync_if_self_locked"
+        ), patch.object(
+            uc, "_write_update_incomplete_marker"
+        ), patch.object(
+            hm, "_clear_update_incomplete_marker"
+        ):
+            cmd_update(mock_args)
+
+        reconcile.assert_called_once()
+        broad_install.assert_not_called()
+        lazy_refresh.assert_not_called()
+        tool_restore.assert_not_called()
+
+    def test_python_lockfile_changed_when_no_cache(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd as uc
+
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='hermes'\n", encoding="utf-8")
+        (tmp_path / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir()
+
+        # Without recorded hash cache, un-synced installs must trip the change detector
+        assert uc._python_lockfile_changed(hermes_root) is True
+
+    def test_python_lockfile_detects_mutation_after_recorded(self, tmp_path, monkeypatch):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd as uc
+
+        (tmp_path / "pyproject.toml").write_text("[project]\nname='hermes'\n", encoding="utf-8")
+        (tmp_path / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir()
+
+        uc._record_python_lockfile_hash(hermes_root)
+        assert uc._python_lockfile_changed(hermes_root) is False
+
+        # Modifying uv.lock trips the change detector
+        (tmp_path / "uv.lock").write_text("version = 2\n", encoding="utf-8")
+        assert uc._python_lockfile_changed(hermes_root) is True
+
+    @staticmethod
+    def _write_wheel(wheelhouse, name, version, *, requires_dist=None):
+        import zipfile
+
+        distribution = name.replace("-", "_")
+        dist_info = f"{distribution}-{version}.dist-info"
+        wheel = wheelhouse / f"{distribution}-{version}-py3-none-any.whl"
+        records = [
+            f"{distribution}/__init__.py",
+            f"{dist_info}/METADATA",
+            f"{dist_info}/WHEEL",
+            f"{dist_info}/RECORD",
+        ]
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr(f"{distribution}/__init__.py", "")
+            archive.writestr(
+                f"{dist_info}/METADATA",
+                f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
+                + (f"Requires-Dist: {requires_dist}\n" if requires_dist else ""),
+            )
+            archive.writestr(
+                f"{dist_info}/WHEEL",
+                "Wheel-Version: 1.0\nGenerator: hermes-test\n"
+                "Root-Is-Purelib: true\nTag: py3-none-any\n",
+            )
+            archive.writestr(
+                f"{dist_info}/RECORD",
+                "".join(f"{record},,\n" for record in records),
+            )
+        return wheel
+
+    def test_no_cache_reconciles_real_transitive_without_pruning_unlocked_package(
+        self, tmp_path, monkeypatch
+    ):
+        import json
+        import os
+        import shutil
+        import sys
+
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd as uc
+        from hermes_constants import venv_python_path
+
+        uv = shutil.which("uv")
+        if not uv:
+            pytest.skip("uv is required for the real-venv reconciliation regression")
+
+        project = tmp_path / "checkout"
+        wheelhouse = tmp_path / "wheels"
+        hermes_root = tmp_path / ".hermes"
+        project.mkdir()
+        wheelhouse.mkdir()
+        hermes_root.mkdir()
+        self._write_wheel(wheelhouse, "locked-demo", "1.0.0")
+        self._write_wheel(
+            wheelhouse,
+            "app-demo",
+            "1.0.0",
+            requires_dist="locked-demo>=1,<3",
+        )
+        self._write_wheel(wheelhouse, "unrelated-demo", "1.0.0")
+
+        (project / "pyproject.toml").write_text(
+            "[project]\nname = 'hermes-test'\nversion = '0.0.0'\n",
+            encoding="utf-8",
+        )
+        (project / "uv.lock").write_text(
+            "version = 1\n"
+            "[[package]]\n"
+            "name = 'locked-demo'\n"
+            "version = '2.0.0'\n"
+            "source = { registry = 'https://pypi.org/simple' }\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(hm, "PROJECT_ROOT", project)
+
+        venv = tmp_path / "venv"
+        subprocess.run([uv, "venv", str(venv), "--python", sys.executable], check=True)
+        python_exe = venv_python_path(venv, windows=hm._is_windows())
+        install_env = {
+            **os.environ,
+            "VIRTUAL_ENV": str(venv),
+            "UV_NO_INDEX": "1",
+            "UV_FIND_LINKS": str(wheelhouse),
+        }
+        subprocess.run(
+            [
+                uv,
+                "pip",
+                "install",
+                "--python",
+                str(python_exe),
+                "app-demo==1.0.0",
+                "unrelated-demo==1.0.0",
+            ],
+            env=install_env,
+            check=True,
+        )
+
+        def probe_environment():
+            result = subprocess.run(
+                [
+                    str(python_exe),
+                    "-c",
+                    "import importlib.metadata as m, json; "
+                    "print(json.dumps({'versions': {n: m.version(n) for n in "
+                    "('app-demo', 'locked-demo', 'unrelated-demo')}, "
+                    "'app_requires': m.requires('app-demo')}))",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return json.loads(result.stdout)
+
+        # The stale lock-managed distribution is present only because the
+        # installed application depends on it, matching the real report.
+        assert probe_environment() == {
+            "versions": {
+                "app-demo": "1.0.0",
+                "locked-demo": "1.0.0",
+                "unrelated-demo": "1.0.0",
+            },
+            "app_requires": ["locked-demo>=1,<3"],
+        }
+
+        # Make the reviewed lock target available only after seeding the stale
+        # environment, so app-demo genuinely installed locked-demo transitively.
+        self._write_wheel(wheelhouse, "locked-demo", "2.0.0")
+
+        # Existing installs start with no digest cache; this must drive the
+        # same non-pruning reconciliation used by hermes update.
+        assert uc._python_lockfile_changed(hermes_root) is True
+        assert uc._reconcile_and_record_python_lockfile(
+            [uv, "pip"], env=install_env, hermes_root=hermes_root
+        )
+
+        assert probe_environment() == {
+            "versions": {
+                "app-demo": "1.0.0",
+                "locked-demo": "2.0.0",
+                "unrelated-demo": "1.0.0",
+            },
+            "app_requires": ["locked-demo>=1,<3"],
+        }
+        assert uc._python_lockfile_changed(hermes_root) is False
+
+    def test_failed_reconciliation_does_not_record_hash(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd as uc
+
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\nname='hermes'\n", encoding="utf-8"
+        )
+        (tmp_path / "uv.lock").write_text("version = 1\n", encoding="utf-8")
+        hermes_root = tmp_path / ".hermes"
+        hermes_root.mkdir()
+        monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+        monkeypatch.setattr(
+            uc, "_reconcile_installed_python_packages_with_lock", lambda *_a, **_k: False
+        )
+
+        assert not uc._reconcile_and_record_python_lockfile(
+            ["uv", "pip"], hermes_root=hermes_root
+        )
+        assert uc._python_lockfile_changed(hermes_root) is True
