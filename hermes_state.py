@@ -1925,6 +1925,18 @@ def classify_persistence_error(exc_or_str) -> str:
         return "compression_closed"
     if "being compressed" in text or "compression lease" in text:
         return "compression"
+    # A CPython sqlite3 driver glitch — "<connection> returned NULL without
+    # setting an exception" (SystemError) — surfaces under WAL after very
+    # long turns while the database itself is healthy (PRAGMA integrity_check
+    # clean, BEGIN IMMEDIATE + ROLLBACK succeed, disk has space). It is not
+    # SQLITE_BUSY, so the driver's own busy-retry never sees it, and it rode
+    # up as a generic write failure ending the turn with unhelpful advice.
+    # Classify it as lock-shaped TRANSIENT contention so the turn explanation
+    # carries the same "storage was busy, send it again" retry-later guidance
+    # as the locked bucket — the next send re-flushes the unmarked tail via
+    # the existing recovery contract (#94258).
+    if "returned null without setting an exception" in text:
+        return "locked"
     # Structural corruption BEFORE the lock and disk buckets: "database disk
     # image is malformed" contains "disk" (and some wrapped corruption
     # strings mention "locked" recovery attempts), so later buckets would
