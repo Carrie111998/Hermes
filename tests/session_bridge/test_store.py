@@ -16245,3 +16245,141 @@ def test_live_repair_lease_is_not_reported_as_abandoned(db: SessionDB) -> None:
         }
     ]
     assert status["repair_required"] == []
+
+
+# ── Desktop registry reconciliation ledger ──
+
+
+def test_desktop_registry_baselines_upsert_and_load(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    rows = [
+        {
+            "filename": "a.json",
+            "root_id": root,
+            "group_name": "field:title",
+            "value_json": '{"state":"present","value":"T"}',
+            "revision": 1,
+        }
+        for root in ("r1", "r2", "r3")
+    ]
+
+    assert store.upsert_desktop_registry_baselines(rows) == 3
+    loaded = store.load_desktop_registry_baselines()
+    assert len(loaded) == 3
+    assert {row["root_id"] for row in loaded} == {"r1", "r2", "r3"}
+    assert all(row["revision"] == 1 for row in loaded)
+
+    updated = [dict(row, value_json='{"state":"absent"}', revision=2) for row in rows]
+    assert store.upsert_desktop_registry_baselines(updated) == 3
+    loaded = store.load_desktop_registry_baselines()
+    assert len(loaded) == 3
+    assert all(row["value_json"] == '{"state":"absent"}' for row in loaded)
+    assert all(row["revision"] == 2 for row in loaded)
+
+
+def test_desktop_registry_baseline_upsert_rejects_invalid_rows(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    with pytest.raises(ValueError):
+        store.upsert_desktop_registry_baselines(
+            [
+                {
+                    "filename": "",
+                    "root_id": "r1",
+                    "group_name": "field:title",
+                    "value_json": "{}",
+                    "revision": 1,
+                }
+            ]
+        )
+    with pytest.raises(ValueError):
+        store.upsert_desktop_registry_baselines(
+            [
+                {
+                    "filename": "a.json",
+                    "root_id": "r1",
+                    "group_name": "field:title",
+                    "value_json": "{}",
+                    "revision": 0,
+                }
+            ]
+        )
+    assert store.load_desktop_registry_baselines() == []
+
+
+def test_stage_desktop_registry_run_refuses_second_pending(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+
+    staged = store.stage_desktop_registry_run("run-1", 1, '{"mutations": []}')
+    assert staged["state"] == "prepared"
+    with pytest.raises(ValueError, match="pending"):
+        store.stage_desktop_registry_run("run-2", 1, "{}")
+
+    pending = store.pending_desktop_registry_run()
+    assert pending is not None
+    assert pending["id"] == "run-1"
+    assert pending["grouping_version"] == 1
+
+
+def test_finish_desktop_registry_run_transitions(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.stage_desktop_registry_run("run-1", 1, "{}")
+
+    store.finish_desktop_registry_run("run-1", "committed", resolution=None)
+    assert store.pending_desktop_registry_run() is None
+
+    with pytest.raises(ValueError):
+        store.finish_desktop_registry_run("run-1", "abandoned", resolution="again")
+    with pytest.raises(ValueError):
+        store.finish_desktop_registry_run("missing", "committed", resolution=None)
+    store.stage_desktop_registry_run("run-2", 1, "{}")
+    with pytest.raises(ValueError):
+        store.finish_desktop_registry_run("run-2", "prepared", resolution=None)
+
+
+def test_finish_desktop_registry_run_abandoned_records_resolution(db) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0)
+    store.stage_desktop_registry_run("run-1", 1, "{}")
+
+    store.finish_desktop_registry_run(
+        "run-1", "abandoned", resolution="recovered_by_replan"
+    )
+
+    assert store.pending_desktop_registry_run() is None
+    with db._lock:
+        row = db._conn.execute(
+            "SELECT state, resolution FROM desktop_registry_runs WHERE id = 'run-1'"
+        ).fetchone()
+    assert (row["state"], row["resolution"]) == ("abandoned", "recovered_by_replan")
+
+
+def test_replace_desktop_registry_conflicts_preserves_first_seen(db) -> None:
+    clock_value = [100.0]
+    store = SessionBridgeStore(db, clock=lambda: clock_value[0])
+    first = [
+        {
+            "filename": "a.json",
+            "group_name": "protected:cliSessionId",
+            "reason": "protected_linkage_divergence",
+            "candidates_json": '{"r1":"x"}',
+        },
+        {
+            "filename": "b.json",
+            "group_name": "field:title",
+            "reason": "concurrent_divergence",
+            "candidates_json": '{"r1":"y"}',
+        },
+    ]
+    store.replace_desktop_registry_conflicts(first)
+
+    clock_value[0] = 200.0
+    store.replace_desktop_registry_conflicts([first[0]])
+
+    with db._lock:
+        rows = db._conn.execute(
+            "SELECT filename, first_seen_at, last_seen_at "
+            "FROM desktop_registry_conflicts ORDER BY filename"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["filename"] == "a.json"
+    assert rows[0]["first_seen_at"] == 100.0
+    assert rows[0]["last_seen_at"] == 200.0

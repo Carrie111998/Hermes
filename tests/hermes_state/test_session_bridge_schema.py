@@ -2090,3 +2090,130 @@ def test_bridge_schema_failure_rolls_back_ddl_and_keeps_v20(tmp_path, monkeypatc
         assert _read_v20_mirror_job(conn) == V20_MIRROR_JOB_ROW
     finally:
         conn.close()
+
+
+def test_desktop_registry_tables_exist_with_constraints(tmp_path):
+    db = hermes_state.SessionDB(tmp_path / "desktop-registry.db")
+    try:
+        tables = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {
+            "desktop_registry_baselines",
+            "desktop_registry_runs",
+            "desktop_registry_conflicts",
+        } <= tables
+
+        baseline_pk = tuple(
+            row[1]
+            for row in db._conn.execute(
+                'PRAGMA table_info("desktop_registry_baselines")'
+            )
+            if row[5]
+        )
+        assert baseline_pk == ("filename", "root_id", "group_name")
+        conflict_pk = tuple(
+            row[1]
+            for row in db._conn.execute(
+                'PRAGMA table_info("desktop_registry_conflicts")'
+            )
+            if row[5]
+        )
+        assert conflict_pk == ("filename", "group_name")
+
+        indexes = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        assert "idx_desktop_registry_runs_state" in indexes
+
+        with pytest.raises(sqlite3.IntegrityError):
+            db._conn.execute(
+                "INSERT INTO desktop_registry_runs "
+                "(id, state, grouping_version, payload_json, created_at, updated_at) "
+                "VALUES ('r1', 'bogus-state', 1, '{}', 1.0, 1.0)"
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            db._conn.execute(
+                "INSERT INTO desktop_registry_baselines "
+                "(filename, root_id, group_name, value_json, revision, updated_at) "
+                "VALUES ('a.json', 'root', 'field:title', '{}', 0, 1.0)"
+            )
+    finally:
+        db.close()
+
+
+def test_desktop_registry_tables_are_added_to_legacy_database(tmp_path):
+    db_path = tmp_path / "legacy-desktop-registry.db"
+    message_id = _prepare_v20_database(db_path)
+
+    db = hermes_state.SessionDB(db_path)
+    try:
+        tables = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        assert {
+            "desktop_registry_baselines",
+            "desktop_registry_runs",
+            "desktop_registry_conflicts",
+        } <= tables
+        assert _read_v20_mirror_job(db._conn) == V20_MIRROR_JOB_ROW
+        message = db._conn.execute(
+            "SELECT content FROM messages WHERE id = ?", (message_id,)
+        ).fetchone()
+        assert tuple(message) == ("preserve me",)
+    finally:
+        db.close()
+
+
+def test_desktop_registry_rows_survive_reopen(tmp_path):
+    db_path = tmp_path / "desktop-registry-reopen.db"
+    db = hermes_state.SessionDB(db_path)
+    try:
+        with db._lock:
+            db._conn.execute(
+                "INSERT INTO desktop_registry_baselines "
+                "(filename, root_id, group_name, value_json, revision, updated_at) "
+                "VALUES ('a.json', 'root-1', 'field:title', "
+                "'{\"state\":\"present\",\"value\":\"T\"}', 3, 10.0)"
+            )
+            db._conn.execute(
+                "INSERT INTO desktop_registry_runs "
+                "(id, state, grouping_version, payload_json, created_at, updated_at) "
+                "VALUES ('run-1', 'committed', 1, '{}', 1.0, 2.0)"
+            )
+            db._conn.execute(
+                "INSERT INTO desktop_registry_conflicts "
+                "(filename, group_name, reason, candidates_json, "
+                "first_seen_at, last_seen_at) "
+                "VALUES ('a.json', 'protected:cliSessionId', "
+                "'protected_linkage_divergence', '{}', 5.0, 6.0)"
+            )
+            db._conn.commit()
+    finally:
+        db.close()
+
+    reopened = hermes_state.SessionDB(db_path)
+    try:
+        baseline = reopened._conn.execute(
+            "SELECT value_json, revision FROM desktop_registry_baselines"
+        ).fetchone()
+        run = reopened._conn.execute(
+            "SELECT state FROM desktop_registry_runs WHERE id = 'run-1'"
+        ).fetchone()
+        conflict = reopened._conn.execute(
+            "SELECT reason FROM desktop_registry_conflicts"
+        ).fetchone()
+        assert tuple(baseline) == ('{"state":"present","value":"T"}', 3)
+        assert run[0] == "committed"
+        assert conflict[0] == "protected_linkage_divergence"
+    finally:
+        reopened.close()

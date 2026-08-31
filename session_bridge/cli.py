@@ -78,6 +78,7 @@ from .listener_watchdog import (
     make_deaf_listener_handler,
 )
 from .mcp_server import create_app, resolve_bearer_token, resolve_marker_key
+from .desktop_registry_worker import DesktopRegistrySyncWorker
 from .mirror_float import (
     ClaudeMirrorFloatWorker,
     IdleChipArchiveWorker,
@@ -3799,6 +3800,19 @@ class ProductionBackend:
                 )
                 else None
             )
+            registry_sync = (
+                DesktopRegistrySyncWorker(
+                    self._require_store(),
+                    registry_roots=tuple(discover_ccd_convergence_roots()),
+                )
+                if (
+                    not catalog_only
+                    and effective_config.claude_visibility.enabled
+                    and effective_config.claude_visibility.reconcile_desktop_registries
+                    and discover_ccd_convergence_roots()
+                )
+                else None
+            )
             self._coordinator = SessionBridgeCoordinator(
                 config=effective_config,
                 store=self._require_store(),
@@ -3815,6 +3829,7 @@ class ProductionBackend:
                 sidebar_executor=sidebar_executor,
                 mirror_float=mirror_float,
                 idle_chip_archiver=idle_chip_archiver,
+                registry_sync=registry_sync,
             )
             return self._coordinator
         except Exception:

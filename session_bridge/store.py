@@ -12071,6 +12071,230 @@ class SessionBridgeStore:
                 snapshots.append({"bridge_id": bridge_id, **snapshot})
         return snapshots
 
+    # ── Desktop registry reconciliation ledger ──
+    #
+    # Baselines are the last verified per-replica group values for the
+    # cross-account Desktop session registries. They advance only after an
+    # all-root disk verification, so an interrupted cycle is recovered by
+    # abandoning the stale run and replanning from the standing baselines --
+    # never by replaying bytes.
+
+    _DESKTOP_REGISTRY_BASELINE_BATCH = 5_000
+
+    def load_desktop_registry_baselines(self) -> list[dict[str, Any]]:
+        with self.db._lock:
+            rows = self.db._conn.execute(
+                """SELECT filename, root_id, group_name, value_json, revision
+                   FROM desktop_registry_baselines"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_desktop_registry_baselines(
+        self, rows: Sequence[Mapping[str, Any]]
+    ) -> int:
+        validated: list[tuple[str, str, str, str, int]] = []
+        for row in rows:
+            filename = _exact_nonempty_text(
+                row.get("filename"), "desktop registry baseline filename"
+            )
+            root_id = _exact_nonempty_text(
+                row.get("root_id"), "desktop registry baseline root ID"
+            )
+            group_name = _exact_nonempty_text(
+                row.get("group_name"), "desktop registry baseline group"
+            )
+            value_json = row.get("value_json")
+            if not isinstance(value_json, str) or not value_json:
+                raise ValueError(
+                    "desktop registry baseline value must be nonempty JSON text"
+                )
+            revision = row.get("revision")
+            if (
+                not isinstance(revision, int)
+                or isinstance(revision, bool)
+                or revision < 1
+            ):
+                raise ValueError(
+                    "desktop registry baseline revision must be a positive integer"
+                )
+            validated.append((filename, root_id, group_name, value_json, revision))
+
+        # Batch on whole (filename, group) units so a crash between batches can
+        # only leave a group entirely accepted or entirely unaccepted -- the two
+        # states the planner treats as valid. Splitting one group across
+        # transactions could strand partial root coverage, which fails closed.
+        by_group: dict[tuple[str, str], list[tuple[str, str, str, str, int]]] = {}
+        for item in validated:
+            by_group.setdefault((item[0], item[2]), []).append(item)
+        batches: list[list[tuple[str, str, str, str, int]]] = [[]]
+        for group_rows in by_group.values():
+            if (
+                batches[-1]
+                and len(batches[-1]) + len(group_rows)
+                > self._DESKTOP_REGISTRY_BASELINE_BATCH
+            ):
+                batches.append([])
+            batches[-1].extend(group_rows)
+
+        written = 0
+        for batch in batches:
+            if not batch:
+                continue
+
+            def _write(conn: Any, batch: list = batch) -> int:
+                updated_at = _finite_number(self._clock(), "clock")
+                conn.executemany(
+                    """INSERT INTO desktop_registry_baselines
+                           (filename, root_id, group_name, value_json,
+                            revision, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(filename, root_id, group_name) DO UPDATE SET
+                           value_json = excluded.value_json,
+                           revision = excluded.revision,
+                           updated_at = excluded.updated_at""",
+                    [(*item, updated_at) for item in batch],
+                )
+                return len(batch)
+
+            written += self.db._execute_write(_write)
+        return written
+
+    def pending_desktop_registry_run(self) -> dict[str, Any] | None:
+        with self.db._lock:
+            row = self.db._conn.execute(
+                """SELECT id, state, grouping_version, payload_json, created_at
+                   FROM desktop_registry_runs
+                   WHERE state = 'prepared'
+                   ORDER BY created_at LIMIT 1"""
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def stage_desktop_registry_run(
+        self, run_id: str, grouping_version: int, payload_json: str
+    ) -> dict[str, Any]:
+        normalized_id = _exact_nonempty_text(run_id, "desktop registry run ID")
+        if (
+            not isinstance(grouping_version, int)
+            or isinstance(grouping_version, bool)
+            or grouping_version < 1
+        ):
+            raise ValueError("desktop registry grouping version must be >= 1")
+        if not isinstance(payload_json, str) or not payload_json:
+            raise ValueError("desktop registry run payload must be nonempty text")
+
+        def _write(conn: Any) -> dict[str, Any]:
+            pending = conn.execute(
+                "SELECT id FROM desktop_registry_runs WHERE state = 'prepared' LIMIT 1"
+            ).fetchone()
+            if pending is not None:
+                raise ValueError(
+                    f"desktop registry run {pending['id']} is still pending"
+                )
+            now = _finite_number(self._clock(), "clock")
+            conn.execute(
+                """INSERT INTO desktop_registry_runs
+                       (id, state, grouping_version, payload_json,
+                        created_at, updated_at)
+                   VALUES (?, 'prepared', ?, ?, ?, ?)""",
+                (normalized_id, grouping_version, payload_json, now, now),
+            )
+            return {
+                "id": normalized_id,
+                "state": "prepared",
+                "grouping_version": grouping_version,
+            }
+
+        return self.db._execute_write(_write)
+
+    def finish_desktop_registry_run(
+        self, run_id: str, state: str, *, resolution: str | None
+    ) -> None:
+        normalized_id = _exact_nonempty_text(run_id, "desktop registry run ID")
+        if state not in {"committed", "conflicted", "abandoned"}:
+            raise ValueError(f"invalid desktop registry run state: {state}")
+        if resolution is not None and (
+            not isinstance(resolution, str) or not resolution
+        ):
+            raise ValueError("desktop registry run resolution must be None or text")
+
+        def _write(conn: Any) -> None:
+            row = conn.execute(
+                "SELECT state FROM desktop_registry_runs WHERE id = ?",
+                (normalized_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown desktop registry run: {normalized_id}")
+            if row["state"] != "prepared":
+                raise ValueError(
+                    f"desktop registry run {normalized_id} is already {row['state']}"
+                )
+            conn.execute(
+                """UPDATE desktop_registry_runs
+                   SET state = ?, resolution = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    state,
+                    resolution,
+                    _finite_number(self._clock(), "clock"),
+                    normalized_id,
+                ),
+            )
+
+        self.db._execute_write(_write)
+
+    def replace_desktop_registry_conflicts(
+        self, conflicts: Sequence[Mapping[str, Any]]
+    ) -> None:
+        validated: list[tuple[str, str, str, str]] = []
+        for conflict in conflicts:
+            validated.append(
+                (
+                    _exact_nonempty_text(
+                        conflict.get("filename"), "desktop registry conflict filename"
+                    ),
+                    _exact_nonempty_text(
+                        conflict.get("group_name"), "desktop registry conflict group"
+                    ),
+                    _exact_nonempty_text(
+                        conflict.get("reason"), "desktop registry conflict reason"
+                    ),
+                    _exact_nonempty_text(
+                        conflict.get("candidates_json"),
+                        "desktop registry conflict candidates",
+                    ),
+                )
+            )
+
+        def _write(conn: Any) -> None:
+            now = _finite_number(self._clock(), "clock")
+            first_seen = {
+                (row["filename"], row["group_name"]): row["first_seen_at"]
+                for row in conn.execute(
+                    "SELECT filename, group_name, first_seen_at "
+                    "FROM desktop_registry_conflicts"
+                )
+            }
+            conn.execute("DELETE FROM desktop_registry_conflicts")
+            conn.executemany(
+                """INSERT INTO desktop_registry_conflicts
+                       (filename, group_name, reason, candidates_json,
+                        first_seen_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        filename,
+                        group_name,
+                        reason,
+                        candidates_json,
+                        first_seen.get((filename, group_name), now),
+                        now,
+                    )
+                    for filename, group_name, reason, candidates_json in validated
+                ],
+            )
+
+        self.db._execute_write(_write)
+
 
 def _finite_number(value: object, label: str) -> float:
     if (

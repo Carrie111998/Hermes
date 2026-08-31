@@ -6699,6 +6699,76 @@ def test_mirror_float_must_provide_run_once() -> None:
         )
 
 
+@pytest.mark.asyncio
+async def test_successful_scan_runs_registry_sync_worker() -> None:
+    """Desktop registry reconciliation runs post-scan, local-only.
+
+    Like the mirror float and the idle-chip archiver, it reads only the local
+    state database and registry files, so it runs outside the provider-health
+    gate and off the event loop.
+    """
+    now = 3_000_000.0
+    store = _SidebarScanStore()
+    event_loop_thread = get_ident()
+    sync_threads: list[int] = []
+
+    class RecordingRegistrySync:
+        def run_once(self) -> dict[str, int]:
+            sync_threads.append(get_ident())
+            return {"examined": 0, "patched": 0}
+
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=True),
+        store=store,
+        adapters={Provider.CLAUDE: _LifecycleClaudeAdapter()},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+        registry_sync=RecordingRegistrySync(),
+    )
+
+    summary = await coordinator.scan_once(Provider.CLAUDE)
+
+    assert summary.failed == 0
+    assert len(sync_threads) == 1
+    assert sync_threads[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_registry_sync_failure_is_recorded_not_raised() -> None:
+    now = 3_000_000.0
+    store = _SidebarScanStore()
+
+    class ExplodingRegistrySync:
+        def run_once(self) -> dict[str, int]:
+            raise RuntimeError("boom")
+
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=True),
+        store=store,
+        adapters={Provider.CLAUDE: _LifecycleClaudeAdapter()},
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+        registry_sync=ExplodingRegistrySync(),
+    )
+
+    summary = await coordinator.scan_once(Provider.CLAUDE)
+
+    assert summary.failed == 0
+    assert "desktop_registry_sync_failed" in coordinator._recent_error_codes
+
+
+def test_registry_sync_must_provide_run_once() -> None:
+    with pytest.raises(TypeError, match="registry_sync must provide run_once"):
+        SessionBridgeCoordinator(
+            config=_sidebar_config(),
+            store=_SidebarScanStore(),
+            adapters={},
+            target_adapters={},
+            clock=lambda: 0.0,
+            registry_sync=object(),
+        )
+
+
 def test_cached_index_opt_in_is_capability_detected() -> None:
     """Scan resolution opts into a TTL'd inventory index only where one exists.
 

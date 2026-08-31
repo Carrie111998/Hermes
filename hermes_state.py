@@ -2237,6 +2237,45 @@ CREATE TABLE IF NOT EXISTS session_bridge_migrations (
     applied_at REAL NOT NULL
 );
 
+-- Desktop registry reconciliation ledger (cross-account session record
+-- convergence). Baselines are the last verified per-replica group values;
+-- they advance only after an all-root disk verification, which is what makes
+-- an interrupted cycle recoverable by replanning rather than byte replay.
+CREATE TABLE IF NOT EXISTS desktop_registry_baselines (
+    filename TEXT NOT NULL,
+    root_id TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (filename, root_id, group_name)
+);
+
+CREATE TABLE IF NOT EXISTS desktop_registry_runs (
+    id TEXT PRIMARY KEY,
+    state TEXT NOT NULL CHECK (
+        state IN ('prepared', 'committed', 'conflicted', 'abandoned')
+    ),
+    grouping_version INTEGER NOT NULL CHECK (grouping_version >= 1),
+    payload_json TEXT NOT NULL,
+    resolution TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_desktop_registry_runs_state
+    ON desktop_registry_runs(state, created_at);
+
+CREATE TABLE IF NOT EXISTS desktop_registry_conflicts (
+    filename TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    candidates_json TEXT NOT NULL,
+    first_seen_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    PRIMARY KEY (filename, group_name)
+);
+
 CREATE INDEX IF NOT EXISTS idx_external_sessions_last_indexed_at
     ON external_sessions(last_indexed_at);
 CREATE INDEX IF NOT EXISTS idx_external_sessions_origin_bridge_id
