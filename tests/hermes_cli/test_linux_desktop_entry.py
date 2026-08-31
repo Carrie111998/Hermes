@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import stat
 from pathlib import Path
 
@@ -107,7 +108,7 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
+    interpreter = os.path.abspath(sys.executable)
     assert exec_line.split(" ")[0].strip('"') == interpreter
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
@@ -135,7 +136,7 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     root = _make_project(tmp_path)
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
-    interpreter = str(Path(sys.executable).resolve())
+    interpreter = os.path.abspath(sys.executable)
     hermes_bin.write_text(f"#!{interpreter}\nimport hermes_cli\n", encoding="utf-8")
     hermes_bin.chmod(0o755)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
