@@ -6184,9 +6184,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         )
                     _call_coro = server.session.call_tool(tool_name, arguments=args)
                     _watch_children = getattr(server, "_watch_stdio_children", None)
+                    # Probe WITHOUT calling: isawaitable(_watch_children())
+                    # minted a real coroutine that nothing ever awaited — a
+                    # "never awaited" RuntimeWarning on every stdio tool call
+                    # (asyncio.iscoroutinefunction also accepts AsyncMock).
                     _watch_ok = (
                         _watch_children is not None
-                        and inspect.isawaitable(_watch_children())
+                        and asyncio.iscoroutinefunction(_watch_children)
                         and asyncio.iscoroutine(_call_coro)
                     )
                     if not _watch_ok:
