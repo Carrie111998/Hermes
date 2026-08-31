@@ -1463,8 +1463,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         "preview": repr(result)[:200],
                     })
             except Exception as _val_err:
-                # Validation is best-effort — never block the tool result
-                logger.debug("tool result validator raised for %s: %s", function_name, _val_err)
+                # Validation is best-effort — never block the tool result.
+                # Log at WARNING so a bug in the validator itself is visible.
+                logger.warning("tool result validator raised for %s: %s", function_name, _val_err)
 
             if not blocked and not dispatched:
                 _emit_terminal_post_tool_call(
