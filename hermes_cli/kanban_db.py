@@ -5228,6 +5228,11 @@ def release_stale_claims(
                 "retry_status": retry_status,
             }
             payload.update(termination)
+            # Claim locality is known from the durable lock prefix even when
+            # the recorded PID is already gone. The termination helper avoids
+            # a process probe in that case, so do not let its conservative
+            # default erase this diagnostic fact.
+            payload["host_local"] = host_local
             _append_event(
                 conn, row["id"], "reclaimed",
                 payload,
@@ -8761,7 +8766,7 @@ def _terminate_reclaimed_worker(
     if not pid or pid <= 0 or not claim_lock:
         return info
 
-    # A missing PID cannot be an orphan. Check this before claim-host
+    # A dead PID cannot be an orphan. Check this before claim-host
     # locality: hostname aliases may drift while a gateway is running, but a
     # process that no longer exists is safe to release on every topology.
     if not _pid_alive(pid):
