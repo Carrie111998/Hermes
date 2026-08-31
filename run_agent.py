@@ -162,7 +162,6 @@ from agent.usage_pricing import normalize_usage
 from agent.context_compressor import (  # noqa: F401
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
-    user_originated_turn_view,
 )
 from agent.retry_utils import jittered_backoff  # noqa: F401
 from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.<name>") / from run_agent import <name>
@@ -277,15 +276,6 @@ _MAX_TOOL_WORKERS = 8
 # (agent/transports/chat_completions.py, agent/chat_completion_helpers.py) strip
 # every top-level ``_``-prefixed key before the request leaves the process, so
 # this never reaches a strict OpenAI-compatible gateway.
-#
-# CONTRACT (#92231): the marker asserts "this dict's CONTENT is durable as
-# written". Loaded rows are stamped at materialization time
-# (hermes_state._rows_to_conversation), so any code that mutates a loaded or
-# flushed dict's content in place and needs the change persisted MUST pop the
-# marker (and invalidate _db_flush_scan_prefix if the dict may sit inside the
-# bounded-scan prefix) — see agent/turn_finalizer.py (fill-empty-tail) and
-# agent/context_compressor.py (micro-compaction defrag) for the two canonical
-# pop sites. Mutating without popping leaves the DB silently stale.
 _DB_PERSISTED_MARKER = "_db_persisted"
 
 
@@ -998,15 +988,7 @@ class AIAgent:
         callers. The CLI may still want compact progress hints when no callback
         owns rendering. Embedded/library callers, on the other hand, expect
         quiet mode to be truly silent.
-
-        ``suppress_status_output`` (the strict machine-readable mode used by
-        ``hermes chat -Q``) always wins: those flows neutralize the rendering
-        callbacks, and without this gate the "no callback owns rendering"
-        fallback would print ``[tool]``/``[done]`` spinner lines into the
-        captured stdout it exists to keep clean (#93220).
         """
-        if getattr(self, "suppress_status_output", False):
-            return False
         return (
             self.quiet_mode
             and not self.tool_progress_callback
@@ -1910,7 +1892,8 @@ class AIAgent:
         review_memory: bool = False,
         review_skills: bool = False,
         focus: Optional[str] = None,
-    ) -> None:
+        report_only: bool = False,
+    ) -> Optional[List[Dict]]:
         """Spawn the background memory/skill review thread.
 
         Thin wrapper — the heavy lifting lives in
@@ -1922,6 +1905,10 @@ class AIAgent:
         ``focus`` is optional user-supplied steering (from ``/refine``)
         appended to the review prompt — e.g. "save the deploy workflow as a
         skill". The automatic post-turn triggers never set it.
+
+        ``report_only`` (the ``/refine --report`` path) runs the fork
+        synchronously and stores the parsed proposals on ``self``.  Returns
+        the proposal list (or ``None`` on the background-thread path).
         """
         # A delegation subagent (``_delegate_depth > 0``) must not run the
         # automatic post-turn review. Subagents are ephemeral workers already
@@ -1930,30 +1917,30 @@ class AIAgent:
         # persist — yet it inherits the subagent's (often premium) delegation
         # model and replays the whole conversation at premium rates, silently
         # inflating token cost (#85859). An explicit ``/refine`` (``focus`` set)
-        # is a deliberate user request and still runs.
-        if focus is None and getattr(self, "_delegate_depth", 0) > 0:
-            return
+        # is a deliberate user request and still runs.  Report-only mode is
+        # always deliberate so it also bypasses the subagent gate.
+        if focus is None and not report_only and getattr(self, "_delegate_depth", 0) > 0:
+            return None
         # Explicit off-switch for automatic post-turn forks
         # (``auxiliary.background_review.enabled: false``). Manual ``/refine``
         # still works — same contract as zeroing the nudge intervals (#87250).
         # Load the task block once here and pass it into the spawn path so
         # aux routing does not re-read config.
         task_cfg = None
-        if focus is None:
+        if focus is None and not report_only:
             from agent.background_review import load_background_review_settings
             enabled, task_cfg = load_background_review_settings()
             if not enabled:
-                return
+                return None
         from agent.background_review import (
             finish_background_review_run,
             prepare_background_review_run,
             spawn_background_review_thread,
         )
         from tools.thread_context import propagate_context_to_thread
-
         review_run = prepare_background_review_run(self)
         if review_run is None:
-            return
+            return None
         try:
             target, _prompt = spawn_background_review_thread(
                 self,
@@ -1962,16 +1949,26 @@ class AIAgent:
                 review_skills=review_skills,
                 focus=focus,
                 task_cfg=task_cfg,
+                report_only=report_only,
                 review_run=review_run,
             )
-            # Carry the active profile into the review thread so MEMORY.md /
-            # skill review writes land in the right profile (#54937).
+            # Report-only mode: run synchronously so the caller can read
+            # ``self._last_review_proposals`` and offer interactive acceptance.
+            if report_only:
+                wrapped = propagate_context_to_thread(target)
+                wrapped()
+                finish_background_review_run(self, review_run)
+                return getattr(self, "_last_review_proposals", [])
+            # Normal (execute) mode: fire-and-forget background thread.
+            # Carry the active profile into the review thread so MEMORY.md / skill
+            # review writes land in the right profile (#54937).
             t = threading.Thread(
                 target=propagate_context_to_thread(target),
                 daemon=True,
                 name="bg-review",
             )
             t.start()
+            return None
         except Exception:
             finish_background_review_run(self, review_run)
             raise
@@ -2405,7 +2402,6 @@ class AIAgent:
                         "hidden"
                         if (
                             msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
-                            and user_originated_turn_view(msg) is None
                             and (
                                 ContextCompressor.classify_summary_content(
                                     msg.get("content")
@@ -3301,13 +3297,7 @@ class AIAgent:
                 logging.warning(f"Failed to save session log: {e}")
 
 
-    def interrupt(
-        self,
-        message: Optional[str] = None,
-        *,
-        hard_cancel: bool = False,
-        tool_reason: Optional[str] = None,
-    ) -> None:
+    def interrupt(self, message: Optional[str] = None, *, hard_cancel: bool = False) -> None:
         """
         Request the agent to interrupt its current tool-calling loop.
         
@@ -3323,8 +3313,6 @@ class AIAgent:
             hard_cancel: Mark this as an explicit stop rather than a redirect or
                          incoming-message interrupt. Compression may honor this
                          atomic signal even while ordinary interrupts are masked.
-            tool_reason: Trusted fixed category safe to expose in tool output.
-                         Arbitrary diagnostic or caller text belongs in message.
         
         Example (CLI):
             # In a separate input thread:
@@ -3360,28 +3348,17 @@ class AIAgent:
                     )
             event.set()
 
-        # Keep tool cancellation attribution separate from _interrupt_message:
-        # ordinary interrupts may carry the user's full next message, which
-        # must not be copied into tool output.
-        tool_interrupt_reason = (
-            (tool_reason or "explicit stop requested")
-            if hard_cancel
-            else ("user sent a new message" if message else "user interrupt")
-        )
-
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
             with _redirect_lock:
                 self._interrupt_requested = True
                 self._interrupt_message = message
-                self._tool_interrupt_reason = tool_interrupt_reason
                 if hard_cancel:
                     _admit_hard_cancel()
                 self._pending_redirect = None
         else:
             self._interrupt_requested = True
             self._interrupt_message = message
-            self._tool_interrupt_reason = tool_interrupt_reason
             if hard_cancel:
                 _admit_hard_cancel()
             self._pending_redirect = None
@@ -3414,11 +3391,7 @@ class AIAgent:
         # Scope the interrupt to this agent's execution thread so other
         # agents running in the same process (gateway) are not affected.
         if self._execution_thread_id is not None:
-            _set_interrupt(
-                True,
-                self._execution_thread_id,
-                reason=tool_interrupt_reason,
-            )
+            _set_interrupt(True, self._execution_thread_id)
             self._interrupt_thread_signal_pending = False
         else:
             # The interrupt arrived before run_conversation() finished
@@ -3442,7 +3415,7 @@ class AIAgent:
                 _worker_tids = list(_tracker)
             for _wtid in _worker_tids:
                 try:
-                    _set_interrupt(True, _wtid, reason=tool_interrupt_reason)
+                    _set_interrupt(True, _wtid)
                 except Exception:
                     pass
         # Propagate interrupt to any running child agents (subagent delegation)
@@ -3451,11 +3424,7 @@ class AIAgent:
         for child in children_copy:
             try:
                 if hard_cancel:
-                    request_hard_interrupt(
-                        child,
-                        message,
-                        tool_reason=tool_interrupt_reason,
-                    )
+                    request_hard_interrupt(child, message)
                 else:
                     child.interrupt(message)
             except Exception as e:
@@ -3463,12 +3432,7 @@ class AIAgent:
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 
-    def hard_interrupt(
-        self,
-        message: Optional[str] = None,
-        *,
-        tool_reason: Optional[str] = None,
-    ) -> None:
+    def hard_interrupt(self, message: Optional[str] = None) -> None:
         """Request an explicit stop while preserving ``interrupt()`` ABI.
 
         Frontends can feature-detect this method and fall back to the legacy
@@ -3477,12 +3441,7 @@ class AIAgent:
         # Deliberately bypass dynamic dispatch: subclasses written against the
         # legacy interrupt(message=None) ABI may override interrupt without the
         # newer keyword-only hard_cancel argument.
-        AIAgent.interrupt(
-            self,
-            message,
-            hard_cancel=True,
-            tool_reason=tool_reason,
-        )
+        AIAgent.interrupt(self, message, hard_cancel=True)
 
     def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
         """Clear the interrupt request and per-thread tool signal.
@@ -3498,7 +3457,6 @@ class AIAgent:
                     return False
                 self._interrupt_requested = False
                 self._interrupt_message = None
-                self._tool_interrupt_reason = None
                 getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
                 if not preserve_redirect:
                     self._pending_redirect = None
@@ -3507,7 +3465,6 @@ class AIAgent:
                 return False
             self._interrupt_requested = False
             self._interrupt_message = None
-            self._tool_interrupt_reason = None
             getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
             if not preserve_redirect:
                 self._pending_redirect = None
@@ -3999,13 +3956,6 @@ class AIAgent:
                 + "an error occurred near the iteration limit before a final "
                 "answer. Check the tool output above, then send `continue`."
             )
-        if reason.startswith("repeated_outer_errors"):
-            return (
-                prefix
-                + "the turn kept failing with repeated errors and was stopped "
-                "early instead of retrying forever. Check the errors above, "
-                "then send `continue` to retry."
-            )
         if reason == "pending_tool_result":
             return (
                 prefix
@@ -4352,8 +4302,7 @@ class AIAgent:
                 latch = self._credits_latch = new_credits_latch()
             # Free-model gate: a depleted account on a free model can still
             # inference, so the depleted error banner is suppressed. Local-data
-            # only (":free" suffix, "stealth/" prefix + pricing-cache peek) —
-            # never a network call.
+            # only (":free" suffix + pricing-cache peek) — never a network call.
             model_is_free = is_free_tier_model(
                 getattr(self, "model", "") or "",
                 getattr(self, "base_url", "") or "",

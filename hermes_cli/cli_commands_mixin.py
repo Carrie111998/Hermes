@@ -2986,11 +2986,23 @@ class CLICommandsMixin:
         optional focus instructions. Writes go to the memory + skill stores
         in a background fork; the live conversation and prompt cache are
         never touched.
+
+        ``/refine --report [focus]`` runs the fork in "propose only" mode:
+        no memory or skill writes are executed.  The fork outputs a
+        structured JSON proposal block that is parsed and printed as a
+        numbered list.  The user reviews before any writes happen.
         """
         from cli import _DIM, _RST, _cprint
 
         parts = (cmd or "").strip().split(None, 1)
-        focus = parts[1].strip() if len(parts) > 1 else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        # Parse ``--report`` flag from the focus text.
+        report_only = False
+        if rest.lower() == "--report" or rest.lower().startswith("--report "):
+            report_only = True
+            rest = rest[len("--report"):].strip()
+        focus = rest
 
         agent = getattr(self, "agent", None)
         if agent is None:
@@ -3003,6 +3015,36 @@ class CLICommandsMixin:
             return
 
         review_skills = "skill_manage" in getattr(agent, "valid_tool_names", set())
+
+        if report_only:
+            _cprint(f"  {_DIM}Reviewing... (this may take a minute){_RST}")
+            try:
+                proposals = agent._spawn_background_review(
+                    messages_snapshot=snapshot,
+                    review_memory=True,
+                    review_skills=review_skills,
+                    focus=focus or None,
+                    report_only=True,
+                )
+            except Exception as exc:
+                _cprint(f"  /refine --report failed to start: {exc}")
+                return
+
+            if not proposals:
+                _cprint(
+                    f"  {_DIM}No skills or memory updates proposed.{_RST}"
+                )
+                return
+
+            tail = f" (focus: {focus})" if focus else ""
+            _cprint(f"  ⚗ REPORT{tail} — {len(proposals)} proposal(s) listed above.")
+            _cprint(
+                "  Use /refine <focus> (without --report) to execute the "
+                "review immediately."
+            )
+            return
+
+        # Normal execute mode (existing behavior).
         try:
             agent._spawn_background_review(
                 messages_snapshot=snapshot,
@@ -3018,38 +3060,6 @@ class CLICommandsMixin:
             f"  ⚗ Reviewing this conversation in the background{tail} — "
             f"any memory/skill updates will be reported when done."
         )
-
-    def _handle_review_command(self, cmd: str) -> None:
-        """Dispatch /review — spawn an independent reviewer subagent.
-
-        Snapshots the last N chat messages, wraps them (plus any argument
-        text as extra instructions) in a reviewer briefing, and dispatches a
-        full-privilege background subagent via the async delegation rail.
-        The review re-enters this session as a normal async-delegation
-        completion, addressed to the primary agent.
-        """
-        from cli import _DIM, _RST, _cprint
-
-        parts = (cmd or "").strip().split(None, 1)
-        prompt = parts[1].strip() if len(parts) > 1 else ""
-
-        agent = getattr(self, "agent", None)
-        if agent is None:
-            _cprint(f"  {_DIM}Nothing to review yet — send a message first.{_RST}")
-            return
-
-        snapshot = list(getattr(self, "conversation_history", None) or [])
-        try:
-            from agent.review_engine import format_dispatch_note, start_review
-
-            result = start_review(agent, snapshot, prompt)
-        except ValueError as exc:
-            _cprint(f"  {_DIM}{exc}{_RST}")
-            return
-        except Exception as exc:
-            _cprint(f"  /review failed to start: {exc}")
-            return
-        _cprint(f"  {format_dispatch_note(result, prompt)}")
 
     def _handle_goal_command(self, cmd: str) -> None:
         """Dispatch /goal subcommands: set / draft / show / gate / status / pause / resume / clear."""

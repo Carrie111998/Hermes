@@ -22,14 +22,15 @@ import copy
 import json
 import logging
 import os
-from pathlib import Path
+import re
 import threading
 from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
-
 
 _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS = 2.0
 
@@ -724,6 +725,26 @@ _COMBINED_REVIEW_PROMPT = (
     "and stop — but don't reach for that conclusion as a default."
 )
 
+# REPORT-ONLY suffix appended to the chosen review prompt by
+# ``spawn_background_review_thread`` when ``report_only=True`` (the
+# ``/refine --report`` path).  The fork lists what it would do as a
+# structured JSON block instead of executing any memory/skill writes.
+_REPORT_ONLY_PROMPT_SUFFIX = (
+    "\n\n"
+    "The user is running this review in REPORT only mode. Do NOT execute ANY "
+    "tool calls.\n"
+    "Instead, list what memory/skill actions you would take as a structured "
+    "JSON array.\n"
+    "Each item must have: action (add/update/remove), target "
+    "(memory/skill/user_profile),\n"
+    "content_preview (brief summary of what), name (if skill), reason (why).\n"
+    "Format your response as:\n"
+    "----PROPOSAL_START---\n"
+    '[{"action": "add", "target": "memory", ...}]\n'
+    "----PROPOSAL_END----\n"
+    "Then stop. Do not call any tools."
+)
+
 
 
 def summarize_background_review_actions(
@@ -1099,6 +1120,95 @@ def _log_review_completion(usage: Dict[str, Any], result: str) -> None:
     )
 
 
+# Rough JSON lark to crack open a proposal block even when the model wraps the
+# array in stray prose, fences, or trailing commas (the report-only fork is the
+# least-structured output the review path produces, so defect-tolerant parsing
+# here is worth a few lines).
+_JSON_LIST_START = re.compile(r"\[\s*\{")
+_JSON_LIST_END = re.compile(r"\}\s*\]")
+
+
+def _extract_report_proposals(
+    review_messages: List[Dict],
+) -> List[Dict]:
+    """Parse the ``----PROPOSAL_START--- … ----PROPOSAL_END----`` JSON out of
+    the report-only fork's generated text.
+
+    Walks the fork's assistant messages, joins their text, and pulls everything
+    inside the proposal markers.  Returns a list of proposal dicts, or ``[]``
+    when no parseable proposal block was found (including an explicit
+    "Nothing to save.").
+    """
+    if not review_messages:
+        return []
+    text_chunks: List[str] = []
+    for msg in review_messages:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        c = msg.get("content")
+        if isinstance(c, str):
+            text_chunks.append(c)
+        elif isinstance(c, list):
+            text_chunks.extend(
+                b.get("text", "") for b in c if isinstance(b, dict)
+            )
+    full_text = "\n".join(text_chunks)
+    if "----PROPOSAL_START---" not in full_text:
+        return []
+    block = full_text.split("----PROPOSAL_START---", 1)[1]
+    if "----PROPOSAL_END----" in block:
+        block = block.split("----PROPOSAL_END----", 1)[0]
+    start = _JSON_LIST_START.search(block)
+    end = _JSON_LIST_END.search(block)
+    if not start or not end or end.start() <= start.start():
+        logger.warning("Report-only review returned an unterminated proposal block.")
+        return []
+    payload = block[start.start(): end.end()]
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        # Fall back to stripping trailing commas before the final close, which
+        # models commonly emit.
+        cleaned = _json_repair_trailing_commas(payload)
+        try:
+            parsed = json.loads(cleaned)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Report-only proposal block was not parseable JSON.")
+            return []
+    if not isinstance(parsed, list):
+        return []
+    return [p for p in parsed if isinstance(p, dict)]
+
+
+def _json_repair_trailing_commas(payload: str) -> str:
+    """Remove trailing commas before each ``}``/``]`` so model-emitting JSON
+    with trailing commas still parses.  Best-effort; returns the input
+    unchanged when no repair is needed.
+    """
+    return re.sub(r",\s*([}\]])", r"\1", payload)
+
+
+def _print_report_proposals(
+    agent: Any,
+    proposals: List[Dict],
+) -> None:
+    """Render the report-only proposals as a numbered menu to the user."""
+    for i, p in enumerate(proposals, 1):
+        action = str(p.get("action", "update") or "update")
+        target = str(p.get("target", "memory") or "memory")
+        name = str(p.get("name", "") or "").strip()
+        preview = str(p.get("content_preview", "") or "").strip()
+        reason = str(p.get("reason", "") or "").strip()
+        label = action.upper()
+        part = f"  {i}. [{target}] {label}"
+        if name and target in ("skill", "skill_manage"):
+            part += f" '{name}'"
+        if preview:
+            part += f" — {preview}"
+        if reason:
+            part += f"\n     ↳ why: {reason[:160]}"
+        agent._safe_print(part)
+
 def build_cache_parity_fork(
     agent: Any,
     task_cfg: Optional[Dict[str, Any]] = None,
@@ -1397,6 +1507,7 @@ def _run_review_in_thread(
     messages_snapshot: List[Dict],
     prompt: str,
     task_cfg: Optional[Dict[str, Any]] = None,
+    report_only: bool = False,
     review_run: Optional[_BackgroundReviewRun] = None,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
@@ -1409,6 +1520,12 @@ def _run_review_in_thread(
     :func:`prepare_background_review_run`.  If a live turn bumps the
     cancel generation before this review reaches its first provider call,
     the review aborts without entering ``run_conversation()`` (#84423).
+
+    When ``report_only=True`` (the ``/refine --report`` path) the fork is
+    instructed to output a structured JSON proposal block instead of
+    calling any tools.  The parsed proposals are printed as a numbered
+    list and stored on ``agent._last_review_proposals`` for the CLI to
+    offer interactive acceptance.
     """
     if review_run is not None and review_run.cancel_requested.is_set():
         finish_background_review_run(agent, review_run)
@@ -1507,10 +1624,12 @@ def _run_review_in_thread(
             # Register this fork on the PARENT's _active_children (the same
             # list interrupt() fans out to for subagent delegation) and
             # _background_review_agent (a direct pointer the next live turn
-            # uses to interrupt an admitted request). The per-review run token
-            # separately fences startup and acknowledges request-phase exit.
-            # The legacy pointer/list remain best-effort for direct test stubs;
-            # a prepared run token is the live-turn cancellation authority.
+            # uses to proactively cancel a still-running review). Without
+            # this, a review still streaming when the next turn starts races
+            # the live turn against the same session_id/credentials — producing
+            # doubled prompt-token accounting and a Ctrl+C-proof lockup.
+            # Best-effort: agents built without agent_init.py (test stubs)
+            # degrade to "no cross-cancellation" rather than aborting the review.
             if hasattr(agent, "_background_review_agent"):
                 _br_lock = getattr(agent, "_background_review_lock", None)
                 if _br_lock is not None:
@@ -1674,6 +1793,30 @@ def _run_review_in_thread(
                 pass
             review_agent = None
 
+        # --- REPORT-ONLY path (``/refine --report``) ---
+        if report_only:
+            proposals = _extract_report_proposals(review_messages)
+            agent._last_review_proposals = proposals
+            if not proposals:
+                agent._safe_print(
+                    "  📋 REPORT: Review fork found nothing worth proposing."
+                )
+                _log_review_completion(review_usage, "none")
+            else:
+                _log_review_completion(
+                    review_usage,
+                    f"proposals({len(proposals)})",
+                )
+                agent._safe_print("  📋 REPORT — proposed changes (nothing was written):")
+                _print_report_proposals(agent, proposals)
+                agent._safe_print(
+                    "  ──\n"
+                    "  Send /refine without --report to execute immediately, or\n"
+                    "  review the proposals above and reply with actions to take."
+                )
+            return
+
+        # --- EXECUTION path (normal ``/refine``) ---
         # Scan the review agent's messages for successful tool actions
         # and surface a compact summary to the user. Tool messages
         # already present in messages_snapshot must be skipped, since
@@ -1765,6 +1908,7 @@ def spawn_background_review_thread(
     review_skills: bool = False,
     focus: Optional[str] = None,
     task_cfg: Optional[Dict[str, Any]] = None,
+    report_only: bool = False,
     review_run: Optional[_BackgroundReviewRun] = None,
 ):
     """Build the review thread target and prompt for a background review.
@@ -1783,6 +1927,17 @@ def spawn_background_review_thread(
     from :func:`load_background_review_settings`. When omitted, config is
     read once here and shared with the worker (aux routing) so a single
     turn does not re-parse the config file.
+
+    ``report_only`` (the ``/refine --report`` path) appends a suffix that
+    tells the fork to output a structured JSON proposal block instead of
+    calling any memory/skill tools.  The caller prints the parsed proposals
+    as a numbered list and stores them on ``agent._last_review_proposals``
+    for interactive review.
+
+    ``review_run`` is the per-review cancellation token from
+    :func:`prepare_background_review_run`.  When supplied, the review aborts
+    without entering ``run_conversation()`` if a live turn cancels it first
+    (#84423).
     """
     if task_cfg is None:
         task_cfg = _background_review_task_config()
@@ -1805,12 +1960,12 @@ def spawn_background_review_thread(
             f"{focus}"
         )
 
+    if report_only:
+        prompt += _REPORT_ONLY_PROMPT_SUFFIX
+
     def _target() -> None:
         _run_review_in_thread(
-            agent,
-            messages_snapshot,
-            prompt,
-            task_cfg=task_cfg,
+            agent, messages_snapshot, prompt, task_cfg, report_only=report_only,
             review_run=review_run,
         )
 
@@ -1821,9 +1976,12 @@ __all__ = [
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
     "_COMBINED_REVIEW_PROMPT",
+    "_REPORT_ONLY_PROMPT_SUFFIX",
     "is_background_review_enabled",
     "load_background_review_settings",
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",
+    "_extract_report_proposals",
+    "_print_report_proposals",
 ]
