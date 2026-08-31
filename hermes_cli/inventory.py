@@ -615,9 +615,16 @@ def _append_unconfigured_rows(
 
     seen = {r["slug"].lower() for r in rows}
     cur = (ctx.current_provider or "").lower()
+    excluded = {
+        str(provider).strip().lower()
+        for provider in (ctx.excluded_providers or [])
+        if str(provider).strip()
+    }
     cur_model = str(ctx.current_model or "").strip()
     extras: list[dict] = []
     for entry in CANONICAL_PROVIDERS:
+        if entry.slug.lower() in excluded:
+            continue
         if entry.slug.lower() in seen:
             continue
         if current_only and entry.slug.lower() != cur:
