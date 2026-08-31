@@ -11,6 +11,7 @@ state_lost/state_reset reporting, fail-open, and owner isolation.
 import json
 import os
 import sys
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -247,6 +248,104 @@ class TestDeathDetection(RemoteKernelBase):
 
 
 class TestOwnershipIsolation(RemoteKernelBase):
+    def test_concurrent_first_calls_spawn_one_remote_kernel(self):
+        class SlowSpawnEnv(ScriptedEnv):
+            def __init__(self):
+                self.nohup_calls = 0
+                self._guard = threading.Lock()
+                self._results = [_cell(), _cell(execution_count=2)]
+                super().__init__([
+                    ("nohup", self._spawn),
+                    ("kill -0", lambda c: {"output": "ALIVE\n", "returncode": 0}),
+                    ("cat ", self._cat),
+                ])
+
+            def _spawn(self, _command):
+                with self._guard:
+                    self.nohup_calls += 1
+                time.sleep(0.15)
+                return {"output": "PID:4242\n", "returncode": 0}
+
+            def _cat(self, _command):
+                with self._guard:
+                    result = self._results.pop(0)
+                return {"output": json.dumps(result), "returncode": 0}
+
+        env = SlowSpawnEnv()
+        results = []
+
+        def run_turn(task):
+            results.append(_run(env, task=task))
+
+        with patch(
+            "tools.approval.get_current_session_key",
+            return_value="shared-conversation",
+        ):
+            workers = [
+                threading.Thread(target=run_turn, args=("turn-1",)),
+                threading.Thread(target=run_turn, args=("turn-2",)),
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=5)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(len(results), 2)
+        self.assertEqual(env.nohup_calls, 1)
+        self.assertEqual(len(_REMOTE_KERNELS), 1)
+
+    def test_concurrent_cells_on_same_remote_kernel_are_serialized(self):
+        class OverlapEnv(ScriptedEnv):
+            def __init__(self):
+                self._results = [_cell(), _cell(), _cell()]
+                self._active_cats = 0
+                self.max_active_cats = 0
+                self._guard = threading.Lock()
+                super().__init__([
+                    ("nohup", lambda c: {"output": "PID:4242\n", "returncode": 0}),
+                    ("kill -0", lambda c: {"output": "ALIVE\n", "returncode": 0}),
+                    ("cat ", self._cat),
+                ])
+
+            def _cat(self, _command):
+                with self._guard:
+                    self._active_cats += 1
+                    self.max_active_cats = max(
+                        self.max_active_cats,
+                        self._active_cats,
+                    )
+                    result = self._results.pop(0)
+                time.sleep(0.15)
+                with self._guard:
+                    self._active_cats -= 1
+                return {"output": json.dumps(result), "returncode": 0}
+
+        env = OverlapEnv()
+        results = []
+
+        def run_turn(task):
+            results.append(_run(env, task=task))
+
+        with patch(
+            "tools.approval.get_current_session_key",
+            return_value="shared-conversation",
+        ):
+            first = _run(env, task="turn-1")
+            assert first is not None
+            workers = [
+                threading.Thread(target=run_turn, args=("turn-2",)),
+                threading.Thread(target=run_turn, args=("turn-3",)),
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=5)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(len(results), 2)
+        self.assertEqual(env.max_active_cats, 1)
+
     def test_same_session_reuses_remote_kernel_across_turn_task_ids(self):
         env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell(execution_count=2)]))
 
