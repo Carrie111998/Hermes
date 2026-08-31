@@ -598,6 +598,121 @@ def _editable_install_is_current(git_cmd, cwd, pre_pull_sha: str | None) -> bool
         return False
     return not result.stdout.strip()
 
+
+def _preserve_venv_shebang_in_launcher(
+    *,
+    launcher_path: Path | None = None,
+    venv_py: str | Path | None = None,
+) -> None:
+    """Preserve venv-pointing shebang in the hermes launcher script after git pull.
+
+    The launcher script in the repository has ``#!/usr/bin/env python3`` so it
+    works for contributors without a Hermes venv. After a user install, the
+    shebang is rewritten to point at the venv Python
+    (``#!/path/to/venv/bin/python3``) so desktop launchers and non-login-shell
+    environments see Hermes packages instead of escaping to the system interpreter.
+
+    ``git pull`` overwrites that file with the repo version, resetting the shebang
+    to the generic ``#!/usr/bin/env python3``. For users launching Hermes from a
+    desktop entry (XDG ``.desktop`` files, Windows Start Menu shortcuts), the
+    PATH-resolution in ``/usr/bin/env`` sees the system Python instead of the venv,
+    and ``import hermes_cli`` fails with ``ModuleNotFoundError`` on first
+    third-party import (e.g. ``dotenv``).
+
+    This function runs immediately after a successful ``git pull``, before the
+    dependency reinstall step. It detects when the running interpreter is inside
+    Hermes' own venv and rewrites the launcher shebang to point at that venv
+    Python explicitly, so the next desktop-launched invocation sees the right
+    environment.
+
+    Best-effort: never raises. A failed rewrite is logged at debug level; the
+    shebang stays generic and desktop launches continue to fail until the user
+    runs ``hermes`` once from a shell (which activates the venv PATH) or manually
+    patches the shebang.
+    """
+    try:
+        launcher = (
+            Path(launcher_path)
+            if launcher_path is not None
+            else _m().PROJECT_ROOT / "hermes"
+        )
+        if not launcher.is_file():
+            # Not a checkout install (PyPI wheel, system package, etc.) — no
+            # launcher script to patch.
+            return
+
+        venv_py = venv_py if venv_py is not None else venv_python_path()
+        if not venv_py or not Path(venv_py).is_file():
+            # No venv or venv Python not found — leave the shebang alone.
+            logger.debug(
+                "Skipping launcher shebang rewrite: venv Python not found (venv_python_path=%r)",
+                venv_py,
+            )
+            return
+
+        # Only rewrite if we're actually running from Hermes' venv. If the user
+        # is running ``hermes update`` from a different Python (system, conda,
+        # another venv), respect that choice and don't force the shebang.
+        running_exe = Path(sys.executable).resolve()
+        venv_exe = Path(venv_py).resolve()
+        if running_exe != venv_exe:
+            logger.debug(
+                "Skipping launcher shebang rewrite: running from %s, venv is %s",
+                running_exe,
+                venv_exe,
+            )
+            return
+
+        # Keep the unresolved absolute path for the shebang. On POSIX,
+        # ``venv/bin/python3`` is commonly a symlink to the base interpreter;
+        # resolving it here would point the launcher at the system Python and
+        # lose the venv's site-packages.
+        target_python = Path(venv_py).absolute()
+
+        # Read the current launcher content.
+        try:
+            lines = launcher.read_text(encoding="utf-8").splitlines(keepends=True)
+        except OSError as exc:
+            logger.debug("Could not read launcher script %s: %s", launcher, exc)
+            return
+
+        if not lines or not lines[0].startswith("#!"):
+            # No shebang line — leave it alone.
+            return
+
+        target_shebang = f"#!{target_python}\n"
+        if len(target_shebang) > 253:
+            logger.warning(
+                "Launcher shebang is longer than Linux's safe limit (%d bytes): %s",
+                len(target_shebang),
+                target_shebang.strip(),
+            )
+        if lines[0] == target_shebang:
+            # Already pointing at the venv — nothing to do.
+            return
+
+        # Rewrite atomically so an interrupted update cannot leave a truncated
+        # launcher. Preserve the original mode explicitly because write_text()
+        # would otherwise create a replacement using the process umask.
+        lines[0] = target_shebang
+        temporary = launcher.with_name(f".{launcher.name}.tmp-{os.getpid()}")
+        try:
+            temporary.write_text("".join(lines), encoding="utf-8")
+            temporary.chmod(launcher.stat().st_mode & 0o7777)
+            os.replace(temporary, launcher)
+            logger.debug("Rewrote launcher shebang to %s", target_shebang.strip())
+        except OSError as exc:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+            logger.debug("Could not rewrite launcher shebang in %s: %s", launcher, exc)
+
+    except Exception as exc:
+        # Never let a shebang rewrite failure block an update.
+        logger.debug("Unexpected error in _preserve_venv_shebang_in_launcher: %s", exc)
+
+
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
@@ -8316,6 +8431,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
         _m()._record_bytecode_fingerprint()
         _m()._refresh_bootstrap_cache_scripts(branch)
+
+        # Preserve venv shebang in the launcher script if we're running from
+        # the venv. ``git pull`` resets it to ``#!/usr/bin/env python3``, which
+        # breaks desktop-launcher invocations that don't see the venv in PATH.
+        _preserve_venv_shebang_in_launcher()
 
         # Fork upstream sync logic (only for main branch on forks)
         if is_fork and branch == "main":
