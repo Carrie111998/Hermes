@@ -1949,7 +1949,12 @@ def _restore_state_db_from_snapshot(state_path: Path, snap_state: Path) -> bool:
     return bool(restored.get("valid"))
 
 
-def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> bool:
+def _update_via_zip(
+    args,
+    *,
+    had_desktop_app_before_update: bool = False,
+    pre_update_snapshot_id: str | None = None,
+) -> bool:
     """Update Hermes Agent by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
@@ -2167,7 +2172,9 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
     # Self-lock deferral (relocated preflight — #86735): the ZIP code swap
     # above is already committed; defer only the dependency sync when this
     # process holds a native extension the sync must rewrite.
-    _m()._abort_dependency_sync_if_self_locked()
+    _m()._abort_dependency_sync_if_self_locked(
+        pre_update_snapshot_id=pre_update_snapshot_id
+    )
     print("→ Updating Python dependencies...")
 
     from hermes_cli.managed_uv import ensure_uv, update_managed_uv
@@ -4872,6 +4879,31 @@ def _run_pre_update_backup(args) -> Optional[str]:
     print()
     return snapshot_id
 
+
+def _run_or_resume_pre_update_backup(args) -> tuple[Optional[str], bool]:
+    """Run the backup once, or reuse the parent snapshot after Windows re-exec."""
+    inherited_snapshot_id = None
+    if os.environ.get(_m()._UPDATE_REEXEC_ENV) == "1":
+        inherited_snapshot_id = os.environ.get(_m()._UPDATE_PRE_SNAPSHOT_ENV)
+    if inherited_snapshot_id:
+        try:
+            sibling_snapshots = json.loads(
+                os.environ.get(_m()._UPDATE_SIBLING_SNAPSHOTS_ENV, "{}")
+            )
+            if isinstance(sibling_snapshots, dict):
+                global _LAST_SIBLING_SNAPSHOTS
+                _LAST_SIBLING_SNAPSHOTS = {
+                    str(profile): str(snapshot_id)
+                    for profile, snapshot_id in sibling_snapshots.items()
+                    if profile and snapshot_id
+                }
+        except (TypeError, ValueError):
+            pass
+        print(f"◆ Pre-update snapshot: {inherited_snapshot_id} (reused from parent)")
+        print()
+        return inherited_snapshot_id, True
+    return _m()._run_pre_update_backup(args), False
+
 def _write_update_planned_stop_marker(profile_path: Path, pid: int) -> bool:
     """Write a planned-stop marker into a specific profile home."""
     try:
@@ -5249,7 +5281,10 @@ def _detect_self_loaded_native_modules() -> list[str]:
     return sorted(set(found))
 
 
-def _abort_dependency_sync_if_self_locked(gateway_resume=None) -> None:
+def _abort_dependency_sync_if_self_locked(
+    gateway_resume=None,
+    pre_update_snapshot_id: str | None = None,
+) -> None:
     """Defer the venv rewrite when THIS process holds something it must replace.
 
     Runs at the last moment before the venv rewrite — after the code swap —
@@ -5276,7 +5311,9 @@ def _abort_dependency_sync_if_self_locked(gateway_resume=None) -> None:
             _m()._resume_windows_gateways_after_update(gateway_resume)
         sys.exit(2)
 
-    if _m()._reexec_dependency_sync_off_windows_shim():
+    if _m()._reexec_dependency_sync_off_windows_shim(
+        pre_update_snapshot_id=pre_update_snapshot_id
+    ):
         if gateway_resume is not None:
             _m()._resume_windows_gateways_after_update(gateway_resume)
         sys.exit(0)
@@ -8006,14 +8043,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # always roll back to the exact state they had before this update.
     # Returns the quick-snapshot id (or None when disabled/failed); the
     # post-update cron-jobs safety net uses it to detect job loss.
-    pre_update_snapshot_id = _m()._run_pre_update_backup(args)
+    pre_update_snapshot_id, backup_reused = _m()._run_or_resume_pre_update_backup(args)
     try:
         from hermes_cli.update_receipt import record_step
 
         record_step(
-            "pre_update_backup",
+            "pre_update_backup_handoff" if backup_reused else "pre_update_backup",
             pre_update_snapshot_id is not None,
-            f"snapshot={pre_update_snapshot_id}" if pre_update_snapshot_id else "disabled or failed",
+            (
+                f"reused snapshot={pre_update_snapshot_id}"
+                if backup_reused
+                else f"snapshot={pre_update_snapshot_id}"
+                if pre_update_snapshot_id
+                else "disabled or failed"
+            ),
         )
     except Exception:
         pass
@@ -8282,6 +8325,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             desktop_build_ok = _update_via_zip(
                 args,
                 had_desktop_app_before_update=had_desktop_app_before_update,
+                pre_update_snapshot_id=pre_update_snapshot_id,
             )
         finally:
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
@@ -8628,7 +8672,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if handed_off_sync or not healthy:
                 # Self-lock deferral (#86735): the repair rewrites the venv
                 # too — same mapped-extension hazard as the update sync.
-                _m()._abort_dependency_sync_if_self_locked(_windows_gateway_resume)
+                _m()._abort_dependency_sync_if_self_locked(
+                    _windows_gateway_resume,
+                    pre_update_snapshot_id=pre_update_snapshot_id,
+                )
                 _write_update_incomplete_marker()
                 from hermes_cli.managed_uv import ensure_uv
 
@@ -9020,7 +9067,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # holds a native extension the sync must rewrite, defer NOW — after
         # the code swap, so only the dependency install is pending and the
         # next fresh launch completes it via the marker.
-        _m()._abort_dependency_sync_if_self_locked(_windows_gateway_resume)
+        _m()._abort_dependency_sync_if_self_locked(
+            _windows_gateway_resume,
+            pre_update_snapshot_id=pre_update_snapshot_id,
+        )
         #
         # Drop the core-install breadcrumb BEFORE touching the venv. If the
         # install is killed mid-flight (Ctrl-C, terminal close, WSL OOM), the
@@ -10692,6 +10742,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             desktop_build_ok = _update_via_zip(
                 args,
                 had_desktop_app_before_update=had_desktop_app_before_update,
+                pre_update_snapshot_id=pre_update_snapshot_id,
             )
             if gateway_mode:
                 _write_gateway_update_exit_code(desktop_build_ok)

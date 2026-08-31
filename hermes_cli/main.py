@@ -5184,6 +5184,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_resume_windows_gateways_after_update",
         "_run_pending_fleet_restart",
         "_run_logged_subprocess",
+        "_run_or_resume_pre_update_backup",
         "_run_pre_update_backup",
         "_service_unit_supports_graceful_sigusr1_restart",
         "_should_skip_upstream_prompt",
@@ -9333,9 +9334,13 @@ def _windows_running_hermes_launcher_locked() -> bool:
 
 # Set on the re-exec'd child so it can never spawn another one.
 _UPDATE_REEXEC_ENV = "HERMES_UPDATE_REEXEC"
+_UPDATE_PRE_SNAPSHOT_ENV = "HERMES_UPDATE_PRE_SNAPSHOT_ID"
+_UPDATE_SIBLING_SNAPSHOTS_ENV = "HERMES_UPDATE_SIBLING_SNAPSHOT_IDS"
 
 
-def _reexec_dependency_sync_off_windows_shim() -> bool:
+def _reexec_dependency_sync_off_windows_shim(
+    pre_update_snapshot_id: str | None = None,
+) -> bool:
     """Hand the dependency sync to the venv interpreter, off the console shim.
 
     Returns True when a child was spawned and the caller must exit at once,
@@ -9388,10 +9393,34 @@ def _reexec_dependency_sync_off_windows_shim() -> bool:
     python_exe = venv_python_path(shim.parent.parent, windows=True)
     cmd = [str(python_exe), "-m", "hermes_cli.main", *sys.argv[1:]]
     if python_exe.is_file():
+        receipt_handoff = None
+        try:
+            from hermes_cli.update_receipt import (
+                UPDATE_RECEIPT_HANDOFF_ENV,
+                prepare_update_receipt_handoff,
+            )
+
+            receipt_handoff = prepare_update_receipt_handoff()
+        except Exception:
+            receipt_handoff = None
+        child_env = {**os.environ, _UPDATE_REEXEC_ENV: "1"}
+        if pre_update_snapshot_id:
+            child_env[_UPDATE_PRE_SNAPSHOT_ENV] = str(pre_update_snapshot_id)
+        try:
+            from hermes_cli.update_cmd import _LAST_SIBLING_SNAPSHOTS
+
+            if _LAST_SIBLING_SNAPSHOTS:
+                child_env[_UPDATE_SIBLING_SNAPSHOTS_ENV] = json.dumps(
+                    _LAST_SIBLING_SNAPSHOTS
+                )
+        except Exception:
+            pass
+        if receipt_handoff is not None:
+            child_env[UPDATE_RECEIPT_HANDOFF_ENV] = str(receipt_handoff)
         try:
             subprocess.Popen(
                 cmd,
-                env={**os.environ, _UPDATE_REEXEC_ENV: "1"},
+                env=child_env,
                 stdin=subprocess.DEVNULL,
             )
             print(
@@ -9404,6 +9433,13 @@ def _reexec_dependency_sync_off_windows_shim() -> bool:
             )
             return True
         except OSError as exc:
+            if receipt_handoff is not None:
+                try:
+                    from hermes_cli.update_receipt import resume_update_receipt_handoff
+
+                    resume_update_receipt_handoff(receipt_handoff)
+                except Exception:
+                    pass
             logger.debug("Dependency-sync hand-off via %s failed: %s", python_exe, exc)
         print(f"  ⚠ Could not hand the dependency install off {shim.name}.")
         print("    Continuing in-process; if it cannot replace the shim, run:")
