@@ -25,13 +25,14 @@ import {
   setSkillEnabled,
   setToolsetEnabled
 } from '@/hermes'
-import { useI18n } from '@/i18n'
+import { type Translations, useI18n } from '@/i18n'
 import { isDesktopToolsetVisible } from '@/lib/desktop-toolsets'
 import { compactNumber } from '@/lib/format'
 import { queryClient } from '@/lib/query-client'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { normalize } from '@/lib/text'
 import { useStoreSelector } from '@/lib/use-session-slice'
+import { cn } from '@/lib/utils'
 import { $gateway, activeGatewayConnectionId } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
@@ -64,7 +65,10 @@ import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
 import { EmbeddedHubPicker } from './embedded-hub-picker'
 import { McpTab } from './mcp-tab'
-import { $skillsSortDesc, $toolsetsSortDesc } from './store'
+import { $skillsProvenanceFilter, $skillsSortDesc, $toolsetsSortDesc, type SkillsProvenanceFilter } from './store'
+
+// Provenance values a Skills row can carry; the filter chips map onto them.
+type SkillProvenanceFilter = SkillsProvenanceFilter
 
 // 'hub' is gone as a top-level tab — the Skills Hub browser lives inside the
 // Skills tab now (EmbeddedHubPicker below the installed list). Legacy
@@ -135,16 +139,106 @@ function skillSubtitle(skill: SkillInfo): React.ReactNode {
   )
 }
 
-function filteredSkills(skills: SkillInfo[], query: string, desc: boolean): SkillInfo[] {
+// Chip label per provenance id — keys are display labels by design (see
+// filterByProvenance), so this is the one place ids translate to labels.
+const PROVENANCE_LABEL_KEYS = {
+  agent: 'Learned',
+  bundled: 'Built-in',
+  hub: 'Hub'
+} as const
+
+function filteredSkills(
+  skills: SkillInfo[],
+  query: string,
+  provenance: SkillProvenanceFilter,
+  desc: boolean
+): SkillInfo[] {
   const q = normalize(query)
   const sign = desc ? 1 : -1
 
   return skills
-    .filter(
-      skill =>
+    .filter(skill => {
+      if (provenance !== 'all' && skill.provenance !== provenance) {
+        return false
+      }
+
+      return (
         !q || includesQuery(skill.name, q) || includesQuery(skill.description, q) || includesQuery(skill.category, q)
-    )
+      )
+    })
     .sort((a, b) => sign * (usageOf(b) - usageOf(a)) || asText(a.name).localeCompare(asText(b.name)))
+}
+
+// One toggleable provenance chip for the list strip ("All · Learned · …").
+// Typographic on purpose — the row badges already color the taxonomy.
+const FILTER_CHIP =
+  'cursor-pointer rounded-full border px-2 py-px text-[0.62rem] font-medium leading-4 transition-colors'
+
+const CHIP_OFF = 'border-transparent text-muted-foreground/60 hover:text-foreground'
+const CHIP_ON = 'border-(--ui-stroke-secondary) bg-(--ui-bg-quaternary) text-foreground'
+
+function FilterChip({
+  active,
+  children,
+  onClick
+}: {
+  active: boolean
+  children: React.ReactNode
+  onClick: () => void
+}) {
+  return (
+    <button
+      aria-pressed={active}
+      className={cn(FILTER_CHIP, active ? CHIP_ON : CHIP_OFF)}
+      onClick={onClick}
+      type="button"
+    >
+      {children}
+    </button>
+  )
+}
+
+// The whole filter line: All + every provenance that actually has rows.
+function provenanceChips(
+  skills: SkillInfo[],
+  current: SkillProvenanceFilter,
+  t: Translations,
+  setFilter: (value: SkillProvenanceFilter) => void
+): React.ReactNode {
+  const counts = new Map<NonNullable<SkillInfo['provenance']>, number>()
+
+  for (const skill of skills) {
+    if (!skill.provenance) {
+      continue
+    }
+
+    counts.set(skill.provenance, (counts.get(skill.provenance) ?? 0) + 1)
+  }
+
+  const options = [...counts.entries()].sort((a, b) => b[1] - a[1])
+
+  // Nothing to narrow — hide the strip rather than show dead controls. A
+  // single provenance is still useful when some rows are unclassified, but
+  // not when applying it would leave the whole list unchanged.
+  if (options.length === 0 || (options.length === 1 && options[0][1] === skills.length)) {
+    return null
+  }
+
+  const labelFor = (provenance: NonNullable<SkillInfo['provenance']>): string =>
+    t.skills.filterByProvenance[PROVENANCE_LABEL_KEYS[provenance]]
+
+  return (
+    <div className="flex items-center gap-1 pl-2">
+      <FilterChip active={current === 'all'} onClick={() => setFilter('all')}>
+        {t.skills.filterByProvenance.All}
+      </FilterChip>
+      {options.map(([provenance]) => (
+        <FilterChip active={current === provenance} key={provenance} onClick={() => setFilter(provenance)}>
+          {labelFor(provenance)}
+        </FilterChip>
+      ))}
+    </div>
+  )
 }
 
 const toolsetCalls = (toolset: ToolsetInfo, toolCalls: Record<string, number>): number =>
@@ -329,6 +423,7 @@ export function SkillsView({
   // toolCalls after the user moved to B.
   const toolCallsEpoch = useRef(0)
   const skillsSortDesc = useStore($skillsSortDesc)
+  const skillsProvenanceFilter = useStore($skillsProvenanceFilter)
   const toolsetsSortDesc = useStore($toolsetsSortDesc)
   const [bulkBusy, setBulkBusy] = useState(false)
   const [selectedSkill, setSelectedSkill] = useState<string | null>(null)
@@ -398,8 +493,8 @@ export function SkillsView({
   })
 
   const visibleSkills = useMemo(
-    () => (skills ? filteredSkills(skills, query, skillsSortDesc) : []),
-    [query, skills, skillsSortDesc]
+    () => (skills ? filteredSkills(skills, query, skillsProvenanceFilter, skillsSortDesc) : []),
+    [query, skills, skillsProvenanceFilter, skillsSortDesc]
   )
 
   const visibleToolsets = useMemo(
@@ -571,16 +666,29 @@ export function SkillsView({
     <ListStripButton onClick={flip}>{desc ? t.skills.sortMostUsedDesc : t.skills.sortLeastUsedAsc}</ListStripButton>
   )
 
-  // Full-bleed empty state, matching the MCP tab (spans both columns, not a
-  // cramped note in the left rail). Query-aware, and says "tools" not the
-  // internal "toolsets".
-  const capabilityEmpty = (noun: string) => {
+  // Query-aware empty state: a filter/search that removes every row says so,
+  // an empty install says nothing exists yet.
+  const capabilityEmpty = (noun: string, filtered = false) => {
     const q = query.trim()
+    const canClearSkillsFilter = noun === 'skills' && skillsProvenanceFilter !== 'all'
 
     return (
       <div className="flex h-full min-h-0 flex-1">
         <PanelEmpty
-          description={q ? t.skills.emptyNothingMatches(q) : t.skills.emptyNoneAvailable(noun)}
+          action={
+            canClearSkillsFilter ? (
+              <Button onClick={() => $skillsProvenanceFilter.set('all')} size="sm">
+                {t.skills.clearProvenanceFilter}
+              </Button>
+            ) : undefined
+          }
+          description={
+            q
+              ? t.skills.emptyNothingMatches(q)
+              : filtered
+                ? t.skills.emptyNoneFound(noun)
+                : t.skills.emptyNoneAvailable(noun)
+          }
           icon="search"
           title={t.skills.emptyNoneFound(noun)}
         />
@@ -817,27 +925,32 @@ export function SkillsView({
               // and "changes apply" footer can no longer be starved to 0px
               // and painted over by the hub header.
               visibleSkills.length === 0 ? (
-                capabilityEmpty('skills')
+                capabilityEmpty('skills', Boolean(query.trim() || skillsProvenanceFilter !== 'all'))
               ) : (
                 <MasterDetail pane={skillEditorPane} resizeId="capabilities-split" split="wide">
                   <ListColumn
                     header={
-                      <ListStrip
-                        left={sortButton(skillsSortDesc, () => $skillsSortDesc.set(!$skillsSortDesc.get()))}
-                        right={
-                          <ListStripMenu
-                            items={[
-                              {
-                                disabled: bulkBusy,
-                                label: t.skills.disableUnused,
-                                onSelect: () => void disableUnused()
-                              }
-                            ]}
-                            label={t.skills.tabSkills}
-                            toggle={bulkSwitch(allSkillsEnabled)}
-                          />
-                        }
-                      />
+                      <div>
+                        <ListStrip
+                          left={sortButton(skillsSortDesc, () => $skillsSortDesc.set(!$skillsSortDesc.get()))}
+                          right={
+                            <ListStripMenu
+                              items={[
+                                {
+                                  disabled: bulkBusy,
+                                  label: t.skills.disableUnused,
+                                  onSelect: () => void disableUnused()
+                                }
+                              ]}
+                              label={t.skills.tabSkills}
+                              toggle={bulkSwitch(allSkillsEnabled)}
+                            />
+                          }
+                        />
+                        {provenanceChips(bulkSkills, skillsProvenanceFilter, t, value =>
+                          $skillsProvenanceFilter.set(value)
+                        )}
+                      </div>
                     }
                   >
                     {visibleSkills.map(skill => (
