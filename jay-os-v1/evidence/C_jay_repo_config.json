@@ -1,0 +1,53 @@
+{
+  "data": {
+    "branch": {
+      "cmd": [
+        "git",
+        "-C",
+        "/Users/jay/work/jay-os-v1-hermes-agent",
+        "branch",
+        "--show-current"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "feat/jay-os-v1-bootstrap\n"
+    },
+    "head": {
+      "cmd": [
+        "git",
+        "-C",
+        "/Users/jay/work/jay-os-v1-hermes-agent",
+        "rev-parse",
+        "--short",
+        "HEAD"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "a95d9d67db\n"
+    },
+    "hermes_version": {
+      "cmd": [
+        "hermes",
+        "--version"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "Hermes Agent v0.20.0 (2026.8.3)\nInstall directory: /Users/jay/.hermes/hermes-agent\nInstall method: git\nPython: 3.11.15\nOpenAI SDK: 2.24.0\nRun 'hermes version' for update status.\n"
+    },
+    "repo": "/Users/jay/work/jay-os-v1-hermes-agent",
+    "status": {
+      "cmd": [
+        "git",
+        "-C",
+        "/Users/jay/work/jay-os-v1-hermes-agent",
+        "status",
+        "--short"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": " M contributors/emails/agent@Agents-Mac-mini.local\n?? jay-os-v1/evidence/\n?? jay-os-v1/scripts/jay_os_bootstrap_driver.py\n"
+    }
+  },
+  "timestamp_utc": "2026-08-31T19:33:16.091950+00:00",
+  "worker": "C_jay_repo_config"
+}

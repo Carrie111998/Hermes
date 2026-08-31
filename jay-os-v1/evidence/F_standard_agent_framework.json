@@ -1,0 +1,34 @@
+{
+  "data": {
+    "mastra_package_hits": [],
+    "node": {
+      "cmd": [
+        "node",
+        "--version"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "v24.20.0\n"
+    },
+    "npm": {
+      "cmd": [
+        "npm",
+        "--version"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "11.19.0\n"
+    },
+    "pnpm": {
+      "cmd": [
+        "pnpm",
+        "--version"
+      ],
+      "returncode": 0,
+      "stderr": "\u2009WARN\u2009 The \"workspaces\" field in package.json is not supported by pnpm. Create a \"pnpm-workspace.yaml\" file instead.\n",
+      "stdout": "10.33.0\n"
+    }
+  },
+  "timestamp_utc": "2026-08-31T19:33:16.398741+00:00",
+  "worker": "F_standard_agent_framework"
+}

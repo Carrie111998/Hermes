@@ -1,0 +1,56 @@
+{
+  "data": {
+    "ping": {
+      "m1": {
+        "cmd": [
+          "ping",
+          "-c",
+          "1",
+          "-W",
+          "1000",
+          "m1"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "PING m1.tailc95221.ts.net (100.85.86.51): 56 data bytes\n64 bytes from 100.85.86.51: icmp_seq=0 ttl=64 time=6.615 ms\n\n--- m1.tailc95221.ts.net ping statistics ---\n1 packets transmitted, 1 packets received, 0.0% packet loss\nround-trip min/avg/max/stddev = 6.615/6.615/6.615/0.000 ms\n"
+      },
+      "m5": {
+        "cmd": [
+          "ping",
+          "-c",
+          "1",
+          "-W",
+          "1000",
+          "m5"
+        ],
+        "returncode": 2,
+        "stderr": "",
+        "stdout": "PING m5.tailc95221.ts.net (100.96.157.75): 56 data bytes\n\n--- m5.tailc95221.ts.net ping statistics ---\n1 packets transmitted, 0 packets received, 100.0% packet loss\n"
+      },
+      "rtx": {
+        "cmd": [
+          "ping",
+          "-c",
+          "1",
+          "-W",
+          "1000",
+          "rtx"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "PING rtx.tailc95221.ts.net (100.120.123.103): 56 data bytes\n64 bytes from 100.120.123.103: icmp_seq=0 ttl=128 time=3.044 ms\n\n--- rtx.tailc95221.ts.net ping statistics ---\n1 packets transmitted, 1 packets received, 0.0% packet loss\nround-trip min/avg/max/stddev = 3.044/3.044/3.044/nan ms\n"
+      }
+    },
+    "tailscale": {
+      "cmd": [
+        "tailscale",
+        "status"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "100.78.252.90    jay  andrewcabs17@  macOS    -                                                             \n100.85.86.51     m1   andrewcabs17@  macOS    idle, tx 872 rx 600                                           \n100.96.157.75    m5   andrewcabs17@  macOS    active; relay \"nyc\"; offline, last seen 7h ago, tx 9984 rx 0  \n100.120.123.103  rtx  andrewcabs17@  windows  active; direct 192.168.50.32:41641, tx 1441396 rx 1261700     \n"
+    }
+  },
+  "timestamp_utc": "2026-08-31T19:33:18.250254+00:00",
+  "worker": "A_tailscale_network"
+}

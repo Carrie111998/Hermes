@@ -1,0 +1,21 @@
+{
+  "data": {
+    "ollama": null,
+    "rtx_ping": {
+      "cmd": [
+        "ping",
+        "-c",
+        "1",
+        "-W",
+        "1000",
+        "rtx"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "PING rtx.tailc95221.ts.net (100.120.123.103): 56 data bytes\n64 bytes from 100.120.123.103: icmp_seq=0 ttl=128 time=4.929 ms\n\n--- rtx.tailc95221.ts.net ping statistics ---\n1 packets transmitted, 1 packets received, 0.0% packet loss\nround-trip min/avg/max/stddev = 4.929/4.929/4.929/nan ms\n"
+    },
+    "voice_policy": "RTX voice preempts batch; do not saturate GPU with batch jobs."
+  },
+  "timestamp_utc": "2026-08-31T19:33:16.007427+00:00",
+  "worker": "G_rtx_qwen3_tts_voice"
+}

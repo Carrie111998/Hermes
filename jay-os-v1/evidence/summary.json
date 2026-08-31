@@ -1,0 +1,16 @@
+{
+  "elapsed_seconds": 2.27,
+  "timestamp_utc": "2026-08-31T19:33:18.252070+00:00",
+  "workers": [
+    "A_tailscale_network",
+    "B_machine_resource",
+    "C_jay_repo_config",
+    "D_onememory_auth_api_capability",
+    "E_github_ci_cd_repo",
+    "F_standard_agent_framework",
+    "G_rtx_qwen3_tts_voice",
+    "H_testing_release_infra",
+    "I_security_adversarial",
+    "J_business_work_intake"
+  ]
+}

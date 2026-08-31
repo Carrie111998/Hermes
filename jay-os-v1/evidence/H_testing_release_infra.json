@@ -1,0 +1,20 @@
+{
+  "data": {
+    "package_json": true,
+    "pyproject": true,
+    "pytest_collect_help": {
+      "cmd": [
+        "python3",
+        "-m",
+        "pytest",
+        "--version"
+      ],
+      "returncode": 1,
+      "stderr": "/Applications/Xcode.app/Contents/Developer/usr/bin/python3: No module named pytest\n",
+      "stdout": ""
+    },
+    "tests_dir": true
+  },
+  "timestamp_utc": "2026-08-31T19:33:16.031216+00:00",
+  "worker": "H_testing_release_infra"
+}

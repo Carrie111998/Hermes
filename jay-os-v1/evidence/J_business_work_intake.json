@@ -1,0 +1,20 @@
+{
+  "data": {
+    "ledger": "GitHub for engineering; Linear expected for tasks if configured",
+    "linear_env_keys": [
+      "LINEAR_API_KEY"
+    ],
+    "messaging_targets": {
+      "cmd": [
+        "hermes",
+        "send",
+        "--list"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "Available messaging targets:\n\nTelegram:\n  telegram:Jay Command Center / topic 7 (group)\n  telegram:Jay Command Center / topic 5 (group)\n  telegram:Jay Command Center / topic 6 (group)\n  telegram:Jay Command Center / topic 11 (group)\n  telegram:Jay Command Center / topic 1 (group)\n  telegram:A C (dm)\n  telegram:Jay Command Center / topic 3 (group)\n  telegram:Jay Command Center / topic 2 (group)\n  telegram:Jay Command Center / topic 8 (group)\n  telegram:Jay Command Center / topic 9 (group)\n\nUse these as the \"target\" parameter when sending.\nBare platform name (e.g. \"telegram\") sends to home channel.\n"
+    }
+  },
+  "timestamp_utc": "2026-08-31T19:33:16.618374+00:00",
+  "worker": "J_business_work_intake"
+}

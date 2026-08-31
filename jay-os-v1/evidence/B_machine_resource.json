@@ -1,0 +1,29 @@
+{
+  "data": {
+    "disk": {
+      "cmd": [
+        "df",
+        "-h",
+        "/"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "Filesystem        Size    Used   Avail Capacity iused ifree %iused  Mounted on\n/dev/disk3s1s1   460Gi    16Gi    57Gi    22%    458k  597M    0%   /\n"
+    },
+    "hostname": "Jays-Mac-mini.local",
+    "machine": "arm64",
+    "memory": {
+      "cmd": [
+        "sysctl",
+        "-n",
+        "hw.memsize"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "17179869184\n"
+    },
+    "platform": "macOS-26.4-arm64-arm-64bit"
+  },
+  "timestamp_utc": "2026-08-31T19:33:16.023435+00:00",
+  "worker": "B_machine_resource"
+}

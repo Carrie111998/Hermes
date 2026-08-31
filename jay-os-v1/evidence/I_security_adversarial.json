@@ -1,0 +1,27 @@
+{
+  "data": {
+    "git_tracked_env": {
+      "cmd": [
+        "git",
+        "-C",
+        "/Users/jay/work/jay-os-v1-hermes-agent",
+        "ls-files",
+        "*.env",
+        ".env",
+        "**/.env"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": ""
+    },
+    "policy": [
+      "no human login/OTP",
+      "service identities",
+      "short-lived scoped tokens",
+      "least privilege"
+    ],
+    "secret_file_present": true
+  },
+  "timestamp_utc": "2026-08-31T19:33:16.004550+00:00",
+  "worker": "I_security_adversarial"
+}

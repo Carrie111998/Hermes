@@ -1,0 +1,22 @@
+{
+  "data": {
+    "env_keys_present_redacted": [
+      "VX_API_BASE_URL",
+      "VX_API_KEY",
+      "XAI_VOICE_WEBHOOK_SECRET"
+    ],
+    "mcp_test_vx": {
+      "cmd": [
+        "hermes",
+        "mcp",
+        "test",
+        "vx"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "  \u2717 Server 'vx' not found in config.\n  Available: om\n"
+    }
+  },
+  "timestamp_utc": "2026-08-31T19:33:16.235383+00:00",
+  "worker": "D_onememory_auth_api_capability"
+}

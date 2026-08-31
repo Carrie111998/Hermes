@@ -1,0 +1,60 @@
+{
+  "data": {
+    "ci_files": [
+      ".github/workflows/ci.yaml",
+      ".github/workflows/docker-lint.yml",
+      ".github/workflows/tests-os.yml",
+      ".github/workflows/review-labels.yml",
+      ".github/workflows/lint.yml",
+      ".github/workflows/deploy-site.yml",
+      ".github/workflows/installer-tests.yml",
+      ".github/workflows/js-tests.yml",
+      ".github/workflows/rust-tests.yml",
+      ".github/workflows/supply-chain-audit.yml",
+      ".github/workflows/nix.yml",
+      ".github/workflows/uv-lockfile-check.yml",
+      ".github/workflows/label-rerun.yml",
+      ".github/workflows/install-e2e-run.yml",
+      ".github/workflows/contributor-check.yml",
+      ".github/workflows/ci-review-comment.yml",
+      ".github/workflows/js-autofix.yml",
+      ".github/workflows/install-e2e.yml",
+      ".github/workflows/tests.yml",
+      ".github/workflows/publish-e2e-evidence.yml",
+      ".github/workflows/skills-index-freshness.yml",
+      ".github/workflows/skills-index.yml",
+      ".github/workflows/osv-scanner.yml",
+      ".github/workflows/history-check.yml",
+      ".github/workflows/e2e-desktop.yml",
+      ".github/workflows/docker.yml",
+      ".github/workflows/windows-venv-e2e.yml",
+      ".github/workflows/docs-site-checks.yml",
+      ".github/workflows/infographic-check.yml",
+      ".github/workflows/lockfile-diff.yml"
+    ],
+    "gh_auth": {
+      "cmd": [
+        "gh",
+        "auth",
+        "status"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "github.com\n  \u2713 Logged in to github.com account onenyc77-prog (keyring)\n  - Active account: true\n  - Git operations protocol: ssh\n  - Token: gho_************************************\n  - Token scopes: 'admin:public_key', 'gist', 'read:org', 'repo'\n\n  \u2713 Logged in to github.com account andrescabsi14 (keyring)\n  - Active account: false\n  - Git operations protocol: ssh\n  - Token: gho_************************************\n  - Token scopes: 'admin:public_key', 'gist', 'read:org', 'repo'\n"
+    },
+    "remotes": {
+      "cmd": [
+        "git",
+        "-C",
+        "/Users/jay/work/jay-os-v1-hermes-agent",
+        "remote",
+        "-v"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "origin\tgit@github.com:NousResearch/hermes-agent.git (fetch)\norigin\tgit@github.com:NousResearch/hermes-agent.git (push)\n"
+    }
+  },
+  "timestamp_utc": "2026-08-31T19:33:16.501961+00:00",
+  "worker": "E_github_ci_cd_repo"
+}
