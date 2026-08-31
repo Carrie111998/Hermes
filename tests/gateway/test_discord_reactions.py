@@ -175,6 +175,25 @@ async def test_adapter_add_reaction_targets_explicit_message(adapter):
 
 
 @pytest.mark.asyncio
+async def test_reaction_action_without_message_id_targets_latest_inbound_message(
+    adapter, monkeypatch
+):
+    """The lifecycle hook must preserve the default target used by plugin actions."""
+    monkeypatch.setenv("DISCORD_REACTIONS", "false")
+    monkeypatch.setattr(adapter, "_record_discord_processing_start", lambda *args, **kwargs: None)
+    inbound = _reaction_target(556)
+    channel = _ReactionChannel(123, {556: inbound})
+    adapter._client.get_channel = lambda channel_id: channel if channel_id == 123 else None
+
+    await adapter.on_processing_start(_make_event("556", SimpleNamespace()))
+
+    result = await adapter.add_reaction("123", "🟢")
+
+    assert result == {"success": True, "message_id": "556"}
+    inbound.add_reaction.assert_awaited_once_with("🟢")
+
+
+@pytest.mark.asyncio
 async def test_adapter_reaction_uses_thread_parent_and_ignores_lifecycle_toggle(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REACTIONS", "false")
     message = _reaction_target(777)
