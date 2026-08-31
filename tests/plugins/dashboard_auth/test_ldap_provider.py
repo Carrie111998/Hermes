@@ -144,3 +144,142 @@ class TestSessionTokens:
     def test_revoke_never_raises(self):
         p = make_provider()
         assert p.revoke_session(refresh_token="anything") is None
+
+
+# ---------------------------------------------------------------------------
+# LDAP I/O tests — use ldap3's offline MOCK_SYNC strategy (no real server).
+# ---------------------------------------------------------------------------
+
+ldap3 = pytest.importorskip("ldap3")
+
+BASE_DN = "dc=example,dc=com"
+ALICE_DN = f"uid=alice,ou=people,{BASE_DN}"
+GROUP_DN = f"cn=hermes-users,ou=groups,{BASE_DN}"
+
+MOCK_ENTRIES = {
+    ALICE_DN: {
+        "objectClass": ["inetOrgPerson"],
+        "uid": ["alice"],
+        "cn": ["Alice Adams"],
+        "mail": ["alice@example.com"],
+        "userPassword": ["s3cret"],
+    },
+    f"uid=bob,ou=people,{BASE_DN}": {
+        "objectClass": ["inetOrgPerson"],
+        "uid": ["bob"],
+        "cn": ["Bob Brown"],
+        "mail": ["bob@example.com"],
+        "userPassword": ["hunter2"],
+    },
+    f"cn=hermes,ou=svc,{BASE_DN}": {
+        "objectClass": ["simpleSecurityObject"],
+        "cn": ["hermes"],
+        "userPassword": ["svc-secret"],
+    },
+    GROUP_DN: {
+        "objectClass": ["groupOfNames"],
+        "cn": ["hermes-users"],
+        "member": [ALICE_DN],
+    },
+}
+
+
+def mock_factory(entries=MOCK_ENTRIES):
+    """connection_factory backed by ldap3's offline mock directory."""
+    server = ldap3.Server("fake_ldap_server")
+
+    def factory(*, user, password):
+        conn = ldap3.Connection(
+            server,
+            user=user or None,
+            password=password or None,
+            client_strategy=ldap3.MOCK_SYNC,
+            raise_exceptions=False,
+        )
+        for dn, attrs in entries.items():
+            conn.strategy.add_entry(dn, attrs)
+        return conn
+
+    return factory
+
+
+def broken_factory(*, user, password):
+    """Factory simulating an unreachable directory."""
+    from ldap3.core.exceptions import LDAPSocketOpenError
+
+    raise LDAPSocketOpenError("connection refused")
+
+
+class TestDirectBindLogin:
+    def make(self, **overrides):
+        return make_provider(
+            user_dn_template="uid={username},ou=people," + BASE_DN,
+            connection_factory=mock_factory(),
+            **overrides,
+        )
+
+    def test_valid_credentials_mint_session(self):
+        p = self.make()
+        s = p.complete_password_login(username="alice", password="s3cret")
+        assert s.user_id == "alice"
+        assert s.provider == "ldap"
+        assert p.verify_session(access_token=s.access_token) is not None
+
+    def test_direct_mode_has_no_email(self):
+        p = self.make()
+        s = p.complete_password_login(username="alice", password="s3cret")
+        assert s.email == ""
+        assert s.display_name == "alice"
+
+    def test_wrong_password_rejected(self):
+        p = self.make()
+        with pytest.raises(InvalidCredentialsError):
+            p.complete_password_login(username="alice", password="wrong")
+
+    def test_unknown_user_rejected(self):
+        p = self.make()
+        with pytest.raises(InvalidCredentialsError):
+            p.complete_password_login(username="mallory", password="x")
+
+    def test_empty_password_rejected_before_bind(self):
+        # An empty password is an ANONYMOUS bind on real LDAP servers —
+        # must be rejected before any bind is attempted.
+        calls = []
+        inner = mock_factory()
+
+        def counting_factory(*, user, password):
+            calls.append(user)
+            return inner(user=user, password=password)
+
+        p = make_provider(
+            user_dn_template="uid={username},ou=people," + BASE_DN,
+            connection_factory=counting_factory,
+        )
+        for pw in ("", "   ", "\t"):
+            with pytest.raises(InvalidCredentialsError):
+                p.complete_password_login(username="alice", password=pw)
+        assert calls == []  # no bind ever attempted
+
+    def test_empty_username_rejected(self):
+        p = self.make()
+        with pytest.raises(InvalidCredentialsError):
+            p.complete_password_login(username="", password="s3cret")
+
+    def test_username_is_rdn_escaped(self):
+        # A username with DN metacharacters must not smuggle extra RDNs
+        # into the template. "alice,ou=admins" would, unescaped, bind as
+        # uid=alice,ou=admins,ou=people,... — escaped, it's a single
+        # (nonexistent) RDN value and the login fails.
+        p = self.make()
+        with pytest.raises(InvalidCredentialsError):
+            p.complete_password_login(
+                username="alice,ou=admins", password="s3cret"
+            )
+
+    def test_directory_down_raises_provider_error(self):
+        p = make_provider(
+            user_dn_template="uid={username},ou=people," + BASE_DN,
+            connection_factory=broken_factory,
+        )
+        with pytest.raises(ProviderError):
+            p.complete_password_login(username="alice", password="s3cret")

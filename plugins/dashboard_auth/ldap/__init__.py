@@ -266,6 +266,113 @@ class LdapAuthProvider(DashboardAuthProvider):
             "LdapAuthProvider is password-only; use complete_password_login."
         )
 
+    # ---- password login ------------------------------------------------------
+
+    def complete_password_login(
+        self, *, username: str, password: str
+    ) -> Session:
+        username = (username or "").strip()
+        # SECURITY: an empty password is an ANONYMOUS bind on LDAP servers
+        # (RFC 4513 §5.1.2) and would "succeed" — reject before any bind.
+        if not username or not password or not password.strip():
+            raise InvalidCredentialsError("invalid username or password")
+
+        if self._user_dn_template:
+            from ldap3.utils.dn import escape_rdn
+
+            user_dn = self._user_dn_template.format(
+                username=escape_rdn(username)
+            )
+            attrs: dict = {}
+        else:
+            user_dn, attrs = self._search_user(username)
+            if user_dn is None:
+                # Timing pad: unknown-user should cost about the same as
+                # wrong-password, so attempt one bind against a fixed
+                # nonexistent DN before rejecting.
+                pad = self._bind(user=_DUMMY_BIND_DN, password=password)
+                if pad is not None:  # pragma: no cover — defensive
+                    pad.unbind()
+                raise InvalidCredentialsError("invalid username or password")
+
+        conn = self._bind(user=user_dn, password=password)
+        if conn is None:
+            raise InvalidCredentialsError("invalid username or password")
+        try:
+            if self._require_group and not self._user_in_group(
+                conn, user_dn, username
+            ):
+                raise InvalidCredentialsError(
+                    "invalid username or password"
+                )
+        finally:
+            try:
+                conn.unbind()
+            except Exception:  # noqa: BLE001 — teardown must not mask errors
+                pass
+        return self._mint_session(username, user_dn, attrs)
+
+    # ---- internals: LDAP I/O -------------------------------------------------
+
+    def _default_factory(
+        self, *, user: Optional[str], password: Optional[str]
+    ):
+        """Build a real ldap3 Connection (unbound) with TLS + timeouts.
+
+        Imported lazily — ldap3 is only installed once the plugin is
+        configured (tools/lazy_deps.py "auth.ldap").
+        """
+        import ssl
+
+        import ldap3
+
+        tls = None
+        if self._server_url.startswith("ldaps://") or self._start_tls:
+            tls = ldap3.Tls(
+                validate=ssl.CERT_REQUIRED,
+                ca_certs_file=self._ca_certs_file or None,
+            )
+        server = ldap3.Server(
+            self._server_url,
+            connect_timeout=self._timeout,
+            tls=tls,
+            get_info=ldap3.NONE,
+        )
+        conn = ldap3.Connection(
+            server,
+            user=user or None,
+            password=password or None,
+            client_strategy=ldap3.SYNC,
+            receive_timeout=self._timeout,
+            raise_exceptions=False,
+            auto_bind=False,
+        )
+        if self._start_tls:
+            conn.open()
+            conn.start_tls()
+        return conn
+
+    def _bind(
+        self, *, user: Optional[str], password: Optional[str]
+    ):
+        """Create a connection and bind. Bound connection, or None if the
+        server rejected the credentials. ProviderError on transport
+        failure (unreachable, TLS failure, timeout)."""
+        from ldap3.core.exceptions import LDAPException
+
+        try:
+            conn = self._factory(user=user, password=password)
+            ok = conn.bind()
+        except LDAPException as exc:
+            raise ProviderError(f"LDAP server unreachable: {exc}") from exc
+        if not ok:
+            try:
+                conn.unbind()
+            except Exception:  # noqa: BLE001
+                pass
+            return None
+        return conn
+
     # ---- session lifecycle (stateless tokens — no LDAP I/O) ----------------
 
     def verify_session(self, *, access_token: str) -> Optional[Session]:
@@ -364,8 +471,11 @@ class LdapAuthProvider(DashboardAuthProvider):
 
     # ---- internals: LDAP I/O (implemented in later tasks) -------------------
 
-    def _default_factory(self, *, user: Optional[str], password: Optional[str]):
-        raise NotImplementedError  # Task 3
+    def _search_user(self, username: str):
+        raise NotImplementedError  # Task 4
+
+    def _user_in_group(self, conn, user_dn: str, username: str) -> bool:
+        raise NotImplementedError  # Task 5
 
     def _user_still_present(self, user_dn: str) -> bool:
         raise NotImplementedError  # Task 5
