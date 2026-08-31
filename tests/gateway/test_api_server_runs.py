@@ -125,6 +125,7 @@ def _make_slow_agent(**kwargs):
     mock_agent.session_prompt_tokens = 0
     mock_agent.session_completion_tokens = 0
     mock_agent.session_total_tokens = 0
+    mock_agent.session_cache_read_tokens = 0
 
     return mock_agent, ready, interrupted
 
@@ -180,6 +181,7 @@ class TestStartRun:
                 mock_agent.session_prompt_tokens = 10
                 mock_agent.session_completion_tokens = 5
                 mock_agent.session_total_tokens = 15
+                mock_agent.session_cache_read_tokens = 0
                 mock_create.return_value = mock_agent
 
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
@@ -219,6 +221,7 @@ class TestStartRun:
                 mock_agent.session_prompt_tokens = 0
                 mock_agent.session_completion_tokens = 0
                 mock_agent.session_total_tokens = 0
+                mock_agent.session_cache_read_tokens = 0
                 mock_create.return_value = mock_agent
 
                 resp = await cli.post(
@@ -286,6 +289,7 @@ class TestStartRun:
                 mock_agent.session_prompt_tokens = 0
                 mock_agent.session_completion_tokens = 0
                 mock_agent.session_total_tokens = 0
+                mock_agent.session_cache_read_tokens = 0
                 mock_create.return_value = mock_agent
 
                 resp = await cli.post(
@@ -326,6 +330,7 @@ class TestRunStatus:
                 mock_agent.session_prompt_tokens = 0
                 mock_agent.session_completion_tokens = 0
                 mock_agent.session_total_tokens = 0
+                mock_agent.session_cache_read_tokens = 0
                 mock_create.return_value = mock_agent
 
                 resp = await cli.post(
@@ -346,6 +351,44 @@ class TestRunStatus:
                 assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
                 assert status["session_id"] == "space-session"
 
+    @pytest.mark.asyncio
+    async def test_completed_usage_reports_cached_tokens(self, adapter):
+        """/v1/runs usage must expose cached reads alongside the totals (#99554).
+
+        ``input_tokens`` is cache-inclusive (CanonicalUsage.prompt_tokens =
+        input + cache_read + cache_write), so without a ``cached_tokens`` key
+        a warm cached run is indistinguishable from a cold one and clients
+        record zero cached tokens.
+        """
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 1_000
+                mock_agent.session_completion_tokens = 50
+                mock_agent.session_total_tokens = 1_050
+                mock_agent.session_cache_read_tokens = 900
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                status = {}
+                for _ in range(20):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert status["status"] == "completed"
+                assert status["usage"]["input_tokens"] == 1_000
+                assert status["usage"]["output_tokens"] == 50
+                assert status["usage"]["total_tokens"] == 1_050
+                assert status["usage"]["cached_tokens"] == 900
+
 
 # ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id}/events — SSE event stream
@@ -364,6 +407,7 @@ class TestRunEvents:
                 mock_agent.session_prompt_tokens = 10
                 mock_agent.session_completion_tokens = 5
                 mock_agent.session_total_tokens = 15
+                mock_agent.session_cache_read_tokens = 0
                 mock_create.return_value = mock_agent
 
                 # Start run
@@ -537,6 +581,7 @@ class TestSteerRun:
                 mock_agent.session_prompt_tokens = 0
                 mock_agent.session_completion_tokens = 0
                 mock_agent.session_total_tokens = 0
+                mock_agent.session_cache_read_tokens = 0
                 mock_agent.steer = MagicMock(return_value=True)
 
                 def _interrupt(_message=None):
@@ -587,6 +632,7 @@ class TestSteerRun:
                 mock_agent.session_prompt_tokens = 0
                 mock_agent.session_completion_tokens = 0
                 mock_agent.session_total_tokens = 0
+                mock_agent.session_cache_read_tokens = 0
                 mock_agent.run_conversation.return_value = {
                     "final_response": "done",
                     "pending_steer": "tighten the ending",
@@ -703,6 +749,7 @@ class TestStopRun:
                 mock_agent.session_prompt_tokens = 0
                 mock_agent.session_completion_tokens = 0
                 mock_agent.session_total_tokens = 0
+                mock_agent.session_cache_read_tokens = 0
                 started = threading.Event()
 
                 def _run_conversation(*_args, **_kwargs):
@@ -886,6 +933,7 @@ class TestRunIdempotency:
                 agent.session_prompt_tokens = agent.session_completion_tokens = (
                     agent.session_total_tokens
                 ) = 0
+                agent.session_cache_read_tokens = 0
                 create.return_value = agent
                 accepted = await cli.post(
                     "/v1/runs", json={"input": "valid"}, headers=headers
@@ -918,6 +966,7 @@ class TestRunIdempotency:
                     agent.session_prompt_tokens = agent.session_completion_tokens = (
                         agent.session_total_tokens
                     ) = 0
+                    agent.session_cache_read_tokens = 0
                     create.return_value = agent
                     accepted = await cli.post(
                         "/v1/runs", json={"input": "valid"}, headers=headers
@@ -943,6 +992,7 @@ class TestRunIdempotency:
                 agent.session_prompt_tokens = agent.session_completion_tokens = (
                     agent.session_total_tokens
                 ) = 0
+                agent.session_cache_read_tokens = 0
                 create.return_value = agent
                 headers = {"Idempotency-Key": "retry-1"}
                 first = await cli.post(
@@ -968,6 +1018,7 @@ class TestRunIdempotency:
                 agent.session_prompt_tokens = agent.session_completion_tokens = (
                     agent.session_total_tokens
                 ) = 0
+                agent.session_cache_read_tokens = 0
                 create.return_value = agent
                 headers = {"Idempotency-Key": "same-key"}
                 assert (
@@ -1000,6 +1051,7 @@ class TestRunIdempotency:
                 agent.session_prompt_tokens = agent.session_completion_tokens = (
                     agent.session_total_tokens
                 ) = 0
+                agent.session_cache_read_tokens = 0
                 create.return_value = agent
 
                 async def post():
@@ -1203,6 +1255,7 @@ class TestRunIdempotency:
                 agent.session_prompt_tokens = agent.session_completion_tokens = (
                     agent.session_total_tokens
                 ) = 0
+                agent.session_cache_read_tokens = 0
                 create.return_value = agent
                 first = await cli.post("/v1/runs", json={"input": "hello"})
                 second = await cli.post("/v1/runs", json={"input": "hello"})
@@ -1222,6 +1275,7 @@ class TestRunIdempotency:
                 agent.session_prompt_tokens = agent.session_completion_tokens = (
                     agent.session_total_tokens
                 ) = 0
+                agent.session_cache_read_tokens = 0
                 create.return_value = agent
                 first_headers = {
                     "Authorization": "Bearer sk-secret",
@@ -1256,6 +1310,7 @@ class TestRunIdempotency:
                 agent.session_prompt_tokens = agent.session_completion_tokens = (
                     agent.session_total_tokens
                 ) = 0
+                agent.session_cache_read_tokens = 0
                 create.return_value = agent
                 headers = {
                     "Authorization": "Bearer sk-secret",
@@ -1295,6 +1350,7 @@ class TestRunIdempotency:
                 agent.session_prompt_tokens = agent.session_completion_tokens = (
                     agent.session_total_tokens
                 ) = 0
+                agent.session_cache_read_tokens = 0
                 create.return_value = agent
                 started = await cli.post(
                     "/v1/runs",
@@ -1400,6 +1456,7 @@ class TestRunIdempotency:
                 agent.session_prompt_tokens = agent.session_completion_tokens = (
                     agent.session_total_tokens
                 ) = 0
+                agent.session_cache_read_tokens = 0
                 create.return_value = agent
                 response = await cli.post(
                     "/v1/runs", json={"input": "no stored session"}
@@ -2004,6 +2061,7 @@ class TestHostedRoomRuns:
                 agent.session_prompt_tokens = agent.session_completion_tokens = (
                     agent.session_total_tokens
                 ) = 0
+                agent.session_cache_read_tokens = 0
                 create.return_value = agent
                 started = await cli.post(
                     "/v1/runs",
