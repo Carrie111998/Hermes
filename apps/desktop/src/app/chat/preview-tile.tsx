@@ -41,7 +41,7 @@ import {
   previewTabBelongsToSession,
   type PreviewTarget
 } from '@/store/preview'
-import { runtimeHasOpenSurface } from '@/store/session-states'
+import { $focusedStoredSessionId, runtimeHasOpenSurface } from '@/store/session-states'
 import { canOpenBrowserWindow } from '@/store/windows'
 
 import { paneMirror } from './pane-mirror'
@@ -214,6 +214,9 @@ function existingPreviewAnchor(tabId: string): string | undefined {
  *  would leave a tab invisible from every conversation forever. */
 export function syncBrowserSessionPanes(): void {
   const sessionId = $browserSessionId.get()
+  // The restart-durable half of the claim: a restored tab kept only its stored
+  // owner, so without this it belongs to nobody and shows in every chat.
+  const storedSessionId = $focusedStoredSessionId.get()
 
   for (const tab of $previewTabs.get()) {
     // Hidden only while its conversation is still around to go back to. A tab
@@ -221,9 +224,15 @@ export function syncBrowserSessionPanes(): void {
     // never be current again, it would be invisible from every conversation
     // and unreachable until a restart, which reads as "my tab vanished".
     // Orphans belong to nobody, which is the same thing as belonging to all.
-    const owned = Boolean(tab.owner) && runtimeHasOpenSurface(tab.owner ?? null)
+    // Owned = someone can still go back to it: a live conversation on screen,
+    // or a stored claim that outlived the runtime. Neither → orphan, shown to
+    // all, because a tab scoped to a dead id is reachable from nowhere.
+    const owned = Boolean(tab.ownerKey) || (Boolean(tab.owner) && runtimeHasOpenSurface(tab.owner ?? null))
 
-    setTreePaneHidden(previewPaneId(tab.id), owned && !previewTabBelongsToSession(tab, sessionId))
+    setTreePaneHidden(
+      previewPaneId(tab.id),
+      owned && !previewTabBelongsToSession(tab, sessionId, storedSessionId)
+    )
   }
 }
 

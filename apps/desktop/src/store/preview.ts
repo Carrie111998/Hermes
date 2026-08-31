@@ -77,6 +77,20 @@ export interface PreviewTab {
    *  Absent = nobody's: a file-browser click, an artifact, a link you opened.
    *  Those stay visible to everyone. */
   owner?: string
+  /** STORED session id of the conversation that owns this tab — the same claim
+   *  as `owner`, in the one form that survives a restart.
+   *
+   *  `owner` is a runtime id and is dropped on the way out, so without this
+   *  every restored tab came back belonging to nobody and showed in EVERY
+   *  conversation: reopen the app and the other chat's page is sitting in
+   *  yours again.
+   *
+   *  Safe where the deleted registry was not, because this id decides only what
+   *  the strip DRAWS — nothing routes a write through it. The registry removed
+   *  in 96999b116 keyed the WRITE path on the stored id and lost races against
+   *  its own arrival; a late id here can only leave a tab visible a moment
+   *  longer. */
+  ownerKey?: string
   target: PreviewTarget
 }
 
@@ -166,6 +180,7 @@ export const $previewTabs = persistentAtom<PreviewTab[]>(TABS_STORAGE_KEY, [], {
       // names a RUNTIME session, and no runtime survives the restart. A
       // restored owner would bind the tab to a dead id — invisible to every
       // live session and reachable by none.
+      // `ownerKey` deliberately survives — it is the restart-durable half.
       (key, value) => (key === 'agent' || key === 'dataUrl' || key === 'owner' ? undefined : value)
     )
 })
@@ -435,7 +450,18 @@ export const $browserSessionId = atom<null | string>(null)
  *  to no conversation, so it stays visible from all of them. Only an agent's
  *  own browser tabs are scoped, which is exactly what "this chat's browser"
  *  means. */
-export function previewTabBelongsToSession(tab: PreviewTab, sessionId: null | string): boolean {
+export function previewTabBelongsToSession(
+  tab: PreviewTab,
+  sessionId: null | string,
+  storedSessionId?: null | string
+): boolean {
+  // A RESTORED tab has only `ownerKey` — its runtime died with the last run.
+  // Matching the conversation's stored id is what keeps a browser with its own
+  // chat across a restart instead of spilling into all of them.
+  if (!tab.owner && tab.ownerKey) {
+    return !sessionId || (Boolean(storedSessionId) && tab.ownerKey === storedSessionId)
+  }
+
   // No conversation established yet (first paint, a window with no chat
   // focused): show everything. An empty rail is a worse answer than an
   // unscoped one, and this is the state the Bot Mode regression lived in.
@@ -548,7 +574,7 @@ function previewTargetForSource(target: PreviewTarget, source: PreviewRecordSour
 export function openPreview(
   target: PreviewTarget,
   source: PreviewRecordSource = 'manual',
-  options: { newTab?: boolean; reveal?: boolean; sessionId?: null | string } = {}
+  options: { newTab?: boolean; ownerKey?: null | string; reveal?: boolean; sessionId?: null | string } = {}
 ) {
   const resolved = previewTargetForSource(target, source)
   const current = $previewTabs.get()
@@ -574,7 +600,10 @@ export function openPreview(
   // later session — `browserTabId` only returns a tab this session already
   // owns, so reaching here with a different owner means the user opened it.
   const owner = owned ? (current[index]?.owner ?? sessionId ?? undefined) : undefined
-  const tab: PreviewTab = owned ? { agent: true, id, owner, target: resolved } : { id, target: resolved }
+  const ownerKey = owned ? (current[index]?.ownerKey ?? options.ownerKey ?? undefined) : undefined
+  const tab: PreviewTab = owned
+    ? { agent: true, id, owner, ownerKey, target: resolved }
+    : { id, target: resolved }
 
   if (owned) {
     agentTabBySession.set(owner ?? UNSCOPED, id)

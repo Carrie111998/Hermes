@@ -20,7 +20,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $hiddenTreePanes } from '@/components/pane-shell/tree/store'
-import { $browserSessionId, $dockedPreviewTabs, closeRightRail, openPreview } from '@/store/preview'
+import { $browserSessionId, $dockedPreviewTabs, $previewTabs, closeRightRail, openPreview } from '@/store/preview'
 
 const A = 'runtime-a'
 const B = 'runtime-b'
@@ -29,7 +29,10 @@ const B = 'runtime-b'
  *  turns on exactly this. */
 const onScreen = vi.hoisted(() => ({ ids: new Set<string>() }))
 
+const storedFocus = vi.hoisted(() => ({ id: null as null | string }))
+
 vi.mock('@/store/session-states', () => ({
+  $focusedStoredSessionId: { get: () => storedFocus.id },
   runtimeHasOpenSurface: (id: null | string) => Boolean(id && onScreen.ids.has(id))
 }))
 
@@ -61,6 +64,7 @@ beforeEach(() => {
   $hiddenTreePanes.set(new Set())
   $browserSessionId.set(null)
   onScreen.ids = new Set([A, B])
+  storedFocus.id = null
 })
 
 describe('per-conversation browser', () => {
@@ -144,6 +148,24 @@ describe('per-conversation browser', () => {
     expect(shown()).toEqual(['https://b-side.com'])
 
     $browserSessionId.set(A)
+    expect(shown()).toEqual(['https://a-side.com'])
+  })
+
+  // THE restart hole the user found: `owner` is a runtime id and is dropped on
+  // the way out, so a restored tab used to come back belonging to nobody and
+  // showed in EVERY conversation — reopen the app and the other chat's page is
+  // sitting in yours. `ownerKey` is the half that survives.
+  it('keeps a restored tab with its own conversation across a restart', () => {
+    agentOpen('a-side.com', A)
+    // What restore produces: the runtime half gone, the stored half kept.
+    $previewTabs.set($previewTabs.get().map(tab => ({ ...tab, agent: true, owner: undefined, ownerKey: 'stored-a' })))
+
+    $browserSessionId.set(B)
+    storedFocus.id = 'stored-b'
+    expect(shown()).toEqual([])
+
+    $browserSessionId.set(A)
+    storedFocus.id = 'stored-a'
     expect(shown()).toEqual(['https://a-side.com'])
   })
 })

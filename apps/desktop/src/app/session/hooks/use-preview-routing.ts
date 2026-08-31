@@ -14,7 +14,7 @@ import {
   requestPreviewReload
 } from '@/store/preview'
 import { $currentCwd } from '@/store/session'
-import { $focusedRuntimeId, runtimeHasOpenSurface } from '@/store/session-states'
+import { $focusedRuntimeId, runtimeHasOpenSurface, storedSessionIdForRuntimeId } from '@/store/session-states'
 import type { RpcEvent } from '@/types/hermes'
 
 type EventHandler = (event: RpcEvent) => void
@@ -98,6 +98,10 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
                 // in. An on-screen tile whose turn opens a page gets its tab
                 // — it does not get to pull the rail off the page you are
                 // reading in the chat you are typing in.
+                // The claim in its restart-durable form. Visibility only —
+                // nothing routes a write through it, which is what made the
+                // old stored-id registry lose races against its own arrival.
+                ownerKey: event.session_id ? storedSessionIdForRuntimeId(event.session_id) : null,
                 reveal: !event.session_id || event.session_id === $focusedRuntimeId.get(),
                 sessionId: event.session_id || null
               })
