@@ -409,7 +409,7 @@ mcp_servers:
       client_secret_env: MY_CLIENT_SECRET        # optional
 ```
 
-**Secret values must never appear in `config.yaml`**. Only environment-variable *names* belong in the config. The values are read at runtime from the process environment, which is populated from `$HERMES_HOME/.env` before any MCP connection is made. Put the actual secrets there:
+**Secret values must never appear in `config.yaml`**. Only environment-variable *names* belong in the config. The values are resolved at runtime through the active profile's secret scope, falling back to the process environment, which is populated from `$HERMES_HOME/.env` before any MCP connection is made. In a multi-profile process each profile resolves its own value, so two profiles can use the same env-var name for different credentials. Put the actual secrets there:
 
 ```sh
 # ~/.hermes/.env  (or the active profile's .env)
@@ -421,7 +421,7 @@ AUTHENTIK_ZUG_APP_PASSWORD=your-app-password-here
 | Key | Required | Meaning |
 |---|---|---|
 | `grant_type` | yes | Grant strategy. Only `authentik_app_password` is supported; there is no default |
-| `token_url` | yes | OAuth token endpoint URL. **`https://` is required** and enforced — an `http://` value is rejected at config validation and again immediately before every token request |
+| `token_url` | yes | OAuth token endpoint URL. **`https://` is required** for any host reachable over a network, and enforced twice — at config validation and again immediately before every token request. Plain `http://` is accepted only for loopback (`localhost`, `127.0.0.1`, `::1`), which never leaves the machine; it logs a warning on every exchange and is meant for local development IdPs only |
 | `client_id` | yes | Client ID registered at the IdP |
 | `username` | yes | Service-account username (`authentik_app_password` only) |
 | `password_env` | yes | Name of the environment variable holding the password (`authentik_app_password` only) |
@@ -430,9 +430,10 @@ AUTHENTIK_ZUG_APP_PASSWORD=your-app-password-here
 
 ### Behavior
 
-- Tokens are cached at `$HERMES_HOME/mcp-tokens/<server>-sa.json` (mode `0600`, atomic write).
-- A valid token is reused across reconnects; a new token is fetched proactively 60 seconds before expiry.
-- If the server returns a `refresh_token`, Hermes uses it on the next renewal before falling back to a fresh service-account exchange.
+- Tokens are cached at `$HERMES_HOME/mcp-tokens/service-account/<server>-<digest>.json` (mode `0600`, atomic write). The path is rooted at the profile's own home, so two profiles configuring the same server name never share a token.
+- A cached token is **bound to the identity that minted it** — `grant_type`, `token_url`, `client_id`, `username`, `scope` and the credential env-var *names*. Change any of them and the cached token is discarded and re-minted instead of being presented for the previous identity. Only env-var names are hashed; no secret value is.
+- A valid token is reused across reconnects; a new token is fetched proactively 60 seconds before expiry, or at half the token's lifetime when the server issues one shorter than 120 seconds.
+- If the server returns a `refresh_token`, Hermes uses it on the next renewal before falling back to a fresh service-account exchange. A refresh response that omits `refresh_token` means "keep the one you have" (RFC 6749 §6) and the existing one is retained.
 - A single `401` response triggers one immediate re-fetch; if the re-fetch also fails, the error is surfaced to the model.
 - Concurrent requests share a single in-process lock so only one token exchange fires at a time.
 - Passwords and access tokens are never logged or written to `config.yaml`.
