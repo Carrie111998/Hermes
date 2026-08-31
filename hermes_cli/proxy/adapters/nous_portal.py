@@ -11,6 +11,7 @@ import logging
 import threading
 from typing import Any, Dict, FrozenSet, Optional
 
+from hermes_cli import __version__ as HERMES_VERSION
 from hermes_cli.auth import (
     AuthError,
     DEFAULT_NOUS_INFERENCE_URL,
@@ -61,6 +62,13 @@ class NousPortalAdapter(UpstreamAdapter):
     @property
     def allowed_paths(self) -> FrozenSet[str]:
         return _ALLOWED_PATHS
+
+    @property
+    def upstream_headers(self) -> Dict[str, str]:
+        # The Portal's Cloudflare policy rejects SDK fingerprints such as
+        # ``OpenAI/Python`` with error 1010. Identify the credential-attaching
+        # proxy itself rather than forwarding the downstream client's UA.
+        return {"User-Agent": f"HermesAgent/{HERMES_VERSION}"}
 
     def is_authenticated(self) -> bool:
         state = self._read_state()

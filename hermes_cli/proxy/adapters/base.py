@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import FrozenSet, Optional
+from typing import FrozenSet, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -58,6 +58,11 @@ class UpstreamAdapter(ABC):
         ``http://127.0.0.1:<port>/v1/chat/completions``. Requests to paths
         not in this set get a 404 with a helpful error body.
         """
+
+    @property
+    def upstream_headers(self) -> Mapping[str, str]:
+        """Provider-required request headers that override client headers."""
+        return {}
 
     @abstractmethod
     def is_authenticated(self) -> bool:
