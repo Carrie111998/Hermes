@@ -6,7 +6,7 @@
     "jpaulomf@gmail.com"
   ],
   "authserv_id": "mx.google.com",
-  "model": "gpt-5.4-mini-2026-03-17",
+  "classifier_backend": "hindsight-reflect",
   "calendar_profile": "jarvis",
   "calendar_cli": "/Users/jarvis/.hermes/bin/hermes-calendar",
   "timezone": "America/Sao_Paulo",

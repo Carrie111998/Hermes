@@ -410,7 +410,7 @@ def test_exact_runtime_contract_and_private_config(tmp_path):
         "account": triage.REQUIRED_ACCOUNT,
         "allowed_senders": sorted(triage.REQUIRED_SENDERS),
         "authserv_id": triage.REQUIRED_AUTHSERV,
-        "model": "gpt-5.4-mini-2026-03-17",
+        "classifier_backend": triage.REQUIRED_CLASSIFIER_BACKEND,
         "calendar_cli": triage.REQUIRED_CALENDAR_CLI,
         "timezone": triage.REQUIRED_TIMEZONE,
         "cutover_at": "2026-08-30T12:00:00-03:00",
@@ -459,8 +459,9 @@ def test_main_doctor_fails_closed_when_a_dependency_is_unhealthy(tmp_path, monke
     monkeypatch.setattr(triage, "load_config", lambda unused: {})
     monkeypatch.setattr(triage, "doctor", lambda *args: {
         "gmail_account_ok": True,
-        "calendars": {"trabalho": True, "pessoal": True, "familia": False},
+        "calendars": {"trabalho": True, "pessoal": True, "familia": True},
         "hindsight_ok": True,
+        "hindsight_reflect_ok": False,
         "timezone_ok": True,
         "script_sha256": "hash",
         "ledger": "ledger.db",
@@ -491,6 +492,9 @@ def test_doctor_accepts_current_hindsight_api_version(monkeypatch, tmp_path):
     profile = types.SimpleNamespace(execute=lambda: {"emailAddress": triage.REQUIRED_ACCOUNT})
     service = types.SimpleNamespace(users=lambda: types.SimpleNamespace(getProfile=lambda **kwargs: profile))
     monkeypatch.setattr(triage, "_google_service", lambda unused: service)
+    monkeypatch.setattr(
+        triage, "Classifier", lambda unused: types.SimpleNamespace(probe=lambda: True)
+    )
     monkeypatch.setattr(triage.urllib.request, "urlopen", lambda *args, **kwargs: Response())
     monkeypatch.setattr(
         triage.subprocess,
@@ -503,6 +507,7 @@ def test_doctor_accepts_current_hindsight_api_version(monkeypatch, tmp_path):
         "script_sha256": "hash",
     })
     assert report["hindsight_ok"] is True
+    assert report["hindsight_reflect_ok"] is True
 
 
 def test_main_dry_run_requires_expected_calendar_decision(tmp_path, monkeypatch, capsys):
@@ -590,6 +595,129 @@ def test_gmail_raw_checks_encoded_size_before_decoding():
     parsed = triage.parse_raw_message(raw, {"jpfischer@serraville.com"}, triage.REQUIRED_AUTHSERV)
     assert parsed["authorized"] is True
     assert parsed["unsupported_attachment"] is True
+
+
+def test_classifier_uses_hindsight_structured_reflect_without_recall(monkeypatch, tmp_path):
+    captured = {}
+    monkeypatch.setattr(triage.Classifier, "_require_mission", lambda self: None)
+
+    class Hindsight:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def list_memories(self, bank_id, limit=100):
+            return types.SimpleNamespace(items=[])
+
+        def list_mental_models(self, bank_id):
+            return types.SimpleNamespace(items=[])
+
+        def list_directives(self, bank_id):
+            return types.SimpleNamespace(items=[])
+
+        def reflect(
+            self, bank_id, query, budget, context, max_tokens, response_schema,
+            tags, tags_match, include_facts, exclude_mental_models,
+        ):
+            captured.update(locals())
+            return types.SimpleNamespace(
+                structured_output=decision("calendar"),
+                based_on={"memories": [], "mental_models": [], "directives": []},
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "hindsight_client", types.SimpleNamespace(Hindsight=Hindsight))
+    config = tmp_path / "config.json"
+    config.write_text('{"api_url":"http://127.0.0.1:8888","bank_id":"bank"}')
+    config.chmod(0o600)
+    result = triage.Classifier(config).classify({"body": "safe fixture"})
+    assert result["category"] == "calendar"
+    assert captured["response_schema"] == triage.DECISION_SCHEMA
+    assert captured["tags_match"] == "all_strict"
+    assert captured["include_facts"] is True
+    assert "include_tool_calls" not in captured
+    assert captured["exclude_mental_models"] is True
+
+
+def test_classifier_fails_closed_if_hindsight_uses_bank_memory(monkeypatch, tmp_path):
+    monkeypatch.setattr(triage.Classifier, "_require_mission", lambda self: None)
+
+    class Hindsight:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def list_memories(self, *args, **kwargs):
+            return types.SimpleNamespace(items=[])
+
+        def list_mental_models(self, *args, **kwargs):
+            return types.SimpleNamespace(items=[])
+
+        def list_directives(self, *args, **kwargs):
+            return types.SimpleNamespace(items=[])
+
+        def reflect(self, **kwargs):
+            return types.SimpleNamespace(
+                structured_output=decision("calendar"),
+                based_on={"memories": ["memory-id"], "mental_models": [], "directives": []},
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setitem(sys.modules, "hindsight_client", types.SimpleNamespace(Hindsight=Hindsight))
+    config = tmp_path / "config.json"
+    config.write_text('{"api_url":"http://127.0.0.1:8888","bank_id":"bank"}')
+    config.chmod(0o600)
+    with pytest.raises(RuntimeError, match="classifier_unexpected_memory"):
+        triage.Classifier(config).classify({"body": "safe fixture"})
+
+
+def test_classifier_requires_exact_trusted_bank_mission(monkeypatch, tmp_path):
+    class Response:
+        def __init__(self, mission):
+            self.mission = mission
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return json.dumps({"overrides": {"reflect_mission": self.mission}}).encode()
+
+    config = tmp_path / "config.json"
+    config.write_text('{"api_url":"http://127.0.0.1:8888","bank_id":"ignored"}')
+    config.chmod(0o600)
+    classifier = triage.Classifier(config)
+    monkeypatch.setattr(
+        triage.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: Response(triage.CLASSIFIER_MISSION),
+    )
+    classifier._require_mission()
+    monkeypatch.setattr(
+        triage.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: Response("wrong mission"),
+    )
+    with pytest.raises(RuntimeError, match="classifier_mission_mismatch"):
+        classifier._require_mission()
+
+
+def test_classifier_requires_empty_dedicated_bank(tmp_path):
+    config = tmp_path / "config.json"
+    config.write_text('{"api_url":"http://127.0.0.1:8888","bank_id":"ignored"}')
+    config.chmod(0o600)
+    classifier = triage.Classifier(config)
+    client = types.SimpleNamespace(
+        list_memories=lambda *args, **kwargs: types.SimpleNamespace(items=["fact"]),
+        list_mental_models=lambda *args, **kwargs: types.SimpleNamespace(items=[]),
+        list_directives=lambda *args, **kwargs: types.SimpleNamespace(items=[]),
+    )
+    with pytest.raises(RuntimeError, match="classifier_bank_not_empty"):
+        classifier._require_empty_bank(client)
 
 
 def test_hindsight_uses_stable_document_origin_and_tag(monkeypatch, tmp_path):

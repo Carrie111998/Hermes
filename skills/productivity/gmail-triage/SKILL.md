@@ -14,9 +14,11 @@ metadata:
 # Gmail triage
 
 Use the bundled `scripts/gmail_triage.py` as a no-agent Hermes cron script.
-It is intentionally self-contained: Gmail content is sent to a structured-output
-classifier with no tools, then a closed validator permits only Apple Calendar and
-Hindsight writes.
+It is intentionally self-contained: Gmail content is sent to the existing local
+Hindsight `reflect` structured-output classifier in a dedicated empty bank. The
+bank mission holds the trusted classifier rules; every run verifies the mission,
+empty bank, and zero memory provenance before a closed validator permits only
+Apple Calendar and Hindsight writes.
 
 ## Setup
 
@@ -26,10 +28,13 @@ Hindsight writes.
    `cutover_at` to the deployment timestamp, set `script_sha256` to the
    installed script's SHA-256, and set the file mode to `0600`.
 3. Set top-level `timezone: America/Sao_Paulo` in `~/.hermes/config.yaml`.
-4. Validate with the Hermes venv Python:
+4. Provision the dedicated Hindsight bank `gmail-triage-classifier` with the
+   script's exact `CLASSIFIER_MISSION`, and verify it has zero memories, mental
+   models, and directives. Never retain content into this bank.
+5. Validate with the Hermes venv Python:
    `~/.hermes/hermes-agent/venv/bin/python ~/.hermes/scripts/gmail-triage/gmail_triage.py doctor`,
    then run `synthetic` and `dry-run` with the same interpreter.
-4. Schedule it with native cron in no-agent mode.
+6. Schedule it with native cron in no-agent mode.
 
 ```bash
 hermes cron create "0 10,22 * * *" --name "Gmail triage" \
