@@ -370,6 +370,15 @@ DEFAULT_CONFIG = {
         # ``false`` keeps the historical strict-provider behavior (Mistral,
         # Groq, Cerebras reject the field with HTTP 400).
         "reasoning_echo": False,
+
+        # User-owned manual system-prompt overlay. Personality selection is
+        # stored separately under ``display.personality`` and never writes
+        # this field. An empty string means no manual overlay.
+        "system_prompt": "",
+
+        # User-defined personality presets. Entries may be prompt strings or
+        # mappings with metadata such as description and system_prompt.
+        "personalities": {},
     },
 
     "terminal": {
