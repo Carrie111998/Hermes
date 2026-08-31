@@ -1,0 +1,122 @@
+version: 1
+name: JAY-OS-V1
+created_utc: '2026-08-31T19:29:24Z'
+owner: Andres / One Memory
+operating_model:
+  parallel_by_default: true
+  foundations_first: true
+  estimates: DAG + measured capacity + provider telemetry; report P50/P90, not human-dev days
+  autonomy: safe/reversible operations proceed without founder approval; production/money/public-trust/destructive paths require policy gates
+  release_contract: deploy is incomplete until production verification passes; failed verification triggers rollback or re-entry to development loop
+control_plane:
+  canonical: One Memory
+  namespaces:
+    - identity
+    - knowledge_contexts
+    - skills
+    - tools
+    - capabilities
+    - policies
+    - provenance
+  auth_contract:
+    human_login_otp_for_agents: false
+    required_identity: service identity
+    token_contract: short-lived scoped tokens
+standard_frameworks:
+  engineering_ledger: GitHub
+  agent_workflows: Mastra
+  versioned_config_repo: hermes-agent worktree /Users/jay/work/jay-os-v1-hermes-agent
+capacity_policy:
+  target_batch_allocatable_productive_assignment: '>=90%'
+  reserve_headroom_for:
+    - control-plane
+    - voice
+    - personal devices
+  preemption:
+    rtx_voice_workloads: highest
+    m5_personal: opportunistic_only_never_critical_dependency
+discovered:
+  timestamp_utc: '2026-08-31T19:29:24Z'
+  control_node:
+    hostname: Jays-Mac-mini.local
+    tailscale_name: jay
+    tailscale_ip: 100.78.252.90
+    os: macOS 26.4 build 25E246
+    cpu: Apple M4
+    memory_bytes: 17179869184
+    disk_root: 460Gi total, 16Gi used, 58Gi available reported by df
+    hermes: Hermes Agent v0.20.0 installed at /Users/jay/.hermes/hermes-agent
+  network_nodes:
+    - name: m1
+      tailscale_ip: 100.85.86.51
+      os: macOS
+      state: online
+      path: direct 192.168.50.28:41641
+      role: routine macOS/test resource worker
+    - name: rtx
+      tailscale_ip: 100.120.123.103
+      os: windows
+      state: online
+      path: direct 192.168.50.32:41641
+      role: GPU/local models/voice priority worker
+    - name: m5
+      tailscale_ip: 100.96.157.75
+      os: macOS
+      state: offline_last_seen_7h
+      path: relay nyc when last seen
+      role: protected personal opportunistic capacity only
+  messaging:
+    telegram_gateway: connected
+    current_thread: Jay Command Center topic 7
+  github:
+    gh_available: true
+    active_account: onenyc77-prog
+    auth_scopes_observed:
+      - repo
+      - read:org
+      - gist
+      - admin:public_key
+  repo:
+    upstream: git@github.com:NousResearch/hermes-agent.git
+    safe_worktree: /Users/jay/work/jay-os-v1-hermes-agent
+    branch: feat/jay-os-v1-bootstrap
+    base_commit: 29112bef09
+  local_tools:
+    node: v24.20.0
+    npm: 11.19.0
+    pnpm: 10.33.0
+    uv: present
+    docker: present
+    ollama_local_11434: unreachable_or_not_serving_json
+    ollama_m5_tunnel_11436: unreachable_or_not_serving_json
+foundations:
+  network_identity_worker_lifecycle:
+    status: started
+    next_artifacts:
+      - worker registry with leases and safety class
+      - remote runner contract
+      - capability probes per node
+  observability_task_leases:
+    status: started
+    next_artifacts:
+      - trace schema
+      - lease schema
+      - heartbeat/status schema
+  security_policy:
+    status: started
+    next_artifacts:
+      - service identity token policy
+      - no-human-login enforcement checks
+      - adversarial prompt/tool boundary test set
+  release_verification:
+    status: started
+    next_artifacts:
+      - production verification loop contract
+      - regression evidence manifest
+metrics_initial:
+  runnable_parallelism: 6
+  active_agents: 6
+  allocatable_capacity: 'jay+m1+rtx online; m5 excluded/offline; RTX preemptible for voice'
+  current_bottleneck: 'One Memory VX MCP disabled by OAuth/DCR bug; Mastra inventory pending; no service-token issuer verified yet'
+  eta_p50: '90m to v1 repo artifacts + runnable local registry/probe scripts'
+  eta_p90: '4h if remote SSH/Windows/voice probes require fallback or service identity gaps'

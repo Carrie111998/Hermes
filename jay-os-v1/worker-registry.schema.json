@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://onememory.co/schemas/jay-os-v1/worker-registry.schema.json",
+  "title": "JAY OS v1 Worker Registry",
+  "type": "object",
+  "required": ["version", "nodes"],
+  "properties": {
+    "version": {"const": 1},
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "hostname", "network", "safety_class", "roles", "capabilities", "lifecycle"],
+        "properties": {
+          "id": {"type": "string"},
+          "hostname": {"type": "string"},
+          "network": {
+            "type": "object",
+            "required": ["provider"],
+            "properties": {
+              "provider": {"enum": ["tailscale", "local", "ssh", "unknown"]},
+              "tailscale_ip": {"type": "string"},
+              "dns_name": {"type": "string"},
+              "last_probe_utc": {"type": "string"},
+              "reachable": {"type": "boolean"}
+            },
+            "additionalProperties": false
+          },
+          "safety_class": {"enum": ["control_plane", "general_resource_worker", "gpu_resource_worker", "protected_personal_resource_worker"]},
+          "roles": {"type": "array", "items": {"type": "string"}},
+          "capabilities": {"type": "array", "items": {"type": "string"}},
+          "preemption": {
+            "type": "object",
+            "properties": {
+              "priority": {"type": "integer", "minimum": 0},
+              "preempt_for": {"type": "array", "items": {"type": "string"}}
+            },
+            "additionalProperties": false
+          },
+          "lifecycle": {
+            "type": "object",
+            "required": ["critical_path_allowed", "requires_founder_permission"],
+            "properties": {
+              "critical_path_allowed": {"type": "boolean"},
+              "requires_founder_permission": {"type": "boolean"},
+              "workspace_root": {"type": "string"},
+              "notes": {"type": "string"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

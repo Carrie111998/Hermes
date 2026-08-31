@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://onememory.co/schemas/jay-os-v1/task-lease.schema.json",
+  "title": "JAY OS v1 Task Lease",
+  "type": "object",
+  "required": ["version", "lease_id", "workstream", "state", "holder", "scope", "evidence"],
+  "properties": {
+    "version": {"const": 1},
+    "lease_id": {"type": "string"},
+    "workstream": {"type": "string"},
+    "state": {"enum": ["queued", "leased", "running", "blocked", "verifying", "done", "failed", "rolled_back"]},
+    "holder": {
+      "type": "object",
+      "required": ["agent_id", "node_id", "service_identity"],
+      "properties": {
+        "agent_id": {"type": "string"},
+        "node_id": {"type": "string"},
+        "service_identity": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "scope": {
+      "type": "object",
+      "required": ["repo", "branch", "paths", "policy_class"],
+      "properties": {
+        "repo": {"type": "string"},
+        "branch": {"type": "string"},
+        "paths": {"type": "array", "items": {"type": "string"}},
+        "policy_class": {"enum": ["safe_reversible", "sandbox", "production_gated", "money_gated", "public_trust_gated", "destructive_gated"]}
+      },
+      "additionalProperties": false
+    },
+    "dag": {
+      "type": "object",
+      "properties": {
+        "depends_on": {"type": "array", "items": {"type": "string"}},
+        "unblocks": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "ttl_seconds": {"type": "integer", "minimum": 1},
+    "heartbeat_utc": {"type": "string"},
+    "evidence": {
+      "type": "object",
+      "properties": {
+        "commands": {"type": "array", "items": {"type": "string"}},
+        "traces": {"type": "array", "items": {"type": "string"}},
+        "commits": {"type": "array", "items": {"type": "string"}},
+        "regression_evidence": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
