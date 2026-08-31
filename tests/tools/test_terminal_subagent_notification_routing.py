@@ -196,7 +196,7 @@ def test_unresolved_child_attribution_fail_closes_notification(
     assert result.get("notify_on_complete") is False
     assert captured_spawn["session_key"] == task_id
     assert captured_spawn.get("parent_session_id") != "immediate-child-session"
-    assert captured_spawn.get("notify_on_complete") is False
+    assert captured_spawn.get("notify_on_complete") is not True
 
 
 def test_failed_attribution_lookup_does_not_stamp_child_session(monkeypatch):
@@ -220,4 +220,4 @@ def test_failed_attribution_lookup_does_not_stamp_child_session(monkeypatch):
 
     assert result.get("notify_on_complete") is False
     assert captured_spawn.get("parent_session_id") != "immediate-child-session"
-    assert captured_spawn.get("notify_on_complete") is False
+    assert captured_spawn.get("notify_on_complete") is not True

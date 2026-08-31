@@ -3400,19 +3400,21 @@ def terminal_tool(
                 watch_patterns=watch_patterns,
                 background=True,
             )
-            spawn_notification_kwargs = {
-                "notification_session_key": notification_session_key,
-                "parent_session_id": notification_parent_session_id,
-                "notify_on_complete": bool(notify_on_complete),
-                "watch_patterns": watch_patterns,
-                "watcher_platform": watcher_platform,
-                "watcher_chat_id": watcher_chat_id,
-                "watcher_user_id": watcher_user_id,
-                "watcher_user_name": watcher_user_name,
-                "watcher_thread_id": watcher_thread_id,
-                "watcher_message_id": watcher_message_id,
-                "watcher_interval": watcher_interval,
-            }
+            spawn_notification_kwargs = {}
+            if notify_on_complete or watch_patterns:
+                spawn_notification_kwargs = {
+                    "notification_session_key": notification_session_key,
+                    "parent_session_id": notification_parent_session_id,
+                    "notify_on_complete": bool(notify_on_complete),
+                    "watch_patterns": watch_patterns,
+                    "watcher_platform": watcher_platform,
+                    "watcher_chat_id": watcher_chat_id,
+                    "watcher_user_id": watcher_user_id,
+                    "watcher_user_name": watcher_user_name,
+                    "watcher_thread_id": watcher_thread_id,
+                    "watcher_message_id": watcher_message_id,
+                    "watcher_interval": watcher_interval,
+                }
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
