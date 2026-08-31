@@ -472,6 +472,67 @@ def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
     return reason if verdict != "done" else None
 
 
+_PYTEST_NON_EVIDENCE_EXIT_RE = re.compile(
+    r"\bpytest\b.{0,160}?\b(?:exit(?:ed)?(?:\s+code)?|rc)\s*[:=]?\s*([2-5])\b",
+    re.IGNORECASE | re.DOTALL,
+)
+_VERIFICATION_UNAVAILABLE_RE = re.compile(
+    r"\b(?:behavioral|focused|regression|test)\s+(?:verification|evidence|result)"
+    r"\s+(?:is\s+)?(?:unavailable|absent|missing)\b"
+    r"|\bno\s+(?:behavioral|focused|regression)\s+(?:test\s+)?"
+    r"(?:verification|evidence|result)\b",
+    re.IGNORECASE,
+)
+
+
+def _verifier_handoff_rejection(
+    task: Any,
+    evidence: str,
+    metadata: Optional[dict],
+) -> Optional[str]:
+    """Reject verifier completion when pytest never produced test evidence.
+
+    Pytest exit 1 can be a legitimate verifier finding: tests ran and exposed
+    a concrete regression.  Exit 2-5 instead means interruption, internal
+    error, usage error, or no tests collected.  A contract verifier reporting
+    one of those outcomes has not satisfied its evidence boundary and must
+    block for workspace/toolchain repair rather than release downstream work.
+
+    Keep this deterministic gate narrow to verification-shaped tasks.  Audit
+    and research cards are allowed to complete with negative findings because
+    reporting the failure can itself be their deliverable.
+    """
+    if task is None:
+        return None
+    title = str(getattr(task, "title", "") or "")
+    assignee = str(getattr(task, "assignee", "") or "")
+    body = str(getattr(task, "body", "") or "")
+    verification_shaped = (
+        title.strip().lower().startswith(("verify ", "verification "))
+        or "test-contract" in assignee.lower()
+        or "review-verification" in assignee.lower()
+    )
+    if not verification_shaped or "test" not in f"{title}\n{body}".lower():
+        return None
+
+    metadata_text = ""
+    if isinstance(metadata, dict):
+        try:
+            metadata_text = json.dumps(metadata, sort_keys=True, default=str)
+        except (TypeError, ValueError):
+            metadata_text = str(metadata)
+    handoff = f"{evidence}\n{metadata_text}"
+    pytest_exit = _PYTEST_NON_EVIDENCE_EXIT_RE.search(handoff)
+    if pytest_exit:
+        return (
+            f"pytest exit {pytest_exit.group(1)} did not produce valid test "
+            "evidence"
+        )
+    if _VERIFICATION_UNAVAILABLE_RE.search(handoff):
+        return "required behavioral test evidence is unavailable"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Runtime-activity → board-heartbeat bridge (#31752)
 # ---------------------------------------------------------------------------
@@ -1019,6 +1080,19 @@ def _handle_complete(args: dict, **kw) -> str:
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
+            verifier_rejection = _verifier_handoff_rejection(
+                task,
+                (summary or result or "").strip(),
+                metadata,
+            )
+            if verifier_rejection is not None:
+                return tool_error(
+                    f"Verifier completion rejected: {verifier_rejection}. "
+                    "The task is still running. Repair the workspace or test "
+                    "invocation and rerun verification; if that cannot be "
+                    "done in this attempt, call kanban_block with the exact "
+                    "evidence blocker instead of kanban_complete."
+                )
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
