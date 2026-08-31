@@ -372,6 +372,7 @@ import {
   shouldCountCommits
 } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
+import { isGitCheckout } from './update-git-checkout'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
 import {
@@ -2822,9 +2823,9 @@ function resolveUpdateRoot() {
     process.env.HERMES_DESKTOP_HERMES_ROOT && path.resolve(process.env.HERMES_DESKTOP_HERMES_ROOT),
     !IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT) ? SOURCE_REPO_ROOT : null,
     isHermesSourceRoot(ACTIVE_HERMES_ROOT) ? ACTIVE_HERMES_ROOT : null
-  ].filter(Boolean)
+  ].filter((candidate): candidate is string => Boolean(candidate))
 
-  return candidates.find(c => directoryExists(path.join(c, '.git'))) || candidates[0] || ACTIVE_HERMES_ROOT
+  return candidates.find(c => isGitCheckout(c)) || candidates[0] || ACTIVE_HERMES_ROOT
 }
 
 function runGit(args, options: any = {}): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -2905,9 +2906,8 @@ async function resolveHealedBranch(updateRoot, branch) {
 async function checkUpdates() {
   const updateRoot = resolveUpdateRoot()
   let { branch } = readDesktopUpdateConfig()
-  const gitDir = path.join(updateRoot, '.git')
 
-  if (!directoryExists(gitDir)) {
+  if (!isGitCheckout(updateRoot)) {
     return {
       supported: false,
       reason: 'not-a-git-checkout',
@@ -3992,7 +3992,7 @@ async function handOffWindowsBootstrapRecovery(reason) {
   const updateRoot = resolveUpdateRoot()
   const { branch: configuredBranch } = readDesktopUpdateConfig()
 
-  const branch = directoryExists(path.join(updateRoot, '.git'))
+  const branch = isGitCheckout(updateRoot)
     ? await resolveHealedBranch(updateRoot, configuredBranch || DEFAULT_UPDATE_BRANCH)
     : configuredBranch || DEFAULT_UPDATE_BRANCH
 
