@@ -119,6 +119,44 @@ class TestWorkerTeardownOnCeiling:
         # Teardown proved quiescence, so the lease must NOT stay retained.
         assert fence._retain_cancelled_lock_until_worker_done is False
 
+    def test_parent_context_capture_is_outside_worker_budget(self, monkeypatch):
+        """One-time parent-thread setup must not expire the worker deadline."""
+        from tools import thread_context
+
+        original = [{"role": "user", "content": "keep"}]
+        compressed = [{"role": "assistant", "content": "summary"}]
+        worker_started = threading.Event()
+        real_propagate = thread_context.propagate_context_to_thread
+
+        def slow_first_capture(target):
+            # Deterministically model Windows cold-start import/callback capture.
+            time.sleep(0.3)
+            return real_propagate(target)
+
+        monkeypatch.setattr(
+            thread_context,
+            "propagate_context_to_thread",
+            slow_first_capture,
+        )
+
+        def fast_worker(_fence: CompressionCommitFence):
+            worker_started.set()
+            return compressed, "compressed"
+
+        msgs, prompt = run_compress_context_with_progress_timeout(
+            worker=fast_worker,
+            messages=original,
+            system_prompt_fallback="fallback",
+            idle_timeout_seconds=0.1,
+            total_ceiling_seconds=0.2,
+            fence=CompressionCommitFence(),
+            stall_fallback=False,
+        )
+
+        assert worker_started.is_set()
+        assert msgs is compressed
+        assert prompt == "compressed"
+
     def test_uninterruptible_worker_is_orphaned_with_lease_retained(self):
         """A worker stuck in an uninterruptible provider call is orphaned:
         the host returns after the grace, the poison fence discards its late
