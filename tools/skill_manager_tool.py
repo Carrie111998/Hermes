@@ -676,6 +676,28 @@ def _resolve_skill_dir(name: str, category: str = None) -> Path:
     return _skills_dir() / name
 
 
+def _read_frontmatter_name(skill_md: Path) -> Optional[str]:
+    """Read a SKILL.md's frontmatter ``name:`` — the name skills_list displays.
+
+    Fail-quiet on unreadable files: the fallback lookup in ``_find_skill``
+    must never break the directory-name match, and an unreadable SKILL.md
+    simply has no second name to offer. The value is truncated with the
+    same ``MAX_NAME_LENGTH`` budget skills_list applies when displaying it.
+    """
+    try:
+        from agent.skill_utils import parse_frontmatter
+
+        content = skill_md.read_text(encoding="utf-8-sig", errors="replace")[:4000]
+        frontmatter, _ = parse_frontmatter(content)
+    except OSError:
+        logger.debug("frontmatter read failed for %s", skill_md, exc_info=True)
+        return None
+    name = frontmatter.get("name")
+    if isinstance(name, str):
+        return name[:MAX_NAME_LENGTH]
+    return None
+
+
 def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     """
     Find a skill by name across all skill directories.
@@ -690,6 +712,14 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     the caller to use. The bare-name match compares the skill's own
     directory name (``parent.name``), so bare lookups keep working for
     category-nested skills.
+
+    As a last resort the frontmatter ``name:`` is matched too, so the name
+    ``skills list`` displays (frontmatter name wins over the directory
+    name there) resolves everywhere instead of failing with a misleading
+    "not found in active profile" error when the two names diverge.
+    Directory-name matches keep priority; a frontmatter match is only
+    returned after the whole scan found no directory/categorized match,
+    so one skill's frontmatter cannot shadow another skill's directory.
     """
     from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
 
@@ -711,6 +741,8 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
                 _resolved_root = _skills_dir()
         return _resolved_root
 
+    frontmatter_match: Optional[Path] = None
+
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
@@ -727,9 +759,14 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
                 try:
                     rel = skill_md.parent.resolve().relative_to(_local_root())
                 except ValueError:
-                    continue
-                if rel.as_posix() == name:
+                    rel = None
+                if rel is not None and rel.as_posix() == name:
                     return {"path": skill_md.parent}
+            if frontmatter_match is None:
+                if _read_frontmatter_name(skill_md) == name:
+                    frontmatter_match = skill_md.parent
+    if frontmatter_match is not None:
+        return {"path": frontmatter_match}
     return None
 
 
