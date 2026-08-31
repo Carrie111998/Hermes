@@ -64,6 +64,22 @@ def _active_cron_provider_name() -> str:
         return "builtin"
 
 
+def _cron_profile_name() -> str:
+    """Return the profile whose cron store and gateway are being inspected."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name()
+    except Exception:
+        return "unknown"
+
+
+def _print_cron_profile(profile: Optional[str] = None) -> str:
+    profile = profile or _cron_profile_name()
+    print(color(f"Profile: {profile}", Colors.DIM))
+    return profile
+
+
 def _builtin_gateway_liveness() -> Optional[bool]:
     """Tri-state liveness of the builtin cron scheduler's trigger.
 
@@ -127,7 +143,12 @@ def _warn_if_gateway_not_running() -> None:
     if _builtin_gateway_liveness() is not False:
         return
 
-    print(color("  ⚠  Gateway is not running — jobs won't fire automatically.", Colors.YELLOW))
+    profile = _cron_profile_name()
+    print(color(
+        f"  ⚠  Gateway for profile '{profile}' is not running — "
+        "jobs won't fire automatically.",
+        Colors.YELLOW,
+    ))
     print(color("     Start it with: hermes gateway install", Colors.DIM))
     print(color("                    sudo hermes gateway install --system  # Linux servers", Colors.DIM))
     print(color("     Check status:  hermes cron status", Colors.DIM))
@@ -138,6 +159,7 @@ def cron_list(show_all: bool = False):
     from cron.jobs import list_jobs
 
     jobs = list_jobs(include_disabled=show_all)
+    _print_cron_profile()
 
     if not jobs:
         print(color("No scheduled jobs.", Colors.DIM))
@@ -395,6 +417,8 @@ def cron_status():
     from hermes_cli.gateway import find_gateway_pids
 
     print()
+    profile = _print_cron_profile()
+    print()
 
     provider = _active_cron_provider_name()
     if provider != "builtin":
@@ -520,13 +544,21 @@ def cron_status():
                     ))
             print("  Check the gateway log for 'Cron tick error'.")
         else:
-            print(color("✓ Gateway is running — cron jobs will fire automatically", Colors.GREEN))
+            print(color(
+                f"✓ Gateway for profile '{profile}' is running — "
+                "cron jobs will fire automatically",
+                Colors.GREEN,
+            ))
             if pids:
                 print(f"  PID: {', '.join(map(str, pids))}")
             if hb_age is not None:
                 print(f"  Ticker heartbeat: {int(hb_age)}s ago")
     else:
-        print(color("✗ Gateway is not running — cron jobs will NOT fire", Colors.RED))
+        print(color(
+            f"✗ Gateway for profile '{profile}' is not running — "
+            "cron jobs will NOT fire",
+            Colors.RED,
+        ))
         print()
         print("  To enable automatic execution:")
         print("    hermes gateway install    # Install as a user service")
