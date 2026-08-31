@@ -782,6 +782,13 @@ class ChatCompletionsTransport(ProviderTransport):
             if is_moonshot_model(model):
                 tools = sanitize_moonshot_tools(tools)
             api_kwargs["tools"] = tools
+            # Profiles whose backends only batch tool rounds when the field is
+            # sent explicitly (local OpenAI-compat servers) declare a default
+            # here; request_overrides are merged later and still win.
+            if profile.parallel_tool_calls_default is not None:
+                api_kwargs.setdefault(
+                    "parallel_tool_calls", profile.parallel_tool_calls_default
+                )
 
         # max_tokens resolution — priority: ephemeral > user > profile default
         max_tokens_fn = params.get("max_tokens_param_fn")

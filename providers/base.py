@@ -93,6 +93,10 @@ class ProviderProfile:
     # ── Request-level quirks ─────────────────────────────────
     # Temperature: None = use caller's default, OMIT_TEMPERATURE = don't send
     fixed_temperature: Any = None
+    # parallel_tool_calls: None = omit the field, True/False = send as the
+    # default (request_overrides still win). Local OpenAI-compat backends
+    # (llama.cpp et al.) batch tool rounds only when it is sent explicitly.
+    parallel_tool_calls_default: bool | None = None
     default_max_tokens: int | None = None
     default_aux_model: str = (
         ""  # cheap model for auxiliary tasks (compression, vision, etc.)

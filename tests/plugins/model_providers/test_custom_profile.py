@@ -180,3 +180,19 @@ class TestCustomReasoningWithNumCtx:
         assert eb == {"options": {"num_ctx": 8192}}
         assert tl == {}
 
+
+class TestCustomRequestQuirks:
+    """Declarative request-level quirks for local OpenAI-compat backends (#18470).
+
+    llama.cpp defaults to temperature=1.0 when the field is omitted (factual
+    drift), and local backends only batch tool rounds when parallel_tool_calls
+    is sent explicitly. The transport consumes both declarations; end-to-end
+    wiring is pinned in tests/providers/test_e2e_wiring.py.
+    """
+
+    def test_fixed_temperature_default(self, custom_profile):
+        assert custom_profile.fixed_temperature == 0.2
+
+    def test_parallel_tool_calls_default(self, custom_profile):
+        assert custom_profile.parallel_tool_calls_default is True
+

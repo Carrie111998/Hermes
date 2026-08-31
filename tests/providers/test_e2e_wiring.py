@@ -105,3 +105,79 @@ class TestDeepSeekProfileWiring:
         assert kwargs["model"] == "deepseek-chat"
         assert kwargs.get("max_tokens") is None or "max_tokens" not in kwargs
 
+
+class TestCustomProfileWiring:
+    """provider=custom: temperature + parallel_tool_calls reach the wire (#18470).
+
+    Local OpenAI-compat backends (llama.cpp, vLLM) default to temperature=1.0
+    and refuse to batch tool rounds when the fields are omitted, so the custom
+    profile must emit both; request_overrides are merged last and still win.
+    """
+
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "description": "run a command",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+
+    def test_custom_sends_temperature_and_parallel_tool_calls(self, transport):
+        profile = get_provider_profile("custom")
+        kwargs = transport.build_kwargs(
+            model="llama3",
+            messages=_msgs(),
+            tools=self.TOOLS,
+            provider_profile=profile,
+            max_tokens=None,
+            max_tokens_param_fn=lambda x: {"max_tokens": x} if x else {},
+            timeout=300,
+            reasoning_config=None,
+            request_overrides=None,
+            session_id="test",
+            ollama_num_ctx=None,
+        )
+        assert kwargs["temperature"] == 0.2
+        assert kwargs["parallel_tool_calls"] is True
+
+    def test_custom_parallel_tool_calls_omitted_without_tools(self, transport):
+        profile = get_provider_profile("custom")
+        kwargs = transport.build_kwargs(
+            model="llama3",
+            messages=_msgs(),
+            tools=None,
+            provider_profile=profile,
+            max_tokens=None,
+            max_tokens_param_fn=lambda x: {"max_tokens": x} if x else {},
+            timeout=300,
+            reasoning_config=None,
+            request_overrides=None,
+            session_id="test",
+            ollama_num_ctx=None,
+        )
+        # temperature still pinned; parallel_tool_calls is meaningless without
+        # tools and must stay off the wire
+        assert kwargs["temperature"] == 0.2
+        assert "parallel_tool_calls" not in kwargs
+
+    def test_custom_request_overrides_win(self, transport):
+        profile = get_provider_profile("custom")
+        kwargs = transport.build_kwargs(
+            model="llama3",
+            messages=_msgs(),
+            tools=self.TOOLS,
+            provider_profile=profile,
+            max_tokens=None,
+            max_tokens_param_fn=lambda x: {"max_tokens": x} if x else {},
+            timeout=300,
+            reasoning_config=None,
+            request_overrides={"temperature": 0.7, "parallel_tool_calls": False},
+            session_id="test",
+            ollama_num_ctx=None,
+        )
+        assert kwargs["temperature"] == 0.7
+        assert kwargs["parallel_tool_calls"] is False
+
