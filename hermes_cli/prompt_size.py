@@ -243,6 +243,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     largest-first). The last two answer "what should I disable to cut tokens?".
     """
     from agent.system_prompt import build_system_prompt, build_system_prompt_parts
+    from agent.prompt_builder import list_profile_context_files
 
     agent = _build_inspection_agent(platform)
 
@@ -295,6 +296,7 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
         "sections": sections,
         "skills_breakdown": _compute_skills_breakdown(skills_index),
         "toolsets_breakdown": _compute_toolsets_breakdown(tools),
+        "profile_context_files": list_profile_context_files(),
     }
 
 
@@ -324,6 +326,17 @@ def render_breakdown(data: Dict[str, Any]) -> str:
     lines.append("")
     tools = data["tools"]
     lines.append(f"  Tool schemas         : {tools['json_bytes']:>8,} B  ({_fmt_kb(tools['json_bytes'])}, {tools['count']} tools)")
+
+    profile_files = data.get("profile_context_files") or []
+    if profile_files:
+        lines.append("")
+        lines.append("  Profile context files (declared order):")
+        for entry in profile_files:
+            digest = entry.get("sha256") or "n/a"
+            lines.append(
+                f"    [{entry['status']}] {entry['path']} "
+                f"({entry['chars']:,} chars, sha256:{digest})"
+            )
 
     # Per-toolset schema cost — which toolset's tools cost the most to ship.
     toolsets = data.get("toolsets_breakdown") or []

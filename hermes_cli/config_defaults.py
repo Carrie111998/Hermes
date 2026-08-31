@@ -43,6 +43,12 @@ DEFAULT_CONFIG = {
         "terminal_continue": True,
     },
     "agent": {
+        # Explicit profile policy/contract files loaded in declared order into
+        # the initial cached prompt. Relative paths resolve from HERMES_HOME.
+        "context_files": [],
+        # Aggregate raw-character budget across agent.context_files. Individual
+        # files remain subject to the global context_file_max_chars cap below.
+        "context_files_max_chars": 100_000,
         # Unlimited by default. The agent turn cap caused more problems than
         # it solved (silent mid-task truncation). null = unlimited; set a
         # positive integer to cap, or use "none"/"unlimited"/"inf"/0/-1 —

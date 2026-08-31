@@ -26,6 +26,35 @@ Only **one** project context type is loaded per session (first match wins): `.he
 If an `AGENTS.override.md` exists next to an `AGENTS.md`, the override is loaded **instead of** the committed file — keep a personal (usually gitignored) `AGENTS.override.md` when you want different instructions than the ones checked into the repo, without editing the tracked `AGENTS.md`.
 :::
 
+## Profile Context Files
+
+Use `agent.context_files` for stable policies and contracts that every new
+session for one Hermes profile must receive before its first model call. Files
+are loaded in declared order. Relative paths resolve from that profile's
+`HERMES_HOME`; absolute paths are also accepted.
+
+```yaml
+agent:
+  context_files_max_chars: 100000
+  context_files:
+    - POLICY.md
+    - path: agents/CONTRACT.md
+      required: true
+    - path: LOCAL_OVERRIDES.md
+      required: false
+```
+
+String entries and mappings without `required` are required by default. A
+missing or unreadable required file stops prompt construction with a clear
+error. Missing optional files are skipped. Globs and `.env` files are rejected;
+every loaded file passes through the normal context-file prompt-injection scan
+and per-file truncation limit.
+
+The aggregate raw content is capped by `agent.context_files_max_chars`
+(100,000 by default). `hermes prompt-size` reports each declared path, load
+status, character count, and SHA-256 hash. Changes take effect in a new session;
+Hermes does not mutate an existing conversation's cached system prompt.
+
 ## AGENTS.md
 
 `AGENTS.md` is the primary project context file. It tells the agent how your project is structured, what conventions to follow, and any special instructions.
@@ -190,6 +219,7 @@ This scanner protects against common injection patterns, but it's not a substitu
 | Limit | Value |
 |-------|-------|
 | Max chars per file | `context_file_max_chars` when set; otherwise dynamic (scales with model context window, floor 20,000, ceiling 500,000) |
+| Max chars across `agent.context_files` | `agent.context_files_max_chars` (default 100,000) |
 | Head truncation ratio | 70% |
 | Tail truncation ratio | 20% |
 | Truncation marker | 10% (shows char counts and suggests using file tools) |

@@ -66,6 +66,21 @@ class TestContextFileCwd:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         assert _captured_context_cwd(_make_agent()) == tmp_path
 
+    def test_configured_profile_context_is_in_stable_tier(self):
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch(
+                "run_agent.build_profile_context_files_prompt",
+                return_value="# Profile Context\n\nStable policy.",
+            ),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+        ):
+            parts = build_system_prompt_parts(_make_agent())
+
+        assert "Stable policy." in parts["stable"]
+        assert "Stable policy." not in parts["context"]
+
 
 def _stable_prompt(agent):
     with (

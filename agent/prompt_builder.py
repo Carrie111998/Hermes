@@ -4,6 +4,8 @@ All functions are stateless. AIAgent._build_system_prompt() calls these to
 assemble pieces, then combines them with memory and ephemeral prompts.
 """
 
+import glob
+import hashlib
 import json
 import logging
 import os
@@ -2390,6 +2392,162 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
     return _truncate_content(
         cursorrules_content, ".cursorrules", context_length=context_length,
         read_path=str(cwd_path / ".cursorrules"),
+    )
+
+
+def _profile_context_file_specs(home: Path) -> tuple[List[dict], int]:
+    """Resolve and validate profile context-file configuration."""
+    token = None
+    if get_hermes_home() != home:
+        token = set_hermes_home_override(home)
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)
+
+    agent_config = config.get("agent") or {}
+    if not isinstance(agent_config, dict):
+        return [], 100_000
+    entries = agent_config.get("context_files") or []
+    if not isinstance(entries, list):
+        raise ValueError("agent.context_files must be a list")
+    total_limit = agent_config.get("context_files_max_chars", 100_000)
+    if isinstance(total_limit, bool) or not isinstance(total_limit, int) or total_limit <= 0:
+        raise ValueError("agent.context_files_max_chars must be a positive integer")
+
+    specs: List[dict] = []
+    for index, entry in enumerate(entries):
+        if isinstance(entry, str):
+            path_value = entry
+            required = True
+        elif isinstance(entry, dict):
+            path_value = entry.get("path")
+            required = entry.get("required", True)
+            if not isinstance(required, bool):
+                raise ValueError(
+                    f"agent.context_files[{index}].required must be a boolean"
+                )
+        else:
+            path_value = None
+            required = True
+        if not path_value:
+            raise ValueError(
+                f"agent.context_files[{index}] must be a path string or mapping"
+            )
+        if not isinstance(path_value, str):
+            raise ValueError(f"agent.context_files[{index}].path must be a string")
+        if glob.has_magic(path_value):
+            raise ValueError(
+                f"agent.context_files[{index}] must be an explicit path, not a glob"
+            )
+        path = Path(path_value).expanduser()
+        if not path.is_absolute():
+            path = home / path
+        path = path.resolve()
+        if path.name == ".env" or path.name.startswith(".env."):
+            raise ValueError("agent.context_files must not load environment files")
+        specs.append({"path": path, "required": required})
+    return specs, total_limit
+
+
+def list_profile_context_files(
+    home_override: "Path | None" = None,
+    context_length: Optional[int] = None,
+) -> List[dict]:
+    """Return ordered path, size, hash, and load status diagnostics."""
+    home = Path(home_override) if home_override is not None else get_hermes_home()
+    specs, _ = _profile_context_file_specs(home)
+    max_chars = _get_context_file_max_chars(context_length)
+    diagnostics: List[dict] = []
+    for spec in specs:
+        path = spec["path"]
+        required = spec["required"]
+        try:
+            raw = path.read_bytes()
+            content = raw.decode("utf-8")
+        except (OSError, UnicodeError):
+            diagnostics.append({
+                "path": str(path),
+                "required": required,
+                "status": "missing_required" if required else "missing_optional",
+                "chars": 0,
+                "bytes": 0,
+                "sha256": "",
+            })
+            continue
+        findings = _scan_for_threats(content, scope="context")
+        status = "blocked" if findings else (
+            "truncated" if len(content) > max_chars else "loaded"
+        )
+        diagnostics.append({
+            "path": str(path),
+            "required": required,
+            "status": status,
+            "chars": len(content),
+            "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+        })
+    return diagnostics
+
+
+def _load_profile_context_files(
+    home: Path,
+    context_length: Optional[int] = None,
+) -> List[str]:
+    """Load the profile's explicitly configured context files in order."""
+    specs, total_limit = _profile_context_file_specs(home)
+    sections: List[str] = []
+    total_chars = 0
+    for spec in specs:
+        path = spec["path"]
+        required = spec["required"]
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            if not required:
+                logger.info("Optional profile context file unavailable: %s", path)
+                continue
+            raise ValueError(
+                f"Required profile context file is unavailable: {path}: {exc}"
+            ) from exc
+        total_chars += len(content)
+        if total_chars > total_limit:
+            raise ValueError(
+                "Profile context files total "
+                f"{total_chars} chars exceeds agent.context_files_max_chars "
+                f"limit of {total_limit}"
+            )
+        content = content.strip()
+        if not content:
+            continue
+        content = _scan_context_content(content, str(path))
+        content = _truncate_content(
+            content,
+            str(path),
+            context_length=context_length,
+            read_path=str(path),
+        )
+        sections.append(f"## {path}\n\n{content}")
+    return sections
+
+
+def build_profile_context_files_prompt(
+    home_override: "Path | None" = None,
+    context_length: Optional[int] = None,
+) -> str:
+    """Build the stable prompt block for configured profile context files."""
+    home = Path(home_override) if home_override is not None else get_hermes_home()
+    sections = _load_profile_context_files(home, context_length)
+    if not sections:
+        return ""
+    return (
+        "# Profile Context\n\n"
+        "The following explicitly configured profile context files have been "
+        "loaded in declared order and should be followed:\n\n"
+        + "\n\n".join(sections)
     )
 
 

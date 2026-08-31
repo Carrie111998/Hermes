@@ -169,6 +169,7 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
     DEFAULT_AGENT_IDENTITY,
     build_skills_system_prompt,
     build_context_files_prompt,
+    build_profile_context_files_prompt,
     build_environment_hints,
     load_soul_md,
 )

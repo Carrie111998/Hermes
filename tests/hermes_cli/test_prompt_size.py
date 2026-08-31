@@ -1,5 +1,6 @@
 """Tests for the ``hermes prompt-size`` diagnostic (issue #34667)."""
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -52,6 +53,32 @@ def test_runs_offline_without_credentials(isolated_home, monkeypatch):
         monkeypatch.delenv(var, raising=False)
     data = compute_prompt_breakdown("cli")
     assert data["system_prompt"]["bytes"] > 0
+
+
+def test_reports_configured_profile_context_paths_and_hashes(isolated_home):
+    policy = isolated_home / "POLICY.md"
+    content = "Stable profile policy.\n"
+    policy.write_text(content, encoding="utf-8")
+    optional = isolated_home / "OPTIONAL.md"
+    (isolated_home / "config.yaml").write_text(
+        "agent:\n"
+        "  context_files:\n"
+        "    - POLICY.md\n"
+        "    - path: OPTIONAL.md\n"
+        "      required: false\n",
+        encoding="utf-8",
+    )
+
+    data = compute_prompt_breakdown("cli")
+
+    files = data["profile_context_files"]
+    assert [entry["path"] for entry in files] == [str(policy), str(optional)]
+    assert files[0]["status"] == "loaded"
+    assert files[0]["sha256"] == hashlib.sha256(policy.read_bytes()).hexdigest()
+    assert files[1]["status"] == "missing_optional"
+    rendered = render_breakdown(data)
+    assert str(policy) in rendered
+    assert files[0]["sha256"] in rendered
 
 
 

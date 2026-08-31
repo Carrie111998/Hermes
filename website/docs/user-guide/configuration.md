@@ -747,6 +747,27 @@ Set a positive integer to pin a fixed cap instead of the dynamic behavior:
 context_file_max_chars: 25000
 ```
 
+### Profile context files
+
+Load an explicit ordered set of profile-local policies into the stable system
+prompt before the first model call:
+
+```yaml
+agent:
+  context_files_max_chars: 100000
+  context_files:
+    - POLICY.md
+    - path: agents/CONTRACT.md
+      required: true
+    - path: LOCAL_OVERRIDES.md
+      required: false
+```
+
+Relative paths resolve from the active profile's `HERMES_HOME`. Required files
+fail clearly when unavailable; optional files are skipped. Globs and `.env`
+files are not accepted. Use `hermes prompt-size` to inspect resolved paths,
+sizes, load status, and SHA-256 hashes.
+
 ## File Read Safety
 
 Controls how much content a single `read_file` call can return. Reads that exceed the limit are rejected with an error telling the agent to use `offset` and `limit` for a smaller range. This prevents a single read of a minified JS bundle or large data file from flooding the context window.

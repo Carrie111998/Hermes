@@ -486,6 +486,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
+    if not agent.skip_context_files:
+        profile_context_prompt = _r.build_profile_context_files_prompt(
+            home_override=_agent_home(agent), context_length=_ctx_len
+        )
+        if profile_context_prompt:
+            stable_parts.append(profile_context_prompt)
+
     # Pointer to the docs (and, when it exists, the hermes-agent skill) for
     # user questions about Hermes itself. The skill_view() pointer is a
     # dangling reference in two cases — no skill tools in the toolset
