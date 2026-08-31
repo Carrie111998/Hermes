@@ -1033,13 +1033,96 @@ class TestReviewRound3:
 
     def test_consent_off_triggers_cleanup(self, tmp_path, monkeypatch):
         import tools.browser_tool as bt
-        called = {"n": 0}
+        called = {"close": 0, "terminate": 0, "cleanup": 0}
         with patch.object(bt, "_use_real_profile", return_value=False), \
+             patch.object(bt, "_agent_browser_close_session",
+                          side_effect=lambda *_: called.__setitem__("close", called["close"] + 1)), \
+             patch.object(bt, "_terminate_real_profile_chrome",
+                          side_effect=lambda: called.__setitem__("terminate", called["terminate"] + 1)), \
              patch("hermes_cli.browser_connect.cleanup_real_profile_snapshots",
-                   side_effect=lambda: called.__setitem__("n", called["n"] + 1)):
+                   side_effect=lambda: (called.__setitem__("cleanup", called["cleanup"] + 1), True)[1]):
             cdp, err = bt._real_profile_cdp()
         assert cdp is None and err is None
-        assert called["n"] == 1
+        assert called == {"close": 1, "terminate": 1, "cleanup": 1}
+
+    def test_consent_off_fails_closed_when_credentials_remain(self):
+        import tools.browser_tool as bt
+        with patch.object(bt, "_use_real_profile", return_value=False), \
+             patch.object(bt, "_agent_browser_close_session"), \
+             patch.object(bt, "_terminate_real_profile_chrome"), \
+             patch("hermes_cli.browser_connect.cleanup_real_profile_snapshots",
+                   return_value=False):
+            cdp, err = bt._real_profile_cdp()
+        assert cdp is None
+        assert err and "could not delete" in err.lower()
+
+    def test_cached_cdp_rejects_changed_managed_data_dir(self, tmp_path):
+        import tools.browser_tool as bt
+        bt._real_profile_cdp_cache["cdp"] = "http://127.0.0.1:9251"
+        with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch.object(bt, "_using_lightpanda_engine", return_value=False), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="edge"), \
+             patch("hermes_cli.browser_connect.real_profile_copy_dir",
+                   return_value=str(tmp_path / "edge")), \
+             patch.object(bt, "_cdp_http_ready", return_value=True), \
+             patch.object(bt, "_cdp_on_data_dir", return_value=False), \
+             patch.object(bt, "_agent_browser_close_session") as close, \
+             patch.object(bt, "_terminate_real_profile_chrome") as terminate, \
+             patch.object(bt, "_agent_browser_get_cdp", return_value=None), \
+             patch("hermes_cli.browser_connect.snapshot_real_profile",
+                   return_value=(None, "missing managed edge profile")):
+            cdp, err = bt._real_profile_cdp()
+        assert cdp is None
+        assert err and "missing managed edge profile" in err
+        close.assert_called_once_with(bt._REAL_PROFILE_SESSION)
+        terminate.assert_called_once_with()
+        assert "cdp" not in bt._real_profile_cdp_cache
+
+    def test_cleanup_terminates_only_managed_profile_browser(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+
+        root = tmp_path / "hh" / "browser-profile"
+        managed = root / "chrome"
+        managed.mkdir(parents=True)
+        (managed / "Default").mkdir()
+        (managed / "Default" / "Cookies").write_text("secret")
+
+        class FakeProc:
+            def __init__(self, name, cmdline):
+                self.info = {"name": name, "cmdline": cmdline}
+                self.terminated = False
+                self.killed = False
+
+            def children(self, recursive=True):
+                return []
+
+            def terminate(self):
+                self.terminated = True
+
+            def kill(self):
+                self.killed = True
+
+        ours = FakeProc("chrome.exe", ["chrome.exe", f"--user-data-dir={managed}"])
+        source = FakeProc("chrome.exe", ["chrome.exe", f"--user-data-dir={tmp_path / 'source'}"])
+
+        class FakePsutil:
+            NoSuchProcess = type("NoSuchProcess", (Exception,), {})
+            AccessDenied = type("AccessDenied", (Exception,), {})
+
+            def process_iter(self, attrs=None):
+                return iter([ours, source])
+
+            def wait_procs(self, procs, timeout=None):
+                return list(procs), []
+
+        import sys as _sys
+        monkeypatch.setitem(_sys.modules, "psutil", FakePsutil())
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: tmp_path / "hh")
+
+        assert bc.cleanup_real_profile_snapshots() is True
+        assert ours.terminated is True
+        assert source.terminated is False
+        assert not root.exists()
 
     # ── ① overlay must not run before the reuse check (live-browser safety) ──
     def test_reuse_skips_snapshot_overlay(self, tmp_path):

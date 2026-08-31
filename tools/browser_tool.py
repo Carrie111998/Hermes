@@ -1478,6 +1478,27 @@ def _terminate_real_profile_chrome() -> None:
             logger.debug("real-profile chrome terminate failed: %s", e)
 
 
+def _revoke_real_profile_access() -> str | None:
+    """Close managed sessions and remove every copied credential on consent-off."""
+    from hermes_cli.browser_connect import cleanup_real_profile_snapshots
+
+    _agent_browser_close_session(_REAL_PROFILE_SESSION)
+    _terminate_real_profile_chrome()
+    _real_profile_cdp_cache.pop("cdp", None)
+    try:
+        removed = cleanup_real_profile_snapshots()
+    except Exception as e:
+        logger.warning("real-profile cleanup-on-consent-off failed: %s", e)
+        removed = False
+    if not removed:
+        return (
+            "browser.use_real_profile is off, but Hermes could not delete the "
+            "managed browser-profile credential store. Close managed browser "
+            "processes and retry."
+        )
+    return None
+
+
 def _agent_browser_argv(browser_cmd: str) -> list:
     """Command prefix to invoke agent-browser (binary or npx sentinel)."""
     if _is_npx_agent_browser_sentinel(browser_cmd):
@@ -1578,14 +1599,8 @@ def _real_profile_cdp() -> tuple:
         # still on disk, it holds copies of the user's cookies/logins — delete
         # it so revoking consent actually removes the credential copies. Cheap
         # (one isdir check) and idempotent.
-        try:
-            from hermes_cli.browser_connect import cleanup_real_profile_snapshots
-
-            cleanup_real_profile_snapshots()
-        except Exception as e:
-            logger.debug("real-profile cleanup-on-consent-off failed: %s", e)
-        _real_profile_cdp_cache.pop("cdp", None)
-        return None, None
+        with _real_profile_cdp_lock:
+            return None, _revoke_real_profile_access()
 
     # Lightpanda cannot load a Chromium profile — agent-browser rejects
     # ``--profile`` outright under that engine ("Profiles are not supported
@@ -1609,6 +1624,9 @@ def _real_profile_cdp() -> tuple:
     )
 
     with _real_profile_cdp_lock:
+        # Consent can change while this call waits behind another launch.
+        if not _use_real_profile():
+            return None, _revoke_real_profile_access()
         browser = detect_default_chromium()
         if browser is None:
             return None, (
@@ -1632,15 +1650,19 @@ def _real_profile_cdp() -> tuple:
                 "the toggle off."
             )
 
+        copy_dir = real_profile_copy_dir(browser)
         # Reuse a live copy-browser from an earlier call this process made only
-        # after re-validating the configured identity assertion. The pin can
-        # change while this process remains alive.
+        # when it owns the currently selected browser's managed data directory.
+        # The default browser and pin can both change while this process lives.
         cached = _real_profile_cdp_cache.get("cdp")
-        if cached and _cdp_http_ready(cached):
+        if cached and _cdp_http_ready(cached) and _cdp_on_data_dir(cached, copy_dir):
             identity_err = validate_managed_real_profile_identity(browser)
             if identity_err:
                 return None, f"browser.use_real_profile is on, but {identity_err}"
             return cached, None
+        if cached:
+            _agent_browser_close_session(_REAL_PROFILE_SESSION)
+            _terminate_real_profile_chrome()
         _real_profile_cdp_cache.pop("cdp", None)
 
         # Reuse BEFORE writing anything. A shared copy-browser may already be up
@@ -1652,7 +1674,6 @@ def _real_profile_cdp() -> tuple:
         # as a PATH only (no copy), probe reuse, and return early on a hit. The
         # snapshot/overlay happens solely on the relaunch path below, when no
         # live browser owns the dir.
-        copy_dir = real_profile_copy_dir(browser)
         existing = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
         if existing and _cdp_http_ready(existing) and _cdp_on_data_dir(existing, copy_dir):
             identity_err = validate_managed_real_profile_identity(browser)

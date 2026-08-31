@@ -916,6 +916,92 @@ def _processes_holding_profile(src: str):
         yield proc
 
 
+def _managed_profile_processes(root: str):
+    """Yield Chromium processes whose user-data-dir is below ``root``.
+
+    Consent revocation may run in a different Hermes process from the one that
+    launched Chromium, so Popen handles are insufficient.  Match the structured
+    ``--user-data-dir`` argument and require its resolved path to remain inside
+    this profile's managed store; an unrelated source-profile browser is never
+    eligible.
+    """
+    try:
+        import psutil
+    except ImportError:  # hard dep; defensive
+        return
+
+    managed_root = os.path.normcase(os.path.abspath(root))
+    browser_bins = {
+        "brave", "brave.exe", "brave browser", "chrome", "chrome.exe",
+        "chromium", "chromium.exe", "chromium-browser", "google chrome",
+        "google-chrome", "google-chrome-stable", "microsoft edge",
+        "microsoft-edge", "microsoft-edge-stable", "msedge", "msedge.exe",
+    }
+    for proc in psutil.process_iter(["name", "cmdline"]):
+        try:
+            name = (proc.info.get("name") or "").lower()
+            cmd = proc.info.get("cmdline") or []
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            continue
+        argv0 = os.path.basename(cmd[0]).lower() if cmd else ""
+        if name not in browser_bins and argv0 not in browser_bins:
+            continue
+
+        data_dirs = []
+        for index, arg in enumerate(cmd):
+            if arg.startswith("--user-data-dir="):
+                data_dirs.append(arg.split("=", 1)[1])
+            elif arg == "--user-data-dir" and index + 1 < len(cmd):
+                data_dirs.append(cmd[index + 1])
+        for data_dir in data_dirs:
+            candidate = os.path.normcase(os.path.abspath(data_dir.strip('"')))
+            try:
+                if os.path.commonpath((managed_root, candidate)) == managed_root:
+                    yield proc
+                    break
+            except ValueError:  # different drives on Windows
+                continue
+
+
+def _terminate_managed_profile_browsers(root: str, timeout: float = 15.0) -> bool:
+    """Stop every Chromium process bound to a managed profile below ``root``."""
+    try:
+        import psutil
+    except ImportError:
+        logger.warning("real-profile: psutil unavailable; cannot revoke live sessions")
+        return False
+
+    procs = list(_managed_profile_processes(root))
+    targets = []
+    seen = set()
+    for proc in procs:
+        for target in (proc, *(_safe_process_children(proc, psutil))):
+            identity = getattr(target, "pid", id(target))
+            if identity not in seen:
+                seen.add(identity)
+                targets.append(target)
+    for proc in targets:
+        try:
+            proc.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+    _gone, alive = psutil.wait_procs(targets, timeout=min(timeout, 8.0))
+    for proc in alive:
+        try:
+            proc.kill()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+    _gone, alive = psutil.wait_procs(alive, timeout=min(3.0, timeout))
+    return not alive
+
+
+def _safe_process_children(proc, psutil_module) -> list:
+    try:
+        return proc.children(recursive=True)
+    except (psutil_module.NoSuchProcess, psutil_module.AccessDenied, OSError):
+        return []
+
+
 def close_browser_holding_profile(src: str, timeout: float = 15.0) -> tuple[bool, str]:
     """Terminate the browser process tree holding ``src`` and wait for release.
 
@@ -1150,19 +1236,29 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     return dst, None
 
 
-def cleanup_real_profile_snapshots() -> None:
+def cleanup_real_profile_snapshots() -> bool:
     """Delete the whole real-profile snapshot store (all copied credentials).
 
     Called when consent is OFF: the copied Cookies / Login Data must not
-    outlive the toggle. Best-effort and idempotent — missing dir is fine.
+    outlive the toggle. Browsers on this profile's managed data dirs are ours
+    to terminate; source-profile browsers are outside ``root`` and untouched.
+    Returns true only when the credential store is absent after cleanup.
     """
     root = str(get_hermes_home() / "browser-profile")
+    if not os.path.isdir(root):
+        return True
     try:
-        if os.path.isdir(root):
-            shutil.rmtree(root, ignore_errors=True)
-            logger.info("real-profile: removed snapshot store %s (consent off)", root)
+        if not _terminate_managed_profile_browsers(root):
+            logger.warning("real-profile: managed browser did not stop during consent revocation")
+        shutil.rmtree(root)
     except OSError as e:
-        logger.debug("real-profile cleanup failed for %s: %s", root, e)
+        logger.warning("real-profile cleanup failed for %s: %s", root, e)
+        return False
+    if os.path.exists(root):
+        logger.warning("real-profile: snapshot store remains after consent revocation: %s", root)
+        return False
+    logger.info("real-profile: removed snapshot store %s (consent off)", root)
+    return True
 
 
 def get_chrome_debug_candidates(system: str) -> list[str]:
