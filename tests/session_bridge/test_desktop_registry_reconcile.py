@@ -699,6 +699,107 @@ def test_bootstrap_is_independent_of_root_arrival_order(tmp_path: Path) -> None:
     }
 
 
+def test_quarantined_protected_group_survives_later_cycles(tmp_path: Path) -> None:
+    """A record whose cliSessionId stays quarantined must not poison later cycles.
+
+    Quarantined groups never receive baselines, so a later steady-state cycle
+    sees full baselines for every accepted group and none for the protected
+    one.  That must read as a standing conflict, not a validation error, and
+    the record's other groups must keep converging.
+    """
+    a, b, c = (tmp_path / name for name in ("a", "b", "c"))
+    _write_record(a, "local_one", mtime_ns=100, cliSessionId="cli-a")
+    _write_record(b, "local_one", mtime_ns=300, cliSessionId="cli-b")
+    _write_record(c, "local_one", mtime_ns=200, cliSessionId="cli-a")
+    initial = build_registry_sync_plan(_scan(a, b, c), baselines=())
+    assert not any(
+        baseline.group_name == "protected:cliSessionId"
+        for baseline in initial.proposed_baselines
+    )
+    for mutation in initial.records["local_one.json"].mutations:
+        root = initial.scan.roots[mutation.root_id].path
+        (root / mutation.filename).write_text(mutation.after_bytes, encoding="utf-8")
+
+    path = a / "local_one.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["title"] = "Edited later"
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+    plan = build_registry_sync_plan(
+        _scan(a, b, c), baselines=initial.proposed_baselines
+    )
+
+    conflict = next(
+        item for item in plan.conflicts if item.group_name == "protected:cliSessionId"
+    )
+    assert conflict.reason == "protected_linkage_divergence"
+    desired = plan.records["local_one.json"].desired_groups["field:title"]
+    assert json.loads(desired)["value"] == "Edited later"
+    assert all(
+        "cliSessionId" not in mutation.changed_fields
+        for mutation in plan.records["local_one.json"].mutations
+    )
+
+
+def test_unaccepted_group_is_accepted_when_observations_collapse(
+    tmp_path: Path,
+) -> None:
+    a, b, c = (tmp_path / name for name in ("a", "b", "c"))
+    _write_record(a, "local_one", mtime_ns=300, title="A")
+    _write_record(b, "local_one", mtime_ns=300, title="B")
+    _write_record(c, "local_one", mtime_ns=100, title="C")
+    initial = build_registry_sync_plan(_scan(a, b, c), baselines=())
+    tie = next(
+        item for item in initial.conflicts if item.group_name == "field:title"
+    )
+    assert tie.reason == "bootstrap_newest_tie"
+
+    for root in (a, b, c):
+        path = root / "local_one.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["title"] = "Agreed"
+        path.write_text(json.dumps(record), encoding="utf-8")
+
+    plan = build_registry_sync_plan(
+        _scan(a, b, c), baselines=initial.proposed_baselines
+    )
+
+    assert not any(item.group_name == "field:title" for item in plan.conflicts)
+    desired = plan.records["local_one.json"].desired_groups["field:title"]
+    assert json.loads(desired)["value"] == "Agreed"
+    assert any(
+        baseline.group_name == "field:title"
+        for baseline in plan.proposed_baselines
+    )
+
+
+def test_unaccepted_group_divergence_never_reruns_newest_wins(
+    tmp_path: Path,
+) -> None:
+    """After bootstrap, mtimes stop being conflict-resolution evidence."""
+    a, b, c = (tmp_path / name for name in ("a", "b", "c"))
+    _write_record(a, "local_one", mtime_ns=300, title="A")
+    _write_record(b, "local_one", mtime_ns=300, title="B")
+    _write_record(c, "local_one", mtime_ns=100, title="C")
+    initial = build_registry_sync_plan(_scan(a, b, c), baselines=())
+
+    path = a / "local_one.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["title"] = "Newest by mtime"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    os.utime(path, ns=(900, 900))
+
+    plan = build_registry_sync_plan(
+        _scan(a, b, c), baselines=initial.proposed_baselines
+    )
+
+    conflict = next(
+        item for item in plan.conflicts if item.group_name == "field:title"
+    )
+    assert conflict.reason == "unaccepted_group_divergence"
+    assert "field:title" not in plan.records["local_one.json"].desired_groups
+
+
 def test_baseline_requires_every_root_and_group(tmp_path: Path) -> None:
     a, b, c = (tmp_path / name for name in ("a", "b", "c"))
     for root in (a, b, c):

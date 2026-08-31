@@ -504,31 +504,18 @@ def _changed_fields(group_name: str, value_json: str) -> dict[str, Mapping[str, 
 
 def _validate_baselines(
     scan: RegistryScan,
-    baseline_index: Mapping[tuple[str, str, str], RegistryBaseline],
+    baselines_by_record: Mapping[str, Mapping[str, Mapping[str, RegistryBaseline]]],
 ) -> None:
-    by_filename: dict[str, list[RegistryBaseline]] = {}
-    for baseline in baseline_index.values():
-        by_filename.setdefault(baseline.filename, []).append(baseline)
-
-    for filename, baselines in by_filename.items():
+    expected_roots = set(scan.roots)
+    for filename, groups in baselines_by_record.items():
         observations = scan.records.get(filename)
         if observations is None:
             raise ValueError(f"baseline references missing record {filename}")
-        groups = {baseline.group_name for baseline in baselines}
-        groups.update(
-            group_name
-            for group_name in set().union(
-                *(set(observation.group_values) for observation in observations.values())
-            )
-            if not group_name.startswith("unknown:")
-        )
-        expected_roots = set(scan.roots)
-        for group_name in groups:
-            covered = {
-                baseline.root_id
-                for baseline in baselines
-                if baseline.group_name == group_name
-            }
+        # A group entirely absent from the baselines was never accepted (for
+        # example a standing quarantine); that is legitimate.  Only PARTIAL
+        # root coverage is evidence of a torn or foreign write.
+        for group_name, rows in groups.items():
+            covered = set(rows)
             if covered != expected_roots:
                 raise ValueError(
                     f"incomplete baseline for {filename} {group_name}: "
@@ -564,19 +551,52 @@ def _bootstrap_decision(
     )
 
 
+def _unaccepted_group_decision(
+    filename: str,
+    group_name: str,
+    observations: Mapping[str, RegistryRecordObservation],
+) -> tuple[str | None, RegistryConflict | None]:
+    """Decide a group with no accepted baseline on a record that is past bootstrap.
+
+    File mtimes were spent as evidence during the one-time bootstrap; they are
+    never conflict-resolution authority afterwards.  The only accepted retry
+    path for a standing quarantine is the observations collapsing to one value.
+    """
+    values = {
+        root_id: _value_for_group(observation, group_name)
+        for root_id, observation in observations.items()
+    }
+    if group_name.startswith("unknown:"):
+        return None, RegistryConflict(
+            filename=filename,
+            group_name=group_name,
+            reason="unknown_field_unclassified",
+            candidates=MappingProxyType(values),
+        )
+    if len(set(values.values())) == 1:
+        return next(iter(values.values())), None
+    reason = (
+        "protected_linkage_divergence"
+        if group_name.startswith("protected:")
+        else "unaccepted_group_divergence"
+    )
+    return None, RegistryConflict(
+        filename=filename,
+        group_name=group_name,
+        reason=reason,
+        candidates=MappingProxyType(values),
+    )
+
+
 def _steady_state_decision(
     filename: str,
     group_name: str,
     observations: Mapping[str, RegistryRecordObservation],
-    baseline_index: Mapping[tuple[str, str, str], RegistryBaseline],
+    baseline_rows: Mapping[str, RegistryBaseline],
 ) -> tuple[str | None, RegistryConflict | None]:
     changed: dict[str, str] = {}
     current: dict[str, str] = {}
-    baseline_values = {
-        baseline.value_json
-        for key, baseline in baseline_index.items()
-        if key[0] == filename and key[2] == group_name
-    }
+    baseline_values = {baseline.value_json for baseline in baseline_rows.values()}
 
     if group_name.startswith("unknown:"):
         current = {
@@ -595,7 +615,7 @@ def _steady_state_decision(
     for root_id, observation in observations.items():
         value = _value_for_group(observation, group_name)
         current[root_id] = value
-        baseline = baseline_index[(filename, root_id, group_name)]
+        baseline = baseline_rows[root_id]
         if value != baseline.value_json:
             changed[root_id] = value
 
@@ -639,14 +659,18 @@ def build_registry_sync_plan(
     scan: RegistryScan, *, baselines: Iterable[RegistryBaseline]
 ) -> RegistrySyncPlan:
     """Plan field-level convergence without mutating files or durable state."""
-    baseline_rows = tuple(baselines)
-    baseline_index: dict[tuple[str, str, str], RegistryBaseline] = {}
-    for baseline in baseline_rows:
-        key = (baseline.filename, baseline.root_id, baseline.group_name)
-        if key in baseline_index:
-            raise ValueError(f"duplicate baseline: {key}")
-        baseline_index[key] = baseline
-    _validate_baselines(scan, baseline_index)
+    baselines_by_record: dict[str, dict[str, dict[str, RegistryBaseline]]] = {}
+    for baseline in baselines:
+        rows = baselines_by_record.setdefault(baseline.filename, {}).setdefault(
+            baseline.group_name, {}
+        )
+        if baseline.root_id in rows:
+            raise ValueError(
+                "duplicate baseline: "
+                f"{(baseline.filename, baseline.root_id, baseline.group_name)}"
+            )
+        rows[baseline.root_id] = baseline
+    _validate_baselines(scan, baselines_by_record)
 
     record_plans: dict[str, RegistryRecordPlan] = {}
     conflicts: list[RegistryConflict] = []
@@ -658,22 +682,27 @@ def build_registry_sync_plan(
         if len(session_ids) != 1:
             raise ValueError(f"record group has divergent identities: {filename}")
         session_id = next(iter(session_ids))
+        record_baselines = baselines_by_record.get(filename, {})
         groups = set().union(
             *(set(observation.group_values) for observation in observations.values())
         )
-        groups.update(
-            baseline.group_name
-            for baseline in baseline_rows
-            if baseline.filename == filename
-        )
-        has_baseline = any(key[0] == filename for key in baseline_index)
+        groups.update(record_baselines)
+        record_has_baseline = bool(record_baselines)
         desired: dict[str, str] = {}
         group_conflicts: list[RegistryConflict] = []
 
         for group_name in sorted(groups):
-            if has_baseline:
+            group_baselines = record_baselines.get(group_name)
+            if group_baselines is not None:
                 decision, conflict = _steady_state_decision(
-                    filename, group_name, observations, baseline_index
+                    filename, group_name, observations, group_baselines
+                )
+            elif record_has_baseline:
+                # The record is past bootstrap but this group was never
+                # accepted (a standing quarantine, or a field newly classified
+                # since).  Mtimes are no longer evidence for it.
+                decision, conflict = _unaccepted_group_decision(
+                    filename, group_name, observations
                 )
             elif group_name.startswith(("protected:", "unknown:")):
                 values = {
@@ -747,12 +776,10 @@ def build_registry_sync_plan(
                 )
 
         for group_name, value_json in desired.items():
-            prior_revisions = [
-                baseline.revision
-                for baseline in baseline_rows
-                if baseline.filename == filename and baseline.group_name == group_name
-            ]
-            revision = max(prior_revisions, default=0) + 1
+            prior = record_baselines.get(group_name, {})
+            revision = max(
+                (baseline.revision for baseline in prior.values()), default=0
+            ) + 1
             for root_id in scan.roots:
                 proposed.append(
                     RegistryBaseline(
