@@ -8,6 +8,7 @@ b-tree/schema header bytes), not mocked cursor exceptions.
 
 from __future__ import annotations
 
+import json
 import shutil
 import sqlite3
 from pathlib import Path
@@ -426,6 +427,12 @@ def _make_synthetic_lost_and_found(
 def test_classify_lost_and_found_row_sentinels() -> None:
     assert (
         classify_lost_and_found_row(
+            4, ("cold-purged", "terminal", "b" * 64, 123.0)
+        )
+        == "cold_archive_tombstones"
+    )
+    assert (
+        classify_lost_and_found_row(
             23, (None, "20260101_010101_aaa001", "user", "hi")
         )
         == "messages"
@@ -464,6 +471,255 @@ def test_classify_lost_and_found_row_sentinels() -> None:
         classify_lost_and_found_row(23, (None, "sess", "not-a-role", "x")) is None
     )
     assert classify_lost_and_found_row(0, ()) is None
+
+
+def _add_direct_session_conflicting_with_tombstone(
+    lf_conn: sqlite3.Connection,
+) -> None:
+    lf_conn.execute(
+        "CREATE TABLE sessions ("
+        "id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at REAL NOT NULL)"
+    )
+    lf_conn.execute(
+        "INSERT INTO sessions VALUES (?, ?, ?)",
+        ("cold-purged", "cli", 123.0),
+    )
+    lf_conn.execute(
+        "CREATE TABLE messages ("
+        "id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL, "
+        "content TEXT, timestamp REAL NOT NULL)"
+    )
+    lf_conn.execute(
+        "INSERT INTO messages VALUES (?, ?, ?, ?, ?)",
+        (1, "cold-purged", "user", "stale hot row", 124.0),
+    )
+
+
+def test_mapper_preserves_unattributed_cold_archive_tombstones(
+    tmp_path: Path,
+) -> None:
+    lf_conn = sqlite3.connect(":memory:", isolation_level=None)
+    _add_direct_session_conflicting_with_tombstone(lf_conn)
+    lf_conn.execute(
+        "CREATE TABLE lost_and_found ("
+        "rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, "
+        "c0, c1, c2, c3)"
+    )
+    lf_conn.execute(
+        "INSERT INTO lost_and_found VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (1, 2, 4, 9, "cold-purged", "terminal", "c" * 64, 789.0),
+    )
+    output = tmp_path / "mapped-unattributed.db"
+    SessionDB(db_path=output).close()
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+        assert mapping["mapped"]["cold_archive_tombstones"] == 1
+        assert mapping["tombstone_reconciliation"]["sessions_removed"] == 1
+        assert mapping["tombstone_reconciliation"]["messages_removed"] == 1
+        assert stub_missing_parent_sessions(dest)["sessions_stubbed"] == 0
+    finally:
+        lf_conn.close()
+        dest.close()
+
+    recovered = SessionDB(db_path=output)
+    try:
+        assert recovered.get_messages("cold-purged") == []
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            recovered.create_session("cold-purged", source="recovery-test")
+        assert recovered.get_session("cold-purged") is None
+    finally:
+        recovered.close()
+
+
+def test_mapper_preserves_attributed_cold_archive_tombstones(
+    tmp_path: Path,
+) -> None:
+    lf_conn = sqlite3.connect(":memory:", isolation_level=None)
+    _add_direct_session_conflicting_with_tombstone(lf_conn)
+    lf_conn.execute(
+        "CREATE TABLE cold_archive_tombstones ("
+        "session_id TEXT PRIMARY KEY, "
+        "terminal_id TEXT NOT NULL, "
+        "source_fingerprint TEXT NOT NULL, "
+        "deleted_at REAL NOT NULL)"
+    )
+    lf_conn.execute(
+        "INSERT INTO cold_archive_tombstones VALUES (?, ?, ?, ?)",
+        ("cold-purged", "terminal", "a" * 64, 456.0),
+    )
+    output = tmp_path / "mapped.db"
+    SessionDB(db_path=output).close()
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+        assert mapping["direct_table_rows"]["cold_archive_tombstones"] == 1
+        assert mapping["tombstone_reconciliation"]["sessions_removed"] == 1
+        assert mapping["tombstone_reconciliation"]["messages_removed"] == 1
+        assert stub_missing_parent_sessions(dest)["sessions_stubbed"] == 0
+    finally:
+        lf_conn.close()
+        dest.close()
+
+    recovered = SessionDB(db_path=output)
+    try:
+        assert recovered.get_messages("cold-purged") == []
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            recovered.create_session("cold-purged", source="recovery-test")
+        assert recovered.get_session("cold-purged") is None
+    finally:
+        recovered.close()
+
+
+def test_mapper_removes_prompt_from_tombstone_rejected_session(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "mapped-rejected-prompt.db"
+    SessionDB(db_path=output).close()
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    session_columns = [
+        str(row[1]) for row in dest.execute("PRAGMA table_info(sessions)").fetchall()
+    ]
+    prompt_index = session_columns.index("system_prompt_hash")
+    cells: list[object | None] = [None] * len(session_columns)
+    cells[0] = "20260824_120000_deadbe"
+    cells[1] = "cli"
+    cells[prompt_index] = "orphan-prompt-hash"
+
+    lf_conn = sqlite3.connect(":memory:", isolation_level=None)
+    lf_conn.execute(
+        "CREATE TABLE system_prompts (hash TEXT PRIMARY KEY, prompt TEXT NOT NULL)"
+    )
+    lf_conn.execute(
+        "INSERT INTO system_prompts VALUES (?, ?)",
+        ("orphan-prompt-hash", "recovered orphan prompt"),
+    )
+    lf_conn.execute(
+        "CREATE TABLE cold_archive_tombstones ("
+        "session_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, "
+        "source_fingerprint TEXT NOT NULL, deleted_at REAL NOT NULL)"
+    )
+    lf_conn.execute(
+        "INSERT INTO cold_archive_tombstones VALUES (?, ?, ?, ?)",
+        (
+            "20260824_120000_deadbe",
+            "20260824_120000_deadbe",
+            "f" * 64,
+            900.0,
+        ),
+    )
+    cell_columns = ", ".join(f"c{index}" for index in range(len(cells)))
+    placeholders = ", ".join("?" for _ in range(4 + len(cells)))
+    lf_conn.execute(
+        "CREATE TABLE lost_and_found ("
+        "rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, "
+        f"{cell_columns})"
+    )
+    lf_conn.execute(
+        f"INSERT INTO lost_and_found VALUES ({placeholders})",
+        (1, 2, len(cells), 99, *cells),
+    )
+
+    try:
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+        assert mapping["unmapped_rows"] == 1
+        assert mapping["tombstone_reconciliation"]["system_prompts_removed"] == 1
+        assert dest.execute("SELECT COUNT(*) FROM system_prompts").fetchone()[0] == 0
+        assert dest.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+    finally:
+        lf_conn.close()
+        dest.close()
+
+
+def test_mapper_reconciles_prompts_and_routes_for_tombstoned_ids(
+    tmp_path: Path,
+) -> None:
+    lf_conn = sqlite3.connect(":memory:", isolation_level=None)
+    lf_conn.execute(
+        "CREATE TABLE system_prompts (hash TEXT PRIMARY KEY, prompt TEXT NOT NULL)"
+    )
+    lf_conn.execute(
+        "INSERT INTO system_prompts VALUES (?, ?)",
+        ("prompt-hash", "recovered secret prompt"),
+    )
+    lf_conn.execute(
+        "CREATE TABLE sessions ("
+        "id TEXT PRIMARY KEY, source TEXT NOT NULL, started_at REAL NOT NULL, "
+        "system_prompt_hash TEXT)"
+    )
+    lf_conn.executemany(
+        "INSERT INTO sessions VALUES (?, ?, ?, ?)",
+        [
+            ("cold-purged", "cli", 123.0, "prompt-hash"),
+            ("survivor", "cli", 124.0, None),
+        ],
+    )
+    lf_conn.execute(
+        "CREATE TABLE cold_archive_tombstones ("
+        "session_id TEXT PRIMARY KEY, terminal_id TEXT NOT NULL, "
+        "source_fingerprint TEXT NOT NULL, deleted_at REAL NOT NULL)"
+    )
+    lf_conn.execute(
+        "INSERT INTO cold_archive_tombstones VALUES (?, ?, ?, ?)",
+        ("cold-purged", "cold-purged", "d" * 64, 789.0),
+    )
+    lf_conn.execute(
+        "CREATE TABLE gateway_routing ("
+        "scope TEXT NOT NULL, session_key TEXT NOT NULL, "
+        "entry_json TEXT NOT NULL, updated_at REAL NOT NULL, "
+        "PRIMARY KEY (scope, session_key))"
+    )
+    lf_conn.executemany(
+        "INSERT INTO gateway_routing VALUES (?, ?, ?, ?)",
+        [
+            ("test", "cold-key", json.dumps({"session_id": "cold-purged"}), 1.0),
+            ("test", "survivor-key", json.dumps({"session_id": "survivor"}), 2.0),
+        ],
+    )
+    lf_conn.execute("CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT)")
+    lf_conn.executemany(
+        "INSERT INTO state_meta VALUES (?, ?)",
+        [("goal:cold-purged", "stale"), ("goal:survivor", "keep")],
+    )
+    lf_conn.execute(
+        "CREATE TABLE async_delegations ("
+        "delegation_id TEXT PRIMARY KEY, origin_session TEXT NOT NULL, "
+        "parent_session_id TEXT, origin_session_id TEXT NOT NULL DEFAULT '', "
+        "state TEXT NOT NULL, dispatched_at REAL NOT NULL, updated_at REAL NOT NULL)"
+    )
+    lf_conn.executemany(
+        "INSERT INTO async_delegations VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            ("cold-delegation", "cold-purged", None, "", "completed", 1.0, 2.0),
+            ("keep-delegation", "survivor", None, "", "completed", 1.0, 2.0),
+        ],
+    )
+
+    output = tmp_path / "mapped-prompt-route.db"
+    SessionDB(db_path=output).close()
+    dest = sqlite3.connect(str(output), isolation_level=None)
+    try:
+        mapping = map_lost_and_found_rows(lf_conn, dest)
+        reconciliation = mapping["tombstone_reconciliation"]
+        assert reconciliation["system_prompts_removed"] == 1
+        assert reconciliation["gateway_routes_removed"] == 1
+        assert reconciliation["state_meta_removed"] == 1
+        assert reconciliation["async_delegations_removed"] == 1
+        assert dest.execute("SELECT COUNT(*) FROM system_prompts").fetchone()[0] == 0
+        routes = dest.execute(
+            "SELECT session_key FROM gateway_routing ORDER BY session_key"
+        ).fetchall()
+        assert routes == [("survivor-key",)]
+        assert dest.execute(
+            "SELECT key FROM state_meta ORDER BY key"
+        ).fetchall() == [("goal:survivor",)]
+        assert dest.execute(
+            "SELECT delegation_id FROM async_delegations ORDER BY delegation_id"
+        ).fetchall() == [("keep-delegation",)]
+        assert stub_missing_parent_sessions(dest)["sessions_stubbed"] == 0
+    finally:
+        lf_conn.close()
+        dest.close()
 
 
 def test_mapper_rebuilds_sessiondb_from_synthetic_lost_and_found(

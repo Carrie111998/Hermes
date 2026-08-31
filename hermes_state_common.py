@@ -427,6 +427,23 @@ CREATE TABLE IF NOT EXISTS sessions (
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
 
+CREATE TABLE IF NOT EXISTS cold_archive_tombstones (
+    session_id TEXT PRIMARY KEY,
+    terminal_id TEXT NOT NULL,
+    source_fingerprint TEXT NOT NULL,
+    deleted_at REAL NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS sessions_reject_cold_archive_tombstone
+BEFORE INSERT ON sessions
+WHEN EXISTS (
+    SELECT 1 FROM cold_archive_tombstones
+    WHERE session_id = NEW.id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'session ID is cold-archived and cannot be recreated');
+END;
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -489,6 +506,32 @@ CREATE TABLE IF NOT EXISTS gateway_routing (
     PRIMARY KEY (scope, session_key)
 );
 
+CREATE TRIGGER IF NOT EXISTS gateway_routing_reject_cold_archive_tombstone_insert
+BEFORE INSERT ON gateway_routing
+WHEN CASE
+    WHEN json_valid(NEW.entry_json) THEN EXISTS (
+        SELECT 1 FROM cold_archive_tombstones
+        WHERE session_id = json_extract(NEW.entry_json, '$.session_id')
+    )
+    ELSE 0
+END
+BEGIN
+    SELECT RAISE(ABORT, 'gateway route targets a cold-archived session ID');
+END;
+
+CREATE TRIGGER IF NOT EXISTS gateway_routing_reject_cold_archive_tombstone_update
+BEFORE UPDATE OF entry_json ON gateway_routing
+WHEN CASE
+    WHEN json_valid(NEW.entry_json) THEN EXISTS (
+        SELECT 1 FROM cold_archive_tombstones
+        WHERE session_id = json_extract(NEW.entry_json, '$.session_id')
+    )
+    ELSE 0
+END
+BEGIN
+    SELECT RAISE(ABORT, 'gateway route targets a cold-archived session ID');
+END;
+
 CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
     session_key TEXT PRIMARY KEY,
     failure_streak INTEGER NOT NULL DEFAULT 0
@@ -543,7 +586,8 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     owner_started_at INTEGER,
     task_json TEXT,
     delivery_claim TEXT,
-    delivery_claimed_at REAL
+    delivery_claimed_at REAL,
+    origin_session_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);

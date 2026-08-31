@@ -300,6 +300,262 @@ def _corrupt_table_root(path: Path, root_page: int) -> None:
     path.write_bytes(data)
 
 
+def test_recovery_preserves_cold_archive_tombstone_fence(tmp_path: Path) -> None:
+    source = tmp_path / "source.db"
+    output = tmp_path / "recovered.db"
+    db = SessionDB(db_path=source)
+    try:
+        assert db._conn is not None
+        db._conn.execute(
+            "INSERT INTO cold_archive_tombstones "
+            "(session_id, terminal_id, source_fingerprint, deleted_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("cold-purged", "terminal", "f" * 64, 123.0),
+        )
+    finally:
+        db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    assert report["copy"]["cold_archive_tombstones"]["status"] == "complete"
+    assert report["verification"]["table_counts"]["cold_archive_tombstones"] == 1
+    recovered = SessionDB(db_path=output)
+    try:
+        assert recovered._conn is not None
+        row = recovered._conn.execute(
+            "SELECT terminal_id, source_fingerprint, deleted_at "
+            "FROM cold_archive_tombstones WHERE session_id = ?",
+            ("cold-purged",),
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == ("terminal", "f" * 64, 123.0)
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            recovered.create_session("cold-purged", source="recovery-test")
+        assert recovered.get_session("cold-purged") is None
+    finally:
+        recovered.close()
+
+
+def test_recovery_removes_rows_that_conflict_with_cold_archive_tombstones(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-conflict.db"
+    output = tmp_path / "recovered-conflict.db"
+    db = SessionDB(db_path=source)
+    try:
+        db.create_session("cold-purged", source="cli")
+        db.append_message("cold-purged", role="user", content="stale hot row")
+        assert db._conn is not None
+        db._conn.execute(
+            "INSERT INTO cold_archive_tombstones "
+            "(session_id, terminal_id, source_fingerprint, deleted_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("cold-purged", "terminal", "e" * 64, 321.0),
+        )
+    finally:
+        db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    assert report["tombstone_reconciliation"] == {
+        "sessions_removed": 1,
+        "sessions_parent_cleared": 0,
+        "system_prompts_removed": 0,
+        "gateway_routes_removed": 0,
+        "gateway_routes_unverifiable": 0,
+        "state_meta_removed": 0,
+        "async_delegations_removed": 0,
+        "messages_removed": 1,
+        "session_model_usage_removed": 0,
+        "compression_locks_removed": 0,
+        "telegram_dm_topic_bindings_removed": 0,
+    }
+    assert report["verification"]["healthy"] is True
+    assert report["verification"]["table_counts"]["sessions"] == 0
+    assert report["verification"]["table_counts"]["messages"] == 0
+    recovered = SessionDB(db_path=output)
+    try:
+        assert recovered.get_session("cold-purged") is None
+        assert recovered.get_messages("cold-purged") == []
+        with pytest.raises(sqlite3.IntegrityError, match="cold-archived"):
+            recovered.create_session("cold-purged", source="recovery-test")
+    finally:
+        recovered.close()
+
+
+def test_recovery_removes_only_prompts_orphaned_by_tombstone_authority(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-prompts.db"
+    output = tmp_path / "recovered-prompts.db"
+    db = SessionDB(db_path=source)
+    try:
+        db.create_session("cold-unique", source="cli")
+        db.update_system_prompt("cold-unique", "orphaned secret prompt")
+        db.create_session("cold-shared", source="cli")
+        db.update_system_prompt("cold-shared", "shared surviving prompt")
+        db.create_session("survivor", source="cli")
+        db.update_system_prompt("survivor", "shared surviving prompt")
+        assert db._conn is not None
+        db._conn.executemany(
+            "INSERT INTO cold_archive_tombstones "
+            "(session_id, terminal_id, source_fingerprint, deleted_at) "
+            "VALUES (?, ?, ?, ?)",
+            [
+                ("cold-unique", "cold-unique", "1" * 64, 100.0),
+                ("cold-shared", "cold-shared", "2" * 64, 101.0),
+            ],
+        )
+    finally:
+        db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    assert report["tombstone_reconciliation"]["system_prompts_removed"] == 1
+    recovered = SessionDB(db_path=output)
+    try:
+        assert recovered._conn is not None
+        prompts = [
+            str(row[0])
+            for row in recovered._conn.execute(
+                "SELECT prompt FROM system_prompts ORDER BY prompt"
+            ).fetchall()
+        ]
+        assert prompts == ["shared surviving prompt"]
+        assert recovered.get_session("cold-unique") is None
+        assert recovered.get_session("cold-shared") is None
+        assert recovered.get_session("survivor") is not None
+    finally:
+        recovered.close()
+
+
+def test_recovery_removes_only_routes_targeting_tombstoned_ids(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-routes.db"
+    output = tmp_path / "recovered-routes.db"
+    db = SessionDB(db_path=source)
+    try:
+        db.create_session("cold-purged", source="cli")
+        db.create_session("survivor", source="cli")
+        db.save_gateway_routing_entry(
+            "cold-key",
+            json.dumps({"session_id": "cold-purged"}),
+            scope="test",
+        )
+        db.save_gateway_routing_entry(
+            "survivor-key",
+            json.dumps({"session_id": "survivor"}),
+            scope="test",
+        )
+        db.save_gateway_routing_entry("malformed-key", "{broken", scope="test")
+        assert db._conn is not None
+        db._conn.execute(
+            "INSERT INTO cold_archive_tombstones "
+            "(session_id, terminal_id, source_fingerprint, deleted_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("cold-purged", "cold-purged", "3" * 64, 102.0),
+        )
+    finally:
+        db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    reconciliation = report["tombstone_reconciliation"]
+    assert reconciliation["gateway_routes_removed"] == 1
+    assert reconciliation["gateway_routes_unverifiable"] == 1
+    recovered = SessionDB(db_path=output)
+    try:
+        assert recovered._conn is not None
+        routes = {
+            str(row[0]): str(row[1])
+            for row in recovered._conn.execute(
+                "SELECT session_key, entry_json FROM gateway_routing "
+                "WHERE scope = ? ORDER BY session_key",
+                ("test",),
+            ).fetchall()
+        }
+        assert routes == {
+            "malformed-key": "{broken",
+            "survivor-key": json.dumps({"session_id": "survivor"}),
+        }
+        assert recovered.get_session("cold-purged") is None
+        assert recovered.get_session("survivor") is not None
+    finally:
+        recovered.close()
+
+
+def test_recovery_removes_state_and_delegation_references_to_tombstones(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source-soft-references.db"
+    output = tmp_path / "recovered-soft-references.db"
+    db = SessionDB(db_path=source)
+    try:
+        db.create_session("cold-purged", source="cli")
+        db.create_session("survivor", source="cli")
+        assert db._conn is not None
+        db._conn.execute(
+            "INSERT INTO cold_archive_tombstones "
+            "(session_id, terminal_id, source_fingerprint, deleted_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("cold-purged", "cold-purged", "4" * 64, 103.0),
+        )
+        db._conn.executemany(
+            "INSERT INTO state_meta (key, value) VALUES (?, ?)",
+            [
+                ("goal:cold-purged", "stale"),
+                ("loop:cold-purged", "stale"),
+                ("heartbeat:cold-purged", "stale"),
+                ("goal:survivor", "keep"),
+                ("other:cold-purged", "keep"),
+            ],
+        )
+        db._conn.executemany(
+            "INSERT INTO async_delegations ("
+            "delegation_id, origin_session, parent_session_id, origin_session_id, "
+            "state, dispatched_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                ("by-origin", "cold-purged", None, "", "completed", 1.0, 2.0),
+                ("by-parent", "survivor", "cold-purged", "", "completed", 1.0, 2.0),
+                ("by-origin-id", "survivor", None, "cold-purged", "completed", 1.0, 2.0),
+                ("keep", "survivor", None, "survivor", "completed", 1.0, 2.0),
+            ],
+        )
+    finally:
+        db.close()
+
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    reconciliation = report["tombstone_reconciliation"]
+    assert reconciliation["state_meta_removed"] == 3
+    assert reconciliation["async_delegations_removed"] == 3
+    recovered = SessionDB(db_path=output)
+    try:
+        assert recovered._conn is not None
+        meta = recovered._conn.execute(
+            "SELECT key, value FROM state_meta WHERE key IN (?, ?, ?, ?, ?) "
+            "ORDER BY key",
+            (
+                "goal:cold-purged",
+                "loop:cold-purged",
+                "heartbeat:cold-purged",
+                "goal:survivor",
+                "other:cold-purged",
+            ),
+        ).fetchall()
+        assert [tuple(row) for row in meta] == [
+            ("goal:survivor", "keep"),
+            ("other:cold-purged", "keep"),
+        ]
+        delegations = recovered._conn.execute(
+            "SELECT delegation_id FROM async_delegations ORDER BY delegation_id"
+        ).fetchall()
+        assert [str(row[0]) for row in delegations] == ["keep"]
+    finally:
+        recovered.close()
+
+
 def test_snapshot_blocks_connections_opened_during_the_copy(
     tmp_path: Path,
 ) -> None:

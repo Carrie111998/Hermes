@@ -52,6 +52,7 @@ from agent.skill_commands import (
     describe_skill_invocation,
 )
 from hermes_constants import get_hermes_home
+from hermes_accounting_locks import acquire_pending_accounting_lock
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
@@ -4601,6 +4602,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._token_writer_thread: Optional[threading.Thread] = None
         self._token_writer_stop = False
         self._token_writer_busy = False
+        self._token_accounting_lock_fds: Dict[str, Optional[int]] = {}
+        self._token_writer_failed_sessions: Set[str] = set()
         self._token_atexit_hook: Optional[Callable[[], None]] = None
         initialization_complete = False
         try:
@@ -5791,6 +5794,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         #45383). Read-only connections never request a checkpoint.
         """
         self._stop_token_writer()
+        self._release_token_accounting_locks_if_idle()
         hook, self._token_atexit_hook = self._token_atexit_hook, None
         if hook is not None:
             atexit.unregister(hook)
@@ -8712,6 +8716,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 thread is None or not thread.is_alive()
             )
             if not writer_stopped:
+                if session_id not in self._token_accounting_lock_fds:
+                    self._token_accounting_lock_fds[session_id] = (
+                        acquire_pending_accounting_lock(self.db_path, session_id)
+                    )
                 self._token_queue.append((session_id, kwargs))
                 if thread is None or not thread.is_alive():
                     # Daemon so process exit never hangs on accounting; the
@@ -8750,6 +8758,41 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # update_token_counts path these call sites still guard for.
             self.update_token_counts(session_id, **kwargs)
 
+    def _finish_token_accounting_batch_locked(
+        self,
+        batch: List[Tuple[str, Dict[str, Any]]],
+        failed_sessions: Set[str],
+    ) -> None:
+        """Release shared locks only for successfully drained session queues."""
+        self._token_writer_failed_sessions.update(failed_sessions)
+        still_queued = {session_id for session_id, _kwargs in self._token_queue}
+        completed = {
+            session_id for session_id, _kwargs in batch
+        } - still_queued - self._token_writer_failed_sessions
+        for session_id in completed:
+            descriptor = self._token_accounting_lock_fds.pop(session_id, None)
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def _release_token_accounting_locks_if_idle(self) -> None:
+        """Release retained failure locks only after this owner is fully stopped."""
+        with self._token_queue_cond:
+            thread = self._token_writer_thread
+            if (
+                self._token_queue
+                or self._token_writer_busy
+                or (thread is not None and thread.is_alive())
+            ):
+                return
+            descriptors = [
+                descriptor
+                for descriptor in self._token_accounting_lock_fds.values()
+                if descriptor is not None
+            ]
+            self._token_accounting_lock_fds.clear()
+        for descriptor in descriptors:
+            os.close(descriptor)
+
     def flush_token_counts(self, timeout: float = 5.0) -> bool:
         """Block until every queued token delta has been applied.
 
@@ -8760,7 +8803,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         # Fast path — nothing queued, nothing in flight.
         if not self._token_queue and not self._token_writer_busy:
-            return True
+            return not self._token_writer_failed_sessions
         batch = None
         with self._token_queue_cond:
             deadline = time.monotonic() + timeout
@@ -8793,13 +8836,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     return False
                 self._token_queue_cond.wait(remaining)
         if batch:
+            failed_sessions: Set[str] = set()
             try:
-                self._apply_token_batch(batch)
+                failed_sessions = self._apply_token_batch(batch) or set()
             finally:
                 with self._token_queue_cond:
+                    self._finish_token_accounting_batch_locked(
+                        batch, failed_sessions
+                    )
                     self._token_writer_busy = False
                     self._token_queue_cond.notify_all()
-        return True
+        return not self._token_writer_failed_sessions
 
     def _token_writer_loop(self) -> None:
         while True:
@@ -8816,6 +8863,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._token_queue_cond.wait(remaining)
                 if not self._token_queue:
                     self._token_writer_thread = None
+                    descriptors = [
+                        descriptor
+                        for descriptor in self._token_accounting_lock_fds.values()
+                        if descriptor is not None
+                    ]
+                    self._token_accounting_lock_fds.clear()
+                    for descriptor in descriptors:
+                        os.close(descriptor)
                     return  # stop requested and fully drained
                 # busy is set BEFORE the queue is cleared: the lock-free
                 # fast path in flush_token_counts() reads queue-then-busy,
@@ -8824,15 +8879,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._token_writer_busy = True
                 batch = list(self._token_queue)
                 self._token_queue.clear()
+            failed_sessions: Set[str] = set()
             try:
-                self._apply_token_batch(batch)
+                failed_sessions = self._apply_token_batch(batch) or set()
             finally:
                 with self._token_queue_cond:
+                    self._finish_token_accounting_batch_locked(
+                        batch, failed_sessions
+                    )
                     self._token_writer_busy = False
                     self._token_queue_cond.notify_all()
 
-    def _apply_token_batch(self, batch: List[Tuple[str, Dict[str, Any]]]) -> None:
-        """Apply queued deltas in order, coalescing where safe. Never raises."""
+    def _apply_token_batch(
+        self, batch: List[Tuple[str, Dict[str, Any]]]
+    ) -> Set[str]:
+        """Apply queued deltas and return session IDs whose accounting failed."""
+        failed_sessions: Set[str] = set()
         try:
             coalesced = self._coalesce_token_deltas(batch)
         except Exception as exc:
@@ -8848,12 +8910,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             try:
                 self.update_token_counts(session_id, **kwargs)
             except Exception as exc:
+                failed_sessions.add(session_id)
                 # Same contract as the old inline call sites: accounting
                 # loss is logged, never raised into a turn.
                 logger.warning(
                     "async token accounting: apply failed (session=%s): %s",
                     session_id, exc,
                 )
+        return failed_sessions
 
     def _coalesce_token_deltas(
         self, batch: List[Tuple[str, Dict[str, Any]]]
@@ -8932,10 +8996,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._token_writer_busy = True
                 self._token_queue.clear()
         if batch:
+            failed_sessions: Set[str] = set()
             try:
-                self._apply_token_batch(batch)
+                failed_sessions = self._apply_token_batch(batch) or set()
             finally:
                 with self._token_queue_cond:
+                    self._finish_token_accounting_batch_locked(
+                        batch, failed_sessions
+                    )
                     self._token_writer_busy = False
                     self._token_queue_cond.notify_all()
 

@@ -35,8 +35,9 @@ _CANONICAL_TABLES = (
     "sessions",
     "messages",
     "session_model_usage",
-    "compression_locks",
     "gateway_routing",
+    "cold_archive_tombstones",
+    "compression_locks",
     "async_delegations",
 )
 
@@ -1442,6 +1443,7 @@ def _recover_via_lost_and_found(
     try:
         destination_conn.execute("PRAGMA foreign_keys=OFF")
         mapping = map_lost_and_found_rows(lf_conn, destination_conn)
+        tombstone_reconciliation = mapping["tombstone_reconciliation"]
         stubbing = stub_missing_parent_sessions(destination_conn)
         fts = rebuild_fts_indexes(destination_conn)
         derived_metadata = _finalize_derived_metadata(destination_conn)
@@ -1512,6 +1514,7 @@ def _recover_via_lost_and_found(
         "unreadable_schemas": missing_required,
         "sqlite3_cli": cli_report,
         "lost_and_found": mapping,
+        "tombstone_reconciliation": tombstone_reconciliation,
         "session_stubs": stubbing,
         "fts_rebuild": fts,
         "copy": copy_report,
@@ -1662,6 +1665,13 @@ def recover_session_database(
                     progress_cb=progress_cb,
                     source_rows=table_inspection.get("rows"),
                 )
+            from hermes_cli.session_lost_and_found import (
+                reconcile_cold_archive_tombstones,
+            )
+
+            tombstone_reconciliation = reconcile_cold_archive_tombstones(
+                destination_conn
+            )
             orphan_cleanup = (
                 _cleanup_partial_orphans(destination_conn)
                 if allow_partial
@@ -1675,12 +1685,23 @@ def recover_session_database(
             if destination_db is not None:
                 destination_db.close()
 
+        expected_counts = {
+            table: inspection["tables"][table].get("rows")
+            for table in _CANONICAL_TABLES
+        }
+        for table, removed_key in (
+            ("sessions", "sessions_removed"),
+            ("messages", "messages_removed"),
+        ):
+            expected = expected_counts.get(table)
+            if expected is not None:
+                expected_counts[table] = max(
+                    0, int(expected) - tombstone_reconciliation[removed_key]
+                )
+
         verification = _verify_recovered_database(
             output,
-            expected_counts={
-                table: inspection["tables"][table].get("rows")
-                for table in _CANONICAL_TABLES
-            },
+            expected_counts=expected_counts,
             copy_report=copy_report,
             allow_partial=allow_partial,
             orphan_cleanup=orphan_cleanup,
@@ -1710,6 +1731,7 @@ def recover_session_database(
                 "warnings": inspection["warnings"],
             },
             "copy": copy_report,
+            "tombstone_reconciliation": tombstone_reconciliation,
             "orphan_cleanup": orphan_cleanup,
             "derived_metadata": derived_metadata,
             "verification": verification,

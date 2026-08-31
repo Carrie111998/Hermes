@@ -449,6 +449,8 @@ py-modules = [
   "cli",
   "hermes_bootstrap",
   "hermes_constants",
+  "hermes_accounting_locks",
+  "hermes_cold_archive_errors",
   "hermes_state",
   "hermes_state_common",
   "hermes_state_portability",
