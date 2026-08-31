@@ -40,16 +40,29 @@ _ASPECT_RATIOS = {
     "portrait": "9:16",
 }
 _MODELS: Dict[str, Dict[str, str]] = {
-    "gemini-3-pro-image-preview": {
+    "gemini-3.1-flash-lite-image": {
+        "display": "Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)",
+        "speed": "fast",
+        "strengths": "Lowest latency and cost; efficient image generation and editing",
+    },
+    "gemini-3.1-flash-image": {
+        "display": "Nano Banana 2 (Gemini 3.1 Flash Image)",
+        "speed": "balanced",
+        "strengths": "General-purpose generation, 4K output, and multi-reference editing",
+    },
+    "gemini-3-pro-image": {
         "display": "Nano Banana Pro (Gemini 3 Pro Image)",
-        "speed": "~30s",
-        "strengths": "Highest fidelity, prompt adherence, and image editing",
+        "speed": "premium",
+        "strengths": "Highest fidelity, reasoning, 4K output, and search grounding",
     },
     "gemini-2.5-flash-image": {
         "display": "Nano Banana (Gemini 2.5 Flash Image)",
-        "speed": "~10s",
-        "strengths": "Fast generation and image editing",
+        "speed": "fast",
+        "strengths": "Legacy fast generation and image editing",
     },
+}
+_MODEL_REFERENCE_LIMITS = {
+    "gemini-2.5-flash-image": 3,
 }
 
 
@@ -91,7 +104,9 @@ def _resolve_model(explicit: Optional[str] = None) -> str:
 def _api_key() -> Optional[str]:
     """Return the direct Google key, keeping the text-provider precedence."""
     try:
-        return (get_secret("GOOGLE_API_KEY") or get_secret("GEMINI_API_KEY") or "").strip() or None
+        return (
+            get_secret("GOOGLE_API_KEY") or get_secret("GEMINI_API_KEY") or ""
+        ).strip() or None
     except Exception as exc:  # noqa: BLE001 - scoped-secret failures are auth failures
         logger.debug("Google AI Studio credential lookup failed: %s", exc)
         return None
@@ -107,8 +122,12 @@ def _load_reference_image(reference: str) -> Tuple[bytes, str]:
 
         response = requests.get(reference, timeout=60)
         response.raise_for_status()
-        content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip()
-        return response.content, content_type if content_type.startswith("image/") else "image/png"
+        content_type = (
+            (response.headers.get("Content-Type") or "").split(";", 1)[0].strip()
+        )
+        return response.content, content_type if content_type.startswith(
+            "image/"
+        ) else "image/png"
 
     if lower.startswith("data:"):
         header, separator, encoded = reference.partition(",")
@@ -233,7 +252,8 @@ class GeminiImageGenProvider(ImageGenProvider):
         if isinstance(image_url, str) and image_url.strip():
             sources.append(image_url.strip())
         sources.extend(normalize_reference_images(reference_image_urls) or [])
-        sources = sources[:_MAX_REFERENCE_IMAGES]
+        reference_limit = _MODEL_REFERENCE_LIMITS.get(model, _MAX_REFERENCE_IMAGES)
+        sources = sources[:reference_limit]
 
         parts: List[Dict[str, Any]] = [{"text": prompt}]
         for source in sources:
@@ -248,32 +268,25 @@ class GeminiImageGenProvider(ImageGenProvider):
                     prompt=prompt,
                     aspect_ratio=aspect,
                 )
-            parts.append(
-                {
-                    "inlineData": {
-                        "mimeType": mime,
-                        "data": base64.b64encode(data).decode("ascii"),
-                    }
+            parts.append({
+                "inlineData": {
+                    "mimeType": mime,
+                    "data": base64.b64encode(data).decode("ascii"),
                 }
-            )
+            })
 
         payload = {
             "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
                 "responseModalities": ["TEXT", "IMAGE"],
                 "imageConfig": {"aspectRatio": _ASPECT_RATIOS[aspect]},
-                "imageConfig": {"aspectRatio": _ASPECT_RATIOS[aspect]},
             },
         }
-        timeout = kwargs.get("timeout", 120)
         timeout = kwargs.get("timeout", 180)
         try:
             timeout = max(1.0, float(timeout))
         except (TypeError, ValueError):
             timeout = 180
-            timeout = max(1.0, float(timeout))
-        except (TypeError, ValueError):
-            timeout = 120
 
         endpoint = f"{BASE_URL}/models/{quote(model, safe='')}:generateContent"
         try:
@@ -281,7 +294,6 @@ class GeminiImageGenProvider(ImageGenProvider):
 
             response = requests.post(
                 endpoint,
-                params={"key": api_key},
                 headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
                 json=payload,
                 timeout=timeout,
@@ -333,11 +345,14 @@ class GeminiImageGenProvider(ImageGenProvider):
 
         image_data = None
         image_mime = "image/png"
+        response_text: List[str] = []
         candidates = body.get("candidates") if isinstance(body, dict) else None
         for candidate in candidates if isinstance(candidates, list) else []:
             content = candidate.get("content") if isinstance(candidate, dict) else None
             response_parts = content.get("parts") if isinstance(content, dict) else None
             for part in response_parts if isinstance(response_parts, list) else []:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    response_text.append(part["text"].strip())
                 inline = part.get("inlineData") if isinstance(part, dict) else None
                 if isinstance(inline, dict) and isinstance(inline.get("data"), str):
                     image_data = inline["data"]
@@ -347,8 +362,12 @@ class GeminiImageGenProvider(ImageGenProvider):
                 break
 
         if not image_data:
+            detail = " ".join(text for text in response_text if text)
+            message = "Google AI Studio returned no inline image data"
+            if detail:
+                message = f"{message}: {detail}"
             return error_response(
-                error="Google AI Studio returned no inline image data",
+                error=message,
                 error_type="empty_response",
                 provider=self.name,
                 model=model,
