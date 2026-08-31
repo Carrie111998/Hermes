@@ -136,6 +136,20 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
     [actions, activeGatewayProfile, gateway, gatewayState]
   )
 
+  const reasoningMenuContent = useMemo(
+    () =>
+      gatewayState === 'open' ? (
+        <ModelMenuPanel
+          gateway={gateway || undefined}
+          mode="reasoning"
+          onSelectModel={actions.selectModel}
+          profile={activeGatewayProfile}
+          requestGateway={actions.requestGateway}
+        />
+      ) : null,
+    [actions, activeGatewayProfile, gateway, gatewayState]
+  )
+
   const chatActions = useMemo(() => latestChatActions(actions), [actions])
 
   const chatView = (
@@ -143,6 +157,7 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       gateway={gateway}
       maxVoiceRecordingSeconds={maxVoiceRecordingSeconds}
       modelMenuContent={modelMenuContent}
+      reasoningMenuContent={reasoningMenuContent}
       {...chatActions}
     />
   )

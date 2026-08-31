@@ -240,6 +240,19 @@ function TileChat({
     [activeGatewayProfile, gatewayOpen, ownerRoute?.profile, ownerRoute?.targetProfile, requestTileGateway, selectModel]
   )
 
+  const reasoningMenuContent = useMemo(
+    () =>
+      gatewayOpen ? (
+        <ModelMenuPanel
+          mode="reasoning"
+          onSelectModel={selectModel}
+          profile={ownerRoute?.targetProfile || ownerRoute?.profile || activeGatewayProfile}
+          requestGateway={requestTileGateway}
+        />
+      ) : null,
+    [activeGatewayProfile, gatewayOpen, ownerRoute?.profile, ownerRoute?.targetProfile, requestTileGateway, selectModel]
+  )
+
   return (
     <SessionViewProvider value={view}>
       <ComposerScopeProvider value={scope}>
@@ -268,6 +281,7 @@ function TileChat({
           onThreadMessagesChange={actions.handleThreadMessagesChange}
           onToggleSelectedPin={noop}
           onTranscribeAudio={tileTranscribeAudio}
+          reasoningMenuContent={reasoningMenuContent}
         />
       </ComposerScopeProvider>
     </SessionViewProvider>

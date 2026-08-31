@@ -38,6 +38,7 @@ import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-c
 import { $defaultReasoningEffort } from '@/store/session'
 import type { ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
 
+import { isFreeTierModelId, metadataSummary, ModelDetailsSubmenu } from './model-details-submenu'
 import { type FastControl, ModelEditSubmenu, resolveFastControl } from './model-edit-submenu'
 
 /** Whether a catalog row represents the session's current provider. Custom
@@ -90,6 +91,8 @@ export interface ModelMenuController {
 
 interface ModelCatalogMenuProps {
   controller: ModelMenuController
+  /** Show model facts instead of per-model option presets in the composer. */
+  detailsOnHover?: boolean
   /** Rows appended under the catalog (Refresh Models, Edit Models, …). */
   footer?: ReactNode
   gateway?: HermesGateway
@@ -121,6 +124,7 @@ interface ProviderGroup {
  */
 export function ModelCatalogMenu({
   controller,
+  detailsOnHover = false,
   footer,
   gateway,
   includeMoa = false,
@@ -423,12 +427,16 @@ export function ModelCatalogMenu({
                       effFast
                     )
 
-                    const meta = [
-                      fastControl.kind !== 'none' && fastControl.on ? copy.fast : null,
-                      (caps?.reasoning ?? true) ? reasoningEffortLabel(effEffort || defaultEffort) : null
-                    ]
-                      .filter(Boolean)
-                      .join(' ')
+                    const modelMetadata = group.provider.metadata?.[family.id]
+
+                    const meta = detailsOnHover
+                      ? metadataSummary(modelMetadata, isFreeTierModelId(family.id) ? t.shell.modelOptions.optionsFree : undefined)
+                      : [
+                          fastControl.kind !== 'none' && fastControl.on ? copy.fast : null,
+                          (caps?.reasoning ?? true) ? reasoningEffortLabel(effEffort || defaultEffort) : null
+                        ]
+                          .filter(Boolean)
+                          .join(' ')
 
                     // Clicking the row commits the model and closes; the edit
                     // submenu (reasoning/fast) is reached by HOVER, so you can
@@ -461,24 +469,34 @@ export function ModelCatalogMenu({
                             <Codicon className="ml-auto text-foreground" name="check" size="0.75rem" />
                           ) : null}
                         </DropdownMenuSubTrigger>
-                        <ModelEditSubmenu
-                          canDisableReasoning={caps?.can_disable_reasoning}
-                          defaultEffort={defaultEffort}
-                          effort={effEffort}
-                          fastControl={fastControl}
-                          isActive={isCurrent}
-                          model={family.id}
-                          onSelectModel={nextModel => controller.select(nextModel, group.provider.slug)}
-                          onSetOptions={patch =>
-                            controller.setOptions(patch, {
-                              isActive: isCurrent,
-                              model: family.id,
-                              provider: group.provider.slug
-                            })
-                          }
-                          provider={group.provider.slug}
-                          reasoning={caps?.reasoning ?? true}
-                        />
+                        {detailsOnHover ? (
+                          <ModelDetailsSubmenu
+                            metadata={modelMetadata}
+                            model={family.id}
+                            modelName={name}
+                            pricing={group.provider.pricing?.[family.id]}
+                            providerName={group.provider.name}
+                          />
+                        ) : (
+                          <ModelEditSubmenu
+                            canDisableReasoning={caps?.can_disable_reasoning}
+                            defaultEffort={defaultEffort}
+                            effort={effEffort}
+                            fastControl={fastControl}
+                            isActive={isCurrent}
+                            model={family.id}
+                            onSelectModel={nextModel => controller.select(nextModel, group.provider.slug)}
+                            onSetOptions={patch =>
+                              controller.setOptions(patch, {
+                                isActive: isCurrent,
+                                model: family.id,
+                                provider: group.provider.slug
+                              })
+                            }
+                            provider={group.provider.slug}
+                            reasoning={caps?.reasoning ?? true}
+                          />
+                        )}
                       </DropdownMenuSub>
                     )
                   })}
