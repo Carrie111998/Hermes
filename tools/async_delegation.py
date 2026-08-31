@@ -1112,15 +1112,28 @@ def dispatch_async_delegation_batch(
         status = "error"
         try:
             combined = runner() or {}
-            # Batch status: completed unless every child errored/was interrupted.
+            # Batch status: completed if every child succeeded, error if none
+            # did, partial if some but not all succeeded. Surfaced distinctly
+            # so a listing of this record (e.g. the CLI's /agents command)
+            # doesn't report a flat "completed" for a batch where some
+            # children actually failed — each child's own per-task status is
+            # already reported correctly in the completion message; this is
+            # the aggregate the batch record itself carries.
             child_results = combined.get("results") or []
-            if child_results and all(
-                (r.get("status") not in ("completed", "success"))
-                for r in child_results
-            ):
-                status = "error"
-            else:
+            if not child_results:
                 status = "completed"
+            else:
+                succeeded = sum(
+                    1
+                    for r in child_results
+                    if r.get("status") in ("completed", "success")
+                )
+                if succeeded == 0:
+                    status = "error"
+                elif succeeded == len(child_results):
+                    status = "completed"
+                else:
+                    status = "partial"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation batch %s crashed", delegation_id)
             combined = {
