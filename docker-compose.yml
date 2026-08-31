@@ -74,3 +74,48 @@ services:
       - HERMES_GID=${HERMES_GID:-10000}
     # Localhost-only. For remote access, tunnel via `ssh -L 9119:localhost:9119`.
     command: ["dashboard", "--host", "127.0.0.1", "--no-open"]
+
+  # Sandbox container used by profiles/sandbox (terminal.backend: docker).
+  # Created 2026-08-30 per F7-A: thin python:3.12-slim image; /output mounts
+  # the host's cache/documents/ so any files written from inside the container
+  # appear on the host for review. restart: no — sandbox is started on demand
+  # by the sandbox profile's terminal handler and torn down when the session
+  # exits; do not make this `restart: unless-stopped` (it would interfere with
+  # container_persistent: false semantics). Pin the image digest before going
+  # to production; `python:3.12-slim` is a moving tag.
+  #
+  # Network policy (F7-A Option A, default N2 simplified 2026-08-30): sandbox
+  # runs on the dedicated `sandbox-net` bridge with `internal: true`, which
+  # strips the default gateway. That means no outbound network access — the
+  # container can resolve DNS internally but cannot reach the internet or
+  # host services. This matches SOUL.md bullet 3 ("no network egress beyond
+  # docker-compose policy"). If a future task needs external API access, swap
+  # the network attachment to a separate non-internal network on a per-call
+  # basis (do NOT flip internal: false globally).
+  #
+  # Filesystem policy (F7-A Option A, default I2 2026-08-30):
+  #   /output — write surface. Anything the sandbox writes here appears on the
+  #             host at cache/documents/ for the agent to review.
+  #   /input  — read-only mount of research/sandbox-inputs/. The agent drops
+  #             test fixtures / vendor scripts here before invoking sandbox;
+  #             sandbox reads them, runs them, writes results to /output.
+  #             Anything not in this folder is invisible to the sandbox.
+  sandbox:
+    image: python:3.12-slim@sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217
+    container_name: hermes-sandbox
+    restart: "no"
+    networks:
+      - sandbox-net
+    volumes:
+      - C:\\Users\\bbask\\AppData\\Local\\hermes\\cache\\documents:/output
+      - C:\\Users\\bbask\\Hermes-Workspace\\research\\sandbox-inputs:/input:ro
+    command: ["sh", "-c", "trap 'exit 0' TERM INT; while true; do sleep 3600; done"]
+
+networks:
+  # F7-A Option A: dedicated bridge with no gateway. The sandbox can reach
+  # nothing outside the container (no internet, no host services). To grant
+  # egress for a specific test, attach this container to a second non-internal
+  # network on the command line, NOT by flipping this flag.
+  sandbox-net:
+    driver: bridge
+    internal: true
