@@ -22,7 +22,7 @@ import { GatewayProvider } from '../../src/app/gatewayContext.js'
 import { patchOverlayState, resetOverlayState } from '../../src/app/overlayStore.js'
 import { patchUiState, resetUiState } from '../../src/app/uiStore.js'
 import { FloatingOverlays } from '../../src/components/appOverlays.js'
-import { Banner, SessionPanel } from '../../src/components/branding.js'
+import { Banner, CompactSessionPanel, SessionPanel } from '../../src/components/branding.js'
 import { fromSkin, type Theme } from '../../src/theme.js'
 import type { SessionInfo } from '../../src/types.js'
 
@@ -262,6 +262,11 @@ for (const scene of scenes) {
     88
   )
 
+  const compactIntro = renderAnsi(
+    <CompactSessionPanel info={info} maxWidth={86} sid="d2a6ecf8" t={scene.theme} />,
+    88
+  )
+
   patchOverlayState({})
 
   const comps = renderAnsi(
@@ -301,6 +306,8 @@ for (const scene of scenes) {
   page += `<div style="background:${scene.bg};color:${scene.fg};padding:14px;border-radius:6px">`
   page += `<div style="font:bold 12px sans-serif;opacity:.6;margin-bottom:8px;color:${scene.fg}">${scene.name}</div>`
   page += `<pre style="margin:0;white-space:pre">${ansiToHtml(intro, scene.fg, scene.bg)}</pre>`
+  page += `<div style="font:bold 11px sans-serif;opacity:.5;margin:12px 0 6px;color:${scene.fg}">density on</div>`
+  page += `<pre style="margin:0;white-space:pre">${ansiToHtml(compactIntro, scene.fg, scene.bg)}</pre>`
   page += `<pre style="margin:8px 0 0;white-space:pre">${ansiToHtml(comps, scene.fg, scene.bg)}</pre>`
   page += `<pre style="margin:8px 0 0;white-space:pre">${ansiToHtml(statusLine, scene.fg, scene.bg)}</pre>`
   page += `</div>`

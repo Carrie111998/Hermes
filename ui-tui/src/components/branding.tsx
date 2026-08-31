@@ -209,6 +209,107 @@ const SKELETON_ROWS: readonly (readonly [number, number])[] = [
 const SKILLS_MAX = 8
 const TOOLSETS_MAX = 8
 
+/**
+ * Low-chrome session identity for ``/density on``.
+ *
+ * The classic intro is intentionally expressive and inspectable: logo art,
+ * expandable inventories, and a bordered session card. Compact mode is the
+ * opposite presentation. It keeps the information needed to start working,
+ * leaves the full inventories to /tools and /skills, and spends only four
+ * base rows before any actionable update or install notices.
+ */
+export function CompactSessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
+  const term = useStdout().stdout?.columns ?? 100
+  const cols = Math.max(20, Math.min(term, maxWidth ?? term))
+  const model = info.model.split('/').pop() || info.model
+  const toolsTotal = flat(info.tools).length
+  const skillsTotal = flat(info.skills).length
+  const mcpConnected = (info.mcp_servers ?? []).filter(server => server.connected).length
+
+  const counts = [
+    `${info.lazy && !toolsTotal ? '…' : toolsTotal} tools`,
+    `${info.lazy && !skillsTotal ? '…' : skillsTotal} skills`,
+    ...(mcpConnected ? [`${mcpConnected} MCP`] : [])
+  ].join('  ·  ')
+
+  const sideMeta = [
+    info.profile_name ? `profile ${info.profile_name}` : 'Nous Research',
+    info.version && `v${info.version}`
+  ]
+    .filter(Boolean)
+    .join('  ')
+
+  const sessionMeta = sid ? `session ${sid}` : ''
+  const showSideMeta = cols >= 64
+  const showWorkingDirectory = cols >= 42
+
+  return (
+    <Box flexDirection="column" marginBottom={1} width={cols}>
+      <Box width={cols}>
+        <Box flexGrow={1} flexShrink={1} overflow="hidden">
+          <Text bold color={t.color.primary} wrap="truncate-end">
+            {t.brand.icon} {t.brand.name}
+            <Text bold={false} color={t.color.muted}>
+              {'  ·  '}
+            </Text>
+            <Text bold={false} color={t.color.accent}>
+              {model}
+            </Text>
+          </Text>
+        </Box>
+
+        {showSideMeta && (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {'  '}
+            {sideMeta}
+          </Text>
+        )}
+      </Box>
+
+      {showWorkingDirectory && (
+        <Box width={cols}>
+          <Box flexGrow={1} flexShrink={1} overflow="hidden">
+            <Text color={t.color.muted} wrap="truncate-end">
+              {info.cwd || process.cwd()}
+            </Text>
+          </Box>
+
+          {sessionMeta && (
+            <Text color={t.color.sessionLabel} wrap="truncate-end">
+              {'  '}
+              {sessionMeta}
+            </Text>
+          )}
+        </Box>
+      )}
+
+      <Box width={cols}>
+        <Box flexGrow={1} flexShrink={1} overflow="hidden">
+          <Text color={t.color.text} wrap="truncate-end">
+            {counts}
+          </Text>
+        </Box>
+        <Text color={t.color.muted}>/help</Text>
+      </Box>
+
+      <Text color={t.color.border}>{'─'.repeat(cols)}</Text>
+
+      {typeof info.update_behind === 'number' && info.update_behind > 0 && (
+        <Text color={t.color.warn} wrap="truncate-end">
+          ! update available · {info.update_behind} {info.update_behind === 1 ? 'commit' : 'commits'} behind ·{' '}
+          {info.update_command || 'hermes update'}
+        </Text>
+      )}
+
+      {info.install_warning && (
+        <Text color={t.color.warn} wrap="wrap">
+          ! {info.install_warning}
+        </Text>
+      )}
+    </Box>
+  )
+}
+
 export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
   const term = useStdout().stdout?.columns ?? 100
   const cols = Math.max(20, Math.min(term, maxWidth ?? term))

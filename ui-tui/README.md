@@ -207,6 +207,8 @@ The Markdown renderer handles headings, lists, block quotes, tables, fenced code
 
 Tool/status activity is shown in a live activity lane. Transcript rows stay focused on user/assistant turns.
 
+`/density on` switches the whole chat surface to a focused presentation: the art-heavy startup panel becomes a four-row session header, capability inventories collapse to aggregate counts, and idle composer spacing is removed. `/density off` restores the classic presentation. The preference is persisted in `display.tui_compact`.
+
 ## Prompt flows
 
 The Python gateway can pause the main loop and request structured input:
