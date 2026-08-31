@@ -502,7 +502,7 @@ def load_cli_config() -> Dict[str, Any]:
             "show_reasoning": True,
             "reasoning_full": False,
             "streaming": True,
-            "busy_input_mode": "interrupt",
+            "busy_input_mode": "steer",
             "persistent_output": True,
             "persistent_output_max_lines": 200,
             # Clear terminal scrollback as well as the visible viewport when the
