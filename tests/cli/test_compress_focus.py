@@ -28,7 +28,7 @@ def test_focus_topic_extracted_and_passed(capsys):
     shell.agent._cached_system_prompt = ""
     shell.agent._compress_context.return_value = (compressed, "")
 
-    def _estimate(messages):
+    def _estimate(messages, *, include_reasoning_content=None):
         if messages is history:
             return 100
         return 50
