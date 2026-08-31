@@ -7044,7 +7044,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             elapsed = max(0.0, time.monotonic() - started) if started else 0.0
             line = collector.render(elapsed)
             if line:
-                _cprint(f"  {_DIM}{line}{_RST}")
+                from agent.turn_summary import format_completion_time
+
+                finished_at = format_completion_time(datetime.now().astimezone())
+                _cprint(f"  {_DIM}{line} · finished at {finished_at}{_RST}")
         except Exception:
             logger.debug("Turn summary render failed", exc_info=True)
 
