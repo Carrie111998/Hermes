@@ -760,7 +760,12 @@ export const ja = defineLocale({
       imported: '設定をインポートしました',
       invalidJson: '設定 JSON が無効です',
       keepAwakeTitle: 'コンピューターをスリープさせない',
-      keepAwakeDesc: '本体のスリープを防ぎ、長時間や夜通しの実行を継続します。画面は暗転できます。'
+      keepAwakeDesc: '本体のスリープを防ぎ、長時間や夜通しの実行を継続します。画面は暗転できます。',
+      previewUblockTitle: 'Preview で uBlock Origin Lite を有効化',
+      previewUblockDescription:
+        '公式 GitHub リリースから uBlock Origin Lite をダウンロードし、Preview のみで広告とトラッカーをブロックします。ダウンロードは後で使えるようローカルに保持されます。',
+      previewUblockDownloading: 'uBlock Origin Lite をダウンロードして有効化しています…',
+      previewUblockFailure: 'Preview のコンテンツブロック設定を更新できませんでした。'
     },
     quickEntry: {
       enabledTitle: 'クイック入力',
@@ -2711,6 +2716,7 @@ export const ja = defineLocale({
       openDevTools: 'プレビュー DevTools を開く',
       goBack: '戻る',
       goForward: '進む',
+      ublockDashboard: 'uBlock Origin Lite は有効です — コントロールを開く',
       reload: 'ページを再読み込み',
       address: 'アドレス',
       addressPlaceholder: 'アドレスを入力',

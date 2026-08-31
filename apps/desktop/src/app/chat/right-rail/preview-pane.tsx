@@ -27,6 +27,7 @@ import {
   popOutBrowserTab,
   type PreviewTarget
 } from '@/store/preview'
+import { $previewUblock, loadPreviewUblock } from '@/store/preview-ublock'
 import { canOpenBrowserWindow, isBrowserWindow } from '@/store/windows'
 
 import { ArtifactPreview } from './preview-artifact'
@@ -233,6 +234,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const previewContentRef = useRef<HTMLDivElement | null>(null)
   const webviewRef = useRef<PreviewWebview | null>(null)
   const previewServerRestart = useStore($previewServerRestart)
+  const previewUblock = useStore($previewUblock)
   const consoleHeight = useStore(consoleState.$height)
   const consoleOpen = useStore(consoleState.$open)
   const [currentUrl, setCurrentUrl] = useState(target.url)
@@ -252,6 +254,12 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
 
   const isRemoteHtmlTarget =
     target.kind === 'file' && target.previewKind === 'html' && Boolean(target.dataUrl || target.transient)
+
+  useEffect(() => {
+    if (isWebPreview) {
+      void loadPreviewUblock()
+    }
+  }, [isWebPreview])
 
   // Hand the live address to storage when this guest is about to go away
   // (pop-out, dock-back, tab close). The other renderer builds from
@@ -457,6 +465,24 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     },
     [copy.unreachableDescription]
   )
+
+  const openUblockDashboard = useCallback(() => {
+    const dashboardUrl = previewUblock.dashboardUrl
+
+    if (!dashboardUrl || !webviewRef.current?.loadURL) {
+      return
+    }
+
+    setLoadError(null)
+    setLoading(true)
+    void webviewRef.current.loadURL(dashboardUrl).catch((error: unknown) => {
+      setLoading(false)
+      setLoadError({
+        description: error instanceof Error ? error.message : copy.failedToLoad,
+        url: dashboardUrl
+      })
+    })
+  }, [copy.failedToLoad, previewUblock.dashboardUrl])
 
   const goBack = useCallback(() => {
     const webview = webviewRef.current
@@ -1035,6 +1061,9 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
               !isBrowserWindow() && !canOpenBrowserWindow()
                 ? () => void window.hermesDesktop?.openExternal(currentUrl)
                 : undefined
+            }
+            onOpenUblockDashboard={
+              previewUblock.available && previewUblock.rulesetsReady && previewUblock.dashboardUrl ? openUblockDashboard : undefined
             }
             onPopIn={isBrowserWindow() ? () => window.close() : undefined}
             onPopOut={

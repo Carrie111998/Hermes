@@ -922,6 +922,11 @@ export const zh: Translations = {
       keepAwakeDesc: '阻止本机休眠，让长时间或通宵运行继续进行。屏幕仍可变暗。',
       disableF12Title: '禁用 F12 开发者工具',
       disableF12Desc: '阻止 F12 打开开发者工具。Ctrl+Shift+I（Mac 上为 Cmd+Opt+I）仍然可用。',
+      previewUblockTitle: '在 Preview 中启用 uBlock Origin Lite',
+      previewUblockDescription:
+        '从官方 GitHub 发布下载 uBlock Origin Lite，仅在 Preview 中拦截广告和跟踪器，并将下载内容保留在本地供以后使用。',
+      previewUblockDownloading: '正在下载并启用 uBlock Origin Lite…',
+      previewUblockFailure: '无法更新 Preview 内容拦截设置。',
       attachmentSizeTitle: '预览 / 图片加载大小上限',
       attachmentSizeDesc:
         '桌面端为预览和图片附件加载本地文件的大小上限（MB）。默认为 16。远程非图片附件使用单独的 256 MB 上限。设置过大会将整个文件读入内存，可能导致应用卡死或崩溃。',
@@ -3246,6 +3251,7 @@ export const zh: Translations = {
       goBack: '后退',
       goForward: '前进',
       reload: '重新加载页面',
+      ublockDashboard: 'uBlock Origin Lite 已启用 — 打开控制项',
       address: '地址',
       addressPlaceholder: '输入地址',
       blankPageBody: '在上方输入地址开始浏览，或让 Hermes 打开一个页面。',

@@ -29,6 +29,7 @@ interface PreviewBrowserBarProps {
   consoleOpen: boolean
   devToolsOpen: boolean
   loading: boolean
+  onOpenUblockDashboard?: () => void
   onBack: () => void
   onForward: () => void
   onNavigate: (url: string) => void
@@ -94,6 +95,7 @@ export function PreviewBrowserBar({
   consoleOpen,
   devToolsOpen,
   loading,
+  onOpenUblockDashboard,
   onBack,
   onForward,
   onNavigate,
@@ -154,6 +156,13 @@ export function PreviewBrowserBar({
         label={copy.reload}
         onSelect={onReload}
       />
+      {onOpenUblockDashboard && (
+        <PaneStripGlyph
+          icon={<Codicon name="shield" size="0.8125rem" />}
+          label={copy.ublockDashboard}
+          onSelect={onOpenUblockDashboard}
+        />
+      )}
       {/* The copy control lives INSIDE the field, on its right edge — the
           same pre-faded inline icon code blocks use, not a toolbar button.
           It copies what the field shows: on a remote gateway, that is the

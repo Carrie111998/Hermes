@@ -743,7 +743,12 @@ export const zhHant = defineLocale({
       imported: '設定已匯入',
       invalidJson: '設定 JSON 無效',
       keepAwakeTitle: '保持電腦喚醒',
-      keepAwakeDesc: '阻止本機睡眠，讓長時間或整夜執行持續進行。螢幕仍可變暗。'
+      keepAwakeDesc: '阻止本機睡眠，讓長時間或整夜執行持續進行。螢幕仍可變暗。',
+      previewUblockTitle: '在 Preview 中啟用 uBlock Origin Lite',
+      previewUblockDescription:
+        '從官方 GitHub 發行版本下載 uBlock Origin Lite，僅在 Preview 中封鎖廣告與追蹤器，並將下載內容保留在本機供日後使用。',
+      previewUblockDownloading: '正在下載並啟用 uBlock Origin Lite…',
+      previewUblockFailure: '無法更新 Preview 內容封鎖設定。'
     },
     quickEntry: {
       enabledTitle: '快速輸入',
@@ -2620,6 +2625,7 @@ export const zhHant = defineLocale({
       openDevTools: '開啟預覽 DevTools',
       goBack: '上一頁',
       goForward: '下一頁',
+      ublockDashboard: 'uBlock Origin Lite 已啟用 — 開啟控制項',
       reload: '重新載入頁面',
       address: '網址',
       addressPlaceholder: '輸入網址',

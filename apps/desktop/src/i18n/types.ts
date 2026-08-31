@@ -603,6 +603,10 @@ export interface Translations {
       keepAwakeDesc: string
       disableF12Title: string
       disableF12Desc: string
+      previewUblockTitle: string
+      previewUblockDescription: string
+      previewUblockDownloading: string
+      previewUblockFailure: string
       attachmentSizeTitle: string
       attachmentSizeDesc: string
       attachmentSizeUnit: string
@@ -2648,6 +2652,7 @@ export interface Translations {
       goBack: string
       goForward: string
       reload: string
+      ublockDashboard: string
       address: string
       addressPlaceholder: string
       blankPageBody: string

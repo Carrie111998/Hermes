@@ -720,6 +720,11 @@ export const en: Translations = {
       keepAwakeDesc: 'Stop this machine from sleeping so long or overnight runs keep going. The display can still dim.',
       disableF12Title: 'Disable F12 DevTools',
       disableF12Desc: 'Block F12 from opening Developer Tools. Ctrl+Shift+I (or Cmd+Opt+I on Mac) still works.',
+      previewUblockTitle: 'Enable uBlock Origin Lite in Preview',
+      previewUblockDescription:
+        'Downloads uBlock Origin Lite from its official GitHub release, blocks ads and trackers only in Preview, and keeps it locally for later use.',
+      previewUblockDownloading: 'Downloading and enabling uBlock Origin Lite…',
+      previewUblockFailure: 'Could not update the Preview content-blocking setting.',
       attachmentSizeTitle: 'Max preview / image load size',
       attachmentSizeDesc:
         'How big a local file Desktop will load for previews and image attach, in MB. Default is 16. Remote non-image attach uses a separate 256 MB cap. Setting this very high loads the whole file into memory and can freeze or crash the app.',
@@ -3084,6 +3089,7 @@ export const en: Translations = {
       goBack: 'Back',
       goForward: 'Forward',
       reload: 'Reload page',
+      ublockDashboard: 'uBlock Origin Lite is enabled — open controls',
       address: 'Address',
       addressPlaceholder: 'Enter address',
       blankPageBody: 'Type an address above to browse, or ask Hermes to open a page.',
