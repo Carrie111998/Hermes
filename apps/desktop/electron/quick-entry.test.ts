@@ -6,6 +6,7 @@ import {
   type GlobalShortcutLike,
   parseQuickEntryShortcut,
   quickEntryWindowBounds,
+  quickEntryWindowOptions,
   sanitizeQuickEntrySettings
 } from './quick-entry'
 
@@ -236,5 +237,33 @@ describe('quickEntryWindowBounds', () => {
 
   it('falls back to the origin without a work area', () => {
     expect(quickEntryWindowBounds()).toEqual({ height: 168, width: 640, x: 0, y: 0 })
+  })
+})
+
+describe('quickEntryWindowOptions', () => {
+  it('configures hasShadow: false to prevent shadow artifacts on transparent windows', () => {
+    const bounds = { height: 168, width: 640, x: 100, y: 50 }
+    const macOptions = quickEntryWindowOptions(bounds, true)
+    const winOptions = quickEntryWindowOptions(bounds, false)
+
+    expect(macOptions.hasShadow).toBe(false)
+    expect(winOptions.hasShadow).toBe(false)
+    expect(macOptions.frame).toBe(false)
+    expect(macOptions.transparent).toBe(true)
+    expect(macOptions.alwaysOnTop).toBe(true)
+    expect(macOptions.backgroundColor).toBe('#00000000')
+  })
+
+  it('sets platform-specific window options', () => {
+    const macOptions = quickEntryWindowOptions(undefined, true)
+    const nonMacOptions = quickEntryWindowOptions(undefined, false)
+
+    expect(macOptions.type).toBe('panel')
+    expect(macOptions.skipTaskbar).toBe(false)
+    expect(macOptions.hiddenInMissionControl).toBe(true)
+
+    expect(nonMacOptions.type).toBeUndefined()
+    expect(nonMacOptions.skipTaskbar).toBe(true)
+    expect(nonMacOptions.hiddenInMissionControl).toBe(false)
   })
 })

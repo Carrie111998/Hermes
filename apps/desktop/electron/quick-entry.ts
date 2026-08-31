@@ -418,4 +418,33 @@ export function quickEntryWindowBounds(workArea?: { height: number; width: numbe
   return { height, width, x, y }
 }
 
+/**
+ * BrowserWindow constructor options for the Quick Entry overlay window.
+ *
+ * Uses hasShadow: false to avoid native rectangular shadow/border artifacts on
+ * transparent frameless windows (matching the pet and HUD overlays).
+ */
+export function quickEntryWindowOptions(
+  bounds?: { height: number; width: number; x: number; y: number },
+  isMac: boolean = process.platform === 'darwin'
+) {
+  return {
+    ...bounds,
+    frame: false,
+    transparent: true,
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: !isMac,
+    hasShadow: false,
+    alwaysOnTop: true,
+    type: (isMac ? 'panel' : undefined) as 'panel' | undefined,
+    hiddenInMissionControl: isMac,
+    show: false,
+    backgroundColor: '#00000000'
+  }
+}
+
 export { DEFAULT_QUICK_ENTRY_SHORTCUT, QUICK_ENTRY_TOP_FRACTION, QUICK_ENTRY_WINDOW_HEIGHT, QUICK_ENTRY_WINDOW_WIDTH }

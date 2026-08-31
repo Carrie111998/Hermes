@@ -308,7 +308,7 @@ import {
   spliceRegistrySessionRows,
   tagRegistrySessionResponse
 } from './profile-session-routing'
-import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
+import { createQuickEntryShortcut, quickEntryWindowBounds, quickEntryWindowOptions, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
@@ -13767,24 +13767,7 @@ function spawnQuickEntryWindow() {
   const bounds = quickEntryWindowBounds(display?.workArea)
 
   const win = new BrowserWindow({
-    ...bounds,
-    frame: false,
-    transparent: true,
-    resizable: false,
-    movable: true,
-    minimizable: false,
-    maximizable: false,
-    fullscreenable: false,
-    // Same rationale as the pet overlay: on Windows/Linux keep the helper out
-    // of the taskbar/alt-tab list; on macOS use an NSPanel so the frameless
-    // capture window never becomes the app's cmd-tab anchor.
-    skipTaskbar: !IS_MAC,
-    hasShadow: true,
-    alwaysOnTop: true,
-    type: IS_MAC ? 'panel' : undefined,
-    hiddenInMissionControl: IS_MAC,
-    show: false,
-    backgroundColor: '#00000000',
+    ...quickEntryWindowOptions(bounds, IS_MAC),
     webPreferences: {
       preload: PRELOAD_PATH,
       contextIsolation: true,
