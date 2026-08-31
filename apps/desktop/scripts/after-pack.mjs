@@ -24,6 +24,20 @@ import path from 'node:path'
 import { stampExeIdentity } from './set-exe-identity.mjs'
 
 export default async function afterPack(context) {
+  // Fix chrome-sandbox permissions on all platforms (electron-builder auto-fix
+  // may fail when run as non-root or in restricted environments).
+  const sandboxPath = path.join(context.appOutDir, 'chrome-sandbox')
+  if (path.existsSync(sandboxPath)) {
+    try {
+      const { execSync } = require('child_process')
+      execSync(`sudo chown root:root "${sandboxPath}"`)
+      execSync(`sudo chmod 4755 "${sandboxPath}"`)
+      console.log('✓ Fixed chrome-sandbox permissions')
+    } catch (err) {
+      console.warn(`⚠ chrome-sandbox fix warning: ${err.message}`)
+    }
+  }
+
   if (context.electronPlatformName !== 'win32') {
     return
   }

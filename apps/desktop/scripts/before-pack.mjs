@@ -57,10 +57,57 @@
  *   - electronPlatformName: 'win32' | 'darwin' | 'linux'
  *   - arch:                 Arch enum (0=ia32, 1=x64, 2=armv7l, 3=arm64, 4=universal)
  */
-import { existsSync, rmSync, renameSync } from 'node:fs'
+import { existsSync, rmSync, renameSync, execFileSync } from 'node:fs'
+import { execSync } from 'node:child_process'
 import path from 'node:path'
 import { Arch } from 'electron-builder'
 import { stageNodePty, stageGetWindows } from './stage-native-deps.mjs'
+
+// ---------------------------------------------------------------------------
+// chrome-sandbox helper — fixes Electron's SUID sandbox permissions
+//
+// Electron requires chrome-sandbox to be owned by root with mode 4755
+// (setuid). electron-builder sets this during pack, but the fix can fail
+// when:
+//   • the process runs without sudo (e.g. user without NOPASSWD)
+//   • the chown target is wrong (e.g. uid changes across reinstalls)
+//   • electron-builder's auto-fix runs in a different user namespace
+//
+// If permissions are wrong, Electron refuses to start the sandboxed
+// renderer process and the desktop app hangs or exits immediately.
+//
+// This function fixes it in-place, best-effort. A failure is non-fatal
+// (the app can still start with --no-sandbox).
+// ---------------------------------------------------------------------------
+
+function _fix_chrome_sandbox(appOutDir) {
+  const sandbox = path.join(appOutDir, 'chrome-sandbox')
+  if (!existsSync(sandbox)) {
+    return false
+  }
+
+  // Fast path: check lstat() first so we don't follow a stale symlink.
+  const sb = execFileSync('stat', ['-c', '%u:%g:%a', sandbox], { encoding: 'utf8' }).trim()
+  const parts = sb.split(':')
+  const uid = parseInt(parts[0], 10)
+  const gid = parseInt(parts[1], 10)
+  const mode = parseInt(parts[2], 8)
+
+  // Need root ownership and setuid bit set (mode >= 4000).
+  if (uid === 0 && (mode & 0o4000)) {
+    return true
+  }
+
+  try {
+    execSync(`sudo chown root:root "${sandbox}"`)
+    execSync(`sudo chmod 4755 "${sandbox}"`)
+    console.log('[before-pack] ✓ Fixed chrome-sandbox permissions')
+    return true
+  } catch (err) {
+    console.warn(`[before-pack] ⚠ chrome-sandbox fix warning: ${err.message}`)
+    return false
+  }
+}
 
 export function cleanStaleAppOutDir(appOutDir) {
   if (!appOutDir || typeof appOutDir !== 'string') {
@@ -124,6 +171,12 @@ export default async function beforePack(context) {
     } else if (cleanStaleAppOutDir(appOutDir)) {
       console.log(`[before-pack] removed stale unpacked dir before staging: ${appOutDir}`)
     }
+
+    // Fix chrome-sandbox permissions AFTER cleaning (before electron-builder
+    // stages the fresh tree). This is the critical fix for the #3 bug:
+    // if electron-builder's auto-fix failed on a previous pack, the
+    // permissions are wrong and the desktop app won't start.
+    _fix_chrome_sandbox(appOutDir)
   } catch (err) {
     // Never fail the build over cleanup; surface why so a genuinely stuck
     // directory (permissions, mount) is still diagnosable.

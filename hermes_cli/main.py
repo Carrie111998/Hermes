@@ -8544,6 +8544,27 @@ def cmd_gui(args: argparse.Namespace):
         else:
             sys.exit(1)
 
+    # --- Additional chrome-sandbox safety net (patch #3) ---
+    # If the sandbox helper is a regular file but the SUID bit or ownership
+    # was somehow lost (e.g., interrupted `hermes desktop`, manual chmod),
+    # try to fix it once more before launch.
+    if sys.platform == "linux":
+        sandbox = packaged_executable.parent / "chrome-sandbox"
+        if sandbox.exists() and stat.S_ISREG(sandbox.lstat().st_mode):
+            lstat = sandbox.lstat()
+            if lstat.st_uid != 0 or stat.S_IMODE(lstat.st_mode) != 0o4755:
+                sudo = shutil.which("sudo")
+                if sudo:
+                    print("→ Re-fixing Electron Linux sandbox helper before launch...")
+                    for cmd in ([sudo, "chown", "root:root", str(sandbox)], [sudo, "chmod", "4755", str(sandbox)]):
+                        if subprocess.run(cmd, check=False).returncode != 0:
+                            print(f"⚠ Could not re-fix {sandbox}")
+                            break
+                    else:
+                        print(f"✓ Re-fixed {sandbox}")
+                        # Reload lstat after the fix.
+                        sandbox = packaged_executable.parent / "chrome-sandbox"
+
     launch_command.extend(config_electron_flags)
     print(f"→ Launching packaged Hermes Desktop: {' '.join(launch_command)}")
     launch_result = subprocess.run(launch_command, cwd=desktop_dir, env=env, check=False)

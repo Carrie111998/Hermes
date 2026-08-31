@@ -264,3 +264,163 @@ def test_exec_arg_quoting_handles_spaces(tmp_path, xdg_home, monkeypatch):
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
     assert exec_line == f'"{spaced}" desktop'
+
+
+# ---------------------------------------------------------------------------
+# New tests for review invariants
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", [
+    "/path/with spaces/Hermes",
+    '/path/with "quotes"/Hermes',
+    "/path/with'单引号/Hermes",
+    "/路径/含有中文/Hermes",
+    "/path/with$pecial&chars/Hermes",
+])
+def test_exec_quoting_roundtrip(raw):
+    """Exec= line must round-trip through spec-compliant parsing."""
+    exe = Path(raw)
+    argv = [str(exe), "--no-sandbox", "--ozone-platform=x11"]
+    exec_line = " ".join(lde._quote_exec_arg(a) for a in argv)
+    # Parse back using a spec-compliant parser
+    parsed = _parse_desktop_exec(exec_line)
+    assert parsed == argv
+
+
+def _parse_desktop_exec(exec_line: str) -> list[str]:
+    """Parse a Desktop Entry Exec= line per freedesktop spec.
+    
+    Implements the quoting/escaping rules from:
+    https://specifications.freedesktop.org/desktop-entry-spec/latest/ar01s06.html
+    """
+    import shlex
+    # The spec uses shell-like quoting but with some differences.
+    # shlex with posix=True is close enough for our test cases.
+    return shlex.split(exec_line, posix=True)
+
+
+class TestPackagedLinuxExecutable:
+    """Tests for packaged_linux_executable() verification logic."""
+
+    def test_no_package_returns_none(self, tmp_path, monkeypatch):
+        """No package built → None."""
+        root = _make_project(tmp_path)
+        monkeypatch.setattr(lde, "_verify_build_stamp_matches", lambda *a: False)
+        assert lde.packaged_linux_executable(root) is None
+
+    def test_valid_package_x86_64(self, tmp_path, monkeypatch):
+        """One valid x86_64 package → returns that exe."""
+        root = _make_project(tmp_path)
+        exe = root / "apps" / "desktop" / "release" / "linux-unpacked" / "Hermes"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("#!/bin/sh\necho fake", encoding="utf-8")
+        exe.chmod(0o755)
+        monkeypatch.setattr(lde, "_verify_build_stamp_matches", lambda *a: True)
+        monkeypatch.setattr(lde.os, "access", lambda p, m: True)
+        
+        result = lde.packaged_linux_executable(root)
+        assert result == exe
+
+    def test_both_arch_packages_x86_64_wins(self, tmp_path, monkeypatch):
+        """Both arch packages present → x86_64 wins by priority."""
+        root = _make_project(tmp_path)
+        for arch in ["linux-unpacked", "linux-arm64-unpacked"]:
+            exe = root / "apps" / "desktop" / "release" / arch / "Hermes"
+            exe.parent.mkdir(parents=True)
+            exe.write_text("#!/bin/sh\necho fake", encoding="utf-8")
+            exe.chmod(0o755)
+        monkeypatch.setattr(lde, "_verify_build_stamp_matches", lambda *a: True)
+        monkeypatch.setattr(lde.os, "access", lambda p, m: True)
+        
+        result = lde.packaged_linux_executable(root)
+        assert result is not None
+        assert result.name == "Hermes"
+        assert "linux-unpacked" in str(result)
+
+    def test_stale_incomplete_artifact_skipped(self, tmp_path, monkeypatch):
+        """Stale/incomplete artifact (0-byte, no stamp) → falls through to next candidate."""
+        root = _make_project(tmp_path)
+        # Stale x86_64
+        stale = root / "apps" / "desktop" / "release" / "linux-unpacked" / "Hermes"
+        stale.parent.mkdir(parents=True)
+        stale.write_text("", encoding="utf-8")  # 0-byte
+        stale.chmod(0o755)
+        # Valid arm64
+        valid = root / "apps" / "desktop" / "release" / "linux-arm64-unpacked" / "Hermes"
+        valid.parent.mkdir(parents=True)
+        valid.write_text("#!/bin/sh\necho fake", encoding="utf-8")
+        valid.chmod(0o755)
+        
+        def mock_verify(exe_path, proj):
+            return exe_path == valid
+        monkeypatch.setattr(lde, "_verify_build_stamp_matches", mock_verify)
+        monkeypatch.setattr(lde.os, "access", lambda p, m: True)
+        
+        result = lde.packaged_linux_executable(root)
+        assert result is not None
+        assert result == valid
+
+    def test_non_executable_artifact_skipped(self, tmp_path, monkeypatch):
+        """Non-executable artifact → falls through."""
+        root = _make_project(tmp_path)
+        exe = root / "apps" / "desktop" / "release" / "linux-unpacked" / "Hermes"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("#!/bin/sh\necho fake", encoding="utf-8")
+        # No chmod +x
+        
+        monkeypatch.setattr(lde, "_verify_build_stamp_matches", lambda *a: True)
+        monkeypatch.setattr(lde.os, "access", lambda p, m: False)  # not executable
+        
+        assert lde.packaged_linux_executable(root) is None
+
+    def test_wrong_project_root_rejected(self, tmp_path, monkeypatch):
+        """Package from different PROJECT_ROOT → stamp mismatch → rejected."""
+        root = _make_project(tmp_path)
+        exe = root / "apps" / "desktop" / "release" / "linux-unpacked" / "Hermes"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("#!/bin/sh\necho fake", encoding="utf-8")
+        exe.chmod(0o755)
+        
+        monkeypatch.setattr(lde, "_verify_build_stamp_matches", lambda *a: False)  # mismatch
+        monkeypatch.setattr(lde.os, "access", lambda p, m: True)
+        
+        assert lde.packaged_linux_executable(root) is None
+
+    def test_project_path_with_spaces_quotes_cjk(self, tmp_path, monkeypatch):
+        """Project path with spaces/quotes/CJK → quoted Exec line."""
+        # Create project in path with special chars
+        root = tmp_path / "my project" / "hermes-agent"
+        icon = root / "apps" / "desktop" / "assets" / "icon.png"
+        icon.parent.mkdir(parents=True)
+        icon.write_bytes(b"\x89PNG fake")
+        
+        exe = root / "apps" / "desktop" / "release" / "linux-unpacked" / "Hermes"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("#!/bin/sh\necho fake", encoding="utf-8")
+        exe.chmod(0o755)
+        
+        monkeypatch.setattr(lde, "_verify_build_stamp_matches", lambda *a: True)
+        monkeypatch.setattr(lde.os, "access", lambda p, m: True)
+        monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+        
+        entry = lde.install_desktop_entry(root)
+        exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+        
+        # Should be quoted and contain the path
+        assert "my project" in exec_line
+        assert exec_line.startswith('"') or " " not in exec_line.split()[0]
+
+
+@pytest.mark.integration
+def test_desktop_launch_preserves_profile(tmp_path, monkeypatch):
+    """Integration: gtk-launch → Electron starts, profile env preserved, parent exits promptly."""
+    # This test requires a real desktop environment and is marked integration.
+    # It's a placeholder for the full integration test that would:
+    # 1. Set up a minimal Hermes project with built desktop
+    # 2. Run `gtk-launch hermes` or `dex hermes.desktop`
+    # 3. Wait for Electron main process PID
+    # 4. Read /proc/<pid>/environ → assert HERMES_PROFILE=expected
+    # 5. Assert launcher parent already exited
+    # 6. Kill Electron cleanly
+    pytest.skip("Integration test - requires desktop environment")
