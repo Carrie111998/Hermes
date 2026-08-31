@@ -111,11 +111,13 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert tenant_ids == [c]
 
 
-def test_complete_happy_path(worker_env):
+def test_complete_happy_path(worker_env, tmp_path):
     from tools import kanban_tools as kt
+    proof_file = tmp_path / "deliverable.txt"
+    proof_file.write_text("hi", encoding="utf-8")
     out = kt._handle_complete({
         "summary": "got the thing done",
-        "metadata": {"files": 2},
+        "metadata": {"files": 2, "proof": [str(proof_file)]},
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -127,12 +129,12 @@ def test_complete_happy_path(worker_env):
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
         assert run.summary == "got the thing done"
-        assert run.metadata == {"files": 2}
+        assert run.metadata == {"files": 2, "proof": [str(proof_file)]}
     finally:
         conn.close()
 
 
-def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
+def test_complete_retry_with_empty_created_cards_succeeds(worker_env, tmp_path):
     """After a phantom rejection, retrying kanban_complete with
     created_cards=[] (the documented escape hatch) must complete the
     task. Regression for #22923."""
@@ -146,10 +148,14 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     }))
     assert rejected.get("error")
 
+    proof_file = tmp_path / "deliverable.txt"
+    proof_file.write_text("hi", encoding="utf-8")
+
     # Retry with the escape hatch.
     ok = json.loads(kt._handle_complete({
         "summary": "retry without claims",
         "created_cards": [],
+        "metadata": {"proof": [str(proof_file)]},
     }))
     assert ok.get("ok") is True
 
@@ -487,7 +493,7 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
         conn.close()
 
 
-def test_worker_lifecycle_through_tools(worker_env):
+def test_worker_lifecycle_through_tools(worker_env, tmp_path):
     """Drive the full claim -> heartbeat -> comment -> complete lifecycle
     exclusively through the tools, then verify the DB state matches what
     the dispatcher/notifier expect."""
@@ -515,9 +521,11 @@ def test_worker_lifecycle_through_tools(worker_env):
     assert child_out["ok"]
 
     # 5. complete with structured handoff
+    proof_file = tmp_path / "deliverable.txt"
+    proof_file.write_text("hi", encoding="utf-8")
     comp = json.loads(kt._handle_complete({
         "summary": "implemented + spawned QA follow-up",
-        "metadata": {"child_task": child_out["task_id"]},
+        "metadata": {"child_task": child_out["task_id"], "proof": [str(proof_file)]},
     }))
     assert comp["ok"]
 
@@ -530,7 +538,7 @@ def test_worker_lifecycle_through_tools(worker_env):
         assert parent.current_run_id is None
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
-        assert run.metadata == {"child_task": child_out["task_id"]}
+        assert run.metadata == {"child_task": child_out["task_id"], "proof": [str(proof_file)]}
         # Child is todo (parent just finished, but recompute_ready may
         # have promoted it — complete_task runs recompute internally).
         child = kb.get_task(conn, child_out["task_id"])
@@ -709,8 +717,14 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     finally:
         conn.close()
 
+    proof_file = tmp_path / "deliverable.txt"
+    proof_file.write_text("hi", encoding="utf-8")
     from tools import kanban_tools as kt
-    out = kt._handle_complete({"task_id": tid, "summary": "orchestrator close"})
+    out = kt._handle_complete({
+        "task_id": tid,
+        "summary": "orchestrator close",
+        "metadata": {"proof": [str(proof_file)]},
+    })
     d = json.loads(out)
     assert d.get("ok") is True and d.get("task_id") == tid
 

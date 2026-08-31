@@ -273,6 +273,56 @@ def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
     return reason if verdict != "done" else None
 
 
+def _validate_proof_metadata(
+    metadata: "Optional[dict]",
+    task_id: str,
+    conn: "sqlite3.Connection",
+) -> "Optional[str]":
+    """Re-export of `hermes_cli.kanban._validate_proof_metadata`.
+
+    The CLI's `_cmd_complete` already enforces the "done = verified-done"
+    contract; this re-export is here so `_handle_complete` (the dispatcher
+    worker-facing tool path) can run the exact same gate against the same
+    shape without re-implementing it. A regression in either path will
+    surface as a test failure in both ``tests/hermes_cli/test_kanban_complete_proof.py``
+    and ``tests/tools/test_kanban_complete_tool_proof.py``.
+
+    Acceptable proof entries (shape auto-detected):
+
+      - URL https?://...   verified by HEAD returning 2xx (5s timeout)
+      - absolute file path verified via os.path.exists()
+      - card reference t_<hex>  verified via kb.get_task()
+      - attachment id (positive int) verified via kb.list_attachments()
+
+    Caller MUST skip this gate when the task is goal-mode (the auxiliary
+    judge already enforces the acceptance contract there) or when the
+    caller passed accept_unproven=True.
+    """
+    from hermes_cli.kanban import _validate_proof_metadata as _cli_gate
+
+    return _cli_gate(metadata, task_id, conn)
+
+
+def _tool_proof_author() -> str:
+    """Best-effort author name for the `card_closed_without_proof` audit.
+
+    Mirrors ``hermes_cli.kanban._profile_author`` but prefers worker-identifying
+    env vars first because the tool path is reached primarily by dispatcher-
+    spawned workers, not by interactive humans. Falls back through the
+    active profile so CLI invocations still carry a sensible author.
+    """
+    for env in ("HERMES_PROFILE_NAME", "HERMES_PROFILE"):
+        v = os.environ.get(env)
+        if v:
+            return v
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name() or "worker"
+    except Exception:
+        return "worker"
+
+
 # ---------------------------------------------------------------------------
 # Runtime-activity → board-heartbeat bridge (#31752)
 # ---------------------------------------------------------------------------
@@ -742,16 +792,34 @@ def _handle_complete(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    accept_unproven = bool(args.get("accept_unproven"))
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
+            task = kb.get_task(conn, tid)
+            # Proof-required gate for non-goal cards (Issue #22923 follow-up:
+            # mirror of the CLI's `_validate_proof_metadata`, added so the
+            # tool path the dispatcher actually invokes also enforces
+            # "done = verified-done"). Runs BEFORE the goal-judge gate so
+            # a missing-proof rejection cannot be bypassed by adding a
+            # goal-mode _goal_mode_handoff_rejection exception. Goal-mode
+            # cards exempt (the auxiliary judge already enforces the
+            # acceptance contract there). `accept_unproven` is the audit
+            # trail escape hatch — mirrors the CLI flag.
+            if task is not None and not task.goal_mode and not accept_unproven:
+                rejection = _validate_proof_metadata(metadata, tid, conn)
+                if rejection is not None:
+                    return tool_error(
+                        f"kanban_complete blocked: {rejection} "
+                        f"Pass accept_unproven=True to override, or supply "
+                        f"metadata={{'proof': ['<URL or path or t_id>']}}."
+                    )
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
             # Only enforce when a judge is actually reachable — see
             # _goal_judge_available for why an unavailable judge fails open.
-            task = kb.get_task(conn, tid)
             rejection = _goal_mode_handoff_rejection(
                 task,
                 (summary or result or "").strip(),
@@ -803,6 +871,30 @@ def _handle_complete(args: dict, **kw) -> str:
                 return tool_error(
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
+            # Audit trail for accept_unproven overrides (mirror of CLI).
+            # Only emit on the non-goal path — goal-mode closes via the
+            # auxiliary judge and isn't "unproven", so the audit would be
+            # misleading. Same `card_closed_without_proof` event shape as
+            # hermes_cli/kanban.py::_cmd_complete so downstream audits
+            # stay uniform across CLI + tool paths.
+            if accept_unproven and task is not None and not task.goal_mode:
+                try:
+                    kb._append_event(
+                        conn,
+                        tid,
+                        "card_closed_without_proof",
+                        {
+                            "reason": "worker passed accept_unproven=True",
+                            "accepted_by": _tool_proof_author(),
+                        },
+                    )
+                except Exception:
+                    # Audit is best-effort — never block completion because
+                    # the audit write failed.
+                    logger.exception(
+                        "kanban_complete: failed to emit "
+                        "card_closed_without_proof audit event"
+                    )
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:
@@ -1848,6 +1940,24 @@ KANBAN_COMPLETE_SCHEMA = {
                     "workspace are copied to durable task attachments before "
                     "cleanup; a missing declared scratch artifact keeps the "
                     "task in-flight so you can fix the path and retry."
+                ),
+            },
+            "accept_unproven": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "OPTIONAL audit-trail escape hatch for the "
+                    "``metadata.proof`` requirement. Default False — "
+                    "non-goal cards must supply a ``proof`` list in "
+                    "metadata (URL, absolute file path, card id, or "
+                    "attachment id) to verify the work was real. Set "
+                    "True ONLY when no proof is available and a human "
+                    "operator has authorised the override; this records "
+                    "a ``card_closed_without_proof`` audit event on the "
+                    "task so downstream consumers know the close was "
+                    "unverified. Goal-mode cards are exempt regardless "
+                    "(the auxiliary judge already enforces the acceptance "
+                    "contract)."
                 ),
             },
             "board": _board_schema_prop(),
