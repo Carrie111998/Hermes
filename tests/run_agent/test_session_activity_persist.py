@@ -1,9 +1,11 @@
 """Durable session activity projection from AIAgent._touch_activity (#72016)."""
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import run_agent
+import agent.session_activity as session_activity
 from agent.session_activity import ActivityProvenance
 
 
@@ -12,8 +14,15 @@ def _agent_with_db(session_id: str = "sess-1"):
         session_id=session_id,
         _session_db=MagicMock(),
         _last_activity_ts=0.0,
+        _last_activity_mono=0.0,
         _last_activity_desc="",
         _last_activity_provenance=ActivityProvenance.UNKNOWN,
+        _activity_lock=threading.RLock(),
+        _turn_phase=None,
+        _turn_phase_started_at=None,
+        _turn_tool_total=0,
+        _turn_tool_completed=0,
+        _last_heartbeat_mono=0.0,
         _session_activity_last_persist_mono=0.0,
         _current_tool=None,
         _api_call_count=0,
@@ -188,8 +197,158 @@ def test_get_activity_summary_exposes_shared_activity_contract(monkeypatch):
     assert summary["seconds_since_activity"] == 10.0
     assert summary["last_activity_ts"] == 1_700_000_000.0
     assert summary["last_activity_desc"] == "executing tool: terminal"
-    assert "phase" not in summary
-    assert "last_progress_at" not in summary
+    assert summary["phase"] is None
+    assert summary["tool_total"] == 0
+    assert summary["tool_completed"] == 0
+    assert summary["tool_pending"] == 0
+
+
+def test_touch_activity_exposes_safe_monotonic_turn_state(monkeypatch):
+    agent = _agent_with_db()
+    wall = {"t": 1_700_000_000.0}
+    mono = {"t": 500.0}
+    monkeypatch.setattr(run_agent.time, "time", lambda: wall["t"])
+    monkeypatch.setattr(run_agent.time, "monotonic", lambda: mono["t"])
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    agent._touch_activity(
+        "waiting for tool batch",
+        phase="tool_batch_wait",
+        current_tool="terminal",
+        tool_total=3,
+        tool_completed=1,
+    )
+
+    first = agent.get_activity_summary()
+    assert first["phase"] == "tool_batch_wait"
+    assert first["current_tool"] == "terminal"
+    assert first["tool_completed"] == 1
+    assert first["tool_total"] == 3
+    assert first["tool_pending"] == 2
+    assert first["phase_started_at"] == 500.0
+    assert first["last_heartbeat_mono"] == 500.0
+    assert "last_heartbeat_at" not in first
+    assert first["seconds_since_activity"] == 0.0
+    assert first["last_activity_desc"] == "waiting for tool batch"
+    assert not {
+        "arguments",
+        "command",
+        "prompt",
+        "result",
+        "session_id",
+        "chat_id",
+    } & first.keys()
+
+    wall["t"] += 60.0
+    mono["t"] += 2.0
+    agent._touch_activity("tool still running")
+    second = agent.get_activity_summary()
+    assert second["phase"] == "tool_batch_wait"
+    assert second["phase_started_at"] == 500.0
+    assert second["last_heartbeat_mono"] == 502.0
+    assert "last_heartbeat_at" not in second
+    assert second["seconds_since_activity"] == 0.0
+
+
+def test_touch_activity_memoizes_callback_signature_and_refreshes_when_replaced(
+    monkeypatch,
+):
+    calls = []
+    signature_calls = 0
+
+    def structured(description, **state):
+        calls.append((description, state))
+
+    def legacy(description):
+        calls.append((description, {}))
+
+    original_signature = session_activity.inspect.signature
+
+    def counting_signature(callback):
+        nonlocal signature_calls
+        signature_calls += 1
+        return original_signature(callback)
+
+    monkeypatch.setattr(session_activity.inspect, "signature", counting_signature)
+    agent = SimpleNamespace(_touch_activity=structured)
+
+    session_activity.touch_activity(agent, "first", phase="model_call")
+    session_activity.touch_activity(agent, "second", phase="response_delivery")
+    assert signature_calls == 1
+    assert calls[-1][1]["phase"] == "response_delivery"
+
+    agent._touch_activity = legacy
+    session_activity.touch_activity(agent, "legacy", phase="model_call")
+    assert signature_calls == 2
+    assert calls[-1] == ("legacy", {})
+
+
+def test_get_activity_summary_reads_turn_counters_under_activity_lock():
+    class GuardedLock:
+        def __init__(self):
+            self.held = False
+
+        def acquire(self):
+            self.held = True
+
+        def release(self):
+            self.held = False
+
+    class GuardedBudget:
+        def __init__(self, owner):
+            self.owner = owner
+
+        @property
+        def used(self):
+            assert self.owner._activity_lock.held
+            return 3
+
+        @property
+        def max_total(self):
+            assert self.owner._activity_lock.held
+            return 10
+
+    class GuardedAgent:
+        _LOCKED_FIELDS = {
+            "_api_call_count",
+            "max_iterations",
+            "iteration_budget",
+        }
+
+        def __init__(self):
+            self._activity_lock = GuardedLock()
+            self._last_activity_ts = 1_700_000_000.0
+            self._last_activity_mono = 500.0
+            self._last_activity_desc = "model call"
+            self._last_activity_provenance = ActivityProvenance.UNKNOWN
+            self._current_tool = None
+            self._turn_phase = "model_call"
+            self._turn_phase_started_at = 500.0
+            self._turn_tool_total = 0
+            self._turn_tool_completed = 0
+            self._last_heartbeat_mono = 500.0
+            self._api_call_count = 2
+            self.max_iterations = 10
+            self.iteration_budget = GuardedBudget(self)
+
+        def __getattribute__(self, name):
+            if name in type(self)._LOCKED_FIELDS:
+                lock = object.__getattribute__(self, "_activity_lock")
+                assert lock.held, f"{name} read outside activity lock"
+            return object.__getattribute__(self, name)
+
+    agent = GuardedAgent()
+    get_summary = run_agent.AIAgent.get_activity_summary.__get__(
+        agent,
+        GuardedAgent,
+    )
+
+    summary = get_summary()
+
+    assert summary["api_call_count"] == 2
+    assert summary["max_iterations"] == 10
+    assert summary["budget_used"] == 3
+    assert summary["budget_max"] == 10
 
 
 def test_reset_activity_labels_after_turn_keeps_ts_and_clears_labels():

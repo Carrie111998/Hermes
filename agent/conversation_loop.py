@@ -41,6 +41,7 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
+from agent.session_activity import touch_activity
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     _review_fork_first_request_pending,
@@ -2130,7 +2131,13 @@ def run_conversation(
         
         api_call_count += 1
         agent._api_call_count = api_call_count
-        agent._touch_activity(f"starting API call #{api_call_count}")
+        touch_activity(agent,
+            f"starting API call #{api_call_count}",
+            phase="model_call",
+            current_tool=None,
+            tool_total=0,
+            tool_completed=0,
+        )
 
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
@@ -7892,7 +7899,11 @@ def run_conversation(
                 # timeout (HERMES_AGENT_TIMEOUT, default 1800s) and the
                 # gateway kills the session before the next activity
                 # touch fires (#69559, #69131).
-                agent._touch_activity(f"tool results posted, continuing iteration #{api_call_count}")
+                touch_activity(agent,
+                    f"tool results posted, continuing iteration #{api_call_count}",
+                    phase="next_model_call",
+                    current_tool=None,
+                )
                 # Continue loop for next response
                 continue
             
@@ -8807,6 +8818,11 @@ def run_conversation(
     # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
     # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
     # result dict is returned exactly as before.
+    touch_activity(agent,
+        "preparing response delivery",
+        phase="response_delivery",
+        current_tool=None,
+    )
     return finalize_turn(
         agent,
         final_response=final_response,

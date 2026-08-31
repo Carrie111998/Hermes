@@ -1038,12 +1038,19 @@ def init_agent(
     # agent was doing when it was killed, and by the "still working"
     # notifications to show progress.
     agent._last_activity_ts: float = time.time()
+    agent._last_activity_mono: float = time.monotonic()
     agent._last_activity_desc: str = "initializing"
     # Default / unmigrated paths and _touch_activity stamp unknown; named
     # provenances are stamped by compression writers (heartbeat / timeout / cooldown).
     agent._last_activity_provenance = ActivityProvenance.UNKNOWN
     # Rate-limit durable SessionDB activity stamps from _touch_activity (#72016).
     agent._session_activity_last_persist_mono: float = 0.0
+    agent._activity_lock = threading.RLock()
+    agent._turn_phase: str | None = None
+    agent._turn_phase_started_at: float | None = None
+    agent._turn_tool_total: int = 0
+    agent._turn_tool_completed: int = 0
+    agent._last_heartbeat_mono: float = agent._last_activity_mono
     agent._current_tool: str | None = None
     agent._api_call_count: int = 0
     # Opt-out flag for the between-turns MCP tool refresh (build_turn_context).

@@ -33,6 +33,7 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.message_sanitization import coalesce_tool_call_id
+from agent.session_activity import touch_activity
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
     _is_destructive_command,
@@ -1095,7 +1096,17 @@ def _begin_tool_execution(
             pass
 
 
-def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_concurrent(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    activity_tool_total: int | None = None,
+    activity_tool_offset: int = 0,
+) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
     Results are collected in the original tool-call order and appended to
@@ -1299,11 +1310,28 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # its own bound against the batch deadline it must stay under.
     timeout_s = _resolve_concurrent_tool_timeout()
     gate_timeout_s = _start_order_gate_timeout(timeout_s)
+    activity_total = (
+        num_tools if activity_tool_total is None else activity_tool_total
+    )
+    activity_offset = max(0, activity_tool_offset)
 
     # Touch activity before launching workers so the gateway knows
     # we're executing tools (not stuck).
-    agent._current_tool = tool_names_str
-    agent._touch_activity(f"executing {num_tools} tools concurrently: {tool_names_str}")
+    initially_completed = sum(result is not None for result in results)
+    initial_pending_names = [
+        name
+        for index, (_tc, name, _args, _trace, _parse_error, _scope_block) in enumerate(
+            parsed_calls
+        )
+        if results[index] is None
+    ]
+    touch_activity(agent,
+        f"waiting for {num_tools} concurrent tools",
+        phase="tool_batch_wait",
+        current_tool=(initial_pending_names[0] if initial_pending_names else None),
+        tool_total=activity_total,
+        tool_completed=activity_offset + initially_completed,
+    )
 
     def _run_tool(
         index,
@@ -1579,7 +1607,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 # or a new message during concurrent tool execution.
                 _conc_start = time.time()
                 _interrupt_logged = False
-                while True:
+                pending_futures = set(futures)
+                reported_completed = initially_completed
+                while pending_futures:
                     wait_timeout = 5.0
                     if deadline is not None:
                         effective_deadline = (
@@ -1587,19 +1617,39 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         )
                         remaining = effective_deadline - time.monotonic()
                         if remaining <= 0:
-                            done, not_done = set(), {
-                                f for f in futures if not f.done()
-                            }
+                            done, not_done = set(), pending_futures
                         else:
                             wait_timeout = min(wait_timeout, remaining)
                             done, not_done = concurrent.futures.wait(
-                                futures, timeout=wait_timeout,
+                                pending_futures,
+                                timeout=wait_timeout,
+                                return_when=concurrent.futures.FIRST_COMPLETED,
                             )
                     else:
                         done, not_done = concurrent.futures.wait(
-                            futures, timeout=wait_timeout,
+                            pending_futures,
+                            timeout=wait_timeout,
+                            return_when=concurrent.futures.FIRST_COMPLETED,
                         )
-                    if not not_done:
+                    pending_futures = set(not_done)
+                    completed_count = activity_offset + initially_completed + sum(
+                        future.done() for future in futures
+                    )
+                    if completed_count != reported_completed:
+                        reported_completed = completed_count
+                        pending_names = [
+                            parsed_calls[future_to_index[future]][1]
+                            for future in pending_futures
+                            if future in future_to_index
+                        ]
+                        touch_activity(agent,
+                            f"concurrent tool progress: {completed_count}/{num_tools} completed",
+                            phase="tool_batch_wait",
+                            current_tool=(pending_names[0] if pending_names else None),
+                            tool_total=activity_total,
+                            tool_completed=completed_count,
+                        )
+                    if not pending_futures:
                         break
 
                     if (
@@ -1610,7 +1660,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         abandon_executor = True
                         timed_out_indices = {
                             future_to_index[f]
-                            for f in not_done
+                            for f in pending_futures
                             if f in future_to_index
                         }
                         _still_running = [
@@ -1624,7 +1674,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             len(timed_out_indices),
                             ", ".join(_still_running[:5]),
                         )
-                        for f in not_done:
+                        for f in pending_futures:
                             f.cancel()
                         # Release gate-parked workers before the interrupt
                         # fan-out so none of them wakes up later and dispatches
@@ -1650,17 +1700,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             _interrupt_logged = True
                             agent._vprint(
                                 f"{agent.log_prefix}⚡ Interrupt: cancelling "
-                                f"{len(not_done)} pending concurrent tool(s)",
+                                f"{len(pending_futures)} pending concurrent tool(s)",
                                 force=True,
                             )
-                        for f in not_done:
+                        for f in pending_futures:
                             f.cancel()
                         # Release gate-parked workers so they abort instead of
                         # dispatching after the turn was already interrupted.
                         _abandon_batch()
                         # Give already-running tools a moment to notice the
                         # per-thread interrupt signal and exit gracefully.
-                        concurrent.futures.wait(not_done, timeout=3.0)
+                        concurrent.futures.wait(pending_futures, timeout=3.0)
                         break
 
                     _conc_elapsed = int(time.time() - _conc_start)
@@ -1668,12 +1718,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     if _conc_elapsed > 0 and _conc_elapsed % 30 < 6:
                         _still_running = [
                             parsed_calls[future_to_index[f]][1]
-                            for f in not_done
+                            for f in pending_futures
                             if f in future_to_index
                         ]
                         agent._touch_activity(
                             f"concurrent tools running ({_conc_elapsed}s, "
-                            f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
+                            f"{len(pending_futures)} remaining: {', '.join(_still_running[:3])})"
                         )
             finally:
                 # Belt-and-braces: any exit from the wait loop that abandoned
@@ -1810,9 +1860,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
                 logging.debug("Tool result (%d chars): %s", len(function_result), function_result)
 
-        agent._current_tool = None
         _status_suffix = " (error)" if is_error else ""
-        agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
+        completed_tool_count = activity_offset + sum(
+            result is not None for result in results
+        )
+        touch_activity(agent,
+            f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}; persisting result",
+            phase="tool_result_persist",
+            current_tool=name,
+            tool_total=activity_total,
+            tool_completed=completed_tool_count,
+        )
 
         display_function_result = function_result
         function_result = maybe_persist_tool_result(
@@ -1860,6 +1918,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # Every completion surface is downstream of the canonical append. If
         # the UI bridge or process dies while projecting one of these events,
         # resume can reconstruct the tool result that was already visible.
+        touch_activity(agent,
+            f"projecting tool completion: {name}",
+            phase="post_tool_callbacks",
+            current_tool=name,
+            tool_total=activity_total,
+            tool_completed=completed_tool_count,
+        )
         if not blocked and agent.tool_progress_callback:
             try:
                 agent.tool_progress_callback(
@@ -1949,7 +2014,17 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_sequential(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+    activity_tool_total: int | None = None,
+    activity_tool_offset: int = 0,
+) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
@@ -1958,6 +2033,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """
     # Resolve the context-scaled tool-output budget once per turn.
     _tool_budget = _budget_for_agent(agent)
+    num_tools_seq = len(assistant_message.tool_calls)
+    activity_total = (
+        num_tools_seq if activity_tool_total is None else activity_tool_total
+    )
+    activity_offset = max(0, activity_tool_offset)
 
     # Keep every runtime-tool branch on one bounded execution funnel without
     # duplicating timeout policy across the branch-specific callbacks below.
@@ -2007,11 +2087,25 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             break
 
         function_name = tool_call.function.name
+        touch_activity(agent,
+            f"waiting for sequential tool {i}/{num_tools_seq}",
+            phase="tool_batch_wait",
+            current_tool=function_name,
+            tool_total=activity_total,
+            tool_completed=activity_offset + i - 1,
+        )
 
         function_args, malformed_args_result = _parse_tool_arguments(
             tool_call.function.arguments
         )
         if malformed_args_result is not None:
+            touch_activity(agent,
+                f"tool arguments rejected: {function_name}; persisting result",
+                phase="tool_result_persist",
+                current_tool=function_name,
+                tool_total=activity_total,
+                tool_completed=activity_offset + i,
+            )
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=function_name,
@@ -2036,6 +2130,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 stage=f"invalid tool arguments {function_name}",
             ):
                 return
+            touch_activity(agent,
+                f"projecting tool completion: {function_name}",
+                phase="post_tool_callbacks",
+                current_tool=function_name,
+                tool_total=activity_total,
+                tool_completed=activity_offset + i,
+            )
             continue
 
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
@@ -2730,9 +2831,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-        agent._current_tool = None
         _status_suffix = " (error)" if _is_error_result else ""
-        agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
+        touch_activity(agent,
+            f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}; persisting result",
+            phase="tool_result_persist",
+            current_tool=function_name,
+            tool_total=activity_total,
+            tool_completed=activity_offset + i,
+        )
 
         if agent.verbose_logging:
             logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
@@ -2777,6 +2883,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
+        touch_activity(agent,
+            f"projecting tool completion: {function_name}",
+            phase="post_tool_callbacks",
+            current_tool=function_name,
+            tool_total=activity_total,
+            tool_completed=activity_offset + i,
+        )
         if not _execution_blocked and agent.tool_progress_callback:
             try:
                 agent.tool_progress_callback(
@@ -2851,7 +2964,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # Keep /steer pending until the final post-budget drain below.  The model
     # only receives this batch after all calls finish, and an early drain can
     # be discarded when aggregate budget enforcement replaces a tool result.
-    num_tools_seq = len(assistant_message.tool_calls)
     if finalize and num_tools_seq > 0:
         enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
 
@@ -2894,6 +3006,8 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
+    total_tools = len(assistant_message.tool_calls)
+    activity_offset = 0
     for kind, calls in segments:
         if getattr(agent, "_incremental_persistence_failed", False):
             return
@@ -2902,18 +3016,22 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             execute_tool_calls_concurrent(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                activity_tool_total=total_tools,
+                activity_tool_offset=activity_offset,
             )
         else:
             execute_tool_calls_sequential(
                 agent, segment_message, messages, effective_task_id, api_call_count,
                 finalize=False,
+                activity_tool_total=total_tools,
+                activity_tool_offset=activity_offset,
             )
 
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        activity_offset += len(calls)
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
-    total_tools = len(assistant_message.tool_calls)
     if total_tools > 0:
         _tool_budget = _budget_for_agent(agent)
         enforce_turn_budget(

@@ -15,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+import gateway.run as gateway_run
+
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -167,6 +169,74 @@ class TestStagedInactivityWarning:
         assert _inactivity_timeout
 
 
+def _structured_activity():
+    return {
+        "phase": "tool_batch_wait",
+        "current_tool": "terminal",
+        "tool_completed": 1,
+        "tool_total": 2,
+        "tool_pending": 1,
+        "last_activity_desc": "command text that must stay internal",
+        "arguments": {"token": "credential-value"},
+        "result": "tool output that must stay internal",
+        "chat_id": "private-chat",
+        "session_id": "private-session",
+    }
 
 
+def test_warning_uses_only_structured_safe_activity_metadata():
+    warning = gateway_run._format_gateway_inactivity_warning(
+        _structured_activity(),
+        warning_seconds=60.0,
+        timeout_seconds=120.0,
+    )
+
+    assert "phase: tool_batch_wait" in warning
+    assert "tool: terminal" in warning
+    assert "1/2 tools completed" in warning
+    for private_text in (
+        "command text",
+        "credential-value",
+        "tool output",
+        "private-chat",
+        "private-session",
+    ):
+        assert private_text not in warning
+
+
+def test_timeout_diagnostic_reports_unknown_side_effect_without_private_data():
+    diagnostic = gateway_run._format_gateway_timeout_diagnostic(
+        _structured_activity()
+    )
+
+    assert "configured inactivity limit" in diagnostic
+    assert "`tool_batch_wait`" in diagnostic
+    assert "`terminal`" in diagnostic
+    assert "1/2 tools completed" in diagnostic
+    assert "did not replay" in diagnostic
+    assert "side effect is unknown" in diagnostic
+    assert (
+        "To increase the limit, set agent.gateway_timeout in config.yaml "
+        "(value in seconds, 0 = no limit) and restart the gateway."
+    ) in diagnostic
+    for private_text in (
+        "command text",
+        "credential-value",
+        "tool output",
+        "private-chat",
+        "private-session",
+    ):
+        assert private_text not in diagnostic
+
+
+def test_capture_activity_fails_closed_for_non_mapping_reader():
+    reader = type("Reader", (), {"get_activity_summary": lambda _self: None})()
+
+    assert gateway_run._capture_gateway_activity(reader) == {
+        "phase": "unknown",
+        "current_tool": "none",
+        "tool_completed": 0,
+        "tool_total": 0,
+        "tool_pending": 0,
+    }
 

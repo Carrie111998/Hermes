@@ -38,6 +38,18 @@ import hashlib
 import json
 import logging
 logger = logging.getLogger(__name__)
+
+_ACTIVITY_FIELD_UNSET = object()
+_TURN_ACTIVITY_PHASES = frozenset(
+    {
+        "model_call",
+        "tool_batch_wait",
+        "tool_result_persist",
+        "post_tool_callbacks",
+        "next_model_call",
+        "response_delivery",
+    }
+)
 import os
 import re
 import sys
@@ -4091,6 +4103,10 @@ class AIAgent:
         *,
         provenance: Optional[ActivityProvenance] = None,
         force_persist: bool = False,
+        phase: Optional[str] = None,
+        current_tool: Any = _ACTIVITY_FIELD_UNSET,
+        tool_total: Optional[int] = None,
+        tool_completed: Optional[int] = None,
     ) -> None:
         """Update the last-activity timestamp and description (thread-safe).
 
@@ -4117,9 +4133,44 @@ class AIAgent:
             reset_session_activity_persist_window,
         )
 
-        self._last_activity_ts = time.time()
-        self._last_activity_desc = bound_activity_description(desc)
-        self._last_activity_provenance = normalize_activity_provenance(provenance)
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        activity_lock = getattr(self, "_activity_lock", None)
+        if activity_lock is not None:
+            activity_lock.acquire()
+        try:
+            self._last_activity_ts = now_wall
+            self._last_activity_mono = now_mono
+            self._last_activity_desc = bound_activity_description(desc)
+            self._last_activity_provenance = normalize_activity_provenance(provenance)
+            self._last_heartbeat_mono = now_mono
+
+            normalized_phase = phase if phase in _TURN_ACTIVITY_PHASES else None
+            if normalized_phase is not None:
+                if normalized_phase != getattr(self, "_turn_phase", None):
+                    self._turn_phase_started_at = now_mono
+                self._turn_phase = normalized_phase
+
+            if current_tool is not _ACTIVITY_FIELD_UNSET:
+                self._current_tool = (
+                    str(current_tool) if current_tool is not None else None
+                )
+
+            if tool_total is not None:
+                try:
+                    self._turn_tool_total = max(0, int(tool_total))
+                except (TypeError, ValueError):
+                    pass
+            if tool_completed is not None:
+                try:
+                    completed = max(0, int(tool_completed))
+                    total = max(0, int(getattr(self, "_turn_tool_total", 0)))
+                    self._turn_tool_completed = min(completed, total)
+                except (TypeError, ValueError):
+                    pass
+        finally:
+            if activity_lock is not None:
+                activity_lock.release()
         if os.environ.get("HERMES_KANBAN_TASK"):
             try:
                 from tools.kanban_tools import (
@@ -4195,8 +4246,21 @@ class AIAgent:
         """
         from agent.session_activity import ActivityProvenance
 
-        self._last_activity_desc = ""
-        self._last_activity_provenance = ActivityProvenance.UNKNOWN
+        activity_lock = getattr(self, "_activity_lock", None)
+        if activity_lock is not None:
+            activity_lock.acquire()
+        try:
+            self._last_activity_desc = ""
+            self._last_activity_provenance = ActivityProvenance.UNKNOWN
+            self._turn_phase = None
+            self._turn_phase_started_at = None
+            self._turn_tool_total = 0
+            self._turn_tool_completed = 0
+            self._last_heartbeat_mono = 0.0
+            self._current_tool = None
+        finally:
+            if activity_lock is not None:
+                activity_lock.release()
         session_id = getattr(self, "session_id", None)
         session_db = getattr(self, "_session_db", None)
         if not session_id or session_db is None:
@@ -4435,19 +4499,66 @@ class AIAgent:
             build_activity_snapshot,
         )
 
-        provenance = getattr(self, "_last_activity_provenance", None)
+        now_wall = time.time()
+        now_mono = time.monotonic()
+        activity_lock = getattr(self, "_activity_lock", None)
+        if activity_lock is not None:
+            activity_lock.acquire()
+        try:
+            last_activity_at = getattr(self, "_last_activity_ts", None)
+            last_activity_mono = getattr(self, "_last_activity_mono", None)
+            last_activity_description = (
+                getattr(self, "_last_activity_desc", None) or ""
+            )
+            provenance = getattr(self, "_last_activity_provenance", None)
+            current_tool = getattr(self, "_current_tool", None)
+            phase = getattr(self, "_turn_phase", None)
+            phase_started_at = getattr(self, "_turn_phase_started_at", None)
+            tool_total = max(0, int(getattr(self, "_turn_tool_total", 0) or 0))
+            tool_completed = min(
+                tool_total,
+                max(0, int(getattr(self, "_turn_tool_completed", 0) or 0)),
+            )
+            last_heartbeat_mono = getattr(self, "_last_heartbeat_mono", None)
+            api_call_count = getattr(self, "_api_call_count", 0)
+            max_iterations = getattr(self, "max_iterations", 0)
+            iteration_budget = getattr(self, "iteration_budget", None)
+            budget_used = getattr(iteration_budget, "used", 0)
+            budget_max = getattr(iteration_budget, "max_total", 0)
+        finally:
+            if activity_lock is not None:
+                activity_lock.release()
+
         if provenance is None:
             provenance = ActivityProvenance.UNKNOWN
+        seconds_since_activity = None
+        if last_activity_mono:
+            seconds_since_activity = round(
+                max(0.0, now_mono - float(last_activity_mono)),
+                1,
+            )
         return build_activity_snapshot(
-            last_activity_at=getattr(self, "_last_activity_ts", None),
-            last_activity_description=getattr(self, "_last_activity_desc", None) or "",
+            last_activity_at=last_activity_at,
+            last_activity_description=last_activity_description,
             last_activity_provenance=provenance,
+            now=now_wall,
             extra={
-            "current_tool": self._current_tool,
-            "api_call_count": self._api_call_count,
-            "max_iterations": self.max_iterations,
-            "budget_used": self.iteration_budget.used,
-            "budget_max": self.iteration_budget.max_total,
+                "current_tool": current_tool,
+                "api_call_count": api_call_count,
+                "max_iterations": max_iterations,
+                "budget_used": budget_used,
+                "budget_max": budget_max,
+                "phase": phase,
+                "tool_total": tool_total,
+                "tool_completed": tool_completed,
+                "tool_pending": max(0, tool_total - tool_completed),
+                "phase_started_at": phase_started_at,
+                "last_heartbeat_mono": last_heartbeat_mono or None,
+                **(
+                    {"seconds_since_activity": seconds_since_activity}
+                    if seconds_since_activity is not None
+                    else {}
+                ),
             },
         )
 

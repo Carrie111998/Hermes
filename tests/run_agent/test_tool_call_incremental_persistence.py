@@ -23,16 +23,22 @@ makes the corresponding assertion fail.
 """
 
 import copy
-from types import SimpleNamespace
 from pathlib import Path
 import tempfile
+import threading
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent.tool_dispatch_helpers import make_tool_result_message
 from agent.agent_runtime_helpers import sanitize_api_messages
-from agent.tool_executor import execute_tool_calls_segmented
+from agent.tool_executor import (
+    execute_tool_calls_concurrent,
+    execute_tool_calls_segmented,
+    execute_tool_calls_sequential,
+)
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -51,13 +57,14 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
-def _make_agent():
+def _make_agent(*tool_names: str):
     hermes_home = Path(tempfile.mkdtemp(prefix="hermes-test-home-"))
     (hermes_home / "logs").mkdir(parents=True, exist_ok=True)
+    names = tool_names or ("web_search",)
     with (
         patch(
             "run_agent.get_tool_definitions",
-            return_value=_make_tool_defs("web_search"),
+            return_value=_make_tool_defs(*names),
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
@@ -116,6 +123,28 @@ def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
     msg = SimpleNamespace(content=content, tool_calls=tool_calls)
     choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+
+def _record_activity_snapshots(agent):
+    snapshots: list[dict] = []
+    original_touch = agent._touch_activity
+
+    def _record(description, **state):
+        original_touch(description, **state)
+        snapshots.append(agent.get_activity_summary())
+
+    agent._touch_activity = _record
+    return snapshots
+
+
+def _wait_for_snapshot(snapshots, predicate, timeout: float = 3.0) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        for snapshot in reversed(list(snapshots)):
+            if predicate(snapshot):
+                return snapshot
+        time.sleep(0.01)
+    raise AssertionError("expected activity snapshot was not observed")
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +591,83 @@ def test_segmented_batch_stops_before_later_segment_after_persist_failure():
     assert getattr(agent, "_incremental_persistence_failed", False) is True
 
 
+def test_segmented_batch_activity_counters_cover_full_turn():
+    agent = _make_agent("tool_one", "tool_two")
+    first = _mock_tool_call(name="tool_one", call_id="first")
+    second = _mock_tool_call(name="tool_two", call_id="second")
+    assistant_message = SimpleNamespace(tool_calls=[first, second])
+    messages: list[dict] = []
+    snapshots = _record_activity_snapshots(agent)
+
+    with (
+        patch.object(agent, "_invoke_tool", return_value="first result"),
+        patch("run_agent.handle_function_call", return_value="second result"),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        execute_tool_calls_segmented(
+            agent,
+            assistant_message,
+            messages,
+            "task-1",
+            segments=[("parallel", [first]), ("sequential", [second])],
+        )
+
+    second_segment = [
+        item
+        for item in snapshots
+        if item.get("phase") == "tool_batch_wait"
+        and item.get("current_tool") == "tool_two"
+    ]
+    assert second_segment
+    assert second_segment[-1]["tool_completed"] == 1
+    assert second_segment[-1]["tool_total"] == 2
+    assert any(
+        item.get("phase") == "tool_result_persist"
+        and item.get("tool_completed") == 2
+        and item.get("tool_total") == 2
+        for item in snapshots
+    )
+
+
+@pytest.mark.parametrize(
+    ("executor", "tool_call_id"),
+    [
+        (execute_tool_calls_sequential, "zero-sequential"),
+        (execute_tool_calls_concurrent, "zero-concurrent"),
+    ],
+)
+def test_explicit_zero_activity_total_is_not_replaced_by_batch_size(
+    executor,
+    tool_call_id,
+):
+    agent = _make_agent("tool_one")
+    call = _mock_tool_call(name="tool_one", call_id=tool_call_id)
+    assistant_message = SimpleNamespace(content="", tool_calls=[call])
+    messages: list[dict] = []
+    snapshots = _record_activity_snapshots(agent)
+
+    with (
+        patch.object(agent, "_invoke_tool", return_value="result"),
+        patch("run_agent.handle_function_call", return_value="result"),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        executor(
+            agent,
+            assistant_message,
+            messages,
+            "task-1",
+            activity_tool_total=0,
+        )
+
+    assert any(snapshot["tool_total"] == 0 for snapshot in snapshots)
+
+
 # ---------------------------------------------------------------------------
 # Contract 3: the CONCURRENT path flushes each collected tool result in append
 # order.  Dispatch goes through agent._invoke_tool (the real concurrent
@@ -616,6 +722,158 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     assert flush_lengths == [1, 2]
 
 
+def test_concurrent_activity_reports_collected_and_persisted_tool_counts():
+    agent = _make_agent("tool_one", "tool_two")
+    calls = [
+        _mock_tool_call(name="tool_one", call_id="c1"),
+        _mock_tool_call(name="tool_two", call_id="c2"),
+    ]
+    assistant_message = SimpleNamespace(content="", tool_calls=calls)
+    messages: list[dict] = []
+    snapshots = _record_activity_snapshots(agent)
+    first_done = threading.Event()
+    second_started = threading.Event()
+    release_second = threading.Event()
+    errors: list[BaseException] = []
+
+    def _invoke(_name, _args, _task_id, tool_call_id, **_kwargs):
+        if tool_call_id == "c1":
+            first_done.set()
+            return "first result"
+        second_started.set()
+        release_second.wait(timeout=5.0)
+        return "second result"
+
+    def _run():
+        try:
+            agent._execute_tool_calls_concurrent(
+                assistant_message,
+                messages,
+                "task",
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=_run, daemon=True)
+    with (
+        patch.object(agent, "_invoke_tool", side_effect=_invoke),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        worker.start()
+        try:
+            assert first_done.wait(timeout=3.0)
+            assert second_started.wait(timeout=3.0)
+            waiting = _wait_for_snapshot(
+                snapshots,
+                lambda item: item.get("phase") == "tool_batch_wait"
+                and item.get("tool_completed") == 1,
+            )
+            assert waiting["current_tool"] == "tool_two"
+            assert waiting["tool_total"] == 2
+            assert waiting["tool_pending"] == 1
+        finally:
+            release_second.set()
+            worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert errors == []
+    persisted = _wait_for_snapshot(
+        snapshots,
+        lambda item: item.get("phase") == "tool_result_persist"
+        and item.get("tool_completed") == 2,
+    )
+    assert persisted["tool_total"] == 2
+    assert persisted["tool_pending"] == 0
+    assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+
+
+def test_sequential_activity_marks_persist_and_callback_boundaries():
+    agent = _make_agent("tool_one", "tool_two")
+    calls = [
+        _mock_tool_call(name="tool_one", call_id="c1"),
+        _mock_tool_call(name="tool_two", call_id="c2"),
+    ]
+    assistant_message = SimpleNamespace(content="", tool_calls=calls)
+    messages: list[dict] = []
+    snapshots = _record_activity_snapshots(agent)
+    persist_entered = threading.Event()
+    release_persist = threading.Event()
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    errors: list[BaseException] = []
+    flush_count = 0
+
+    def _dispatch(_name, _args, _task_id, *, tool_call_id, **_kwargs):
+        return f"result-{tool_call_id}"
+
+    def _flush(_messages, _history=None):
+        nonlocal flush_count
+        flush_count += 1
+        if flush_count == 1:
+            persist_entered.set()
+            release_persist.wait(timeout=5.0)
+
+    def _progress(event, _name, *_args, **_kwargs):
+        if event == "tool.completed" and not callback_entered.is_set():
+            callback_entered.set()
+            release_callback.wait(timeout=5.0)
+
+    def _run():
+        try:
+            agent._execute_tool_calls_sequential(
+                assistant_message,
+                messages,
+                "task",
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    agent._flush_messages_to_session_db = _flush
+    agent.tool_progress_callback = _progress
+    worker = threading.Thread(target=_run, daemon=True)
+    with (
+        patch("run_agent.handle_function_call", side_effect=_dispatch),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        worker.start()
+        try:
+            assert persist_entered.wait(timeout=3.0)
+            persisting = agent.get_activity_summary()
+            assert persisting["phase"] == "tool_result_persist"
+            assert persisting["current_tool"] == "tool_one"
+            assert persisting["tool_completed"] == 1
+            assert persisting["tool_total"] == 2
+            assert persisting["tool_pending"] == 1
+
+            release_persist.set()
+            assert callback_entered.wait(timeout=3.0)
+            callbacks = agent.get_activity_summary()
+            assert callbacks["phase"] == "post_tool_callbacks"
+            assert callbacks["current_tool"] == "tool_one"
+            assert callbacks["tool_completed"] == 1
+
+            release_callback.set()
+        finally:
+            release_persist.set()
+            release_callback.set()
+            worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert errors == []
+    next_tool = _wait_for_snapshot(
+        snapshots,
+        lambda item: item.get("phase") == "tool_batch_wait"
+        and item.get("current_tool") == "tool_two",
+    )
+    assert next_tool["tool_completed"] == 1
+    assert next_tool["tool_total"] == 2
+    assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
 def test_empty_final_response_updates_already_flushed_blank_assistant_row(tmp_path):
     """#95514: popping _db_persisted must UPDATE the flushed row, not INSERT.
 

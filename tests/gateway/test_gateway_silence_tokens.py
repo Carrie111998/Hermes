@@ -166,6 +166,47 @@ async def test_prose_mentioning_silence_token_is_delivered(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_timeout_diagnostic_uses_normal_response_path_once(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    diagnostic = gateway_run._format_gateway_timeout_diagnostic(
+        {
+            "phase": "tool_batch_wait",
+            "current_tool": "terminal",
+            "tool_completed": 1,
+            "tool_total": 2,
+            "tool_pending": 1,
+        }
+    )
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": diagnostic,
+            "messages": [{"role": "user", "content": "generic request"}],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+            "failed": True,
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert response == diagnostic
+    assert runner._run_agent.await_count == 1
+    appended = [
+        call.args[1]
+        for call in runner.session_store.append_to_transcript.call_args_list
+    ]
+    assert not [
+        message
+        for message in appended
+        if message.get("role") in {"user", "assistant"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_agent_end_hook_includes_model_and_provider(monkeypatch, tmp_path):
     """Gateway hooks receive the actual model/provider for post-turn routing."""
     runner = _runner(monkeypatch, tmp_path)

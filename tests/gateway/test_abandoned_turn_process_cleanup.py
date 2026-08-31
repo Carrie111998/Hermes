@@ -115,6 +115,46 @@ def test_timeout_cleanup_is_idempotent(monkeypatch):
     assert len(agent.interrupts) == 1
 
 
+def test_timeout_captures_activity_before_interrupt(monkeypatch):
+    worker_done, timeout_fired, cleanup_lock = _state()
+    captured = [None]
+
+    class _Agent:
+        def __init__(self):
+            self.phase = "tool_result_persist"
+
+        def get_activity_summary(self):
+            return {
+                "phase": self.phase,
+                "current_tool": "terminal",
+                "tool_completed": 2,
+                "tool_total": 3,
+                "tool_pending": 1,
+                "seconds_since_activity": 60.0,
+            }
+
+        def interrupt(self, _reason):
+            self.phase = "response_delivery"
+
+    monkeypatch.setattr(
+        process_registry,
+        "kill_started_since",
+        lambda *_args, **_kwargs: 0,
+    )
+
+    assert _abandon_timed_out_gateway_turn(
+        agent_holder=[_Agent()],
+        task_id="generic-task",
+        process_baseline=frozenset(),
+        worker_done=worker_done,
+        timeout_fired=timeout_fired,
+        cleanup_lock=cleanup_lock,
+        activity_holder=captured,
+    )
+    assert captured[0]["phase"] == "tool_result_persist"
+    assert captured[0]["tool_completed"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Cross-turn race guard (#76188 review): task_id is session-scoped, not
 # turn-scoped, so a replacement turn on the same session could otherwise

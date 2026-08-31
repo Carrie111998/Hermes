@@ -3620,6 +3620,131 @@ _TURN_STACK_DUMP_FRAME_MARKERS = (
     "run_in_session",
 )
 
+_SAFE_GATEWAY_ACTIVITY_PHASES = frozenset(
+    {
+        "model_call",
+        "tool_batch_wait",
+        "tool_result_persist",
+        "post_tool_callbacks",
+        "next_model_call",
+        "response_delivery",
+    }
+)
+_SAFE_GATEWAY_TOOL_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,63}$")
+_MAX_GATEWAY_TOOL_COUNT = 10_000
+
+
+def _bounded_gateway_activity_count(value: Any) -> int:
+    """Return a bounded, non-negative count for gateway diagnostics."""
+    try:
+        count = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return min(max(count, 0), _MAX_GATEWAY_TOOL_COUNT)
+
+
+def _safe_gateway_activity_fields(activity: Optional[dict]) -> dict:
+    """Project an activity snapshot onto the privacy-safe diagnostic fields."""
+    activity = activity if isinstance(activity, dict) else {}
+
+    raw_phase = activity.get("phase")
+    phase = (
+        raw_phase
+        if isinstance(raw_phase, str) and raw_phase in _SAFE_GATEWAY_ACTIVITY_PHASES
+        else "unknown"
+    )
+
+    raw_tool = activity.get("current_tool")
+    current_tool = (
+        raw_tool
+        if isinstance(raw_tool, str)
+        and _SAFE_GATEWAY_TOOL_NAME_RE.fullmatch(raw_tool)
+        else "none"
+    )
+
+    tool_total = _bounded_gateway_activity_count(activity.get("tool_total"))
+    tool_completed = min(
+        _bounded_gateway_activity_count(activity.get("tool_completed")),
+        tool_total,
+    )
+    tool_pending = max(tool_total - tool_completed, 0)
+    return {
+        "phase": phase,
+        "current_tool": current_tool,
+        "tool_completed": tool_completed,
+        "tool_total": tool_total,
+        "tool_pending": tool_pending,
+    }
+
+
+def _capture_gateway_activity(agent: Any) -> dict:
+    """Capture only bounded fields that are safe to retain for diagnostics."""
+    if agent is None or not hasattr(agent, "get_activity_summary"):
+        return _safe_gateway_activity_fields(None)
+    try:
+        activity = agent.get_activity_summary()
+    except Exception:
+        return _safe_gateway_activity_fields(None)
+    if not isinstance(activity, dict):
+        return _safe_gateway_activity_fields(None)
+
+    safe = _safe_gateway_activity_fields(activity)
+    try:
+        idle_seconds = float(activity.get("seconds_since_activity", 0.0))
+    except (TypeError, ValueError, OverflowError):
+        idle_seconds = 0.0
+    safe["seconds_since_activity"] = max(idle_seconds, 0.0)
+    safe["api_call_count"] = _bounded_gateway_activity_count(
+        activity.get("api_call_count")
+    )
+    safe["max_iterations"] = _bounded_gateway_activity_count(
+        activity.get("max_iterations")
+    )
+    return safe
+
+
+def _format_gateway_inactivity_warning(
+    activity: Optional[dict],
+    *,
+    warning_seconds: float,
+    timeout_seconds: float,
+) -> str:
+    """Build a privacy-safe warning from structured activity metadata."""
+    safe = _safe_gateway_activity_fields(activity)
+    remaining_minutes = max(int((timeout_seconds - warning_seconds) // 60), 1)
+    return (
+        "⚠️ Still working — "
+        f"phase: {safe['phase']}; tool: {safe['current_tool']}; "
+        f"{safe['tool_completed']}/{safe['tool_total']} tools completed. "
+        "If no new activity is observed, this turn will stop in about "
+        f"{remaining_minutes} min. You can continue waiting or use /reset."
+    )
+
+
+def _format_gateway_timeout_diagnostic(activity: Optional[dict]) -> str:
+    """Build the bounded user-facing diagnostic for an inactive turn."""
+    safe = _safe_gateway_activity_fields(activity)
+    remediation = (
+        " To increase the limit, set agent.gateway_timeout in config.yaml "
+        "(value in seconds, 0 = no limit) and restart the gateway.\n"
+        "Try again, or use /reset to start fresh."
+    )
+    diagnostic = (
+        "⏱️ I stopped this turn after the configured inactivity limit. "
+        f"It was in `{safe['phase']}` with `{safe['current_tool']}` as the "
+        f"current tool ({safe['tool_completed']}/{safe['tool_total']} tools "
+        "completed)."
+    )
+    if safe["tool_pending"]:
+        return (
+            f"{diagnostic} I did not replay the unfinished tool; its final side "
+            "effect is unknown. Review external state before continuing."
+            f"{remediation}"
+        )
+    return (
+        f"{diagnostic} No tool was replayed automatically.{remediation}"
+    )
+
 
 def _dump_wedged_turn_stacks(task_id: str) -> None:
     """Log the stack of every thread that looks like turn work, at reap time.
@@ -3682,12 +3807,16 @@ def _abandon_timed_out_gateway_turn(
     worker_done: threading.Event,
     timeout_fired: threading.Event,
     cleanup_lock: threading.Lock,
+    activity_holder=None,
     is_still_current: Optional[Callable[[], bool]] = None,
 ) -> bool:
     """Interrupt one timed-out turn and reap only processes it created."""
     with cleanup_lock:
         if worker_done.is_set() or timeout_fired.is_set():
             return False
+        agent = agent_holder[0] if agent_holder else None
+        if activity_holder is not None:
+            activity_holder[0] = _capture_gateway_activity(agent)
         timeout_fired.set()
 
     # Capture the wedged worker's stack BEFORE interrupting it — the
@@ -3695,7 +3824,6 @@ def _abandon_timed_out_gateway_turn(
     # where the turn was stuck (see _dump_wedged_turn_stacks).
     _dump_wedged_turn_stacks(task_id)
 
-    agent = agent_holder[0] if agent_holder else None
     if agent is not None:
         try:
             request_hard_interrupt(agent, _INTERRUPT_REASON_TIMEOUT)
@@ -3727,6 +3855,7 @@ def _watch_gateway_turn_inactivity(
     worker_done: threading.Event,
     timeout_fired: threading.Event,
     cleanup_lock: threading.Lock,
+    activity_holder=None,
     poll_interval: float = 5.0,
     is_still_current: Optional[Callable[[], bool]] = None,
 ) -> None:
@@ -3750,6 +3879,7 @@ def _watch_gateway_turn_inactivity(
             worker_done=worker_done,
             timeout_fired=timeout_fired,
             cleanup_lock=cleanup_lock,
+            activity_holder=activity_holder,
             is_still_current=is_still_current,
         )
         return
@@ -30574,6 +30704,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _turn_worker_done = threading.Event()
             _turn_timeout_fired = threading.Event()
             _turn_cleanup_lock = threading.Lock()
+            _turn_timeout_activity = [None]
             # task_id above is session-scoped, not turn-scoped (#76115
             # review): gate the eventual reap on this exact claim still
             # being current, so a replacement turn that starts on the same
@@ -30618,6 +30749,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "worker_done": _turn_worker_done,
                         "timeout_fired": _turn_timeout_fired,
                         "cleanup_lock": _turn_cleanup_lock,
+                        "activity_holder": _turn_timeout_activity,
                         "poll_interval": 5.0,
                         "is_still_current": _turn_is_current,
                     },
@@ -30715,21 +30847,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _warning_fired = True
                         _warn_adapter = self._adapter_for_source(source)
                         if _warn_adapter:
-                            _elapsed_warn = int(_agent_warning // 60) or 1
-                            _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
                             try:
                                 await _warn_adapter.send(
                                     source.chat_id,
-                                    f"⚠️ No activity for {_elapsed_warn} min. "
-                                    f"If the agent does not respond soon, it will "
-                                    f"be timed out in {_remaining_mins} min. "
-                                    f"You can continue waiting or use /reset.",
+                                    _format_gateway_inactivity_warning(
+                                        _act,
+                                        warning_seconds=_agent_warning,
+                                        timeout_seconds=_agent_timeout,
+                                    ),
                                     metadata=_interim_metadata(_status_thread_metadata),
                                 )
                             except Exception as _warn_err:
                                 logger.debug("Inactivity warning send error: %s", _warn_err)
                     if _idle_secs >= _agent_timeout:
                         _inactivity_timeout = True
+                        _turn_timeout_activity[0] = _capture_gateway_activity(
+                            _agent_ref
+                        )
                         threading.Thread(
                             target=_abandon_timed_out_gateway_turn,
                             kwargs={
@@ -30739,6 +30873,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "worker_done": _turn_worker_done,
                                 "timeout_fired": _turn_timeout_fired,
                                 "cleanup_lock": _turn_cleanup_lock,
+                                "activity_holder": _turn_timeout_activity,
                                 "is_still_current": _turn_is_current,
                             },
                             name=f"gateway-turn-reaper-{_turn_task_id[:12]}",
@@ -30781,27 +30916,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _stts.abort("barge-in")
 
             if _inactivity_timeout:
-                # Build a diagnostic summary from the agent's activity tracker.
                 _timed_out_agent = agent_holder[0]
-                _activity = {}
-                if _timed_out_agent and hasattr(_timed_out_agent, "get_activity_summary"):
-                    try:
-                        _activity = _timed_out_agent.get_activity_summary()
-                    except Exception:
-                        pass
+                _activity = _turn_timeout_activity[0]
+                if _activity is None:
+                    _activity = _capture_gateway_activity(_timed_out_agent)
 
-                _last_desc = _activity.get("last_activity_desc", "unknown")
+                _safe_activity = _safe_gateway_activity_fields(_activity)
                 _secs_ago = _activity.get("seconds_since_activity", 0)
-                _cur_tool = _activity.get("current_tool")
                 _iter_n = _activity.get("api_call_count", 0)
                 _iter_max = _activity.get("max_iterations", 0)
 
                 logger.error(
-                    "Agent idle for %.0fs (timeout %.0fs) in session %s "
-                    "| last_activity=%s | iteration=%s/%s | tool=%s",
-                    _secs_ago, _agent_timeout, session_key,
-                    _last_desc, _iter_n, _iter_max,
-                    _cur_tool or "none",
+                    "Agent idle for %.0fs (timeout %.0fs) "
+                    "| phase=%s | tool=%s | tools=%s/%s | iteration=%s/%s",
+                    _secs_ago,
+                    _agent_timeout,
+                    _safe_activity["phase"],
+                    _safe_activity["current_tool"],
+                    _safe_activity["tool_completed"],
+                    _safe_activity["tool_total"],
+                    _iter_n,
+                    _iter_max,
                 )
 
                 # Interrupt the agent if it's still running so the thread
@@ -30809,33 +30944,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _timed_out_agent:
                     request_hard_interrupt(_timed_out_agent, _INTERRUPT_REASON_TIMEOUT)
 
-                _timeout_mins = int(_agent_timeout // 60) or 1
-
-                # Construct a user-facing message with diagnostic context.
-                _diag_lines = [
-                    f"⏱️ Agent inactive for {_timeout_mins} min — no tool calls "
-                    f"or API responses."
-                ]
-                if _cur_tool:
-                    _diag_lines.append(
-                        f"The agent appears stuck on tool `{_cur_tool}` "
-                        f"({_secs_ago:.0f}s since last activity, "
-                        f"iteration {_iter_n}/{_iter_max})."
-                    )
-                else:
-                    _diag_lines.append(
-                        f"Last activity: {_last_desc} ({_secs_ago:.0f}s ago, "
-                        f"iteration {_iter_n}/{_iter_max}). "
-                        "The agent may have been waiting on an API response."
-                    )
-                _diag_lines.append(
-                    "To increase the limit, set agent.gateway_timeout in config.yaml "
-                    "(value in seconds, 0 = no limit) and restart the gateway.\n"
-                    "Try again, or use /reset to start fresh."
-                )
-
                 response = {
-                    "final_response": "\n".join(_diag_lines),
+                    "final_response": _format_gateway_timeout_diagnostic(_activity),
                     "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                     "api_calls": _iter_n,
                     "tools": tools_holder[0] or [],
