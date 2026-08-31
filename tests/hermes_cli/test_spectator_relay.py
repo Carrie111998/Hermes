@@ -50,6 +50,23 @@ def test_stale_descriptor_is_not_live(monkeypatch, tmp_path):
     assert spectator_relay.has_live_desktop_descriptors() is False
 
 
+def test_pid_liveness_uses_shared_cross_platform_probe(monkeypatch):
+    import gateway.status as gateway_status
+
+    calls = []
+    monkeypatch.setattr(gateway_status, "_pid_exists", lambda pid: calls.append(pid) or True)
+
+    assert spectator_relay._pid_is_live(43123) is True
+    assert calls == [43123]
+
+    monkeypatch.setattr(
+        gateway_status,
+        "_pid_exists",
+        lambda _pid: (_ for _ in ()).throw(RuntimeError("probe unavailable")),
+    )
+    assert spectator_relay._pid_is_live(43123) is False
+
+
 def test_relay_rejects_writer_rpc_before_upstream_lookup(monkeypatch, tmp_path):
     _relay_env(monkeypatch, tmp_path)
     monkeypatch.setattr(

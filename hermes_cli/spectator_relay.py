@@ -101,15 +101,13 @@ def remove_desktop_descriptor(descriptor: DesktopSpectatorDescriptor | None) -> 
 
 
 def _pid_is_live(pid: int) -> bool:
+    """Fail closed through the shared cross-platform process probe."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        from gateway.status import _pid_exists
+
+        return bool(_pid_exists(pid))
+    except Exception:
         return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
 
 
 def load_desktop_descriptor(profile: str) -> DesktopSpectatorDescriptor | None:
