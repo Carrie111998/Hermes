@@ -876,6 +876,15 @@ DEFAULT_CONFIG = {
                                       # for a full trigger-sized token runway to
                                       # regrow before rearming. Keeps prompt-cache
                                       # breaks episodic. 0 = no minimum-savings gate.
+        "background_compact": False,  # opt-in: begin full compaction on a stable
+                                      # snapshot before the foreground threshold,
+                                      # then atomically splice in rows appended while
+                                      # the summary ran. The next turn adopts the
+                                      # committed transcript without waiting.
+        "background_compact_start_ratio": 0.80,  # fraction of the normal compression
+                                      # threshold at which background work starts;
+                                      # clamped to 0.10..0.99. Ignored unless
+                                      # background_compact is true.
         "micro_compact": False,       # opt-in: after each completed turn, fold the
                                       # oldest un-absorbed exchange into a rolling
                                       # summary, amortizing compression cost instead

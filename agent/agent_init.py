@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -2305,6 +2306,20 @@ def init_agent(
     compression_micro_compact = is_truthy_value(
         _compression_cfg.get("micro_compact"), default=False
     )
+    compression_background_compact = is_truthy_value(
+        _compression_cfg.get("background_compact"), default=False
+    )
+    try:
+        compression_background_start_ratio = float(
+            _compression_cfg.get("background_compact_start_ratio", 0.80)
+        )
+        if not math.isfinite(compression_background_start_ratio):
+            raise ValueError("non-finite background compaction ratio")
+    except (TypeError, ValueError):
+        compression_background_start_ratio = 0.80
+    compression_background_start_ratio = min(
+        0.99, max(0.10, compression_background_start_ratio)
+    )
     # How often a pass runs, in completed turns. Each pass rewrites
     # already-sent history and costs one prompt-cache break, so this is the
     # dial for how often that cost is paid: 1 = every turn (most aggressive
@@ -2831,6 +2846,9 @@ def init_agent(
         _cc._micro_compact_defrag_threshold_tokens = (
             compression_micro_compact_defrag_tokens
         )
+    agent._background_compression_enabled = compression_background_compact
+    agent._background_compression_start_ratio = compression_background_start_ratio
+    agent._background_compression_job = None
     agent.compression_checkpoint_required = compression_checkpoint_required
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.codex_responses_native_compaction = codex_responses_native_compaction

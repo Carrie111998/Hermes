@@ -1957,6 +1957,23 @@ def run_conversation(
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
 
+    # A completed background compaction has already atomically published its
+    # stable snapshot plus every durable row appended after the start watermark.
+    # Adopt only at this turn boundary: an in-flight job never delays the user,
+    # and no live provider request sees its transcript mutate underneath it.
+    # This runs after the per-turn reset so adoption can raise the in-place
+    # boundary signal consumed by gateway transcript re-baselining.
+    try:
+        from agent.background_compression import (
+            adopt_completed_background_compression,
+        )
+
+        conversation_history = adopt_completed_background_compression(
+            agent, conversation_history
+        )
+    except Exception:
+        logger.warning("Background compression adoption failed", exc_info=True)
+
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
     # was built at agent init (#67821). No-op when .env is unchanged.
