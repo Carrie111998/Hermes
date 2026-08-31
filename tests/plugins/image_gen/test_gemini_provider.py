@@ -35,24 +35,22 @@ def _tmp_hermes_home(tmp_path, monkeypatch):
 
 
 def _image_response(data: bytes = b"image-bytes"):
-    return _Response(
-        {
-            "candidates": [
-                {
-                    "content": {
-                        "parts": [
-                            {
-                                "inlineData": {
-                                    "mimeType": "image/png",
-                                    "data": base64.b64encode(data).decode("ascii"),
-                                }
+    return _Response({
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "inlineData": {
+                                "mimeType": "image/png",
+                                "data": base64.b64encode(data).decode("ascii"),
                             }
-                        ]
-                    }
+                        }
+                    ]
                 }
-            ]
-        }
-    )
+            }
+        ]
+    })
 
 
 def test_metadata_and_setup_schema():
@@ -60,14 +58,15 @@ def test_metadata_and_setup_schema():
 
     assert provider.name == "gemini"
     assert provider.display_name == "Google AI Studio"
-    assert provider.default_model() == "gemini-3-pro-image-preview"
-    assert {item["id"] for item in provider.list_models()} == {
-        "gemini-3-pro-image-preview",
-        "gemini-2.5-flash-image",
-    }
+    models = provider.list_models()
+    assert provider.default_model() == gemini_plugin.DEFAULT_MODEL
+    assert gemini_plugin.DEFAULT_MODEL in {item["id"] for item in models}
+    assert all(
+        {"id", "display", "speed", "strengths", "price"} <= set(item) for item in models
+    )
     assert provider.capabilities() == {
         "modalities": ["text", "image"],
-        "max_reference_images": 3,
+        "max_reference_images": 14,
     }
     assert [item["key"] for item in provider.get_setup_schema()["env_vars"]] == [
         "GOOGLE_API_KEY",
@@ -89,7 +88,9 @@ def test_model_precedence(monkeypatch):
     monkeypatch.delenv("GEMINI_IMAGE_MODEL")
     assert gemini_plugin._resolve_model() == "from-config"
 
-    monkeypatch.setattr(gemini_plugin, "_load_image_gen_config", lambda: {"model": "from-top-level"})
+    monkeypatch.setattr(
+        gemini_plugin, "_load_image_gen_config", lambda: {"model": "from-top-level"}
+    )
     assert gemini_plugin._resolve_model() == "from-top-level"
 
 
@@ -115,19 +116,15 @@ def test_generate_posts_native_gemini_payload_and_caches_inline_image(
     assert Path(result["image"]).read_bytes() == b"image-bytes"
 
     post.assert_called_once()
-    endpoint, = post.call_args.args
+    (endpoint,) = post.call_args.args
     assert endpoint.endswith("/models/gemini-2.5-flash-image:generateContent")
-    assert post.call_args.kwargs["params"] == {"key": "google-test-key"}
+    assert "params" not in post.call_args.kwargs
     assert post.call_args.kwargs["headers"]["x-goog-api-key"] == "google-test-key"
+    assert post.call_args.kwargs["headers"]["Content-Type"] == "application/json"
     payload = post.call_args.kwargs["json"]
     assert payload["contents"] == [{"role": "user", "parts": [{"text": "a red kite"}]}]
     assert payload["generationConfig"] == {
         "responseModalities": ["TEXT", "IMAGE"],
-        "imageConfig": {"aspectRatio": "9:16"},
-    }
-    assert payload["contents"] == [{"role": "user", "parts": [{"text": "a red kite"}]}]
-    assert payload["generationConfig"] == {
-        "responseModalities": ["IMAGE"],
         "imageConfig": {"aspectRatio": "9:16"},
     }
 
@@ -150,6 +147,60 @@ def test_generate_inlines_reference_image(monkeypatch, tmp_path):
     assert parts[0] == {"text": "make it snowy"}
     assert parts[1]["inlineData"]["mimeType"] == "image/png"
     assert base64.b64decode(parts[1]["inlineData"]["data"]) == b"reference"
+
+
+def test_generate_respects_legacy_model_reference_limit(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-test-key")
+    reference = "data:image/png;base64," + base64.b64encode(b"reference").decode(
+        "ascii"
+    )
+    post = MagicMock(return_value=_image_response())
+
+    with patch("requests.post", post):
+        result = gemini_plugin.GeminiImageGenProvider().generate(
+            "combine these references",
+            model="gemini-2.5-flash-image",
+            reference_image_urls=[reference] * 5,
+        )
+
+    assert result["success"] is True
+    parts = post.call_args.kwargs["json"]["contents"][0]["parts"]
+    assert len(parts) == 4
+
+
+def test_empty_response_includes_model_text(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-test-key")
+    response = _Response({
+        "candidates": [
+            {
+                "content": {
+                    "parts": [{"text": "The request was blocked by safety filters."}]
+                },
+                "finishReason": "SAFETY",
+            }
+        ]
+    })
+
+    with patch("requests.post", MagicMock(return_value=response)):
+        result = gemini_plugin.GeminiImageGenProvider().generate("a disallowed image")
+
+    assert result["success"] is False
+    assert result["error_type"] == "empty_response"
+    assert "safety filters" in result["error"]
+
+
+def test_invalid_json_response_returns_error(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "google-test-key")
+
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.side_effect = ValueError("not json")
+
+    with patch("requests.post", MagicMock(return_value=response)):
+        result = gemini_plugin.GeminiImageGenProvider().generate("a cat")
+
+    assert result["success"] is False
+    assert result["error_type"] == "invalid_response"
 
 
 def test_missing_key_returns_auth_error(monkeypatch):
