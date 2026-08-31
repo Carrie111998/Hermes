@@ -806,6 +806,15 @@ def resolve_user_provider(name: str, user_config: Dict[str, Any]) -> Optional[Pr
     if not isinstance(entry, dict):
         return None
 
+    # Keep this shared resolver aligned with the picker, runtime and doctor
+    # gates. Several direct callers (notably explicit /model --provider and
+    # web route normalization) do not pass through those later surfaces, so
+    # returning a ProviderDef here would make ``enabled: false`` bypassable.
+    from hermes_cli.config import is_provider_enabled
+
+    if not is_provider_enabled(entry):
+        return None
+
     # Extract fields
     display_name = entry.get("name", "") or name
     api_url = entry.get("api", "") or entry.get("url", "") or entry.get("base_url", "") or ""
