@@ -15,7 +15,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor
-from agent.turn_context import TurnContext, build_turn_context
+from agent.turn_context import (
+    TurnContext,
+    _native_responses_compaction_owns_turn_start,
+    build_turn_context,
+)
 from hermes_state import SessionDB
 
 
@@ -386,6 +390,60 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
     # The prompt was populated before the DB row was created.
     assert agent._ensure_db_prompt_at_call == "REBUILT-SYSTEM"
     assert agent._cached_system_prompt == "REBUILT-SYSTEM"
+
+
+@pytest.mark.parametrize(
+    ("provider", "base_url", "expected"),
+    [
+        (
+            "openai-codex",
+            "https://chatgpt.com/backend-api/codex",
+            True,
+        ),
+        (
+            "custom-provider",
+            "https://chatgpt.com/backend-api/codex",
+            True,
+        ),
+        ("openai-codex", "https://api.x.ai/v1", False),
+        ("openai-codex", "https://models.github.ai/inference", False),
+    ],
+)
+def test_native_preflight_owner_matches_responses_route(
+    provider, base_url, expected
+):
+    """The preflight bypass must use the same route gates as request assembly."""
+    agent = types.SimpleNamespace(
+        api_mode="codex_responses",
+        provider=provider,
+        base_url=base_url,
+        model="gpt-5.6-sol-900k",
+        codex_responses_native_compaction=True,
+        compression_enabled=True,
+        compression_checkpoint_required=False,
+        codex_responses_compact_threshold=200_000,
+        context_compressor=types.SimpleNamespace(threshold_tokens=450_000),
+    )
+
+    assert _native_responses_compaction_owns_turn_start(agent) is expected
+
+
+def test_native_preflight_owner_respects_wire_removal_override():
+    """An explicit transport override can remove context_management."""
+    agent = types.SimpleNamespace(
+        api_mode="codex_responses",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        model="gpt-5.6-sol-900k",
+        codex_responses_native_compaction=True,
+        compression_enabled=True,
+        compression_checkpoint_required=False,
+        codex_responses_compact_threshold=200_000,
+        context_compressor=types.SimpleNamespace(threshold_tokens=450_000),
+        request_overrides={"context_management": None},
+    )
+
+    assert _native_responses_compaction_owns_turn_start(agent) is False
 
 
 # ── Between-turns MCP refresh (cache-safe late-binding) ──────────────────────

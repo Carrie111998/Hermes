@@ -28,6 +28,7 @@ def _agent(
     threshold: object = DEFAULT_COMPACT_THRESHOLD,
     compressor=None,
     capabilities=None,
+    request_overrides=None,
 ):
     return SimpleNamespace(
         model=model,
@@ -37,6 +38,7 @@ def _agent(
         codex_responses_compact_threshold=threshold,
         context_compressor=compressor,
         capabilities=capabilities or {},
+        request_overrides=request_overrides or {},
     )
 
 
@@ -163,6 +165,26 @@ class TestRequestGate:
             _agent(threshold=None, compressor=compressor), is_codex_backend=False
         )
         assert payload == [{"type": "compaction", "compact_threshold": 756_808}]
+
+    @pytest.mark.parametrize("override", [None, [], {}, "disabled"])
+    def test_request_override_that_removes_wire_field_disables_native_owner(
+        self, override
+    ):
+        agent = _agent(request_overrides={"context_management": override})
+
+        assert (
+            native_compaction_context_management(agent, is_codex_backend=False)
+            is None
+        )
+
+    def test_valid_request_override_is_the_native_payload(self):
+        override = [{"type": "compaction", "compact_threshold": 123_456}]
+        agent = _agent(request_overrides={"context_management": override})
+
+        assert (
+            native_compaction_context_management(agent, is_codex_backend=False)
+            == override
+        )
 
 
 class TestThresholdClamp:

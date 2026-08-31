@@ -1,6 +1,7 @@
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -1724,6 +1725,98 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     assert len(compress_calls) == 1
     assert compress_calls[0] >= 15_000
     assert len(requests) == 2
+
+
+def test_native_compaction_owns_large_resumed_request(monkeypatch):
+    """Eligible Responses requests must reach provider-side compaction first."""
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6-sol-900k"
+    agent.runtime_capabilities = {"native_compaction": True}
+    agent.codex_responses_native_compaction = True
+    agent.codex_responses_compact_threshold = 10_000
+    agent.compression_checkpoint_required = False
+    agent.context_compressor.context_length = 20_000
+    agent.context_compressor.threshold_tokens = 20_000
+
+    requests = []
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda api_kwargs: requests.append(api_kwargs)
+        or _codex_message_response("Resumed without a local summary."),
+    )
+    compress = MagicMock(
+        return_value=([{"role": "user", "content": "local summary"}], "prompt")
+    )
+    monkeypatch.setattr(agent, "_compress_context", compress)
+
+    history = [
+        {"role": "user", "content": "x" * 120_000},
+        {"role": "assistant", "content": "y" * 20_000},
+    ]
+    result = agent.run_conversation("continue", conversation_history=history)
+
+    assert result["completed"] is True
+    compress.assert_not_called()
+    assert len(requests) == 1
+    assert requests[0]["context_management"] == [
+        {"type": "compaction", "compact_threshold": 10_000}
+    ]
+
+
+def test_native_compaction_owns_post_tool_and_next_request(monkeypatch):
+    """Automatic post-tool and pre-API summaries must yield to native compaction."""
+    agent = _build_agent(monkeypatch)
+    agent.model = "gpt-5.6-sol-900k"
+    agent.runtime_capabilities = {"native_compaction": True}
+    agent.codex_responses_native_compaction = True
+    agent.codex_responses_compact_threshold = 10_000
+    agent.compression_checkpoint_required = False
+    agent.context_compressor.context_length = 20_000
+    agent.context_compressor.threshold_tokens = 20_000
+
+    responses = [
+        _codex_tool_call_response(),
+        _codex_message_response("Finished without a local summary."),
+    ]
+    responses[0].usage = SimpleNamespace(
+        input_tokens=25_000, output_tokens=4, total_tokens=25_004
+    )
+    requests = []
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda api_kwargs: requests.append(api_kwargs) or responses.pop(0),
+    )
+
+    def _fake_execute_tool_calls(
+        assistant_message, messages, effective_task_id, api_call_count=0
+    ):
+        for call in assistant_message.tool_calls:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": "x" * 80_000,
+                }
+            )
+
+    compress = MagicMock(
+        return_value=([{"role": "user", "content": "local summary"}], "prompt")
+    )
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+    monkeypatch.setattr(agent, "_compress_context", compress)
+
+    result = agent.run_conversation("do a tool-heavy task")
+
+    assert result["completed"] is True
+    compress.assert_not_called()
+    assert len(requests) == 2
+    assert all(
+        request["context_management"]
+        == [{"type": "compaction", "compact_threshold": 10_000}]
+        for request in requests
+    )
 
 
 def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, tmp_path):

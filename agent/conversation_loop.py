@@ -43,6 +43,7 @@ from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
+    _native_responses_compaction_owns_turn_start,
     _review_fork_first_request_pending,
     build_turn_context,
     compose_user_api_content,
@@ -2789,8 +2790,15 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        # When the next Responses request carries context_management, the
+        # provider owns proactive compaction.  This must guard the per-request
+        # pressure check as well as turn_context's initial preflight; otherwise
+        # a resumed large thread is summarized locally immediately before the
+        # native-compaction request can be sent.
+        _responses_native_auto = _native_responses_compaction_owns_turn_start(agent)
         if (
             agent.compression_enabled
+            and not _responses_native_auto
             and not _review_fork_first_request_pending(agent)
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
@@ -2915,6 +2923,7 @@ def run_conversation(
                 continue
         elif (
             agent.compression_enabled
+            and not _responses_native_auto
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _defer_preflight(request_pressure_tokens)
@@ -7769,6 +7778,7 @@ def run_conversation(
 
                 if (
                     agent.compression_enabled
+                    and not _native_responses_compaction_owns_turn_start(agent)
                     and compression_attempts < max_compression_attempts
                     and _compressor.should_compress(_real_tokens)
                 ):
@@ -7819,7 +7829,10 @@ def run_conversation(
                                 final_response = _HANDOFF_SKIP_FINAL_RESPONSE
                             _turn_exit_reason = "compaction_handoff_not_actionable"
                             break
-                elif agent.compression_enabled:
+                elif (
+                    agent.compression_enabled
+                    and not _native_responses_compaction_owns_turn_start(agent)
+                ):
                     # Over threshold but compression is blocked (summary-LLM
                     # cooldown or anti-thrashing). Surface a deduped warning so
                     # the user isn't left with a silently growing context that
