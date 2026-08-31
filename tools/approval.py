@@ -282,13 +282,26 @@ _UNATTENDED_APPROVAL_PLATFORMS = frozenset({
 def _is_unattended_platform_approval_context() -> bool:
     """True when the session platform is a programmatic/unattended surface.
 
-    Webhook, msgraph_webhook, and api_server sessions bind
+    Webhook, msgraph_webhook, and ordinary api_server sessions bind
     ``HERMES_SESSION_PLATFORM`` like chat gateways do, but there is no human
     who can resolve a pending approval. Treating them as gateway approval
     contexts blocks the session for the full approval timeout (60-300s) and
-    then fails closed anyway — the deadlock in #37284/#87509.
+    then fails closed anyway — the deadlock in #37284/#87509. An api_server
+    request with an authenticated, session-scoped notifier is the exception.
     """
-    return _get_session_platform() in _UNATTENDED_APPROVAL_PLATFORMS
+    platform = _get_session_platform()
+    if platform not in _UNATTENDED_APPROVAL_PLATFORMS:
+        return False
+    # An OpenAI-compatible API stream can explicitly attach an authenticated
+    # approval notifier for this one request. The notifier is session-scoped,
+    # so its presence is the authoritative proof that a human-capable client
+    # can answer; ordinary API/webhook requests remain unattended and retain
+    # the configured fail-closed policy.
+    if platform != "api_server":
+        return True
+    session_key = get_current_session_key(default="")
+    with _lock:
+        return not bool(session_key and _gateway_notify_cbs.get(session_key))
 
 
 def _is_single_query_approval_context() -> bool:
