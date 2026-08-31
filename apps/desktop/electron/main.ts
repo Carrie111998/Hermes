@@ -281,6 +281,9 @@ import { createPoolStopper } from './pool-stop'
 import { poolTouchKeys } from './pool-touch-scope'
 import { createKeepAwake } from './power-save'
 import { PreviewReachRegistry } from './preview-reach'
+import { createPreviewUblockController, type PreviewUblockController } from './preview-ublock'
+import { createPreviewUblockInstaller } from './preview-ublock-installer'
+import { readPreviewUblockSettings, writePreviewUblockSettings } from './preview-ublock-settings'
 import {
   createPrimaryRemoteConnection,
   FirstRunSetupResetError,
@@ -462,6 +465,19 @@ const GLASS_SUPPORTED = glassSupportedOn(process.platform, os.release())
 // there and Settings drops the row entirely.
 const TRANSLUCENCY_SUPPORTED = translucencySupportedOn(process.platform)
 const APP_ROOT = app.getAppPath()
+
+const previewUblockSettingsPath = path.join(app.getPath('userData'), 'preview-ublock.json')
+
+let previewUblockController: PreviewUblockController | null = null
+let previewUblockEnabled = false
+
+function requirePreviewUblockController(): PreviewUblockController {
+  if (!previewUblockController) {
+    throw new Error('uBlock Origin Lite is not ready')
+  }
+
+  return previewUblockController
+}
 
 // Device-local preference: block F12 from opening DevTools.
 // Set dynamically via IPC from the renderer Settings → Advanced.
@@ -16684,6 +16700,22 @@ ipcMain.on('hermes:devtools:disable-f12', (_event, on) => {
   }
 })
 
+ipcMain.handle('hermes:preview-ublock:get', async () => requirePreviewUblockController().getState())
+
+ipcMain.handle('hermes:preview-ublock:set-enabled', async (_event, enabled) => {
+  const requestedEnabled = enabled === true
+  const nextState = await requirePreviewUblockController().setEnabled(requestedEnabled)
+  previewUblockEnabled = nextState.enabled
+
+  try {
+    writePreviewUblockSettings(previewUblockSettingsPath, { enabled: previewUblockEnabled })
+  } catch (error) {
+    rememberLog(`[preview] uBlock preference write failed: ${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  return nextState
+})
+
 ipcMain.handle('hermes:openExternal', (_event, url) => {
   if (!openExternalUrl(url)) {
     throw new Error('Invalid external URL')
@@ -17328,7 +17360,108 @@ app.on('open-url', (event, url) => {
   handleDeepLink(url)
 })
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  // Load optional uBlock Origin Lite into Preview's exact persistent session
+  // before any Preview webview is created. Startup only reuses a verified
+  // local cache; an explicit Settings action is required for network access.
+  const previewSession = session.fromPartition('persist:hermes-preview')
+  const persistedUblockEnabled = readPreviewUblockSettings(previewUblockSettingsPath).enabled
+  const previewUblockInstaller = createPreviewUblockInstaller({ userDataPath: app.getPath('userData') })
+
+  const ublock = createPreviewUblockController({
+    bootstrap: async extension => {
+      const bootstrapWindow = new BrowserWindow({
+        show: false,
+        webPreferences: { session: previewSession }
+      })
+
+      try {
+        await bootstrapWindow.loadURL(`${extension.url}/dashboard.html`)
+
+        return await bootstrapWindow.webContents.executeJavaScript(
+          `(async () => {
+            const configured = await chrome.runtime.sendMessage({ what: 'getEnabledRulesets' })
+            const enabled = await chrome.declarativeNetRequest.getEnabledRulesets()
+            const staticIds = Array.isArray(configured)
+              ? configured.filter(id => typeof id === 'string' && id.includes('://') === false)
+              : []
+            const missing = staticIds.filter(id => enabled.includes(id) === false)
+            if (missing.length !== 0) {
+              await chrome.declarativeNetRequest.updateEnabledRulesets({ enableRulesetIds: missing })
+            }
+            const after = await chrome.declarativeNetRequest.getEnabledRulesets()
+            return staticIds.every(id => after.includes(id))
+          })()`
+        )
+      } catch {
+        return false
+      } finally {
+        bootstrapWindow.destroy()
+      }
+    },
+    enabled: persistedUblockEnabled,
+    installer: previewUblockInstaller,
+    onStaleCache: error => {
+      rememberLog(
+        `[preview] uBlock Origin Lite update failed; using the cached release: ${error instanceof Error ? error.message : String(error)}`
+      )
+    },
+    session: previewSession
+  })
+
+  previewUblockController = ublock
+  const ublockState = await ublock.initialize()
+  previewUblockEnabled = ublockState.enabled
+  if (persistedUblockEnabled && !ublockState.enabled) {
+    try {
+      writePreviewUblockSettings(previewUblockSettingsPath, { enabled: false })
+    } catch (error) {
+      rememberLog(`[preview] uBlock preference reset failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    rememberLog('[preview] uBlock Origin Lite cache unavailable; content blocking remains disabled')
+  }
+  rememberLog(
+    ublockState.available
+      ? `[preview] loaded uBlock Origin Lite ${ublockState.version ?? 'unknown'} (${ublockState.extensionId}); rulesetsReady=${ublockState.rulesetsReady}`
+      : '[preview] uBlock Origin Lite unavailable'
+  )
+
+  if (process.env.HERMES_UBOL_SMOKE === '1') {
+    try {
+      const smokeState = await ublock.setEnabled(true)
+      if (!smokeState.available || !smokeState.rulesetsReady || !smokeState.dashboardUrl) {
+        throw new Error('uBlock Origin Lite did not become available')
+      }
+
+      const smokeWindow = new BrowserWindow({ show: false, webPreferences: { session: previewSession } })
+      try {
+        await smokeWindow.loadURL(smokeState.dashboardUrl)
+        const matchResult = await smokeWindow.webContents.executeJavaScript(
+          `(async () => chrome.declarativeNetRequest.testMatchOutcome({
+            url: 'http://000491b06a.com/blocked.png',
+            initiator: 'http://localhost/',
+            method: 'get',
+            type: 'image'
+          }))()`
+        )
+        const matchedRules = (matchResult as { matchedRules?: unknown[] })?.matchedRules
+        if (!Array.isArray(matchedRules) || matchedRules.length === 0) {
+          throw new Error('the known blocked URL did not match a uBlock ruleset')
+        }
+      } finally {
+        smokeWindow.destroy()
+      }
+      await ublock.setEnabled(false)
+      console.log('uBlock Origin Lite smoke test passed')
+      app.exit(0)
+      return
+    } catch (error) {
+      console.error(error)
+      app.exit(1)
+      return
+    }
+  }
+
   // Warm the login-shell PATH resolution immediately so it usually completes
   // before the backend start path awaits the same single-flight promise.
   void ensureLoginShellPath()

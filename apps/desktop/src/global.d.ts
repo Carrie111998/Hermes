@@ -1,6 +1,8 @@
 import type { GatewayWsUrlResult } from '@hermes/shared'
 import type { TranslucencyState } from '@hermes/shared/translucency'
 
+import type { PreviewUblockState } from '../electron/preview-ublock'
+
 import type { WakeIndicatorState } from './lib/wake-indicator'
 import type {
   PetOverlayBounds,
@@ -445,6 +447,10 @@ declare global {
           registryScoped?: boolean
         } | null
       ) => void
+      previewUblock: {
+        getState: () => Promise<PreviewUblockState>
+        setEnabled: (enabled: boolean) => Promise<PreviewUblockState>
+      }
       onClosePreviewRequested?: (callback: () => void) => () => void
       onPreviewNav?: (callback: (command: 'back' | 'forward' | 'reload') => void) => () => void
       onOpenFolderRequested?: (callback: () => void) => () => void
