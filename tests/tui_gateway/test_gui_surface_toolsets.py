@@ -43,7 +43,7 @@ def no_desktop_env(monkeypatch):
 
 class TestDesktopUiToolset:
     def test_holds_exactly_the_gui_affordances(self):
-        assert set(resolve_toolset("desktop_ui")) == GUI_TOOLS
+        assert set(resolve_toolset("desktop_ui", include_registry=False)) == GUI_TOOLS
 
     def test_stays_off_the_core_tool_list(self):
         """Core ships on every API call — a GUI-only tool must not be there."""
