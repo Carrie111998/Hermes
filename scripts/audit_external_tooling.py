@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from collections.abc import Sequence
 import hashlib
 import json
 import shutil
@@ -14,7 +15,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Protocol, cast
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
@@ -31,6 +32,28 @@ class AuditCommand:
     name: str
     argv: tuple[str, ...]
     expected_version: str
+
+
+class AuditProcessResult(Protocol):
+    """The subprocess fields consumed by the read-only audit pipeline."""
+
+    @property
+    def returncode(self) -> int: ...
+
+    @property
+    def stdout(self) -> str: ...
+
+    @property
+    def stderr(self) -> str: ...
+
+
+@dataclass(frozen=True)
+class SkippedAuditResult:
+    """Typed result for an audit that cannot run after preparation fails."""
+
+    returncode: int
+    stdout: str
+    stderr: str
 
 
 def build_commands(
@@ -109,20 +132,21 @@ def _run(
     *,
     repo_root: Path,
     timeout: int,
-) -> Any:
-    return runner(
-        list(argv),
-        cwd=repo_root,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
+) -> AuditProcessResult:
+    return cast(
+        AuditProcessResult,
+        runner(
+            list(argv),
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        ),
     )
 
 
-def _git_value(
-    runner: Callable[..., Any], repo_root: Path, *arguments: str
-) -> str:
+def _git_value(runner: Callable[..., Any], repo_root: Path, *arguments: str) -> str:
     result = _run(runner, ("git", *arguments), repo_root=repo_root, timeout=30)
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"git {' '.join(arguments)} failed")
@@ -191,17 +215,15 @@ def run_audits(
         export_result = _run(runner, export_command, repo_root=repo_root, timeout=120)
         export_stdout = str(export_result.stdout or "")
         export_stderr = str(export_result.stderr or "")
-        preparations.append(
-            {
-                "name": "uv-lock-export",
-                "command": list(export_command),
-                "returncode": int(export_result.returncode),
-                "stdout_sha256": _sha256(export_stdout),
-                "stderr_sha256": _sha256(export_stderr),
-                "stdout": _bounded_output(export_stdout),
-                "stderr": _bounded_output(export_stderr),
-            }
-        )
+        preparations.append({
+            "name": "uv-lock-export",
+            "command": list(export_command),
+            "returncode": int(export_result.returncode),
+            "stdout_sha256": _sha256(export_stdout),
+            "stderr_sha256": _sha256(export_stderr),
+            "stdout": _bounded_output(export_stdout),
+            "stderr": _bounded_output(export_stderr),
+        })
 
         for command in build_commands(
             repo_root=repo_root,
@@ -209,32 +231,26 @@ def run_audits(
             requirements_path=requirements_path,
         ):
             if command.name == "pip-audit" and export_result.returncode != 0:
-                result = type(
-                    "SkippedResult",
-                    (),
-                    {
-                        "returncode": 1,
-                        "stdout": "",
-                        "stderr": "uv lock export failed; pip-audit was not run",
-                    },
-                )()
+                result: AuditProcessResult = SkippedAuditResult(
+                    returncode=1,
+                    stdout="",
+                    stderr="uv lock export failed; pip-audit was not run",
+                )
             else:
                 result = _run(runner, command.argv, repo_root=repo_root, timeout=600)
             stdout = str(result.stdout or "")
             stderr = str(result.stderr or "")
-            audits.append(
-                {
-                    "name": command.name,
-                    "expected_version": command.expected_version,
-                    "command": list(command.argv),
-                    "returncode": int(result.returncode),
-                    "stdout_sha256": _sha256(stdout),
-                    "stderr_sha256": _sha256(stderr),
-                    "summary": _summarize_json_output(command.name, stdout),
-                    "stdout": _bounded_output(stdout),
-                    "stderr": _bounded_output(stderr),
-                }
-            )
+            audits.append({
+                "name": command.name,
+                "expected_version": command.expected_version,
+                "command": list(command.argv),
+                "returncode": int(result.returncode),
+                "stdout_sha256": _sha256(stdout),
+                "stderr_sha256": _sha256(stderr),
+                "summary": _summarize_json_output(command.name, stdout),
+                "stdout": _bounded_output(stdout),
+                "stderr": _bounded_output(stderr),
+            })
 
     return {
         "schema_version": "hermes_external_tooling_audit_v1",
