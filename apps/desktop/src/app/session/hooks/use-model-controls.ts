@@ -194,28 +194,39 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
       const liveSessionId = 'sessionId' in selection ? (selection.sessionId ?? null) : primaryRuntimeId
       const touchesPrimary = !liveSessionId || liveSessionId === primaryRuntimeId
 
-      const prevModel = touchesPrimary ? $currentModel.get() : ($sessionStates.get()[liveSessionId!]?.model ?? '')
+      const prevSlice = liveSessionId ? $sessionStates.get()[liveSessionId] : undefined
+      const prevModel = touchesPrimary ? $currentModel.get() : (prevSlice?.model ?? '')
 
-      const prevProvider = touchesPrimary
-        ? $currentProvider.get()
-        : ($sessionStates.get()[liveSessionId!]?.provider ?? '')
+      const prevProvider = touchesPrimary ? $currentProvider.get() : (prevSlice?.provider ?? '')
 
       const prevSource = getCurrentModelSource()
       const liveGatewayProfile = $activeGatewayProfile.get()
+
+      // PRIMARY_SESSION_VIEW treats `$sessionStates[runtimeId]` as
+      // authoritative for model/provider once a runtime exists. Painting only
+      // the composer atoms left the visible selector on the previous pair.
+      // Writes go through the session-tile delegate (updateSessionState) so
+      // the wiring cache, $sessionStates, and the focused view stay aligned.
+      const paintLiveSlice = (model: string, provider: string) => {
+        if (!liveSessionId) {
+          return
+        }
+
+        sessionTileDelegate()?.updateSession(liveSessionId, state => ({
+          ...state,
+          model,
+          provider
+        }))
+      }
 
       const paintSelection = () => {
         if (touchesPrimary) {
           setCurrentModel(selection.model)
           setCurrentProvider(selection.provider)
           markComposerSelectionManual()
-        } else if (liveSessionId) {
-          // Optimistic tile paint — session.info will confirm; rollback on error.
-          sessionTileDelegate()?.updateSession(liveSessionId, state => ({
-            ...state,
-            model: selection.model,
-            provider: selection.provider
-          }))
         }
+
+        paintLiveSlice(selection.model, selection.provider)
       }
 
       const cacheSelection = (provider: string, model: string) => {
@@ -227,14 +238,9 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
           setCurrentModel(prevModel)
           setCurrentProvider(prevProvider)
           setCurrentModelSource(prevSource)
-        } else if (liveSessionId) {
-          sessionTileDelegate()?.updateSession(liveSessionId, state => ({
-            ...state,
-            model: prevModel,
-            provider: prevProvider
-          }))
         }
 
+        paintLiveSlice(prevSlice?.model ?? prevModel, prevSlice?.provider ?? prevProvider)
         cacheSelection(prevProvider, prevModel)
       }
 
@@ -300,14 +306,29 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
             // a different model or switches sessions. Clicking Confirm must
             // not clobber the newer choice: bail if the live state no longer
             // matches the snapshot this notification was created for.
-            isStale: () =>
-              touchesPrimary
-                ? $activeSessionId.get() !== liveSessionId ||
-                  $currentModel.get() !== prevModel ||
-                  $currentProvider.get() !== prevProvider
-                : !liveSessionId ||
-                  $sessionStates.get()[liveSessionId]?.model !== prevModel ||
-                  $sessionStates.get()[liveSessionId]?.provider !== prevProvider,
+            isStale: () => {
+              if ($activeSessionId.get() !== liveSessionId) {
+                return true
+              }
+
+              if (!liveSessionId) {
+                return $currentModel.get() !== prevModel || $currentProvider.get() !== prevProvider
+              }
+
+              const live = $sessionStates.get()[liveSessionId]
+
+              // No slice yet (fresh runtime / tests without a cache entry):
+              // compare composer atoms, the same snapshot the confirm toast
+              // rolled back to.
+              if (!live) {
+                return $currentModel.get() !== prevModel || $currentProvider.get() !== prevProvider
+              }
+
+              return (
+                live.model !== (prevSlice?.model ?? prevModel) ||
+                live.provider !== (prevSlice?.provider ?? prevProvider)
+              )
+            },
             repaint: () => {
               paintSelection()
               cacheSelection(selection.provider, selection.model)
