@@ -821,6 +821,110 @@ class TestCodexBuildKwargs:
             assert "reasoning" not in kw, f"{model} must not receive reasoning"
 
 
+class TestXaiToolSearchBridgeAlias:
+    """xAI reserves the function name ``tool_search`` for Grok's native
+    server-side Tool Search (HTTP 400, #95003). The transport aliases the
+    Hermes bridge on the wire and maps it back on dispatch."""
+
+    @pytest.fixture
+    def transport(self):
+        from agent.transports.codex import ResponsesApiTransport
+        return ResponsesApiTransport()
+
+    _TOOLS = [
+        {"type": "function", "function": {
+            "name": "tool_search", "description": "Search deferred tools.",
+            "parameters": {"type": "object",
+                           "properties": {"query": {"type": "string"}}}}},
+        {"type": "function", "function": {
+            "name": "tool_describe", "description": "Describe a deferred tool.",
+            "parameters": {"type": "object",
+                           "properties": {"name": {"type": "string"}}}}},
+        {"type": "function", "function": {
+            "name": "read_file", "description": "Read a file.",
+            "parameters": {"type": "object",
+                           "properties": {"path": {"type": "string"}}}}},
+    ]
+
+    def _names(self, kw):
+        return [t.get("name") for t in kw.get("tools", []) if t.get("type") == "function"]
+
+    def test_xai_aliases_tool_search_bridge(self, transport):
+        kw = transport.build_kwargs(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=list(self._TOOLS),
+            is_xai_responses=True,
+        )
+        names = self._names(kw)
+        assert "hermes_tool_search" in names
+        assert "tool_search" not in names
+        assert "tool_describe" in names  # not reserved by xAI
+        assert "read_file" in names
+
+    def test_xai_does_not_emit_native_tool_search_type(self, transport):
+        """Hermes must not swap the bridge for xAI's native tool_search."""
+        kw = transport.build_kwargs(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=list(self._TOOLS),
+            is_xai_responses=True,
+        )
+        assert not any(t.get("type") == "tool_search" for t in kw.get("tools", []))
+
+    def test_non_xai_path_keeps_canonical_tool_search_name(self, transport):
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=list(self._TOOLS),
+            is_xai_responses=False,
+        )
+        names = self._names(kw)
+        assert "tool_search" in names
+        assert "hermes_tool_search" not in names
+
+    def test_xai_rename_does_not_mutate_input_tools(self, transport):
+        tools = list(self._TOOLS)
+        transport.build_kwargs(
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+            is_xai_responses=True,
+        )
+        assert tools[0]["function"]["name"] == "tool_search"
+
+    def test_normalize_maps_tool_search_alias_back(self, transport, monkeypatch):
+        import agent.transports.codex as codex_mod
+
+        msg = SimpleNamespace(
+            content=None,
+            reasoning=None,
+            tool_calls=[
+                SimpleNamespace(
+                    id="call_1",
+                    call_id="call_1",
+                    response_item_id="fc_1",
+                    function=SimpleNamespace(
+                        name=codex_mod._XAI_CLIENT_TOOL_SEARCH_ALIAS,
+                        arguments='{"query":"browser"}',
+                    ),
+                )
+            ],
+            codex_reasoning_items=None,
+            codex_message_items=None,
+            reasoning_details=None,
+        )
+        response = SimpleNamespace(output=[], status="completed")
+        monkeypatch.setattr(
+            "agent.codex_responses_adapter._normalize_codex_response",
+            lambda resp, issuer_kind=None: (msg, "tool_calls"),
+        )
+        normalized = transport.normalize_response(response)
+        assert normalized.tool_calls is not None
+        assert len(normalized.tool_calls) == 1
+        assert normalized.tool_calls[0].name == "tool_search"
+
+
 class TestOpencodeReservedToolAliases:
     """OpenCode /v1/responses reserves web_search / search_files as function
     names (HTTP 400 "custom function name 'X' is reserved", #85589). The
