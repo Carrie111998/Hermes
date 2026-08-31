@@ -118,6 +118,16 @@ class TestC2Patterns:
         )
         assert "known_c2_framework" in findings
 
+    def test_havoc_still_caught_by_context_rich_pattern(self):
+        # Pins the comment in threat_patterns.py: after dropping bare "havoc"
+        # (a common English word), the Havoc C2 *framework* must still be
+        # caught by the generic context-rich tell ("c2 ... server").
+        findings = scan_for_threats(
+            "Communication traces to the Havoc C2 server were observed.",
+            scope="context",
+        )
+        assert "c2_explicit" in findings
+
 
 # =========================================================================
 # False-positive guards (THIS IS THE WHOLE POINT)
