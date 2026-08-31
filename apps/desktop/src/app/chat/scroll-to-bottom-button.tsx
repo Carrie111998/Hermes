@@ -1,12 +1,13 @@
 import { useStore } from '@nanostores/react'
 import { useRef } from 'react'
 
+import { useComposerSurfaceId } from '@/app/chat/composer/scope'
 import { Codicon } from '@/components/ui/codicon'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
 import { $approvalRequest } from '@/store/prompts'
-import { $threadJumpButtonVisible, requestScrollToBottom } from '@/store/thread-scroll'
+import { requestScrollToBottom, threadJumpButtonVisibleStore } from '@/store/thread-scroll'
 
 /**
  * Floating "jump to bottom" control. Sits centered just above the composer,
@@ -30,7 +31,8 @@ import { $threadJumpButtonVisible, requestScrollToBottom } from '@/store/thread-
  */
 export function ScrollToBottomButton() {
   const { t } = useI18n()
-  const visible = useStore($threadJumpButtonVisible)
+  const scrollScope = useComposerSurfaceId() ?? ''
+  const visible = useStore(threadJumpButtonVisibleStore(scrollScope))
   const request = useStore($approvalRequest)
   // Scrolled away while an approval is pending → the inline Run/Reject bar is
   // below the fold. Relabel so the user knows the session needs them, not just
@@ -59,7 +61,7 @@ export function ScrollToBottomButton() {
       data-state={state}
       onClick={() => {
         triggerHaptic('selection')
-        requestScrollToBottom()
+        requestScrollToBottom(scrollScope)
       }}
       style={{
         bottom: 'calc(var(--composer-measured-height) + 0.625rem)'

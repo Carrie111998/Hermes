@@ -29,6 +29,7 @@ import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { useI18n } from '@/i18n'
 import { useKeybindHint } from '@/lib/keybinds/use-keybind-hint'
+import { isolateTileWheel } from '@/lib/tile-scroll'
 import { cn } from '@/lib/utils'
 import { closeAllOpenSessionTiles } from '@/store/session-states'
 
@@ -684,8 +685,12 @@ export function TreeGroup({
               return (
                 <div
                   aria-hidden={!isActive || undefined}
-                  className={cn('absolute inset-0 overflow-auto', !isActive && 'pointer-events-none invisible')}
+                  className={cn(
+                    'absolute inset-0 overflow-auto overscroll-contain',
+                    !isActive && 'pointer-events-none invisible'
+                  )}
                   key={paneId}
+                  onWheel={isolateTileWheel}
                   {...hiddenPaneProps(!isActive)}
                 >
                   {pane?.render ? (

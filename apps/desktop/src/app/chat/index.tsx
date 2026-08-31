@@ -664,6 +664,7 @@ const ChatViewContent = memo(function ChatViewContent({
             onCancel={haltRun}
             onDismissError={onDismissError}
             onRestoreToMessage={onRestoreToMessage}
+            scrollScope={composerSurfaceId ?? ''}
             sessionId={activeSessionId}
             sessionKey={threadKey}
           />

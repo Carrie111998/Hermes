@@ -43,6 +43,8 @@ interface ThreadProps {
   onCancel?: () => Promise<void> | void
   onDismissError?: (messageId: string) => void
   onRestoreToMessage?: (messageId: string, target?: RestoreMessageTarget) => Promise<void> | void
+  /** Per-ChatView scroll identity. See `useComposerSurfaceId`. */
+  scrollScope?: string
   sessionId?: string | null
   sessionKey?: string | null
 }
@@ -64,6 +66,7 @@ export const Thread = memo(function Thread({
   onCancel,
   onDismissError,
   onRestoreToMessage,
+  scrollScope = '',
   sessionId = null,
   sessionKey
 }: ThreadProps) {
@@ -175,6 +178,8 @@ export const Thread = memo(function Thread({
           components={messageComponents}
           emptyPlaceholder={emptyPlaceholder}
           loadingIndicator={loadingIndicator}
+          scrollScope={scrollScope}
+          sessionId={sessionId}
           sessionKey={sessionKey}
         />
         {loading === 'session' && <CenteredThreadSpinner />}

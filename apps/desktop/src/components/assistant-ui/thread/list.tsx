@@ -20,6 +20,7 @@ import { type GetTargetScrollTop, useStickToBottom } from 'use-stick-to-bottom'
 import { usePaneLifecycle } from '@/components/pane-shell/pane-visibility'
 import { useI18n } from '@/i18n'
 import { messagePaintWeight } from '@/lib/render-weight'
+import { isolateTileWheel } from '@/lib/tile-scroll'
 import { cn } from '@/lib/utils'
 import {
   onScrollToBottomRequest,
@@ -186,6 +187,10 @@ interface ThreadMessageListProps {
   components: ThreadMessageComponents
   emptyPlaceholder?: ReactNode
   loadingIndicator?: ReactNode
+  /** Per-ChatView identity for transcript scroll. Empty is the unscoped
+   *  legacy slot used by tests / a lone pane. */
+  scrollScope?: string
+  sessionId?: string | null
   sessionKey?: string | null
 }
 
@@ -375,6 +380,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   components,
   emptyPlaceholder,
   loadingIndicator,
+  scrollScope = '',
+  sessionId = null,
   sessionKey
 }) => {
   // TWO signatures, deliberately split. The STRUCTURAL one (ids/roles/count)
@@ -575,11 +582,22 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     ? 'pt-[calc(var(--titlebar-height)+0.75rem)]'
     : 'pt-[calc(var(--titlebar-height)-0.5rem)]'
 
-  useEffect(() => setThreadAtBottom(isAtBottom), [isAtBottom])
-  useEffect(() => () => resetThreadScroll(), [])
+  useEffect(() => setThreadAtBottom(isAtBottom, scrollScope), [isAtBottom, scrollScope])
+  useEffect(() => () => resetThreadScroll(scrollScope), [scrollScope])
 
   // Floating jump button (outside this subtree) → return to the bottom.
-  useEffect(() => onScrollToBottomRequest(() => void scrollToBottom()), [scrollToBottom])
+  // Register under this ChatView's surface id AND the live runtime id so a
+  // gateway-driven jump (clarify hydration) hits only this transcript.
+  useEffect(() => {
+    const jump = () => void scrollToBottom()
+    const stopSurface = onScrollToBottomRequest(jump, scrollScope)
+    const stopSession = sessionId ? onScrollToBottomRequest(jump, sessionId) : undefined
+
+    return () => {
+      stopSurface()
+      stopSession?.()
+    }
+  }, [scrollScope, scrollToBottom, sessionId])
 
   // Waking from display: hidden (HUD mode hides the main window; OS hide does
   // the same to any window): rAF and ResizeObserver may have been frozen, so
@@ -617,8 +635,8 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     el.setAttribute('data-editing', 'true')
   }, [endEditHold, scrollRef, stopScroll])
 
-  useEffect(() => onThreadEditOpen(beginEditHold), [beginEditHold])
-  useEffect(() => onThreadEditClose(endEditHold), [endEditHold])
+  useEffect(() => onThreadEditOpen(beginEditHold, scrollScope), [beginEditHold, scrollScope])
+  useEffect(() => onThreadEditClose(endEditHold, scrollScope), [endEditHold, scrollScope])
   useEffect(() => () => endEditHold(), [endEditHold])
   // New run → snap to the latest turn.
   useAuiEvent('thread.runStart', () => void scrollToBottom())
@@ -772,6 +790,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
         className="size-full overflow-x-hidden overflow-y-auto overscroll-contain"
         data-following={isAtBottom ? 'true' : 'false'}
         data-slot="aui_thread-viewport"
+        onWheel={isolateTileWheel}
         ref={scrollRef as React.RefCallback<HTMLDivElement>}
       >
         {renderEmpty ? (

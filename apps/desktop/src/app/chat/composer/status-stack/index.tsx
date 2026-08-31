@@ -3,6 +3,7 @@ import { type ReactNode, useEffect, useMemo } from 'react'
 import { useNavigate } from 'react-router'
 
 import { blurComposerInput } from '@/app/chat/composer/focus'
+import { useComposerSurfaceId } from '@/app/chat/composer/scope'
 import { AGENTS_ROUTE } from '@/app/routes'
 import { BillingBanner } from '@/components/billing-banner'
 import { composerDockCard } from '@/components/chat/composer-dock'
@@ -27,7 +28,7 @@ import {
 } from '@/store/composer-status'
 import { refreshSessionGoal } from '@/store/goals'
 import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview-status'
-import { $threadScrolledUp } from '@/store/thread-scroll'
+import { threadScrolledUpStore } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
 
 import { PreviewStatusRow } from './preview-row'
@@ -97,7 +98,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   // items actually changed.
   const items = useSessionSlice($statusItemsBySession, sessionId)
   const previews = useSessionSlice($previewStatusBySession, sessionId)
-  const scrolledUp = useStore($threadScrolledUp)
+  const scrolledUp = useStore(threadScrolledUpStore(useComposerSurfaceId() ?? ''))
   const billing = useStore($billingBlock)
 
   const groups = useMemo(() => groupStatusItems(items), [items])

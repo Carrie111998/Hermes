@@ -44,6 +44,7 @@ import {
   replaceBeforeCaret,
   RICH_INPUT_SLOT
 } from '@/app/chat/composer/rich-editor'
+import { useComposerSurfaceId } from '@/app/chat/composer/scope'
 import { detectTrigger, openDirectiveScope, textBeforeCaret, type TriggerState } from '@/app/chat/composer/text-utils'
 import { ComposerTriggerPopover } from '@/app/chat/composer/trigger-popover'
 import { isRedoShortcut, isUndoShortcut } from '@/app/chat/composer/undo-history'
@@ -87,6 +88,7 @@ interface UserEditComposerProps {
 export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sessionId }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
+  const scrollScope = useComposerSurfaceId() ?? ''
   const aui = useAui()
   const draft = useAuiState(s => s.composer.text)
   const rootRef = useRef<HTMLDivElement | null>(null)
@@ -148,7 +150,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   // and a sibling unmount-only effect would only be a second place to forget.
   useEffect(
     () => () => {
-      notifyThreadEditClose()
+      notifyThreadEditClose(scrollScope)
       releaseActiveComposer('edit')
 
       for (const id of pendingTimeoutsRef.current) {
@@ -157,7 +159,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
 
       pendingTimeoutsRef.current.clear()
     },
-    []
+    [scrollScope]
   )
 
   const focusEditor = useCallback(() => {
