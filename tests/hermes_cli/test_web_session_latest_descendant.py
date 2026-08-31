@@ -43,6 +43,36 @@ def test_latest_descendant_does_not_follow_non_continuation_children(
     assert _session_latest_descendant("parent", db) == ("parent", ["parent"])
 
 
+def test_latest_descendant_does_not_follow_legacy_branch_child(
+    db: SessionDB,
+) -> None:
+    db.create_session("parent", source="webui")
+    db.end_session("parent", "branched")
+    db.create_session(
+        "legacy-branch",
+        source="webui",
+        parent_session_id="parent",
+    )
+
+    assert _session_latest_descendant("parent", db) == ("parent", ["parent"])
+
+
+def test_latest_descendant_does_not_follow_legacy_reset_child(
+    db: SessionDB,
+) -> None:
+    session_key = "agent:main:webui:dm:lane"
+    db.create_session("parent", source="webui", session_key=session_key)
+    db.end_session("parent", "session_reset")
+    db.create_session(
+        "legacy-reset",
+        source="webui",
+        session_key=session_key,
+        parent_session_id="parent",
+    )
+
+    assert _session_latest_descendant("parent", db) == ("parent", ["parent"])
+
+
 def test_latest_descendant_still_follows_model_child_with_inherited_marker(
     db: SessionDB,
 ) -> None:

@@ -106,6 +106,11 @@ from gateway.status import (
     read_runtime_status,
     resolve_gateway_liveness,
 )
+from hermes_state_common import (
+    _RESET_END_REASONS_SQL,
+    _legacy_branch_child_sql,
+    _legacy_reset_child_sql,
+)
 from utils import env_var_enabled
 
 try:
@@ -12171,12 +12176,18 @@ def _session_latest_descendant(session_id: str, db):
                 WHERE COALESCE(
                     json_extract(COALESCE(s.model_config, '{}'), '$._branched_from'), ''
                 ) != d.id
+                  AND NOT (
+                    """ + _legacy_branch_child_sql("s") + """
+                  )
                   AND COALESCE(
                     json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from'), ''
                 ) != d.id
                   AND COALESCE(
                     json_extract(COALESCE(s.model_config, '{}'), '$._reset_from'), ''
                 ) != d.id
+                  AND NOT (
+                    """ + _legacy_reset_child_sql("s", _RESET_END_REASONS_SQL) + """
+                  )
                   AND COALESCE(s.source, '') != 'tool'
             )
             SELECT id, parent_session_id, started_at FROM descendants
