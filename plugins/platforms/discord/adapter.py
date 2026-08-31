@@ -1967,8 +1967,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._suspension_watch_thread.start()
 
     def _stop_suspension_watch(self) -> None:
-        self._suspension_watch_stop.set()
-        thread = self._suspension_watch_thread
+        stop = getattr(self, "_suspension_watch_stop", None)
+        if stop is not None:
+            stop.set()
+        thread = getattr(self, "_suspension_watch_thread", None)
         if thread is None or thread is threading.current_thread():
             return
         if thread.is_alive():
