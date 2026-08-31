@@ -302,3 +302,40 @@ class TestCoerceToolArgsSingleKeyDictArray:
         with patch("model_tools.registry.get_schema", return_value=schema):
             result = coerce_tool_args("test_tool", {"ids": {"item": 14}})
             assert result["ids"] == [{"item": 14}]
+
+    def test_union_array_type_with_null_unwrapped(self):
+        """JSON-Schema union array form ``["integer", "null"]``: some MCP
+        servers emit it and ``strip_nullable_unions`` only folds ``anyOf``/
+        ``oneOf``, so the union form reaches the registry verbatim (#99270
+        live report: the unwrap branch never fired for an MCP tool)."""
+        with patch("model_tools.registry.get_schema", return_value=self._schema({"type": ["integer", "null"]})):
+            result = coerce_tool_args("test_tool", {"ids": {"item": 14}})
+            assert result["ids"] == [14]
+
+    def test_union_array_type_all_scalar_unwrapped(self):
+        with patch("model_tools.registry.get_schema", return_value=self._schema({"type": ["string"]})):
+            result = coerce_tool_args("test_tool", {"ids": {"item": "a"}})
+            assert result["ids"] == ["a"]
+
+    def test_union_array_type_with_object_left_alone(self):
+        """A union mixing in a non-scalar member can legitimately carry dict
+        elements — the unwrap must not apply."""
+        with patch("model_tools.registry.get_schema", return_value=self._schema({"type": ["integer", "object"]})):
+            result = coerce_tool_args("test_tool", {"ids": {"item": 1}})
+            assert result["ids"] == [{"item": 1}]
+
+    def test_union_array_type_empty_left_alone(self):
+        with patch("model_tools.registry.get_schema", return_value=self._schema({"type": []})):
+            result = coerce_tool_args("test_tool", {"ids": {"item": 14}})
+            assert result["ids"] == [{"item": 14}]
+
+    def test_wrapped_dict_logs_keys_not_values(self, caplog):
+        """When the unwrap does not apply, the wrap logs the dict's KEYS so
+        the next live report shows what the model actually emitted — without
+        echoing values, which may carry user content."""
+        with patch("model_tools.registry.get_schema", return_value=self._schema({"type": "integer"})):
+            with caplog.at_level("INFO", logger="model_tools"):
+                coerce_tool_args("test_tool", {"ids": {"item": 14, "extra": "secret-value"}})
+        joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "keys: ['extra', 'item']" in joined
+        assert "secret-value" not in joined
