@@ -93,6 +93,12 @@ jobs:
     with:
       event_name: ${{ needs.detect.outputs.event_name }}
 
+  workflow-lint:
+    name: GitHub Actions workflow lint
+    needs: detect
+    if: needs.detect.outputs.ci_review == 'true'
+    uses: ./.github/workflows/lint-workflows.yml
+
   js-tests:
     name: JS & TS checks
     needs: detect
@@ -220,6 +226,7 @@ jobs:
       - tests
       - tests-os
       - lint
+      - workflow-lint
       - js-tests
       - installer-tests
       - rust-tests

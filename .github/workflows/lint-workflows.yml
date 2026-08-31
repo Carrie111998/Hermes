@@ -1,0 +1,37 @@
+name: GitHub Actions workflow lint
+
+# Reusable sub-workflow: ci.yaml owns the pull_request/push triggers and the
+# all-checks-pass branch-protection gate.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workflow-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.10
+          ACTIONLINT_SHA256: f4c76b71db5755a713e6055cbb0857ed07e103e028bda117817660ebadb4386f
+        run: |
+          curl --fail --location --retry 3 \
+            --output actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum --check
+          tar -xzf actionlint.tar.gz actionlint
+          chmod 0755 actionlint
+
+      - name: Lint workflows
+        run: ./actionlint -color=false -shellcheck=""
