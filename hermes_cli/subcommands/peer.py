@@ -32,7 +32,8 @@ import re
 import sys
 import urllib.error
 import urllib.parse
-import urllib.request
+
+import httpx
 
 BOT_CHAT_TITLE = "Bot Chat"
 _PEER_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -77,23 +78,42 @@ def _peer_secret(name: str) -> str:
 
 
 def _request(url: str, key: str, *, method: str = "GET", body: dict | None = None, timeout: int = LIST_TIMEOUT_S) -> dict:
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-            "User-Agent": "hermes-peer-dm",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — user-registered peer URL
-        payload = resp.read().decode("utf-8", "replace")
+    """HTTP JSON request to a peer gateway via httpx.
+
+    Uses httpx (same stack as the rest of the codebase) instead of
+    http.client/urllib.  On Windows, http.client's default headers
+    (Connection: close, Accept-Encoding: identity, implicit Host handling)
+    trigger an aiohttp 3.1 incompatibility: the Windows Proactor loop
+    mis-parses the request as chunked transfer and waits for a terminating
+    chunk that never arrives → timeout, while curl/httpx (keep-alive,
+    explicit Content-Length, Accept: */*) succeed.  Switching to httpx
+    aligns peer dm with every other Hermes HTTP client and fixes the
+    Windows gateway timeout (#97769).
+    """
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "User-Agent": "hermes-peer-dm",
+        "Accept": "application/json",
+    }
     try:
-        parsed = json.loads(payload)
+        with httpx.Client(timeout=timeout) as client:
+            if body is not None:
+                resp = client.request(method, url, headers=headers, json=body)
+            else:
+                resp = client.request(method, url, headers=headers)
+            resp.raise_for_status()
+    except httpx.HTTPStatusError:
+        raise
+    except httpx.TimeoutException as exc:
+        raise TimeoutError(str(exc)) from exc
+    except httpx.RequestError as exc:
+        raise OSError(str(exc)) from exc
+    # Success — parse JSON (same contract as the urllib version)
+    try:
+        parsed = resp.json()
     except ValueError as exc:
-        raise RuntimeError(f"Peer returned non-JSON response: {payload[:200]}") from exc
+        raise RuntimeError(f"Peer returned non-JSON response: {resp.text[:200]}") from exc
     if not isinstance(parsed, dict):
         raise RuntimeError("Peer returned a non-object JSON response")
     return parsed
@@ -137,6 +157,17 @@ def _ensure_bot_chat(base: str, key: str) -> str:
             method="POST",
             body={"title": BOT_CHAT_TITLE, "source": "bot_peer_dm"},
         )
+    except httpx.HTTPStatusError as exc:
+        detail = _http_error_detail(exc)
+        code = exc.response.status_code
+        if code == 400 and "title" in detail.lower():
+            raise RuntimeError(
+                f"Peer already has a '{BOT_CHAT_TITLE}' session but it is hidden and the "
+                f"peer's gateway is too old to expose hidden sessions to this lookup "
+                f"(HTTP 400: {detail}). Update the peer's hermes-agent, or unhide the "
+                f"session there: PATCH /api/sessions/<id> {{\"hidden\": false}}."
+            ) from exc
+        raise
     except urllib.error.HTTPError as exc:
         detail = _http_error_detail(exc)
         if exc.code == 400 and "title" in detail.lower():
@@ -171,14 +202,38 @@ def _parse_target(target: str) -> tuple[str, str | None]:
     return peer, profile
 
 
-def _http_error_detail(exc: urllib.error.HTTPError) -> str:
-    try:
-        body = exc.read().decode("utf-8", "replace")
-        parsed = json.loads(body)
-        message = parsed.get("error", {}).get("message") if isinstance(parsed, dict) else None
-        return message or body[:200]
-    except Exception:
-        return str(exc)
+def _http_error_detail(exc) -> str:
+    """Extract a human-readable error detail from an HTTP error.
+
+    Handles both httpx.HTTPStatusError (new) and urllib.error.HTTPError (legacy/tests).
+    """
+    # httpx path (primary)
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            body = exc.response.text
+            try:
+                parsed = exc.response.json()
+                if isinstance(parsed, dict):
+                    err = parsed.get("error")
+                    if isinstance(err, dict) and err.get("message"):
+                        return str(err["message"])
+                    if isinstance(parsed.get("message"), str):
+                        return str(parsed["message"])
+            except Exception:
+                pass
+            return body[:500] if body else str(exc)
+        except Exception:
+            return str(exc)
+    # urllib fallback (tests / older mocks)
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            body = exc.read().decode("utf-8", "replace")
+            parsed = json.loads(body)
+            message = parsed.get("error", {}).get("message") if isinstance(parsed, dict) else None
+            return message or body[:200]
+        except Exception:
+            return str(exc)
+    return str(exc)
 
 
 def cmd_peer(args) -> int:
@@ -269,13 +324,16 @@ def cmd_peer(args) -> int:
                 body={"message": message},
                 timeout=DM_TIMEOUT_S,
             )
+        except httpx.HTTPStatusError as exc:
+            print(f"Peer '{peer_name}' rejected the request (HTTP {exc.response.status_code}): {_http_error_detail(exc)}", file=sys.stderr)
+            return 1
         except urllib.error.HTTPError as exc:
             print(f"Peer '{peer_name}' rejected the request (HTTP {exc.code}): {_http_error_detail(exc)}", file=sys.stderr)
             return 1
         except RuntimeError as exc:
             print(f"Peer '{peer_name}': {exc}", file=sys.stderr)
             return 1
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (httpx.RequestError, urllib.error.URLError, TimeoutError, OSError) as exc:
             print(f"Could not reach peer '{peer_name}': {exc}", file=sys.stderr)
             return 1
 
