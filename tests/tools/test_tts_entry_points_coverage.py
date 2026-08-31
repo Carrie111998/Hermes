@@ -110,58 +110,59 @@ class TestTextToSpeechToolFraming:
         assert result["success"] is False
         assert "Text is empty after TTS cleanup" in result["error"]
 
-    def test_prepare_spoken_text_exception_falls_back_to_strip(self):
+    def test_prepare_spoken_text_exception_falls_back_to_strip(self, tmp_path):
         # 3537-3538: a failing normalizer falls back to plain strip.
         def boom(text, max_chars=None):
             raise RuntimeError("normalizer down")
 
+        out = tmp_path / "out.mp3"
+        out.write_bytes(b"\x00" * 16)
         with patch("tools.tts_text_normalize.prepare_spoken_text", boom), \
              patch.object(tts_tool, "_text_to_speech_single") as single:
-            single.return_value = _success_result(
-                str(Path("/tmp/out.mp3")), "edge"
-            )
-            # Output path must point at a real file for the post-encode check.
-            out = Path("/tmp/out.mp3")
-            out.write_bytes(b"\x00" * 16)
+            single.return_value = _success_result(str(out), "edge")
             tts_tool.text_to_speech_tool(text="  hello  ", output_path=str(out))
             # text passed to the single generator is stripped, not raw.
             assert single.call_args[1]["text"] == "hello"
 
-    def test_resolves_configured_provider(self):
+    def test_resolves_configured_provider(self, tmp_path):
         # provider picked from config when none passed -> dispatched to it.
+        out = tmp_path / "out.mp3"
+        out.write_bytes(b"\x00" * 16)
         with patch.object(tts_tool, "_load_tts_config",
                           return_value={"provider": "openai"}), \
              patch.object(tts_tool, "_text_to_speech_single") as single:
-            single.return_value = _success_result("/tmp/out.mp3", "openai")
-            Path("/tmp/out.mp3").write_bytes(b"\x00" * 16)
-            tts_tool.text_to_speech_tool(text="hi", output_path="/tmp/out.mp3")
+            single.return_value = _success_result(str(out), "openai")
+            tts_tool.text_to_speech_tool(text="hi", output_path=str(out))
         assert single.call_args[1]["provider"] == "openai"
 
-    def test_provider_override_is_dispatched(self):
+    def test_provider_override_is_dispatched(self, tmp_path):
+        out = tmp_path / "out.mp3"
+        out.write_bytes(b"\x00" * 16)
         with patch.object(tts_tool, "_text_to_speech_single") as single:
-            single.return_value = _success_result("/tmp/out.mp3", "minimax")
-            Path("/tmp/out.mp3").write_bytes(b"\x00" * 16)
+            single.return_value = _success_result(str(out), "minimax")
             tts_tool.text_to_speech_tool(
-                text="hi", output_path="/tmp/out.mp3", provider="minimax"
+                text="hi", output_path=str(out), provider="minimax"
             )
         assert single.call_args[1]["provider"] == "minimax"
 
-    def test_provider_case_and_whitespace_normalized(self):
+    def test_provider_case_and_whitespace_normalized(self, tmp_path):
         # 3553: provider is lowercased + stripped before dispatch.
+        out = tmp_path / "out.mp3"
+        out.write_bytes(b"\x00" * 16)
         with patch.object(tts_tool, "_text_to_speech_single") as single:
-            single.return_value = _success_result("/tmp/out.mp3", "openai")
-            Path("/tmp/out.mp3").write_bytes(b"\x00" * 16)
+            single.return_value = _success_result(str(out), "openai")
             tts_tool.text_to_speech_tool(
-                text="hi", output_path="/tmp/out.mp3", provider="  OPENAI  "
+                text="hi", output_path=str(out), provider="  OPENAI  "
             )
         assert single.call_args[1]["provider"] == "openai"
 
-    def test_speed_passed_through(self):
+    def test_speed_passed_through(self, tmp_path):
+        out = tmp_path / "out.mp3"
+        out.write_bytes(b"\x00" * 16)
         with patch.object(tts_tool, "_text_to_speech_single") as single:
-            single.return_value = _success_result("/tmp/out.mp3", "edge")
-            Path("/tmp/out.mp3").write_bytes(b"\x00" * 16)
+            single.return_value = _success_result(str(out), "edge")
             tts_tool.text_to_speech_tool(
-                text="hi", output_path="/tmp/out.mp3", speed=2.0
+                text="hi", output_path=str(out), speed=2.0
             )
         assert single.call_args[1]["speed"] == 2.0
 
@@ -239,7 +240,7 @@ class TestTextToSpeechToolFraming:
         monkeypatch.setattr("agent.file_safety.is_write_denied",
                             lambda path: True, raising=False)
         result = json.loads(tts_tool.text_to_speech_tool(
-                text="hello", output_path="/tmp/out.mp3"
+                text="hello", output_path="/etc/out.mp3"
             ))
         assert result["success"] is False
         assert "protected credential or system path" in result["error"]
@@ -259,7 +260,7 @@ class TestTextToSpeechToolFraming:
         assert result["file_path"].endswith(".mp3")
         single.assert_called_once()
 
-    def test_chunk_invalid_json_raises_runtime_error(self):
+    def test_chunk_invalid_json_raises_runtime_error(self, tmp_path):
         # 3638-3639 + 3699-3702: non-JSON chunk result -> delivery error.
         with (
             patch.object(tts_tool, "_text_to_speech_single",
@@ -268,20 +269,20 @@ class TestTextToSpeechToolFraming:
                          return_value=["chunk"]),
         ):
             result = json.loads(tts_tool.text_to_speech_tool(
-                text="hello", output_path="/tmp/out.mp3"
+                text="hello", output_path=str(tmp_path / "out.mp3")
             ))
         assert result["success"] is False
         assert "TTS long-form generation failed" in result["error"]
 
-    def test_chunk_no_output_audio_raises(self):
+    def test_chunk_no_output_audio_raises(self, tmp_path):
         # 3650: success claimed but no file on disk -> delivery error.
         with patch.object(tts_tool, "_text_to_speech_single",
-                          return_value=_success_result("/tmp/missing.mp3", "edge")), \
+                          return_value=_success_result(str(tmp_path / "missing.mp3"), "edge")), \
              patch.object(tts_tool, "_split_text_for_tts",
                           return_value=["chunk"]):
-            Path("/tmp/missing.mp3").unlink(missing_ok=True)
+            Path(tmp_path / "missing.mp3").unlink(missing_ok=True)
             result = json.loads(tts_tool.text_to_speech_tool(
-                text="hello", output_path="/tmp/out.mp3"
+                text="hello", output_path=str(tmp_path / "out.mp3")
             ))
         assert result["success"] is False
         assert "produced no final audio" in result["error"]
