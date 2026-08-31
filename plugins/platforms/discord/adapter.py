@@ -4301,6 +4301,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if not pcm:
             return
         await asyncio.to_thread(handle.child.write, pcm)
+        if handle.aborted:
+            raise RuntimeError("Discord streaming TTS write was aborted")
         # A successful child write may already have been consumed by Discord;
         # suppress whole-file fallback before detecting any later staleness.
         handle.audible = True
