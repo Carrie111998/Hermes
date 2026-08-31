@@ -171,6 +171,32 @@ def test_turn_route_middleware_receives_redacted_route_and_resolves_provider(mon
     assert trace == [{"source": "test"}]
 
 
+def test_gateway_internal_turn_bypasses_turn_route_middleware(monkeypatch):
+    runner = _make_runner()
+    invoked = False
+
+    def fail_if_invoked(*_args, **_kwargs):
+        nonlocal invoked
+        invoked = True
+        raise AssertionError("internal turns must not invoke turn_route middleware")
+
+    monkeypatch.setattr("hermes_cli.middleware.apply_turn_route_middleware", fail_if_invoked)
+    model, runtime, trace = runner._apply_turn_route_middleware(
+        message="internal continuation",
+        model="primary",
+        runtime_kwargs={"provider": "openai", "api_key": "secret"},
+        session_id="physical-1",
+        session_key="chat-1",
+        source=_make_source(),
+        internal=True,
+    )
+
+    assert invoked is False
+    assert model == "primary"
+    assert runtime == {"provider": "openai", "api_key": "secret"}
+    assert trace == []
+
+
 def test_gateway_command_and_turn_route_share_durable_session_key(monkeypatch):
     """A control command must affect the same chat after physical rotation."""
     from hermes_cli.plugins import invoke_plugin_command
