@@ -4073,8 +4073,20 @@ def run_conversation(
                     # surfaced cache telemetry (#84460).
                     if canonical_usage.cache_telemetry_present:
                         if canonical_usage.cache_read_tokens:
+                            # Keep the cache-hit percentage available for
+                            # capacity monitoring (dropped by the old
+                            # cache=<read>/<prompt> (<pct>%) → cache_state
+                            # switch); the percentage is cache-read relative
+                            # to billed prompt tokens.
+                            hit_pct = (
+                                canonical_usage.cache_read_tokens * 100.0
+                                / prompt_tokens
+                                if prompt_tokens > 0
+                                else 0.0
+                            )
                             _cache_state = (
                                 f" cache_state=hit cache_read={canonical_usage.cache_read_tokens}"
+                                f" ({hit_pct:.0f}%)"
                                 f" cache_write={canonical_usage.cache_write_tokens}"
                             )
                         elif canonical_usage.cache_write_tokens:
