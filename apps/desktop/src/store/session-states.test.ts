@@ -268,6 +268,30 @@ describe('SessionTile workspace scope', () => {
     ])
   })
 
+  it('keeps one canonical Bot tile when the same durable session opens twice', () => {
+    const firstScope = {
+      workspaceMode: 'bots' as const,
+      workspaceOwnerKey: 'connection-a::default'
+    }
+
+    const refreshedScope = {
+      workspaceMode: 'bots' as const,
+      workspaceOwnerKey: 'connection-a::default',
+      workspaceTabTitle: 'Bot Chat'
+    }
+
+    openSessionTile('bot-chat', 'right', undefined, undefined, firstScope)
+    openSessionTile('bot-chat', 'right', undefined, undefined, refreshedScope)
+
+    expect($sessionTiles.get()).toHaveLength(1)
+    expect($sessionTiles.get()[0]).toMatchObject({
+      storedSessionId: 'bot-chat',
+      workspaceMode: 'bots',
+      workspaceOwnerKey: 'connection-a::default',
+      workspaceTabTitle: 'Bot Chat'
+    })
+  })
+
   it('allows a Bot-scoped tab when the same stored session is hidden in Sessions main', () => {
     const scope = { workspaceMode: 'bots' as const, workspaceOwnerKey: 'connection-a::default' }
 
