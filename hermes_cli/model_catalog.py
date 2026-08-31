@@ -112,6 +112,104 @@ def _load_catalog_config() -> dict[str, Any]:
     }
 
 
+def get_model_catalog_exclusions(
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the provider-scoped local model exclusion policy."""
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config() or {}
+        except Exception:
+            return {}
+    raw = config.get("model_catalog") if isinstance(config, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    excluded = raw.get("excluded_models")
+    return dict(excluded) if isinstance(excluded, dict) else {}
+
+
+def filter_model_catalog_exclusions(
+    provider: str,
+    model_ids: list[str],
+    excluded_models: Any,
+) -> list[str]:
+    """Return a copy without exact, case-insensitive provider/model matches."""
+    if not isinstance(excluded_models, dict):
+        return list(model_ids or [])
+    provider_key = str(provider or "").strip().lower()
+    blocked: set[str] = set()
+    for configured_provider, configured_models in excluded_models.items():
+        if str(configured_provider or "").strip().lower() != provider_key:
+            continue
+        if not isinstance(configured_models, list):
+            continue
+        blocked.update(
+            model_id.strip().lower()
+            for model_id in configured_models
+            if isinstance(model_id, str) and model_id.strip()
+        )
+    return [
+        model_id
+        for model_id in (model_ids or [])
+        if str(model_id).strip().lower() not in blocked
+    ]
+
+
+def is_automatic_model_excluded(
+    provider: str,
+    model_id: str,
+    config: dict[str, Any] | None = None,
+) -> bool:
+    """Apply local policy to an automatic model, even after config loss."""
+    policy_config = (
+        config
+        if isinstance(config, dict)
+        and isinstance(config.get("model_catalog"), dict)
+        else None
+    )
+    policy = get_model_catalog_exclusions(policy_config)
+    provider_id = str(provider or "").strip()
+    if provider_id:
+        return not filter_model_catalog_exclusions(
+            provider_id, [model_id], policy
+        )
+    return any(
+        not filter_model_catalog_exclusions(
+            str(candidate), [model_id], policy
+        )
+        for candidate in policy
+    )
+
+
+def filter_model_catalog_rows(
+    rows: list[dict[str, Any]],
+    excluded_models: Any,
+) -> list[dict[str, Any]]:
+    """Filter merged picker rows without mutating cache-backed row data."""
+    filtered_rows: list[dict[str, Any]] = []
+    for row in rows or []:
+        models = list(row.get("models") or [])
+        visible = filter_model_catalog_exclusions(
+            str(row.get("slug") or ""), models, excluded_models
+        )
+        if len(visible) == len(models):
+            filtered_rows.append(row)
+            continue
+        filtered = dict(row)
+        filtered["models"] = visible
+        total = row.get("total_models")
+        removed = len(models) - len(visible)
+        filtered["total_models"] = (
+            max(len(visible), total - removed)
+            if isinstance(total, int)
+            else len(visible)
+        )
+        filtered_rows.append(filtered)
+    return filtered_rows
+
+
 def _cache_path() -> Path:
     """Return the disk cache path. Import lazily so tests can monkeypatch home."""
     from hermes_constants import get_hermes_home

@@ -3043,6 +3043,9 @@ DEFAULT_CONFIG = {
         #     openrouter:
         #       url: https://example.com/my-curation.json
         "providers": {},
+        # Provider-scoped model IDs hidden from merged pickers and skipped by
+        # automatic defaults/fallbacks. Raw upstream caches stay untouched.
+        "excluded_models": {},
     },
 
     # Per-model metadata overrides — manually declare context_window,

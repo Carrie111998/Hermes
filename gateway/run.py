@@ -8476,6 +8476,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 or (_lr_star.conversation.last_resolved_model if _lr_star else "")
             )
             if _recovered:
+                from hermes_cli.model_catalog import is_automatic_model_excluded
+
+                if is_automatic_model_excluded(
+                    runtime_kwargs.get("provider", ""),
+                    _recovered,
+                    user_config,
+                ):
+                    _recovered = ""
+            if _recovered:
                 logger.warning(
                     "Empty model resolved for session=%s — recovering "
                     "last-known-good model %s (config read likely returned "

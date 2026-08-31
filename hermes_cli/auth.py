@@ -7748,6 +7748,20 @@ def _prompt_model_selection(
         compute_sale_discount,
     )
 
+    if confirm_provider:
+        from hermes_cli.model_catalog import (
+            filter_model_catalog_exclusions,
+            get_model_catalog_exclusions,
+        )
+
+        excluded_models = get_model_catalog_exclusions()
+        model_ids = filter_model_catalog_exclusions(
+            confirm_provider, model_ids, excluded_models
+        )
+        unavailable_models = filter_model_catalog_exclusions(
+            confirm_provider, unavailable_models or [], excluded_models
+        )
+
     _unavailable = unavailable_models or []
     # Sale chrome (★ / -N% / was) is Nous Portal-only — never for OpenRouter
     # or other providers even if pricing.original is somehow present.
@@ -7755,6 +7769,14 @@ def _prompt_model_selection(
 
     def _confirmed_selection(mid: str) -> Optional[str]:
         if not mid:
+            return None
+        if confirm_provider and not filter_model_catalog_exclusions(
+            confirm_provider, [mid], excluded_models
+        ):
+            print(
+                f"Model {mid!r} is excluded by "
+                f"model_catalog.excluded_models.{confirm_provider}."
+            )
             return None
         # Unified guard registry (hermes_cli.model_selection_guards): the cost
         # guard only runs when a provider is known (pricing lookups need one);

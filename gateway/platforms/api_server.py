@@ -3076,6 +3076,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if not model:
             _recovered = (self._last_resolved_model.get(_resolved_key)
                           or self._last_resolved_model.get("*"))
+            if _recovered:
+                from hermes_cli.model_catalog import is_automatic_model_excluded
+
+                if is_automatic_model_excluded(
+                    runtime_kwargs.get("provider", ""), _recovered
+                ):
+                    _recovered = ""
             if _recovered and _recovered != self._model_name:
                 logger.warning(
                     "Empty model resolved for session=%s — recovering "

@@ -58,6 +58,29 @@ def test_empty_model_recovers_session_last_good(monkeypatch):
     assert model == "deepseek/deepseek-v4-flash", "recovery turn must reuse last-known-good, not build model=''"
 
 
+def test_empty_model_does_not_recover_locally_excluded_model(monkeypatch):
+    runner = _make_runner()
+    sk = "agent:main:discord:dm:retired"
+    config = {
+        "model_catalog": {"excluded_models": {"zai": ["glm-4.5-air"]}}
+    }
+
+    _patch_resolution(
+        monkeypatch,
+        model_from_config="glm-4.5-air",
+        provider="zai",
+    )
+    runner._resolve_session_agent_runtime(session_key=sk, user_config=config)
+
+    _patch_resolution(monkeypatch, model_from_config="", provider="")
+    model, _ = runner._resolve_session_agent_runtime(
+        session_key=sk,
+        user_config=config,
+    )
+
+    assert model == ""
+
+
 def test_bare_runner_without_cache_attr_does_not_crash(monkeypatch):
     """object.__new__ runners (test helpers / pitfall #17) lack _last_resolved_model.
 
@@ -88,5 +111,4 @@ def test_has_pending_fallback_empty_chain():
     agent._fallback_chain = []
     agent._fallback_index = 0
     assert agent._has_pending_fallback() is False
-
 

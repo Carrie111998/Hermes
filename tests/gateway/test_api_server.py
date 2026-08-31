@@ -2974,6 +2974,44 @@ class TestCreateAgentModelRecovery:
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
 
+    def test_create_agent_does_not_recover_locally_excluded_model(
+        self, monkeypatch,
+    ):
+        captured = []
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.append(dict(kwargs))
+
+        _patch_create_agent_runtime(monkeypatch, {}, FakeAgent)
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model_catalog": {
+                    "excluded_models": {"zai": ["glm-4.5-air"]}
+                }
+            },
+        )
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+        adapter._last_resolved_model["ch"] = "glm-4.5-air"
+
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "")
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {"provider": "zai", "base_url": None, "api_mode": None},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.get_default_model_for_provider",
+            lambda _provider: "",
+        )
+
+        adapter._create_agent(session_id="s1", gateway_session_key="ch")
+
+        assert captured[0]["model"] == ""
+
     # ── Recovery-net alias guards (PR for #79101) ──────────────────────
 
     def test_create_agent_does_not_cache_virtual_alias(self, monkeypatch):

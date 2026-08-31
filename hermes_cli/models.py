@@ -1616,6 +1616,14 @@ def pick_silent_default_model(model_ids: list[str], provider: str = "openrouter"
     model on the user's behalf without an interactive picker (GUI onboarding
     recommended-default, empty-model runtime fallback).
     """
+    from hermes_cli.model_catalog import (
+        filter_model_catalog_exclusions,
+        get_model_catalog_exclusions,
+    )
+
+    model_ids = filter_model_catalog_exclusions(
+        provider, model_ids, get_model_catalog_exclusions()
+    )
     preferred = get_preferred_silent_default_model(provider)
     if preferred in model_ids:
         return preferred
@@ -1657,13 +1665,27 @@ def get_default_model_for_provider(provider: str) -> str:
     catalog-labeled default instead; a missing model must never auto-escalate
     to the flagship.
     """
-    models = _PROVIDER_MODELS.get(provider, [])
+    from hermes_cli.model_catalog import (
+        filter_model_catalog_exclusions,
+        get_model_catalog_exclusions,
+    )
+
+    excluded_models = get_model_catalog_exclusions()
+    models = filter_model_catalog_exclusions(
+        provider, _PROVIDER_MODELS.get(provider, []), excluded_models
+    )
     if provider in _SILENT_DEFAULT_PROVIDERS:
         preferred = get_preferred_silent_default_model(provider)
         # Trust the preferred default even when the provider has no static
         # catalog (OpenRouter's picker list is fetched live; its curated
         # snapshot carries the default).
-        if preferred and (preferred in models or not models):
+        if (
+            preferred
+            and filter_model_catalog_exclusions(
+                provider, [preferred], excluded_models
+            )
+            and (preferred in models or not models)
+        ):
             return preferred
     return models[0] if models else ""
 

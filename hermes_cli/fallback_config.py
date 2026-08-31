@@ -87,11 +87,21 @@ def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     """
 
     config = config or {}
+    from hermes_cli.model_catalog import (
+        filter_model_catalog_exclusions,
+        get_model_catalog_exclusions,
+    )
+
+    excluded_models = get_model_catalog_exclusions(config)
     chain: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
 
     for key in ("fallback_providers", "fallback_model"):
         for entry in _iter_fallback_entries(config.get(key)):
+            if not filter_model_catalog_exclusions(
+                entry["provider"], [entry["model"]], excluded_models
+            ):
+                continue
             identity = _entry_identity(entry)
             if identity in seen:
                 continue
