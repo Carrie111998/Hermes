@@ -406,6 +406,227 @@ def test_live_stream_defers_runtime_shutdown_until_exhaustion(
 
 
 
+def test_openai_chat_stream_accumulator_rebuilds_text_tools_and_usage():
+    accumulator = relay_llm.OpenAIChatStreamAccumulator()
+    for chunk in (
+        {
+            "model": "test-model",
+            "choices": [
+                {
+                    "delta": {
+                        "role": "assistant",
+                        "reasoning_content": "check ",
+                        "content": [{"type": "text", "text": "done"}],
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "search_files",
+                                    "arguments": '{"pat',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "model": "test-model",
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {
+                                    "name": "search_files",
+                                    "arguments": 'tern":"x"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+        },
+    ):
+        accumulator.observe(chunk)
+
+    assert accumulator.finalize() == {
+        "model": "test-model",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "reasoning_content": "check ",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "search_files",
+                                "arguments": '{"pattern":"x"}',
+                            },
+                            "extra_content": None,
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+    }
+
+
+def test_openai_chat_accumulator_preserves_reused_indices_and_terminal_fields():
+    accumulator = relay_llm.OpenAIChatStreamAccumulator()
+    accumulator.observe(
+        {
+            "model": "test-model",
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": "shared",
+                                "id": "call-1",
+                                "function": {
+                                    "name": "first",
+                                    "arguments": '{"a":',
+                                },
+                                "model_extra": {
+                                    "extra_content": {"signature": "sig-1"}
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+        }
+    )
+    accumulator.observe(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": "shared",
+                                "id": "call-2",
+                                "function": {
+                                    "name": "second",
+                                    "arguments": '{"b":',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "",
+                }
+            ],
+        }
+    )
+    accumulator.observe(
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": "shared",
+                                "id": "",
+                                "function": {"arguments": "2}"},
+                            }
+                        ],
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+    )
+    accumulator.observe(
+        {
+            "choices": [],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+        }
+    )
+    accumulator.observe({"choices": [], "usage": {}})
+
+    response = accumulator.finalize()
+    assert response["choices"][0]["finish_reason"] == "tool_calls"
+    assert response["usage"] == {"prompt_tokens": 11, "completion_tokens": 7}
+    assert response["choices"][0]["message"]["tool_calls"] == [
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "first", "arguments": '{"a":'},
+            "extra_content": {"signature": "sig-1"},
+        },
+        {
+            "id": "call-2",
+            "type": "function",
+            "function": {"name": "second", "arguments": '{"b":2}'},
+            "extra_content": None,
+        },
+    ]
+
+
+def test_openai_chat_finalizer_is_complete_before_python_consumer_drains(
+    relay_turn, monkeypatch
+):
+    relay, _turn = relay_turn
+    captured = {}
+    chunks = [
+        {
+            "model": "test-model",
+            "choices": [{"delta": {"content": "hello "}, "finish_reason": None}],
+        },
+        {
+            "model": "test-model",
+            "choices": [{"delta": {"content": "world"}, "finish_reason": "stop"}],
+        },
+    ]
+
+    async def drain_before_returning_stream(
+        _name, request, callback, observe_chunk, finalizer, **_kwargs
+    ):
+        upstream = callback(request)
+        drained = []
+        async for chunk in upstream:
+            observe_chunk(chunk)
+            drained.append(chunk)
+        captured["final"] = finalizer()
+
+        async def replay():
+            for chunk in drained:
+                yield chunk
+
+        return replay()
+
+    monkeypatch.setattr(
+        relay.llm, "stream_execute", drain_before_returning_stream
+    )
+    accumulator = relay_llm.OpenAIChatStreamAccumulator()
+    stream = relay_llm.stream(
+        {"model": "test-model", "messages": []},
+        lambda _request: iter(chunks),
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        finalizer=accumulator.finalize,
+        on_chunk=accumulator.observe,
+        metadata={"api_mode": "custom"},
+    )
+
+    assert captured["final"]["choices"][0]["message"]["content"] == "hello world"
+    assert list(stream) == chunks
+
+
 def test_anthropic_stream_accumulator_merges_plain_provider_object():
     accumulator = relay_llm.AnthropicStreamAccumulator()
     accumulator.observe({

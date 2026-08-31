@@ -4144,25 +4144,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             last_chunk_time["t"] = time.time()
             return True
 
-        def _relay_final_response() -> dict[str, Any]:
-            tool_calls = [tool_calls_acc[index] for index in sorted(tool_calls_acc)]
-            return {
-                "model": model_name,
-                "choices": [
-                    {
-                        "message": {
-                            "role": role,
-                            "content": "".join(content_parts) or None,
-                            "reasoning_content": "".join(reasoning_parts) or None,
-                            "tool_calls": tool_calls or None,
-                        },
-                        "finish_reason": finish_reason or "stop",
-                    }
-                ],
-                "usage": usage_obj,
-            }
-
         from agent import relay_llm
+        relay_accumulator = relay_llm.OpenAIChatStreamAccumulator()
 
         stream = _set_managed_stream(
             relay_llm.stream(
@@ -4171,8 +4154,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 session_id=str(getattr(agent, "session_id", "") or ""),
                 name=str(getattr(agent, "provider", "") or "provider"),
                 model_name=str(getattr(agent, "model", "") or ""),
-                finalizer=_relay_final_response,
+                finalizer=relay_accumulator.finalize,
                 on_stream_created=_stream_created,
+                on_chunk=relay_accumulator.observe,
                 accept_chunk=_accept_stream_chunk,
                 completed_response_predicate=lambda value: hasattr(value, "choices"),
                 metadata={

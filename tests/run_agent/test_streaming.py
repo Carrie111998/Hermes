@@ -98,6 +98,81 @@ class TestStreamingAccumulator:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_relay_finalizer_observes_chunks_before_host_replay(
+        self, mock_close, mock_create
+    ):
+        """Relay finalization does not depend on Hermes consuming the replay."""
+        from agent import relay_llm
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(content="Hello"),
+            _make_stream_chunk(
+                content=" world",
+                finish_reason="stop",
+                model="test-model",
+            ),
+        ]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+        captured = {}
+
+        def drain_before_replay(
+            request,
+            stream_factory,
+            *,
+            finalizer,
+            on_chunk,
+            on_stream_created,
+            **_kwargs,
+        ):
+            upstream = stream_factory(request)
+            on_stream_created(upstream)
+            drained = list(upstream)
+            for chunk in drained:
+                on_chunk(chunk)
+            captured["final"] = finalizer()
+
+            class ReplayStream:
+                final_response = None
+                output_modified = False
+
+                def __init__(self):
+                    self._chunks = iter(drained)
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    return next(self._chunks)
+
+                def close(self):
+                    return None
+
+            return ReplayStream()
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        with patch.object(relay_llm, "stream", side_effect=drain_before_replay):
+            response = agent._interruptible_streaming_api_call({})
+
+        assert captured["final"]["choices"][0]["message"]["content"] == (
+            "Hello world"
+        )
+        assert response.choices[0].message.content == "Hello world"
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
     def test_sparse_delta_allows_missing_optional_fields(self, mock_close, mock_create):
         """Managed stream deltas may omit both content and tool_calls."""
         from run_agent import AIAgent

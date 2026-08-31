@@ -833,6 +833,144 @@ class ManagedLlmStream(Iterator[Any]):
         self._close(logical_outcome="cancelled")
 
 
+class OpenAIChatStreamAccumulator:
+    """Rebuild a Chat Completions response from post-intercept chunks.
+
+    Relay may drain the provider stream before Hermes' synchronous consumer
+    processes the replayed chunks. The Relay finalizer must therefore observe
+    the post-intercept chunks directly instead of reading consumer-owned
+    accumulation state.
+    """
+
+    def __init__(self) -> None:
+        self._model: Any = None
+        self._role = "assistant"
+        self._content_parts: list[str] = []
+        self._reasoning_parts: list[str] = []
+        self._tool_calls: dict[int, dict[str, Any]] = {}
+        self._last_id_at_index: dict[Any, str] = {}
+        self._active_slot_by_index: dict[Any, int] = {}
+        self._finish_reason: Any = None
+        self._usage: Any = None
+
+    def observe(self, chunk: Any) -> None:
+        payload = _jsonable(chunk)
+        if not isinstance(payload, dict):
+            return
+        if payload.get("model"):
+            self._model = payload["model"]
+        if payload.get("usage"):
+            self._usage = payload["usage"]
+
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            return
+        if choice.get("finish_reason"):
+            self._finish_reason = choice["finish_reason"]
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            return
+        if delta.get("role"):
+            self._role = str(delta["role"])
+
+        from agent.message_content import flatten_message_text
+        from agent.reasoning_summaries import separate_glued_reasoning_blocks
+
+        content = flatten_message_text(delta.get("content"), sep="")
+        if content:
+            self._content_parts.append(content)
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+        if isinstance(reasoning, str) and reasoning:
+            reasoning = separate_glued_reasoning_blocks(
+                self._reasoning_parts[-1] if self._reasoning_parts else "",
+                reasoning,
+            )
+            self._reasoning_parts.append(reasoning)
+
+        tool_calls = delta.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            raw_index = tool_call.get("index")
+            raw_index = raw_index if raw_index is not None else 0
+            tool_call_id = tool_call.get("id")
+            tool_call_id = str(tool_call_id) if tool_call_id is not None else ""
+            if raw_index not in self._active_slot_by_index:
+                numeric_index = (
+                    raw_index
+                    if isinstance(raw_index, int)
+                    else int(raw_index)
+                    if isinstance(raw_index, str) and raw_index.isdigit()
+                    else max(self._tool_calls, default=-1) + 1
+                )
+                if numeric_index in self._tool_calls:
+                    numeric_index = max(self._tool_calls, default=-1) + 1
+                self._active_slot_by_index[raw_index] = numeric_index
+            if (
+                tool_call_id
+                and raw_index in self._last_id_at_index
+                and tool_call_id != self._last_id_at_index[raw_index]
+            ):
+                self._active_slot_by_index[raw_index] = (
+                    max(self._tool_calls, default=-1) + 1
+                )
+            if tool_call_id:
+                self._last_id_at_index[raw_index] = tool_call_id
+            index = self._active_slot_by_index[raw_index]
+            accumulated = self._tool_calls.setdefault(
+                index,
+                {
+                    "id": "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                    "extra_content": None,
+                },
+            )
+            if tool_call_id:
+                accumulated["id"] = tool_call_id
+            if tool_call.get("type"):
+                accumulated["type"] = tool_call["type"]
+            function = tool_call.get("function")
+            if isinstance(function, dict):
+                if function.get("name"):
+                    accumulated["function"]["name"] = function["name"]
+                arguments = function.get("arguments")
+                if isinstance(arguments, str) and arguments:
+                    accumulated["function"]["arguments"] += arguments
+            extra_content = tool_call.get("extra_content")
+            if extra_content is None and isinstance(
+                tool_call.get("model_extra"), dict
+            ):
+                extra_content = tool_call["model_extra"].get("extra_content")
+            if extra_content is not None:
+                accumulated["extra_content"] = extra_content
+
+    def finalize(self) -> dict[str, Any]:
+        tool_calls = [
+            self._tool_calls[index] for index in sorted(self._tool_calls)
+        ]
+        return {
+            "model": self._model,
+            "choices": [
+                {
+                    "message": {
+                        "role": self._role,
+                        "content": "".join(self._content_parts) or None,
+                        "reasoning_content": "".join(self._reasoning_parts) or None,
+                        "tool_calls": tool_calls or None,
+                    },
+                    "finish_reason": self._finish_reason or "stop",
+                }
+            ],
+            "usage": self._usage,
+        }
+
+
 class AnthropicStreamAccumulator:
     """Rebuild an Anthropic Message from post-intercept SSE events."""
 
