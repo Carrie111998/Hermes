@@ -8695,16 +8695,22 @@ def _restart_managed_dashboard_service(
     reason: str,
     unit: str = _DASHBOARD_SYSTEMD_UNIT,
 ) -> bool:
-    """Restart a systemd-managed dashboard instead of raw-killing its PID.
+    """Restart a managed dashboard instead of raw-killing its PID.
 
-    Returns True when a dashboard unit was found and handled (successfully or
-    with a printed actionable failure).  Returning True deliberately prevents
-    the caller from falling back to ``os.kill``: systemd treats a direct
-    SIGTERM of the service's main PID as a clean stop, so ``Restart=on-failure``
-    will not bring the dashboard back.
+    Returns True when a managed dashboard was found and handled (successfully
+    or with a printed actionable failure).  Returning True deliberately
+    prevents the caller from falling back to ``os.kill``: systemd treats a
+    direct SIGTERM of the service's main PID as a clean stop, so
+    ``Restart=on-failure`` will not bring the dashboard back — and on macOS,
+    raw-killing a launchd ``KeepAlive`` agent just makes launchd respawn it
+    while the update path's own detached respawn races it for the port
+    (two supervisors, one job).
     """
     if sys.platform == "win32":
         return False
+
+    if sys.platform == "darwin":
+        return _restart_launchd_dashboard_after_update(reason)
 
     def _systemctl(*args: str, timeout: int = 10) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -8947,6 +8953,94 @@ def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
         return argv or None
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
+
+
+def _restart_launchd_dashboard_after_update(reason: str) -> bool:
+    """Restart the launchd-supervised ``ai.hermes.dashboard`` agent (macOS).
+
+    Mirrors the gateway's launchd contract (#88848 via
+    ``_restart_launchd_gateway_after_update``): plist existence classifies a
+    launchd install, ``launchctl kickstart -k`` owns the restart, and the
+    function only reports success when launchd reports a fresh supervised
+    PID. Returning True keeps the caller from raw-killing the agent's PID —
+    killing a ``KeepAlive`` agent just makes launchd respawn it, and the
+    update path's own detached ``Popen`` respawn then races launchd for
+    :9119/:9120 (the loser exit-75s and crash-loops every ~30s).
+
+    Returns False when no dashboard plist exists (not a launchd install —
+    the systemd branch or the manual-respawn path handles those).
+    """
+    if sys.platform != "darwin":
+        return False
+
+    def _launchctl(*args: str, timeout: int = 15) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["launchctl", *args],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout,
+        )
+
+    label = "ai.hermes.dashboard"
+    uid = os.getuid()
+    domain = f"gui/{uid}"
+    plist = (
+        Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    )
+    if not plist.exists():
+        return False
+
+    def _supervised_pid():
+        try:
+            result = _launchctl("print", f"{domain}/{label}")
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+        if result.returncode != 0:
+            return None
+        for line in (result.stdout or "").splitlines():
+            line = line.strip()
+            if line.startswith("pid ="):
+                value = line.split("=", 1)[1].strip()
+                try:
+                    pid = int(value)
+                except ValueError:
+                    return None
+                return pid or None
+        return None
+
+    print()
+    print(f"⟲ Restarting launchd-supervised dashboard ({reason})")
+    try:
+        result = _launchctl("kickstart", "-k", f"{domain}/{label}", timeout=30)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        print(
+            f"  ⚠ Could not restart {label} ({e.__class__.__name__}: {e}).\n"
+            f"    Recover manually: launchctl kickstart -k {domain}/{label}"
+        )
+        return True
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        print(
+            f"  ⚠ launchctl kickstart failed for {label}: {stderr}\n"
+            f"    Recover manually: launchctl kickstart -k {domain}/{label}"
+        )
+        return True
+
+    # kickstart returning is only "restart REQUESTED" — verify supervision,
+    # same contract as the gateway path (#88848: "the call returned" is not
+    # "the service is supervised").
+    deadline = _time.monotonic() + 20.0
+    while _time.monotonic() < deadline:
+        pid = _supervised_pid()
+        if pid:
+            print(f"  ✓ restarted {label} (launchd pid {pid})")
+            return True
+        _time.sleep(1.0)
+    print(
+        f"  ✗ {label} kickstarted but launchd is not supervising it.\n"
+        f"    Check: launchctl print {domain}/{label}  |  logs: ~/.hermes/logs/dashboard.error.log"
+    )
+    return True
 
 
 def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
