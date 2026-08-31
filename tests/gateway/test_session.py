@@ -421,16 +421,22 @@ class TestSessionStoreRewriteTranscript:
             entry.session_key,
             last_prompt_tokens=12_345,
             last_prompt_tokens_model="provider/model-a",
+            last_prompt_tokens_provider="provider-a",
+            last_prompt_tokens_base_url="https://API.EXAMPLE/v1/",
         )
 
         stamped = store._entries[entry.session_key]
         assert stamped.last_prompt_tokens == 12_345
         assert stamped.last_prompt_tokens_model == "provider/model-a"
+        assert stamped.last_prompt_tokens_provider == "provider-a"
+        assert stamped.last_prompt_tokens_base_url == "https://api.example/v1"
         assert isinstance(stamped.last_prompt_tokens_at, datetime)
 
         store.update_session(entry.session_key, last_prompt_tokens=0)
         cleared = store._entries[entry.session_key]
         assert cleared.last_prompt_tokens_model is None
+        assert cleared.last_prompt_tokens_provider is None
+        assert cleared.last_prompt_tokens_base_url is None
         assert cleared.last_prompt_tokens_at is None
 
     def test_rewrite_replaces_transcript(self, store, tmp_path):

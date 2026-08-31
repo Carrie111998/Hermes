@@ -808,10 +808,12 @@ class SessionEntry:
     cost_status: str = "unknown"
     
     # Last API-reported prompt tokens (for accurate compression pre-check).
-    # Model + capture time make the snapshot route-comparable; legacy entries
-    # without either field deliberately fall back to a rough wire estimate.
+    # Full route identity + capture time make the snapshot comparable; legacy
+    # entries without every identity field fall back to a rough wire estimate.
     last_prompt_tokens: int = 0
     last_prompt_tokens_model: Optional[str] = None
+    last_prompt_tokens_provider: Optional[str] = None
+    last_prompt_tokens_base_url: Optional[str] = None
     last_prompt_tokens_at: Optional[datetime] = None
     
     # Set when a session was created because the previous one expired;
@@ -892,6 +894,8 @@ class SessionEntry:
             "total_tokens": self.total_tokens,
             "last_prompt_tokens": self.last_prompt_tokens,
             "last_prompt_tokens_model": self.last_prompt_tokens_model,
+            "last_prompt_tokens_provider": self.last_prompt_tokens_provider,
+            "last_prompt_tokens_base_url": self.last_prompt_tokens_base_url,
             "last_prompt_tokens_at": (
                 self.last_prompt_tokens_at.isoformat()
                 if self.last_prompt_tokens_at
@@ -1007,6 +1011,8 @@ class SessionEntry:
             total_tokens=data.get("total_tokens", 0),
             last_prompt_tokens=data.get("last_prompt_tokens", 0),
             last_prompt_tokens_model=data.get("last_prompt_tokens_model"),
+            last_prompt_tokens_provider=data.get("last_prompt_tokens_provider"),
+            last_prompt_tokens_base_url=data.get("last_prompt_tokens_base_url"),
             last_prompt_tokens_at=last_prompt_tokens_at,
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
@@ -1029,12 +1035,13 @@ class SessionEntry:
 def trusted_prompt_token_snapshot(
     entry: SessionEntry,
     current_model: Any,
+    current_provider: Any,
+    current_base_url: Any,
 ) -> Optional[int]:
     """Return a provider prompt snapshot only for the route that captured it.
 
-    Legacy snapshots have neither model nor capture time and therefore fail
-    closed to the current route's rough wire estimate. Model comparison is
-    case-insensitive because provider catalogs may vary only in slug casing.
+    Legacy snapshots without the complete model/provider/endpoint identity or
+    capture time fail closed to the current route's rough wire estimate.
     """
     try:
         tokens = int(entry.last_prompt_tokens or 0)
@@ -1042,11 +1049,27 @@ def trusted_prompt_token_snapshot(
         return None
     captured_model = str(entry.last_prompt_tokens_model or "").strip().lower()
     active_model = str(current_model or "").strip().lower()
+    captured_provider = str(entry.last_prompt_tokens_provider or "").strip().lower()
+    active_provider = str(current_provider or "").strip().lower()
+    captured_base_url = entry.last_prompt_tokens_base_url
+    if captured_base_url is None:
+        return None
+    try:
+        from hermes_cli.route_identity import normalize_route_base_url
+
+        active_base_url = normalize_route_base_url(current_base_url)
+        captured_base_url = normalize_route_base_url(captured_base_url)
+    except Exception:
+        return None
     if (
         tokens <= 0
         or not captured_model
         or not active_model
         or captured_model != active_model
+        or not captured_provider
+        or not active_provider
+        or captured_provider != active_provider
+        or captured_base_url != active_base_url
         or not isinstance(entry.last_prompt_tokens_at, datetime)
     ):
         return None
@@ -3073,6 +3096,8 @@ class SessionStore:
         session_key: str,
         last_prompt_tokens: int = None,
         last_prompt_tokens_model: Optional[str] = None,
+        last_prompt_tokens_provider: Optional[str] = None,
+        last_prompt_tokens_base_url: Optional[str] = None,
         touch_activity: bool = True,
     ) -> None:
         """Update lightweight session metadata after an interaction.
@@ -3089,11 +3114,24 @@ class SessionStore:
                 entry.updated_at = _now()
             if last_prompt_tokens is not None:
                 entry.last_prompt_tokens = last_prompt_tokens
-                if last_prompt_tokens > 0 and last_prompt_tokens_model:
+                if (
+                    last_prompt_tokens > 0
+                    and last_prompt_tokens_model
+                    and last_prompt_tokens_provider
+                    and last_prompt_tokens_base_url is not None
+                ):
+                    from hermes_cli.route_identity import normalize_route_base_url
+
                     entry.last_prompt_tokens_model = str(last_prompt_tokens_model)
+                    entry.last_prompt_tokens_provider = str(last_prompt_tokens_provider)
+                    entry.last_prompt_tokens_base_url = normalize_route_base_url(
+                        last_prompt_tokens_base_url
+                    )
                     entry.last_prompt_tokens_at = _now()
                 else:
                     entry.last_prompt_tokens_model = None
+                    entry.last_prompt_tokens_provider = None
+                    entry.last_prompt_tokens_base_url = None
                     entry.last_prompt_tokens_at = None
             # Snapshot peer fields while still holding _lock: a concurrent
             # reset/heal may rewrite the entry, and mixing old and new

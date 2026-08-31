@@ -163,17 +163,30 @@ class TestPromptTokenSnapshotTrust:
             updated_at=captured_at,
             last_prompt_tokens=238_633,
             last_prompt_tokens_model="provider/current-model",
+            last_prompt_tokens_provider="provider-a",
+            last_prompt_tokens_base_url="https://api.example/v1",
             last_prompt_tokens_at=captured_at,
         )
 
         assert trusted_prompt_token_snapshot(
-            entry, "provider/current-model"
+            entry,
+            "provider/current-model",
+            "provider-a",
+            "https://API.EXAMPLE:443/v1/",
         ) == 238_633
-        assert trusted_prompt_token_snapshot(entry, "provider/new-model") is None
+        assert trusted_prompt_token_snapshot(
+            entry, "provider/new-model", "provider-a", "https://api.example/v1"
+        ) is None
+        assert trusted_prompt_token_snapshot(
+            entry, "provider/current-model", "provider-b", "https://api.example/v1"
+        ) is None
+        assert trusted_prompt_token_snapshot(
+            entry, "provider/current-model", "provider-a", "https://other.example/v1"
+        ) is None
 
         entry.last_prompt_tokens_at = None
         assert trusted_prompt_token_snapshot(
-            entry, "provider/current-model"
+            entry, "provider/current-model", "provider-a", "https://api.example/v1"
         ) is None
 
     def test_snapshot_metadata_round_trips_and_legacy_data_fails_closed(self):
@@ -185,18 +198,37 @@ class TestPromptTokenSnapshotTrust:
             updated_at=captured_at,
             last_prompt_tokens=10,
             last_prompt_tokens_model="model-a",
+            last_prompt_tokens_provider="provider-a",
+            last_prompt_tokens_base_url="",
             last_prompt_tokens_at=captured_at,
         )
 
         restored = SessionEntry.from_dict(entry.to_dict())
         assert restored.last_prompt_tokens_model == "model-a"
+        assert restored.last_prompt_tokens_provider == "provider-a"
+        assert restored.last_prompt_tokens_base_url == ""
         assert restored.last_prompt_tokens_at == captured_at
 
         legacy_payload = entry.to_dict()
         legacy_payload.pop("last_prompt_tokens_model")
+        legacy_payload.pop("last_prompt_tokens_provider")
+        legacy_payload.pop("last_prompt_tokens_base_url")
         legacy_payload.pop("last_prompt_tokens_at")
         legacy = SessionEntry.from_dict(legacy_payload)
-        assert trusted_prompt_token_snapshot(legacy, "model-a") is None
+        assert trusted_prompt_token_snapshot(
+            legacy, "model-a", "provider-a", ""
+        ) is None
+
+
+def test_hygiene_reasoning_echo_honors_custom_provider_opt_in():
+    from gateway.run import _hygiene_needs_reasoning_echo
+
+    assert _hygiene_needs_reasoning_echo(
+        "custom",
+        "unknown-thinking-model",
+        "https://custom.example/v1",
+        {"model": {"reasoning_echo": True}},
+    ) is True
 
 
 class TestSessionHygieneWarnThreshold:

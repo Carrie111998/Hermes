@@ -288,6 +288,41 @@ def hygiene_compaction_recovered(
     )
 
 
+def _hygiene_needs_reasoning_echo(
+    provider: Any,
+    model: Any,
+    base_url: Any,
+    user_config: Any,
+) -> bool:
+    """Mirror the active agent's built-in or configured replay policy."""
+    from agent.message_sanitization import needs_reasoning_echo
+
+    if needs_reasoning_echo(provider, model, base_url):
+        return True
+    if not isinstance(user_config, dict):
+        return False
+    model_config = user_config.get("model")
+    return bool(
+        isinstance(model_config, dict) and model_config.get("reasoning_echo", False)
+    )
+
+
+def _estimate_hygiene_tokens(
+    history: list,
+    provider: Any,
+    model: Any,
+    base_url: Any,
+    user_config: Any,
+) -> int:
+    """Estimate the active route's request shape for session hygiene."""
+    return estimate_messages_tokens_rough(
+        history,
+        include_reasoning_content=_hygiene_needs_reasoning_echo(
+            provider, model, base_url, user_config
+        ),
+    )
+
+
 def _record_hygiene_cooldown(
     gateway,
     session_id: str,
@@ -6898,6 +6933,8 @@ class TurnRunner:
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
+                "provider": getattr(agent, "provider", None),
+                "base_url": getattr(agent, "base_url", None),
                 "context_length": _context_length,
             }
 
@@ -6979,6 +7016,8 @@ class TurnRunner:
             "input_tokens": _input_toks,
             "output_tokens": _output_toks,
             "model": _resolved_model,
+            "provider": getattr(agent, "provider", None),
+            "base_url": getattr(agent, "base_url", None),
             "context_length": _context_length,
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
@@ -20411,19 +20450,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # for the route about to run. Legacy and cross-model values
                 # fall back to the current provider's replay shape.
                 _stored_tokens = trusted_prompt_token_snapshot(
-                    session_entry, _hyg_model
+                    session_entry,
+                    _hyg_model,
+                    _hyg_provider,
+                    _hyg_base_url,
                 )
                 if _stored_tokens is not None:
                     _approx_tokens = _stored_tokens
                     _token_source = "provider-reported last prompt"
                 else:
-                    from agent.message_sanitization import needs_reasoning_echo
-
-                    _approx_tokens = estimate_messages_tokens_rough(
+                    _approx_tokens = _estimate_hygiene_tokens(
                         history,
-                        include_reasoning_content=needs_reasoning_echo(
-                            _hyg_provider, _hyg_model, _hyg_base_url
-                        ),
+                        _hyg_provider,
+                        _hyg_model,
+                        _hyg_base_url,
+                        _hyg_data,
                     )
                     _token_source = "rough wire estimate"
                     # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
@@ -21919,6 +21960,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
                 last_prompt_tokens_model=agent_result.get("model"),
+                last_prompt_tokens_provider=agent_result.get("provider"),
+                last_prompt_tokens_base_url=agent_result.get("base_url"),
                 touch_activity=not bool(getattr(event, "internal", False)),
             )
 
