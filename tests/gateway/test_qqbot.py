@@ -171,6 +171,26 @@ class TestQQGroupSenderAttribution:
         adapter.handle_message.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_group_message_with_null_member_openid_is_cleanly_rejected(
+        self, tmp_path
+    ):
+        adapter = self._make(tmp_path / "identities.json")
+
+        await adapter._handle_group_message(
+            {"group_openid": "group-1"},
+            "msg-1",
+            "hello",
+            {
+                "member_openid": None,
+                "id": "non-member-author-id",
+                "username": "Unknown",
+            },
+            "",
+        )
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_group_message_includes_event_group_nickname(self, tmp_path):
         adapter = self._make(tmp_path / "identities.json")
         await adapter._handle_group_message(

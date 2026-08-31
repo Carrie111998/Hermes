@@ -1391,7 +1391,7 @@ class QQAdapter(BasePlatformAdapter):
         group_openid = str(d.get("group_openid", ""))
         if not group_openid:
             return
-        member_openid = str(author.get("member_openid", "")).strip()
+        member_openid = str(author.get("member_openid") or "").strip()
         if not member_openid:
             logger.warning(
                 "[%s] Dropping QQ group message %s without member_openid",

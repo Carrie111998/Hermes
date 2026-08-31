@@ -19,6 +19,7 @@ Coverage targets:
 from __future__ import annotations
 
 from datetime import datetime
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -131,6 +132,51 @@ async def test_whoami_non_admin_lists_runnable_commands():
     assert "/whoami" in result    # always-allowed floor
     assert "/status" in result
     assert "/model" in result
+
+
+def test_secondary_profile_slash_gate_uses_secondary_policy():
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["primary-admin"],
+            "user_allowed_commands": [],
+        }
+    )
+    secondary = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(
+                enabled=True,
+                token="***",
+                extra={
+                    "allow_admin_from": ["secondary-admin"],
+                    "user_allowed_commands": [],
+                },
+            )
+        },
+        multiplex_profiles=True,
+    )
+    runner._profile_configs = {
+        "default": runner.config,
+        "secondary": secondary,
+    }
+    source = replace(
+        _make_source(user_id="primary-admin"),
+        profile="secondary",
+    )
+
+    assert "admin-only" in runner._check_slash_access(source, "stop")
+    assert runner._check_slash_access(
+        replace(source, user_id="secondary-admin"), "stop"
+    ) is None
+
+
+def test_unknown_profile_slash_gate_fails_closed():
+    runner = _make_runner(platform_extra={})
+    runner._profile_configs = {"default": runner.config}
+    source = replace(_make_source(user_id="anyone"), profile="missing")
+
+    assert "configuration is unavailable" in runner._check_slash_access(
+        source, "stop"
+    )
 
 
 # ---------------------------------------------------------------------------

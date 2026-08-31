@@ -417,7 +417,13 @@ class GatewaySlashCommandsMixin:
         from gateway.slash_access import policy_for_source as _policy_for_source
 
         source = event.source
-        policy = _policy_for_source(self.config, source)
+        config = self._session_config_for_source(source)
+        if config is None:
+            return (
+                "**You** — profile configuration unavailable\n"
+                "Slash command access cannot be resolved safely."
+            )
+        policy = _policy_for_source(config, source)
         platform = source.platform.value if source and source.platform else "?"
         chat_type = (source.chat_type if source else "") or "dm"
         scope = "DM" if chat_type.lower() in {"dm", "direct", "private", ""} else "group/channel"
@@ -1109,7 +1115,10 @@ class GatewaySlashCommandsMixin:
         """
         try:
             from gateway.slash_access import policy_for_source
-            policy = policy_for_source(self.config, source)
+            config = self._session_config_for_source(source)
+            if config is None:
+                return False
+            policy = policy_for_source(config, source)
             uid = getattr(source, "user_id", None)
             return bool(policy.enabled and uid and policy.is_admin(uid))
         except Exception:
@@ -4204,7 +4213,10 @@ class GatewaySlashCommandsMixin:
         # This mutates profile-wide security policy. The central slash gate can
         # allow selected commands to non-admin users, so enforce admin again at
         # this side-effect boundary. Unconfigured policies remain unrestricted.
-        policy = policy_for_source(self.config, event.source)
+        config = self._session_config_for_source(event.source)
+        if config is None:
+            return "Profile configuration is unavailable; approval mode was not changed."
+        policy = policy_for_source(config, event.source)
         if requested and not policy.is_admin(event.source.user_id):
             return "Only gateway admins can change the persistent approval mode."
         result = run_approval_mode_command(requested)

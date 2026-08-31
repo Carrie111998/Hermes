@@ -53,6 +53,10 @@ def _make_multiplex_runner():
     runner._profile_adapters = {
         "medicina": {Platform.TELEGRAM: _adapter("medicina")},
     }
+    runner._profile_configs = {
+        "default": runner.config,
+        "medicina": _config("2222"),
+    }
     runner._voice_mode = {}
     runner.hooks = SimpleNamespace(
         emit=AsyncMock(), emit_collect=AsyncMock(return_value=[]), loaded_hooks=False,
@@ -219,3 +223,25 @@ async def test_secondary_profile_without_live_adapters_fails_loudly(monkeypatch)
             {"id": "cli-session", "title": "work", "handoff_platform": "telegram"},
             profile_name="medicina",
         )
+
+
+@pytest.mark.asyncio
+async def test_secondary_profile_without_registered_config_fails_closed(monkeypatch):
+    runner, _ = _make_multiplex_runner()
+    runner._profile_configs.pop("medicina")
+    used = {}
+    monkeypatch.setattr(
+        "gateway.run.resolve_delivery_transport", _spy_transport_factory(used),
+    )
+    monkeypatch.setattr(
+        "gateway.run.load_gateway_config",
+        MagicMock(side_effect=RuntimeError("broken config")),
+    )
+
+    with pytest.raises(RuntimeError, match="no registered gateway config"):
+        await runner._process_handoff(
+            {"id": "cli-session", "title": "work", "handoff_platform": "telegram"},
+            profile_name="medicina",
+        )
+
+    assert used == {}

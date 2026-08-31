@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource, build_session_key
 
@@ -941,6 +941,44 @@ class TestSameOriginChatGroupScoping:
         bob = replace(alice, user_id="bob")
 
         assert runner._same_origin_chat(alice, bob) is False
+
+    def test_secondary_profile_admin_override_uses_secondary_policy(self):
+        runner = _make_runner()
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.QQBOT: PlatformConfig(
+                    enabled=True,
+                    extra={"group_allow_admin_from": ["primary-admin"]},
+                )
+            },
+            multiplex_profiles=True,
+        )
+        secondary = GatewayConfig(
+            platforms={
+                Platform.QQBOT: PlatformConfig(
+                    enabled=True,
+                    extra={"group_allow_admin_from": ["secondary-admin"]},
+                )
+            },
+            multiplex_profiles=True,
+        )
+        runner._profile_configs = {
+            "default": runner.config,
+            "secondary": secondary,
+        }
+        source = replace(
+            self._src(
+                "primary-admin",
+                platform=Platform.QQBOT,
+                chat_id="qq-group",
+            ),
+            profile="secondary",
+        )
+
+        assert runner._resume_caller_is_admin(source) is False
+        assert runner._resume_caller_is_admin(
+            replace(source, user_id="secondary-admin")
+        ) is True
 
     @pytest.mark.asyncio
     async def test_qq_override_isolates_persisted_group_when_global_is_shared(

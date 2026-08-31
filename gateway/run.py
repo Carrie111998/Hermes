@@ -14870,16 +14870,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"profile '{profile_name}' has no live adapters in this gateway"
                 )
             handoff_adapters = secondary
-            # The watcher already entered _profile_runtime_scope for this
-            # profile, so a fresh load resolves that profile's config.yaml
-            # and .env (home channel, tokens) rather than the primary's.
-            try:
-                handoff_config = load_gateway_config()
-            except Exception:
-                logger.warning(
-                    "Handoff: could not load config for profile %s; "
-                    "falling back to the primary's config",
-                    profile_name, exc_info=True,
+            profile_configs = getattr(self, "_profile_configs", None)
+            handoff_config = (
+                profile_configs.get(profile_name)
+                if isinstance(profile_configs, dict)
+                else None
+            )
+            if handoff_config is None:
+                raise RuntimeError(
+                    f"profile '{profile_name}' has no registered gateway config"
                 )
 
         # Adapter must be live. A relay-fronted gateway registers ONE adapter
@@ -23127,7 +23126,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not canonical_cmd:
             return None
-        policy = _policy_for_source(self.config, source)
+        config = self._session_config_for_source(source)
+        if config is None:
+            logger.warning(
+                "Slash command /%s denied: no config registered for profile %r",
+                canonical_cmd,
+                source.profile,
+            )
+            return (
+                f"⛔ /{canonical_cmd} denied because this profile's "
+                "configuration is unavailable."
+            )
+        policy = _policy_for_source(config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(
