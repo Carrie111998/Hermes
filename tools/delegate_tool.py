@@ -2602,6 +2602,7 @@ def _run_single_child(
     parent-visible truncation flag stays truthful for all of the above.
     """
     child_start = time.monotonic()
+    _child_future = None
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -3550,14 +3551,27 @@ def _run_single_child(
             except (ValueError, UnboundLocalError) as e:
                 logger.debug("Could not remove child from active_children: %s", e)
 
-        # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
-        try:
-            if hasattr(child, "close"):
-                child.close()
-        except Exception:
-            logger.debug("Failed to close child agent after delegation")
+        # Close tool resources only after the worker has finished unwinding.
+        # A hard timeout abandons the daemon future after requesting interrupt;
+        # run_conversation's finally block may still be persisting/clearing its
+        # SessionDB. Closing the child here used to close that SQLite handle
+        # concurrently with the worker's turn-finally query. The callback runs
+        # on the completing worker unless completion wins the registration race;
+        # in that case add_done_callback invokes it immediately only after the
+        # future is done. If a daemon worker never returns, its child intentionally
+        # remains live until process exit: force-closing it on another thread after
+        # a grace period would recreate the same unsafe cross-thread teardown race.
+        def _close_child_resources(_completed_future=None):
+            try:
+                if child is not None and hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug("Failed to close child agent after delegation")
+
+        if _child_future is not None and not _child_future.done():
+            _child_future.add_done_callback(_close_child_resources)
+        else:
+            _close_child_resources()
 
         # The AIAgent turn boundary normally closes the child scope itself. This
         # fallback covers failures before that boundary starts, but must not pop

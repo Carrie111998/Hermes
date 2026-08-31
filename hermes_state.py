@@ -8214,13 +8214,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         from agent.session_activity import ActivityProvenance
 
         # No-op fast path: skip the transaction when there is nothing to
-        # clear. Read-only, no write lock.
+        # clear. Use the read context rather than touching the shared writer
+        # connection directly: check_same_thread=False permits hand-off, not
+        # concurrent use of pysqlite's per-connection statement cache.
         try:
-            row = self._conn.execute(
-                "SELECT last_activity_description, last_activity_provenance "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
+            with self._read_ctx() as conn:
+                row = (
+                    conn.execute(
+                        "SELECT last_activity_description, last_activity_provenance "
+                        "FROM sessions WHERE id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    if conn is not None
+                    else None
+                )
         except sqlite3.Error:
             row = None
         if row is not None:
