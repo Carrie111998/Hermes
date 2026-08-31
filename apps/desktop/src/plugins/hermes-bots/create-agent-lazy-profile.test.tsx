@@ -110,6 +110,7 @@ async function renderDialog(hasSkillsView: boolean) {
   const view = render(withQueryClient(<CreateAgentDialog onClose={() => undefined} open roster={roster} />))
 
   fireEvent.change(screen.getByPlaceholderText('inbox-triage'), { target: { value: 'inbox-triage' } })
+  fireEvent.change(screen.getByPlaceholderText('Inbox Triage'), { target: { value: 'Operations Agent' } })
   fireEvent.click(screen.getByRole('button', { name: /Advanced/ }))
 
   return view
@@ -175,7 +176,12 @@ describe('materializing the draft profile', () => {
     // Create Bot goes through the same helper — no duplicate profiles.create.
     fireEvent.click(screen.getByRole('button', { name: 'Create Bot' }))
 
-    await waitFor(() => expect(mocks.createCanonicalChat).toHaveBeenCalledWith('inbox-triage', { kickoff: true }))
+    await waitFor(() =>
+      expect(mocks.createCanonicalChat).toHaveBeenCalledWith(
+        { name: 'inbox-triage', title: 'Operations Agent' },
+        { kickoff: true }
+      )
+    )
     expect(createCalls()).toHaveLength(1)
   })
 

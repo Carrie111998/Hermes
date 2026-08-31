@@ -546,7 +546,7 @@ export function CreateAgentDialog({ open, onClose, roster }: CreateAgentDialogPr
         // the ONE caller allowed to request the intro turn — genuine New
         // Agent creation. Click-path resolution (openBotCanonicalChat) mints
         // silently so a resolution miss never burns a turn (ScottFive).
-        const sid = await createCanonicalChat(slug, {
+        const sid = await createCanonicalChat({ name: slug, title }, {
           kickoff: true
         })
 
