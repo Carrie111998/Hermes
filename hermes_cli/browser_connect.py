@@ -547,8 +547,10 @@ _SNAPSHOT_IGNORES = (
     "BrowserMetrics-spare.pma",
 )
 
-# Small, auth-bearing files re-synced from the live profile on EVERY consented
-# launch (the full tree is only copied when the snapshot doesn't exist yet).
+# Small, auth-bearing files copied from the live profile when the managed
+# profile is FIRST created. After that the managed profile owns its state: a
+# partial source overlay cannot be consistent with Local Storage / IndexedDB,
+# and would overwrite logins created inside the managed browser.
 # Paths here are RELATIVE TO A PROFILE DIR (Default, "Profile 6", …) — the
 # caller resolves which source profile is active and mirrors these into the
 # copy's ``Default`` so the launched Chromium (which opens ``Default``) lands
@@ -697,13 +699,13 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
 
 
 def _mirror_profile_auth(src: str, dst: str, source_profile: str) -> int:
-    """Copy ``source_profile``'s auth files into the copy's ``Default`` slot.
+    """Bootstrap ``source_profile``'s auth files into the copy's ``Default``.
 
     agent-browser launches ``Default`` in the copied user-data-dir; mirroring
     the active source profile's cookies/logins/prefs there is what makes the
-    session actually signed in (the LinkedIn/Gmail "logged out" bug when the
-    real session lives in a non-Default profile). Lock-aware (Windows), so a
-    running Chrome doesn't block the cookie DBs.
+    initial session can reuse portable cookies and saved logins when the real
+    session lives in a non-Default profile. Lock-aware (Windows), so a running
+    Chrome doesn't block the cookie DBs.
 
     Returns the number of DB auth files that could NOT be copied (0 = clean).
     """
@@ -933,26 +935,50 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     succeeds; a torn/interrupted first copy (disk full, Ctrl+C) therefore never
     looks "already populated" on the next run — it is redone from scratch.
 
-    Auth files are re-synced on every call so fresh logins from the user's own
-    browsing show up. Locked-file copy errors are tolerated best-effort.
+    Once created, the managed profile is durable and independently authenticated.
+    We do not overlay source auth files on later calls: browser authentication can
+    span Cookies, Local Storage, and IndexedDB, so refreshing only a subset creates
+    an internally inconsistent profile and overwrites managed-browser logins.
 
     Returns ``(copy_dir, None)`` on success, ``(None, error)`` on failure.
     """
-    src = src or real_profile_data_dir(browser)
-    if not src or not os.path.isdir(src):
-        return None, (
-            f"profile directory for '{browser}' was not found ({src!r}). "
-            "Launch that browser at least once, or turn browser.use_real_profile off."
-        )
-    source_profile, resolve_err = _resolve_source_profile(src)
-    if resolve_err or not source_profile:
-        return None, resolve_err
     dst = real_profile_copy_dir(browser)
-    # Fast lock probe BEFORE any copy: a running browser holds the cookie DB
-    # deny-all (Windows), and a blocking file op on it can hang the launch for
-    # minutes. On POSIX this never trips (no mandatory locking) so
-    # copy-while-running still works.
-    if _profile_is_locked(src, source_profile):
+    marker = os.path.join(dst, _SNAPSHOT_DONE_MARKER)
+    # Only a copy that previously COMPLETED counts as populated. A half-written
+    # tree (no marker) is treated as absent and rebuilt.
+    populated = os.path.isfile(marker)
+    source_profile = None
+    if populated:
+        # An explicit pin is an identity assertion. Never silently keep driving
+        # a managed profile bootstrapped from another pinned source.
+        pin = _real_profile_pin()
+        if pin:
+            try:
+                with open(marker, encoding="utf-8") as fh:
+                    bootstrapped_from = fh.read().strip()
+            except OSError:
+                bootstrapped_from = ""
+            if bootstrapped_from and bootstrapped_from != pin:
+                return None, (
+                    f"the managed '{browser}' profile was initialized from "
+                    f"'{bootstrapped_from}', but browser.real_profile_pin is now "
+                    f"'{pin}'. Turn real-profile browsing off and use the browser "
+                    "once to delete the managed profile, then turn it on again."
+                )
+    else:
+        src = src or real_profile_data_dir(browser)
+        if not src or not os.path.isdir(src):
+            return None, (
+                f"profile directory for '{browser}' was not found ({src!r}). "
+                "Launch that browser at least once, or turn browser.use_real_profile off."
+            )
+        source_profile, resolve_err = _resolve_source_profile(src)
+        if resolve_err or not source_profile:
+            return None, resolve_err
+    # Fast lock probe BEFORE the initial copy: a running browser holds the cookie
+    # DB deny-all (Windows), and a blocking file op on it can hang the launch for
+    # minutes. A completed managed profile never reads or locks the source again.
+    if not populated and _profile_is_locked(src, source_profile):
         # NEVER kill from here. Closing the user's browser is destructive and
         # must be an explicit, per-attempt, user-approved step — not a silent
         # side effect of a snapshot. So we always BLOCK when locked and let the
@@ -978,11 +1004,6 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
                 "for you.)"
             )
         return None, _PROFILE_LOCKED_PREFIX + msg
-    marker = os.path.join(dst, _SNAPSHOT_DONE_MARKER)
-    # Only a copy that previously COMPLETED counts as populated. A half-written
-    # tree (no marker) is treated as absent and rebuilt — otherwise a torn first
-    # copy poisons freshness forever and only ever gets auth overlays.
-    populated = os.path.isfile(marker)
     try:
         os.makedirs(dst, exist_ok=True)
         # Secure the snapshot dir AND its browser-profile parent on EVERY
@@ -994,48 +1015,39 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
             _secure_snapshot_root(parent)
         _secure_snapshot_root(dst)
 
-        # Base user-data-dir file the browser reads at startup. Cheap; always
-        # re-synced so last_used etc. stay current.
-        ls_src = os.path.join(src, "Local State")
-        ls_dst = os.path.join(dst, "Local State")
-        if os.path.isfile(ls_src):
-            try:
-                shutil.copy2(ls_src, ls_dst)
-            except OSError as e:
-                logger.debug("real-profile snapshot: skipped Local State: %s", e)
-
-        # The copy contains ONLY the mirrored Default dir (that is where the
-        # pinned/active profile's auth was mirrored into), but a verbatim
-        # Local State still names the SOURCE profile (e.g. last_used="Profile
-        # 2", info_cache listing Profile 2/4/7). Chrome therefore opens a
-        # missing profile dir and starts SIGNED OUT. Rewrite Local State so
-        # the copy's only profile is Default and it is the last-used one.
-        # CRITICAL: Default's identity entry must be the SOURCE profile's
-        # entry (name + Google account), not the source's own "Default"
-        # entry — the Default DIR holds the source profile's cookies. A
-        # mismatch (cookies belong to profile B, info_cache names profile A) makes Chrome
-        # demand a "Continue as <name>" profile-sign-in reconciliation on
-        # every launch and treat the profile as mid-sign-in.
-        try:
-            import json as _json
-
-            with open(ls_dst, encoding="utf-8") as fh:
-                state = _json.load(fh)
-            prof = state.get("profile")
-            if isinstance(prof, dict):
-                cache = prof.get("info_cache")
-                if isinstance(cache, dict):
-                    src_entry = cache.get(source_profile) or cache.get("Default")
-                    if src_entry:
-                        prof["info_cache"] = {"Default": src_entry}
-                prof["last_used"] = "Default"
-                prof["last_active_profiles"] = ["Default"]
-            with open(ls_dst, "w", encoding="utf-8") as fh:
-                _json.dump(state, fh)
-        except (OSError, ValueError) as e:
-            logger.debug("real-profile snapshot: could not normalize Local State: %s", e)
-
         if not populated:
+            # Bootstrap Local State once. It becomes managed state after this
+            # initial copy, just like the profile tree.
+            ls_src = os.path.join(src, "Local State")
+            ls_dst = os.path.join(dst, "Local State")
+            if os.path.isfile(ls_src):
+                try:
+                    shutil.copy2(ls_src, ls_dst)
+                except OSError as e:
+                    logger.debug("real-profile snapshot: skipped Local State: %s", e)
+
+            # The copy contains ONLY the mirrored Default dir. Normalize the
+            # initial Local State to that layout while preserving the selected
+            # source profile's identity entry.
+            try:
+                import json as _json
+
+                with open(ls_dst, encoding="utf-8") as fh:
+                    state = _json.load(fh)
+                prof = state.get("profile")
+                if isinstance(prof, dict):
+                    cache = prof.get("info_cache")
+                    if isinstance(cache, dict):
+                        src_entry = cache.get(source_profile) or cache.get("Default")
+                        if src_entry:
+                            prof["info_cache"] = {"Default": src_entry}
+                    prof["last_used"] = "Default"
+                    prof["last_active_profiles"] = ["Default"]
+                with open(ls_dst, "w", encoding="utf-8") as fh:
+                    _json.dump(state, fh)
+            except (OSError, ValueError) as e:
+                logger.debug("real-profile snapshot: could not normalize Local State: %s", e)
+
             # Fresh (or torn-and-rebuilding): drop any partial Default and copy
             # the ACTIVE profile's full dir (minus caches AND the locked auth
             # DBs) into the copy's Default. The SQLite auth DBs are excluded
@@ -1060,19 +1072,22 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
                     len(multi.args[0]) if multi.args else 0, src, source_profile,
                 )
 
-        # Both paths: copy the active profile's auth DBs into Default,
-        # lock-aware (sqlite online-backup) so a running Chrome on Windows
-        # doesn't block them. This is also the per-launch fresh-login re-sync.
-        failed_dbs = _mirror_profile_auth(src, dst, source_profile)
-        if failed_dbs:
-            # We could not read the user's cookie/login DBs at all — even the
-            # online-backup fallback failed. Rather than launch a silently
-            # signed-out session, fail closed with an actionable message.
-            return None, (
-                f"could not read the '{browser}' profile's login data "
-                f"({failed_dbs} database(s) locked). Close {browser} and retry, "
-                "or turn browser.use_real_profile off."
-            )
+            # Bootstrap portable auth DBs into Default. Later launches keep the
+            # managed browser's complete auth/storage state instead of mixing owners.
+            failed_dbs = _mirror_profile_auth(src, dst, source_profile)
+            if failed_dbs:
+                return None, (
+                    f"could not read the '{browser}' profile's login data "
+                    f"({failed_dbs} database(s) locked). Close {browser} and retry, "
+                    "or turn browser.use_real_profile off."
+                )
+
+            # Mark complete only after the initial bootstrap succeeded.
+            try:
+                with open(marker, "w", encoding="utf-8") as fh:
+                    fh.write(source_profile)
+            except OSError as e:
+                logger.debug("real-profile snapshot: could not write done marker: %s", e)
 
         # Never carry live-instance leftovers into the copy.
         for leftover in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
@@ -1080,12 +1095,7 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
                 os.unlink(os.path.join(dst, leftover))
             except OSError:
                 pass
-        # Mark complete only after everything above succeeded.
-        try:
-            with open(marker, "w", encoding="utf-8") as fh:
-                fh.write(source_profile)
-        except OSError as e:
-            logger.debug("real-profile snapshot: could not write done marker: %s", e)
+
         # Owner-only modes for everything the copies above created — copy2
         # preserves Chrome's 0644 and sqlite backup files land umask-wide;
         # these are the user's session cookies (#96729). Runs AFTER the marker

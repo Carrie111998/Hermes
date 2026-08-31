@@ -170,9 +170,9 @@ browser:
   use_real_profile: true
 ```
 
-When enabled, Hermes copies your default browser's **active** profile — the one
-you actually browse (`Local State → profile.last_used`), with its cookies, saved
-logins, and preferences — into a managed snapshot under
+When enabled for the first time, Hermes copies your default browser's **active**
+profile — the one you actually browse (`Local State → profile.last_used`) — into
+a managed profile under
 `~/.hermes/browser-profile/<browser>/`, then launches your **real browser
 binary** on that snapshot and attaches its browsing engine to it. Launching the
 real binary (instead of a bundled Chromium with mock-keychain switches) is what
@@ -182,10 +182,19 @@ of them, opening signed out. Your live browser profile is **never opened
 directly**: the
 snapshot is a separate directory, so it doesn't fight your running browser for
 the profile lock and it sidesteps Chrome 136+'s block on remote-debugging the
-default profile directory. The auth files (cookies/logins/preferences) are
-re-synced from your real profile whenever a fresh session is launched, so logins
-you do in your own browser show up in the agent's session. Only the active
-profile is copied — other Chrome profiles are never snapshotted.
+default profile directory. Portable cookies, saved logins, and preferences are
+used to bootstrap the managed profile. After that first copy, it is a **durable,
+independently authenticated browser profile**: logins and browser storage created
+inside it persist across Hermes sessions and are not overwritten from your normal
+browser. Only the active profile is copied — other Chrome profiles are never
+snapshotted.
+
+Some applications bind authentication to Local Storage or IndexedDB. Those stores
+cannot be transactionally copied from a running browser, so they are not refreshed
+from the normal profile. Such applications may require a one-time login in the
+Hermes-managed browser; that login then persists there. To intentionally start over
+from the current normal-browser profile, turn the toggle off and use the browser
+once to delete the managed profile, then turn it on again.
 
 The snapshot browser runs **headless** — it drives your profile in the
 background with no visible window and never steals focus, so you can keep
@@ -209,7 +218,10 @@ browser:
 ```
 
 A pin naming a profile directory that doesn't exist fails closed with a
-fixable message — it never silently falls back to the last-used profile.
+fixable message — it never silently falls back to the last-used profile. The pin
+selects the identity when the managed profile is first created. Changing it later
+also fails closed until you reset the managed profile with the off/use/on sequence
+described above.
 
 When you turn the toggle back off, Hermes deletes the snapshot store
 (`~/.hermes/browser-profile/`) on the next browser use, so the copied

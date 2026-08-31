@@ -113,7 +113,7 @@ class TestSnapshotRealProfile:
         assert not (home / "browser-profile" / "chrome" / "Crashpad").exists()
         assert not (home / "browser-profile" / "chrome" / "SingletonLock").exists()
 
-    def test_existing_snapshot_refreshes_auth_files_only(self, tmp_path, monkeypatch):
+    def test_existing_snapshot_preserves_managed_auth_and_storage(self, tmp_path, monkeypatch):
         import hermes_cli.browser_connect as bc
         src = self._make_profile(tmp_path / "real")
         home = tmp_path / "hermes-home"
@@ -121,16 +121,22 @@ class TestSnapshotRealProfile:
 
         dst, err = bc.snapshot_real_profile("chrome", src=str(src))
         assert err is None
-        # Simulate: user logs into a new site in their own browser, and the
-        # copy has drifted state that must survive (History not in refresh set).
+        # The managed browser becomes independently authenticated after its
+        # initial bootstrap. Source-profile changes must not overwrite any part
+        # of that internally consistent state on a later launch.
         (src / "Default" / "Cookies").write_text("sqlite-cookies-v2")
-        copy_history = home / "browser-profile" / "chrome" / "Default" / "History"
-        copy_history.write_text("agent-session-history")
+        managed = home / "browser-profile" / "chrome" / "Default"
+        (managed / "Cookies").write_text("managed-session-cookies")
+        (managed / "Local Storage").mkdir()
+        (managed / "Local Storage" / "state").write_text("managed-local-storage")
+        (managed / "IndexedDB").mkdir()
+        (managed / "IndexedDB" / "state").write_text("managed-indexeddb")
 
         dst2, err2 = bc.snapshot_real_profile("chrome", src=str(src))
         assert err2 is None and dst2 == dst
-        assert (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text() == "sqlite-cookies-v2"
-        assert copy_history.read_text() == "agent-session-history"
+        assert (managed / "Cookies").read_text() == "managed-session-cookies"
+        assert (managed / "Local Storage" / "state").read_text() == "managed-local-storage"
+        assert (managed / "IndexedDB" / "state").read_text() == "managed-indexeddb"
 
     def test_missing_source_fails_closed(self, tmp_path, monkeypatch):
         import hermes_cli.browser_connect as bc
@@ -138,6 +144,23 @@ class TestSnapshotRealProfile:
         dst, err = bc.snapshot_real_profile("chrome", src=str(tmp_path / "nope"))
         assert dst is None
         assert err and "was not found" in err
+
+    def test_existing_snapshot_no_longer_depends_on_source(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+        src = self._make_profile(tmp_path / "real")
+        home = tmp_path / "hermes-home"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(bc, "_real_profile_pin", lambda: None)
+        dst, err = bc.snapshot_real_profile("chrome", src=str(src))
+        assert err is None
+
+        monkeypatch.setattr(
+            bc,
+            "_profile_is_locked",
+            lambda *_: pytest.fail("completed snapshot inspected its source profile"),
+        )
+        dst2, err2 = bc.snapshot_real_profile("chrome", src=str(tmp_path / "gone"))
+        assert err2 is None and dst2 == dst
 
     def test_snapshot_files_are_owner_only(self, tmp_path, monkeypatch):
         """Every copied file must be 0600 and every dir 0700 (#96729).
@@ -215,6 +238,7 @@ class TestRealProfileCdpLaunch:
         self._reset()
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch.object(bt, "_agent_browser_get_cdp", return_value=None), \
              patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(None, "boom")):
             cdp, err = bt._real_profile_cdp()
         assert cdp is None
@@ -677,16 +701,18 @@ class TestReviewBugFixes:
         (root / "Local State").write_text('{"profile": {"last_used": "Profile 6"}}')
         assert bc._last_used_profile(str(root)) == "Profile 6"
 
-    def test_refresh_remirrors_last_used(self, tmp_path, monkeypatch):
+    def test_existing_snapshot_does_not_remirror_last_used(self, tmp_path, monkeypatch):
         import hermes_cli.browser_connect as bc
         src = self._multi_profile(tmp_path / "real")
         home = tmp_path / "hh"
         monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
         bc.snapshot_real_profile("chrome", src=str(src))          # fresh
-        (src / "Profile 6" / "Cookies").write_text("PROFILE6-REFRESHED")
-        dst, err = bc.snapshot_real_profile("chrome", src=str(src))  # refresh
+        copy_cookie = home / "browser-profile" / "chrome" / "Default" / "Cookies"
+        copy_cookie.write_text("MANAGED-SESSION")
+        (src / "Profile 6" / "Cookies").write_text("PROFILE6-SOURCE-CHANGED")
+        dst, err = bc.snapshot_real_profile("chrome", src=str(src))
         assert err is None
-        assert (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text() == "PROFILE6-REFRESHED"
+        assert copy_cookie.read_text() == "MANAGED-SESSION"
 
     # ── Bug 3: private-URL sidecar must NOT carry the real profile ──
     def test_sidecar_never_uses_real_profile(self):
@@ -964,6 +990,15 @@ class TestReviewRound3:
         import tools.browser_tool as bt
         bt._real_profile_cdp_cache.clear()
         proc = Mock(returncode=0, stdout="", stderr="")
+
+        class FakeChrome:
+            def poll(self):
+                return None
+
+        def fake_popen(argv, **kw):
+            (tmp_path / "DevToolsActivePort").write_text("9251\n/devtools/browser/x\n")
+            return FakeChrome()
+
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch.object(bt, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
@@ -972,6 +1007,7 @@ class TestReviewRound3:
                    return_value=(str(tmp_path), None)) as snap, \
              patch.object(bt, "_agent_browser_get_cdp",
                           side_effect=[None, "http://127.0.0.1:9251"]), \
+             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
              patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
              patch.object(bt.subprocess, "run", return_value=proc), \
              patch.object(bt, "_is_headed_mode", return_value=False):
