@@ -409,3 +409,82 @@ class TestDefaultFactory:
         with pytest.raises(LDAPStartTLSError):
             p._default_factory(user=None, password=None)
         conn.unbind.assert_called_once_with()
+
+
+class TestSearchThenBindLogin:
+    def make(self, **overrides):
+        kwargs = dict(
+            server_url="ldaps://ldap.example.com",
+            secret=SECRET,
+            bind_dn=f"cn=hermes,ou=svc,{BASE_DN}",
+            bind_password="svc-secret",
+            user_search_base=f"ou=people,{BASE_DN}",
+            connection_factory=mock_factory(),
+        )
+        kwargs.update(overrides)
+        return ldap_plugin.LdapAuthProvider(**kwargs)
+
+    def test_valid_credentials_mint_session_with_attrs(self):
+        p = self.make()
+        s = p.complete_password_login(username="alice", password="s3cret")
+        assert s.user_id == "alice"
+        assert s.email == "alice@example.com"
+        assert s.display_name == "Alice Adams"
+
+    def test_wrong_password_rejected(self):
+        p = self.make()
+        with pytest.raises(InvalidCredentialsError):
+            p.complete_password_login(username="alice", password="wrong")
+
+    def test_unknown_user_rejected_generically(self):
+        p = self.make()
+        with pytest.raises(InvalidCredentialsError):
+            p.complete_password_login(username="mallory", password="x")
+
+    def test_unknown_user_still_attempts_dummy_bind(self):
+        # Timing pad: the factory must see exactly one extra bind attempt
+        # (the dummy DN) after the search misses.
+        binds = []
+        inner = mock_factory()
+
+        def counting_factory(*, user, password):
+            binds.append(user)
+            return inner(user=user, password=password)
+
+        p = self.make(connection_factory=counting_factory)
+        with pytest.raises(InvalidCredentialsError):
+            p.complete_password_login(username="mallory", password="x")
+        # First bind: service account (search); second: dummy pad.
+        assert binds[0] == f"cn=hermes,ou=svc,{BASE_DN}"
+        assert binds[1] == ldap_plugin._DUMMY_BIND_DN
+
+    def test_service_bind_failure_is_provider_error(self):
+        p = self.make(bind_password="wrong-svc-password")
+        with pytest.raises(ProviderError):
+            p.complete_password_login(username="alice", password="s3cret")
+
+    def test_filter_injection_is_escaped(self):
+        # "*)(uid=*" unescaped would wildcard-match every user; escaped
+        # per RFC 4515 it matches nothing.
+        p = self.make()
+        with pytest.raises(InvalidCredentialsError):
+            p.complete_password_login(username="*)(uid=*", password="x")
+
+    def test_custom_search_filter(self):
+        p = self.make(user_search_filter="(mail={username})")
+        s = p.complete_password_login(
+            username="alice@example.com", password="s3cret"
+        )
+        assert s.email == "alice@example.com"
+
+    def test_directory_down_is_provider_error(self):
+        p = self.make(connection_factory=broken_factory)
+        with pytest.raises(ProviderError):
+            p.complete_password_login(username="alice", password="s3cret")
+
+    def test_anonymous_search_when_bind_dn_empty(self):
+        # MOCK_SYNC allows anonymous binds, standing in for a directory
+        # that permits anonymous search.
+        p = self.make(bind_dn="", bind_password="")
+        s = p.complete_password_login(username="alice", password="s3cret")
+        assert s.user_id == "alice"

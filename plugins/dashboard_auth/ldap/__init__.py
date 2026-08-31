@@ -494,7 +494,74 @@ class LdapAuthProvider(DashboardAuthProvider):
     # ---- internals: LDAP I/O (implemented in later tasks) -------------------
 
     def _search_user(self, username: str):
-        raise NotImplementedError  # Task 4
+        """Search-then-bind leg 1: find the user's DN + profile attributes.
+
+        Returns ``(user_dn, {"email": ..., "display": ...})`` on a unique
+        match, ``(None, {})`` when no entry matches. Zero matches and
+        multiple matches are both treated as "not found" — a filter that
+        matches several entries must never let a bind against ANY of them
+        succeed. Raises ``ProviderError`` when the service bind is
+        rejected or the directory is unreachable — both mean *we* cannot
+        verify anyone, which is an operator problem (503), not a
+        credentials problem (401).
+        """
+        import ldap3
+        from ldap3.core.exceptions import LDAPException
+        from ldap3.utils.conv import escape_filter_chars
+
+        conn = self._bind(
+            user=self._bind_dn or None,
+            password=self._bind_password or None,
+        )
+        if conn is None:
+            raise ProviderError(
+                "LDAP service-account bind was rejected — check "
+                "dashboard.ldap_auth.bind_dn / bind_password"
+            )
+        try:
+            flt = self._user_search_filter.format(
+                username=escape_filter_chars(username)
+            )
+            ok = conn.search(
+                search_base=self._user_search_base,
+                search_filter=flt,
+                search_scope=ldap3.SUBTREE,
+                attributes=[self._email_attr, self._display_attr],
+            )
+            entries = list(conn.entries) if ok else []
+        except LDAPException as exc:
+            raise ProviderError(f"LDAP search failed: {exc}") from exc
+        finally:
+            try:
+                conn.unbind()
+            except Exception:  # noqa: BLE001
+                pass
+
+        if len(entries) != 1:
+            if len(entries) > 1:
+                logger.warning(
+                    "dashboard-auth-ldap: user_search_filter matched %d "
+                    "entries for a single username — rejecting login. "
+                    "Tighten dashboard.ldap_auth.user_search_filter.",
+                    len(entries),
+                )
+            return None, {}
+
+        entry = entries[0]
+
+        def _first(attr_name: str) -> str:
+            try:
+                val = entry[attr_name].value
+            except Exception:  # noqa: BLE001 — attribute absent
+                return ""
+            if isinstance(val, (list, tuple)):
+                val = val[0] if val else ""
+            return str(val or "")
+
+        return entry.entry_dn, {
+            "email": _first(self._email_attr),
+            "display": _first(self._display_attr),
+        }
 
     def _user_in_group(self, conn, user_dn: str, username: str) -> bool:
         raise NotImplementedError  # Task 5
