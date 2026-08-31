@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import Any
 from urllib.parse import urlparse
 import urllib.request
 
@@ -41,6 +42,17 @@ class ActualProfile(ProviderProfile):
     the Actual client only when it runs in offline mode, so users opt into it by
     setting ACTUAL_BASE_URL to the local API URL.
     """
+
+    def build_api_kwargs_extras(
+        self, *, reasoning_config: dict | None = None, **context: Any
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        if not isinstance(reasoning_config, dict):
+            return {}, {}
+
+        enabled = reasoning_config.get("enabled") is not False
+        if str(reasoning_config.get("effort") or "").strip().lower() == "none":
+            enabled = False
+        return {"thinking": {"type": "enabled" if enabled else "disabled"}}, {}
 
     def fetch_models(
         self,
@@ -85,7 +97,7 @@ actual = ActualProfile(
     env_vars=("ACTUAL_API_KEY", "ACTUAL_BASE_URL"),
     base_url=DEFAULT_ACTUAL_BASE_URL,
     auth_type="api_key",
-    api_mode="codex_responses",
+    api_mode="chat_completions",
 )
 
 register_provider(actual)

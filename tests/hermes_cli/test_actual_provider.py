@@ -36,7 +36,7 @@ def test_actual_aliases_and_profile_metadata():
     assert profile.name == "actual"
     assert profile.display_name == "Actual Computer"
     assert profile.base_url == DEFAULT_ACTUAL_BASE_URL
-    assert profile.api_mode == "codex_responses"
+    assert profile.api_mode == "chat_completions"
     assert profile.auth_type == "api_key"
     assert profile.env_vars == ("ACTUAL_API_KEY", "ACTUAL_BASE_URL")
     assert normalize_overlay_provider("aci") == "actual"
@@ -44,7 +44,7 @@ def test_actual_aliases_and_profile_metadata():
     assert resolve_provider("actual-computer") == "actual"
     assert _normalize_aux_provider("aci") == "actual"
     assert get_label("actual") == "Actual Computer"
-    assert determine_api_mode("actual", "https://api.actual.inc") == "codex_responses"
+    assert determine_api_mode("actual", "https://api.actual.inc") == "chat_completions"
 
 
 def test_actual_base_url_normalization():
@@ -108,9 +108,33 @@ def test_actual_runtime_uses_hosted_default(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="actual")
 
     assert resolved["provider"] == "actual"
-    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["api_mode"] == "chat_completions"
     assert resolved["api_key"] == "actual-test-key"
     assert resolved["base_url"] == DEFAULT_ACTUAL_BASE_URL
+
+
+def test_actual_runtime_repairs_stale_responses_mode(monkeypatch):
+    _clear_actual_env(monkeypatch)
+    monkeypatch.setenv("ACTUAL_API_KEY", "actual-test-key")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "actual",
+            "default": "actual/test-model",
+            "api_mode": "codex_responses",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="actual")
+    explicit = rp.resolve_runtime_provider(
+        requested="actual",
+        explicit_api_key="actual-test-key",
+        explicit_base_url="https://api.actual.inc/v1",
+    )
+
+    assert resolved["api_mode"] == "chat_completions"
+    assert explicit["api_mode"] == "chat_completions"
 
 
 def test_actual_runtime_uses_local_env_without_key(monkeypatch):
@@ -125,7 +149,7 @@ def test_actual_runtime_uses_local_env_without_key(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="actual")
 
     assert resolved["provider"] == "actual"
-    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["api_mode"] == "chat_completions"
     assert resolved["api_key"] == ACTUAL_LOCAL_NOAUTH_PLACEHOLDER
     assert resolved["base_url"] == DEFAULT_ACTUAL_LOCAL_BASE_URL
 
@@ -145,7 +169,7 @@ def test_actual_runtime_uses_local_config_without_key(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="actual")
 
     assert resolved["provider"] == "actual"
-    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["api_mode"] == "chat_completions"
     assert resolved["api_key"] == ACTUAL_LOCAL_NOAUTH_PLACEHOLDER
     assert resolved["base_url"] == DEFAULT_ACTUAL_LOCAL_BASE_URL
 
@@ -165,7 +189,7 @@ def test_actual_runtime_normalizes_explicit_hosted_base_url(monkeypatch):
     )
 
     assert resolved["provider"] == "actual"
-    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["api_mode"] == "chat_completions"
     assert resolved["api_key"] == "actual-test-key"
     assert resolved["base_url"] == DEFAULT_ACTUAL_BASE_URL
     assert resolved["source"] == "explicit"
@@ -322,36 +346,256 @@ def test_actual_hosted_model_ids_do_not_probe_without_credentials(monkeypatch):
     fetch.assert_not_called()
 
 
-def test_actual_codex_transport_clamps_reasoning_effort():
-    """Actual's SGLang/vLLM backends only accept none/low/medium/high/max.
+def test_actual_profile_translates_explicit_reasoning_controls():
+    profile = get_provider_profile("actual")
 
-    A global xhigh/ultra reasoning_effort must be clamped before the wire,
-    otherwise every request fails with a wrapped HTTP 400. Regression for
-    the field-reported reasoning_effort trap.
-    """
-    from agent.transports.codex import ResponsesApiTransport
+    assert profile.build_api_kwargs_extras(reasoning_config=None) == ({}, {})
+    for config, expected in (
+        ({"enabled": True, "effort": "high"}, "enabled"),
+        ({"enabled": False, "effort": "high"}, "disabled"),
+        ({"enabled": True, "effort": "none"}, "disabled"),
+    ):
+        extra_body, top_level = profile.build_api_kwargs_extras(reasoning_config=config)
+        assert extra_body == {"thinking": {"type": expected}}
+        assert top_level == {}
 
-    t = ResponsesApiTransport()
-    for requested, expected in (("xhigh", "high"), ("ultra", "max"), ("high", "high")):
-        kwargs = t.build_kwargs(
-            model="glm-5.2-nvfp4",
-            messages=[{"role": "user", "content": "hi"}],
-            tools=None,
-            provider="actual",
-            reasoning_config={"effort": requested},
-            base_url=DEFAULT_ACTUAL_BASE_URL,
+
+def test_actual_agent_side_routing_keeps_chat_completions_for_any_model():
+    from run_agent import AIAgent
+
+    for model in ("qwen3.8-27b-Q4_K_M", "zai-org/GLM-5.3", "gpt-5.4"):
+        assert not AIAgent._provider_model_requires_responses_api(
+            model,
+            provider=" Actual ",
         )
-        assert kwargs["reasoning"]["effort"] == expected, requested
 
-    # Other providers keep the wider values untouched on the generic path.
-    kwargs = t.build_kwargs(
-        model="some-model",
-        messages=[{"role": "user", "content": "hi"}],
-        tools=None,
-        provider="openai-codex",
-        reasoning_config={"effort": "xhigh"},
+
+def test_actual_agent_init_repairs_stale_responses_mode():
+    from run_agent import AIAgent
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="actual-test-key",
+            base_url=DEFAULT_ACTUAL_BASE_URL,
+            provider="actual",
+            api_mode="codex_responses",
+            model="gpt-5.4",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    assert agent.api_mode == "chat_completions"
+
+
+def test_actual_chat_completions_wire_replays_reasoning_through_tool_turn(
+    monkeypatch,
+):
+    import http.server
+    import threading
+
+    from openai import OpenAI
+
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    requests: list[tuple[str, dict]] = []
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            request = json.loads(self.rfile.read(length))
+            requests.append((self.path, request))
+
+            if len(requests) == 1:
+                message = {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning": "I should call the probe tool.",
+                    "reasoning_content": "I should call the probe tool.",
+                    "tool_calls": [
+                        {
+                            "id": "call_actual_probe",
+                            "type": "function",
+                            "function": {
+                                "name": "actual_probe",
+                                "arguments": '{"value":"ok"}',
+                            },
+                        }
+                    ],
+                }
+                finish_reason = "tool_calls"
+            else:
+                message = {
+                    "role": "assistant",
+                    "content": "ACTUAL_CHAT_OK",
+                    "reasoning": "The tool result confirms the answer.",
+                    "reasoning_content": "The tool result confirms the answer.",
+                }
+                finish_reason = "stop"
+
+            body = json.dumps({
+                "id": f"chatcmpl-actual-{len(requests)}",
+                "object": "chat.completion",
+                "created": 1,
+                "model": request["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": message,
+                        "finish_reason": finish_reason,
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                },
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        _clear_actual_env(monkeypatch)
+        base_url = f"http://127.0.0.1:{server.server_address[1]}/v1"
+        monkeypatch.setenv("ACTUAL_BASE_URL", base_url)
+        monkeypatch.setattr(
+            rp,
+            "_get_model_config",
+            lambda: {"provider": "actual", "default": "actual/test-model"},
+        )
+
+        resolved = rp.resolve_runtime_provider(requested="actual")
+        profile = get_provider_profile(resolved["provider"])
+        transport = ChatCompletionsTransport()
+        client = OpenAI(
+            api_key=resolved["api_key"],
+            base_url=resolved["base_url"],
+            max_retries=0,
+        )
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "actual_probe",
+                    "description": "Return the supplied value.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                },
+            }
+        ]
+        messages = [{"role": "user", "content": "Use actual_probe."}]
+        params = {
+            "provider_profile": profile,
+            "reasoning_config": {"enabled": True, "effort": "high"},
+            "base_url": resolved["base_url"],
+        }
+
+        first_raw = client.chat.completions.create(
+            **transport.build_kwargs(
+                model="test-model",
+                messages=messages,
+                tools=tools,
+                **params,
+            )
+        )
+        first = transport.normalize_response(first_raw)
+        assert first.reasoning == "I should call the probe tool."
+        assert first.reasoning_content == "I should call the probe tool."
+        assert first.tool_calls and first.tool_calls[0].name == "actual_probe"
+
+        tool_call = first.tool_calls[0]
+        messages.extend([
+            {
+                "role": "assistant",
+                "content": first.content,
+                "reasoning": first.reasoning,
+                "reasoning_content": first.reasoning_content,
+                "tool_calls": [
+                    {
+                        "id": tool_call.id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": '{"value":"ok"}',
+            },
+        ])
+        second_raw = client.chat.completions.create(
+            **transport.build_kwargs(
+                model="test-model",
+                messages=messages,
+                tools=tools,
+                **params,
+            )
+        )
+        second = transport.normalize_response(second_raw)
+    finally:
+        server.shutdown()
+        thread.join(timeout=2.0)
+
+    assert resolved["api_mode"] == "chat_completions"
+    assert [path for path, _ in requests] == [
+        "/v1/chat/completions",
+        "/v1/chat/completions",
+    ]
+    assert requests[0][1]["thinking"] == {"type": "enabled"}
+    replayed = requests[1][1]["messages"][-2]
+    assert replayed["reasoning"] == "I should call the probe tool."
+    assert replayed["reasoning_content"] == "I should call the probe tool."
+    assert second.content == "ACTUAL_CHAT_OK"
+    assert second.reasoning == "The tool result confirms the answer."
+    assert second.reasoning_content == "The tool result confirms the answer."
+
+
+def test_actual_chat_completion_without_reasoning_keeps_final_content():
+    from types import SimpleNamespace
+
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    content="ACTUAL_NO_REASONING_OK",
+                    reasoning=None,
+                    reasoning_content=None,
+                    tool_calls=None,
+                ),
+            )
+        ],
+        usage=None,
     )
-    assert kwargs["reasoning"]["effort"] == "xhigh"
+
+    normalized = ChatCompletionsTransport().normalize_response(response)
+
+    assert normalized.content == "ACTUAL_NO_REASONING_OK"
+    assert normalized.reasoning is None
+    assert normalized.reasoning_content is None
 
 
 def test_actual_runtime_config_local_base_url_without_key(monkeypatch):
@@ -370,4 +614,4 @@ def test_actual_runtime_config_local_base_url_without_key(monkeypatch):
     resolved = rp.resolve_runtime_provider(requested="actual")
 
     assert resolved["api_key"] == ACTUAL_LOCAL_NOAUTH_PLACEHOLDER
-    assert resolved["api_mode"] == "codex_responses"
+    assert resolved["api_mode"] == "chat_completions"

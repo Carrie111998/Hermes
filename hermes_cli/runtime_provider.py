@@ -161,8 +161,6 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     # hostname per #32243.
     if hostname == "api.meta.ai":
         return "codex_responses"
-    if hostname == "api.actual.inc":
-        return "codex_responses"
     # Ramp Router: Responses-native host — /v1/chat/completions is only a
     # minimal compatibility shim, while reasoning and caching support live
     # on /v1/responses (docs.router.com/api/endpoint). Mirrors the
@@ -545,6 +543,11 @@ def _resolve_runtime_from_pool_entry(
         base_url = base_url or OPENROUTER_BASE_URL
     elif provider == "xai":
         api_mode = "codex_responses"
+    elif provider == "actual":
+        # Pool entries can outlive the release that created them; never let a
+        # stale persisted Responses mode override Actual's current contract.
+        api_mode = "chat_completions"
+        base_url = normalize_actual_base_url(base_url)
     elif provider == "nous":
         from hermes_cli.providers import nous_api_mode
 
@@ -1845,7 +1848,9 @@ def _resolve_explicit_runtime(
         elif provider == "xai":
             api_mode = "codex_responses"
         elif provider == "actual":
-            api_mode = "codex_responses"
+            # Actual's built-in provider is Chat Completions-only. Ignore a
+            # stale persisted mode from releases that routed it to Responses.
+            api_mode = "chat_completions"
         else:
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
@@ -2493,7 +2498,9 @@ def resolve_runtime_provider(
         elif provider == "xai":
             api_mode = "codex_responses"
         elif provider == "actual":
-            api_mode = "codex_responses"
+            # Actual's built-in provider is Chat Completions-only. Ignore a
+            # stale persisted mode from releases that routed it to Responses.
+            api_mode = "chat_completions"
         else:
             configured_provider = str(model_cfg.get("provider") or "").strip().lower()
             # Only honor persisted api_mode when it belongs to the same provider family.
