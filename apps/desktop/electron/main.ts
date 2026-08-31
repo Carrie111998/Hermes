@@ -16522,6 +16522,15 @@ ipcMain.on('hermes:translucency:support', event => {
   event.returnValue = { glass: GLASS_SUPPORTED, translucency: TRANSLUCENCY_SUPPORTED }
 })
 
+// Synchronous read used by the renderer's applyTheme() to store the correct
+// pre-paint boot background: 'transparent' when glass/vibrancy is active so
+// the NSVisualEffectView shows through on the first painted pixel rather than
+// being buried under an opaque fallback color (macOS dark-mode white flash,
+// issue #98561).
+ipcMain.on('hermes:glass-enabled', event => {
+  event.returnValue = glassActive(translucencyState)
+})
+
 ipcMain.on('hermes:translucency', (_event, payload) => {
   const next = normalizeTranslucency(payload, GLASS_SUPPORTED)
   const previous = translucencyState
