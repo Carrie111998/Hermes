@@ -1,8 +1,8 @@
-"""Kanban worker runs must not surface as user conversations.
+"""Kanban workers persist enough metadata for a readable project transcript.
 
-Workers spawn as `hermes chat -q "work kanban task <id>"`, which used to land in
-state.db as an untitled `cli` row — the desktop sidebar then rendered one entry
-per attempt, labeled with the worker's own prompt.
+Workers remain a distinct ``kanban`` source so global Recents can omit them,
+but their session rows carry the workspace and a deterministic title so the
+project tree can render every run alongside ordinary project conversations.
 """
 
 import os
@@ -53,6 +53,7 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
         claim_lock=None,
         claim_expires=None,
         tenant=None,
+        current_run_id=7,
     )
     workspace = str(tmp_path / "ws")
     os.makedirs(workspace, exist_ok=True)
@@ -60,6 +61,63 @@ def test_worker_spawn_tags_session_source_kanban(monkeypatch, tmp_path):
     kb._default_spawn(task, workspace)
 
     assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
+    assert captured["env"]["HERMES_KANBAN_SESSION_TITLE"] == (
+        "default · ship it · run 7"
+    )
+
+
+def test_worker_session_title_shortens_long_card_at_word_boundary():
+    """Long card names stay readable instead of being cut mid-word."""
+    from hermes_cli import kanban_db as kb
+
+    title = kb._worker_session_title(
+        "dunbar-dossier",
+        (
+            "DD-S2B Build Change Inbox candidate review with accept, "
+            "edit-and-accept, reject, and immutable evidence"
+        ),
+        13,
+    )
+
+    assert len(title) <= SessionDB.MAX_TITLE_LENGTH
+    assert title.endswith("… · run 13")
+    assert title.startswith("dunbar-dossier · DD-S2B Build Change Inbox")
+
+
+def test_worker_session_persists_workspace_and_readable_title(monkeypatch, tmp_path):
+    """The agent row keeps the worker's real cwd and dispatcher-provided title."""
+    from run_agent import AIAgent
+
+    workspace = tmp_path / "repo" / ".worktrees" / "slice-2a"
+    workspace.mkdir(parents=True)
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+    monkeypatch.setenv(
+        "HERMES_KANBAN_SESSION_TITLE", "dunbar-dossier · DD-S2A foundation · run 11"
+    )
+
+    database = SessionDB(db_path=tmp_path / "worker-state.db")
+    try:
+        agent = AIAgent(
+            base_url="https://example.invalid/v1",
+            api_key="test",
+            model="test/model",
+            quiet_mode=True,
+            session_db=database,
+            session_id="worker-session",
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent._ensure_db_session()
+
+        row = database.get_session("worker-session")
+        assert row["source"] == "kanban"
+        assert row["cwd"] == str(workspace)
+        assert row["title"] == "dunbar-dossier · DD-S2A foundation · run 11"
+        assert row["title_source"] == SessionDB.TITLE_SOURCE_LLM
+    finally:
+        database.close()
 
 
 def test_kanban_rows_stay_out_of_the_session_list(db):
