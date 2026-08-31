@@ -48,7 +48,7 @@ import {
   sessionPinId,
   shouldMigrateComposerScope
 } from '@/store/session'
-import { $focusedStoredSessionId, sessionTileDelegate } from '@/store/session-states'
+import { $focusedStoredSessionId, $sessionStates, sessionTileDelegate } from '@/store/session-states'
 import { $transcriptTailBySessionId, transcriptTailState } from '@/store/transcript-tail'
 import { isAuxiliaryWindow, isWatchWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
@@ -107,6 +107,22 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onRetryResume: (sessionId: string) => void
   onTranscribeAudio?: (audio: Blob) => Promise<string>
   onDismissError?: (messageId: string) => void
+}
+
+export function shouldShowChatBar({
+  activeSessionId,
+  isRoutedSessionView,
+  messagesEmpty,
+  resumeExhausted,
+  watchWindow
+}: {
+  activeSessionId: null | string | undefined
+  isRoutedSessionView: boolean
+  messagesEmpty: boolean
+  resumeExhausted: boolean
+  watchWindow: boolean
+}): boolean {
+  return !(isRoutedSessionView && messagesEmpty && !activeSessionId) && !resumeExhausted && !watchWindow
 }
 
 interface ChatHeaderProps {
@@ -393,6 +409,11 @@ const ChatViewContent = memo(function ChatViewContent({
   const composerSurfaceId = useComposerSurfaceId()
   const isPrimary = view.kind === 'primary'
   const activeSessionId = useStore(view.$runtimeId)
+
+  const activeRuntimeStoredId = useStoreSelector($sessionStates, states =>
+    activeSessionId ? (states[activeSessionId]?.storedSessionId ?? null) : null
+  )
+
   const storedId = useStore(view.$storedId)
   // Multi-pane dimming: only the focused surface paints at full strength, so
   // two sessions side by side read as "this one, and that one over there".
@@ -488,6 +509,15 @@ const ChatViewContent = memo(function ChatViewContent({
   // waiting for the resume effect (which paints a frame later) to clear them.
   const routeSessionMismatch = isPrimary ? isRouteSessionMismatch(routedSessionId, selectedSessionId, sessions) : false
 
+  const activeRuntimeRouteMismatch =
+    isPrimary && isRoutedSessionView
+      ? !activeSessionId ||
+        !activeRuntimeStoredId ||
+        isRouteSessionMismatch(routedSessionId, activeRuntimeStoredId, sessions)
+      : false
+
+  const sessionTransitioning = routeSessionMismatch || activeRuntimeRouteMismatch
+
   // The compact new-session pop-out skips the wordmark/tagline intro — it's a
   // scratch window, not the full-height empty state. The Appearance toggle
   // turns it off everywhere else.
@@ -526,22 +556,26 @@ const ChatViewContent = memo(function ChatViewContent({
     knownHistory: routedHasHistory,
     messagesEmpty,
     resumeExhausted,
-    routeSessionMismatch,
+    routeSessionMismatch: sessionTransitioning,
     routedSessionView: isRoutedSessionView
   })
 
   const threadLoading = threadLoadingState(loadingSession, busy, awaitingResponse, lastVisibleIsUser)
-  // The composer mount deliberately does NOT follow `routeSessionMismatch`.
-  // That flag is a transient split-write flicker during session switches (the
-  // routed id and the active id land in two separate store writes), and
-  // unmounting the composer mid-typing destroys DOM focus and the caret — the
-  // #88621 class of "it stopped letting me type" bugs. The transcript still
-  // shows the loader; the composer stays mounted and the draft-swap layout
-  // effect handles the session transition. Hide it only when there is
-  // genuinely no session yet (route not resumed), the resume gave up (no live
-  // runtime to send to), or the window is a read-only watch spectator.
-  const showChatBar =
-    !(isRoutedSessionView && messagesEmpty && !activeSessionId) && !resumeExhausted && !isWatchWindow()
+
+  // Keep the DOM/editor mounted through the transient route ↔ selected-session
+  // split write so focus, draft, and selection survive. A mismatch is also a
+  // genuine navigation seam, though: the route/draft can already mean B while
+  // busy/session actions still point at A. ChatBar receives an independent
+  // action fence below — typing stays enabled, every submit/steer/cancel/queue
+  // path fails closed until the identities converge.
+  const showChatBar = shouldShowChatBar({
+    activeSessionId,
+    isRoutedSessionView,
+    messagesEmpty,
+    resumeExhausted,
+    watchWindow: isWatchWindow()
+  })
+
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
@@ -654,7 +688,7 @@ const ChatViewContent = memo(function ChatViewContent({
         onEdit={onEdit}
         onReload={onReload}
         onThreadMessagesChange={onThreadMessagesChange}
-        suppressMessages={routeSessionMismatch}
+        suppressMessages={sessionTransitioning}
       >
         <div
           className="relative min-h-0 max-w-full flex-1 overflow-hidden bg-(--ui-chat-surface-background) contain-[layout_paint]"
@@ -721,6 +755,7 @@ const ChatViewContent = memo(function ChatViewContent({
         {showChatBar && (
           <Suspense fallback={<ChatBarFallback />}>
             <ChatBar
+              actionsDisabled={sessionTransitioning}
               busy={busy}
               cwd={currentCwd}
               disabled={!gatewayOpen}

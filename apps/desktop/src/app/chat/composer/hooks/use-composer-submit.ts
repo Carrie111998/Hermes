@@ -18,6 +18,7 @@ import { useComposerScope, useComposerSurfaceId } from '../scope'
 import type { ChatBarProps } from '../types'
 
 interface UseComposerSubmitArgs {
+  actionsDisabled: boolean
   activeQueueSessionKey: string | null
   activeQueueSessionKeyRef: RefObject<string | null>
   attachments: ComposerAttachment[]
@@ -53,6 +54,7 @@ interface UseComposerSubmitArgs {
  * external-submit listener ref.
  */
 export function useComposerSubmit({
+  actionsDisabled,
   activeQueueSessionKey,
   activeQueueSessionKeyRef,
   attachments,
@@ -88,7 +90,13 @@ export function useComposerSubmit({
     const submittedAttachments = attachments ?? []
 
     const restore = () => {
-      loadIntoComposer(text, submittedAttachments)
+      // The mounted composer may now be showing another route. Preserve the
+      // rejected payload in A's stash, but never paint it over B's visible
+      // editor or attachments after a session switch.
+      if (activeQueueSessionKeyRef.current === submittedScope) {
+        loadIntoComposer(text, submittedAttachments)
+      }
+
       // Use the scope captured at dispatch, not whatever session is focused
       // now — the gateway can reject well after the user has switched away,
       // and re-stashing into the currently-focused session would overwrite
@@ -110,7 +118,10 @@ export function useComposerSubmit({
   // and the exact visible surface captured at click time — every tile stays
   // mounted, and a session can be rendered in more than one pane.
   const dispatchSubmitRef = useRef(dispatchSubmit)
-  dispatchSubmitRef.current = dispatchSubmit
+
+  useLayoutEffect(() => {
+    dispatchSubmitRef.current = dispatchSubmit
+  })
 
   useLayoutEffect(
     () =>
@@ -120,16 +131,17 @@ export function useComposerSubmit({
           surfaceId !== null &&
           requestedSurfaceId === surfaceId &&
           paneVisible &&
-          !inputDisabled
+          !inputDisabled &&
+          !actionsDisabled
         ) {
           dispatchSubmitRef.current(text, undefined, displayKind)
         }
       }),
-    [inputDisabled, paneVisible, scope.target, surfaceId]
+    [actionsDisabled, inputDisabled, paneVisible, scope.target, surfaceId]
   )
 
   const submitDraft = () => {
-    if (disabled) {
+    if (disabled || actionsDisabled) {
       return
     }
 
@@ -241,7 +253,7 @@ export function useComposerSubmit({
 
     // Guard on live editor state, not the render-lagged `canSteer`: a redirect
     // fired on a fast Enter must not be dropped because state hasn't synced.
-    if (!onSteer || !text || attachments.length > 0 || SLASH_COMMAND_RE.test(text)) {
+    if (actionsDisabled || !onSteer || !text || attachments.length > 0 || SLASH_COMMAND_RE.test(text)) {
       return
     }
 
@@ -256,7 +268,7 @@ export function useComposerSubmit({
   }
 
   const queueDraft = () => {
-    if (disabled || !busy) {
+    if (disabled || actionsDisabled || !busy) {
       return
     }
 

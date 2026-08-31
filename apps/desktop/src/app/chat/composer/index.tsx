@@ -1,6 +1,15 @@
 import { ComposerPrimitive } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { type ClipboardEvent, type FormEvent, type KeyboardEvent, useCallback, useEffect, useMemo, useRef } from 'react'
+import {
+  type ClipboardEvent,
+  type FormEvent,
+  type KeyboardEvent,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef
+} from 'react'
 
 import { useTourMarker } from '@/app/chat/tour-marker'
 import { useHudComposerDrag } from '@/app/hud/composer-drag'
@@ -45,6 +54,7 @@ import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-aff
 import { markActiveComposer, onComposerAttachImagesRequest } from './focus'
 import { HelpHint } from './help-hint'
 import { useAtCompletions } from './hooks/use-at-completions'
+import { useCommittedActionScope } from './hooks/use-committed-action-scope'
 import { useComposerBranch } from './hooks/use-composer-branch'
 import { useComposerDraft } from './hooks/use-composer-draft'
 import { useComposerDrop } from './hooks/use-composer-drop'
@@ -87,6 +97,7 @@ import { chipTypedUrlOnSpace, linkifyUrls } from './url-refs'
 import { VoiceActivity, VoicePlaybackActivity } from './voice-activity'
 
 export function ChatBar({
+  actionsDisabled = false,
   busy,
   cwd,
   disabled,
@@ -124,12 +135,18 @@ export function ChatBar({
   // end control. Populated after useComposerVoice below (the submit wrapper
   // is created first); render-time assignment keeps the ref current.
   const voiceStopRef = useRef<{ active: boolean; end: () => void }>({ active: false, end: () => {} })
+  const submitScopeKey = queueSessionKey === undefined ? (sessionId ?? null) : queueSessionKey
+  const submitActionIsCurrent = useCommittedActionScope(submitScopeKey, actionsDisabled)
 
   // Every send (typed, queued, voice) passes through the contributed
   // middleware chain first — rewrite / pass-through / cancel. Empty chain =
   // exact pass-through, so surfaces without contributions are byte-identical.
   const onSubmit = useCallback<ChatBarProps['onSubmit']>(
     async (value, options) => {
+      if (!submitActionIsCurrent()) {
+        return false
+      }
+
       // Bare stop phrase typed while the voice conversation is live: end the
       // conversation (mic off, pill dismissed) instead of sending "stop" to
       // the agent. Spoken transcripts are already stop-checked inside
@@ -147,13 +164,13 @@ export function ChatBar({
 
       const draft = await runComposerMiddleware({ text: value, attachments: options?.attachments })
 
-      if (!draft) {
+      if (!draft || !submitActionIsCurrent()) {
         return false
       }
 
       return onSubmitProp(draft.text, { ...options, attachments: draft.attachments })
     },
-    [onSubmitProp]
+    [onSubmitProp, submitActionIsCurrent]
   )
 
   // Which live composer this instance IS (main | tile) — its attachment set,
@@ -172,7 +189,7 @@ export function ChatBar({
   // busy submit routes text to the queue instead of a steer (which would sit
   // undelivered behind the blocked tool batch). Drives the button affordance.
   const blockingPrompt = useStore(useMemo(() => sessionBlockingPrompt(sessionId ?? null), [sessionId]))
-  const activeQueueSessionKey = queueSessionKey || sessionId || null
+  const activeQueueSessionKey = submitScopeKey
 
   // Status items (subagents, background processes) are keyed by the RUNTIME
   // session id — gateway events and process.list both speak that id. Only the
@@ -222,6 +239,7 @@ export function ChatBar({
   const gatewayState = useStore($gatewayState)
   const reconnecting = gatewayState === 'closed' || gatewayState === 'error'
   const inputDisabled = disabled && !reconnecting
+  const actionDisabled = disabled || actionsDisabled
 
   // The draft engine — detached source of truth (DOM + draftRef + edge
   // selectors); typing never re-renders the chrome. ChatBar owns `queueEditRef`
@@ -302,6 +320,7 @@ export function ChatBar({
     steerQueuedNow,
     stepQueuedEdit
   } = useComposerQueue({
+    actionsDisabled,
     activeQueueSessionKey,
     attachments,
     busy,
@@ -317,7 +336,7 @@ export function ChatBar({
     sessionId
   })
 
-  const statusStackVisible = queuedPrompts.length > 0 || statusPresent
+  const statusStackVisible = !actionsDisabled && (queuedPrompts.length > 0 || statusPresent)
 
   // Halt vs. reach-the-queue: every interrupt lands on onCancel, but only the
   // gestures that MEAN "stop working" (Stop button, Esc) go through this
@@ -328,10 +347,14 @@ export function ChatBar({
   // busy) call the raw onCancel and keep draining on settle. Parked entries
   // stay in the panel until resumed, sent, edited, or deleted.
   const haltRun = useCallback(() => {
+    if (actionsDisabled) {
+      return
+    }
+
     parkQueuedPrompts(activeQueueSessionKeyRef.current)
 
     return onCancel()
-  }, [activeQueueSessionKeyRef, onCancel])
+  }, [actionsDisabled, activeQueueSessionKeyRef, onCancel])
 
   const { compactPill, foldVoice, minimal, stacked } = useComposerMetrics({
     composerDockRef,
@@ -342,7 +365,7 @@ export function ChatBar({
   })
 
   const hasComposerPayload = hasText || attachments.length > 0
-  const canSubmit = busy || hasComposerPayload
+  const canSubmit = !actionsDisabled && (busy || hasComposerPayload)
 
   // Steer only makes sense mid-turn, text-only (the gateway can't carry images
   // into a tool result) and never for a slash command (those execute inline).
@@ -361,6 +384,7 @@ export function ChatBar({
   // The submit engine — the orchestration seam where draft + queue meet. Owns
   // the submit decision tree, the send-with-restore primitive, and steer.
   const { queueDraft, steerDraft, submitDraft } = useComposerSubmit({
+    actionsDisabled,
     activeQueueSessionKey,
     activeQueueSessionKeyRef,
     attachments,
@@ -662,7 +686,7 @@ export function ChatBar({
     if ((event.metaKey || event.ctrlKey) && !event.altKey && event.shiftKey && event.key.toLowerCase() === 'k') {
       event.preventDefault()
 
-      if (!busy) {
+      if (!actionsDisabled && !busy) {
         void drainNextQueued()
       }
 
@@ -673,14 +697,14 @@ export function ChatBar({
     // Tab must not fall through to the browser — it would move focus out of
     // the composer mid-completion, which reads as the popover "eating" the
     // keypress. Swallow it; the refresh lands with the items.
-    if (trigger && triggerLoading && triggerItems.length === 0 && event.key === 'Tab') {
+    if (!actionsDisabled && trigger && triggerLoading && triggerItems.length === 0 && event.key === 'Tab') {
       event.preventDefault()
       triggerKeyConsumedRef.current = true
 
       return
     }
 
-    if (trigger && triggerItems.length > 0) {
+    if (!actionsDisabled && trigger && triggerItems.length > 0) {
       if (event.key === 'ArrowDown') {
         event.preventDefault()
         triggerKeyConsumedRef.current = true
@@ -765,6 +789,7 @@ export function ChatBar({
     // `/personality creative`. Space/Tab still commit what's typed as a single
     // directive chip; Enter falls through to submit (send it as-is).
     if (
+      !actionsDisabled &&
       trigger?.kind === '/' &&
       !triggerItems.length &&
       (event.key === ' ' || event.key === 'Tab') &&
@@ -782,7 +807,7 @@ export function ChatBar({
     // ArrowUp/ArrowDown navigate, in priority order: the queue (edit entries in
     // place) then sent-message history. The history ring is derived from live
     // session messages each press — single source of truth, no mirror.
-    if (event.key === 'ArrowUp') {
+    if (!actionsDisabled && event.key === 'ArrowUp') {
       const currentDraft = draftRef.current
 
       // Editing a queued turn → walk to the older entry.
@@ -823,7 +848,7 @@ export function ChatBar({
       return
     }
 
-    if (event.key === 'ArrowDown') {
+    if (!actionsDisabled && event.key === 'ArrowDown') {
       // Editing a queued turn → walk to the newer entry (past the newest exits).
       if (queueEdit) {
         event.preventDefault()
@@ -854,7 +879,7 @@ export function ChatBar({
     if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
       event.preventDefault()
 
-      if (busy && !disabled) {
+      if (busy && !actionDisabled) {
         // As with plain Enter, source the just-typed content from the DOM so a
         // fast keypress cannot queue a stale draft.
         const editorText = editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
@@ -882,7 +907,7 @@ export function ChatBar({
       const editorText = editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
       const hasLivePayload = editorText.trim().length > 0 || attachments.length > 0
 
-      if (disabled) {
+      if (actionDisabled) {
         return
       }
 
@@ -917,7 +942,7 @@ export function ChatBar({
 
     if (event.key === 'Escape') {
       // Editing a queued turn → Esc cancels the edit, restoring the prior draft.
-      if (queueEdit) {
+      if (!actionsDisabled && queueEdit) {
         event.preventDefault()
         exitQueuedEdit('cancel')
 
@@ -927,7 +952,7 @@ export function ChatBar({
       // Otherwise Esc interrupts the running turn (Stop-button parity) — unless
       // the turn is parked waiting on the user, where Esc must not discard the
       // pending prompt. An explicit halt, so it parks the queue too.
-      if (busy && !awaitingInput) {
+      if (!actionsDisabled && busy && !awaitingInput) {
         event.preventDefault()
         triggerHaptic('cancel')
         void Promise.resolve(haltRun())
@@ -958,11 +983,11 @@ export function ChatBar({
   // Branch / worktree hand-offs (CodingStatusRow). Owns the worktree open +
   // branch-off/convert/list/switch actions; draft travels into the new session.
   const { handleBranchOff, handleConvertBranch, handleListBranches, handleSwitchBranch, openInWorktree } =
-    useComposerBranch({ clearDraft, cwd, draftRef })
+    useComposerBranch({ actionsDisabled, clearDraft, cwd, draftRef, sessionKey: activeQueueSessionKey })
 
   // Global Esc-to-cancel when the chat (not the composer input) has focus.
   // Same explicit-halt semantics as the Stop button: park the queue.
-  useComposerEscCancel({ awaitingInput, busy, onCancel: haltRun, target: scope.target })
+  useComposerEscCancel({ awaitingInput, busy: actionsDisabled ? false : busy, onCancel: haltRun, target: scope.target })
 
   const {
     conversation,
@@ -976,7 +1001,7 @@ export function ChatBar({
   } = useComposerVoice({
     busy,
     clearDraft,
-    disabled,
+    disabled: actionDisabled,
     focusInput,
     insertText,
     maxRecordingSeconds,
@@ -985,13 +1010,15 @@ export function ChatBar({
     onSubmit,
     onTranscribeAudio,
     sessionId,
+    submissionKey: activeQueueSessionKey,
     target: scope.target
   })
 
-  // Keep the typed-stop interceptor (see onSubmit above) in sync with the
-  // live conversation state. Render-time ref assignment, same pattern as
-  // dispatchSubmitRef — no effect needed for a plain mirror.
-  voiceStopRef.current = { active: voiceConversationActive, end: endConversation }
+  // Publish only committed conversation state so an abandoned concurrent
+  // render cannot redirect typed Stop into another session's voice lifecycle.
+  useLayoutEffect(() => {
+    voiceStopRef.current = { active: voiceConversationActive, end: endConversation }
+  }, [endConversation, voiceConversationActive])
 
   const contextMenu = (
     <ContextMenu
@@ -1022,7 +1049,7 @@ export function ChatBar({
         onToggleMute: conversation.toggleMute,
         status: conversation.status
       }}
-      disabled={disabled}
+      disabled={actionDisabled}
       foldVoice={foldVoice}
       hasComposerPayload={hasComposerPayload}
       minimal={minimal}
@@ -1186,43 +1213,45 @@ export function ChatBar({
               5px transparent grab margin — so both strips carry the same inset
               and share one left edge with it. */}
           <div className={cn(composerFloatingStrip, 'px-[5px] pb-1.5 empty:hidden')}>
-            <ActionBadges sessionId={statusSessionId} />
-            <SuggestionPills sessionId={statusSessionId} />
+            {!actionsDisabled && <ActionBadges sessionId={statusSessionId} />}
+            {!actionsDisabled && <SuggestionPills sessionId={statusSessionId} />}
           </div>
           {/* Session-scoped status stack (todos, subagents, background tasks,
               queue). An in-flow dock child: the dock is bottom-anchored, so it
               grows upward over the thread and the dock's own measurement covers
               it. Collapses to nothing when every status is empty. */}
-          <ComposerStatusStack
-            queue={
-              activeQueueSessionKey && queuedPrompts.length > 0 ? (
-                <QueuePanel
-                  busy={busy}
-                  editingId={queueEdit?.entryId ?? null}
-                  entries={queuedPrompts}
-                  onDelete={id => {
-                    if (removeQueuedPrompt(activeQueueSessionKey, id) && queueEdit?.entryId === id) {
-                      exitQueuedEdit('cancel')
-                    }
-                  }}
-                  onEdit={beginQueuedEdit}
-                  onResume={() => {
-                    unparkQueuedPrompts(activeQueueSessionKey)
+          {!actionsDisabled && (
+            <ComposerStatusStack
+              queue={
+                activeQueueSessionKey && queuedPrompts.length > 0 ? (
+                  <QueuePanel
+                    busy={busy}
+                    editingId={queueEdit?.entryId ?? null}
+                    entries={queuedPrompts}
+                    onDelete={id => {
+                      if (removeQueuedPrompt(activeQueueSessionKey, id) && queueEdit?.entryId === id) {
+                        exitQueuedEdit('cancel')
+                      }
+                    }}
+                    onEdit={beginQueuedEdit}
+                    onResume={() => {
+                      unparkQueuedPrompts(activeQueueSessionKey)
 
-                    // Idle → kick the head immediately; busy → the settle drain
-                    // takes over now that the park is lifted.
-                    if (!busy) {
-                      void drainNextQueued()
-                    }
-                  }}
-                  onSendNow={id => void sendQueuedNow(id)}
-                  onSteerNow={id => void steerQueuedNow(id)}
-                  parked={queueParked}
-                />
-              ) : null
-            }
-            sessionId={statusSessionId}
-          />
+                      // Idle → kick the head immediately; busy → the settle drain
+                      // takes over now that the park is lifted.
+                      if (!busy) {
+                        void drainNextQueued()
+                      }
+                    }}
+                    onSendNow={id => void sendQueuedNow(id)}
+                    onSteerNow={id => void steerQueuedNow(id)}
+                    parked={queueParked}
+                  />
+                ) : null
+              }
+              sessionId={statusSessionId}
+            />
+          )}
           <ComposerPrimitive.Root
             className={cn(
               'group/composer relative w-full overflow-visible rounded-2xl',
@@ -1260,7 +1289,7 @@ export function ChatBar({
             ref={composerRef}
           >
             {isHelpHint && <HelpHint />}
-            {trigger && !argStageEmpty && (
+            {!actionsDisabled && trigger && !argStageEmpty && (
               <ComposerTriggerPopover
                 activeIndex={triggerActive}
                 items={triggerItems}
@@ -1316,21 +1345,23 @@ export function ChatBar({
                     composerSurfaceGlass
                   )}
                 />
-                <CodingStatusRow
-                  onBranchOff={handleBranchOff}
-                  onConvertBranch={handleConvertBranch}
-                  onListBranches={handleListBranches}
-                  // A tile's rail reviews ITS worktree: pin the pane's scope to
-                  // this surface's cwd. Main keeps the classic follow-the-
-                  // active-session scope (null).
-                  onOpen={() => toggleReview(scope.target === 'main' ? null : (cwd ?? null), scope.target)}
-                  onOpenWorktree={openInWorktree}
-                  onSwitchBranch={handleSwitchBranch}
-                  // Blank in a bot chat: the row hides itself without a repo,
-                  // and stops probing git / GitHub for a surface that has no
-                  // branch to show. Cheaper than a second composer.
-                  repoPath={botChat ? undefined : cwd}
-                />
+                {!actionsDisabled && (
+                  <CodingStatusRow
+                    onBranchOff={handleBranchOff}
+                    onConvertBranch={handleConvertBranch}
+                    onListBranches={handleListBranches}
+                    // A tile's rail reviews ITS worktree: pin the pane's scope to
+                    // this surface's cwd. Main keeps the classic follow-the-
+                    // active-session scope (null).
+                    onOpen={() => toggleReview(scope.target === 'main' ? null : (cwd ?? null), scope.target)}
+                    onOpenWorktree={openInWorktree}
+                    onSwitchBranch={handleSwitchBranch}
+                    // Blank in a bot chat: the row hides itself without a repo,
+                    // and stops probing git / GitHub for a surface that has no
+                    // branch to show. Cheaper than a second composer.
+                    repoPath={botChat ? undefined : cwd}
+                  />
+                )}
                 <div
                   className={cn(
                     'relative z-1 flex min-h-0 w-full flex-col gap-(--composer-row-gap) overflow-hidden rounded-[inherit] px-(--composer-surface-pad-x) py-(--composer-surface-pad-y) transition-opacity duration-200 ease-out',
@@ -1343,10 +1374,10 @@ export function ChatBar({
                   {/* Contribution seams: banners above, a row below, inline
                     additions beside the "+" menu and before the controls.
                     All four render nothing until something contributes. */}
-                  <ContribSlot area={COMPOSER_AREAS.top} />
+                  {!actionsDisabled && <ContribSlot area={COMPOSER_AREAS.top} />}
                   <VoiceActivity state={voiceActivityState} />
                   <VoicePlaybackActivity />
-                  {queueEdit && editingQueuedPrompt && (
+                  {!actionsDisabled && queueEdit && editingQueuedPrompt && (
                     <div className="flex items-center justify-between gap-2 rounded-lg border border-[color-mix(in_srgb,var(--dt-composer-ring)_32%,transparent)] bg-accent/18 px-2 py-1">
                       <div className="min-w-0 text-[0.7rem] text-muted-foreground/88">
                         {t.composer.editingQueuedInComposer}
@@ -1380,16 +1411,16 @@ export function ChatBar({
                     )}
                   >
                     <div className="flex translate-y-[3px] items-start gap-(--composer-control-gap) self-start [grid-area:menu]">
-                      {contextMenu}
-                      <ContribSlot area={COMPOSER_AREAS.leading} />
+                      {!actionsDisabled && contextMenu}
+                      {!actionsDisabled && <ContribSlot area={COMPOSER_AREAS.leading} />}
                     </div>
                     <div className="min-w-0 [grid-area:input]">{input}</div>
                     <div className="flex min-w-0 items-center justify-end gap-(--composer-control-gap) [grid-area:controls]">
-                      <ContribSlot area={COMPOSER_AREAS.actions} />
+                      {!actionsDisabled && <ContribSlot area={COMPOSER_AREAS.actions} />}
                       {controls}
                     </div>
                   </div>
-                  <ContribSlot area={COMPOSER_AREAS.bottom} />
+                  {!actionsDisabled && <ContribSlot area={COMPOSER_AREAS.bottom} />}
                 </div>
               </div>
             </div>

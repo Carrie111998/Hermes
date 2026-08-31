@@ -32,6 +32,7 @@ export interface ChatBarState {
 }
 
 export interface ChatBarProps {
+  actionsDisabled?: boolean
   busy: boolean
   disabled: boolean
   focusKey?: string | null

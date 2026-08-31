@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
 import { chatMessageText, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
@@ -19,6 +19,7 @@ import { useComposerScope } from '../scope'
 import type { ChatBarProps } from '../types'
 
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
+import { useCommittedActionScope } from './use-committed-action-scope'
 import { useVoiceConversation } from './use-voice-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
 
@@ -35,9 +36,15 @@ interface UseComposerVoiceArgs {
   onSubmit: ChatBarProps['onSubmit']
   onTranscribeAudio: ChatBarProps['onTranscribeAudio']
   sessionId: string | null | undefined
+  /** Durable identity for the route-scoped draft this callback belongs to. */
+  submissionKey: string | null
   /** This composer's focus-bus key — voice toggles targeting another
    *  composer (or the active one, when not us) are ignored. */
   target: ComposerTarget
+}
+
+export function canSubmitVoiceTurn({ busy, disabled }: Pick<UseComposerVoiceArgs, 'busy' | 'disabled'>): boolean {
+  return !busy && !disabled
 }
 
 /**
@@ -57,6 +64,7 @@ export function useComposerVoice({
   onSubmit,
   onTranscribeAudio,
   sessionId,
+  submissionKey,
   target
 }: UseComposerVoiceArgs) {
   const { t } = useI18n()
@@ -66,12 +74,65 @@ export function useComposerVoice({
   const ownsWakeIndicatorRef = useRef(false)
   const voiceStartRequest = useStore($voiceConversationStartRequest)
 
-  const { dictate, voiceActivityState, voiceStatus } = useVoiceRecorder({
+  // Voice transcription completes asynchronously. The composer intentionally
+  // stays mounted across route switches, so a callback created for A can finish
+  // after the same editor is showing B. Invalidate every callback generation on
+  // a durable draft-scope change and read all action dependencies live.
+  const voiceScopeIsCurrent = useCommittedActionScope(submissionKey, disabled)
+
+  const voiceActionStateRef = useRef({
+    busy,
+    clearDraft,
+    disabled,
     focusInput,
+    insertText,
+    onInterrupt,
+    onSubmit,
+    sessionId
+  })
+
+  useLayoutEffect(() => {
+    voiceActionStateRef.current = {
+      busy,
+      clearDraft,
+      disabled,
+      focusInput,
+      insertText,
+      onInterrupt,
+      onSubmit,
+      sessionId
+    }
+  }, [busy, clearDraft, disabled, focusInput, insertText, onInterrupt, onSubmit, sessionId])
+
+  const insertVoiceTranscript = (text: string) => {
+    if (voiceScopeIsCurrent()) {
+      voiceActionStateRef.current.insertText(text)
+    }
+  }
+
+  const focusAfterVoice = () => {
+    if (voiceScopeIsCurrent()) {
+      voiceActionStateRef.current.focusInput()
+    }
+  }
+
+  const {
+    cancel: cancelDictation,
+    dictate,
+    voiceActivityState,
+    voiceStatus
+  } = useVoiceRecorder({
+    focusInput: focusAfterVoice,
     maxRecordingSeconds,
-    onTranscript: insertText,
+    onTranscript: insertVoiceTranscript,
     onTranscribeAudio
   })
+
+  const cancelDictationRef = useRef(cancelDictation)
+
+  useLayoutEffect(() => {
+    cancelDictationRef.current = cancelDictation
+  }, [cancelDictation])
 
   /** Auto-speak selector: the latest unspoken reply only — a backlog collapses to the newest. */
   const pendingResponse = () => {
@@ -117,14 +178,24 @@ export function useComposerVoice({
   }
 
   const submitVoiceTurn = async (text: string) => {
-    if (busy) {
+    const action = voiceActionStateRef.current
+
+    if (!voiceScopeIsCurrent() || !canSubmitVoiceTurn(action)) {
       return
     }
 
     triggerHaptic('submit')
-    resetBrowseState(sessionId)
-    clearDraft()
-    await onSubmit(text)
+    resetBrowseState(action.sessionId)
+    action.clearDraft()
+    await action.onSubmit(text)
+  }
+
+  const interruptVoiceTurn = async () => {
+    if (!voiceScopeIsCurrent()) {
+      return
+    }
+
+    await voiceActionStateRef.current.onInterrupt?.()
   }
 
   const wakePausedRef = useRef(false)
@@ -138,17 +209,25 @@ export function useComposerVoice({
   const conversation = useVoiceConversation({
     busy,
     consumePendingResponse,
-    enabled: voiceConversationActive,
-    onFatalError: () => setVoiceConversationActive(false),
+    enabled: voiceConversationActive && !disabled,
+    onFatalError: () => {
+      if (voiceScopeIsCurrent()) {
+        setVoiceConversationActive(false)
+      }
+    },
     // Speaking over the model mid-generation interrupts the in-flight turn —
     // the same seam as the Stop button — so the interjection becomes the next
     // turn instead of waiting behind a reply the user already rejected.
-    onInterrupt,
+    onInterrupt: interruptVoiceTurn,
     // A spoken stop command ("stop", "never mind", "goodbye", …) ends the
     // hands-free conversation. Flipping the flag is the authoritative off
     // switch — the enabled=false prop + effect below drive conversation.end()
     // teardown (mic close, wake re-arm).
-    onStopWord: () => setVoiceConversationActive(false),
+    onStopWord: () => {
+      if (voiceScopeIsCurrent()) {
+        setVoiceConversationActive(false)
+      }
+    },
     onSubmit: submitVoiceTurn,
     onTranscribeAudio,
     pendingResponse: pendingTurnResponse,
@@ -156,6 +235,26 @@ export function useComposerVoice({
     // to finish releasing the capture device (see wakePauseBarrierRef).
     beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
   })
+
+  const mountedVoiceScopeKeyRef = useRef(submissionKey)
+  const mountedVoiceDisabledRef = useRef(disabled)
+
+  // eslint-disable-next-line no-restricted-syntax -- local lifecycle token, not an atom mirror
+  useEffect(() => {
+    const scopeChanged = mountedVoiceScopeKeyRef.current !== submissionKey
+    const becameDisabled = disabled && !mountedVoiceDisabledRef.current
+
+    mountedVoiceScopeKeyRef.current = submissionKey
+    mountedVoiceDisabledRef.current = disabled
+
+    if (!scopeChanged && !becameDisabled) {
+      return
+    }
+
+    cancelDictationRef.current()
+    setVoiceConversationActive(false)
+    void conversation.end()
+  }, [conversation, disabled, submissionKey])
 
   // eslint-disable-next-line no-restricted-syntax -- ownership token used only by unmount cleanup
   useEffect(() => {
