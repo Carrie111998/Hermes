@@ -18,7 +18,7 @@ This is different from the [API server](./api-server.md):
 |---|---|---|
 | What it serves | Your agent (full toolset, memory, skills) | Raw model inference |
 | Use case | "Use Hermes as a chat backend" | "Use my Portal sub from another app" |
-| Auth | Your `API_SERVER_KEY` | Any bearer (proxy attaches the real one) |
+| Auth | Your `API_SERVER_KEY` | Provider-specific; Codex requires an owner-only client bearer |
 | Tool calls | Yes — the agent runs tools | No — passthrough only |
 
 Use the API server when you want the **agent** as a backend. Use the
@@ -72,9 +72,56 @@ automatically when the bearer approaches expiry.
 hermes proxy providers
 ```
 
-Currently shipped: `nous` (Nous Portal) and `xai` (xAI / Grok). More
-OAuth providers can be added by implementing the `UpstreamAdapter`
+Currently shipped:
+
+- `openai-codex` (`codex` alias) — OpenAI Codex / ChatGPT OAuth, Responses API only
+- `nous` — Nous Portal
+- `xai` — xAI / Grok OAuth
+
+More OAuth providers can be added by implementing the `UpstreamAdapter`
 interface in `hermes_cli/proxy/adapters/`.
+
+### OpenAI Codex / ChatGPT OAuth
+
+Create a client bearer in an owner-only regular file, then start the proxy from
+the Hermes profile that owns the Codex OAuth credential:
+
+```bash
+umask 077
+python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > ~/.hermes/codex-proxy.token
+hermes proxy start --provider codex \
+  --auth-token-file ~/.hermes/codex-proxy.token
+```
+
+On POSIX systems the token file must be owned by the current user and have mode
+`0600`; symlinks are rejected. Keep its contents out of logs, command arguments,
+and source-controlled configuration.
+
+On Windows the file owner must be the current user (or SYSTEM), and its DACL may
+grant access only to that user and SYSTEM. Inherited or explicit allow entries
+for principals such as `Everyone` or `BUILTIN\\Users` are rejected.
+
+Codex forwards only `/v1/responses` and `/v1/models`. The adapter attaches the
+native Codex `originator`, `User-Agent`, and JWT-derived
+`ChatGPT-Account-ID` headers after stripping client-supplied values, so a
+loopback client cannot spoof account identity. A 401 refreshes the exact failed
+pool credential and rotates when refresh fails; a 429 marks the failed credential
+exhausted and rotates to another available account.
+
+Point a Responses-compatible client at:
+
+```text
+Base URL: http://127.0.0.1:8645/v1
+API key:  the bearer stored in ~/.hermes/codex-proxy.token
+Model:    a model available to your ChatGPT/Codex account
+Transport: OpenAI Responses API
+```
+
+Keep this proxy on `127.0.0.1`. Loopback limits network reachability, while the
+required client bearer establishes authority to spend the OAuth account owned
+by the profile that started it. Missing or incorrect client credentials return
+HTTP 401 before Hermes reads credential-pool availability, resolves a bearer,
+or contacts the Codex upstream. This applies to `/health` as well as `/v1/*`.
 
 ## Check status
 
@@ -173,6 +220,11 @@ subscription. The proxy has no auth of its own — it accepts any bearer.
 Use a firewall, VPN, or reverse proxy with proper auth if you expose
 this beyond your trusted network.
 
+The `openai-codex` adapter is stricter: it rejects every non-loopback bind,
+including `0.0.0.0`, and requires an owner-only client bearer even on loopback.
+Loopback alone is not an identity boundary on a multi-user host. Codex must
+remain on `127.0.0.1`, `::1`, or `localhost`.
+
 ## Rate limits
 
 Your Portal tier's RPM/TPM limits apply across the whole proxy. The
@@ -184,10 +236,11 @@ subscription quota. Monitor usage at
 
 The proxy is intentionally minimal. Per request:
 
-1. Receive `POST /v1/chat/completions` from your app
-2. Look up the adapter's current credential (refresh if expiring)
-3. Forward the request body verbatim, with `Authorization: Bearer <minted-key>`
-4. Stream the response back unchanged (SSE preserved)
+1. Receive a request on an adapter-allowed `/v1/*` path
+2. Validate client authority when the adapter requires it
+3. Look up the adapter's current credential (refresh if expiring)
+4. Forward the request body verbatim, replacing `Authorization` with the upstream bearer
+5. Stream the response back unchanged (SSE preserved)
 
 No transformation. No logging of request bodies. No agent loop. The
 proxy is a credential-attaching pass-through.

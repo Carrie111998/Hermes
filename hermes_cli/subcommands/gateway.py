@@ -30,7 +30,11 @@ def _add_compat_platform_flag(parser: argparse.ArgumentParser) -> None:
 
 
 def build_gateway_parser(
-    subparsers, *, cmd_gateway: Callable, cmd_proxy: Callable, cmd_gateway_enroll: Callable
+    subparsers,
+    *,
+    cmd_gateway: Callable,
+    cmd_proxy: Callable,
+    cmd_gateway_enroll: Callable,
 ) -> None:
     """Attach the ``gateway`` and ``proxy`` subcommands to ``subparsers``."""
     # =========================================================================
@@ -218,7 +222,9 @@ def build_gateway_parser(
     )
 
     # gateway list
-    gateway_subparsers.add_parser("list", help="List all profiles and their gateway status")
+    gateway_subparsers.add_parser(
+        "list", help="List all profiles and their gateway status"
+    )
 
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
@@ -319,8 +325,8 @@ def build_gateway_parser(
         description=(
             "Run a local HTTP server that forwards OpenAI-compatible requests "
             "to an OAuth-authenticated provider (e.g. Nous Portal). External "
-            "apps can point at the proxy with any bearer token; the proxy "
-            "attaches your real credentials."
+            "apps authenticate as required by the selected provider; the proxy "
+            "replaces client authorization with your upstream credentials."
         ),
     )
     proxy_subparsers = proxy_parser.add_subparsers(dest="proxy_command")
@@ -331,12 +337,15 @@ def build_gateway_parser(
     proxy_start.add_argument(
         "--provider",
         default="nous",
-        help="Upstream provider: nous or xai (default: nous). See `hermes proxy providers`.",
+        help="Upstream provider: codex, nous, or xai (default: nous). See `hermes proxy providers`.",
     )
     proxy_start.add_argument(
         "--host",
         default=None,
-        help="Bind address (default: 127.0.0.1). Use 0.0.0.0 to expose on LAN.",
+        help=(
+            "Bind address (default: 127.0.0.1). Use 0.0.0.0 only for "
+            "providers that permit LAN exposure."
+        ),
     )
     proxy_start.add_argument(
         "--port",
@@ -344,10 +353,16 @@ def build_gateway_parser(
         default=None,
         help="Bind port (default: 8645)",
     )
-
-    proxy_subparsers.add_parser(
-        "status", help="Show which proxy upstreams are ready"
+    proxy_start.add_argument(
+        "--auth-token-file",
+        default=None,
+        help=(
+            "File containing the client bearer token. Required for Codex; "
+            "must be a regular owner-only file (mode 0600 on POSIX)."
+        ),
     )
+
+    proxy_subparsers.add_parser("status", help="Show which proxy upstreams are ready")
     proxy_subparsers.add_parser(
         "providers", help="List available proxy upstream providers"
     )
