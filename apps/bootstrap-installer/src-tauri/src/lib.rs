@@ -107,7 +107,7 @@ pub fn run() {
     // macOS bare-launch self-update. When "Hermes" is launched normally (Install
     // mode, no repair flag) on an EXISTING install, decide up front whether to
     // fast-path-relaunch the built app or switch into the Update flow: if the
-    // checkout is behind upstream `main`, flip to Update so a normal launch
+    // checkout is behind the updater's selected branch, flip to Update so a normal launch
     // self-updates instead of silently running stale code. This is the recurring
     // "it never updates" trap — users relaunch expecting an update and just get
     // the old build, because a bare launch always fast-path-relaunched. Up-to-date
@@ -118,7 +118,8 @@ pub fn run() {
     if cfg!(target_os = "macos") && mode == AppMode::Install && !force_setup {
         let install_root = paths::hermes_home().join("hermes-agent");
         if bootstrap::hermes_is_installed(&install_root) {
-            if bootstrap::install_is_behind(&install_root) {
+            let branch = update::resolved_update_branch(std::env::args().skip(1));
+            if bootstrap::install_is_behind(&install_root, &branch) {
                 mode = AppMode::Update;
             } else {
                 macos_relaunch_existing = true;
