@@ -1242,6 +1242,45 @@ class TeamsAdapter(BasePlatformAdapter):
                     body=AdaptiveCardActionMessageResponse(value="⛔ Not authorized."),
                 )
 
+        # --- Hermes interactive-card patch: slash-confirm + clarify clicks ---
+        if hermes_action in ("sc_once", "sc_always", "sc_cancel"):
+            from tools import slash_confirm as _sc_mod
+
+            choice = {"sc_once": "once", "sc_always": "always", "sc_cancel": "cancel"}[hermes_action]
+            label = {"once": "\u2705 Approved once", "always": "\U0001f512 Always approve", "cancel": "\u274c Cancelled"}[choice]
+            _result = await _sc_mod.resolve(session_key, data.get("confirm_id", ""), choice)
+            body = [TextBlock(text=label, wrap=True, weight="Bolder")]
+            _followup_chat = data.get("chat_id", "")
+            if _result and _followup_chat and self._app:
+                try:
+                    await self.send(_followup_chat, _result)
+                except Exception as _e:
+                    logger.debug("[teams] slash-confirm follow-up send failed: %s", _e)
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionCardResponse(
+                    value=AdaptiveCard().with_version("1.4").with_body(body)
+                ),
+            )
+
+        if hermes_action in ("cl_pick", "cl_other"):
+            from tools.clarify_gateway import resolve_gateway_clarify, mark_awaiting_text
+
+            clarify_id = data.get("clarify_id", "")
+            if hermes_action == "cl_other":
+                mark_awaiting_text(clarify_id)
+                body = [TextBlock(text="\u270f\ufe0f Type your answer \u2014 the next message becomes the response.", wrap=True)]
+            else:
+                resp = data.get("choice_text", "")
+                resolve_gateway_clarify(clarify_id, resp)
+                body = [TextBlock(text=f"\u2705 {resp}", wrap=True, weight="Bolder")]
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionCardResponse(
+                    value=AdaptiveCard().with_version("1.4").with_body(body)
+                ),
+            )
+
         choice_map = {
             "approve_once": "once",
             "approve_session": "session",
@@ -1385,6 +1424,87 @@ class TeamsAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=str(e), retryable=True)
 
         return SendResult(success=True, message_id=last_message_id)
+
+    async def send_slash_confirm(
+        self,
+        chat_id: str,
+        title: str,
+        message: str,
+        session_key: str,
+        confirm_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a three-button slash-command confirmation as an Adaptive Card."""
+        if not self._app:
+            return SendResult(success=False, error="Teams app not initialized")
+        try:
+            data_base = {
+                "session_key": session_key,
+                "confirm_id": confirm_id,
+                "chat_id": chat_id,
+            }
+            card = (
+                AdaptiveCard()
+                .with_version("1.4")
+                .with_body([
+                    TextBlock(text=title or "Confirm", wrap=True, weight="Bolder"),
+                    TextBlock(text=message, wrap=True),
+                ])
+                .with_actions([
+                    ExecuteAction(title="\u2705 Approve Once", verb="hermes_approve",
+                                  data={**data_base, "hermes_action": "sc_once"}, style="positive"),
+                    ExecuteAction(title="\U0001f512 Always Approve", verb="hermes_approve",
+                                  data={**data_base, "hermes_action": "sc_always"}),
+                    ExecuteAction(title="\u274c Cancel", verb="hermes_approve",
+                                  data={**data_base, "hermes_action": "sc_cancel"}, style="destructive"),
+                ])
+            )
+            result = await self._send_card(chat_id, card)
+            message_id = getattr(result, "id", None) if result else None
+            return SendResult(success=True, message_id=str(message_id) if message_id else None)
+        except Exception as e:
+            logger.warning("[teams] send_slash_confirm failed: %s", e)
+            return SendResult(success=False, error=str(e))
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a clarify prompt as an Adaptive Card (one button per choice + Other)."""
+        if not self._app:
+            return SendResult(success=False, error="Teams app not initialized")
+        try:
+            body = [TextBlock(text=f"\u2753 {question}", wrap=True, weight="Bolder")]
+            actions = []
+            if choices:
+                for idx, choice_text in enumerate(choices):
+                    actions.append(ExecuteAction(
+                        title=str(idx + 1), verb="hermes_approve",
+                        data={"session_key": session_key, "clarify_id": clarify_id,
+                              "chat_id": chat_id, "hermes_action": "cl_pick",
+                              "choice_text": str(choice_text)},
+                    ))
+                body.append(TextBlock(
+                    text="\n".join(f"{i + 1}. {c}" for i, c in enumerate(choices)),
+                    wrap=True,
+                ))
+                actions.append(ExecuteAction(
+                    title="\u270f\ufe0f Other (type answer)", verb="hermes_approve",
+                    data={"session_key": session_key, "clarify_id": clarify_id,
+                          "chat_id": chat_id, "hermes_action": "cl_other"},
+                ))
+            card = AdaptiveCard().with_version("1.4").with_body(body).with_actions(actions)
+            result = await self._send_card(chat_id, card)
+            message_id = getattr(result, "id", None) if result else None
+            return SendResult(success=True, message_id=str(message_id) if message_id else None)
+        except Exception as e:
+            logger.warning("[teams] send_clarify failed: %s", e)
+            return SendResult(success=False, error=str(e))
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         if not self._app:
