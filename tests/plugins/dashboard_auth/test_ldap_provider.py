@@ -550,6 +550,40 @@ class TestGroupRestriction:
             p.complete_password_login(username="bob", password="hunter2")
 
 
+def search_failure_factory(exc):
+    """Factory whose connections bind fine but raise inside ``search()``.
+
+    Returns ``(factory, made)`` where ``made`` collects every connection
+    handed out, so a test can assert it was unbound. The MOCK_SYNC
+    directory cannot reach the refresh probe's exception arms at all —
+    it is built with ``raise_exceptions=False``, so LDAP result codes
+    arrive as a falsy search rather than an exception — hence this stub.
+    """
+    made = []
+
+    class _Conn:
+        entries: list = []
+
+        def __init__(self):
+            self.unbound = False
+
+        def bind(self):
+            return True
+
+        def search(self, **kwargs):
+            raise exc
+
+        def unbind(self):
+            self.unbound = True
+
+    def factory(*, user, password):
+        conn = _Conn()
+        made.append(conn)
+        return conn
+
+    return factory, made
+
+
 class TestRefreshDirectoryCheck:
     def make(self, entries=MOCK_ENTRIES, **overrides):
         kwargs = dict(
@@ -585,6 +619,42 @@ class TestRefreshDirectoryCheck:
         p._factory = broken_factory
         with pytest.raises(ProviderError):
             p.refresh_session(refresh_token=s.refresh_token)
+
+    def test_refresh_transport_failure_mid_probe_is_provider_error(self):
+        # The service bind SUCCEEDS and the socket then dies during the
+        # existence probe. That is an outage, not a deleted account:
+        # answering "user gone" here would raise RefreshExpiredError and
+        # log every active user out whenever the directory blipped. The
+        # contract says an unreachable directory is a 503 (ProviderError)
+        # with the session cookies left intact.
+        from ldap3.core.exceptions import LDAPSocketReceiveError
+
+        p = self.make()
+        s = p.complete_password_login(username="alice", password="s3cret")
+        factory, made = search_failure_factory(
+            LDAPSocketReceiveError("connection reset by peer")
+        )
+        p._factory = factory
+        with pytest.raises(ProviderError):
+            p.refresh_session(refresh_token=s.refresh_token)
+        # The failing probe must not leak its connection.
+        assert made and all(c.unbound for c in made)
+
+    def test_refresh_no_such_object_result_means_user_gone(self):
+        # A connection_factory that opted into raise_exceptions=True
+        # surfaces the noSuchObject *result code* as an exception instead
+        # of a falsy search — still "user gone", so the session expires.
+        from ldap3.core.exceptions import LDAPNoSuchObjectResult
+
+        p = self.make()
+        s = p.complete_password_login(username="alice", password="s3cret")
+        factory, made = search_failure_factory(
+            LDAPNoSuchObjectResult(description="noSuchObject")
+        )
+        p._factory = factory
+        with pytest.raises(RefreshExpiredError):
+            p.refresh_session(refresh_token=s.refresh_token)
+        assert made and all(c.unbound for c in made)
 
     def test_refresh_check_can_be_disabled(self):
         p = self.make(verify_user_on_refresh=False)

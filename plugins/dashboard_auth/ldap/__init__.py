@@ -609,7 +609,10 @@ class LdapAuthProvider(DashboardAuthProvider):
         if not user_dn:
             return False
         import ldap3
-        from ldap3.core.exceptions import LDAPException
+        from ldap3.core.exceptions import (
+            LDAPException,
+            LDAPNoSuchObjectResult,
+        )
 
         conn = self._bind(
             user=self._bind_dn or None,
@@ -626,13 +629,24 @@ class LdapAuthProvider(DashboardAuthProvider):
                 search_scope=ldap3.BASE,
                 attributes=[],
             )
+            # The normal "user gone" path: connections are built with
+            # raise_exceptions=False, so an LDAP *result* code such as
+            # noSuchObject comes back as a falsy search, not an exception.
             return bool(ok and conn.entries)
-        except LDAPException:
-            # A BASE search on a nonexistent DN raises noSuchObject on
-            # many servers rather than returning an empty result — that
-            # is "user gone", not an outage (the bind above already
-            # proved the directory reachable).
+        except LDAPNoSuchObjectResult:
+            # Same verdict for a connection_factory that opted into
+            # raise_exceptions=True, where the result code is raised.
             return False
+        except LDAPException as exc:
+            # Everything else that raises here is transport-level — the
+            # socket died mid-refresh, the receive timed out, the session
+            # was terminated. That is an outage, NOT a deleted account:
+            # returning False would make the caller raise
+            # RefreshExpiredError and log the user out. The contract says
+            # an unreachable directory must 503 with cookies intact.
+            raise ProviderError(
+                f"LDAP refresh check failed: {exc}"
+            ) from exc
         finally:
             try:
                 conn.unbind()
