@@ -388,3 +388,286 @@ def _make_file_chat_item(file_path: str, file_name: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 11. Inbound: chatItemUpdated (edits) and message_id propagation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_item_updated_direct_sets_message_id_and_is_edit():
+    """(a) chatItemUpdated for a direct chat produces MessageEvent with
+    message_id, metadata["is_edit"]=True, text, chat_id, and sender."""
+    adapter = _adapter_with_ws()
+    adapter.handle_message = AsyncMock()
+    # Bypass text batching delay — flush immediately
+    adapter._text_batch_delay = 0
+
+    event = {
+        "type": "chatItemUpdated",
+        "chatItem": {
+            "chatInfo": {
+                "type": "direct",
+                "contact": {"contactId": 42, "localDisplayName": "tester"},
+            },
+            "chatItem": {
+                "chatDir": {"type": "directRcv"},
+                "meta": {
+                    "itemId": 123,
+                    "itemTs": "2026-01-01T00:00:00Z",
+                },
+                "content": {
+                    "type": "rcvMsgContent",
+                    "msgContent": {"type": "text", "text": "edited message"},
+                },
+            },
+        },
+    }
+
+    await adapter._handle_event(event)
+    await asyncio.sleep(0.01)  # let batch flush task complete
+
+    adapter.handle_message.assert_called_once()
+    msg = adapter.handle_message.call_args[0][0]
+    assert msg.message_id == "123"
+    assert msg.metadata.get("is_edit") is True
+    assert msg.text == "edited message"
+    assert msg.source.chat_id == "42"
+    assert msg.source.user_id == "42"
+    assert msg.source.chat_type == "dm"
+
+
+@pytest.mark.asyncio
+async def test_chat_item_updated_group_sets_message_id_and_is_edit():
+    """(b) chatItemUpdated for a group chat — sender from groupMember."""
+    adapter = _adapter_with_ws()
+    adapter.handle_message = AsyncMock()
+    adapter._text_batch_delay = 0  # flush immediately, no async sleep
+
+    # Temporarily enable group allowance
+    adapter.group_allow_from = {"*"}
+
+    event = {
+        "type": "chatItemUpdated",
+        "chatItem": {
+            "chatInfo": {
+                "type": "group",
+                "groupInfo": {
+                    "groupId": 77,
+                    "localDisplayName": "my-group",
+                },
+            },
+            "chatItem": {
+                "chatDir": {
+                    "type": "groupRcv",
+                    "groupMember": {
+                        "memberId": 55,
+                        "localDisplayName": "alice",
+                    },
+                },
+                "meta": {
+                    "itemId": 456,
+                    "itemTs": "2026-01-01T00:00:00Z",
+                },
+                "content": {
+                    "type": "rcvMsgContent",
+                    "msgContent": {"type": "text", "text": "group edit"},
+                },
+            },
+        },
+    }
+
+    await adapter._handle_event(event)
+    await asyncio.sleep(0.01)  # let batch flush task complete
+
+    adapter.handle_message.assert_called_once()
+    msg = adapter.handle_message.call_args[0][0]
+    assert msg.message_id == "456"
+    assert msg.metadata.get("is_edit") is True
+    assert msg.text == "group edit"
+    assert msg.source.chat_id == "group:77"
+    assert msg.source.user_id == "55"
+    assert msg.source.chat_type == "group"
+
+
+@pytest.mark.asyncio
+async def test_chat_item_updated_outgoing_ignored():
+    """(c) chatItemUpdated with directSnd direction is dropped."""
+    adapter = _adapter_with_ws()
+    adapter.handle_message = AsyncMock()
+
+    event = {
+        "type": "chatItemUpdated",
+        "chatItem": {
+            "chatInfo": {
+                "type": "direct",
+                "contact": {"contactId": 42, "localDisplayName": "tester"},
+            },
+            "chatItem": {
+                "chatDir": {"type": "directSnd"},
+                "meta": {"itemId": 999, "itemTs": "2026-01-01T00:00:00Z"},
+                "content": {
+                    "type": "rcvMsgContent",
+                    "msgContent": {
+                        "type": "text",
+                        "text": "our own edit",
+                    },
+                },
+            },
+        },
+    }
+
+    await adapter._handle_event(event)
+    adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_new_chat_items_sets_message_id():
+    """(d) newChatItems path populates message_id from meta.itemId."""
+    adapter = _adapter_with_ws()
+    adapter.handle_message = AsyncMock()
+    adapter._text_batch_delay = 0  # flush immediately, no async sleep
+
+    event = {
+        "resp": {
+            "type": "newChatItems",
+            "chatItems": [
+                {
+                    "chatInfo": {
+                        "type": "direct",
+                        "contact": {
+                            "contactId": 42,
+                            "localDisplayName": "tester",
+                        },
+                    },
+                    "chatItem": {
+                        "chatDir": {"type": "directRcv"},
+                        "meta": {
+                            "itemId": 789,
+                            "itemTs": "2026-01-01T00:00:00Z",
+                        },
+                        "content": {
+                            "type": "rcvMsgContent",
+                            "msgContent": {
+                                "type": "text",
+                                "text": "hello",
+                            },
+                        },
+                    },
+                }
+            ],
+        }
+    }
+
+    await adapter._handle_event(event)
+    await asyncio.sleep(0.01)  # let batch flush task complete
+
+    adapter.handle_message.assert_called_once()
+    msg = adapter.handle_message.call_args[0][0]
+    assert msg.message_id == "789"
+    # metadata should NOT contain is_edit for a non-edit message
+    assert "is_edit" not in msg.metadata
+
+
+@pytest.mark.asyncio
+async def test_chat_item_updated_empty_does_not_raise():
+    """(e) chatItemUpdated with empty/malformed chatItem does not raise."""
+    adapter = _adapter_with_ws()
+    adapter.handle_message = AsyncMock()
+
+    # Empty chatItem dict
+    event = {"type": "chatItemUpdated", "chatItem": {}}
+    await adapter._handle_event(event)
+    adapter.handle_message.assert_not_called()
+
+    # No chatItem key at all
+    event2 = {"type": "chatItemUpdated"}
+    await adapter._handle_event(event2)
+    adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_chat_item_updated_image_msg_content_produces_edit():
+    """(f) chatItemUpdated with image-type msgContent + caption: edit still
+    produces MessageEvent with message_id, is_edit=True, and caption text;
+    file metadata is not reconstructed on edits."""
+    adapter = _adapter_with_ws()
+    adapter.handle_message = AsyncMock()
+    adapter._text_batch_delay = 0
+
+    event = {
+        "type": "chatItemUpdated",
+        "chatItem": {
+            "chatInfo": {
+                "type": "direct",
+                "contact": {"contactId": 42, "localDisplayName": "tester"},
+            },
+            "chatItem": {
+                "chatDir": {"type": "directRcv"},
+                "meta": {
+                    "itemId": 321,
+                    "itemTs": "2026-01-01T00:00:00Z",
+                },
+                "content": {
+                    "type": "rcvMsgContent",
+                    "msgContent": {
+                        "type": "image",
+                        "text": "a photo of a cat",
+                    },
+                },
+            },
+        },
+    }
+
+    await adapter._handle_event(event)
+    await asyncio.sleep(0.01)
+
+    adapter.handle_message.assert_called_once()
+    msg = adapter.handle_message.call_args[0][0]
+    assert msg.message_id == "321"
+    assert msg.metadata.get("is_edit") is True
+    assert msg.text == "a photo of a cat"
+
+
+@pytest.mark.asyncio
+async def test_chat_item_updated_missing_itemid():
+    """(g) chatItemUpdated whose meta has no itemId: MessageEvent produced
+    WITHOUT message_id; metadata is_edit is still True. This documents the
+    fallback where the gateway treats such an edit as a non-edit (normal
+    dispatch)."""
+    adapter = _adapter_with_ws()
+    adapter.handle_message = AsyncMock()
+    adapter._text_batch_delay = 0
+
+    event = {
+        "type": "chatItemUpdated",
+        "chatItem": {
+            "chatInfo": {
+                "type": "direct",
+                "contact": {"contactId": 42, "localDisplayName": "tester"},
+            },
+            "chatItem": {
+                "chatDir": {"type": "directRcv"},
+                "meta": {
+                    "itemTs": "2026-01-01T00:00:00Z",
+                    # no itemId key
+                },
+                "content": {
+                    "type": "rcvMsgContent",
+                    "msgContent": {
+                        "type": "text",
+                        "text": "edit with no itemId",
+                    },
+                },
+            },
+        },
+    }
+
+    await adapter._handle_event(event)
+    await asyncio.sleep(0.01)
+
+    adapter.handle_message.assert_called_once()
+    msg = adapter.handle_message.call_args[0][0]
+    # message_id is not set when meta.itemId is absent
+    assert not hasattr(msg, "message_id") or msg.message_id is None
+    assert msg.metadata.get("is_edit") is True
+    assert msg.text == "edit with no itemId"

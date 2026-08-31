@@ -440,6 +440,25 @@ class SimplexAdapter(BasePlatformAdapter):
                 logger.exception("SimpleX: error processing chat item")
             return
 
+        # Edited messages — simplex-chat sends "chatItemUpdated" with the
+        # full updated chatItem wrapper.  The itemId is stable across edits,
+        # so we use it as message_id and mark metadata["is_edit"] so
+        # consumers can react differently (e.g. re-summarize instead of
+        # append).  Outgoing-direction guard inside _handle_chat_item
+        # naturally drops edits of the bot's own messages.
+        # NOTE: edited media items carry only their caption text on the edit
+        # event — file/image payloads are not reconstructed on edits
+        # (intentional; matches newChatItems behavior for caption-only
+        # edits).
+        if resp_type == "chatItemUpdated":
+            try:
+                await self._handle_chat_item(
+                    resp.get("chatItem", {}), is_edit=True
+                )
+            except Exception:
+                logger.exception("SimpleX: error processing chat item update")
+            return
+
         # File transfer completion — deliver any deferred chat item
         if resp_type == "rcvFileComplete":
             chat_item = resp.get("chatItem", {}) or {}
@@ -471,8 +490,8 @@ class SimplexAdapter(BasePlatformAdapter):
         if resp_type:
             logger.debug("SimpleX: unhandled event type: %s", resp_type)
 
-    async def _handle_chat_item(self, chat_item: dict) -> None:
-        """Process a single chat item from a newChatItems event."""
+    async def _handle_chat_item(self, chat_item: dict, is_edit: bool = False) -> None:
+        """Process a single chat item from a newChatItems or chatItemUpdated event."""
         chat_info = chat_item.get("chatInfo", {}) or {}
         chat_item_data = chat_item.get("chatItem", {}) or {}
 
@@ -643,7 +662,11 @@ class SimplexAdapter(BasePlatformAdapter):
         except (ValueError, AttributeError):
             timestamp = datetime.now(tz=timezone.utc)
 
-        msg_event = MessageEvent(
+        # Extract the stable item ID for edit tracking
+        item_id = meta.get("itemId")
+        msg_id = str(item_id) if item_id is not None else None
+
+        msg_kwargs: Dict[str, Any] = dict(
             source=source,
             text=text or "",
             message_type=msg_type,
@@ -652,6 +675,12 @@ class SimplexAdapter(BasePlatformAdapter):
             timestamp=timestamp,
             raw_message=chat_item,
         )
+        if msg_id is not None:
+            msg_kwargs["message_id"] = msg_id
+        if is_edit:
+            msg_kwargs["metadata"] = {"is_edit": True}
+
+        msg_event = MessageEvent(**msg_kwargs)
 
         logger.debug(
             "SimpleX: message from %s in %s: %s",

@@ -9607,6 +9607,155 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _q_state.conversation.queued_events = kept
         return removed
 
+    def _replace_queued_message(
+        self,
+        session_key: str,
+        adapter: Any,
+        message_id: str,
+        new_text: str,
+    ) -> bool:
+        """Replace the text of the first queued event matching ``message_id``.
+
+        Searches the primary pending slot first, then the overflow FIFO.
+        Mutates the matching event's ``.text`` in place and preserves all
+        other fields and FIFO order.  Returns True if a match was replaced,
+        False if no match was found in either queue level.
+
+        Modeled on ``_clear_goal_pending_continuations`` (same two-level
+        search pattern).
+        """
+        # Primary slot
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if isinstance(pending_slot, dict):
+            pending_event = pending_slot.get(session_key)
+            if pending_event is not None and getattr(pending_event, "message_id", None) == message_id:
+                pending_event.text = new_text
+                return True
+
+        # Overflow FIFO
+        _q_state = self._peek_session_state(session_key)
+        overflow = _q_state.conversation.queued_events if _q_state else []
+        for ev in overflow:
+            if getattr(ev, "message_id", None) == message_id:
+                ev.text = new_text
+                return True
+
+        return False
+
+    def _handle_edit_supersede(
+        self,
+        event: "MessageEvent",
+        session_key: str,
+        adapter: Any,
+    ) -> bool:
+        """Correlate an inbound edit with queued or in-flight messages.
+
+        Called from the synchronous edit-supersede block in
+        ``_handle_message`` (#35535).  Returns True if the event was handled
+        (queue-replaced, in-flight redirected/steered, or silently dropped);
+        the caller should return ``None`` to skip normal dispatch.  Returns
+        False for non-edit events that should continue through normal
+        processing.
+
+        Design intent (per issue #35535 design review):
+          * Queue match -> replace text in-place, silent (no ack).
+          * In-flight match (active_message_id) -> redirect/steer with
+            framing text.  Neither primitive cancels in-flight tools — this
+            is the best available approach without transcript mutation.
+          * No match (uncorrelated edit) -> silently dropped.  An isolated
+            out-of-context correction would confuse the model.
+
+        SYNCHRONOUS: this method and ``_replace_queued_message`` are only
+        called from the gateway's single asyncio event loop with **no await
+        points** between the queue check, the in-flight check, and the
+        mutation — cooperative scheduling therefore cannot interleave a queue
+        promotion or turn completion inside the correlation block, and no lock
+        is required.  Cross-vendor review (Gemini/GPT-OSS) verified this
+        invariant.
+        """
+        _is_edit = bool(event.metadata.get("is_edit", False) if event.metadata else False)
+        _msg_id = event.message_id
+        if not _is_edit or not _msg_id:
+            return False  # not an edit — continue normal dispatch
+
+        # SECURITY: correlation is scoped by session_key (derived from
+        # platform + chat_id, distinct for group vs DM sessions).  Platform
+        # message ids are unique per chat, so an edit from user A cannot
+        # supersede a queued message from user B in a shared group — each
+        # group session is separate.
+        # 1. Try queued supersede
+        if self._replace_queued_message(session_key, adapter, _msg_id, event.text or ""):
+            logger.info(
+                "Edit supersede — replaced queued message_id=%s for session %s",
+                _msg_id, session_key,
+            )
+            return True
+
+        # 2. Try in-flight redirect / steer
+        _q_state = self._peek_session_state(session_key)
+        if _q_state and _q_state.turn.active_message_id == _msg_id:
+            running_agent = _q_state.turn.agent
+            if running_agent is not None and running_agent is not _AGENT_PENDING_SENTINEL:
+                _framing = f'[User edited their earlier message. Corrected message: "{event.text}"]'
+                _handled = False
+                # Prefer redirect() over steer() — redirect delivers as
+                # user-side input next model iteration, steer appends to
+                # last tool result.  Neither cancels in-flight tools.
+                if (
+                    getattr(running_agent, "_supports_active_turn_redirect", False) is True
+                    and hasattr(running_agent, "redirect")
+                ):
+                    try:
+                        _handled = bool(running_agent.redirect(_framing))
+                    except Exception as exc:
+                        logger.warning(
+                            "Edit supersede — redirect failed for session %s: %s",
+                            session_key, exc,
+                        )
+                if not _handled and hasattr(running_agent, "steer"):
+                    try:
+                        _handled = bool(running_agent.steer(_framing))
+                    except Exception as exc:
+                        logger.warning(
+                            "Edit supersede — steer failed for session %s: %s",
+                            session_key, exc,
+                        )
+                if _handled:
+                    logger.info(
+                        "Edit supersede — redirected/steered in-flight turn "
+                        "message_id=%s for session %s",
+                        _msg_id, session_key,
+                    )
+                    return True
+                # Fallback: queue the edit as a normal pending event
+                logger.warning(
+                    "Edit supersede — redirect/steer unavailable for session %s, "
+                    "queueing edit as normal pending event",
+                    session_key,
+                )
+                self._queue_or_replace_pending_event(session_key, event)
+                return True
+
+            elif running_agent is _AGENT_PENDING_SENTINEL:
+                logger.info(
+                    "Edit supersede — edit matched in-flight turn but agent "
+                    "still pending (sentinel); edit dropped for session %s",
+                    session_key,
+                )
+                return True
+
+        # 3. Uncoupled edit (#35535 deliberate policy): no queued match,
+        #    no in-flight match.  An isolated out-of-context correction
+        #    would confuse the model — drop it silently.
+        logger.info(
+            "Edit supersede — uncorrelated edit dropped "
+            "(platform=%s, chat=%s, message_id=%s)",
+            getattr(getattr(event.source, "platform", None), "value", "?"),
+            getattr(event.source, "chat_id", "?"),
+            _msg_id,
+        )
+        return True
+
     def _goal_still_active_for_session(self, session_id: str) -> bool:
         """Best-effort fresh DB check before running a queued continuation."""
         if not session_id:
@@ -18307,6 +18456,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 self._release_running_agent_state(_quick_key)
 
+        # ── Edit supersede (#35535) ────────────────────────────────────
+        # SYNCHRONOUS block: no await between queued-replace, in-flight
+        # check, and decision.  An inbound EDIT of a previously-sent message
+        # supersedes the queued original or the in-flight turn; an isolated
+        # out-of-context correction is silently dropped.
+        _edit_adapter = self._adapter_for_source(source)
+        if _edit_adapter is not None:
+            if self._handle_edit_supersede(event, _quick_key, _edit_adapter):
+                return None
+
         if self._is_session_running(_quick_key):
             # Resolve the command once; every command's mid-run behavior is
             # declared on its CommandDef (busy_policy / busy_handler in
@@ -19257,6 +19416,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.started_ts = time.time()
+        _claim_state.turn.active_message_id = event.message_id or None
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
