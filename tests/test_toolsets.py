@@ -69,6 +69,13 @@ class TestResolveToolset:
         assert "web_search" in tools
         assert "web_extract" in tools
 
+    def test_review_toolset_exposes_inspection_without_mutation(self):
+        tools = set(resolve_toolset("review"))
+        assert {"read_file", "search_files", "web_search", "web_extract"}.issubset(tools)
+        assert not tools.intersection(
+            {"write_file", "patch", "terminal", "process", "execute_code", "delegate_task", "cronjob"}
+        )
+
     def test_cycle_detection(self):
         # Create a cycle: A includes B, B includes A
         TOOLSETS["_cycle_a"] = {"description": "test", "tools": ["t1"], "includes": ["_cycle_b"]}

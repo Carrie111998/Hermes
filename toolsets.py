@@ -367,6 +367,22 @@ TOOLSETS = {
         "includes": ["web", "file"]  # For searching error messages and solutions, and file operations
     },
     
+    "review": {
+        "description": (
+            "Read-only inspection for independent reviews: local evidence, source, "
+            "and public web research without file mutation, shell access, code "
+            "execution, cron, delegation, or service writes"
+        ),
+        "tools": [
+            "read_file", "search_files",
+            "web_search", "web_extract",
+            "vision_analyze",
+            "skills_list", "skill_view",
+            "session_search", "clarify",
+        ],
+        "includes": [],
+    },
+
     "safe": {
         "description": "Safe toolkit without terminal access",
         "tools": [],
