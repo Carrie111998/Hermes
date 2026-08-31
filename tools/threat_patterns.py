@@ -245,6 +245,25 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     # so a payload past ``MAX_SCAN_CHARS`` (which the renderer may still emit as
     # a tail) is not silently skipped.  Findings are deduplicated — a pattern
     # can legitimately fire in more than one overlapping chunk.
+    #
+    # Cost model: this loop is O(len(content)) in the input — deliberately,
+    # because the tail is now scanned rather than dropped.  `scan_for_threats`
+    # runs on the hot path (every tool result / context string), so a multi-MB
+    # input costs proportionally per call.  The old single-pass HEAD-only scan
+    # was O(MAX_SCAN_CHARS) regardless of size; that bounded-runtime guarantee
+    # no longer holds and should not be re-asserted.
+    #
+    # Overlap semantics: `_CHUNK_OVERLAP` (4096) is sized so any single pattern
+    # match straddling a seam — the widest spans are the ``[^\n]{0,2048}`` /
+    # ``[^>]{0,2048}`` exfil and config-mod patterns (see the `_CHUNK_OVERLAP`
+    # comment above) — is seen whole by the following chunk.  This is a
+    # guarantee about *span width*,
+    # not boundary equivalence with a single-pass scan: a ``\\b``-anchored keyword
+    # can still fire (or miss) purely because a chunk begins/ends mid-text at a
+    # word boundary.  NFKC is likewise applied per chunk, so a multi-codepoint
+    # composition that spans a seam (e.g. a Hangul jamo pair) may normalize
+    # differently than in whole-string normalization — low risk in practice, but
+    # the overlap only mitigates, not eliminates, this boundary effect.
     patterns = _COMPILED.get(scope)
     if patterns is None:
         raise ValueError(f"scan_for_threats: unknown scope {scope!r}")
