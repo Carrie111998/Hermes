@@ -423,6 +423,33 @@ def _review_fork_first_request_pending(agent: Any) -> bool:
     )
 
 
+def _native_responses_compaction_owns_turn_start(agent: Any) -> bool:
+    """Whether the next Responses request can own turn-start compaction.
+
+    A resumed thread can already exceed Hermes' local trigger before its first
+    request. In that case merely configuring the native threshold below the
+    local threshold is insufficient: the turn prologue starts local compression
+    before the provider ever sees ``context_management``. Reuse the request
+    gate here so eligible OpenAI/Codex threads reach native compaction first,
+    while every disabled, checkpoint-required, unsupported-model, or indirect
+    route keeps the existing local-preflight fallback.
+    """
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return False
+
+    from agent.codex_responses_adapter import classify_responses_route
+    from agent.native_compaction import native_compaction_context_management
+
+    route = classify_responses_route(agent)
+
+    return native_compaction_context_management(
+        agent,
+        is_codex_backend=route.is_codex_backend,
+        is_xai_responses=route.is_xai_responses,
+        is_github_responses=route.is_github_responses,
+    ) is not None
+
+
 def _compression_warrants_another_preflight_pass(
     orig_tokens: int, new_tokens: int, threshold_tokens: int
 ) -> bool:
@@ -904,8 +931,14 @@ def build_turn_context(
     # work; nothing has touched it yet this turn, so it measures the gap since
     # the previous turn finished. The cheap gap pre-check gates the (more
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
+    _responses_native_auto = _native_responses_compaction_owns_turn_start(agent)
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
-    if agent.compression_enabled and _idle_after > 0 and messages:
+    if (
+        agent.compression_enabled
+        and not _responses_native_auto
+        and _idle_after > 0
+        and messages
+    ):
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
@@ -1038,7 +1071,6 @@ def build_turn_context(
             ).lower()
             in {"native", "off"}
         )
-
         if not _preflight_deferred:
             _last = _compressor.last_prompt_tokens
             # Do NOT overwrite the -1 sentinel (#36718).
@@ -1060,6 +1092,11 @@ def build_turn_context(
                 f"{_preflight_tokens:,}",
                 f"{_compressor.threshold_tokens:,}",
                 f"{_compressor.last_real_prompt_tokens:,}",
+            )
+        elif _responses_native_auto:
+            logger.info(
+                "Skipping Hermes preflight compression for native Responses "
+                "compaction; provider context_management owns this request."
             )
         elif _compression_cooldown:
             logger.info(
@@ -1218,7 +1255,12 @@ def build_turn_context(
             # cooldown, deferred estimate, or codex-native route must keep
             # the engine hook un-consulted (#20316 contract — the cooldown
             # exists precisely because compression recently failed).
-            if _compression_cooldown or _preflight_deferred or _codex_native_auto:
+            if (
+                _compression_cooldown
+                or _preflight_deferred
+                or _codex_native_auto
+                or _responses_native_auto
+            ):
                 _engine_preflight = None
             else:
                 _engine_preflight = getattr(
@@ -1226,7 +1268,8 @@ def build_turn_context(
                 )
             # ── Engine-driven sub-threshold preflight maintenance (#20316) ──
             # None of the threshold-path branches fired (not deferred, no
-            # failure cooldown, not codex-native, and should_compress() said
+            # failure cooldown, no native compaction owner, and
+            # should_compress() said
             # the request is under pressure). Context engines that override
             # ``should_compress_preflight()`` (e.g. LCM-style incremental
             # leaf-chunk compaction) can still request deferred maintenance

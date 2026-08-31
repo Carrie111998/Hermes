@@ -1012,6 +1012,54 @@ class TestPreflightCompression:
         assert agent.client.chat.completions.create.call_count == 0
         assert agent.context_compressor.last_prompt_tokens == 74_400
 
+    def test_native_compaction_eligible_resume_skips_local_preflight(self, agent):
+        """A large resumable Codex thread must reach native compaction first."""
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent.model = "gpt-5.6-sol-900k"
+        agent.runtime_capabilities = {"native_compaction": True}
+        agent.codex_responses_native_compaction = True
+        agent.compression_checkpoint_required = False
+        agent.compression_enabled = True
+        agent.compression_idle_compact_after_seconds = 1
+        agent._last_activity_ts = 0
+        agent._interrupt_requested = True
+        agent.context_compressor.context_length = 900_000
+        agent.context_compressor.threshold_tokens = 450_000
+
+        big_history = []
+        for i in range(20):
+            big_history.append({"role": "user", "content": f"Message {i}"})
+            big_history.append({"role": "assistant", "content": f"Response {i}"})
+
+        with (
+            patch(
+                "agent.turn_context._preflight_request_tokens",
+                return_value=463_003,
+            ),
+            patch(
+                "agent.turn_context.estimate_request_tokens_rough",
+                return_value=463_003,
+            ),
+            patch.object(agent.context_compressor, "should_compress", return_value=True),
+            patch.object(
+                agent.context_compressor,
+                "should_compress_preflight",
+                return_value=True,
+            ),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "resume proof", conversation_history=big_history
+            )
+
+        assert result["interrupted"] is True
+        mock_compress.assert_not_called()
+
 
     def test_interrupt_keeps_post_compression_state(self, agent):
         """Display rollback must not restore real post-compaction state.
