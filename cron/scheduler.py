@@ -4269,6 +4269,21 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _to_msys_form(arg: str) -> str:
+    """Rewrite a drive-qualified Windows path (``C:/Users/x``) to the MSYS
+    ``/c/Users/x`` form Git Bash resolves natively, reusing the conversion
+    the local shell environment already uses
+    (``tools/environments/local.py::_windows_to_msys_path``).
+
+    ``Path.as_posix()`` alone is not enough: it yields ``C:/...``, which
+    MSYS argument conversion still treats as a Windows path (teknium1's
+    review on #23405 — the exact ``/c/...`` result is required).
+    """
+    from tools.environments.local import _windows_to_msys_path
+
+    return _windows_to_msys_path(arg)
+
+
 def _bash_script_argument(path: Path) -> str:
     """Render a script path as the argument handed to bash.
 
@@ -4278,10 +4293,16 @@ def _bash_script_argument(path: Path) -> str:
     bash with every separator stripped (``C:UsersUser...watch.sh``) and
     fails with exit 127 (#99303). Python's ``list2cmdline`` only quotes
     arguments containing spaces, so the path cannot rely on quoting
-    either. Forward slashes are accepted by MSYS2 and native Windows
-    APIs alike, and are a no-op on POSIX.
+    either. On Windows the POSIX-form path is additionally rewritten to
+    MSYS ``/c/...`` form (``_to_msys_form``), since ``C:/...`` alone is
+    still a Windows path as far as MSYS argument conversion is concerned.
+    On POSIX hosts ``str(path)`` is already a valid POSIX path and is a
+    pass-through.
     """
-    return path.as_posix()
+    arg = path.as_posix()
+    if os.name == "nt":
+        arg = _to_msys_form(arg)
+    return arg
 
 
 def _run_job_script(
