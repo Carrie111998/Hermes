@@ -3085,3 +3085,101 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="s2", gateway_session_key="ch")
         assert captured[1]["model"] == "anthropic/claude-opus-4.6"
+
+
+class TestResponsesTranscriptPrefixDetection:
+    """Regression tests for stored /v1/responses history doubling.
+
+    ``_response_messages_turn_start_index`` used to compare whole message dicts.
+    The agent stamps live messages with bookkeeping fields (``_db_persisted``,
+    ``_row_id``, ``timestamp``, reasoning traces) that the API-layer history does
+    not carry, so the prefix check failed on every chained turn and
+    ``_build_response_conversation_history`` prepended history the transcript
+    already contained -- doubling the stored context each turn.
+    """
+
+    @staticmethod
+    def _turn_start(prior, user_message, agent_messages):
+        return APIServerAdapter._response_messages_turn_start_index(
+            prior, user_message, {"messages": agent_messages}
+        )
+
+    def test_bookkeeping_fields_do_not_break_prefix_detection(self):
+        prior = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        ]
+        agent_messages = [
+            {"role": "user", "content": "hi", "_db_persisted": True, "_row_id": 41,
+             "timestamp": "2026-08-31T23:51:23"},
+            {"role": "assistant", "content": "hello", "_db_persisted": True, "_row_id": 42,
+             "timestamp": "2026-08-31T23:51:24", "reasoning": "...",
+             "reasoning_content": "...", "finish_reason": "stop"},
+            {"role": "user", "content": "and now?"},
+            {"role": "assistant", "content": "sure"},
+        ]
+        assert self._turn_start(prior, "and now?", agent_messages) == len(prior) + 1
+
+    def test_tool_name_dropped_on_round_trip_still_matches(self):
+        # Live tool messages carry ``name``; the stored copy loses it.
+        prior = [
+            {"role": "user", "content": "list them"},
+            {"role": "tool", "tool_call_id": "call_1", "content": '{"output": "a\\nb"}'},
+        ]
+        agent_messages = [
+            {"role": "user", "content": "list them", "_row_id": 7},
+            {"role": "tool", "tool_call_id": "call_1", "content": '{"output": "a\\nb"}',
+             "name": "terminal", "_row_id": 8},
+            {"role": "user", "content": "thanks"},
+        ]
+        assert self._turn_start(prior, "thanks", agent_messages) == len(prior) + 1
+
+    def test_conflicting_tool_names_are_not_treated_as_equal(self):
+        prior = [{"role": "tool", "tool_call_id": "call_1", "content": "x", "name": "terminal"}]
+        agent_messages = [
+            {"role": "tool", "tool_call_id": "call_1", "content": "x", "name": "read_file"},
+            {"role": "user", "content": "next"},
+        ]
+        assert self._turn_start(prior, "next", agent_messages) == 0
+
+    def test_differing_content_is_still_not_a_prefix(self):
+        prior = [{"role": "user", "content": "hi"}]
+        agent_messages = [
+            {"role": "user", "content": "something else", "_row_id": 1},
+            {"role": "assistant", "content": "hello"},
+        ]
+        assert self._turn_start(prior, "next", agent_messages) == 0
+
+    def test_stored_history_grows_linearly_across_chained_turns(self):
+        """Four chained turns must not double the stored transcript."""
+        history: list = []
+        row_id = 0
+        for turn in range(4):
+            user_message = f"question {turn}"
+            # The agent returns the authoritative full transcript, bookkeeping
+            # fields and all.
+            transcript = []
+            for message in history:
+                row_id += 1
+                transcript.append({**message, "_db_persisted": True, "_row_id": row_id,
+                                   "timestamp": f"t{row_id}"})
+            transcript.append({"role": "user", "content": user_message})
+            transcript.append({"role": "assistant", "content": f"answer {turn}"})
+
+            history = APIServerAdapter._build_response_conversation_history(
+                history, user_message, {"messages": transcript}, f"answer {turn}"
+            )
+            # Strip bookkeeping the way the store round-trip does.
+            history = [
+                {k: v for k, v in m.items()
+                 if k not in {"_db_persisted", "_row_id", "timestamp"}}
+                for m in history
+            ]
+
+        assert len(history) == 8, [m["content"] for m in history]
+        assert [m["content"] for m in history] == [
+            "question 0", "answer 0",
+            "question 1", "answer 1",
+            "question 2", "answer 2",
+            "question 3", "answer 3",
+        ]
