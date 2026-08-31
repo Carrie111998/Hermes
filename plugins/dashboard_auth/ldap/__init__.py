@@ -39,6 +39,11 @@ Security invariants:
     set explicitly; certificate validation is on by default.
   * Unknown-user vs wrong-password is never distinguished; on unknown
     user (search mode) a dummy bind equalises timing.
+  * **Referral chasing is off** (``auto_referrals=False``): ldap3's
+    default follows a directory-supplied referral and re-binds with the
+    SAME credentials — the service account, or the end user's own DN and
+    password — to a host named by directory data, and a plain ``ldap://``
+    referral from an ``ldaps://`` deployment would bind in the clear.
 
 Configuration surfaces (env wins over config.yaml when set non-empty),
 mirroring the ``basic`` provider's precedence convention:
@@ -233,6 +238,29 @@ class LdapAuthProvider(DashboardAuthProvider):
             raise ValueError(
                 "user_search_filter must contain the {username} placeholder"
             )
+        # Containing {username} isn't enough: a stray second placeholder
+        # ("uid={username},ou={dept},...") passes the checks above and
+        # then raises KeyError from .format() at the FIRST login — a 500
+        # on the login endpoint, long after startup. Trial-format both
+        # templates now so a bad one is a construction error (and hence a
+        # register() skip reason) instead. Literal braces are vanishingly
+        # rare in DNs and filters; treating a format failure as a config
+        # error is the intent.
+        for label, template in (
+            ("user_dn_template", user_dn_template),
+            # Only meaningful in search mode; the direct-bind path never
+            # formats the (defaulted) filter.
+            ("user_search_filter", user_search_filter if user_search_base else ""),
+        ):
+            if not template:
+                continue
+            try:
+                template.format(username="hermes-placeholder-probe")
+            except (KeyError, IndexError, ValueError) as exc:
+                raise ValueError(
+                    f"{label} contains unsupported placeholder(s); only "
+                    f"{{username}} is allowed: {exc}"
+                ) from exc
 
         self._server_url = server_url
         self._secret = secret
@@ -348,6 +376,8 @@ class LdapAuthProvider(DashboardAuthProvider):
             receive_timeout=self._timeout,
             raise_exceptions=False,
             auto_bind=False,
+            # never replay credentials to a host named by directory data
+            auto_referrals=False,
         )
         if self._start_tls:
             # open() connects the socket; if the StartTLS upgrade then
@@ -531,7 +561,25 @@ class LdapAuthProvider(DashboardAuthProvider):
                 search_scope=ldap3.SUBTREE,
                 attributes=[self._email_attr, self._display_attr],
             )
-            entries = list(conn.entries) if ok else []
+            if ok:
+                entries = list(conn.entries)
+            else:
+                # A falsy search is an LDAP *result* code, not a
+                # transport error (raise_exceptions=False) — typically
+                # insufficientAccessRights on the service account or a
+                # user_search_base that doesn't exist. Every login then
+                # gets a generic 401, so say so once here or the
+                # misconfiguration is invisible. No username, no
+                # password: this line goes to ordinary server logs.
+                entries = []
+                logger.warning(
+                    "dashboard-auth-ldap: user search under %r failed "
+                    "(result=%r) — every login will be rejected. Check "
+                    "dashboard.ldap_auth.user_search_base and the service "
+                    "account's read access.",
+                    self._user_search_base,
+                    getattr(conn, "result", None),
+                )
         except LDAPException as exc:
             raise ProviderError(f"LDAP search failed: {exc}") from exc
         finally:
@@ -598,6 +646,19 @@ class LdapAuthProvider(DashboardAuthProvider):
             raise ProviderError(
                 f"LDAP group check failed: {exc}"
             ) from exc
+        if not ok:
+            # Same trap as the user search: an ACL that hides the group
+            # entry from ordinary users makes this probe fail for
+            # EVERYONE, and the verdict is the generic 401 of a wrong
+            # password. Log the group DN and the result code only — no
+            # username, no user DN, no password.
+            logger.warning(
+                "dashboard-auth-ldap: require_group membership probe on "
+                "%r failed (result=%r) — every login will be rejected. "
+                "Check the DN exists and authenticated users may read it.",
+                self._require_group,
+                getattr(conn, "result", None),
+            )
         return bool(ok and conn.entries)
 
     def _user_still_present(self, user_dn: str) -> bool:
