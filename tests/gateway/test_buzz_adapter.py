@@ -3182,6 +3182,59 @@ class TestBuzzAdapterLifecycle:
         assert await adapter.connect() is False
         assert adapter._lock_key is None
 
+    @pytest.mark.asyncio
+    async def test_connect_publishes_online_and_disconnect_publishes_offline(self, monkeypatch):
+        """A connected Buzz agent must have a visible presence record."""
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("users", "get", [{"pubkey": SELF_PUBKEY, "display_name": "Chip"}])
+        cli.script("channels", "list", [{"channel_id": CHANNEL, "name": "general"}])
+        adapter._run_cli = cli
+        monkeypatch.setattr(_buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1test")
+        monkeypatch.setattr(adapter, "_seed_channel", AsyncMock())
+        monkeypatch.setattr(adapter, "_discover_dms", AsyncMock())
+        monkeypatch.setattr(adapter, "_start_websocket", AsyncMock(return_value=True))
+
+        assert await adapter.connect() is True
+        assert [
+            args for args, _input in cli.calls
+            if args[:2] == ["users", "set-presence"]
+        ] == [["users", "set-presence", "--status", "online"]]
+
+        await adapter.disconnect()
+        assert [
+            args for args, _input in cli.calls
+            if args[:2] == ["users", "set-presence"]
+        ] == [
+            ["users", "set-presence", "--status", "online"],
+            ["users", "set-presence", "--status", "offline"],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_presence_refreshes_until_cancelled(self):
+        """The heartbeat republishes online presence before relay expiry."""
+        adapter = _make_adapter()
+        adapter._presence_interval = 0.001
+        calls = []
+        refreshed = asyncio.Event()
+
+        async def record_presence(status):
+            calls.append(status)
+            if len(calls) >= 2:
+                refreshed.set()
+            return True
+
+        adapter._set_presence = record_presence
+        task = asyncio.create_task(adapter._presence_loop())
+        try:
+            await asyncio.wait_for(refreshed.wait(), timeout=1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        assert calls[0] == "online"
+        assert len(calls) >= 2
+
 
 # ── Credentials / requirements ────────────────────────────────────────────
 

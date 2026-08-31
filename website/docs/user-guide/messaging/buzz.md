@@ -134,6 +134,10 @@ Buzz has no typing indicator, so the agent marks each conversational turn with e
 
 Only one reaction is shown at a time — each replaces the previous one. Commands (`/status`, `/stop`, …) don't get reactions, and senders who aren't authorized to talk to the agent never see any. Reactions are best-effort: if a reaction fails to update, the reply is unaffected. Set `reactions: false` in the `buzz` `extra` block to turn them off.
 
+## Presence
+
+Buzz presence expires unless republished, so the adapter publishes `online` when it connects and refreshes it every minute; on graceful shutdown it publishes `offline` (best-effort — a slow or unreachable relay never blocks startup or shutdown).
+
 ## Access control
 
 By default the allow-list is empty, which means every community member who mentions the agent gets a response only if `BUZZ_ALLOW_ALL_USERS=true`; otherwise restrict access by listing npubs or hex pubkeys in `BUZZ_ALLOWED_USERS` (or `allowed_users` in config.yaml). Community membership itself is enforced by the relay — only members can post.

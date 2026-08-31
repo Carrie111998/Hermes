@@ -123,7 +123,7 @@ class _RecordingCli:
                 fails[emoji] -= 1
                 self.calls.append((args, input_text))
                 return 2, "", "relay error"
-        if self.release_first is not None and not self.calls:
+        if self.release_first is not None and not self.calls and args[0] == "reactions":
             await self.release_first.wait()
         self.calls.append((args, input_text))
         return 0, '{"accepted": true, "event_id": "self-sent"}', ""

@@ -240,6 +240,8 @@ _DM_DISCOVERY_EVERY = 5
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
+# Buzz presence records expire, so refresh comfortably before the relay TTL.
+_PRESENCE_INTERVAL = 60.0
 
 # Mention-resolution caches: member lists are cheap to refetch but hit on
 # every publish containing "@", so a short TTL amortizes the CLI round-trip;
@@ -909,6 +911,8 @@ class BuzzAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
+        self._presence_task: Optional[asyncio.Task] = None
+        self._presence_interval = _PRESENCE_INTERVAL
         self._ws_active = False  # True while the WS loop owns inbound delivery
         self._membership_since = 0
         self._lock_key: Optional[str] = None
@@ -994,6 +998,49 @@ class BuzzAdapter(BasePlatformAdapter):
             auth_tag=self._auth_tag,
             input_text=input_text,
         )
+
+    async def _set_presence(self, status: str) -> bool:
+        """Publish a best-effort presence state to the Buzz relay."""
+        try:
+            code, _out, err = await self._run_cli(
+                ["users", "set-presence", "--status", status]
+            )
+        except Exception as exc:
+            logger.debug("Buzz: presence update to %s failed — %s", status, exc)
+            return False
+        if code != 0:
+            logger.debug(
+                "Buzz: presence update to %s failed — %s",
+                status,
+                _cli_error_message(err, code),
+            )
+            return False
+        return True
+
+    async def _presence_loop(self) -> None:
+        """Refresh online presence until the adapter disconnects."""
+        try:
+            while True:
+                await asyncio.sleep(self._presence_interval)
+                await self._set_presence("online")
+        except asyncio.CancelledError:
+            raise
+
+    async def _start_presence(self) -> None:
+        """Publish online presence and start its expiry-refresh task."""
+        await self._set_presence("online")
+        self._presence_task = asyncio.create_task(self._presence_loop())
+
+    async def _stop_presence(self) -> None:
+        """Stop refreshing and publish offline presence best-effort."""
+        if self._presence_task and not self._presence_task.done():
+            self._presence_task.cancel()
+            await asyncio.gather(self._presence_task, return_exceptions=True)
+        self._presence_task = None
+        try:
+            await asyncio.wait_for(self._set_presence("offline"), timeout=5)
+        except (asyncio.TimeoutError, TimeoutError, Exception):
+            pass  # best-effort: never let presence block shutdown
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
@@ -1113,6 +1160,8 @@ class BuzzAdapter(BasePlatformAdapter):
                 return False
         if transport_used == "poll":
             self._poll_task = asyncio.create_task(self._poll_loop())
+        # Publish online presence and refresh it against relay expiry.
+        await self._start_presence()
         self._mark_connected()
         logger.info(
             "Buzz: connected to %s as %s, watching %d channel(s) via %s%s",
@@ -1153,6 +1202,9 @@ class BuzzAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._poll_task = None
+        # Presence: stop refreshing, then publish offline best-effort. A
+        # failed publish must not break shutdown (relay may already be gone).
+        await self._stop_presence()
         # Reaction lifecycle: cancel any in-flight transition tasks so
         # shutdown never leaks "task pending" warnings or hangs on a wedged
         # buzz-cli call.
