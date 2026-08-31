@@ -248,7 +248,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "platform.wecom_callback": ("defusedxml==0.7.1",),
     # Polling uses core httpx. Only webhook mode needs aiohttp.
     "platform.zalo": (
-        "aiohttp==3.14.1",  # keep in sync with the pyproject `zalo` extra
+        "aiohttp==3.14.3",  # keep in sync with the pyproject `zalo` extra
     ),
     # Microsoft Teams adapter — microsoft-teams-apps pulls a heavy tree
     # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
