@@ -161,6 +161,7 @@ _install_plugin_debug_handler()
 # ---------------------------------------------------------------------------
 
 VALID_HOOKS: Set[str] = {
+    "runtime_fault_repair",
     "provider_request_gate",
     "assistant_final_candidate_gate",
     "assistant_persist_gate",

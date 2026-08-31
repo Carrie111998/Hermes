@@ -1325,18 +1325,27 @@ def build_turn_context(
     # Optional Host-owned request gate. Unlike compatibility hooks, callback
     # failures and explicit ABORT results stop the turn before a provider call.
     from hermes_cli.lifecycle import invoke_required_hook as _invoke_required_hook
-    _provider_gate = _invoke_required_hook(
-        "provider_request_gate",
+    _provider_gate_kwargs = {
+        "session_id": agent.session_id,
+        "task_id": effective_task_id,
+        "turn_id": turn_id,
+        "user_message": original_user_message,
+        "conversation_history": list(messages),
+        "is_first_turn": not bool(conversation_history),
+        "model": agent.model,
+        "platform": getattr(agent, "platform", None) or "",
+        "parent_session_id": getattr(agent, "_parent_session_id", None) or "",
+        "sender_id": getattr(agent, "_user_id", None) or "",
+        "project_root": getattr(agent, "working_directory", None) or "",
+    }
+    from agent.runtime_fault_repair import retry_after_runtime_repair
+    _provider_gate = retry_after_runtime_repair(
+        lambda: _invoke_required_hook("provider_request_gate", **_provider_gate_kwargs),
+        phase="provider_request_gate",
         session_id=agent.session_id,
         task_id=effective_task_id,
         turn_id=turn_id,
-        user_message=original_user_message,
-        conversation_history=list(messages),
-        is_first_turn=(not bool(conversation_history)),
-        model=agent.model,
-        platform=getattr(agent, "platform", None) or "",
-        parent_session_id=getattr(agent, "_parent_session_id", None) or "",
-        sender_id=getattr(agent, "_user_id", None) or "",
+        project_root=_provider_gate_kwargs["project_root"],
     )
     if _provider_gate is not None:
         if (
