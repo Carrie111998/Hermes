@@ -369,6 +369,12 @@ export const ja = defineLocale({
       uiScaleTitle: 'UI スケール',
       uiScaleDesc: (percent: number) =>
         `アプリ全体の文字と UI を拡大縮小します。Cmd/Ctrl と +、-、0 でも変更できます。現在: ${percent}%`,
+      windowControlsTitle: 'ウィンドウ操作ボタン',
+      windowControlsDesc:
+        'Electron の最小化・最大化・閉じるボタンを表示するか選びます。「システム」は Hyprland で非表示にし、「ネイティブ」は常に表示し、「非表示」はコンポジターに任せます。',
+      windowControlsSystem: 'システム',
+      windowControlsNative: 'ネイティブ',
+      windowControlsHidden: '非表示',
       sessionDensityTitle: 'セッションリストの密度',
       sessionDensityDesc: 'サイドバーのセッションタイトルの下に表示する情報量を選びます。',
       sessionDensityCompact: 'コンパクト',

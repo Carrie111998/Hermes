@@ -37,6 +37,10 @@ test('macOS uses traffic lights, not a WCO overlay, so it reserves nothing', () 
   assert.equal(nativeOverlayWidth({ isMac: true }), 0)
 })
 
+test('hidden native controls reserve no titlebar width', () => {
+  assert.equal(nativeOverlayWidth({ nativeWindowControls: false }), 0)
+})
+
 test('the fallback width is a sane positive pixel value', () => {
   assert.ok(Number.isInteger(OVERLAY_FALLBACK_WIDTH) && OVERLAY_FALLBACK_WIDTH > 0)
 })

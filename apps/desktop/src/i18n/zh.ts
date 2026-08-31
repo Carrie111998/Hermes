@@ -533,6 +533,12 @@ export const zh: Translations = {
       uiScaleTitle: '界面缩放',
       uiScaleDesc: (percent: number) =>
         `缩放整个应用的文字和界面。也可使用 Cmd/Ctrl 加 +、- 或 0 调整。当前：${percent}%`,
+      windowControlsTitle: '窗口控制',
+      windowControlsDesc:
+        '选择是否显示 Electron 的最小化、最大化和关闭按钮。系统模式会在 Hyprland 上隐藏它们；原生模式始终显示；隐藏模式交给窗口合成器管理。',
+      windowControlsSystem: '系统',
+      windowControlsNative: '原生',
+      windowControlsHidden: '隐藏',
       sessionDensityTitle: '会话列表密度',
       sessionDensityDesc: '选择侧边栏会话标题下方显示的信息量。',
       sessionDensityCompact: '紧凑',

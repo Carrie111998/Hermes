@@ -395,6 +395,13 @@ import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-market
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { enumerateWindowsFrontToBack, enumerationFailed, readWindowBelow } from './window-below'
 import { registrySshScopeForWindowRoute, WindowConnectionRouteRegistry } from './window-connection-route'
+import {
+  DEFAULT_WINDOW_CONTROLS_MODE,
+  isCompositorManagedWaylandSession,
+  nativeWindowControlsEnabled,
+  normalizeWindowControlsMode,
+  type WindowControlsMode
+} from './window-controls'
 import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
 import { createWindowRevealController } from './window-reveal'
 import {
@@ -451,7 +458,9 @@ const DEV_SERVER = process.env.HERMES_DESKTOP_DEV_SERVER
 const IS_PACKAGED = app.isPackaged || Boolean(process.env.HERMES_DESKTOP_IS_PACKAGED)
 const IS_MAC = process.platform === 'darwin'
 const IS_WINDOWS = process.platform === 'win32'
+const IS_LINUX = process.platform === 'linux'
 const IS_WSL = isWslEnvironment()
+const IS_COMPOSITOR_MANAGED_WAYLAND = IS_LINUX && isCompositorManagedWaylandSession(process.env)
 // Truthful macOS kernel major (Tahoe = 25). Product version lies (16 vs 26) per
 // build SDK, so gate Tahoe workarounds on Darwin instead.
 const DARWIN_MAJOR = IS_MAC ? Number.parseInt(os.release(), 10) || 0 : 0
@@ -955,6 +964,36 @@ function writePersistedThemeSource(mode) {
 
 nativeTheme.themeSource = readPersistedThemeSource()
 
+// Linux desktop environments do not all handle frameless Electron windows the
+// same way. Electron's titleBarOverlay is an in-content control strip, not a
+// compositor server-side decoration, so the system default hides it there
+// and keeps it on desktops where it is the expected fallback. Explicit Native
+// or Hidden choices are available in Appearance.
+const WINDOW_CONTROLS_CONFIG_PATH = path.join(app.getPath('userData'), 'window-controls.json')
+
+function readPersistedWindowControlsMode(): WindowControlsMode {
+  try {
+    return normalizeWindowControlsMode(JSON.parse(fs.readFileSync(WINDOW_CONTROLS_CONFIG_PATH, 'utf8')).mode)
+  } catch {
+    return DEFAULT_WINDOW_CONTROLS_MODE
+  }
+}
+
+let windowControlsMode = readPersistedWindowControlsMode()
+
+function nativeWindowControlsAreEnabled(): boolean {
+  return !IS_LINUX || nativeWindowControlsEnabled(windowControlsMode, IS_COMPOSITOR_MANAGED_WAYLAND)
+}
+
+function writePersistedWindowControlsMode(mode: WindowControlsMode): void {
+  try {
+    fs.mkdirSync(path.dirname(WINDOW_CONTROLS_CONFIG_PATH), { recursive: true })
+    fs.writeFileSync(WINDOW_CONTROLS_CONFIG_PATH, JSON.stringify({ mode }, null, 2), 'utf8')
+  } catch (error) {
+    rememberLog(`[window-controls] write failed: ${error.message}`)
+  }
+}
+
 // Window translucency (see-through window). One lever, 0–100; 0 = off (the
 // default). Two modes share the lever (see electron/translucency.ts and
 // store/translucency): 'clear' maps it to the native window opacity so the
@@ -1131,6 +1170,10 @@ function getWindowBackgroundColor() {
 const TITLEBAR_OVERLAY_COLOR = 'rgba(1, 0, 0, 0)'
 
 function getTitleBarOverlayOptions() {
+  if (!nativeWindowControlsAreEnabled()) {
+    return false
+  }
+
   if (IS_MAC) {
     // Tahoe (Darwin 25+) misplaces the traffic lights when the overlay has a
     // nonzero height (electron#49183); 0 there keeps them at the configured
@@ -1158,9 +1201,9 @@ function getTitleBarOverlayOptions() {
 }
 
 // Push refreshed overlay options to a live window after a theme/appearance
-// change. No-op only on plain (non-WSL) Linux, where getTitleBarOverlayOptions()
-// returns false; the try/catch additionally guards builds where
-// setTitleBarOverlay isn't supported.
+// change. This also switches Linux between Electron's controls and no overlay
+// when the user changes the Appearance setting. The try/catch additionally
+// guards builds where setTitleBarOverlay isn't supported.
 function applyTitleBarOverlay(win) {
   const options = getTitleBarOverlayOptions()
 
@@ -6207,7 +6250,12 @@ function getWindowButtonPosition(win = mainWindow) {
 }
 
 function getNativeOverlayWidth() {
-  return computeNativeOverlayWidth({ isWindows: IS_WINDOWS, isWsl: IS_WSL, isMac: IS_MAC })
+  return computeNativeOverlayWidth({
+    isMac: IS_MAC,
+    isWindows: IS_WINDOWS,
+    isWsl: IS_WSL,
+    nativeWindowControls: nativeWindowControlsAreEnabled()
+  })
 }
 
 function getWindowState(win = mainWindow) {
@@ -16520,6 +16568,34 @@ app.on('will-quit', () => {
 // itself. Registered at module scope, which runs long before any window.
 ipcMain.on('hermes:translucency:support', event => {
   event.returnValue = { glass: GLASS_SUPPORTED, translucency: TRANSLUCENCY_SUPPORTED }
+})
+
+// Window Controls Overlay is a renderer-painted strip, not a Hyprland
+// decoration. Keep its preference in the main process so every window (and a
+// cold launch) uses the same answer. The renderer receives the initial value
+// synchronously through preload, then sends changes here for live application.
+ipcMain.on('hermes:window-controls:get', event => {
+  event.returnValue = {
+    compositorManaged: IS_COMPOSITOR_MANAGED_WAYLAND,
+    mode: windowControlsMode,
+    supported: IS_LINUX
+  }
+})
+
+ipcMain.on('hermes:window-controls:set', (_event, value) => {
+  const next = normalizeWindowControlsMode(value)
+
+  if (next === windowControlsMode) {
+    return
+  }
+
+  windowControlsMode = next
+  writePersistedWindowControlsMode(next)
+
+  for (const win of BrowserWindow.getAllWindows()) {
+    applyTitleBarOverlay(win)
+    win.webContents.send('hermes:window-controls:changed', next)
+  }
 })
 
 ipcMain.on('hermes:translucency', (_event, payload) => {

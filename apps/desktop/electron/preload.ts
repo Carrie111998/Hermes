@@ -8,12 +8,25 @@ import { contextBridge, ipcRenderer, webFrame, webUtils } from 'electron'
 // "Desktop IPC bridge is unavailable"). No reply means no glass, which degrades
 // to an ordinary opaque window rather than a page thinned over nothing.
 const translucencySupport = ipcRenderer.sendSync('hermes:translucency:support')
+const windowControls = ipcRenderer.sendSync('hermes:window-controls:get')
 const hudWindowing = ipcRenderer.sendSync('hermes:hud:windowing')
 const hudNativeDrag = hudWindowing?.nativeDrag === true
 
 contextBridge.exposeInMainWorld('hermesDesktop', {
   glassSupported: translucencySupport?.glass === true,
   translucencySupported: translucencySupport?.translucency === true,
+  windowControls: {
+    compositorManaged: windowControls?.compositorManaged === true,
+    mode: windowControls?.mode,
+    supported: windowControls?.supported === true,
+    setMode: mode => ipcRenderer.send('hermes:window-controls:set', mode),
+    onChanged: callback => {
+      const listener = (_event, mode) => callback(mode)
+      ipcRenderer.on('hermes:window-controls:changed', listener)
+
+      return () => ipcRenderer.removeListener('hermes:window-controls:changed', listener)
+    }
+  },
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
   // Registry-scoped backend resolution: { connectionId, profile } → descriptor.
   getConnectionFor: payload => ipcRenderer.invoke('hermes:connection:for', payload),

@@ -440,6 +440,11 @@ export interface Translations {
       reasoningCollapsedDesc: string
       uiScaleTitle: string
       uiScaleDesc: (percent: number) => string
+      windowControlsTitle: string
+      windowControlsDesc: string
+      windowControlsSystem: string
+      windowControlsNative: string
+      windowControlsHidden: string
       sessionDensityTitle: string
       sessionDensityDesc: string
       sessionDensityCompact: string

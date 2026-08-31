@@ -444,6 +444,12 @@ export const ar = defineLocale({
       toolViewDesc: 'تحكم في كيفية عرض نشاط الأدوات داخل المحادثة.',
       reasoningCollapsedTitle: 'طي التفكير افتراضيًا',
       reasoningCollapsedDesc: 'أبقِ التفكير المتدفق متاحًا دون توسيعه حتى تفتحه.',
+      windowControlsTitle: 'عناصر التحكم بالنافذة',
+      windowControlsDesc:
+        'اختر ما إذا كان Electron يعرض أزرار التصغير والتكبير والإغلاق. يخفي وضع النظام الأزرار في Hyprland؛ ويعرضها الوضع الأصلي دائمًا؛ ويترك الوضع المخفي إدارة النافذة للمركّب.',
+      windowControlsSystem: 'النظام',
+      windowControlsNative: 'أصلي',
+      windowControlsHidden: 'مخفي',
       translucencyTitle: 'شفافية النافذة',
       translucencyDesc: 'إظهار سطح المكتب من خلال النافذة بالكامل، بما في ذلك النص.',
       translucencyGlassDesc: 'زجاج غير لامع: يظهر سطح المكتب كضبابية ناعمة بينما يبقى النص واضحًا.',

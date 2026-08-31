@@ -8,14 +8,20 @@ export const OVERLAY_FALLBACK_WIDTH = 144
  * API is unavailable.
  *
  * macOS uses traffic lights positioned via trafficLightPosition, not a WCO
- * overlay, so it reserves nothing here. Every other desktop platform now paints
- * the Electron overlay (Windows, WSLg, and plain Linux KDE/GNOME), so they all
- * reserve the fallback width — the split is simply mac vs. not.
+ * overlay, so it reserves nothing here. Every other desktop platform paints the
+ * Electron overlay when native controls are enabled. Hyprland's system default
+ * disables them because its frameless Wayland windows have no server-side
+ * decoration to replace them with.
  *
- * @param {{ isMac?: boolean }} opts
+ * @param {{ isWindows?: boolean, isWsl?: boolean, isMac?: boolean, nativeWindowControls?: boolean }} opts
  */
-export function nativeOverlayWidth({ isWindows = false, isWsl = false, isMac = false } = {}) {
-  if (isMac) {
+export function nativeOverlayWidth({
+  isWindows = false,
+  isWsl = false,
+  isMac = false,
+  nativeWindowControls = true
+} = {}) {
+  if (isMac || !nativeWindowControls) {
     return 0
   }
 
