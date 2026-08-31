@@ -6167,12 +6167,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     ):
                         # Dead children but stale server.session, so the
                         # transport-down path above never fired — signal the
-                        # server task to respawn and return a clean
-                        # reconnecting error. No explicit _bump_server_error:
-                        # the error return flows through the handler's JSON
-                        # parse, which already bumps once.
+                        # server task to respawn and raise a transport error so
+                        # the handler's exception path records one breaker
+                        # strike.
                         if _signal_reconnect(server):
-                            return tool_error(
+                            raise TimeoutError(
                                 f"MCP server '{server_name}' stdio subprocess is "
                                 f"dead and reconnect was requested. Do NOT retry "
                                 f"immediately — give it a few seconds to respawn."
@@ -6372,15 +6371,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # A completed tools/call round-trip proves the MCP transport is
+            # healthy even when the tool returns ``isError`` (validation,
+            # operation-not-found, domain conflict, etc.).  Those application
+            # failures must not open the server-unreachable circuit breaker.
+            # Transport/session exceptions still flow through the exception
+            # path below and count as breaker strikes.
+            _reset_server_error(server_name)
             return result
         except InterruptedError:
             return _interrupted_call_result()
