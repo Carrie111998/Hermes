@@ -84,6 +84,7 @@ aiosqlite = false
 tzdata = false
 python-dotenv = false
 daytona = false
+ldap3 = false
 uvicorn = false
 nemo-relay = false
 requests = false

@@ -503,6 +503,7 @@ httpx2 = false
 huggingface_hub = false
 jinja2 = false
 lark-oapi = false
+ldap3 = false
 markdown = false
 maturin = false
 mautrix = false
