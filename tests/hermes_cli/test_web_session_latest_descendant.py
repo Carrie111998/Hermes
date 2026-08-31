@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from hermes_cli.web_server import _session_latest_descendant
+from hermes_cli.web_routers import sessions as web_sessions
 from hermes_state import SessionDB
 
 
@@ -88,3 +91,44 @@ def test_latest_descendant_still_follows_model_child_with_inherited_marker(
         "model-child",
         ["branch", "model-child"],
     )
+
+
+def test_messages_endpoint_keeps_legacy_branch_parent_transcript(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "state.db"
+    seed = SessionDB(db_path=db_path)
+    try:
+        seed.create_session("parent", source="webui")
+        seed.append_message("parent", "user", "parent transcript")
+        seed.end_session("parent", "branched")
+        seed.create_session(
+            "legacy-branch",
+            source="webui",
+            parent_session_id="parent",
+        )
+        seed.append_message("legacy-branch", "user", "branch transcript")
+    finally:
+        seed.close()
+
+    def _open_db(profile=None, *, read_only):
+        assert profile is None
+        return SessionDB(db_path=db_path, read_only=read_only)
+
+    monkeypatch.setattr(web_sessions, "_open_session_db_for_profile", _open_db)
+
+    payload = asyncio.run(
+        web_sessions.get_session_messages(
+            "parent",
+            limit=None,
+            offset=0,
+            order=None,
+            include_compacted=False,
+        )
+    )
+
+    assert payload["session_id"] == "parent"
+    assert [message["content"] for message in payload["messages"]] == [
+        "parent transcript"
+    ]

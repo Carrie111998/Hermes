@@ -70,6 +70,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _RESET_END_REASONS,
     _RESET_END_REASONS_SQL,
     _ephemeral_child_sql,
+    _legacy_branch_child_sql,
     _legacy_reset_child_sql,
     _shape_preview,
     _sql_session_last_active,
@@ -12295,9 +12296,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if row is not None:
                     best = current
 
-                # Walk to the most-recently-started child — but skip explicit
-                # branch (`_branched_from`), delegate/subagent (`_delegate_from`),
-                # reset-continuation (`_reset_from` or the legacy same-key
+                # Walk to the most-recently-started child — but skip branch
+                # (`_branched_from` or the legacy parent-end heuristic),
+                # delegate/subagent (`_delegate_from`), reset-continuation
+                # (`_reset_from` or the legacy same-key
                 # heuristic — a post-reset conversation must never be reached
                 # by resuming the parent the user reset away), and tool
                 # children. They also carry a ``parent_session_id`` yet
@@ -12308,7 +12310,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     child_row = conn.execute(
                         "SELECT id FROM sessions AS child "
                         "WHERE child.parent_session_id = ? "
-                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
+                        "  AND COALESCE(json_extract(COALESCE(child.model_config, '{}'), '$._branched_from'), '') "
+                        "      != child.parent_session_id "
+                        f"  AND NOT {_legacy_branch_child_sql('child')} "
                         "  AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
                         "  AND json_extract(COALESCE(child.model_config, '{}'), '$._reset_from') IS NULL "
                         f"  AND NOT {_legacy_reset_child_sql('child', _RESET_END_REASONS_SQL)} "
