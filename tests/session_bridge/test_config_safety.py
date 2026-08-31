@@ -723,6 +723,7 @@ _CLAUDE_VISIBILITY_DEFAULTS = {
     "discovery_timeout_seconds": 30,
     "float_activity": False,
     "archive_idle_chips": False,
+    "reconcile_desktop_registries": False,
     "idle_chip_archive_seconds": 86_400,
 }
 
@@ -791,6 +792,7 @@ def test_claude_visibility_config_parses_every_valid_override(
         "discovery_timeout_seconds": 45,
         "float_activity": True,
         "archive_idle_chips": True,
+        "reconcile_desktop_registries": True,
         "idle_chip_archive_seconds": 43_200,
     }
 
@@ -808,6 +810,11 @@ def test_claude_visibility_config_parses_every_valid_override(
     (
         ("enabled", 1, "enabled must be a boolean"),
         ("continuous", "false", "continuous must be a boolean"),
+        (
+            "reconcile_desktop_registries",
+            "yes",
+            "reconcile_desktop_registries must be a boolean",
+        ),
         ("backfill_days", 0, "backfill_days must be at least 1"),
         ("backfill_days", -1, "backfill_days must be at least 1"),
         ("continuous_batch_limit", 0, "continuous_batch_limit must be at least 1"),

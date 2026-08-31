@@ -118,6 +118,7 @@ class ClaudeVisibilityConfig:
     discovery_timeout_seconds: int = 30
     float_activity: bool = False
     archive_idle_chips: bool = False
+    reconcile_desktop_registries: bool = False
     idle_chip_archive_seconds: int = 86_400
 
 
@@ -219,6 +220,7 @@ class BridgeConfig:
                 "discovery_timeout_seconds",
                 "float_activity",
                 "archive_idle_chips",
+                "reconcile_desktop_registries",
                 "idle_chip_archive_seconds",
             }),
             scope="session_bridge.claude_visibility",
@@ -670,6 +672,13 @@ class BridgeConfig:
                     claude_visibility_defaults.archive_idle_chips,
                 ),
                 "session_bridge.claude_visibility.archive_idle_chips",
+            ),
+            reconcile_desktop_registries=_toml_bool(
+                claude_visibility.get(
+                    "reconcile_desktop_registries",
+                    claude_visibility_defaults.reconcile_desktop_registries,
+                ),
+                "session_bridge.claude_visibility.reconcile_desktop_registries",
             ),
             idle_chip_archive_seconds=_toml_int(
                 claude_visibility.get(
