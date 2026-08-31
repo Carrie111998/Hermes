@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { ComposerToken } from '../app/interfaces.js'
-import { droppedTokens, expandTokens, imageToken, nextImageIndex } from '../domain/attachments.js'
+import { droppedTokens, expandTokens, imageToken, looksLikeOrphanedPasteToken, nextImageIndex } from '../domain/attachments.js'
 
 const paste = (label: string, text: string): ComposerToken => ({ kind: 'paste', label, text })
 
@@ -15,49 +15,102 @@ const image = (index: number, path = `/tmp/img${index}.png`): ComposerToken => (
 describe('expandTokens (what the agent actually receives)', () => {
   it('replaces a collapsed paste label with its full content', () => {
     const label = '[[ hello.. [3 lines] .. world ]]'
-    const expand = expandTokens([paste(label, 'hello\nfoo\nworld')])
+    const result = expandTokens([paste(label, 'hello\nfoo\nworld')])(` here: ${label} done`)
 
-    expect(expand(`here: ${label} done`)).toBe('here: hello\nfoo\nworld done')
+    expect(result.expanded).toBe('here: hello\nfoo\nworld done')
+    expect(result.unresolved).toEqual([])
   })
 
   it('is a no-op for already-expanded / token-free text (recall round-trip)', () => {
     const expanded = 'hello\nfoo\nworld'
-    expect(expandTokens([])(expanded)).toBe(expanded)
+    const result = expandTokens([])(expanded)
+
+    expect(result.expanded).toBe(expanded)
+    expect(result.unresolved).toEqual([])
   })
 
   it('expands repeated identical labels in submission order', () => {
     const label = '[[ x [1 lines] ]]'
-    const expand = expandTokens([paste(label, 'first'), paste(label, 'second')])
+    const result = expandTokens([paste(label, 'first'), paste(label, 'second')])(`${label} then ${label}`)
 
-    expect(expand(`${label} then ${label}`)).toBe('first then second')
+    expect(result.expanded).toBe('first then second')
+    expect(result.unresolved).toEqual([])
   })
 
-  it('leaves an unmatched label intact', () => {
-    const label = '[[ orphan [2 lines] ]]'
-    expect(expandTokens([])(label)).toBe(label)
+  it('leaves an unmatched label intact when it does not look like a paste token', () => {
+    const label = '[[ orphan ]]'
+    const result = expandTokens([])(label)
+
+    expect(result.expanded).toBe(label)
+    expect(result.unresolved).toEqual([])
+  })
+
+  it('reports an unmatched paste token with [N lines] signature as unresolved', () => {
+    const label = '[[ lost.. [5k lines] .. data ]]'
+    const result = expandTokens([])(`submit: ${label} now`)
+
+    expect(result.expanded).toBe(`submit: ${label} now`)
+    expect(result.unresolved).toEqual([label])
+  })
+
+  it('reports multiple orphaned paste tokens', () => {
+    const a = '[[ chunk1 [135 lines] ]]'
+    const b = '[[ chunk2.. [9.2k lines] .. tail ]]'
+    const result = expandTokens([])(`${a} and ${b}`)
+
+    expect(result.expanded).toBe(`${a} and ${b}`)
+    expect(result.unresolved).toEqual([a, b])
   })
 
   it('drops an image token from the text — the gateway already holds the file', () => {
-    const expand = expandTokens([image(1)])
+    const result = expandTokens([image(1)])(`what is in ${imageToken(1)}`)
 
-    expect(expand(`what is in ${imageToken(1)}`)).toBe('what is in')
+    expect(result.expanded).toBe('what is in')
+    expect(result.unresolved).toEqual([])
   })
 
   it('leaves no double space where an image token sat mid-sentence', () => {
-    const expand = expandTokens([image(1)])
+    const result = expandTokens([image(1)])(`before ${imageToken(1)} after`)
 
-    expect(expand(`before ${imageToken(1)} after`)).toBe('before after')
+    expect(result.expanded).toBe('before after')
+    expect(result.unresolved).toEqual([])
   })
 
   it('resolves an image-only message to empty text', () => {
-    expect(expandTokens([image(1)])(imageToken(1))).toBe('')
+    const result = expandTokens([image(1)])(imageToken(1))
+
+    expect(result.expanded).toBe('')
+    expect(result.unresolved).toEqual([])
   })
 
   it('resolves pastes and images in one pass', () => {
     const label = '[[ log.. [9 lines] ]]'
-    const expand = expandTokens([paste(label, 'stack\ntrace'), image(2)])
+    const result = expandTokens([paste(label, 'stack\ntrace'), image(2)])(`${label} and ${imageToken(2)}`)
 
-    expect(expand(`${label} and ${imageToken(2)}`)).toBe('stack\ntrace and')
+    expect(result.expanded).toBe('stack\ntrace and')
+    expect(result.unresolved).toEqual([])
+  })
+})
+
+describe('looksLikeOrphanedPasteToken (detection of real paste tokens)', () => {
+  it('recognizes a paste token with [N lines] signature', () => {
+    expect(looksLikeOrphanedPasteToken('[[ spec text [135 lines] ]]')).toBe(true)
+  })
+
+  it('recognizes a paste token with [N.Nk lines] suffix (fmtK output)', () => {
+    expect(looksLikeOrphanedPasteToken('[[ heading.. [5.3k lines] .. tail ]]')).toBe(true)
+  })
+
+  it('recognizes lowercase k/m/g suffix from fmtK', () => {
+    expect(looksLikeOrphanedPasteToken('[[ [9.9m lines] ]]')).toBe(true)
+  })
+
+  it('rejects user-typed [[ ... ]] without a [N lines] signature', () => {
+    expect(looksLikeOrphanedPasteToken('[[ orphan ]]')).toBe(false)
+  })
+
+  it('rejects [[ some text ]] that lacks the line-count marker', () => {
+    expect(looksLikeOrphanedPasteToken('[[ I typed this ]]')).toBe(false)
   })
 })
 
@@ -94,3 +147,4 @@ describe('droppedTokens (deleting the token unattaches the thing)', () => {
     expect(droppedTokens([image(1), image(2)], imageToken(2))).toEqual([image(1)])
   })
 })
+
