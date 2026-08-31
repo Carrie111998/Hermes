@@ -304,6 +304,36 @@ def _cached_redirect_port(storage: "HermesTokenStorage | None") -> int | None:
     return None
 
 
+def _port_from_configured_redirect_uri(cfg: dict) -> int | None:
+    """Return the loopback callback port of a configured ``oauth.redirect_uri``.
+
+    When the user pins ``oauth.redirect_uri`` to a loopback http URL with an
+    explicit port, the authorize URL advertises that exact port, so the
+    callback listener must bind it too. Without this derivation, a fresh
+    login (whose cached client registration was just wiped) binds a random
+    ephemeral port and every provider approval dies on a connection-refused
+    redirect (#99503). Non-loopback or portless URIs (e.g. an https proxy
+    funnel forwarding to localhost, where the local port is the funnel's
+    business) return None so the normal fallback chain stays in charge.
+    Mirrors the loopback shape ``_cached_redirect_port`` accepts.
+    """
+    configured = cfg.get("redirect_uri")
+    if not configured:
+        return None
+    try:
+        parsed = urlparse(str(configured))
+    except (TypeError, ValueError):
+        return None
+    if (
+        parsed.scheme == "http"
+        and parsed.hostname in {"127.0.0.1", "localhost"}
+        and parsed.path == "/callback"
+        and parsed.port is not None
+    ):
+        return int(parsed.port)
+    return None
+
+
 def _cached_redirect_uri(storage: "HermesTokenStorage | None") -> str | None:
     """Return a cached non-loopback redirect URI, if one was registered."""
     if storage is None:
@@ -1547,9 +1577,10 @@ def _configure_callback_port(
 
     Port choice precedence:
     1. explicit ``oauth.redirect_port`` config
-    2. cached client registration redirect URI port
-    3. a pinned CIMD port, when the flow is CIMD-eligible
-    4. newly allocated free port
+    2. the port of a configured loopback ``oauth.redirect_uri``
+    3. cached client registration redirect URI port
+    4. a pinned CIMD port, when the flow is CIMD-eligible
+    5. newly allocated free port
 
     A CIMD-eligible flow also records the client_id URL in
     ``cfg['_cimd_url']`` for the provider constructors to forward.
@@ -1580,15 +1611,22 @@ def _configure_callback_port(
         _oauth_port = port
         return port
     requested = int(cfg.get("redirect_port", 0))
-    # Precedence: explicit config port → cached client-registration port →
-    # fresh ephemeral port. The cached port keeps re-auth consistent with the
-    # redirect URI pinned at dynamic client registration (providers reject a
-    # mismatched URI). Only a truly fresh ephemeral pick goes through
-    # _reserve_callback_port(), which keeps the socket bound until
-    # _wait_for_callback adopts it — closing the select→bind TOCTOU race
-    # (#22161). Explicit and cached ports are fixed, known values and bind
-    # via the reuse_address path instead.
-    port = requested or _cached_redirect_port(storage) or _reserve_callback_port()
+    # Precedence: explicit config port → port of a configured loopback
+    # redirect_uri → cached client-registration port → fresh ephemeral port.
+    # The redirect_uri-derived port keeps the listener on the same port the
+    # authorize URL advertises (#99503); the cached port keeps re-auth
+    # consistent with the redirect URI pinned at dynamic client registration
+    # (providers reject a mismatched URI). Only a truly fresh ephemeral pick
+    # goes through _reserve_callback_port(), which keeps the socket bound
+    # until _wait_for_callback adopts it — closing the select→bind TOCTOU
+    # race (#22161). Explicit, derived, and cached ports are fixed, known
+    # values and bind via the reuse_address path instead.
+    port = (
+        requested
+        or _port_from_configured_redirect_uri(cfg)
+        or _cached_redirect_port(storage)
+        or _reserve_callback_port()
+    )
     # A cached port can be one of the pinned CIMD ports, left behind by an
     # earlier CIMD login for this server. Claim it so a sibling server's
     # _pick_cimd_port doesn't hand the same port out a second time.
