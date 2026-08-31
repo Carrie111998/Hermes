@@ -10700,26 +10700,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             effective_mode = "queue"
         steered = False
         redirected = False
-        # Durable Telegram ingress owns a SQLite claim until this exact event
-        # completes its own processing lifecycle. AIAgent.steer() only accepts
-        # text into an in-memory pending string; it does not provide a receipt
-        # proving that the text reached model context. Treating that acceptance
-        # as delivery detaches the durable claim from any owner task and can
-        # leave it leased forever. Until steering has a context-commit receipt,
-        # preserve the event boundary in the gateway FIFO instead.
-        demoted_for_durable_steer = (
-            effective_mode == "steer"
-            and event.source.platform == Platform.TELEGRAM
-            and bool((event.metadata or {}).get("telegram_inbound_claimed"))
-            and bool((event.metadata or {}).get("telegram_durable_update_ids"))
-        )
-        if demoted_for_durable_steer:
-            logger.info(
-                "Demoting durable Telegram steer to queue for session %s "
-                "until context delivery can be receipted",
-                session_key,
-            )
-            effective_mode = "queue"
         if effective_mode == "steer":
             steer_text = await self._prepare_busy_steer_text(event)
             # A follow-up qualifies for steering when it is plain text, OR
@@ -10750,6 +10730,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception as exc:
                     logger.warning("Gateway steer failed for session %s: %s", session_key, exc)
                     steered = False
+            if steered:
+                setattr(event, "_gateway_busy_steer_admitted", True)
             if not steered:
                 # Fall back to queue (merge into pending messages, no interrupt)
                 effective_mode = "queue"
