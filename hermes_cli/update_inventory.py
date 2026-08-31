@@ -186,6 +186,25 @@ _LAUNCHD_PLIST_DIRS = (
 )
 
 
+def launchd_domain_for_plist(plist: str) -> str:
+    """The launchd domain a job in *plist* belongs to.
+
+    A ``LaunchDaemons`` plist is a system job; everything else is a per-user
+    agent in the caller's GUI session. The domain is part of the job's
+    identity — ``launchctl bootout gui/501/<daemon-label>`` addresses a job
+    that is not there, reports success, and leaves the daemon running — so
+    it has to be captured here, next to the plist path, while the runtime is
+    still alive.
+    """
+    if not plist:
+        return ""
+    parts = {part.lower() for part in Path(plist).parts}
+    if "launchdaemons" in parts:
+        return "system"
+    getuid = getattr(os, "getuid", None)
+    return f"gui/{int(getuid()) if getuid else 0}"
+
+
 def launchd_plist_for_label(label: str, *, search_dirs=None) -> str:
     """Path of *label*'s plist, or ``""``.
 
@@ -559,13 +578,19 @@ def collect_runtime_inventory() -> UpdatePlan:
     # long-lived `hermes dashboard`. Every serve/dashboard registers itself
     # (with structured host/port/profile since #63206) at startup, and
     # ledger_entries() live-verifies (pid, create_time) so PID reuse never
-    # fabricates a row. Desktop-supervised backends are classified by their
-    # recorded spawner still being alive — those restart via the Desktop's
-    # own respawn, not ours.
+    # fabricates a row. A backend is treated as ours to stop and respawn
+    # ONLY when its recorded spawner is provably dead; anything else is
+    # Desktop-supervised, and those restart via the Desktop's own respawn,
+    # not ours.
     try:
         from hermes_cli.process_identity import ledger_entries, spawner_is_dead
 
-        for entry in ledger_entries():
+        # strict=True: a corrupt/unreadable ledger raises instead of reading
+        # as an empty roster, and the raise lands in the ``except`` below as
+        # a recorded discovery error. Without it, a damaged ledger and a box
+        # with no serve/dashboard backends produce the identical plan — and
+        # the second one authorizes the mutation.
+        for entry in ledger_entries(strict=True):
             purpose = entry.get("purpose")
             if purpose not in ("serve", "dashboard"):
                 continue
@@ -573,14 +598,50 @@ def collect_runtime_inventory() -> UpdatePlan:
             if not isinstance(pid, int) or pid in seen_pids:
                 continue
             seen_pids.add(pid)
-            has_live_spawner = spawner_is_dead(entry) is False
-            supervisor = "desktop" if has_live_spawner else "manual-serve"
+            # Only a PROVABLY DEAD spawner licenses the manual-serve
+            # treatment (stop by PID, relaunch by respawn). ``None`` — no
+            # spawner recorded, or one whose (pid, create_time) cannot be
+            # probed — is not evidence that nobody is supervising this
+            # backend: a Desktop app whose spawn tag never reached the child,
+            # or whose process we may not query, reads exactly the same. So
+            # anything short of proof is handled as Desktop-supervised, which
+            # makes the stop refuse and ask for manual intervention instead
+            # of killing a PID something else will immediately respawn onto
+            # pre-update code.
+            spawner_dead = spawner_is_dead(entry)
+            supervisor = "manual-serve" if spawner_dead is True else "desktop"
             profile = str(entry.get("profile") or "default")
+            argv_list = entry.get("argv_list")
             detail = {
+                # ``argv`` is the lossy legacy rendering; ``argv_list`` is the
+                # command itself. The relaunch prefers the list, then the
+                # structured host/port/profile, and refuses a legacy string it
+                # cannot prove round-trips (see ``_respawn_recorded_runtime``).
                 "argv": entry.get("argv") or "",
+                "argv_list": (
+                    [str(part) for part in argv_list]
+                    if isinstance(argv_list, (list, tuple)) and argv_list
+                    else None
+                ),
                 "host": entry.get("host") or "",
                 "port": entry.get("port"),
+                # Set in the replacement's environment. Nothing produced this
+                # before, so the respawn silently inherited the updater's home.
+                "hermes_home": str(entry.get("hermes_home") or ""),
+                # Self-stamped by the backend; the only SHA proof for a runtime
+                # kind that never writes gateway_state.json.
+                "code_sha": str(entry.get("code_sha") or ""),
             }
+            if spawner_dead is None:
+                # Presumed-supervised, not proven so. The stop refuses on it
+                # exactly like a live Desktop, but a POSITIVE supervisor
+                # identity (a systemd unit, a launchd label, an SCM service)
+                # found by ``_attach_supervisor_identities`` still outranks
+                # the presumption: that is hard evidence of who owns the
+                # runtime, and stopping it through its unit is both safe and
+                # respawn-proof. A provably-alive Desktop spawner carries no
+                # such flag and is never downgraded.
+                detail["supervisor_unproven"] = True
             create_time = entry.get("create_time")
             if isinstance(create_time, (int, float)):
                 detail["start_time"] = float(create_time)
@@ -665,7 +726,15 @@ def _attach_supervisor_identities(plan: UpdatePlan) -> None:
                 plist = launchd_plist_for_label(identity.unit)
                 if plist:
                     runtime.detail["plist"] = plist
-            if runtime.supervisor in _IDENTITY_UPGRADABLE_SUPERVISORS:
+                    domain = launchd_domain_for_plist(plist)
+                    if domain:
+                        runtime.detail["launchd_domain"] = domain
+            upgradable = (
+                runtime.supervisor in _IDENTITY_UPGRADABLE_SUPERVISORS
+                or bool(runtime.detail.get("supervisor_unproven"))
+            )
+            if upgradable:
+                runtime.detail.pop("supervisor_unproven", None)
                 if identity.scope == "launchd":
                     runtime.supervisor = "launchd"
                 elif identity.scope == "scm":

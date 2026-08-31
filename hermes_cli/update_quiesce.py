@@ -123,17 +123,27 @@ def relaunch_authority(runtime: Any) -> str:
     """The exact authority that will bring *runtime* back, or ``""``.
 
     Preserving this BEFORE the stop is the whole reason inventory runs
-    pre-mutation: a custom systemd unit or a manual argv is unreadable
-    once the process (and its cgroup) is gone.
+    pre-mutation: a custom systemd unit, a recorded argv or a bind endpoint
+    is unreadable once the process (and its cgroup) is gone.
+
+    Accepts either a :class:`~hermes_cli.update_inventory.RuntimeRecord` or
+    the plain dict it is persisted as — the durable restart-pending record
+    goes through the second shape.
     """
-    unit = str(getattr(runtime, "unit", "") or "")
+    data = _as_record_dict(runtime)
+    unit = str(data.get("unit") or "")
     if unit:
         return unit
-    detail = getattr(runtime, "detail", None) or {}
-    argv = detail.get("argv") if isinstance(detail, dict) else None
-    if argv:
+    detail = data.get("detail")
+    detail = detail if isinstance(detail, dict) else {}
+    # Any of the three launch authorities ``_respawn_recorded_runtime``
+    # honours: the lossless argv list, the structured serve/dashboard
+    # endpoint, or a legacy joined argv.
+    if detail.get("argv_list") or detail.get("argv"):
         return "argv"
-    supervisor = str(getattr(runtime, "supervisor", "") or "")
+    if str(data.get("kind") or "") in ("serve", "dashboard") and detail.get("port"):
+        return "argv"
+    supervisor = str(data.get("supervisor") or "")
     if supervisor in ("desktop",):
         # The Desktop app respawns its own backend; no unit/argv needed.
         return supervisor
@@ -210,6 +220,47 @@ def wait_for_pid_exit(
         sleep(max(float(poll_interval), 0.0))
 
 
+#: How many collect→stop rounds the gate will run before giving up. Two
+#: rounds cover the real race (something started while we were stopping the
+#: fleet); a third exists only so a single unlucky retry is not fatal. A
+#: runtime still there after that is being respawned by something, and the
+#: fail-closed answer is to abort rather than fight it.
+DEFAULT_MAX_QUIESCE_PASSES = 3
+
+
+def runtime_identity_key(runtime: Any) -> tuple:
+    """Forge-proof identity of a runtime row: ``(pid, start_time)``.
+
+    A PID alone is a name the kernel reuses, so it cannot answer "have we
+    already stopped this?" — the pair can. A row whose start time differs
+    is a DIFFERENT process that inherited the number, and it still has to
+    be stopped.
+    """
+    data = _as_record_dict(runtime)
+    detail = data.get("detail")
+    detail = detail if isinstance(detail, dict) else {}
+    start = detail.get("start_time")
+    return (data.get("pid"), None if start is None else float(start))
+
+
+def _collect_gate_plan(recollect: Callable[[], Any], what: str) -> Any:
+    """Re-inventory the fleet at the gate. Fails closed on any answer but one."""
+    try:
+        plan = recollect()
+    except Exception as exc:
+        raise QuiesceAbort(
+            f"refusing to mutate: the {what} runtime inventory could not be "
+            f"collected ({exc}), so running Hermes runtimes cannot be proven "
+            "stopped"
+        ) from exc
+    if plan is None:
+        raise QuiesceAbort(
+            f"refusing to mutate: the {what} runtime inventory came back "
+            "empty-handed, so running Hermes runtimes cannot be proven stopped"
+        )
+    return plan
+
+
 def run_pre_mutation_quiesce(
     plan: Any,
     *,
@@ -223,6 +274,8 @@ def run_pre_mutation_quiesce(
     on_event: Optional[Callable[[str], None]] = None,
     expected_sha: str = "",
     persist_state: bool = True,
+    recollect: Optional[Callable[[], Any]] = None,
+    max_passes: int = DEFAULT_MAX_QUIESCE_PASSES,
 ) -> QuiesceReport:
     """Establish ownership, stop every runtime, and authorize mutation.
 
@@ -232,9 +285,23 @@ def run_pre_mutation_quiesce(
     record third, stops last. Everything that can fail is therefore
     checked while the fleet is still untouched — an abort here needs no
     restore, because nothing has been stopped yet.
+
+    ``recollect`` re-inventories the fleet AT THE GATE. The plan handed in
+    was collected much earlier (it is what printed the fleet banner), and a
+    runtime that started in between was never in it — so it was never
+    stopped, and it kept importing from the checkout the update mutated.
+    With ``recollect`` the gate works from what is running now, and sweeps
+    again after the stops so a runtime that appeared *during* the stop loop
+    is caught too. Runtimes already proven gone are never signalled twice:
+    the sweep matches on ``(pid, start_time)``, so a recycled PID reads as
+    the new process it is.
     """
     global _authorized
     _authorized = None
+
+    if recollect is not None:
+        # Assess ownership against the fleet we are actually going to stop.
+        plan = _collect_gate_plan(recollect, "pre-mutation")
 
     isolation = assess_isolation(plan)
     if not getattr(isolation, "isolated", False):
@@ -243,84 +310,143 @@ def run_pre_mutation_quiesce(
             f"Hermes fleet — {getattr(isolation, 'reason', '') or 'unknown reason'}"
         )
 
-    runtimes = verify_inventory_complete(plan)
-
-    # Persist the relaunch obligation BEFORE the first stop. From the first
-    # SIGTERM onward the runtimes describe themselves nowhere else, so an
-    # updater killed mid-phase would otherwise leave a fleet that cannot be
-    # reconstructed — the exact "interrupted after quiesce" case.
-    if persist_state and runtimes:
-        try:
-            persisted = write_restart_pending_state(
-                runtimes, expected_sha=expected_sha
-            )
-        except Exception as exc:
-            raise QuiesceAbort(
-                "refusing to mutate: the durable restart-pending record could "
-                f"not be written ({exc}) — an updater interrupted after the "
-                "stops would leave a fleet nothing can restore"
-            ) from exc
-        if not persisted:
-            raise QuiesceAbort(
-                "refusing to mutate: the durable restart-pending record could "
-                "not be written — an updater interrupted after the stops "
-                "would leave a fleet nothing can restore"
-            )
-
+    pending = verify_inventory_complete(plan)
     quiesced: list[int] = []
-    for runtime in runtimes:
-        pid = int(runtime.pid)
-        if on_event:
-            on_event(f"stopping {_runtime_label(runtime)}")
-        try:
-            stopped = bool(stop_runtime(runtime))
-        except Exception as exc:
-            raise QuiesceAbort(
-                f"refusing to mutate: could not stop {_runtime_label(runtime)} "
-                f"({exc})"
-            ) from exc
-        if not stopped:
-            raise QuiesceAbort(
-                f"refusing to mutate: could not stop {_runtime_label(runtime)}"
+    stopped_runtimes: list = []
+    stopped_keys: set = set()
+
+    for attempt in range(1, max(int(max_passes), 1) + 1):
+        if pending:
+            _persist_pending_obligation(
+                pending, expected_sha=expected_sha, persist_state=persist_state
             )
-        exited = wait_for_pid_exit(
-            pid,
-            pid_alive=pid_alive,
-            timeout=exit_timeout,
-            poll_interval=poll_interval,
-        )
-        if not exited and escalate is not None:
-            # A wedged runtime (dead event loop, blocked I/O) must not
-            # abort the whole update — escalate, then re-verify. The
-            # verification is what stays non-negotiable: we only proceed
-            # on a PID that is provably gone.
-            if on_event:
-                on_event(
-                    f"{_runtime_label(runtime)} ignored the graceful stop "
-                    "— escalating"
+            for runtime in pending:
+                _stop_and_confirm(
+                    runtime,
+                    stop_runtime=stop_runtime,
+                    pid_alive=pid_alive,
+                    escalate=escalate,
+                    exit_timeout=exit_timeout,
+                    escalated_exit_timeout=escalated_exit_timeout,
+                    poll_interval=poll_interval,
+                    on_event=on_event,
                 )
-            try:
-                escalate(runtime)
-            except Exception as exc:
-                logger.debug("Escalated stop failed for %s: %s", pid, exc)
-            exited = wait_for_pid_exit(
-                pid,
-                pid_alive=pid_alive,
-                timeout=escalated_exit_timeout,
-                poll_interval=poll_interval,
-            )
-        if not exited:
+                quiesced.append(int(runtime.pid))
+                stopped_runtimes.append(runtime)
+                stopped_keys.add(runtime_identity_key(runtime))
+
+        if recollect is None:
+            break
+
+        # Sweep: anything still (or newly) live after the stops would keep
+        # importing from the checkout we are about to mutate.
+        sweep = _collect_gate_plan(recollect, "post-stop")
+        pending = [
+            runtime
+            for runtime in verify_inventory_complete(sweep)
+            if runtime_identity_key(runtime) not in stopped_keys
+        ]
+        if not pending:
+            break
+        if attempt >= max(int(max_passes), 1):
+            labels = ", ".join(_runtime_label(r) for r in pending)
             raise QuiesceAbort(
-                f"refusing to mutate: {_runtime_label(runtime)} did not exit "
-                "— it would keep importing from the mutated checkout"
+                "refusing to mutate: Hermes runtimes are still running after "
+                f"{attempt} stop pass(es) — something is respawning them "
+                f"faster than the update can stop them ({labels}). Stop them "
+                "at their supervisor, then retry"
             )
-        quiesced.append(pid)
+        if on_event:
+            on_event(
+                f"{len(pending)} runtime(s) appeared during the stop — "
+                "quiescing them too"
+            )
 
     report = QuiesceReport(
-        isolation=isolation, quiesced_pids=quiesced, runtimes=list(runtimes)
+        isolation=isolation, quiesced_pids=quiesced, runtimes=stopped_runtimes
     )
     _authorized = report
     return report
+
+
+def _persist_pending_obligation(
+    runtimes, *, expected_sha: str, persist_state: bool
+) -> None:
+    """Record the relaunch obligation BEFORE the first stop of a pass.
+
+    From the first SIGTERM onward the runtimes describe themselves nowhere
+    else, so an updater killed mid-phase would otherwise leave a fleet that
+    cannot be reconstructed — the exact "interrupted after quiesce" case.
+    """
+    if not (persist_state and runtimes):
+        return
+    try:
+        persisted = write_restart_pending_state(runtimes, expected_sha=expected_sha)
+    except Exception as exc:
+        raise QuiesceAbort(
+            "refusing to mutate: the durable restart-pending record could "
+            f"not be written ({exc}) — an updater interrupted after the "
+            "stops would leave a fleet nothing can restore"
+        ) from exc
+    if not persisted:
+        raise QuiesceAbort(
+            "refusing to mutate: the durable restart-pending record could "
+            "not be written — an updater interrupted after the stops "
+            "would leave a fleet nothing can restore"
+        )
+
+
+def _stop_and_confirm(
+    runtime,
+    *,
+    stop_runtime: Callable[[Any], bool],
+    pid_alive: Callable[[int], bool],
+    escalate: Optional[Callable[[Any], None]],
+    exit_timeout: float,
+    escalated_exit_timeout: float,
+    poll_interval: float,
+    on_event: Optional[Callable[[str], None]],
+) -> None:
+    """Stop one runtime and prove its old PID is gone, or raise."""
+    pid = int(runtime.pid)
+    if on_event:
+        on_event(f"stopping {_runtime_label(runtime)}")
+    try:
+        stopped = bool(stop_runtime(runtime))
+    except Exception as exc:
+        raise QuiesceAbort(
+            f"refusing to mutate: could not stop {_runtime_label(runtime)} ({exc})"
+        ) from exc
+    if not stopped:
+        raise QuiesceAbort(
+            f"refusing to mutate: could not stop {_runtime_label(runtime)}"
+        )
+    exited = wait_for_pid_exit(
+        pid, pid_alive=pid_alive, timeout=exit_timeout, poll_interval=poll_interval
+    )
+    if not exited and escalate is not None:
+        # A wedged runtime (dead event loop, blocked I/O) must not abort the
+        # whole update — escalate, then re-verify. The verification is what
+        # stays non-negotiable: we only proceed on a PID provably gone.
+        if on_event:
+            on_event(
+                f"{_runtime_label(runtime)} ignored the graceful stop — escalating"
+            )
+        try:
+            escalate(runtime)
+        except Exception as exc:
+            logger.debug("Escalated stop failed for %s: %s", pid, exc)
+        exited = wait_for_pid_exit(
+            pid,
+            pid_alive=pid_alive,
+            timeout=escalated_exit_timeout,
+            poll_interval=poll_interval,
+        )
+    if not exited:
+        raise QuiesceAbort(
+            f"refusing to mutate: {_runtime_label(runtime)} did not exit "
+            "— it would keep importing from the mutated checkout"
+        )
 
 
 def _cgroup_conflict(updater_cgroup: str, runtime_cgroup: str) -> bool:
@@ -479,20 +605,108 @@ def restart_pending_state_path():
     return get_hermes_home() / RESTART_PENDING_STATE_NAME
 
 
-def write_restart_pending_state(runtimes, *, expected_sha: str = "") -> bool:
-    """Persist the relaunch obligation atomically. Never raises."""
+def _as_record_dict(record) -> dict:
+    """A runtime record as a plain dict, whatever shape it arrived in."""
+    if hasattr(record, "to_dict"):
+        return record.to_dict()
+    try:
+        return dict(record)
+    except (TypeError, ValueError):
+        return {}
+
+
+def restart_record_identity(record) -> tuple:
+    """Stable identity of the runtime a pending record is an obligation for.
+
+    Deliberately PID-free: a PID is what changes when a runtime is
+    relaunched, so keying on it would make every retry treat the same
+    runtime as a brand-new obligation (and the old one as unaccountable).
+    What stays put across a restart is the runtime's kind, its profile, the
+    supervisor unit/scope that owns it, the endpoint it binds, and the
+    command it was launched with.
+    """
+    data = _as_record_dict(record)
+    detail = data.get("detail")
+    detail = detail if isinstance(detail, dict) else {}
+    argv = detail.get("argv_list") or detail.get("argv") or ""
+    if isinstance(argv, (list, tuple)):
+        argv = "\x00".join(str(part) for part in argv)
+    port = detail.get("port")
+    return (
+        str(data.get("kind") or ""),
+        str(data.get("profile") or ""),
+        str(data.get("unit") or ""),
+        str(data.get("unit_scope") or ""),
+        str(detail.get("host") or ""),
+        "" if port is None else str(port),
+        str(argv),
+    )
+
+
+def _merge_pending_records(new_records: list) -> list:
+    """New obligations on top of the ones still undischarged on disk.
+
+    A retry re-inventories the fleet, and a runtime the previous attempt
+    stopped and never brought back is — by definition — not in that new
+    inventory. Replacing the file wholesale therefore dropped exactly the
+    obligations that still mattered. Same identity wins by the newer record
+    (that runtime came back and was re-inventoried under a fresh PID);
+    everything else is carried forward untouched.
+    """
+    merged: list = []
+    index: dict = {}
+    try:
+        existing = read_restart_pending_state() or {}
+        for record in existing.get("runtimes") or []:
+            if not isinstance(record, dict):
+                continue
+            key = restart_record_identity(record)
+            if key in index:
+                merged[index[key]] = record
+                continue
+            index[key] = len(merged)
+            merged.append(record)
+    except Exception as exc:
+        # An unreadable prior record must not block writing the current one:
+        # over-reporting is impossible here, and under-reporting the CURRENT
+        # fleet would be strictly worse.
+        logger.warning("Could not merge the prior restart-pending record: %s", exc)
+    for record in new_records:
+        data = _as_record_dict(record)
+        key = restart_record_identity(data)
+        if key in index:
+            merged[index[key]] = data
+        else:
+            index[key] = len(merged)
+            merged.append(data)
+    return merged
+
+
+def write_restart_pending_state(
+    runtimes, *, expected_sha: str = "", merge: bool = True
+) -> bool:
+    """Persist the relaunch obligation atomically. Never raises.
+
+    ``merge`` (the default) folds *runtimes* into whatever is still owed on
+    disk, keyed by :func:`restart_record_identity`. Pass ``merge=False``
+    only when the caller's list is authoritatively the complete remainder —
+    :func:`discharge_relaunched_records`, which exists to SHRINK the record.
+    """
     import json
     import os as _os
 
     path = restart_pending_state_path()
+    records = (
+        _merge_pending_records(list(runtimes))
+        if merge
+        else [_as_record_dict(r) for r in runtimes]
+    )
     payload = {
         "version": 1,
         "written_at": time.time(),
         "pid": _os.getpid(),
         "expected_sha": expected_sha or "",
-        "runtimes": [
-            r.to_dict() if hasattr(r, "to_dict") else dict(r) for r in runtimes
-        ],
+        "runtimes": records,
     }
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -573,16 +787,16 @@ def relaunch_recorded_runtimes(
     restart_unit: Callable[[str, str], bool],
     respawn_argv: Callable[[str, dict], Optional[int]],
     pid_alive: Callable[[int], bool],
-    probe_sha: Callable[[dict], Optional[str]],
+    probe_sha: Callable[[dict, Optional[int]], Optional[str]],
     on_event: Optional[Callable[[str], None]] = None,
 ) -> list:
     """Bring every recorded runtime back, by its EXACT recorded authority.
 
     Each record is acted on exactly once: a recorded unit/label is handed
-    verbatim to its supervisor, otherwise the recorded argv is respawned.
-    Every old PID is verified gone (a survivor is still importing from the
-    mutated checkout) and each replacement is asked for the source SHA it
-    is now running.
+    verbatim to its supervisor, otherwise the recorded launch identity is
+    respawned. Every old PID is verified gone (a survivor is still importing
+    from the mutated checkout) and each replacement is asked — by its own
+    PID, where we know it — for the source SHA it is now running.
     """
     expected_sha = str((state or {}).get("expected_sha") or "")
     outcomes: list[RelaunchOutcome] = []
@@ -593,9 +807,15 @@ def relaunch_recorded_runtimes(
         detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
         argv = str((detail or {}).get("argv") or "")
         supervisor = str(record.get("supervisor") or "")
+        # One question, one answer: whatever the inventory accepted as this
+        # runtime's relaunch authority is what the relaunch acts on. Reading
+        # ``detail['argv']`` directly here is how a record with a lossless
+        # ``argv_list`` (and no legacy string) used to fall through to
+        # "no recorded relaunch authority".
+        authority = relaunch_authority(record)
         if unit:
             mechanism = "unit"
-        elif argv:
+        elif authority == "argv":
             mechanism = "argv"
         elif supervisor == "desktop":
             # The Desktop app respawns its own backend; there is nothing
@@ -621,7 +841,7 @@ def relaunch_recorded_runtimes(
                 outcome.relaunched = bool(
                     restart_unit(unit, str(record.get("unit_scope") or ""))
                 )
-            elif argv:
+            elif mechanism == "argv":
                 # A record whose PID is STILL ALIVE was never actually
                 # stopped — the abort-then-restore path, where a stop
                 # failed partway through the fleet. Respawning it would
@@ -652,7 +872,10 @@ def relaunch_recorded_runtimes(
             outcome.old_pid_gone = not _pid_still_alive(outcome.old_pid, pid_alive)
 
         try:
-            sha = probe_sha(record)
+            # The new PID is what ties the replacement's own stamp to the
+            # process THIS relaunch started; without it the probe can only
+            # prove "not the process we stopped".
+            sha = probe_sha(record, outcome.new_pid)
         except Exception as exc:
             logger.debug("SHA probe failed: %s", exc)
             sha = None
@@ -719,8 +942,13 @@ def discharge_relaunched_records(state: Optional[dict], outcomes: Sequence) -> b
     if not remaining:
         clear_restart_pending_state()
         return True
+    # merge=False: ``remaining`` IS the complete remainder, and merging it
+    # back over the record it was derived from would re-add every entry this
+    # call exists to drop.
     written = write_restart_pending_state(
-        remaining, expected_sha=str((state or {}).get("expected_sha") or "")
+        remaining,
+        expected_sha=str((state or {}).get("expected_sha") or ""),
+        merge=False,
     )
     if not written:
         logger.warning(

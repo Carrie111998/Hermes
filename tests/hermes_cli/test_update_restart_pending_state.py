@@ -134,7 +134,7 @@ class TestRelaunchFromRecordedState:
             restart_unit=lambda unit, scope: (restarted_units.append(unit) or True),
             respawn_argv=lambda argv, record: (respawned.append(argv) or 5555),
             pid_alive=lambda pid: False,
-            probe_sha=lambda record: "newsha",
+            probe_sha=lambda record, _new_pid=None: "newsha",
         )
 
         assert restarted_units == ["hermes-gateway.service"]
@@ -153,7 +153,7 @@ class TestRelaunchFromRecordedState:
             restart_unit=lambda unit, scope: True,
             respawn_argv=lambda argv, record: None,
             pid_alive=lambda pid: pid == 4242,
-            probe_sha=lambda record: "newsha",
+            probe_sha=lambda record, _new_pid=None: "newsha",
         )
         assert outcomes[0].old_pid_gone is False
         assert update_quiesce.relaunch_is_complete(outcomes) is False
@@ -167,7 +167,7 @@ class TestRelaunchFromRecordedState:
             restart_unit=lambda unit, scope: True,
             respawn_argv=lambda argv, record: None,
             pid_alive=lambda pid: False,
-            probe_sha=lambda record: "oldsha",
+            probe_sha=lambda record, _new_pid=None: "oldsha",
         )
         assert outcomes[0].sha_matches is False
         assert update_quiesce.relaunch_is_complete(outcomes) is False
@@ -181,7 +181,7 @@ class TestRelaunchFromRecordedState:
             restart_unit=lambda unit, scope: False,
             respawn_argv=lambda argv, record: None,
             pid_alive=lambda pid: False,
-            probe_sha=lambda record: "newsha",
+            probe_sha=lambda record, _new_pid=None: "newsha",
         )
         assert outcomes[0].relaunched is False
         assert update_quiesce.relaunch_is_complete(outcomes) is False
@@ -198,7 +198,7 @@ class TestRelaunchFromRecordedState:
             restart_unit=lambda unit, scope: True,
             respawn_argv=lambda argv, record: respawned.append(argv) or 5555,
             pid_alive=lambda pid: pid == 4300,
-            probe_sha=lambda record: "newsha",
+            probe_sha=lambda record, _new_pid=None: "newsha",
         )
 
         assert respawned == []
@@ -223,7 +223,7 @@ class TestRelaunchFromRecordedState:
             restart_unit=lambda unit, scope: False,
             respawn_argv=lambda argv, rec: None,
             pid_alive=lambda pid: False,
-            probe_sha=lambda rec: "newsha",
+            probe_sha=lambda rec, _new_pid=None: "newsha",
         )
 
         assert outcomes[0].mechanism == "desktop"
@@ -238,7 +238,7 @@ class TestRelaunchFromRecordedState:
             restart_unit=lambda unit, scope: True,
             respawn_argv=lambda argv, record: 6000,
             pid_alive=lambda pid: False,
-            probe_sha=lambda record: "newsha",
+            probe_sha=lambda record, _new_pid=None: "newsha",
         )
         assert update_quiesce.relaunch_is_complete(outcomes) is True
 
@@ -262,7 +262,7 @@ class TestDischargingRelaunchedRecords:
             pid_alive=lambda pid: False,
             # A replacement that has not written its state file yet still
             # reports the pre-update SHA, so the run is "incomplete".
-            probe_sha=lambda record: "oldsha",
+            probe_sha=lambda record, _new_pid=None: "oldsha",
         )
         assert update_quiesce.relaunch_is_complete(outcomes) is False
 
@@ -282,7 +282,7 @@ class TestDischargingRelaunchedRecords:
             restart_unit=lambda unit, scope: True,
             respawn_argv=lambda argv, record: None,
             pid_alive=lambda pid: False,
-            probe_sha=lambda record: "oldsha",
+            probe_sha=lambda record, _new_pid=None: "oldsha",
         )
 
         update_quiesce.discharge_relaunched_records(state, outcomes)
@@ -313,7 +313,7 @@ class TestDischargingRelaunchedRecords:
                     respawned.append(argv) or 6000
                 ),
                 pid_alive=lambda pid: False,
-                probe_sha=lambda record: "oldsha",
+                probe_sha=lambda record, _new_pid=None: "oldsha",
             )
             if update_quiesce.relaunch_is_complete(outcomes):
                 update_quiesce.clear_restart_pending_state()

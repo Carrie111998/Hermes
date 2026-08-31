@@ -3345,22 +3345,38 @@ def _stop_runtime_for_quiesce(runtime) -> bool:
         # provably gone.
         if not _desktop_supervisor_is_gone(runtime):
             raise update_quiesce.QuiesceAbort(
-                "the Hermes Desktop app still supervises this backend and "
-                "would respawn it onto pre-update code during the update — "
-                "quit Hermes Desktop (or stop the backend from Desktop), "
-                "then retry"
+                "this serve/dashboard backend is not provably unsupervised: "
+                "the Hermes Desktop app (or whatever spawned it) may still "
+                "be there and would respawn it onto pre-update code during "
+                "the update — quit Hermes Desktop (or stop the backend "
+                "yourself), then retry"
             )
+    detail = getattr(runtime, "detail", None) or {}
+    if not isinstance(detail, dict):
+        detail = {}
     if unit and scope == "scm":
         # Windows SCM: the update's own pause machinery owns these, and it
         # already ran. Treat an SCM-supervised runtime as stopped once its
         # PID is gone (the caller verifies that).
-        if _m()._is_windows():
-            try:
-                _m()._stop_windows_gateway_service(unit)
-                return True
-            except Exception as exc:
-                logger.debug("sc.exe stop %s failed: %s", unit, exc)
-    stop_argv = _supervised_stop_command(unit, scope)
+        #
+        # Every exit from this branch is a RETURN, never a fall-through. The
+        # SCM is the authority for this process: killing its PID is answered
+        # by the service manager restarting it on pre-update code, under a
+        # new PID the old-PID exit check never looks at — the exact skew the
+        # supervised-stop rule exists to prevent. A stop we could not perform
+        # is a failed stop.
+        if not _m()._is_windows():
+            logger.debug("Refusing to stop SCM-supervised %s off Windows", unit)
+            return False
+        try:
+            _m()._stop_windows_gateway_service(unit)
+            return True
+        except Exception as exc:
+            logger.debug("sc.exe stop %s failed: %s", unit, exc)
+            return False
+    stop_argv = _supervised_stop_command(
+        unit, scope, domain=str(detail.get("launchd_domain") or "")
+    )
     if stop_argv is not None:
         # No PID fallback here — see the docstring. A stop we could not run
         # (no privileges, missing binary) leaves the supervisor in charge.
@@ -3404,7 +3420,12 @@ def _current_uid(uid: Optional[int] = None) -> int:
 
 
 def _supervised_stop_command(
-    unit: str, scope: str, *, uid: Optional[int] = None, is_root: Optional[bool] = None
+    unit: str,
+    scope: str,
+    *,
+    uid: Optional[int] = None,
+    is_root: Optional[bool] = None,
+    domain: str = "",
 ):
     """Argv that stops *unit* WITHOUT its supervisor respawning it.
 
@@ -3423,8 +3444,29 @@ def _supervised_stop_command(
         # `bootout` UNLOADS the job. `stop`/`kill` would let a KeepAlive
         # agent respawn immediately — straight back onto pre-update code
         # inside the mutation window, which is the skew we are removing.
-        return ["launchctl", "bootout", f"gui/{_current_uid(uid)}/{unit}"]
+        #
+        # The DOMAIN is part of the job's identity: a LaunchDaemon lives in
+        # `system`, not in the caller's `gui/<uid>` session, and booting a
+        # label out of a domain it is not in "succeeds" while the job keeps
+        # running. Use the domain the inventory recorded; fall back to the
+        # GUI session only for records written before it was captured.
+        return [
+            "launchctl",
+            "bootout",
+            f"{_launchd_domain(domain, uid)}/{unit}",
+        ]
     return None
+
+
+def _launchd_domain(domain: str, uid: Optional[int] = None) -> str:
+    """The launchd domain target a job must be addressed in.
+
+    ``domain`` is what the pre-mutation inventory recorded (derived from the
+    directory its plist lives in). Empty means the record predates that
+    capture, and the GUI session is the right default: LaunchAgents are the
+    overwhelmingly common case and the only one the old code handled.
+    """
+    return str(domain or f"gui/{_current_uid(uid)}")
 
 
 def _supervised_restart_command(
@@ -3434,6 +3476,7 @@ def _supervised_restart_command(
     uid: Optional[int] = None,
     is_root: Optional[bool] = None,
     plist: str = "",
+    domain: str = "",
 ):
     """Argv that brings *unit* back from a fresh process. ``None`` if N/A."""
     if not unit:
@@ -3444,7 +3487,7 @@ def _supervised_restart_command(
             is_root = bool(geteuid and geteuid() == 0)
         return _systemd_unit_argv(unit, scope, "restart", is_root=is_root)
     if scope == "launchd":
-        domain = f"gui/{_current_uid(uid)}"
+        domain = _launchd_domain(domain, uid)
         if plist:
             # Re-bootstrap the job we booted out; this is the only way back
             # after an unload.
@@ -3537,6 +3580,13 @@ def _escalate_runtime_stop(runtime) -> None:
         logger.debug("Forced stop of %s failed: %s", pid, exc)
 
 
+def _recollect_runtime_inventory():
+    """A fresh read-only fleet inventory, for the pre-mutation gate."""
+    from hermes_cli.update_inventory import collect_runtime_inventory
+
+    return collect_runtime_inventory()
+
+
 def _quiesce_fleet_before_mutation(plan, *, expected_sha: str = ""):
     """Establish ownership + stop the fleet, or exit before mutating."""
     from hermes_cli import update_quiesce
@@ -3553,6 +3603,11 @@ def _quiesce_fleet_before_mutation(plan, *, expected_sha: str = ""):
             exit_timeout=_quiesce_exit_budget(),
             expected_sha=expected_sha,
             on_event=lambda message: print(f"  → {message}"),
+            # The plan above printed the fleet banner minutes ago, before the
+            # fetch and the up-to-date check. Re-inventory HERE, at the moment
+            # the update is actually about to write, or a runtime started in
+            # between is never stopped and keeps importing from the checkout.
+            recollect=_recollect_runtime_inventory,
         )
     except update_quiesce.QuiesceAbort as exc:
         _print_quiesce_abort(exc)
@@ -3629,7 +3684,9 @@ def _relaunch_quiesced_runtimes(expected_sha: str = ""):
         ),
         respawn_argv=lambda argv, record: _m()._respawn_recorded_runtime(argv, record),
         pid_alive=lambda pid: _m()._runtime_pid_alive(pid),
-        probe_sha=lambda record: _m()._probe_relaunched_runtime_sha(record),
+        probe_sha=lambda record, new_pid: _m()._probe_relaunched_runtime_sha(
+            record, new_pid
+        ),
         on_event=lambda message: print(f"  → {message}"),
     )
     for outcome in outcomes:
@@ -3672,39 +3729,119 @@ def _restart_supervised_unit(unit: str, scope: str, state: dict | None = None) -
             logger.debug("sc.exe start %s failed: %s", unit, exc)
             return False
     plist = ""
+    domain = ""
     for record in (state or {}).get("runtimes") or []:
         if isinstance(record, dict) and record.get("unit") == unit:
             detail = record.get("detail")
             if isinstance(detail, dict):
                 plist = str(detail.get("plist") or "")
+                # The domain the job was booted out of is the only one it can
+                # be bootstrapped back into.
+                domain = str(detail.get("launchd_domain") or "")
             break
     return _run_supervisor_command(
-        _supervised_restart_command(unit, scope, plist=plist)
+        _supervised_restart_command(unit, scope, plist=plist, domain=domain)
     )
 
 
-def _respawn_recorded_runtime(argv: str, record: dict):
-    """Respawn a manually-launched runtime from its recorded argv.
+#: The number of argv tokens older ledger entries were truncated at. A legacy
+#: string with exactly this many tokens may have lost everything after it —
+#: including the `--port` a serve backend must come back on — so it is not a
+#: launch authority, it is a guess.
+_LEGACY_ARGV_TOKEN_CAP = 10
 
-    Detached and in a fresh interpreter: the replacement must not inherit
-    this updater's module graph, its process group, or its lifetime.
+
+def _legacy_argv_parts(argv: str):
+    """POSIX-split a legacy joined argv, or ``None`` when it is ambiguous.
+
+    The legacy record was ``" ".join(sys.argv[:10])``, which is lossy in two
+    ways. Truncation is detectable — a string sitting exactly on the cap may
+    be missing arguments. Quoting is the other tell: a plain join never
+    produces quotes, so their presence means the string is not a faithful
+    rendering of the argv and splitting it would invent a different command.
+
+    Respawning the wrong process is worse than not respawning: the caller
+    reports the failure and the operator restarts it, instead of a backend
+    silently coming back on the wrong port or profile.
+
+    The split is POSIX on every OS on purpose. A Windows command line has no
+    faithful inverse of ``list2cmdline``, so a legacy string carrying
+    backslashes or quotes fails the round-trip check and is refused — which
+    is the right answer, and the structured serve/dashboard authority above
+    covers the case that actually matters there.
     """
     import shlex
 
-    if os.name == "nt":
-        # Windows has no POSIX word-splitting: hand the recorded command
-        # line to CreateProcess verbatim, which is exactly how it was
-        # rendered when the runtime was inventoried.
-        parts = argv
-        if not parts.strip():
-            return None
-    else:
-        try:
-            parts = shlex.split(argv)
-        except ValueError:
-            parts = argv.split()
-        if not parts:
-            return None
+    try:
+        parts = shlex.split(argv)
+    except ValueError:
+        return None
+    if not parts:
+        return None
+    if len(parts) >= _LEGACY_ARGV_TOKEN_CAP:
+        logger.debug("Refusing a possibly-truncated legacy argv: %r", argv)
+        return None
+    if shlex.join(parts) != argv.strip():
+        logger.debug("Refusing a legacy argv that does not round-trip: %r", argv)
+        return None
+    return parts
+
+
+def _structured_relaunch_parts(record: dict):
+    """A serve/dashboard launch command built from structured identity.
+
+    ``host``/``port``/``profile`` are recorded as fields, not as text, so
+    they survive spaces and truncation alike. ``None`` when the record is not
+    a serve/dashboard or carries no port.
+    """
+    kind = str(record.get("kind") or "")
+    if kind not in ("serve", "dashboard"):
+        return None
+    detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
+    entry = {
+        "purpose": kind,
+        "profile": record.get("profile") or (detail or {}).get("profile") or "",
+        "host": (detail or {}).get("host") or "",
+        "port": (detail or {}).get("port"),
+    }
+    commands = _m()._serve_relaunch_commands([entry])
+    return commands[0] if commands else None
+
+
+def _recorded_launch_parts(argv: str, record: dict):
+    """The command that brings *record*'s runtime back, or ``None``.
+
+    Authority order — most faithful first:
+
+    1. the lossless recorded argv list, handed to the OS verbatim;
+    2. the structured host/port/profile of a serve/dashboard;
+    3. a legacy joined argv, but only when it is provably unambiguous.
+    """
+    detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
+    argv_list = (detail or {}).get("argv_list")
+    if isinstance(argv_list, (list, tuple)) and argv_list:
+        return [str(part) for part in argv_list]
+    structured = _structured_relaunch_parts(record)
+    if structured:
+        return structured
+    if not argv:
+        return None
+    return _legacy_argv_parts(argv)
+
+
+def _respawn_recorded_runtime(argv: str, record: dict):
+    """Respawn a manually-launched runtime from its recorded launch identity.
+
+    Detached and in a fresh interpreter: the replacement must not inherit
+    this updater's module graph, its process group, or its lifetime.
+
+    Returns ``None`` when nothing faithful was recorded — the caller keeps
+    the relaunch obligation open and reports it, which is the only safe
+    answer when the alternative is starting a DIFFERENT process.
+    """
+    parts = _recorded_launch_parts(argv, record)
+    if not parts:
+        return None
     env = dict(os.environ)
     detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
     home = (detail or {}).get("hermes_home")
@@ -3731,29 +3868,132 @@ def _respawn_recorded_runtime(argv: str, record: dict):
     return proc.pid
 
 
-def _probe_relaunched_runtime_sha(record: dict) -> str | None:
-    """Ask the replacement which source SHA it is actually running.
+#: How long a replacement gets to publish its own code stamp before we call
+#: it unverified. A relaunch returns as soon as the process is CREATED; the
+#: stamp lands when it has booted far enough to write it, which is later.
+RUNTIME_SHA_SETTLE_TIMEOUT = 30.0
+RUNTIME_SHA_POLL_INTERVAL = 0.5
 
-    ``None`` when the runtime publishes no stamp, and deliberately NOT
-    the on-disk checkout SHA: the checkout reads as updated whether the
-    replacement came up on the new graph, came up on a stale venv, or
-    never came up at all. Substituting it turned this check into "the
-    files changed" — the one thing that was never in doubt — so an
-    unstamped runtime is an unverified runtime, and the caller keeps its
-    relaunch obligation open.
+
+def _gateway_stamped_sha(record: dict, new_pid: int | None) -> str | None:
+    """A gateway replacement's own ``gateway_state.json`` stamp.
+
+    The file is keyed by profile, not by process, so the PID inside it is
+    what says WHICH gateway wrote it. Accepting the stamp without that check
+    let the pre-update record (or a co-located gateway that was never
+    stopped) answer for a replacement that had not started.
     """
-    try:
-        from gateway.status import read_runtime_status
-        from hermes_cli.profiles import get_profile_dir
+    from gateway.status import read_runtime_status
+    from hermes_cli.profiles import get_profile_dir
 
-        profile = str(record.get("profile") or "default")
-        home = get_profile_dir(profile)
-        status = read_runtime_status(Path(home) / "gateway_state.json")
-        if status and status.get("code_sha"):
-            return str(status["code_sha"])
-    except Exception as exc:
-        logger.debug("Runtime SHA probe failed: %s", exc)
+    home = get_profile_dir(str(record.get("profile") or "default"))
+    status = read_runtime_status(Path(home) / "gateway_state.json")
+    if not status or not status.get("code_sha"):
+        return None
+    try:
+        stamped_pid = int(status.get("pid"))
+    except (TypeError, ValueError):
+        return None
+    old_pid = record.get("pid")
+    if new_pid is not None:
+        if stamped_pid != int(new_pid):
+            return None
+    elif isinstance(old_pid, int) and stamped_pid == old_pid:
+        # A supervisor relaunch hides the new PID from us, so the weaker
+        # available proof is "not the process we stopped".
+        return None
+    if not _m()._runtime_pid_alive(stamped_pid):
+        return None
+    return str(status["code_sha"])
+
+
+def _ledger_stamped_sha(record: dict, new_pid: int | None) -> str | None:
+    """A serve/dashboard replacement's own spawn-ledger registration.
+
+    These backends never write ``gateway_state.json`` — they self-register
+    in the machine spawn ledger at startup, stamping the source SHA they are
+    running. That registration IS the replacement speaking for itself.
+    """
+    from hermes_cli.process_identity import ledger_entries
+
+    kind = str(record.get("kind") or "")
+    profile = str(record.get("profile") or "")
+    old_pid = record.get("pid")
+    for entry in ledger_entries():
+        if str(entry.get("purpose") or "") != kind:
+            continue
+        sha = str(entry.get("code_sha") or "")
+        if not sha:
+            continue
+        pid = entry.get("pid")
+        if not isinstance(pid, int):
+            continue
+        if new_pid is not None:
+            if pid != int(new_pid):
+                continue
+        else:
+            if isinstance(old_pid, int) and pid == old_pid:
+                continue
+            recorded_profile = str(entry.get("profile") or "")
+            # An empty recorded profile predates the structured fields; it
+            # cannot contradict, so it is allowed to answer.
+            if recorded_profile and profile and recorded_profile != profile:
+                continue
+        return sha
     return None
+
+
+def _probe_relaunched_runtime_sha(
+    record: dict,
+    new_pid: int | None = None,
+    *,
+    timeout: float | None = None,
+    poll_interval: float | None = None,
+) -> str | None:
+    """Ask the REPLACEMENT which source SHA it is actually running.
+
+    Runtime-kind-correct: a gateway publishes ``gateway_state.json``, a
+    serve/dashboard publishes a spawn-ledger registration. Asking the wrong
+    one produced a permanent ``None`` for serve/dashboard (an obligation
+    that could never discharge) or, worse, let some OTHER gateway's stamp
+    stand in for the replacement.
+
+    ``new_pid`` — when the relaunch was ours to make — is what ties the
+    stamp to the process we started. A supervisor relaunch does not tell us
+    the new PID, so the check degrades to "not the process we stopped",
+    which is still stronger than reading the file blind.
+
+    Bounded polling, because a relaunch returns when the process is created
+    and the stamp lands when it has booted. ``None`` when nothing published
+    inside the window, and deliberately NOT the on-disk checkout SHA: the
+    checkout reads as updated whether the replacement came up on the new
+    graph, came up on a stale venv, or never came up at all.
+    """
+    kind = str(record.get("kind") or "")
+    if kind == "gateway":
+        prove = _gateway_stamped_sha
+    elif kind in ("serve", "dashboard"):
+        prove = _ledger_stamped_sha
+    else:
+        logger.debug("No SHA proof defined for runtime kind %r", kind)
+        return None
+
+    budget = RUNTIME_SHA_SETTLE_TIMEOUT if timeout is None else float(timeout)
+    interval = (
+        RUNTIME_SHA_POLL_INTERVAL if poll_interval is None else float(poll_interval)
+    )
+    deadline = _time.monotonic() + max(budget, 0.0)
+    while True:
+        try:
+            sha = prove(record, new_pid)
+        except Exception as exc:
+            logger.debug("Runtime SHA probe failed: %s", exc)
+            sha = None
+        if sha:
+            return sha
+        if _time.monotonic() >= deadline:
+            return None
+        _time.sleep(max(interval, 0.0))
 
 
 def _format_concurrent_instances_message(
@@ -9697,10 +9937,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
             except Exception:
                 _drain_budget = 45.0
 
-            failed_or_stale_units = []
-            killed_pids = set()
-            relaunched_profiles = []
-            externally_supervised_profiles = []
+            # NOTE: the four restart bookkeeping collections are initialised
+            # ONCE, above the enclosing try — deliberately. They are already
+            # populated by the quiesced-runtime relaunch that runs before this
+            # block, and re-initialising them here erased every outcome it
+            # recorded (a relaunched runtime read as unaccounted, a failed one
+            # as a clean update). The platform branches below only ever append.
 
             # Record which gateways are running before any stop/drain, so a
             # later failure that leaves the survivor probe empty can still be

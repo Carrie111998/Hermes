@@ -168,6 +168,21 @@ class LedgerEntry:
     host: str = ""
     port: Optional[int] = None
     profile: str = ""
+    # The FULL argv as a list. ``argv`` above is a lossy human-readable
+    # rendering of it — a joined string cannot round-trip an argument that
+    # contains whitespace, and it used to be truncated at ten tokens, which
+    # is exactly where `--host`/`--port`/`--profile` sit on a slightly longer
+    # command. A relauncher must use this list and hand it to the OS verbatim.
+    argv_list: Optional[list] = None
+    # The HERMES_HOME this runtime was running under. The relaunch sets it in
+    # the replacement's environment; without a producer here that lookup found
+    # nothing and the replacement silently inherited the updater's home.
+    hermes_home: str = ""
+    # The source SHA this process is running, stamped by the process ITSELF.
+    # For serve/dashboard backends — which do not write gateway_state.json —
+    # this is the only runtime-kind-correct proof that a replacement came up
+    # on post-update code.
+    code_sha: str = ""
 
 
 def _ledger_path() -> Path:
@@ -203,6 +218,16 @@ def _read_ledger(path: Path) -> Optional[list[dict]]:
     if not isinstance(parsed, list):
         return None
     return [e for e in parsed if isinstance(e, dict)]
+
+
+class LedgerUnreadable(RuntimeError):
+    """The spawn ledger exists but could not be read as a roster.
+
+    Raised only for ``strict`` readers — the ones whose next act depends on
+    the roster being the whole truth (the pre-mutation update inventory).
+    Everyone else keeps the lenient, self-healing behaviour: quarantine the
+    file and carry on with an empty list.
+    """
 
 
 def _quarantine_ledger(path: Path) -> None:
@@ -290,13 +315,27 @@ def register_self(
     try:
         import sys as _sys
 
-        # 10 tokens (was 6): enough for `hermes serve --host X --port N
-        # --profile P` — the relaunch shapes #63206 needs — while still
-        # bounding pathological argv. Structured detail above is the
-        # canonical identity; argv is the human-readable fallback.
-        entry.argv = " ".join(_sys.argv[:10])
+        # The list is the record; the joined string is kept only so existing
+        # readers (log lines, the dashboard scan's cmdline matcher) keep
+        # working. No truncation: dropping the eleventh token silently
+        # dropped `--port` from longer commands, and a respawn from a
+        # truncated argv is a WRONG process, not a failed one.
+        entry.argv_list = [str(part) for part in _sys.argv]
+        entry.argv = " ".join(entry.argv_list[:10])
     except Exception:
         pass
+    try:
+        from hermes_constants import get_hermes_home
+
+        entry.hermes_home = str(get_hermes_home())
+    except Exception:
+        logger.debug("could not record HERMES_HOME in the spawn ledger", exc_info=True)
+    try:
+        from hermes_cli.build_info import get_code_identity
+
+        entry.code_sha = str(get_code_identity().get("sha") or "")
+    except Exception:
+        logger.debug("could not stamp the running code sha", exc_info=True)
 
     return _append_entry(entry)
 
@@ -384,26 +423,45 @@ def register_child(
     try:
         import psutil
 
-        entry.argv = " ".join(psutil.Process(pid).cmdline()[:10])
+        entry.argv_list = [str(part) for part in psutil.Process(pid).cmdline()]
+        entry.argv = " ".join(entry.argv_list[:10])
     except Exception:
         pass
     return _append_entry(entry)
 
 
-def ledger_entries(*, project_root: Optional[Path] = None) -> list[dict]:
+def ledger_entries(
+    *, project_root: Optional[Path] = None, strict: bool = False
+) -> list[dict]:
     """Live-verified ledger entries for THIS install.
 
     Entries whose ``(pid, create_time)`` no longer matches a live process are
-    excluded (PID reuse reads as dead, thanks to the create-time pair). A
-    corrupt ledger is quarantined and read as empty — identical philosophy to
-    the backend-ownership fix (#89298): never let corruption erase or fake
-    a roster; never let it block the caller either.
+    excluded (PID reuse reads as dead, thanks to the create-time pair).
+
+    Corruption is where the two caller classes part ways. By default a
+    corrupt or unreadable ledger is quarantined and read as empty —
+    identical philosophy to the backend-ownership fix (#89298): never let
+    corruption erase or fake a roster, never let it block a startup reaper
+    either. But "no backends are registered" and "the roster is unreadable"
+    are NOT the same fact, and a caller about to authorize a checkout
+    mutation must not act on the second as if it were the first. Those
+    callers pass ``strict=True`` and get :class:`LedgerUnreadable`.
+
+    A strict read deliberately does NOT quarantine: moving the damaged file
+    aside would make the very next read return a positively-empty roster,
+    turning a fail-closed abort into a fail-open retry.
     """
     want_install = install_id(project_root)
     path = _ledger_path()
     with _LEDGER_LOCK:
         entries = _read_ledger(path)
         if entries is None:
+            if strict:
+                raise LedgerUnreadable(
+                    f"the spawn ledger at {path} is corrupt or unreadable, so "
+                    "the set of running serve/dashboard backends cannot be "
+                    "established"
+                )
             _quarantine_ledger(path)
             return []
     out: list[dict] = []

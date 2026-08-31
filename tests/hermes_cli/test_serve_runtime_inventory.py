@@ -82,7 +82,9 @@ def test_inventory_includes_manual_serve_from_ledger(monkeypatch):
     entry = _ledger_entry()
     fake_pi = SimpleNamespace(
         ledger_entries=lambda **k: [entry],
-        spawner_is_dead=lambda e: None,  # no spawner recorded → manual
+        # Provably-dead spawner: the only state that makes a serve ours to
+        # stop by PID and respawn (see test_update_serve_supervisor_fail_closed).
+        spawner_is_dead=lambda e: True,
     )
     monkeypatch.setitem(sys.modules, "hermes_cli.process_identity", fake_pi)
     plan = update_inventory.collect_runtime_inventory()

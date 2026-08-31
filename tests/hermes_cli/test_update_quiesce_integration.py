@@ -151,6 +151,14 @@ def _patch_update_deps(monkeypatch, tmp_path, events, behind=3):
     monkeypatch.setattr(
         "hermes_cli.update_inventory.collect_runtime_inventory", _plan
     )
+    # The post-update fleet probe polls a real 30s settle window whenever the
+    # restart phase reports work. There is no live gateway here to publish a
+    # state stamp, so short-circuit the probe: these tests pin the ORDER of
+    # stop-vs-mutate, not the fleet version matrix (which has its own suite).
+    for _module in (update_cmd, hermes_main):
+        monkeypatch.setattr(
+            _module, "_fleet_probe_expected_runtimes", lambda *a, **k: False
+        )
 
 
 def _args():
@@ -282,7 +290,9 @@ def test_real_update_leaves_a_relaunch_record_and_restores_the_fleet(
         lambda argv: (supervisor_calls.append(list(argv)) or True),
     )
     monkeypatch.setattr(
-        hermes_main, "_probe_relaunched_runtime_sha", lambda record: "b" * 40
+        hermes_main,
+        "_probe_relaunched_runtime_sha",
+        lambda record, _new_pid=None: "b" * 40,
     )
     outcomes = update_cmd._relaunch_quiesced_runtimes("b" * 40)
 
@@ -317,3 +327,117 @@ def test_command_boundary_relaunches_a_quiesced_fleet(monkeypatch, tmp_path):
         hermes_main.cmd_update(_args())
 
     assert calls, "the command boundary must attempt the relaunch"
+
+
+# ---------------------------------------------------------------------------
+# The restart phase must not discard what the quiesce relaunch achieved
+# ---------------------------------------------------------------------------
+#
+# `_cmd_update_impl` initialises `failed_or_stale_units` / `killed_pids` /
+# `relaunched_profiles` / `externally_supervised_profiles` once, fills them
+# from the quiesced-runtime relaunch, and then — inside the platform restart
+# block — used to re-initialise all four to empty. Everything the relaunch
+# recorded was erased before the summary, the reconciliation and the receipt
+# ever saw it: a runtime that WAS relaunched read as unaccounted, and one that
+# FAILED to come back read as a clean update.
+#
+# These assert on the impl's own stdout rather than on a patched receipt
+# function, because the restart phase runs after `_purge_stale_hermes_modules`
+# — a monkeypatched `hermes_cli.update_receipt` attribute is dropped from
+# sys.modules and the phase re-imports the real one.
+
+
+def _mixed_plan():
+    plan = UpdatePlan()
+    plan.expected_sha = "a" * 40
+    plan.runtimes = [
+        RuntimeRecord(
+            kind="gateway",
+            profile="default",
+            pid=4242,
+            supervisor="systemd",
+            restart_via="systemd",
+            unit="acme-gateway.service",
+            unit_scope="user",
+        ),
+        RuntimeRecord(
+            kind="serve",
+            profile="edge",
+            pid=4343,
+            supervisor="manual-serve",
+            restart_via="respawn-argv",
+            detail={
+                "argv_list": ["hermes", "serve", "--port", "9119"],
+                "argv": "hermes serve --port 9119",
+                "start_time": 111.0,
+            },
+        ),
+    ]
+    return plan
+
+
+def _run_impl_over_a_quiesced_fleet(
+    monkeypatch, tmp_path, capsys, *, unit_restart_ok=True
+):
+    events: list[str] = []
+    _patch_update_deps(monkeypatch, tmp_path, events)
+    monkeypatch.setattr(
+        "hermes_cli.update_inventory.collect_runtime_inventory", _mixed_plan
+    )
+
+    alive = {4242, 4343}
+
+    def _stop(runtime):
+        events.append(f"stop:{runtime.pid}")
+        alive.discard(runtime.pid)
+        return True
+
+    for module in (update_cmd, hermes_main):
+        monkeypatch.setattr(module, "_stop_runtime_for_quiesce", _stop)
+        monkeypatch.setattr(module, "_runtime_pid_alive", lambda pid: pid in alive)
+        monkeypatch.setattr(
+            module, "_probe_relaunched_runtime_sha", lambda *a, **k: "b" * 40
+        )
+        monkeypatch.setattr(module, "_respawn_recorded_runtime", lambda *a, **k: 5151)
+    monkeypatch.setattr(
+        update_quiesce,
+        "assess_updater_isolation",
+        lambda plan, **kw: update_quiesce.IsolationResult(isolated=True, reason="t"),
+    )
+    monkeypatch.setattr(
+        update_cmd, "_run_supervisor_command", lambda argv: unit_restart_ok
+    )
+
+    try:
+        update_cmd._cmd_update_impl(_args(), gateway_mode=False)
+    except SystemExit:
+        pass
+    return capsys.readouterr().out, events
+
+
+def test_restart_phase_keeps_the_quiesce_relaunch_bookkeeping(
+    monkeypatch, tmp_path, capsys
+):
+    """A successful relaunch survives to the summary and reconciliation."""
+    out, events = _run_impl_over_a_quiesced_fleet(monkeypatch, tmp_path, capsys)
+
+    assert "stop:4242" in events and "stop:4343" in events, events
+    # relaunched_profiles survived: the serve came back on its recorded argv.
+    assert "Restarting manual gateway profile(s): edge" in out, out
+    assert "Restarted acme-gateway.service" in out, out
+    # killed_pids survived, so the reconciliation can account for both rows
+    # instead of reporting the fleet it just relaunched as never touched.
+    assert "never touched" not in out, out
+    assert "Stopped 2 manual gateway process(es)" not in out, out
+
+
+def test_restart_phase_keeps_a_failed_relaunch_visible(
+    monkeypatch, tmp_path, capsys
+):
+    """A unit that did NOT come back must not be erased into a clean run."""
+    out, _events = _run_impl_over_a_quiesced_fleet(
+        monkeypatch, tmp_path, capsys, unit_restart_ok=False
+    )
+
+    assert "Update incomplete" in out, out
+    assert "acme-gateway.service" in out, out

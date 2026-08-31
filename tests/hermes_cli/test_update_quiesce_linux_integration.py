@@ -119,7 +119,7 @@ def test_whole_fleet_is_replaced_exactly_once_on_the_same_sha(
         monkeypatch.setattr(
             hermes_main,
             "_probe_relaunched_runtime_sha",
-            lambda record: support.git(repo, "rev-parse", "HEAD"),
+            lambda record, _new_pid=None: support.git(repo, "rev-parse", "HEAD"),
         )
         outcomes = update_cmd._relaunch_quiesced_runtimes(new_sha)
 
@@ -168,7 +168,7 @@ def test_interrupted_after_quiesce_is_recoverable_from_disk(
             restart_unit=lambda unit, scope: False,
             respawn_argv=_respawn,
             pid_alive=update_cmd._runtime_pid_alive,
-            probe_sha=lambda record: support.git(repo, "rev-parse", "HEAD"),
+            probe_sha=lambda record, _new_pid=None: support.git(repo, "rev-parse", "HEAD"),
         )
         assert update_quiesce.relaunch_is_complete(outcomes) is True
     finally:

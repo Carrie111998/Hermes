@@ -232,12 +232,42 @@ class TestInventoryCapturesIdentity:
         row = rows[0]
         assert row.unit == "acme-dash.service"
         assert row.unit_scope == "system"
+        # Hard supervisor evidence outranks the fail-closed presumption an
+        # unprovable spawner creates: systemd owns this dashboard, and its
+        # unit stop is both safe and respawn-proof.
         assert row.supervisor == "systemd"
         assert row.restart_via == "systemd"
+        assert "supervisor_unproven" not in row.detail
         assert row.detail["cgroup"] == CUSTOM_DASH_CGROUP
         assert row.detail["argv"] == "hermes dashboard --port 8765"
 
     def test_manual_dashboard_without_a_unit_keeps_argv_relaunch(self, monkeypatch):
+        """A PROVABLY dead spawner is what makes a dashboard ours to respawn."""
+        import sys
+        from types import SimpleNamespace
+
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_cli.process_identity",
+            SimpleNamespace(
+                ledger_entries=lambda **k: [_ledger_entry()],
+                spawner_is_dead=lambda e: True,
+            ),
+        )
+        monkeypatch.setattr(
+            update_inventory,
+            "_default_pid_cgroup",
+            lambda pid: "/user.slice/user-1000.slice/session-9.scope",
+        )
+
+        plan = update_inventory.collect_runtime_inventory()
+        row = [r for r in plan.runtimes if r.kind == "dashboard"][0]
+        assert row.unit == ""
+        assert row.supervisor == "manual-serve"
+        assert row.restart_via == "respawn-argv"
+
+    def test_unprovable_spawner_without_a_unit_stays_supervised(self, monkeypatch):
+        """No unit AND no proof the spawner is gone: nothing licenses a kill."""
         import sys
         from types import SimpleNamespace
 
@@ -258,8 +288,8 @@ class TestInventoryCapturesIdentity:
         plan = update_inventory.collect_runtime_inventory()
         row = [r for r in plan.runtimes if r.kind == "dashboard"][0]
         assert row.unit == ""
-        assert row.supervisor == "manual-serve"
-        assert row.restart_via == "respawn-argv"
+        assert row.supervisor == "desktop"
+        assert row.restart_via == "desktop"
 
 
 class TestLaunchdPlistCapture:

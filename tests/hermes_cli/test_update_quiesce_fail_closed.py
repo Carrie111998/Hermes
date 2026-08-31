@@ -66,7 +66,7 @@ def fleet(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "hermes_cli.gateway.find_windows_gateway_services", lambda: []
     )
-    monkeypatch.setattr("hermes_cli.process_identity.ledger_entries", lambda: [])
+    monkeypatch.setattr("hermes_cli.process_identity.ledger_entries", lambda **k: [])
     monkeypatch.setattr(
         "hermes_cli.build_info.get_code_identity",
         lambda refresh=False: {"sha": "a" * 40, "version": "1.0"},
@@ -192,7 +192,7 @@ class TestDesktopSupervisedStop:
             "spawner_create": 111.0,
         }
         monkeypatch.setattr(
-            "hermes_cli.process_identity.ledger_entries", lambda: [entry]
+            "hermes_cli.process_identity.ledger_entries", lambda **k: [entry]
         )
         monkeypatch.setattr(
             "hermes_cli.process_identity.spawner_is_dead", lambda e: False
@@ -335,7 +335,7 @@ class TestRestartPendingStateIsMandatory:
         monkeypatch.setattr(
             update_quiesce,
             "write_restart_pending_state",
-            lambda runtimes, expected_sha="": False,
+            lambda runtimes, expected_sha="", merge=True: False,
         )
         stopped: list = []
 
@@ -398,7 +398,7 @@ class TestRestartPendingStateIsMandatory:
         monkeypatch.setattr(
             update_quiesce,
             "write_restart_pending_state",
-            lambda runtimes, expected_sha="": False,
+            lambda runtimes, expected_sha="", merge=True: False,
         )
         state = update_quiesce.read_restart_pending_state()
 
@@ -434,29 +434,34 @@ class TestRuntimeShaVerification:
         )
         return home
 
-    def test_a_runtime_publishing_no_stamp_does_not_verify(self, profile_home):
+    def _probe(self, record, new_pid=None):
         from hermes_cli import update_cmd
 
-        assert (
-            update_cmd._probe_relaunched_runtime_sha({"profile": "default"}) is None
+        return update_cmd._probe_relaunched_runtime_sha(
+            record, new_pid, timeout=0.2, poll_interval=0.02
         )
+
+    def test_a_runtime_publishing_no_stamp_does_not_verify(self, profile_home):
+        assert self._probe({"kind": "gateway", "profile": "default"}) is None
 
     def test_a_failed_probe_does_not_verify(self, profile_home, monkeypatch):
-        from hermes_cli import update_cmd
-
         monkeypatch.setattr("gateway.status.read_runtime_status", _boom)
-        assert (
-            update_cmd._probe_relaunched_runtime_sha({"profile": "default"}) is None
-        )
+        assert self._probe({"kind": "gateway", "profile": "default"}) is None
 
-    def test_the_replacements_own_stamp_is_what_verifies(self, profile_home):
+    def test_the_replacements_own_stamp_is_what_verifies(
+        self, profile_home, monkeypatch
+    ):
         from hermes_cli import update_cmd
 
+        # The stamp has to be the REPLACEMENT's, so the probe checks the PID
+        # in it against the process this relaunch started.
+        monkeypatch.setattr(update_cmd, "_runtime_pid_alive", lambda pid: True)
+        monkeypatch.setattr("hermes_cli.main._runtime_pid_alive", lambda pid: True)
         (profile_home / "gateway_state.json").write_text(
             json.dumps({"pid": 5, "code_sha": "b" * 40}), encoding="utf-8"
         )
         assert (
-            update_cmd._probe_relaunched_runtime_sha({"profile": "default"})
+            self._probe({"kind": "gateway", "profile": "default", "pid": 4}, 5)
             == "b" * 40
         )
 
@@ -478,7 +483,7 @@ class TestRuntimeShaVerification:
             restart_unit=lambda unit, scope: True,
             respawn_argv=lambda argv, record: None,
             pid_alive=lambda pid: False,
-            probe_sha=lambda record: None,  # replacement publishes nothing
+            probe_sha=lambda record, _new_pid=None: None,  # replacement publishes nothing
         )
         assert outcomes[0].relaunched is True
         assert outcomes[0].old_pid_gone is True

@@ -132,6 +132,10 @@ def record(runtime: Runtime, *, kind: str = "gateway", profile: str = "default")
         supervisor="manual",
         restart_via="manual",
         detail={
+            # The lossless list is what the ledger records and what the
+            # respawn hands to the OS; the joined string is kept alongside it
+            # exactly as production does.
+            "argv_list": [str(part) for part in runtime.argv],
             "argv": join_argv(runtime.argv),
             "start_time": float(psutil.Process(runtime.pid).create_time()),
         },
@@ -271,7 +275,7 @@ def assert_replacement_reads_the_new_source(tmp_path: Path) -> None:
             restart_unit=lambda unit, scope: False,
             respawn_argv=_respawn,
             pid_alive=update_cmd._runtime_pid_alive,
-            probe_sha=lambda rec: git(repo, "rev-parse", "HEAD"),
+            probe_sha=lambda rec, _new_pid=None: git(repo, "rev-parse", "HEAD"),
         )
         assert update_quiesce.relaunch_is_complete(outcomes) is True
         assert outcomes[0].new_pid not in (None, runtime.pid)
