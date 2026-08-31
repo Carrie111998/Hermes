@@ -32,7 +32,7 @@ from agent.secret_scope import get_secret
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
-DEFAULT_MODEL = "gemini-3-pro-image-preview"
+DEFAULT_MODEL = "gemini-3.1-flash-image"
 _MAX_REFERENCE_IMAGES = 14
 _ASPECT_RATIOS = {
     "landscape": "16:9",
