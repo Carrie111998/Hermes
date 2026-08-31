@@ -13,12 +13,12 @@
  * session is left untouched for the next correctly-routed attempt.
  *
  * The ONE case where the ambient gateway is not a fallback but the owner by
- * construction: no registry topology exists (legacy v1 primary) AND at most
- * one profile exists — a single backend serves every session, so there is
- * nothing to misroute to. Older single-profile backends omit `profile` on
+ * construction: the loaded topology proves there is only one local backend
+ * and at most one profile. Legacy v1 primary installs with no registry also
+ * satisfy that contract. Older single-profile backends omit `profile` on
  * their rows entirely; those users keep working unchanged.
  */
-import { hasRegistryTopology } from './connection-registry-state'
+import { $connectionsRegistry, hasRegistryTopology } from './connection-registry-state'
 import { $profiles } from './profile'
 import { isSessionOwnerRoute, type SessionOwnerScope } from './session-request-router'
 
@@ -44,11 +44,26 @@ export function isSessionOwnerResolutionError(error: unknown): error is SessionO
 }
 
 /** True when the ambient gateway is provably the only backend any session
- *  can live on (legacy single-backend Desktop): Electron has published no
- *  connection registry and there is at most one profile. The active route is
- *  presentation state; a null active connection does not prove sole topology. */
+ *  can live on. Legacy profile-only Desktop qualifies with at most one
+ *  profile. In modern registry topology, only a loaded registry containing
+ *  exactly one local connection qualifies; the async pre-load window and any
+ *  remote/multi-connection topology continue to fail closed. */
 export function ambientGatewayOwnsEverySession(): boolean {
-  return !hasRegistryTopology() && $profiles.get().length <= 1
+  if ($profiles.get().length > 1) {
+    return false
+  }
+
+  if (!hasRegistryTopology()) {
+    return true
+  }
+
+  const registry = $connectionsRegistry.get()
+  if (!registry) {
+    return false
+  }
+
+  const connections = registry.connections ?? []
+  return connections.length === 1 && connections[0]?.kind === 'local'
 }
 
 /** True when `owner` names a backend: an exact connection route, or a bare

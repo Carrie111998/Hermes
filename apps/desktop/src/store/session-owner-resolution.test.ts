@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $connectionsRegistry } from './connections'
+import { $connectionsRegistry } from './connection-registry-state'
 import { $profiles } from './profile'
 import {
   ambientGatewayOwnsEverySession,
@@ -8,12 +8,12 @@ import {
   sessionOwnerIsKnown
 } from './session-owner-resolution'
 
-const registry = (...ids: string[]) =>
+const registry = (...connections: Array<{ id: string; kind: string }>) =>
   ({
-    connections: ids.map(id => ({ id })),
-    lastUsed: ids[0] ?? null,
+    connections,
+    lastUsed: connections[0]?.id ?? null,
     launchMode: 'primary',
-    primary: ids[0] ?? null
+    primary: connections[0]?.id ?? null
   }) as never
 
 beforeEach(() => {
@@ -43,32 +43,46 @@ describe('session owner topology', () => {
     )
   })
 
-  it('fails closed on an unknown owner in registry topology while preserving legacy profile routes', () => {
-    // A connection registry means the ambient gateway is never provably the
-    // sole backend, even with one profile listed: an unknown owner fails
-    // closed. A bare profile still names a backend — the legacy profile door
-    // (a pick on the primary / explicit `local` source) mints sessions owned
-    // by that profile's pool socket in every topology.
-    $connectionsRegistry.set(registry('local'))
+  it('uses the ambient gateway only when a loaded registry proves a sole local backend', () => {
+    $connectionsRegistry.set(registry({ id: 'local', kind: 'local' }))
     $profiles.set([{ name: 'default' }] as never)
 
     expect(sessionOwnerIsKnown('default')).toBe(true)
-    expect(ambientGatewayOwnsEverySession()).toBe(false)
+    expect(ambientGatewayOwnsEverySession()).toBe(true)
     expect(() =>
-      assertSessionOwnerResolved('default', { method: 'session.resume', sessionId: 'registry-profile' })
+      assertSessionOwnerResolved(null, { method: 'approval.respond', sessionId: 'sole-local' })
     ).not.toThrow()
-    expect(() => assertSessionOwnerResolved(null, { method: 'session.resume', sessionId: 'unknown-owner' })).toThrow(
+
+    $connectionsRegistry.set(registry({ id: 'remote', kind: 'remote' }))
+    expect(ambientGatewayOwnsEverySession()).toBe(false)
+    expect(() => assertSessionOwnerResolved(null, { method: 'approval.respond', sessionId: 'remote-only' })).toThrow(
       /could not be resolved/i
     )
 
-    $connectionsRegistry.set(registry('local', 'homelab'))
+    $connectionsRegistry.set(
+      registry(
+        { id: 'local', kind: 'local' },
+        { id: 'homelab', kind: 'remote' }
+      )
+    )
     expect(sessionOwnerIsKnown(null)).toBe(false)
     expect(ambientGatewayOwnsEverySession()).toBe(false)
     expect(() => assertSessionOwnerResolved(null, { method: 'session.resume', sessionId: 'unknown-owner' })).toThrow(
       /could not be resolved/i
     )
 
+    $connectionsRegistry.set(registry({ id: 'local', kind: 'local' }))
+    $profiles.set([{ name: 'default' }, { name: 'loki' }] as never)
+    expect(ambientGatewayOwnsEverySession()).toBe(false)
+    expect(() => assertSessionOwnerResolved(null, { method: 'approval.respond', sessionId: 'multi-profile' })).toThrow(
+      /could not be resolved/i
+    )
+  })
+
+  it('preserves legacy profile-only owner routing', () => {
     $connectionsRegistry.set(null)
+    $profiles.set([{ name: 'default' }] as never)
+
     expect(sessionOwnerIsKnown('default')).toBe(true)
     expect(ambientGatewayOwnsEverySession()).toBe(true)
     expect(() =>
