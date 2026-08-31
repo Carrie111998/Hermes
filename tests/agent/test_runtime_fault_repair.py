@@ -71,3 +71,9 @@ def test_core_module_prefix_cannot_be_evicted(monkeypatch):
             lambda: (_ for _ in ()).throw(RuntimeError("broken")),
             phase="provider_request_gate", session_id="s", task_id="t", turn_id="v",
         )
+
+
+def test_provider_gate_uses_a_real_process_working_directory() -> None:
+    from pathlib import Path
+
+    assert Path.cwd().is_absolute()

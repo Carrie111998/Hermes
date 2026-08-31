@@ -25,6 +25,7 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -1336,7 +1337,7 @@ def build_turn_context(
         "platform": getattr(agent, "platform", None) or "",
         "parent_session_id": getattr(agent, "_parent_session_id", None) or "",
         "sender_id": getattr(agent, "_user_id", None) or "",
-        "project_root": getattr(agent, "working_directory", None) or "",
+        "project_root": os.getenv("TERMINAL_CWD") or os.getcwd(),
     }
     from agent.runtime_fault_repair import retry_after_runtime_repair
     _provider_gate = retry_after_runtime_repair(
