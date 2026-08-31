@@ -1,4 +1,4 @@
-"""Validation for the ``platform_toolsets`` config section.
+"""Validation for toolset-related config declarations.
 
 Pure, side-effect-free helpers so the logic is unit-testable without importing
 the tool registry or launching Hermes (mirrors the decoupled-helper pattern used
@@ -12,7 +12,58 @@ significant debugging to find. Surfacing invalid toolset names (and the
 zero-tools end state) loudly turns that silent failure into an actionable one.
 """
 
-from typing import Callable, List
+from collections.abc import Mapping
+from typing import Callable, Collection, List, Optional
+
+from agent.skill_utils import parse_config_string_list
+
+
+LEGACY_TOOLSET_NAMES = frozenset({
+    "web_tools",
+    "terminal_tools",
+    "vision_tools",
+    "image_tools",
+    "skills_tools",
+    "browser_tools",
+    "cronjob_tools",
+    "file_tools",
+    "tts_tools",
+})
+
+
+def effective_toolset_validator(
+    config: object,
+    is_valid_toolset: Callable[[str], bool],
+) -> Callable[[str], bool]:
+    """Include configured extension toolsets in a validity predicate.
+
+    Plugin and MCP aliases are registered dynamically, after some config
+    diagnostics run.  Discover their declared names through the same cached
+    APIs used by the toolset picker so an early doctor or migration pass does
+    not mislabel a valid extension deny as inert.
+    """
+    dynamic_names = set()
+    if isinstance(config, dict):
+        mcp_servers = config.get("mcp_servers")
+        if isinstance(mcp_servers, Mapping):
+            dynamic_names.update(
+                name for name in mcp_servers if isinstance(name, str) and name
+            )
+
+    try:
+        from hermes_cli.plugins import (
+            get_plugin_toolset_keys_nowait,
+            get_portable_mcp_server_names_nowait,
+        )
+
+        dynamic_names.update(get_plugin_toolset_keys_nowait())
+        dynamic_names.update(get_portable_mcp_server_names_nowait())
+    except Exception:
+        # Diagnostics remain best-effort. Runtime validation after discovery is
+        # authoritative and will still warn about genuinely unknown names.
+        pass
+
+    return lambda name: is_valid_toolset(name) or name in dynamic_names
 
 
 def validate_platform_toolsets(
@@ -70,5 +121,49 @@ def validate_platform_toolsets(
         warnings.append(
             "platform_toolsets resolves to zero valid toolsets — the agent will "
             "have no tools. Run `hermes tools` to reconfigure."
+        )
+    return warnings
+
+
+def validate_disabled_toolset_declarations(
+    config: object,
+    is_valid_toolset: Callable[[str], bool],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+    legacy_names: Collection[str] = LEGACY_TOOLSET_NAMES,
+) -> List[str]:
+    """Report deny declarations that cannot affect the active tool surface.
+
+    Values are only named when they are toolset identifiers; arbitrary config
+    and environment values are never included in diagnostics.
+    """
+    warnings: List[str] = []
+    if environ is not None and "HERMES_DISABLED_TOOLSETS" in environ:
+        warnings.append(
+            "HERMES_DISABLED_TOOLSETS is not supported and has no effect; "
+            "configure agent.disabled_toolsets in config.yaml instead"
+        )
+
+    if not isinstance(config, dict):
+        return warnings
+
+    if "disabled_toolsets" in config:
+        warnings.append(
+            "root-level 'disabled_toolsets' has no effect; move it under "
+            "agent.disabled_toolsets"
+        )
+
+    agent_config = config.get("agent")
+    if not isinstance(agent_config, dict):
+        return warnings
+
+    for raw_name in parse_config_string_list(agent_config.get("disabled_toolsets")):
+        name = raw_name.strip()
+        if not name or is_valid_toolset(name) or name in legacy_names:
+            continue
+        warnings.append(
+            f"agent.disabled_toolsets references unknown toolset '{name}'; "
+            "this entry has no effect. Run `hermes tools list` to see valid "
+            "toolset names"
         )
     return warnings

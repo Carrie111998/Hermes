@@ -59,6 +59,7 @@ def suppress_post_tool_call_hook():
 # Tracks platform-bundle names already flagged in disabled_toolsets so the
 # advisory (#33924) is logged once per name, not on every tool recompute.
 _WARNED_DISABLED_BUNDLES: set = set()
+_WARNED_UNKNOWN_DISABLED_TOOLSETS: set = set()
 
 
 def _is_delegated_child_context() -> bool:
@@ -475,10 +476,10 @@ def _compute_tool_definitions(
                     to_remove = bundle_non_core_tools(toolset_name)
                     tools_to_include.difference_update(to_remove)
                     resolved = sorted(to_remove)
-                    if (not quiet_mode and toolset_name.startswith("hermes-")
+                    if (toolset_name.startswith("hermes-")
                             and toolset_name not in _WARNED_DISABLED_BUNDLES):
                         _WARNED_DISABLED_BUNDLES.add(toolset_name)
-                        logger.info(
+                        logger.warning(
                             "agent.disabled_toolsets contains platform-bundle "
                             "name '%s'; core tools are preserved and only its "
                             "platform-specific tools (%s) are removed. Bundle "
@@ -497,8 +498,15 @@ def _compute_tool_definitions(
                 tools_to_include.difference_update(legacy_tools)
                 if not quiet_mode:
                     print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
-            elif not quiet_mode:
-                print(f"⚠️  Unknown toolset: {toolset_name}")
+            else:
+                if toolset_name not in _WARNED_UNKNOWN_DISABLED_TOOLSETS:
+                    _WARNED_UNKNOWN_DISABLED_TOOLSETS.add(toolset_name)
+                    logger.warning(
+                        "agent.disabled_toolsets references unknown toolset "
+                        "'%s'; this entry has no effect. Run `hermes tools "
+                        "list` to see valid toolset names.",
+                        toolset_name,
+                    )
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()

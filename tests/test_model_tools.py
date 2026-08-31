@@ -450,6 +450,54 @@ class TestDisabledToolsetsPlatformBundle:
         names = {t["function"]["name"] for t in tools}
         assert "discord" not in names
 
+    def test_unknown_disabled_toolset_warns_in_quiet_mode(self, caplog):
+        from model_tools import _compute_tool_definitions
+
+        _compute_tool_definitions(
+            enabled_toolsets=["terminal"],
+            disabled_toolsets=["execute_code"],
+            quiet_mode=True,
+        )
+
+        assert "agent.disabled_toolsets" in caplog.text
+        assert "execute_code" in caplog.text
+        assert "has no effect" in caplog.text
+
+    def test_registry_owned_toolset_is_removed_when_disabled(self, monkeypatch):
+        from model_tools import _compute_tool_definitions
+        from tools.registry import ToolRegistry
+
+        reg = ToolRegistry()
+        reg.register(
+            name="dynamic_probe",
+            toolset="plugin_bundle",
+            schema={
+                "name": "dynamic_probe",
+                "description": "Probe",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda args, **kwargs: "{}",
+        )
+        monkeypatch.setattr("tools.registry.registry", reg)
+        monkeypatch.setattr("model_tools.registry", reg)
+
+        enabled = _compute_tool_definitions(
+            enabled_toolsets=["plugin_bundle"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+        disabled = _compute_tool_definitions(
+            enabled_toolsets=["plugin_bundle"],
+            disabled_toolsets=["plugin_bundle"],
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+
+        assert "dynamic_probe" in {tool["function"]["name"] for tool in enabled}
+        assert "dynamic_probe" not in {
+            tool["function"]["name"] for tool in disabled
+        }
+
 
 
 

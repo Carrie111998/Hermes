@@ -609,6 +609,41 @@ class TestSanitizeEnvLines:
             "  ✓ Normalized .env line formatting (2 line(s) changed)\n"
         )
 
+    def test_migrate_reports_inert_disabled_toolset_declarations(
+        self, caplog, tmp_path
+    ):
+        latest_version = DEFAULT_CONFIG["_config_version"]
+        raw_config = {
+            "disabled_toolsets": ["terminal"],
+            "agent": {"disabled_toolsets": ["execute_code"]},
+        }
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HERMES_DISABLED_TOOLSETS": "do-not-log-this-value",
+                    "HERMES_HOME": str(tmp_path),
+                },
+                clear=True,
+            ),
+            patch("hermes_cli.config.sanitize_env_file", return_value=0),
+            patch(
+                "hermes_cli.config.check_config_version",
+                return_value=(latest_version, latest_version),
+            ),
+            patch("hermes_cli.config.read_raw_config", return_value=raw_config),
+            patch("hermes_cli.config.get_missing_env_vars", return_value=[]),
+            patch("hermes_cli.config.get_missing_config_fields", return_value=[]),
+            patch("hermes_cli.config.get_missing_skill_config_vars", return_value=[]),
+        ):
+            results = migrate_config(interactive=False, quiet=True)
+
+        assert len(results["warnings"]) == 3
+        assert "HERMES_DISABLED_TOOLSETS" in caplog.text
+        assert "root-level 'disabled_toolsets'" in caplog.text
+        assert "unknown toolset 'execute_code'" in caplog.text
+        assert "do-not-log-this-value" not in caplog.text
+
 
 
 

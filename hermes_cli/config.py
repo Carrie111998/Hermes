@@ -2491,25 +2491,39 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                 config["mcp_servers"] = raw_mcp_servers
                 _persist_migration(config)
 
-    # ── Always: validate platform_toolsets after migration ──
+    # ── Always: validate toolset declarations after migration ──
     # A migration (or hand-edit) that leaves an invalid toolset name in
     # platform_toolsets silently disables the affected tools — resolve_toolset()
     # returns [] for an unknown name, so the agent quietly loses tools with no
     # error or warning. Surface it loudly instead. See #38798.
     try:
         from toolsets import validate_toolset
-        from hermes_cli.toolset_validation import validate_platform_toolsets
-
-        ts_warnings = validate_platform_toolsets(
-            read_raw_config().get("platform_toolsets"), validate_toolset
+        from hermes_cli.toolset_validation import (
+            effective_toolset_validator,
+            validate_disabled_toolset_declarations,
+            validate_platform_toolsets,
         )
-        for w in ts_warnings:
+
+        raw_config = read_raw_config()
+        is_valid_toolset = effective_toolset_validator(raw_config, validate_toolset)
+        platform_warnings = validate_platform_toolsets(
+            raw_config.get("platform_toolsets"), is_valid_toolset
+        )
+        deny_warnings = validate_disabled_toolset_declarations(
+            raw_config, is_valid_toolset, environ=os.environ
+        )
+        for w in platform_warnings:
             results["warnings"].append(w)
+            if not quiet:
+                print(f"  ⚠ {w}")
+        for w in deny_warnings:
+            results["warnings"].append(w)
+            logger.warning("Toolset configuration: %s", w)
             if not quiet:
                 print(f"  ⚠ {w}")
     except Exception as _ts_val_err:
         # best-effort; never block migration on validation
-        logger.debug("platform_toolsets validation skipped: %s", _ts_val_err)
+        logger.debug("toolset configuration validation skipped: %s", _ts_val_err)
 
     if current_ver < latest_ver and not quiet and not floor_refused:
         print(f"Config version: {current_ver} → {latest_ver}")
