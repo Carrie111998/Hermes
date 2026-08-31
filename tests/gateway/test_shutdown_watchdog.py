@@ -66,3 +66,23 @@ def test_arm_shutdown_watchdog_fires_with_dump_and_exit(tmp_path):
     assert get_shutdown_watchdog_dump_path(tmp_path).name == "gateway-shutdown-watchdog.log"
 
 
+@pytest.mark.asyncio
+async def test_loop_heartbeat_forever_without_unix_server_does_not_warn(tmp_path):
+    with patch("gateway.shutdown_watchdog.asyncio", spec=asyncio) as mock_asyncio, \
+         patch("gateway.shutdown_watchdog.logger.warning") as mock_warn, \
+         patch("gateway.shutdown_watchdog.logger.debug") as mock_debug:
+        del mock_asyncio.start_unix_server
+        mock_asyncio.to_thread = asyncio.to_thread
+
+        task = asyncio.create_task(
+            loop_heartbeat_forever(
+                interval_s=0.01,
+                home=tmp_path,
+                should_continue=lambda: False,
+            )
+        )
+        await task
+
+        mock_warn.assert_not_called()
+        assert any("Loop tick socket not supported" in str(c) for c in mock_debug.call_args_list)
+
