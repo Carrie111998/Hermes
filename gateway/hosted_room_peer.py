@@ -814,6 +814,8 @@ def issue_room_grant(
     permissions: Iterable[str] = (
         "approve",
         "attachment.stage",
+        "artifact.ack",
+        "artifact.read",
         "dispatch",
         "status",
         "stop",
@@ -845,6 +847,8 @@ def issue_room_grant(
     if not allowed or not set(allowed) <= {
         "approve",
         "attachment.stage",
+        "artifact.ack",
+        "artifact.read",
         "dispatch",
         "status",
         "stop",

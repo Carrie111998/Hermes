@@ -1041,6 +1041,82 @@ def test_one_corrupt_stored_route_does_not_hide_healthy_peers(tmp_path: Path):
     assert ("room-good", "member-good") in restarted.peer_routes
     assert ("room-bad", "member-bad") not in restarted.peer_routes
     assert restarted.status()["link_load_error"] == "room-bad:member-bad:invalid"
+    with pytest.raises(RuntimeError, match="need repair"):
+        restarted.revoke_room_routes("room-bad")
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM hosted_room_links WHERE room_id='room-bad'"
+        ).fetchone()[0] == 1
+
+
+def test_disband_fence_persists_and_rejects_new_work_before_tombstone(
+    tmp_path: Path,
+    monkeypatch,
+):
+    db = tmp_path / "state.db"
+    service = HostedRoomService(_server(), db_path=db)
+    service.local_profiles = lambda: ("default", "ops")
+    room = service.create_room(
+        room_id="room-disbanding",
+        name="Disband safely",
+        members=[
+            {"member_id": "default", "profile": "default", "handle": "default"},
+            {"member_id": "ops", "profile": "ops", "handle": "ops"},
+        ],
+    )
+    append_started = threading.Event()
+    release_append = threading.Event()
+    fence_finished = threading.Event()
+    real_append = hosted_rooms.append_event
+
+    def held_append(*args, **kwargs):
+        if kwargs.get("event_id") == "before-fence":
+            append_started.set()
+            assert release_append.wait(1)
+        return real_append(*args, **kwargs)
+
+    monkeypatch.setattr(hosted_rooms, "append_event", held_append)
+    sender = threading.Thread(
+        target=lambda: service.send(
+            room_id="room-disbanding",
+            event_id="before-fence",
+            payload={"text": "finish this", "thread_id": "thread-before"},
+        )
+    )
+    sender.start()
+    assert append_started.wait(1)
+    fencer = threading.Thread(
+        target=lambda: (
+            service.begin_room_disband("room-disbanding"),
+            fence_finished.set(),
+        )
+    )
+    fencer.start()
+    assert not fence_finished.wait(0.05)
+    release_append.set()
+    sender.join(timeout=1)
+    fencer.join(timeout=1)
+    assert fence_finished.is_set()
+
+    with pytest.raises(driver.RoomUnavailableError, match="being disbanded"):
+        service.send(
+            room_id="room-disbanding",
+            event_id="late-send",
+            payload={"text": "too late", "thread_id": "thread-late"},
+        )
+    restarted = HostedRoomService(_server(), db_path=db)
+    with pytest.raises(driver.RoomUnavailableError, match="being disbanded"):
+        restarted.prepare_room(restarted.bindings()[0])
+
+    restarted.begin_room_disband("room-disbanding")
+    restarted.stop_room("room-disbanding", cancel_id="disband-stop")
+    tombstone = restarted.retire_and_disband_room(
+        "room-disbanding",
+        expected_gateway_id=str(room["authority_gateway_id"]),
+        expected_epoch=int(room["authority_epoch"]),
+    )
+    assert tombstone["disbanded_at"] is not None
+    assert restarted._room_is_disbanding("room-disbanding") is False
 
 
 def test_unpublished_roomlink_v1_route_is_quarantined_for_reinvitation(

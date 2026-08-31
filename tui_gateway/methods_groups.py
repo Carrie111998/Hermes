@@ -715,7 +715,6 @@ def _(rid, params: dict) -> dict:
         AuthorityConflictError,
         HostedRoomError,
         RoomHistoryExpiredError,
-        disband_room,
         local_authority_gateway_id,
         room_state,
     )
@@ -733,9 +732,8 @@ def _(rid, params: dict) -> dict:
                 raise AuthorityConflictError(
                     "This Group Chat is managed by another gateway."
                 )
-            tombstone = disband_room(
-                service.db_path,
-                room_id=params.get("room_id"),
+            tombstone = service.retire_and_disband_room(
+                str(params.get("room_id") or ""),
                 expected_gateway_id=str(local_gateway_id),
                 expected_epoch=int(
                     state["authority_epoch"] if state is not None else 1
@@ -757,6 +755,7 @@ def _(rid, params: dict) -> dict:
         if existing.get("disbanded_at") is not None:
             tombstone = disband_with_state(existing)
             return _ok(rid, {"tombstone": tombstone})
+        service.begin_room_disband(str(params.get("room_id") or ""))
         service.stop_room(
             str(params.get("room_id") or ""),
             cancel_id=str(params.get("cancel_id") or "room-disbanded"),

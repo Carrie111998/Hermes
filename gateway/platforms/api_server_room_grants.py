@@ -3,6 +3,7 @@
 import asyncio
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 try:
@@ -50,7 +51,10 @@ def _room_grant_error_response(exc: Exception, *, _openai_error) -> "web.Respons
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
-    from gateway.platforms import api_server_room_attachments
+    from gateway.platforms import (
+        api_server_room_artifacts,
+        api_server_room_attachments,
+    )
 
     return [
         (
@@ -73,7 +77,9 @@ def _http_routes(self) -> list[tuple[str, str, Any]]:
             "/v1/room-members/grants/revoke",
             self._handle_room_member_grant_revoke,
         ),
-    ] + api_server_room_attachments._http_routes(self)
+    ] + api_server_room_attachments._http_routes(
+        self
+    ) + api_server_room_artifacts._http_routes(self)
 
 
 def _room_grant_token(request: "web.Request") -> str:
@@ -439,6 +445,18 @@ async def _handle_room_member_grant_revoke(
         except Exception:
             # Authorization is already revoked. A failed cleanup cannot make
             # the grant live again; bounded spool expiry remains the backstop.
+            pass
+        try:
+            from gateway.hosted_room_artifacts import RoomArtifactOutbox
+            from hermes_constants import get_hermes_home
+
+            await asyncio.to_thread(
+                RoomArtifactOutbox(Path(get_hermes_home()) / "state.db").discard_claims,
+                claims,
+            )
+        except Exception:
+            # Revocation still closes access immediately. Keep cleanup
+            # best-effort so a local disk fault cannot resurrect the grant.
             pass
     except Exception:
         return web.json_response(

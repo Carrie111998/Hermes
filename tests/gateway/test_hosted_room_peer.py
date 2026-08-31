@@ -355,6 +355,9 @@ def test_room_grant_default_status_horizon_matches_dispatch_horizon():
 
     assert claims["expires_at"] == 160
     assert claims["status_expires_at"] == 160
+    assert {"attachment.stage", "artifact.ack", "artifact.read"} <= set(
+        claims["permissions"]
+    )
 
 
 def test_expired_status_grant_can_only_authenticate_idempotent_revocation():
@@ -394,6 +397,7 @@ def test_expired_status_grant_can_only_authenticate_idempotent_revocation():
             now=121,
             allow_expired_for_revocation=True,
         )
+
 
 def test_room_grant_attachment_permission_is_scoped_and_expiring():
     dispatch = _dispatch()

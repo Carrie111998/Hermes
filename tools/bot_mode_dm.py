@@ -137,6 +137,9 @@ def ensure_message_agent_tool(agent: Any) -> bool:
     sees the schema. Never raises.
     """
     try:
+        from tools.hosted_room_artifact import ensure_share_group_file_tool
+
+        ensure_share_group_file_tool(agent)
         if not getattr(agent, "_bot_mode_protocol", True):
             return False
         tools = getattr(agent, "tools", None)

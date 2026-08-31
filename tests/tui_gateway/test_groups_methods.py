@@ -1075,18 +1075,40 @@ def test_disband_stops_and_revokes_before_tombstoning(home, monkeypatch):
             prune=lambda: calls.append(("prune", "room-1")),
         )
 
+        def begin_room_disband(self, room_id):
+            calls.append(("fence", room_id))
+
         def stop_room(self, room_id, **_kwargs):
             calls.append(("stop", room_id))
 
         def revoke_room_routes(self, room_id):
             calls.append(("revoke", room_id))
 
+        def retire_and_disband_room(
+            self,
+            room_id,
+            *,
+            expected_gateway_id,
+            expected_epoch,
+        ):
+            from gateway.hosted_rooms import disband_room
+
+            calls.append(("retire-artifacts", room_id))
+            return disband_room(
+                self.db_path,
+                room_id=room_id,
+                expected_gateway_id=expected_gateway_id,
+                expected_epoch=expected_epoch,
+            )
+
     monkeypatch.setattr(srv, "get_hosted_room_service", lambda: FakeService())
     _result(srv._methods["groups.disband"](9, {"room_id": "room-1"}))
 
     assert calls == [
+        ("fence", "room-1"),
         ("stop", "room-1"),
         ("revoke", "room-1"),
+        ("retire-artifacts", "room-1"),
         ("files", "room-1"),
         ("prune", "room-1"),
     ]
@@ -1098,6 +1120,9 @@ def test_failed_remote_revocation_keeps_room_recoverable(home, monkeypatch):
 
     class FakeService:
         db_path = home / "state.db"
+
+        def begin_room_disband(self, _room_id):
+            return None
 
         def stop_room(self, _room_id, **_kwargs):
             return 1
@@ -1124,6 +1149,9 @@ def test_disband_does_not_revoke_routes_while_stop_is_unacknowledged(
     class FakeService:
         db_path = home / "state.db"
 
+        def begin_room_disband(self, room_id):
+            calls.append(("fence", room_id))
+
         def stop_room(self, _room_id, **kwargs):
             calls.append(("stop", kwargs["require_acknowledged"]))
             raise RuntimeError("room work is still stopping")
@@ -1135,7 +1163,7 @@ def test_disband_does_not_revoke_routes_while_stop_is_unacknowledged(
     result = srv._methods["groups.disband"](13, {"room_id": "room-1"})
 
     assert result["error"]["code"] == 5114
-    assert calls == [("stop", True)]
+    assert calls == [("fence", "room-1"), ("stop", True)]
     assert [
         room["room_id"]
         for room in _result(srv._methods["groups.list"](14, {}))["rooms"]
