@@ -164,6 +164,26 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     return metadata
 
 
+def _last_delivered_message_id(result) -> str | None:
+    """Return the id of the LAST message a send produced, if any.
+
+    A long reply is chunked, and ``SendResult.message_id`` names the *first*
+    chunk while ``raw_response["message_ids"]`` carries the whole run. Anything
+    that decorates the delivered reply — a follow-up-action keyboard, say —
+    belongs on the final chunk, which is the one the user is looking at when
+    they finish reading.
+    """
+    if not result or not getattr(result, "success", False):
+        return None
+    raw = getattr(result, "raw_response", None)
+    if isinstance(raw, dict):
+        ids = raw.get("message_ids")
+        if isinstance(ids, (list, tuple)) and ids:
+            return str(ids[-1])
+    message_id = getattr(result, "message_id", None)
+    return str(message_id) if message_id else None
+
+
 def _mark_notify_metadata(metadata: dict | None) -> dict:
     """Clone metadata and mark a user-visible reply as notify-worthy."""
     notify_metadata = dict(metadata) if metadata else {}
@@ -4508,6 +4528,185 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
 
+    async def send_suggested_actions(
+        self,
+        chat_id: str,
+        actions: List[str],
+        set_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        anchor_message_id: Optional[str] = None,
+    ) -> SendResult:
+        """Offer tappable follow-up actions after a delivered reply.
+
+        Unlike :meth:`send_clarify`, nothing is waiting on the answer — the
+        agent's turn is already over.  These are shortcuts for what the user
+        would otherwise type, so ignoring them entirely is a normal outcome
+        and must cost nothing.
+
+        Adapters with native button UIs (Telegram) SHOULD override this to
+        render one button per action, and SHOULD attach that keyboard to the
+        already-delivered reply named by ``anchor_message_id`` rather than
+        posting a second message — the buttons are part of that answer, not a
+        new thing to read.  ``anchor_message_id`` is the LAST message of the
+        reply (a long answer is chunked), or ``None`` when the platform did
+        not report one.
+
+        A tap MUST resolve the action text via
+        ``gateway.suggested_actions.resolve(set_id, index)`` and then feed it
+        back through the adapter's normal inbound path
+        (:meth:`handle_message` with a synthetic :class:`MessageEvent`), so a
+        tapped action becomes an ordinary user turn with no special casing
+        downstream.
+
+        The default renders a numbered list, which works everywhere: the
+        user replies with the action text (or types their own follow-up),
+        and that reply is just a normal next message — no interception, no
+        pending state to leak.  ``set_id`` is unused in this fallback and is
+        left to expire on its own.
+        """
+        if not actions:
+            return SendResult(success=True, message_id=None)
+        lines = ["💡 Next:"]
+        for i, action in enumerate(actions, start=1):
+            lines.append(f"  {i}. {action}")
+        return await self.send(
+            chat_id=chat_id,
+            content="\n".join(lines),
+            metadata=metadata,
+        )
+
+    def _suggestion_accounting_handles(self, session_key: str):
+        """Resolve ``(session_db, session_id)`` for aux usage accounting.
+
+        Returns ``(None, None)`` whenever the pair cannot be resolved — no
+        session store, an unmapped key, a database that will not open. The
+        caller then simply skips accounting: an unrecorded call is a
+        reporting gap, while raising here would cost the user their buttons.
+
+        Goes through the store's scope-aware opener rather than a cached
+        handle so a multiplexed gateway records against the profile that
+        actually served the turn (#88532).
+        """
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return None, None
+        try:
+            peek = getattr(store, "peek_session_id", None)
+            session_id = peek(session_key) if callable(peek) else None
+            if not session_id:
+                return None, None
+            opener = getattr(store, "_open_session_db_for_active_scope", None)
+            session_db = opener() if callable(opener) else None
+            return (session_db, session_id) if session_db is not None else (None, None)
+        except Exception:
+            logger.debug(
+                "suggested-actions accounting handles unavailable", exc_info=True,
+            )
+            return None, None
+
+    async def _maybe_offer_suggested_actions(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        reply_text: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        anchor_message_id: Optional[str] = None,
+    ) -> None:
+        """Generate and deliver follow-up action buttons. Never raises.
+
+        Best-effort by construction: the reply the user asked for has
+        already been delivered, so every failure mode here — feature off, no
+        auxiliary backend, timeout, garbage response — degrades to "no
+        buttons this turn" and must never turn into a user-visible error or
+        a delayed turn.
+        """
+        try:
+            from gateway import suggested_actions as _sa
+
+            if not _sa.is_enabled():
+                return
+
+            # If the user has already sent the next message, suggestions for
+            # the previous one are stale before they render — and generating
+            # them would hold up the drain of that queued message.
+            if session_key in self._pending_messages:
+                return
+
+            # Publish the turn's accounting handles so the generation call's
+            # tokens land in session_model_usage under task
+            # 'suggested_actions', the way title_generation does. Without
+            # this the feature runs once per delivered reply and stays
+            # invisible to the operator's own usage accounting — the one
+            # number they need to decide whether to keep it on.
+            # asyncio.to_thread copies the current context, so setting it
+            # here reaches the worker thread.
+            _session_db, _session_id = self._suggestion_accounting_handles(
+                session_key
+            )
+            _accounting_token = None
+            try:
+                if _session_db is not None and _session_id:
+                    from agent.aux_accounting import set_accounting_context
+                    _accounting_token = set_accounting_context(
+                        _session_db, _session_id,
+                    )
+                actions = await asyncio.to_thread(
+                    _sa.generate, reply_text, getattr(event, "text", "") or "",
+                )
+            finally:
+                # Reset even on the happy path: this coroutine's context
+                # outlives the call, and a stale handle would misattribute
+                # every later aux call on this task.
+                if _accounting_token is not None:
+                    from agent.aux_accounting import reset_accounting_context
+                    reset_accounting_context(_accounting_token)
+
+            if not actions:
+                return
+
+            # Deliver silently. The reply these buttons hang off has just
+            # notified the user; a second ping for an optional shortcut is
+            # noise. Approval prompts keep notify=True because they block.
+            suggestion_metadata = dict(metadata) if metadata else {}
+            suggestion_metadata.pop("notify", None)
+
+            set_id = _sa.register(
+                session_key=session_key,
+                chat_id=event.source.chat_id,
+                actions=actions,
+                source=event.source,
+                metadata=suggestion_metadata,
+            )
+            if not set_id:
+                return
+
+            result = await self.send_suggested_actions(
+                chat_id=event.source.chat_id,
+                actions=actions,
+                set_id=set_id,
+                session_key=session_key,
+                metadata=suggestion_metadata,
+                anchor_message_id=anchor_message_id,
+            )
+            if getattr(result, "success", False):
+                logger.info(
+                    "[%s] Offered %d suggested action(s) (id=%s, session=%s)",
+                    self.name, len(actions), set_id, session_key,
+                )
+            else:
+                # The set is registered but unreachable — drop it rather than
+                # leave a tappable id nothing can render.
+                _sa.clear_session(session_key)
+                logger.warning(
+                    "[%s] Suggested actions send failed (id=%s): %s",
+                    self.name, set_id, getattr(result, "error", "unknown"),
+                )
+        except Exception as exc:
+            logger.debug(
+                "[%s] suggested actions skipped: %s", self.name, exc, exc_info=True,
+            )
+
     async def send_private_notice(
         self,
         chat_id: str,
@@ -6460,6 +6659,10 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        # Message the follow-up-action keyboard should hang off, so the
+        # buttons attach to the reply itself instead of arriving as a
+        # separate message.
+        _suggestion_anchor_id = None
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -6788,6 +6991,7 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    _suggestion_anchor_id = _last_delivered_message_id(result)
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
@@ -7004,6 +7208,39 @@ class BasePlatformAdapter(ABC):
                         "for %s (empty after extract, recovery yielded nothing).",
                         self.name, len(_response_pre_extract), event.source.chat_id,
                     )
+
+                # Offer tappable follow-up actions on the delivered reply.
+                # Runs only after a successful text delivery: buttons that
+                # reference an answer the user never received would be
+                # nonsense, and a failed send is already being retried or
+                # surfaced elsewhere.
+                #
+                # Fire-and-forget, not awaited: the auxiliary call can take
+                # up to its configured timeout (default 20s, longer on a
+                # slow or `:free` backend), and this turn's session-busy
+                # release, on_processing_complete hook, and queued-message
+                # drain must not wait on it. asyncio.create_task copies the
+                # current context (accounting handles included), so the
+                # detached task still attributes its usage correctly.
+                if text_content and delivery_succeeded:
+                    _suggestion_task = asyncio.create_task(
+                        self._maybe_offer_suggested_actions(
+                            event=event,
+                            session_key=session_key,
+                            reply_text=text_content,
+                            metadata=_final_thread_metadata,
+                            anchor_message_id=_suggestion_anchor_id,
+                        )
+                    )
+                    try:
+                        self._background_tasks.add(_suggestion_task)
+                        _suggestion_task.add_done_callback(
+                            self._background_tasks.discard
+                        )
+                    except TypeError:
+                        # Tests stub create_task() with non-hashable
+                        # sentinels; the task still runs, just untracked.
+                        pass
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)

@@ -6555,6 +6555,101 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    async def send_suggested_actions(
+        self, chat_id: str, actions: List[str], set_id: str,
+        session_key: str, metadata: Optional[Dict[str, Any]] = None,
+        anchor_message_id: Optional[str] = None,
+    ) -> SendResult:
+        """Attach follow-up actions as an inline keyboard on the reply.
+
+        The keyboard is edited onto the delivered answer
+        (``anchor_message_id``) rather than posted as its own message. The
+        actions belong to that answer, and a separate carrier message would
+        add a line of chat noise the user has to scroll past on every turn
+        for no information. Only when there is no anchor, or Telegram
+        refuses the edit (message too old, already gone), does this fall
+        back to sending a standalone message.
+
+        The label is the full action text — unlike the clarify keyboard,
+        which uses numeric labels and prints the options in the message
+        body, because these are short by construction (``MAX_LABEL_LEN``)
+        and a button the user must cross-reference against a list defeats
+        the point of a shortcut.
+
+        One action per row: Telegram truncates side-by-side labels on
+        mobile, and a truncated action is one the user taps without seeing
+        what it sends.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        if not actions:
+            return SendResult(success=True, message_id=None)
+
+        try:
+            # Telegram caps callback_data at 64 bytes, so the payload is a
+            # short id plus an index; the action text itself is resolved
+            # server-side from the registry on tap.
+            rows = [
+                [InlineKeyboardButton(action, callback_data=f"sa:{set_id}:{idx}")]
+                for idx, action in enumerate(actions)
+            ]
+            keyboard = InlineKeyboardMarkup(rows)
+
+            if anchor_message_id:
+                try:
+                    await self._bot.edit_message_reply_markup(
+                        chat_id=normalize_telegram_chat_id(chat_id),
+                        message_id=int(anchor_message_id),
+                        reply_markup=keyboard,
+                    )
+                    return SendResult(success=True, message_id=str(anchor_message_id))
+                except Exception as edit_err:
+                    # Editing is best-effort: a reply delivered as media, or
+                    # one Telegram considers no longer editable, still
+                    # deserves its shortcuts. Logged at INFO, not DEBUG:
+                    # falling back changes what the user sees (a second
+                    # message instead of buttons on the reply), and an
+                    # operator asking "why is there a carrier message?"
+                    # should find the answer without raising the log level.
+                    logger.info(
+                        "[%s] could not attach suggested actions to message %s "
+                        "(%s); falling back to a separate message",
+                        self.name, anchor_message_id,
+                        _redact_telegram_error_text(edit_err),
+                    )
+
+            thread_id = self._metadata_thread_id(metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_id),
+                "text": "💡",
+                "parse_mode": ParseMode.HTML,
+                "reply_markup": keyboard,
+                **self._link_preview_kwargs(),
+                **self._notification_kwargs(metadata),
+            }
+            reply_to_id = self._reply_to_message_id_for_send(
+                None, metadata, reply_to_mode=self._reply_to_mode,
+            )
+            kwargs["reply_to_message_id"] = reply_to_id
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                )
+            )
+
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning(
+                "[%s] send_suggested_actions failed: %s",
+                self.name, _redact_telegram_error_text(e),
+            )
+            return SendResult(success=False, error=_redact_telegram_error_text(e))
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -7345,6 +7440,18 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             return
 
+        # --- Suggested-action callbacks (sa:set_id:index) ---
+        if data.startswith("sa:"):
+            await self._handle_suggested_action_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
+
         # --- Exec approval callbacks (ea:choice:id) ---
         if data.startswith("ea:"):
             parts = data.split(":", 2)
@@ -7703,6 +7810,120 @@ class TelegramAdapter(BasePlatformAdapter):
         "vip":          ("vip-add.sh",         ["email"],  "✓ marked VIP",         True),
         "vip-domain":   ("vip-add.sh",         ["domain"], "✓ marked VIP domain",  True),
     }
+
+    async def _handle_suggested_action_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id,
+        query_chat_type,
+        query_thread_id,
+        query_user_name,
+    ) -> None:
+        """Turn a tapped follow-up action into an ordinary user turn.
+
+        The action text is resolved server-side (``callback_data`` only
+        carries the set id and index) and re-enters through the adapter's
+        normal :meth:`handle_message` path as a synthetic ``MessageEvent``.
+        Everything downstream — session routing, busy handling, history —
+        then treats it exactly like a typed message, which is the point: a
+        tapped shortcut must not become a second code path with its own
+        bugs.
+        """
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer(text="Invalid action data.")
+            return
+        set_id = parts[1]
+        try:
+            index = int(parts[2])
+        except (TypeError, ValueError):
+            await query.answer(text="Invalid action data.")
+            return
+
+        # Same authorization gate as the approval and clarify keyboards: a
+        # tap starts an agent turn, so an unauthorized bystander in a group
+        # must not be able to drive the assistant with it.
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to use this action.")
+            return
+
+        from gateway import suggested_actions as _sa
+
+        entry = _sa.get(set_id)
+        # resolve() pops the whole set, so a double-tap (or two people
+        # tapping different buttons on the same message) starts one turn.
+        action_text = _sa.resolve(set_id, index)
+        if not action_text:
+            await query.answer(text="This suggestion is no longer available.")
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        await query.answer(text=action_text[:200])
+
+        # Drop the keyboard, never the text. The keyboard normally rides on
+        # the agent's own reply, so rewriting the message body here would
+        # erase the answer the user is reading. Removing just the markup
+        # also stops the remaining buttons from being tapped against a
+        # conversation that has moved on; the chosen action shows up on its
+        # own as the next user message in the chat.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        logger.info(
+            "Telegram suggested action resolved (id=%s, index=%d, user=%s)",
+            set_id, index, getattr(query.from_user, "first_name", "User"),
+        )
+
+        source = getattr(entry, "source", None)
+        if source is None:
+            logger.warning(
+                "[%s] suggested action %s resolved without a source; dropping",
+                self.name, set_id,
+            )
+            return
+
+        # Reuse the originating source verbatim so the follow-up lands in the
+        # same session. Attribution goes on the event instead: the tapper is
+        # who spoke, but overriding source.user_id could re-key the session.
+        #
+        # ``raw_message`` stays None deliberately. The only PTB object in hand
+        # is the bot's own keyboard message, and the consumers that read it
+        # (group-observe attribution here, Discord guild extraction in
+        # gateway/run.py) both treat a missing raw message as "not applicable"
+        # — handing them a bot message would be worse than handing them
+        # nothing.
+        event = MessageEvent(
+            text=action_text,
+            source=source,
+            user_id=caller_id or getattr(source, "user_id", None),
+            user_name=(
+                getattr(query.from_user, "first_name", None)
+                or getattr(source, "user_name", None)
+            ),
+            message_id=str(getattr(query.message, "message_id", "") or "") or None,
+        )
+
+        try:
+            await self.handle_message(event)
+        except Exception as exc:
+            logger.error(
+                "[%s] suggested action dispatch failed: %s", self.name, exc,
+                exc_info=True,
+            )
 
     async def _handle_gmail_triage_callback(
         self,

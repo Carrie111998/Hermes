@@ -1169,6 +1169,22 @@ DEFAULT_CONFIG = {
         # single-shape tool returns DB content directly). The old
         # ``auxiliary.session_search.*`` block was removed here. Existing
         # values in user config.yaml files are harmless leftovers and ignored.
+        # Proposes the tappable follow-up actions attached to a delivered
+        # reply (see ``gateway.suggested_actions``, off by default). This is
+        # a deliberately cheap, high-volume task — one call per delivered
+        # reply — and it never touches the main model, so pointing it at a
+        # small local model or a ``:free`` SKU here is the intended way to
+        # run the feature at near-zero marginal cost. Combines well with
+        # ``auxiliary.free_only``.
+        "suggested_actions": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 20,         # seconds — a slow suggestion is a useless one; the reply is already delivered
+            "extra_body": {},
+            "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+        },
         "skills_hub": {
             "provider": "auto",
             "model": "",
@@ -3153,6 +3169,24 @@ DEFAULT_CONFIG = {
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
+
+        # Tappable follow-up actions on the final agent reply. When enabled,
+        # the delivered answer is handed to the ``suggested_actions``
+        # auxiliary task (see the ``auxiliary`` section), which proposes the
+        # most likely next things the user would ask for; platforms with
+        # native buttons (Telegram) render them as an inline keyboard, and a
+        # tap starts a new turn seeded with that action's text. Everything
+        # else falls back to a numbered text list.
+        #
+        # OFF by default: it spends one extra (cheap, auxiliary) LLM call per
+        # delivered reply, so an existing install must opt in rather than
+        # start paying for it after an upgrade. ``max_actions`` is clamped to
+        # [1, 4] — a single action is the normal shape for "confirm and
+        # proceed", which is exactly the case a button beats typing.
+        "suggested_actions": {
+            "enabled": False,
+            "max_actions": 4,
+        },
 
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
