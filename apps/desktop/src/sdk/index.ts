@@ -340,7 +340,9 @@ export interface PluginOpenSessionOptions {
    *  (#93604 — Bot Chat shows old messages until app restart). Resume is
    *  cheap and idempotent (the route-resume effect consumes redundant
    *  requests as no-ops), so callers who know the user explicitly navigated
-   *  here set this to guarantee freshness. Only honored with awaitHydration. */
+   *  here set this to guarantee freshness. Honored even without
+   *  awaitHydration so a sleep/wake reattach can handshake without the
+   *  "waking up" overlay. */
   forceResume?: boolean
   hydrationTimeoutMs?: number
   intent?: OpenSessionIntent
@@ -948,7 +950,16 @@ export const host = {
       if (options.awaitHydration) {
         // Keep the target-specific overlay visible through transcript hydration,
         // not merely through the gateway/profile activation that precedes it.
-        $gatewaySwapTarget.set(targetProfile)
+        // Skip it when this chat is already on screen (tile or main): a
+        // sleep/wake reattach of the open Bot Chat used to paint "waking up
+        // <bot>" over a usable transcript until the user hit Ctrl+R (#99646).
+        const alreadyVisible =
+          $selectedStoredSessionId.get() === storedSessionId ||
+          $sessionTiles.get().some(tile => tile.storedSessionId === storedSessionId)
+
+        if (!alreadyVisible) {
+          $gatewaySwapTarget.set(targetProfile)
+        }
       }
 
       // Only the HYDRATION half retries. Activation already failed its own
@@ -1005,7 +1016,7 @@ export const host = {
           // an already-mounted tile would paint the idle snapshot and never
           // pull messages that arrived while the panel WS was down (#96183).
           // Refresh the tile transcript in place instead.
-          if (options.awaitHydration && (options.forceResume || !surfaceHealthy)) {
+          if (options.forceResume || (options.awaitHydration && !surfaceHealthy)) {
             const existingTile = $sessionTiles.get().some(tile => tile.storedSessionId === storedSessionId)
             const tileDelegate = existingTile ? sessionTileDelegate() : null
 
@@ -1091,7 +1102,7 @@ export const host = {
 
       throw error
     } finally {
-      if (options.awaitHydration && generation === openSessionGeneration) {
+      if (generation === openSessionGeneration && $gatewaySwapTarget.get() === targetProfile) {
         $gatewaySwapTarget.set(null)
       }
     }

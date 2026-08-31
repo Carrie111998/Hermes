@@ -804,6 +804,32 @@ describe('profile-aware plugin session opens', () => {
     expect($gatewaySwapTarget.get()).toBeNull()
   })
 
+  it('does not show the waking overlay when reattaching an already-visible Bot Chat', async () => {
+    vi.mocked(openGatewayForProfile).mockImplementationOnce(async () => undefined)
+    setMockAtom($sessionTiles, [{ storedSessionId: 'bot-chat' }] as never)
+    setMockAtom($focusedStoredSessionId, 'bot-chat')
+    setMockAtom($focusedRuntimeId, 'runtime-tile')
+    setMockAtom($focusedSessionState, {
+      messages: [{ id: 'tile-history', parts: [], role: 'assistant' }],
+      storedSessionId: 'bot-chat'
+    } as never)
+
+    const opening = host.openSession('bot-chat', {
+      profile: 'hyoseob',
+      awaitHydration: true,
+      expectHistory: true,
+      forceResume: true,
+      hydrationTimeoutMs: 1_000
+    })
+
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect($gatewaySwapTarget.get()).toBeNull()
+
+    await opening
+    expect($gatewaySwapTarget.get()).toBeNull()
+    expect(requestSessionResume).toHaveBeenCalledWith('bot-chat', undefined)
+  })
+
   it('requests an explicit resume on a cold open where selection has not settled (#89206)', async () => {
     vi.mocked(openGatewayForProfile).mockImplementationOnce(async () => undefined)
 

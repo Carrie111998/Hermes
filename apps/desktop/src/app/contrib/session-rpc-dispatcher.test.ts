@@ -1,3 +1,4 @@
+import { JsonRpcGatewayError } from '@hermes/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 // Fail-closed owner resolution for the window's ONE session-scoped RPC
@@ -11,7 +12,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const gatewayMocks = vi.hoisted(() => ({
   activeConnectionId: null as null | string,
-  requestGatewayForAgent: vi.fn(async () => ({ routed: true })),
+  requestGatewayForAgent: vi.fn(
+    async (
+      _connectionId?: null | string,
+      _profile?: string,
+      _method?: string,
+      _params?: Record<string, unknown>
+    ): Promise<{ routed?: boolean; session_id?: string }> => ({ routed: true })
+  ),
   requestGatewayForProfile: vi.fn(async () => ({ profiled: true }))
 }))
 
@@ -192,5 +200,67 @@ describe('createSessionRpcDispatcher: exact owner rungs', () => {
       session_id: 'stored-tg',
       text: 'hi'
     })
+  })
+})
+
+describe('createSessionRpcDispatcher: detached-runtime resume handshake', () => {
+  afterEach(() => {
+    gatewayMocks.requestGatewayForAgent.mockReset()
+    gatewayMocks.requestGatewayForAgent.mockResolvedValue({ routed: true })
+  })
+
+  it('resumes the stored session and retries prompt.submit after a 4001', async () => {
+    setSessions([makeSessionInfo({ connection_id: 'local', id: 'stored-omar', profile: 'omar' })])
+    gatewayMocks.requestGatewayForAgent.mockImplementation(async (_conn, _profile, method, params) => {
+      if (method === 'prompt.submit' && params?.session_id === 'rt-omar') {
+        throw new JsonRpcGatewayError("session-scoped RPC rejected: session_id='rt-omar' not in memory", { code: 4001 })
+      }
+
+      if (method === 'session.resume') {
+        return { session_id: 'rt-fresh' }
+      }
+
+      return { routed: true }
+    })
+
+    const bindings = { current: new Map([['stored-omar', 'rt-omar']]) }
+    const request = createSessionRpcDispatcher({
+      ambientRequest: vi.fn(async () => ({ ambient: true })) as never,
+      runtimeIdByStoredSessionIdRef: bindings,
+      selectedStoredSessionIdRef: { current: null },
+      sessionStateByRuntimeIdRef: { current: new Map() }
+    })
+
+    await expect(request('prompt.submit', { session_id: 'rt-omar', text: 'hi' })).resolves.toEqual({
+      routed: true
+    })
+
+    expect(gatewayMocks.requestGatewayForAgent.mock.calls.map(call => call[2])).toEqual([
+      'prompt.submit',
+      'session.resume',
+      'prompt.submit'
+    ])
+    expect(gatewayMocks.requestGatewayForAgent.mock.calls[1][3]).toMatchObject({
+      omit_messages: true,
+      session_id: 'stored-omar',
+      source: 'desktop'
+    })
+    expect(gatewayMocks.requestGatewayForAgent.mock.calls[2][3]).toMatchObject({
+      session_id: 'rt-fresh',
+      text: 'hi'
+    })
+    expect(bindings.current.get('stored-omar')).toBe('rt-fresh')
+  })
+
+  it('does not auto-resume session.activate (warm path owns that fall-through)', async () => {
+    setSessions([makeSessionInfo({ connection_id: 'local', id: 'stored-omar', profile: 'omar' })])
+    gatewayMocks.requestGatewayForAgent.mockRejectedValue(
+      new JsonRpcGatewayError('session not found', { code: 4001 })
+    )
+
+    await expect(dispatcher().request('session.activate', { session_id: 'rt-omar' })).rejects.toBeInstanceOf(
+      JsonRpcGatewayError
+    )
+    expect(gatewayMocks.requestGatewayForAgent.mock.calls.map(call => call[2])).toEqual(['session.activate'])
   })
 })

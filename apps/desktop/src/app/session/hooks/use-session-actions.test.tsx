@@ -1,4 +1,4 @@
-import { registryBackendScopeKey } from '@hermes/shared'
+import { JsonRpcGatewayError, registryBackendScopeKey } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { act, cleanup, render, waitFor } from '@testing-library/react'
 import type { MutableRefObject } from 'react'
@@ -2390,6 +2390,51 @@ describe('resumeSession warm-cache mapping integrity', () => {
       expect.objectContaining({ omit_messages: true, session_id: 'rt-A' })
     )
     expect(runtimeIdByStoredSessionIdRef.current.get('stored-A')).toBe('rt-A')
+  })
+
+  it('falls through to a stored session.resume when session.activate 4001s after a detach', async () => {
+    const runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>> = {
+      current: new Map([['stored-A', 'rt-A']])
+    }
+    const sessionStateByRuntimeIdRef: MutableRefObject<Map<string, ClientSessionState>> = {
+      current: new Map([['rt-A', clientState('stored-A')]])
+    }
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.activate') {
+        throw new JsonRpcGatewayError("session-scoped RPC rejected: session_id='rt-A' not in memory", { code: 4001 })
+      }
+
+      if (method === 'session.resume') {
+        return {
+          session_id: 'rt-fresh',
+          resumed: 'stored-A',
+          message_count: 0,
+          messages: [],
+          info: {}
+        } as never
+      }
+
+      return {} as never
+    })
+
+    vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: [], session_id: 'stored-A' } as never)
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(
+      <ResumeHarness
+        onReady={r => (resume = r)}
+        requestGateway={requestGateway}
+        runtimeIdByStoredSessionIdRef={runtimeIdByStoredSessionIdRef}
+        sessionStateByRuntimeIdRef={sessionStateByRuntimeIdRef}
+      />
+    )
+    await waitFor(() => expect(resume).not.toBeNull())
+    await resume!('stored-A', true)
+
+    expect(requestGateway).toHaveBeenCalledWith('session.activate', expect.objectContaining({ session_id: 'rt-A' }))
+    expect(requestGateway).toHaveBeenCalledWith('session.resume', expect.objectContaining({ session_id: 'stored-A' }))
+    expect(runtimeIdByStoredSessionIdRef.current.has('stored-A')).toBe(false)
   })
 
   it('re-arms a pending clarify in place on the warm session.activate path', async () => {

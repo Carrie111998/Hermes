@@ -1,4 +1,5 @@
 import type { AppendMessage } from '@assistant-ui/react'
+import { JsonRpcGatewayError } from '@hermes/shared'
 
 import { translateNow, type Translations } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
@@ -49,9 +50,15 @@ export function inlineErrorMessage(error: unknown, fallback: string): string {
 }
 
 export function isSessionNotFoundError(error: unknown): boolean {
+  // 4001 is the gateway's "runtime not in memory (detached/reaped)" reject;
+  // 4007 is "this id never existed" and must not be treated as recoverable.
+  if (error instanceof JsonRpcGatewayError && typeof error.code === 'number') {
+    return error.code === 4001
+  }
+
   const message = error instanceof Error ? error.message : String(error)
 
-  return /session not found/i.test(message)
+  return /session not found/i.test(message) || message.includes('not in memory')
 }
 
 /**

@@ -1,4 +1,5 @@
 import type { AppendMessage } from '@assistant-ui/react'
+import { JsonRpcGatewayError } from '@hermes/shared'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
@@ -144,6 +145,20 @@ describe('session error classifiers', () => {
     expect(isSessionBusyError(new Error('session busy'))).toBe(true)
     expect(isSessionNotFoundError(new Error('other'))).toBe(false)
     expect(isSessionBusyError(new Error('other'))).toBe(false)
+  })
+
+  it('treats gateway 4001 / not-in-memory as a recoverable detached runtime', () => {
+    expect(isSessionNotFoundError(new JsonRpcGatewayError('session not found', { code: 4001 }))).toBe(true)
+    expect(
+      isSessionNotFoundError(
+        new JsonRpcGatewayError("session-scoped RPC rejected: session_id='rt-1' not in memory", { code: 4001 })
+      )
+    ).toBe(true)
+    expect(isSessionNotFoundError(new Error("session_id='rt-1' not in memory"))).toBe(true)
+  })
+
+  it('does not treat 4007 (never existed) as a recoverable detach', () => {
+    expect(isSessionNotFoundError(new JsonRpcGatewayError('session not found', { code: 4007 }))).toBe(false)
   })
 })
 

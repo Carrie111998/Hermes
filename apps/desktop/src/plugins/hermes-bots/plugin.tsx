@@ -74,6 +74,43 @@ import type { GroupChat, RosterRow } from './types'
 
 // ── plugin ───────────────────────────────────────────────────────────────────
 
+/** Re-resume the open Bot Chat after a detached/reaped runtime.
+ *
+ *  Used on `session.reclaimed` (WS still up) and on a gateway closed→open
+ *  edge (sleep/wake missed the reclaim event). `openBotCanonicalChat` is
+ *  overlay-silent when the chat is already on screen. */
+export async function reattachOpenBotChat(): Promise<void> {
+  const claim = $openBotChat.get()
+
+  if (!claim?.openedRegistryId) {
+    return
+  }
+
+  const bot = selectedRosterBot($lastRoster.get(), $selectedRosterKey.get())
+
+  if (!bot) {
+    return
+  }
+
+  const generation = getBotOpenGeneration()
+
+  try {
+    const opened = await openBotCanonicalChat(bot)
+
+    if (!opened || generation !== getBotOpenGeneration()) {
+      return
+    }
+
+    $openBotChat.set({
+      key: claim.key,
+      openedRegistryId: opened.registryId,
+      openedSessionId: opened.openedId
+    })
+  } catch {
+    /* backend still down — next send recovers via the ladder */
+  }
+}
+
 /** One row the composer's `@` popover renders from the roster. */
 interface MentionCompletionItem {
   display: string
@@ -307,7 +344,22 @@ export default {
     // duplicate listener per cycle (same survives-disable class as the face
     // clock before its onDispose hook — these kept firing until app restart).
     const unbindProfileListener = bindProfileSync($focusedBotOwner)
-    const unbindGatewayListener = host.state.gateway.listen(handleSessionsGatewayTransition)
+    // After sleep/wake the profile serve reaps the Bot Chat runtime. Reclaim
+    // events are missed when the WS is already down, so a closed→open gateway
+    // edge must reattach the open Bot Chat the same way `session.reclaimed`
+    // does — otherwise the pane spins on "waking up" until Ctrl+R (#99646).
+    let gatewayWasOpen = host.state.gateway.get() === 'open'
+    const unbindGatewayListener = host.state.gateway.listen(state => {
+      handleSessionsGatewayTransition()
+
+      const isOpen = state === 'open'
+
+      if (isOpen && !gatewayWasOpen) {
+        void reattachOpenBotChat()
+      }
+
+      gatewayWasOpen = isOpen
+    })
 
     // #93492 root fix: the registry pushes a lifecycle event when a
     // connection is removed. The gateway store already disposes the dead
@@ -559,29 +611,7 @@ export default {
                 return
               }
 
-              const bot = selectedRosterBot($lastRoster.get(), $selectedRosterKey.get())
-
-              if (!bot) {
-                return
-              }
-
-              const generation = getBotOpenGeneration()
-              void openBotCanonicalChat(bot)
-                .then(opened => {
-                  // A user action while the re-resume ran owns the center now.
-                  if (!opened || generation !== getBotOpenGeneration()) {
-                    return
-                  }
-
-                  $openBotChat.set({
-                    key: claim.key,
-                    openedRegistryId: opened.registryId,
-                    openedSessionId: opened.openedId
-                  })
-                })
-                .catch(() => {
-                  /* backend still down — next send recovers via the ladder */
-                })
+              void reattachOpenBotChat()
             })
           : null
 

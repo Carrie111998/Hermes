@@ -33,6 +33,8 @@
  */
 import type { MutableRefObject } from 'react'
 
+import { singleFlightSessionResume } from '@/app/session/hooks/use-prompt-actions/single-flight-resume'
+import { isSessionNotFoundError } from '@/app/session/hooks/use-prompt-actions/utils'
 import { resolveSessionOwner } from '@/app/session/hooks/use-session-actions/utils'
 import type { ClientSessionState } from '@/app/types'
 import { getSessionOwnerHint, knownSessionOwner, ownerLookupSessionRows } from '@/store/session'
@@ -41,6 +43,12 @@ import { requestForSessionProfile, type SessionOwnerScope } from '@/store/sessio
 import { $focusedStoredSessionId, sessionTileOwnerRoute, storedSessionIdForRuntimeId } from '@/store/session-states'
 
 import { findStoredIdForRuntimeId, resolveRoutingSessionId, resolveSessionRpcOwner } from './wiring-routing'
+
+/** Methods that must not auto-resume on a detached runtime.
+ *  `session.resume` is the handshake itself; `session.activate` has its own
+ *  warm-cache 4001 → full stored resume fall-through; replay/create are not
+ *  runtime-rebinding calls. */
+const DETACHED_RUNTIME_NO_RETRY = new Set(['session.resume', 'session.activate', 'session.create', 'session.events.since'])
 
 export type AmbientGatewayRequest = <T>(
   method: string,
@@ -97,6 +105,54 @@ export function createSessionRpcDispatcher(deps: SessionRpcDispatcherDeps): Ambi
     // backend "session not found" on a backend that never held the runtime.
     assertSessionOwnerResolved(owner, { method, sessionId: paramSessionId ? routingSessionId : null })
 
-    return requestForSessionProfile<T>(owner, ambientRequest, method, params ?? {}, timeoutMs, signal)
+    const dispatch = (sessionParams: Record<string, unknown>) =>
+      requestForSessionProfile<T>(owner, ambientRequest, method, sessionParams, timeoutMs, signal)
+
+    try {
+      return await dispatch(params ?? {})
+    } catch (error) {
+      // After sleep/wake the profile serve reaps the in-memory runtime; the
+      // client still holds the dead id. The gateway's 4001 is explicit:
+      // "client should resume the stored session". Do that once here so every
+      // session-scoped RPC (not just prompt.submit) reattaches instead of
+      // spinning on "waking up".
+      if (!paramSessionId || DETACHED_RUNTIME_NO_RETRY.has(method) || !isSessionNotFoundError(error)) {
+        throw error
+      }
+
+      const storedId =
+        sessionStateByRuntimeIdRef.current.get(paramSessionId)?.storedSessionId ??
+        findStoredIdForRuntimeId(runtimeIdByStoredSessionIdRef.current, paramSessionId) ??
+        storedSessionIdForRuntimeId(paramSessionId) ??
+        routingSessionId ??
+        paramSessionId
+
+      if (!storedId) {
+        throw error
+      }
+
+      let liveId = ''
+
+      try {
+        const resumed = await singleFlightSessionResume(storedId, () =>
+          requestForSessionProfile<{ session_id?: string }>(owner, ambientRequest, 'session.resume', {
+            omit_messages: true,
+            session_id: storedId,
+            source: 'desktop'
+          })
+        )
+        liveId = String(resumed?.session_id || '').trim()
+      } catch {
+        throw error
+      }
+
+      if (!liveId || liveId === paramSessionId) {
+        throw error
+      }
+
+      runtimeIdByStoredSessionIdRef.current.set(storedId, liveId)
+
+      return dispatch({ ...(params ?? {}), session_id: liveId })
+    }
   }
 }

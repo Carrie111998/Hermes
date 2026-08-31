@@ -1,3 +1,5 @@
+import { JsonRpcGatewayError } from '@hermes/shared'
+
 import { textWithoutReferenceLines } from '@/components/assistant-ui/reference-kinds'
 import { getSession } from '@/hermes'
 import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
@@ -1719,9 +1721,13 @@ export function applyStoredSessionPreviewRuntimeInfo(
 // from a transient/wedged backend (ECONNREFUSED, timeout), which must still
 // retry rather than discard the id.
 export function isSessionGoneError(err: unknown): boolean {
+  if (err instanceof JsonRpcGatewayError && typeof err.code === 'number') {
+    return err.code === 4001 || err.code === 4007
+  }
+
   const message = err instanceof Error ? err.message : String(err ?? '')
 
-  return message.includes('404') || /session not found/i.test(message)
+  return message.includes('404') || /session not found/i.test(message) || message.includes('not in memory')
 }
 
 /**
