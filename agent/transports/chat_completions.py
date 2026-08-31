@@ -22,6 +22,7 @@ from agent.reasoning_effort import (
     kimi_supported_efforts,
     requested_effort,
 )
+from agent.message_sanitization import normalize_finish_reason as _normalize_finish_reason
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
@@ -912,7 +913,10 @@ class ChatCompletionsTransport(ProviderTransport):
         _fr = getattr(choice, "finish_reason", None)
         if isinstance(_fr, int):
             _fr = str(_fr)
-        finish_reason = _fr or "stop"
+        # Gateways fronting Gemini backends emit native uppercase reasons
+        # (STOP / MAX_TOKENS) — fold to the OpenAI contract at wire intake
+        # (port of oh-my-pi#9566).
+        finish_reason = _normalize_finish_reason(_fr) or "stop"
 
         tool_calls = None
         message_tool_calls = getattr(msg, "tool_calls", None)

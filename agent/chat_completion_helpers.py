@@ -42,6 +42,7 @@ from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
+    normalize_finish_reason as _normalize_finish_reason,
 )
 from agent.reasoning_summaries import separate_glued_reasoning_blocks
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
@@ -4392,7 +4393,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
             chunk_finish_reason = getattr(chunk.choices[0], "finish_reason", None)
             if chunk_finish_reason:
-                finish_reason = chunk_finish_reason
+                # Fold gateway-native uppercase reasons (STOP / MAX_TOKENS from
+                # Gemini-fronting proxies) to the OpenAI contract at wire
+                # intake (port of oh-my-pi#9566).
+                finish_reason = _normalize_finish_reason(chunk_finish_reason)
 
             # Usage in the final chunk
             if hasattr(chunk, "usage") and chunk.usage:

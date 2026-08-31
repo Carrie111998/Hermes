@@ -327,6 +327,43 @@ def close_interrupted_tool_sequence(messages: list, final_response: Any = None) 
     return True
 
 
+# ---------------------------------------------------------------------------
+# finish_reason wire normalization (port of oh-my-pi#9566)
+# ---------------------------------------------------------------------------
+#
+# Some OpenAI-compatible gateways fronting Google Gemini backends emit the
+# native uppercase finish reasons (``STOP``, ``MAX_TOKENS``) instead of the
+# lowercase OpenAI contract values. Every downstream comparison in Hermes
+# (``finish_reason == "stop"`` / ``"length"`` / ``"content_filter"`` /
+# ``"tool_calls"``) uses lowercase literals, so an uppercase reason silently
+# falls through: a clean ``STOP`` completion misses the stop handling and a
+# ``MAX_TOKENS`` truncation never enters the length-recovery path.
+#
+# This is the single owner for folding wire finish reasons to the OpenAI
+# contract. Call it at wire-intake choke points (transport normalize_response,
+# streaming chunk capture) — never re-implement the fold at comparison sites.
+
+# Provider-native aliases → OpenAI contract values. Extend here, not inline.
+_FINISH_REASON_ALIASES = {
+    "max_tokens": "length",   # Gemini-native / Anthropic-style cap reason
+    "end": "stop",            # some gateways' clean-completion spelling
+    "function_call": "tool_calls",  # OpenAI legacy pre-tools spelling
+}
+
+
+def normalize_finish_reason(raw: Any) -> Any:
+    """Fold a wire ``finish_reason`` to the lowercase OpenAI contract value.
+
+    Non-string and empty values are returned unchanged (callers keep their
+    existing ``or "stop"`` defaults). Already-lowercase contract values pass
+    through byte-identical, so cached-prefix behavior is unaffected.
+    """
+    if not isinstance(raw, str) or not raw:
+        return raw
+    lowered = raw.lower()
+    return _FINISH_REASON_ALIASES.get(lowered, lowered)
+
+
 def _strip_non_ascii(text: str) -> str:
     """Remove non-ASCII characters, replacing with closest ASCII equivalent or removing.
 
