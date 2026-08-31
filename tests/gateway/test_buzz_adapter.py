@@ -538,3 +538,209 @@ class TestStandaloneSend:
         assert all("nsec1x" not in str(a) for a in captured["args"])
 
 
+# ── WebSocket conversation (re)discovery ──────────────────────────────────
+
+
+class _FrameWebSocket:
+    """Scripted recv()/send() double: replays queued frames, records sends."""
+
+    def __init__(self, frames):
+        self._frames = list(frames)
+        self.sent = []
+
+    async def recv(self):
+        if not self._frames:
+            await asyncio.sleep(3600)
+        return self._frames.pop(0)
+
+    async def send(self, raw):
+        self.sent.append(json.loads(raw))
+
+
+def _ws_event_frame(event_id, channel=CHANNEL, content="hi", created_at=1000):
+    event = _event(event_id, content=content, created_at=created_at)
+    event["tags"] = [["h", channel]]
+    return json.dumps(["EVENT", "hermes-buzz-0", event])
+
+
+class TestRefreshConversationSubscriptions:
+    """_refresh_conversation_subscriptions: one idempotent
+    discovery+subscription path shared by the membership-event and periodic
+    WebSocket refreshes."""
+
+    @pytest.mark.asyncio
+    async def test_subscribes_newly_discovered_conversation(self):
+        a = _make_adapter()
+        subscriptions = {"hermes-buzz-0": CHANNEL}
+        websocket = object()
+
+        async def discover(*, seed):
+            assert seed is False
+            a._channel_state[DM_CHANNEL] = {
+                "chat_type": "group",
+                "last_ts": 0,
+                "seen": {},
+            }
+
+        sent = []
+
+        async def subscribe(ws, subscription_id, channel_id):
+            sent.append((ws, subscription_id, channel_id))
+
+        a._discover_dms = discover
+        a._send_channel_subscription = subscribe
+
+        await a._refresh_conversation_subscriptions(websocket, subscriptions)
+
+        assert list(subscriptions.values()) == [CHANNEL, DM_CHANNEL]
+        assert sent == [(websocket, "hermes-buzz-conversation-1", DM_CHANNEL)]
+
+    @pytest.mark.asyncio
+    async def test_idempotent_when_conversation_already_subscribed(self):
+        a = _make_adapter()
+        # DM already watched AND already covered by the socket's subscription
+        # map — a repeated refresh must not send a duplicate REQ.
+        a._channel_state[DM_CHANNEL] = {"chat_type": "dm", "last_ts": 0, "seen": {}}
+        subscriptions = {
+            "hermes-buzz-0": CHANNEL,
+            "hermes-buzz-1": DM_CHANNEL,
+        }
+        sent = []
+
+        async def discover(*, seed):
+            return
+
+        async def subscribe(ws, subscription_id, channel_id):
+            sent.append((subscription_id, channel_id))
+
+        a._discover_dms = discover
+        a._send_channel_subscription = subscribe
+
+        await a._refresh_conversation_subscriptions(object(), subscriptions)
+
+        assert sent == []
+        assert list(subscriptions.values()) == [CHANNEL, DM_CHANNEL]
+
+    @pytest.mark.asyncio
+    async def test_membership_event_shares_refresh_helper(self):
+        """The membership path must go through the same discovery+subscribe
+        helper so both transports stay behaviorally identical."""
+        a = _make_adapter()
+        subscriptions = {"hermes-buzz-0": CHANNEL}
+
+        calls = []
+
+        async def refresh(websocket, subs):
+            calls.append((websocket, subs))
+
+        a._refresh_conversation_subscriptions = refresh
+        await a._handle_membership_event(
+            object(), subscriptions, {"created_at": 1234}
+        )
+
+        assert a._membership_since == 1234
+        assert len(calls) == 1
+
+
+class TestWebsocketLoopConversationRediscovery:
+    """Integration coverage for the bounded-recv loop in
+    _websocket_loop(): a quiet socket must still trigger periodic conversation
+    discovery, without cancelling an in-flight recv() (which could drop a
+    frame delivered mid-refresh)."""
+
+    @staticmethod
+    def _fake_connect(monkeypatch, ws):
+        """Replace websockets.connect with a context manager over ``ws``."""
+
+        class _CM:
+            async def __aenter__(self):
+                return ws
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr("websockets.connect", lambda *a, **k: _CM())
+
+    @staticmethod
+    def _wire(adapter, monkeypatch, initial_subscriptions):
+        """Stub the handshake so the loop reaches its recv pump directly."""
+        adapter.poll_interval = 0.05  # discovery window = interval * 5
+        adapter._authenticate_websocket = AsyncMock()
+        adapter._subscribe_websocket = AsyncMock(return_value=dict(initial_subscriptions))
+
+    @pytest.mark.asyncio
+    async def test_quiet_socket_triggers_periodic_rediscovery(self, monkeypatch):
+        a = _make_adapter()
+        ws = _FrameWebSocket([])
+        self._fake_connect(monkeypatch, ws)
+        initial = {"hermes-buzz-0": CHANNEL}
+        self._wire(a, monkeypatch, initial)
+
+        refresh_calls = []
+
+        async def refresh(websocket, subscriptions):
+            refresh_calls.append((websocket, subscriptions))
+            if len(refresh_calls) >= 3:
+                # The only way out of the reconnect loop from inside.
+                raise asyncio.CancelledError
+
+        a._refresh_conversation_subscriptions = refresh
+
+        task = asyncio.create_task(a._websocket_loop())
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=10)
+
+        assert len(refresh_calls) == 3
+        # Every refresh sees the live socket and the current subscription map.
+        assert all(call[0] is ws for call in refresh_calls)
+        assert all(
+            call[1] is initial or call[1] == initial for call in refresh_calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_frames_dispatch_through_real_decoder_then_refresh_fires(
+        self, monkeypatch
+    ):
+        a = _make_adapter()
+        a._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+            "chat_type_locked": True,
+        }
+        frames = [
+            _ws_event_frame("e-ws-1"),
+            _ws_event_frame("e-ws-2", created_at=1001),
+        ]
+        ws = _FrameWebSocket(frames)
+        self._fake_connect(monkeypatch, ws)
+        initial = {"hermes-buzz-0": CHANNEL}
+        self._wire(a, monkeypatch, initial)
+
+        dispatched = []
+
+        async def handle_event(channel_id, state, event):
+            dispatched.append((channel_id, event["id"]))
+
+        a._handle_event = handle_event
+
+        refreshed = []
+
+        async def refresh(websocket, subscriptions):
+            refreshed.append(True)
+            raise asyncio.CancelledError
+
+        a._refresh_conversation_subscriptions = refresh
+
+        task = asyncio.create_task(a._websocket_loop())
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=10)
+
+        # Both frames flowed through the real decoder/subscription routing.
+        assert dispatched == [
+            (CHANNEL, "e-ws-1"),
+            (CHANNEL, "e-ws-2"),
+        ]
+        # …and the quiet period after them still reached the periodic refresh.
+        assert refreshed == [True]
+

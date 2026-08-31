@@ -95,6 +95,12 @@ _SEEN_CAP = 500
 # Re-run DM discovery (``dms list`` plus the channels-list fallback) every
 # N poll sweeps to pick up conversations opened mid-run.
 _DM_DISCOVERY_EVERY = 5
+# WebSocket transport: re-run conversation discovery after every N
+# poll-interval periods of quiet. Some relays materialize new DMs in
+# ``dms list``/``channels list`` without ever emitting the kind-44100
+# membership event that normally wakes this transport, so discovery cannot
+# rely on membership events alone (see _refresh_conversation_subscriptions).
+_WS_REDISCOVERY_EVERY = 5
 
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
@@ -828,15 +834,67 @@ class BuzzAdapter(BasePlatformAdapter):
         """A membership event p-tagged to us: rediscover conversations and
         subscribe to any new ones (fresh DMs dispatch from their beginning)."""
         self._membership_since = max(self._membership_since, int(event.get("created_at") or 0))
-        before = set(self._channel_state)
+        await self._refresh_conversation_subscriptions(websocket, subscriptions)
+
+    async def _refresh_conversation_subscriptions(
+        self, websocket, subscriptions: Dict[str, Optional[str]]
+    ) -> None:
+        """Re-run conversation discovery and subscribe the live socket to any
+        watched conversation it does not cover yet.
+
+        Freshly discovered conversations dispatch from their beginning. The
+        poll transport rediscovers periodically (``_DM_DISCOVERY_EVERY``); the
+        WebSocket transport originally relied on kind-44100 membership events
+        alone. Relays have been observed materializing new DMs in ``dms
+        list``/``channels list`` without emitting that event, which left a DM
+        opened mid-session invisible until the next reconnect. Sharing this
+        helper gives both transports one discovery+subscription path, keyed
+        on what the socket is actually subscribed to (idempotent across
+        repeated refreshes and reconnects).
+        """
+        subscribed = {channel_id for channel_id in subscriptions.values() if channel_id}
         await self._discover_dms(seed=False)
         for channel_id in self._channel_state:
-            if channel_id in before:
+            if channel_id in subscribed:
                 continue
-            subscription_id = f"hermes-buzz-dm-{len(subscriptions)}"
+            subscription_id = f"hermes-buzz-conversation-{len(subscriptions)}"
             subscriptions[subscription_id] = channel_id
             await self._send_channel_subscription(websocket, subscription_id, channel_id)
             logger.info("Buzz: subscribed to new conversation %s", channel_id)
+
+    async def _handle_websocket_message(
+        self,
+        websocket,
+        subscriptions: Dict[str, Optional[str]],
+        # websockets yields either str or bytes; json.loads accepts both.
+        raw: Any,
+    ) -> None:
+        """Decode and route a single WebSocket frame."""
+        try:
+            message = json.loads(raw)
+        except (ValueError, TypeError):
+            logger.warning("Buzz: ignoring malformed WebSocket frame")
+            return
+        if not isinstance(message, list) or not message:
+            return
+        if message[0] == "EVENT" and len(message) >= 3:
+            subscription_id = str(message[1])
+            event = message[2]
+            if not isinstance(event, dict):
+                return
+            if subscription_id == _WS_MEMBERSHIP_SUB_ID:
+                await self._handle_membership_event(websocket, subscriptions, event)
+                return
+            channel_id = subscriptions.get(subscription_id)
+            state = self._channel_state.get(channel_id or "")
+            if channel_id and state is not None:
+                await self._handle_event(channel_id, state, event)
+                self._trim_seen(state)
+        elif message[0] == "CLOSED":
+            detail = message[-1] if len(message) > 2 else "subscription closed"
+            raise ConnectionError(str(detail))
+        elif message[0] == "NOTICE":
+            logger.warning("Buzz: relay notice: %s", message[-1])
 
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
@@ -864,32 +922,32 @@ class BuzzAdapter(BasePlatformAdapter):
                         if self._ws_ready is not None:
                             self._ws_ready.set()
                         backoff = 1.0
-                        async for raw in websocket:
+                        while True:
+                            # Bound each recv so quiet periods still reach the
+                            # periodic conversation rediscovery below: some
+                            # relays materialize new DMs without ever sending
+                            # the kind-44100 membership event. A timeout means
+                            # the socket has been idle for a full window, so
+                            # the rediscovery awaits cannot race inbound
+                            # frames; anything delivered meanwhile stays
+                            # buffered and is consumed by the next recv().
                             try:
-                                message = json.loads(raw)
-                            except (ValueError, TypeError):
-                                logger.warning("Buzz: ignoring malformed WebSocket frame")
+                                raw = await asyncio.wait_for(
+                                    websocket.recv(),
+                                    timeout=self.poll_interval * _WS_REDISCOVERY_EVERY,
+                                )
+                            except asyncio.TimeoutError:
+                                await self._refresh_conversation_subscriptions(
+                                    websocket, subscriptions
+                                )
                                 continue
-                            if not isinstance(message, list) or not message:
-                                continue
-                            if message[0] == "EVENT" and len(message) >= 3:
-                                subscription_id = str(message[1])
-                                event = message[2]
-                                if not isinstance(event, dict):
-                                    continue
-                                if subscription_id == _WS_MEMBERSHIP_SUB_ID:
-                                    await self._handle_membership_event(websocket, subscriptions, event)
-                                    continue
-                                channel_id = subscriptions.get(subscription_id)
-                                state = self._channel_state.get(channel_id or "")
-                                if channel_id and state is not None:
-                                    await self._handle_event(channel_id, state, event)
-                                    self._trim_seen(state)
-                            elif message[0] == "CLOSED":
-                                detail = message[-1] if len(message) > 2 else "subscription closed"
-                                raise ConnectionError(str(detail))
-                            elif message[0] == "NOTICE":
-                                logger.warning("Buzz: relay notice: %s", message[-1])
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as e:
+                                # Surface transport errors (connection closed,
+                                # protocol violation, …) to the reconnect loop.
+                                raise ConnectionError(f"receive failed: {e}") from e
+                            await self._handle_websocket_message(websocket, subscriptions, raw)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
