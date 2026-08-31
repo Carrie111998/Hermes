@@ -3326,7 +3326,9 @@ def switch_model(
         logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
 
     # ── Invalidate cached system prompt so it rebuilds next turn ──
-    agent._cached_system_prompt = None
+    # Use the shared invalidation boundary so a live model switch also reloads
+    # the current memory snapshot and refreshes any frozen prompt sections.
+    agent._invalidate_system_prompt()
 
     # Publish the destination capability map only after every runtime setup
     # above has succeeded. Failed switches must leave the old map intact.

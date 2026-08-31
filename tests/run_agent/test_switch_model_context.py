@@ -119,6 +119,23 @@ def test_switch_model_clears_previous_config_context_length(mock_ctx_len):
     assert agent.context_compressor.context_length == 131_072
 
 
+def test_switch_model_reloads_memory_when_invalidating_system_prompt():
+    """A live model switch must refresh memory before the next prompt build."""
+    agent = _make_agent_with_compressor(config_context_length=None)
+    agent._memory_store = MagicMock()
+
+    with patch("agent.model_metadata.get_model_context_length", return_value=128_000):
+        agent.switch_model(
+            "new-model",
+            "openrouter",
+            api_key="sk-new",
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+    agent._memory_store.load_from_disk.assert_called_once_with()
+    assert agent._cached_system_prompt is None
+
+
 def test_switch_model_without_config_context_length():
     """When switching models without config override, config_context_length should be None."""
     agent = _make_agent_with_compressor(config_context_length=None)
