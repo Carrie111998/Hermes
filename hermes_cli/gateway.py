@@ -1070,16 +1070,26 @@ def find_windows_gateway_services(
         indeterminate_services_by_pid: dict[int, list[tuple[str, object]]] = {}
         for service in psutil_module.win_service_iter():
             try:
-                if all(
-                    callable(getattr(service, field, None))
-                    for field in ("name", "status", "pid")
-                ):
-                    service_name = str(service.name() or "")
-                    service_status = service.status()
-                    service_pid = int(service.pid() or 0)
+                data = None
+                name_getter = getattr(service, "name", None)
+                if callable(name_getter):
+                    service_name = str(name_getter() or "")
                 else:
                     data = service.as_dict()
                     service_name = str(data.get("name") or "")
+                if not service_name:
+                    raise RuntimeError("SCM service has an empty name")
+                if not _is_hermes_windows_gateway_service(service_name):
+                    continue
+
+                status_getter = getattr(service, "status", None)
+                pid_getter = getattr(service, "pid", None)
+                if callable(status_getter) and callable(pid_getter):
+                    service_status = status_getter()
+                    service_pid = int(pid_getter() or 0)
+                else:
+                    if data is None:
+                        data = service.as_dict()
                     service_status = data.get("status")
                     service_pid = int(data.get("pid") or 0)
             except FileNotFoundError:
@@ -1088,10 +1098,6 @@ def find_windows_gateway_services(
                 continue
             except Exception as exc:
                 raise RuntimeError("SCM service inspection failed") from exc
-            if not service_name:
-                raise RuntimeError("SCM service has an empty name")
-            if not _is_hermes_windows_gateway_service(service_name):
-                continue
             if service_status == "stopped":
                 continue
             if service_status != "running":

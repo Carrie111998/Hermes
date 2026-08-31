@@ -1162,6 +1162,30 @@ def test_find_windows_gateway_services_ignores_transitional_task_scheduler_ances
     ) == []
 
 
+def test_find_windows_gateway_services_skips_unowned_service_before_status(monkeypatch):
+    """An unrelated service cannot block discovery through inaccessible details."""
+    monkeypatch.setattr(gateway.sys, "platform", "win32")
+
+    class FakeService:
+        def name(self):
+            return "Schedule"
+
+        def status(self):
+            raise PermissionError("access denied")
+
+        def pid(self):
+            raise AssertionError("unowned service PID must not be queried")
+
+    fake_psutil = SimpleNamespace(
+        win_service_iter=lambda: [FakeService()],
+    )
+
+    assert gateway.find_windows_gateway_services(
+        psutil_module=fake_psutil,
+        profile_processes=[],
+    ) == []
+
+
 def test_find_windows_gateway_services_filters_shared_non_hermes_service(monkeypatch):
     """An OS service sharing a Hermes SCM host does not make ownership ambiguous."""
     monkeypatch.setattr(gateway.sys, "platform", "win32")
