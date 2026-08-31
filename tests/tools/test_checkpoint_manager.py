@@ -580,6 +580,24 @@ class TestSafeRestore:
 # =========================================================================
 
 class TestWorkingDirResolution:
+    def test_registered_checkpoint_wins_over_unrelated_ancestor_marker(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        ancestor = tmp_path / "shared-temp"
+        project = ancestor / "project-without-markers"
+        project.mkdir(parents=True)
+        (ancestor / "package.json").write_text("{}\n")
+        target = project / "main.py"
+        target.write_text("x\n")
+
+        m = CheckpointManager(enabled=True)
+        assert m.ensure_checkpoint(str(project), "initial") is True
+
+        # The checkpoint metadata is the authority for ledger scope.  A
+        # package marker outside that project cannot hijack it.
+        assert m.get_working_dir_for_path(str(target)) == str(project)
+
     def test_resolves_project_root_markers(self, tmp_path, fake_home):
         m = CheckpointManager(enabled=True)
 

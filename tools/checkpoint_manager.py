@@ -1248,6 +1248,28 @@ class CheckpointManager:
         else:
             candidate = path.parent
 
+        # A checkpoint already records the authoritative worktree root.  Use
+        # that before the marker heuristic below: an unrelated marker in a
+        # broad ancestor (for example ``/tmp/package.json``) must not collapse
+        # the agent-write ledger for every nested project into that ancestor.
+        # Walking from the candidate upward naturally prefers the deepest
+        # registered root and avoids scanning every project in a large store.
+        store = _store_path(CHECKPOINT_BASE)
+        check = candidate
+        while check != check.parent:
+            meta_path = _project_meta_path(store, _project_hash(str(check)))
+            if meta_path.exists():
+                try:
+                    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    if (
+                        isinstance(meta, dict)
+                        and _normalize_path(meta.get("workdir", "")) == check
+                    ):
+                        return str(check)
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    pass
+            check = check.parent
+
         markers = {".git", "pyproject.toml", "package.json", "Cargo.toml",
                     "go.mod", "Makefile", "pom.xml", ".hg", "Gemfile"}
         check = candidate
