@@ -23,12 +23,16 @@ duplicate the user turn (#860 / #42039). This test locks in:
 3. The gateway resolution expression preserves standard-runtime behaviour.
 """
 
+from copy import deepcopy
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from agent.codex_runtime import run_codex_app_server_turn
+from agent.codex_runtime import (
+    _normalize_codex_projected_messages,
+    run_codex_app_server_turn,
+)
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -161,6 +165,128 @@ def test_codex_initial_user_echo_is_skipped_but_steer_is_retained():
     assert result["final_response"] == "CODEX_ASSISTANT"
 
 
+def test_codex_commentary_merges_into_following_tool_call_envelope():
+    """Persist the pre-tool commentary and call as one assistant message."""
+    agent = _make_agent(session_db=None)
+    call = {
+        "id": "codex_exec_call-1",
+        "type": "function",
+        "function": {"name": "exec_command", "arguments": '{"cmd":"pwd"}'},
+    }
+    turn = _make_turn()
+    turn.projected_messages = [
+        {
+            "role": "assistant",
+            "content": "I’ll inspect the workspace first.",
+            "reasoning": "commentary reasoning",
+            "display_kind": "commentary",
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [call],
+            "reasoning": "tool reasoning",
+            "reasoning_content": "tool reasoning content",
+            "finish_reason": "tool_calls",
+        },
+        {"role": "tool", "tool_call_id": call["id"], "content": "/repo"},
+    ]
+    turn.final_text = ""
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="inspect",
+        original_user_message="inspect",
+        messages=[{"role": "user", "content": "inspect"}],
+        effective_task_id="task-commentary-tool",
+    )
+
+    assert [message["role"] for message in result["messages"]] == [
+        "user",
+        "assistant",
+        "tool",
+    ]
+    assistant, tool = result["messages"][1:]
+    assert assistant["content"] == "I’ll inspect the workspace first."
+    assert assistant["tool_calls"] == [call]
+    assert assistant["reasoning"] == "commentary reasoning\ntool reasoning"
+    assert assistant["reasoning_content"] == "tool reasoning content"
+    assert assistant["display_kind"] == "commentary"
+    assert assistant["finish_reason"] == "tool_calls"
+    assert tool["tool_call_id"] == assistant["tool_calls"][0]["id"]
+
+
+def test_codex_final_assistant_content_stays_after_tool_result():
+    """A final assistant item is not consumed by the pre-tool normalization."""
+    agent = _make_agent(session_db=None)
+    turn = _make_turn()
+    turn.projected_messages = [
+        {"role": "assistant", "content": "Checking now."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call-1"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+        {"role": "assistant", "content": "The check passed."},
+    ]
+    turn.final_text = "The check passed."
+    agent._codex_session.run_turn.return_value = turn
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="check",
+        original_user_message="check",
+        messages=[{"role": "user", "content": "check"}],
+        effective_task_id="task-final-content",
+    )
+
+    assert [message["role"] for message in result["messages"]] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert result["messages"][-1]["content"] == "The check passed."
+    assert result["final_response"] == "The check passed."
+
+
+def test_codex_projection_normalization_does_not_mutate_or_alias_inputs():
+    projections = [
+        {
+            "role": "assistant",
+            "content": "Working.",
+            "reasoning_details": [{"step": "commentary"}],
+        },
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-1", "function": {"arguments": "{}"}}],
+            "codex_message_items": [{"id": "tool-item"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "done"},
+    ]
+    before = deepcopy(projections)
+
+    normalized = _normalize_codex_projected_messages(projections)
+
+    assert projections == before
+    assert normalized == [
+        {
+            "role": "assistant",
+            "content": "Working.",
+            "reasoning_details": [{"step": "commentary"}],
+            "tool_calls": [{"id": "call-1", "function": {"arguments": "{}"}}],
+            "codex_message_items": [{"id": "tool-item"}],
+        },
+        {"role": "tool", "tool_call_id": "call-1", "content": "done"},
+    ]
+    assert normalized[0] is not projections[0]
+    assert normalized[0]["tool_calls"] is not projections[1]["tool_calls"]
+    assert normalized[1] is not projections[2]
+
+
 def test_codex_user_interrupt_is_reported_and_cleared():
     agent = _make_agent(session_db=None)
     turn = _make_turn()
@@ -213,7 +339,35 @@ def test_codex_turn_persists_each_message_exactly_once():
         agent._session_db_created = True
         codex_session = MagicMock()
         codex_session.ensure_started.return_value = "thread-1"
-        codex_session.run_turn.return_value = _make_turn()
+        turn = _make_turn()
+        persisted_call = {
+            "id": "codex_exec_persisted",
+            "type": "function",
+            "function": {
+                "name": "exec_command",
+                "arguments": '{"cmd":"pwd"}',
+            },
+        }
+        turn.projected_messages = [
+            {
+                "role": "assistant",
+                "content": "PERSISTED_COMMENTARY",
+                "display_kind": "commentary",
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [persisted_call],
+                "finish_reason": "tool_calls",
+            },
+            {
+                "role": "tool",
+                "tool_call_id": persisted_call["id"],
+                "content": "PERSISTED_TOOL_RESULT",
+            },
+            {"role": "assistant", "content": "CODEX_ASSISTANT"},
+        ]
+        codex_session.run_turn.return_value = turn
         session_cwd = str(Path.cwd().resolve())
         setattr(agent, "_codex_session", codex_session)
         setattr(agent, "session_cwd", session_cwd)
@@ -239,9 +393,23 @@ def test_codex_turn_persists_each_message_exactly_once():
 
         rows = db.get_messages(sid, include_inactive=True)
         contents = [r["content"] for r in rows]
-        # Exactly one user turn, exactly one assistant turn — no duplicates.
+        # Exactly one of each projected row, with no assistant→assistant split
+        # at the commentary/tool-call boundary.
         assert contents.count("USER_TURN") == 1, contents
+        assert contents.count("PERSISTED_COMMENTARY") == 1, contents
+        assert contents.count("PERSISTED_TOOL_RESULT") == 1, contents
         assert contents.count("CODEX_ASSISTANT") == 1, contents
+        assert [row["role"] for row in rows] == [
+            "user",
+            "assistant",
+            "tool",
+            "assistant",
+        ]
+        commentary_row = rows[1]
+        assert commentary_row["tool_calls"] == [persisted_call]
+        assert commentary_row["finish_reason"] == "tool_calls"
+        assert commentary_row["display_kind"] == "commentary"
+        assert rows[2]["tool_call_id"] == persisted_call["id"]
         assistant_row = next(
             row for row in rows if row["content"] == "CODEX_ASSISTANT"
         )

@@ -16,6 +16,7 @@ compatibility.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import logging
 import os
@@ -42,6 +43,91 @@ _RUNTIME_CWD_MARKER_SCAN_BYTES = 1024
 
 class _CodexRuntimeCwdError(ValueError):
     """Sanitized, user-facing failure of the explicit cwd contract."""
+
+
+_CODEX_ORDERED_TEXT_METADATA = frozenset({"reasoning", "reasoning_content"})
+_CODEX_ORDERED_LIST_METADATA = frozenset(
+    {"reasoning_details", "codex_reasoning_items", "codex_message_items"}
+)
+
+
+def _normalize_codex_projected_messages(
+    projected_messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return persistence-ready copies of Codex app-server projections.
+
+    Codex can complete an ``agentMessage`` commentary item immediately before
+    a tool-shaped item. The projector faithfully represents those as a text
+    assistant message followed by an empty assistant tool-call envelope, but
+    persisting that pair violates Hermes' assistant/tool alternation contract.
+    Fold only that exact shape into the standard OpenAI assistant message that
+    carries both ``content`` and ``tool_calls``.
+
+    Projection objects belong to the app-server turn result, so this boundary
+    never mutates or aliases them. Distinct metadata is retained from both
+    messages; ordered reasoning fields are concatenated in event order. If two
+    scalar metadata values conflict, leave the pair unchanged rather than lose
+    either value under an ambiguous merge.
+    """
+    normalized: List[Dict[str, Any]] = []
+    for source_message in projected_messages:
+        message = deepcopy(source_message)
+        if not (
+            normalized
+            and isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and isinstance(normalized[-1], dict)
+            and normalized[-1].get("role") == "assistant"
+            and isinstance(normalized[-1].get("content"), str)
+            and normalized[-1]["content"].strip()
+            and not normalized[-1].get("tool_calls")
+            and (
+                message.get("content") is None
+                or (
+                    isinstance(message.get("content"), str)
+                    and not message["content"].strip()
+                )
+            )
+            and isinstance(message.get("tool_calls"), list)
+            and message["tool_calls"]
+        ):
+            normalized.append(message)
+            continue
+
+        commentary = normalized[-1]
+        merged = deepcopy(commentary)
+        mergeable = True
+        for key, value in message.items():
+            if key in {"role", "content"}:
+                continue
+            if key not in merged or key == "tool_calls":
+                merged[key] = value
+                continue
+            existing = merged[key]
+            if existing == value:
+                continue
+            if (
+                key in _CODEX_ORDERED_TEXT_METADATA
+                and isinstance(existing, str)
+                and isinstance(value, str)
+            ):
+                merged[key] = "\n".join(part for part in (existing, value) if part)
+                continue
+            if (
+                key in _CODEX_ORDERED_LIST_METADATA
+                and isinstance(existing, list)
+                and isinstance(value, list)
+            ):
+                merged[key] = existing + value
+                continue
+            mergeable = False
+            break
+
+        if mergeable:
+            normalized[-1] = merged
+        else:
+            normalized.append(message)
+    return normalized
 
 
 def _canonical_default_codex_cwd(agent: Any) -> str:
@@ -1197,16 +1283,15 @@ def run_codex_app_server_turn(
             _INITIAL_USER_ECHO_MARKER,
         )
 
-        for projected_message in turn.projected_messages:
+        for projected_message in _normalize_codex_projected_messages(
+            turn.projected_messages
+        ):
             # Session projection marks turn/start's user echo explicitly. Never
             # infer redundancy from content here: a legitimate turn/steer can
             # repeat the initial text exactly, or the initial echo may be absent.
-            message_to_append = projected_message
-            if isinstance(projected_message, dict):
-                message_to_append = dict(projected_message)
-                if message_to_append.pop(_INITIAL_USER_ECHO_MARKER, False):
-                    continue
-            append_message(messages, message_to_append)
+            if projected_message.pop(_INITIAL_USER_ECHO_MARKER, False):
+                continue
+            append_message(messages, projected_message)
 
     # Persist the turn-owned message list even when Codex produced no
     # projections. A failed turn can still leave an unpersisted inbound user row;
