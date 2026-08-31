@@ -1605,15 +1605,10 @@ def _real_profile_cdp() -> tuple:
         detect_default_chromium,
         real_profile_copy_dir,
         snapshot_real_profile,
+        validate_managed_real_profile_identity,
     )
 
     with _real_profile_cdp_lock:
-        # Reuse a live copy-browser from an earlier call this process made.
-        cached = _real_profile_cdp_cache.get("cdp")
-        if cached and _cdp_http_ready(cached):
-            return cached, None
-        _real_profile_cdp_cache.pop("cdp", None)
-
         browser = detect_default_chromium()
         if browser is None:
             return None, (
@@ -1637,6 +1632,17 @@ def _real_profile_cdp() -> tuple:
                 "the toggle off."
             )
 
+        # Reuse a live copy-browser from an earlier call this process made only
+        # after re-validating the configured identity assertion. The pin can
+        # change while this process remains alive.
+        cached = _real_profile_cdp_cache.get("cdp")
+        if cached and _cdp_http_ready(cached):
+            identity_err = validate_managed_real_profile_identity(browser)
+            if identity_err:
+                return None, f"browser.use_real_profile is on, but {identity_err}"
+            return cached, None
+        _real_profile_cdp_cache.pop("cdp", None)
+
         # Reuse BEFORE writing anything. A shared copy-browser may already be up
         # from a previous hermes process; if it is driving OUR copy dir, hand it
         # back untouched. CRITICAL: the snapshot overlay (which truncates and
@@ -1649,6 +1655,9 @@ def _real_profile_cdp() -> tuple:
         copy_dir = real_profile_copy_dir(browser)
         existing = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
         if existing and _cdp_http_ready(existing) and _cdp_on_data_dir(existing, copy_dir):
+            identity_err = validate_managed_real_profile_identity(browser)
+            if identity_err:
+                return None, f"browser.use_real_profile is on, but {identity_err}"
             _real_profile_cdp_cache["cdp"] = existing
             return existing, None
         if existing:

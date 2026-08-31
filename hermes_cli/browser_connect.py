@@ -11,6 +11,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -729,6 +730,58 @@ _SNAPSHOT_DONE_MARKER = ".hermes-snapshot-complete"
 _PROFILE_LOCKED_PREFIX = "[profile-locked] "
 
 
+def validate_managed_real_profile_identity(browser: str) -> str | None:
+    """Return an error when a configured pin cannot identify the managed copy."""
+    pin = _real_profile_pin()
+    if not pin:
+        return None
+
+    marker = os.path.join(real_profile_copy_dir(browser), _SNAPSHOT_DONE_MARKER)
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            bootstrapped_from = fh.read().strip()
+    except OSError:
+        bootstrapped_from = ""
+
+    if bootstrapped_from == pin:
+        return None
+    if bootstrapped_from:
+        identity = f"was initialized from '{bootstrapped_from}'"
+    else:
+        identity = "has no readable bootstrap identity"
+    return (
+        f"the managed '{browser}' profile {identity}, but "
+        f"browser.real_profile_pin is now '{pin}'. Turn real-profile browsing "
+        "off and use the browser once to delete the managed profile, then turn "
+        "it on again."
+    )
+
+
+def _write_snapshot_marker(marker: str, source_profile: str) -> str | None:
+    """Atomically commit the bootstrap identity, returning an error on failure."""
+    temp_path = ""
+    try:
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{os.path.basename(marker)}.",
+            suffix=".tmp",
+            dir=os.path.dirname(marker),
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(source_profile)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(temp_path, marker)
+        return None
+    except OSError as e:
+        return f"could not commit the managed profile identity marker: {e}"
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
 def _profile_cookie_db(src: str, source_profile: str) -> str | None:
     """Path to the active profile's cookie DB (modern Network/ first)."""
     for rel in (os.path.join("Network", "Cookies"), "Cookies"):
@@ -951,20 +1004,9 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
     if populated:
         # An explicit pin is an identity assertion. Never silently keep driving
         # a managed profile bootstrapped from another pinned source.
-        pin = _real_profile_pin()
-        if pin:
-            try:
-                with open(marker, encoding="utf-8") as fh:
-                    bootstrapped_from = fh.read().strip()
-            except OSError:
-                bootstrapped_from = ""
-            if bootstrapped_from and bootstrapped_from != pin:
-                return None, (
-                    f"the managed '{browser}' profile was initialized from "
-                    f"'{bootstrapped_from}', but browser.real_profile_pin is now "
-                    f"'{pin}'. Turn real-profile browsing off and use the browser "
-                    "once to delete the managed profile, then turn it on again."
-                )
+        identity_err = validate_managed_real_profile_identity(browser)
+        if identity_err:
+            return None, identity_err
     else:
         src = src or real_profile_data_dir(browser)
         if not src or not os.path.isdir(src):
@@ -1083,11 +1125,12 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
                 )
 
             # Mark complete only after the initial bootstrap succeeded.
-            try:
-                with open(marker, "w", encoding="utf-8") as fh:
-                    fh.write(source_profile)
-            except OSError as e:
-                logger.debug("real-profile snapshot: could not write done marker: %s", e)
+            marker_err = _write_snapshot_marker(marker, source_profile)
+            if marker_err:
+                # The failed bootstrap remains incomplete, but copied
+                # credentials must still receive owner-only permissions.
+                _secure_snapshot_contents(dst)
+                return None, marker_err
 
         # Never carry live-instance leftovers into the copy.
         for leftover in ("SingletonLock", "SingletonSocket", "SingletonCookie"):

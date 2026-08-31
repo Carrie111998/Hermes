@@ -162,6 +162,57 @@ class TestSnapshotRealProfile:
         dst2, err2 = bc.snapshot_real_profile("chrome", src=str(tmp_path / "gone"))
         assert err2 is None and dst2 == dst
 
+    def test_empty_marker_fails_closed_when_pin_is_configured(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+        home = tmp_path / "hermes-home"
+        marker = home / "browser-profile" / "chrome" / bc._SNAPSHOT_DONE_MARKER
+        marker.parent.mkdir(parents=True)
+        marker.write_text("")
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(bc, "_real_profile_pin", lambda: "Profile 2")
+
+        dst, err = bc.snapshot_real_profile("chrome", src=str(tmp_path / "gone"))
+
+        assert dst is None
+        assert err and "no readable bootstrap identity" in err
+        assert "delete the managed profile" in err
+
+    def test_unreadable_marker_fails_closed_when_pin_is_configured(self, tmp_path, monkeypatch):
+        import builtins
+        import hermes_cli.browser_connect as bc
+        home = tmp_path / "hermes-home"
+        marker = home / "browser-profile" / "chrome" / bc._SNAPSHOT_DONE_MARKER
+        marker.parent.mkdir(parents=True)
+        marker.write_text("Profile 2")
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(bc, "_real_profile_pin", lambda: "Profile 2")
+        real_open = builtins.open
+
+        def deny_marker(path, *args, **kwargs):
+            if os.path.normpath(path) == os.path.normpath(marker):
+                raise PermissionError("denied")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", deny_marker)
+        dst, err = bc.snapshot_real_profile("chrome")
+
+        assert dst is None
+        assert err and "no readable bootstrap identity" in err
+
+    def test_marker_commit_failure_leaves_snapshot_incomplete(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+        src = self._make_profile(tmp_path / "real")
+        home = tmp_path / "hermes-home"
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(bc.os, "replace", Mock(side_effect=OSError("disk error")))
+
+        dst, err = bc.snapshot_real_profile("chrome", src=str(src))
+
+        marker = home / "browser-profile" / "chrome" / bc._SNAPSHOT_DONE_MARKER
+        assert dst is None
+        assert err and "could not commit" in err
+        assert not marker.exists()
+
     def test_snapshot_files_are_owner_only(self, tmp_path, monkeypatch):
         """Every copied file must be 0600 and every dir 0700 (#96729).
 
@@ -358,6 +409,31 @@ class TestRealProfileCdpLaunch:
             cdp, err = bt._real_profile_cdp()
         assert closed["n"] == 1  # stale wrong-dir session was closed
         assert cdp == "http://127.0.0.1:41000"
+        self._reset()
+
+    def test_live_managed_session_revalidates_profile_pin(self, tmp_path, monkeypatch):
+        import hermes_cli.browser_connect as bc
+        import tools.browser_tool as bt
+        self._reset()
+        live = "http://127.0.0.1:5000"
+        home = tmp_path / "hermes-home"
+        marker = home / "browser-profile" / "chrome" / bc._SNAPSHOT_DONE_MARKER
+        marker.parent.mkdir(parents=True)
+        marker.write_text("Profile 2")
+        monkeypatch.setattr(bc, "get_hermes_home", lambda: home)
+        monkeypatch.setattr(bc, "_real_profile_pin", lambda: "Profile 4")
+        with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
+             patch.object(bt, "_agent_browser_get_cdp", return_value=live), \
+             patch.object(bt, "_cdp_http_ready", return_value=True), \
+             patch.object(bt, "_cdp_on_data_dir", return_value=True), \
+             patch("hermes_cli.browser_connect.snapshot_real_profile") as snapshot:
+            cdp, err = bt._real_profile_cdp()
+
+        assert cdp is None
+        assert err and "initialized from 'Profile 2'" in err
+        assert "real_profile_pin is now 'Profile 4'" in err
+        snapshot.assert_not_called()
         self._reset()
 
     def test_cdp_on_data_dir_matches_devtoolsactiveport(self, tmp_path):
