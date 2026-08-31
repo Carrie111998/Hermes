@@ -12,7 +12,9 @@ active_profile (child-process inheritance contract).
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -163,4 +165,74 @@ class TestSupervisedChildIgnoresStickyProfile:
         result = os.environ.get("HERMES_HOME")
         assert result is not None
         assert result.endswith("coder")
+
+
+class TestRunpyModuleExecutionRegistersCanonicalAlias:
+    """``python -m hermes_cli.main`` must execute the module exactly once.
+
+    runpy runs the module as ``__main__`` WITHOUT registering it under its
+    canonical name in sys.modules. The first lazy
+    ``from hermes_cli.main import ...`` in the process (gateway/code_skew.py's
+    boot fingerprint is the first such import in a gateway process) then
+    re-executed the whole module, running _apply_profile_override() a second
+    time against the already-stripped argv. With a sticky active_profile
+    present, that re-resolved HERMES_HOME to the named profile and silently
+    re-scoped a ``-p default`` gateway (the systemd unit's ExecStart) to that
+    profile — losing the multiplexer's port-binding platforms (api_server
+    8642) after every in-process restart.
+    """
+
+    def test_lazy_import_does_not_rescope_launcher_profile(self, tmp_path):
+        hermes_root = tmp_path / ".hermes"
+        (hermes_root / "profiles" / "biz-assistant").mkdir(parents=True)
+        (hermes_root / "active_profile").write_text("biz-assistant")
+        script = textwrap.dedent(
+            f"""
+            import importlib.util
+            import os
+            import sys
+
+            os.environ["HERMES_HOME"] = {str(hermes_root)!r}
+            sys.argv = ["hermes_cli.main", "-p", "default", "gateway", "run"]
+
+            spec = importlib.util.find_spec("hermes_cli.main")
+            source = open(spec.origin, encoding="utf-8").read()
+            # Neutralize only the trailing main() call — this test exercises
+            # the module-level profile resolution, the way runpy does, while
+            # keeping the __main__ guard block (which registers the canonical
+            # sys.modules alias) intact.
+            source = source.rsplit("    main()", 1)[0] + "    pass\\n"
+            import __main__
+            globs = __main__.__dict__
+            globs.update(
+                __name__="__main__",
+                __spec__=spec,
+                __file__=spec.origin,
+                __loader__=spec.loader,
+                __package__="hermes_cli",
+            )
+            exec(compile(source, spec.origin, "exec"), globs)
+
+            # The lazy import that used to re-execute the module:
+            from hermes_cli.main import _read_git_revision_fingerprint  # noqa: F401
+            print("FINAL_HOME=" + os.environ["HERMES_HOME"])
+            """
+        )
+        env = dict(os.environ)
+        env.pop("INVOCATION_ID", None)
+        env.pop("HERMES_S6_SUPERVISED_CHILD", None)
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+            cwd=str(Path(__file__).resolve().parents[2]),
+        )
+        assert result.returncode == 0, result.stderr
+        final_lines = [
+            line for line in result.stdout.splitlines() if line.startswith("FINAL_HOME=")
+        ]
+        assert final_lines, result.stdout
+        assert final_lines[-1] == f"FINAL_HOME={hermes_root}", result.stdout
 

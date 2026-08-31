@@ -14783,4 +14783,19 @@ def main():
 
 
 if __name__ == "__main__":
+    # ``python -m hermes_cli.main`` (runpy) executes this module as
+    # ``__main__`` WITHOUT registering it under its canonical name in
+    # sys.modules. The first lazy ``from hermes_cli.main import ...`` in the
+    # process (gateway/code_skew.py's boot fingerprint is the first such
+    # import in a gateway process) would then re-execute the entire module —
+    # running _apply_profile_override() a second time against the
+    # already-stripped argv. With a sticky active_profile present, that
+    # re-resolves HERMES_HOME to the named profile and silently re-scopes a
+    # ``-p default`` gateway (the systemd unit's ExecStart) to that profile,
+    # losing the multiplexer's port-binding platforms (api_server 8642) after
+    # every in-process restart. Register the canonical alias so lazy imports
+    # resolve to this already-executed module instead of re-running it.
+    import sys as _sys
+
+    _sys.modules.setdefault("hermes_cli.main", _sys.modules["__main__"])
     main()
