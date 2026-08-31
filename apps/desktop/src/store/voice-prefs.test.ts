@@ -1,11 +1,52 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-vi.mock('@/hermes', () => ({
-  getHermesConfigRecord: vi.fn(async () => ({})),
-  saveHermesConfig: vi.fn(async () => undefined)
-}))
+import {
+  $autoSpeakReplies,
+  $voiceStopPhrase,
+  applyAutoSpeakFromConfig,
+  applyVoiceStopPhraseFromConfig,
+  setAutoSpeakReplies
+} from './voice-prefs'
 
-import { $voiceStopPhrase, applyVoiceStopPhraseFromConfig } from './voice-prefs'
+describe('desktop-local auto-speak preference', () => {
+  beforeEach(() => {
+    window.localStorage.clear()
+    $autoSpeakReplies.set(false)
+  })
+
+  it('migrates from the legacy shared voice.auto_tts value on first run', () => {
+    applyAutoSpeakFromConfig({ voice: { auto_tts: true } })
+
+    expect($autoSpeakReplies.get()).toBe(true)
+    expect(window.localStorage.getItem('hermes.desktop.autoSpeakReplies')).toBeNull()
+  })
+
+  it('keeps the stored local preference over a later config refresh', () => {
+    window.localStorage.setItem('hermes.desktop.autoSpeakReplies', 'false')
+
+    applyAutoSpeakFromConfig({ voice: { auto_tts: true } })
+
+    expect($autoSpeakReplies.get()).toBe(false)
+  })
+
+  it('toggling persists locally without touching the shared config', async () => {
+    await setAutoSpeakReplies(true)
+
+    expect($autoSpeakReplies.get()).toBe(true)
+    expect(window.localStorage.getItem('hermes.desktop.autoSpeakReplies')).toBe('true')
+  })
+
+  it('a failed local write reverts the atom', async () => {
+    const failing = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('quota exceeded', 'QuotaExceededError')
+    })
+
+    await expect(setAutoSpeakReplies(true)).rejects.toThrow()
+    expect($autoSpeakReplies.get()).toBe(false)
+
+    failing.mockRestore()
+  })
+})
 
 describe('applyVoiceStopPhraseFromConfig', () => {
   it('defaults to "stop" when the key is absent (backend default applies)', () => {
