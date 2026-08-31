@@ -531,7 +531,7 @@ def test_posix_publication_remains_bound_after_ancestor_swap(tmp_path, monkeypat
     try:
         auth._save_auth_store(store, primary)
         assert swapped is True
-        assert json.loads((moved_parent / "auth.json").read_text())["providers"] == {
+        assert json.loads((moved_parent / "auth.json").read_text(encoding="utf-8"))["providers"] == {
             "original": {"changed": True}
         }
         assert (attacker_parent / "auth.json").read_bytes() == b"attacker-owned"
