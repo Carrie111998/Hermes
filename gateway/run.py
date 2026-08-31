@@ -25906,6 +25906,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "3. Restore from a backup in ~/.hermes/backups/\n"
                 "Run `hermes doctor` for sanitized diagnostics."
             )
+        elif cause == "fts_index":
+            message = (
+                "⚠️ Session database full-text index degraded — messages are "
+                "still persisted and safe. Search temporarily uses LIKE until "
+                "a later restart rebuilds the indexes. No recovery action is "
+                "needed. Run `hermes doctor` if this persists."
+            )
         else:
             message = (
                 f"⚠️ Session database unavailable — messages may not be persisted. "

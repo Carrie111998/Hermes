@@ -1855,6 +1855,7 @@ PERSISTENCE_ERROR_CAUSES = (
     "compression_closed",
     "turn_lease",
     "corrupt",
+    "fts_index",
     "disk",
     "unknown",
 )
@@ -1872,6 +1873,18 @@ _DB_CORRUPTION_MARKERS = (
     "file is not a database", # SQLITE_NOTADB (also connection-level poisoning)
     "not a database",
     "database corruption",
+)
+
+# Markers that prove an error is confined to the FTS5 shadow tables.
+# When a corruption marker appears TOGETHER with one of these, the damage
+# is FTS-index-only (e.g. "fts5: corruption found reading blob ... from
+# table \"messages_fts\"" or "database disk image is malformed" while
+# querying messages_fts*).  classify_persistence_error returns "fts_index"
+# for this class so callers degrade to LIKE instead of fail-closing the
+# turn with destructive .recover advice (#97794).
+_FTS_INDEX_MARKERS = (
+    "messages_fts",
+    "fts5",
 )
 
 
@@ -1900,6 +1913,12 @@ def classify_persistence_error(exc_or_str) -> str:
       (``database disk image is malformed`` / SQLITE_NOTADB).  Distinct from
       ``"disk"``: freeing space cannot help, the user needs the repair path
       (``hermes doctor`` / automatic schema surgery).
+    * ``"fts_index"`` — FTS5 shadow-table / index corruption only
+      (``fts5: corruption found ... messages_fts`` or a malformed/notadb
+      error whose message or SQL mentions ``messages_fts*`` / ``fts5``);
+      the canonical ``messages`` / ``sessions`` tables are still healthy,
+      search temporarily degrades to LIKE until a later SessionDB open
+      rebuilds the indexes (#97794).
     * ``"disk"``    — disk full / read-only / permission-shaped failures
       (delegates the disk-full patterns to :func:`is_disk_full_error` so the
       two classifiers can never drift apart — e.g. ENOSPC).
@@ -1925,6 +1944,18 @@ def classify_persistence_error(exc_or_str) -> str:
         return "compression_closed"
     if "being compressed" in text or "compression lease" in text:
         return "compression"
+    # FTS-index-only corruption (issue #97794): when a corruption marker
+    # appears together with an FTS hint (messages_fts / fts5), the damage is
+    # confined to the derived index, not the canonical tables.  Return
+    # "fts_index" so callers degrade search to LIKE and avoid the
+    # destructive .recover guidance that requires canonical B-tree damage.
+    # Also catch "fts5: corruption ..." which may not contain the generic
+    # malformed/notadb markers but still means FTS-only.
+    if any(marker in text for marker in _DB_CORRUPTION_MARKERS):
+        if any(fts in text for fts in _FTS_INDEX_MARKERS):
+            return "fts_index"
+    if any(fts in text for fts in _FTS_INDEX_MARKERS) and "corrupt" in text:
+        return "fts_index"
     # Structural corruption BEFORE the lock and disk buckets: "database disk
     # image is malformed" contains "disk" (and some wrapped corruption
     # strings mention "locked" recovery attempts), so later buckets would

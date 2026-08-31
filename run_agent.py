@@ -4055,6 +4055,15 @@ class AIAgent:
                     "3. Restore from a backup in ~/.hermes/backups/\n"
                     "Then send your message again."
                 )
+            if cause == "fts_index":
+                return (
+                    prefix
+                    + "the full-text search index reported an error, but the "
+                    "transcript itself is intact. Search temporarily uses LIKE "
+                    "until a later SessionDB open rebuilds the indexes — no "
+                    "recovery action is needed. Please send your message again "
+                    "in a moment."
+                )
             if cause == "disk":
                 return (
                     prefix
