@@ -42,21 +42,20 @@
  * separate credential file would break the test while being *more* correct.
  * The load-bearing assertion is the raw-bytes absence of the secret.
  *
- * Four at-rest paths, hence four tests — three enforced, one a documented gap:
+ * Five enforced at-rest paths:
  *
  *   1. A NEWLY configured token (ACTIVE). The app's own write path routes
  *      through the strict `encryptDesktopSecret`; this test holds it there
  *      against regression, and pins the mode of the file it actually wrote.
  *   2. An EXISTING `connection.json` at the old 0644 (ACTIVE). Covers the
- *      read-side tighten, and ONLY the mode — its token is already ciphertext,
- *      which is what keeps it independent of the migration test 4 defers.
+ *      read-side tighten, and ONLY the mode — its token is already ciphertext.
  *   3. A CORRUPT `connection.json` at 0644 (ACTIVE). The tighten must not be
- *      gated on the parse succeeding: a truncated file still holds the token
- *      bytes, and the parse failure is swallowed, so nothing would ever come
- *      back for it.
- *   4. An EXISTING plaintext `connection.json` (`test.fixme`). Legacy payloads
- *      are deliberately NOT migrated yet. The test is kept, disabled, with a
- *      precise reason — see the block comment above it.
+ *      gated on the parse succeeding: a truncated file still holds token
+ *      bytes, and parse failure is swallowed.
+ *   4. A malformed policy object (ACTIVE). Hand-edited policy values must not
+ *      downgrade the real write path to plaintext.
+ *   5. An EXISTING plaintext `connection.json` (ACTIVE). A no-marker legacy
+ *      payload is migrated through the startup transition and remains usable.
  *
  * ── Correcting the record on test 4 ─────────────────────────────────────
  *
@@ -131,6 +130,7 @@ import { allowErrorBanners, type ElectronApplication, expect, type Page, test } 
  * covers the URL-encoded form the WS dialer builds (`?token=…`).
  */
 const SENTINEL_TOKEN = 'hermes-e2e-at-rest-sentinel-Zq7Z4hV9nX2pL8sK3tB6wR1yM5jD0fG'
+const SENTINEL_HEADER = 'hermes-e2e-at-rest-header-Qw8E4rT6yU2iO9pL5kJ1hG7fD3sA0zX'
 
 /** Skip absurdly large files during the leak scan (Chromium caches). */
 const MAX_SCAN_BYTES = 16 * 1024 * 1024
@@ -152,6 +152,8 @@ interface FakeGateway {
   url: string
   /** Every `X-Hermes-Session-Token` value the app has sent us. */
   sessionTokens: string[]
+  /** Every synthetic secret header value the app has sent us. */
+  accessHeaderValues: string[]
   close: () => Promise<void>
 }
 
@@ -167,12 +169,18 @@ interface FakeGateway {
  */
 async function startFakeGateway(): Promise<FakeGateway> {
   const sessionTokens: string[] = []
+  const accessHeaderValues: string[] = []
 
   const server = http.createServer((req, res) => {
     const token = req.headers['x-hermes-session-token']
+    const accessHeader = req.headers['x-e2e-access-secret']
 
     if (typeof token === 'string' && token) {
       sessionTokens.push(token)
+    }
+
+    if (typeof accessHeader === 'string' && accessHeader) {
+      accessHeaderValues.push(accessHeader)
     }
 
     if (req.url?.startsWith('/api/status')) {
@@ -190,12 +198,17 @@ async function startFakeGateway(): Promise<FakeGateway> {
   // fast failure rather than hang. The status header is already captured.
   server.on('upgrade', (req, socket) => {
     const token = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams.get('token')
+    const accessHeader = req.headers['x-e2e-access-secret']
 
     if (token) {
       sessionTokens.push(token)
     }
 
-    socket.destroy()
+    if (typeof accessHeader === 'string' && accessHeader) {
+      accessHeaderValues.push(accessHeader)
+    }
+
+    socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n')
   })
 
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -209,7 +222,8 @@ async function startFakeGateway(): Promise<FakeGateway> {
         server.close(() => resolve())
       }),
     sessionTokens,
-    url: `http://127.0.0.1:${port}`,
+    accessHeaderValues,
+    url: `http://127.0.0.1:${port}`
   }
 }
 
@@ -229,11 +243,11 @@ interface Needle {
  * not encryption, so a token that is merely base64'd is still plaintext at
  * rest. A real ciphertext will contain neither needle.
  */
-function secretNeedles(secret: string): Needle[] {
-  return [
+function secretNeedles(...secrets: string[]): Needle[] {
+  return secrets.flatMap(secret => [
     { bytes: Buffer.from(secret, 'utf8'), label: 'plaintext' },
-    { bytes: Buffer.from(Buffer.from(secret, 'utf8').toString('base64'), 'utf8'), label: 'base64' },
-  ]
+    { bytes: Buffer.from(Buffer.from(secret, 'utf8').toString('base64'), 'utf8'), label: 'base64' }
+  ])
 }
 
 /** Relative paths of every file under `root` whose bytes contain a needle. */
@@ -371,7 +385,7 @@ function expectOwnerOnlyMode(filePath: string, why: string): void {
 async function launchAgainst(sandbox: Sandbox): Promise<{ app: ElectronApplication; page: Page }> {
   const env = buildAppEnv(sandbox, {
     HERMES_DESKTOP_APP_NAME: STABLE_APP_NAME,
-    HERMES_DESKTOP_BOOT_FAKE_ERROR: 'E2E at-rest storage spec: local backend intentionally not started',
+    HERMES_DESKTOP_BOOT_FAKE_ERROR: 'E2E at-rest storage spec: local backend intentionally not started'
   })
 
   const { app, page } = await launchDesktop(env)
@@ -379,9 +393,10 @@ async function launchAgainst(sandbox: Sandbox): Promise<{ app: ElectronApplicati
   // The capability bridge is what we drive; it lands with the preload, well
   // before the app would be "ready" in the boot sense.
   await page.waitForFunction(
-    () => Boolean((window as unknown as { hermesDesktop?: Record<string, unknown> }).hermesDesktop?.saveConnectionConfig),
+    () =>
+      Boolean((window as unknown as { hermesDesktop?: Record<string, unknown> }).hermesDesktop?.saveConnectionConfig),
     undefined,
-    { timeout: 60_000 },
+    { timeout: 60_000 }
   )
 
   return { app, page }
@@ -458,7 +473,7 @@ async function saveRemoteToken(page: Page, remoteUrl: string, remoteToken?: stri
           mode: 'remote',
           remoteAuthMode: 'token',
           ...(token ? { remoteToken: token } : {}),
-          remoteUrl: url,
+          remoteUrl: url
         })
 
         return { config, error: null }
@@ -466,8 +481,57 @@ async function saveRemoteToken(page: Page, remoteUrl: string, remoteToken?: stri
         return { config: null, error: error instanceof Error ? error.message : String(error) }
       }
     },
-    [remoteUrl, remoteToken ?? ''] as const,
+    [remoteUrl, remoteToken ?? ''] as const
   )
+}
+
+interface RegistrySaveOutcome {
+  connectionId: null | string
+  error: null | string
+}
+
+/** Drive the v2 registry path, which composes token and extra-header secrets. */
+async function saveRegistrySecrets(
+  page: Page,
+  remoteUrl: string,
+  token: string,
+  header: unknown
+): Promise<RegistrySaveOutcome> {
+  return page.evaluate(
+    async ([url, tokenValue, headerValue]) => {
+      const desktop = (window as unknown as { hermesDesktop: any }).hermesDesktop
+
+      try {
+        const result = await desktop.connections.save({
+          kind: 'remote',
+          label: 'E2E at-rest composed',
+          url,
+          authMode: 'token',
+          token: tokenValue,
+          headers: { 'X-E2E-Access-Secret': headerValue }
+        })
+
+        return { connectionId: result.connection?.id ?? null, error: null }
+      } catch (error) {
+        return { connectionId: null, error: error instanceof Error ? error.message : String(error) }
+      }
+    },
+    [remoteUrl, token, header] as const
+  )
+}
+
+/** Exercise the v2 registry connection's real status + websocket probe. */
+async function exerciseRegistryConnection(page: Page, connectionId: string): Promise<void> {
+  await page.evaluate(async id => {
+    const desktop = (window as unknown as { hermesDesktop: any }).hermesDesktop
+
+    try {
+      await desktop.connections.test(id)
+    } catch {
+      // The fake gateway intentionally refuses the websocket upgrade; the
+      // gateway header captures below are the behavioral witness.
+    }
+  }, connectionId)
 }
 
 /**
@@ -527,13 +591,13 @@ test.describe('remote gateway session token at rest', () => {
     const fake = gateway!
     sandbox = createSandbox('at-rest-fresh')
 
-    // Keychain-backed encryption is opt-in (default OFF — see
-    // electron/secret-storage-policy.ts). This test covers the opted-IN
+    // Keychain-backed encryption is the default (see
+    // electron/secret-storage-policy.ts). This test covers the explicit ON
     // posture, so seed the policy the way the Settings toggle writes it.
     fs.writeFileSync(
       path.join(sandbox.userDataDir, 'secure-token-storage.json'),
       JSON.stringify({ migrated: true, on: true }),
-      'utf8',
+      'utf8'
     )
 
     const first = await launchAgainst(sandbox)
@@ -545,7 +609,7 @@ test.describe('remote gateway session token at rest', () => {
 
     test.info().annotations.push({
       description: `isEncryptionAvailable=${capability.available} backend=${capability.backend}`,
-      type: 'safeStorage',
+      type: 'safeStorage'
     })
 
     const saved = await saveRemoteToken(first.page, fake.url, SENTINEL_TOKEN)
@@ -559,13 +623,13 @@ test.describe('remote gateway session token at rest', () => {
     if (capability.available) {
       expect(
         saved.error,
-        'secure storage is available on this host, so saving a remote gateway token must succeed',
+        'secure storage is available on this host, so saving a remote gateway token must succeed'
       ).toBeNull()
       expect(saved.config?.remoteTokenSet).toBe(true)
     } else {
       expect(
         saved.error,
-        'secure storage is unavailable, so the save must fail loudly rather than persist a plaintext token',
+        'secure storage is unavailable, so the save must fail loudly rather than persist a plaintext token'
       ).not.toBeNull()
     }
 
@@ -580,7 +644,7 @@ test.describe('remote gateway session token at rest', () => {
       expect(fs.existsSync(connectionFile), `expected the app to write ${connectionFile}`).toBe(true)
       expect(
         rawConnection.includes(Buffer.from(fake.url, 'utf8')),
-        'connection.json should record the configured gateway URL (proves this is the real artifact)',
+        'connection.json should record the configured gateway URL (proves this is the real artifact)'
       ).toBe(true)
 
       // The write path's OTHER half of at-rest: opaque bytes AND owner-only
@@ -591,7 +655,7 @@ test.describe('remote gateway session token at rest', () => {
       // instead of the 0644 umask default.
       expectOwnerOnlyMode(
         connectionFile,
-        'connection.json is group/other-accessible, so the encrypted token blob, gateway URL and SSH fields are readable by other local accounts',
+        'connection.json is group/other-accessible, so the encrypted token blob, gateway URL and SSH fields are readable by other local accounts'
       )
     }
 
@@ -602,18 +666,15 @@ test.describe('remote gateway session token at rest', () => {
     expect(
       connectionHits,
       `the gateway session token must not be recoverable from ${connectionFile} ` +
-        `(stored token encoding is "${storedTokenEncoding(connectionFile)}")`,
+        `(stored token encoding is "${storedTokenEncoding(connectionFile)}")`
     ).toEqual([])
 
     // …and not in any sibling file the app writes alongside it, nor in
     // HERMES_HOME (desktop.log lives there).
-    expect(
-      scanTreeForSecret(userDataDir, needles),
-      'the gateway session token leaked into a userData file',
-    ).toEqual([])
+    expect(scanTreeForSecret(userDataDir, needles), 'the gateway session token leaked into a userData file').toEqual([])
     expect(
       scanTreeForSecret(sandbox.hermesHome, needles),
-      'the gateway session token leaked into a HERMES_HOME file (logs included)',
+      'the gateway session token leaked into a HERMES_HOME file (logs included)'
     ).toEqual([])
 
     if (!capability.available) {
@@ -633,7 +694,7 @@ test.describe('remote gateway session token at rest', () => {
 
     expect(
       await resolveUserDataDir(app),
-      'the restarted app must resolve the same userData dir, or this is not a round trip',
+      'the restarted app must resolve the same userData dir, or this is not a round trip'
     ).toBe(userDataDir)
 
     const reread = await second.page.evaluate(async () => {
@@ -653,44 +714,48 @@ test.describe('remote gateway session token at rest', () => {
     // token cannot produce this.
     expect(
       fake.sessionTokens.slice(before),
-      'the app must send the exact stored token to the gateway after a restart',
+      'the app must send the exact stored token to the gateway after a restart'
     ).toContain(SENTINEL_TOKEN)
   })
 
   /**
-   * The DEFAULT posture: keychain encryption opted out (no policy file at
-   * all). Saving a token must (a) succeed without ever touching safeStorage
-   * — this is the whole point of the opt-in: no macOS Keychain dialog on
-   * machines with a broken login keychain — (b) store the token with a
-   * non-safeStorage encoding at 0600, and (c) round-trip it across a
-   * restart. The plaintext-on-disk trade-off is the user's chosen (default)
-   * mode; owner-only file bits remain the at-rest boundary.
+   * The DEFAULT posture: no policy file means keychain encryption is ON.
+   * Saving a token must succeed when safeStorage is available and must refuse
+   * loudly when it is not; neither outcome may write plaintext. When secure
+   * storage is available, the token must also round-trip across a restart.
    */
-  test('with the default policy (no keychain), a token saves without secure storage, is owner-only on disk, and survives a restart', async () => {
+  test('with no policy file, a token uses the secure default and survives a restart when available', async () => {
     const fake = gateway!
     sandbox = createSandbox('at-rest-default')
 
     const first = await launchAgainst(sandbox)
     app = first.app
 
+    const capability = await readSafeStorageCapability(app)
     const userDataDir = await resolveUserDataDir(app)
     const connectionFile = path.join(userDataDir, 'connection.json')
-
-    // Must succeed regardless of host keyring state — the default policy
-    // never consults safeStorage, so "no keyring" cannot refuse the save.
     const saved = await saveRemoteToken(first.page, fake.url, SENTINEL_TOKEN)
 
-    expect(saved.error, 'the default (opted-out) policy must save without secure storage').toBeNull()
-    expect(saved.config?.remoteTokenSet).toBe(true)
+    if (capability.available) {
+      expect(saved.error, 'the secure default must save when safeStorage is available').toBeNull()
+      expect(saved.config?.remoteTokenSet).toBe(true)
+      expect(fs.existsSync(connectionFile), 'the successful save must create connection.json').toBe(true)
+      expect(storedTokenEncoding(connectionFile)).toBe('safeStorage')
+      expectOwnerOnlyMode(connectionFile, 'the secure-default connection.json must be owner-only')
+    } else {
+      expect(saved.error, 'the secure default must refuse without safeStorage').not.toBeNull()
+    }
 
-    // Not a safeStorage blob, and owner-only on disk.
-    expect(storedTokenEncoding(connectionFile)).not.toBe('safeStorage')
-    expectOwnerOnlyMode(
-      connectionFile,
-      'connection.json is group/other-accessible; owner-only bits are the at-rest boundary for opted-out storage',
+    const needles = secretNeedles(SENTINEL_TOKEN)
+    expect(scanTreeForSecret(userDataDir, needles), 'default storage leaked a token').toEqual([])
+    expect(scanTreeForSecret(sandbox.hermesHome, needles), 'default storage leaked a token into HERMES_HOME').toEqual(
+      []
     )
 
-    // Round trip across a restart, same witness as the opted-in test.
+    if (!capability.available) {
+      return
+    }
+
     await app.close().catch(() => undefined)
     app = null
 
@@ -705,13 +770,183 @@ test.describe('remote gateway session token at rest', () => {
 
     expect(reread.remoteTokenSet, 'the stored token must survive a restart').toBe(true)
 
-    const before = fake.sessionTokens.length
+    const beforeToken = fake.sessionTokens.length
     await exerciseStoredToken(second.page, fake.url)
 
+    expect(fake.sessionTokens.slice(beforeToken), 'the restarted app must send the exact token').toContain(
+      SENTINEL_TOKEN
+    )
+  })
+
+  /**
+   * A hand-edited policy object is not an opt-out. Invalid field types,
+   * missing fields, and unknown fields must take the same secure default as an
+   * absent policy, including on the real Electron write path.
+   */
+  test('a malformed policy object cannot downgrade composed token and header storage to plaintext', async () => {
+    const fake = gateway!
+    sandbox = createSandbox('at-rest-malformed-policy')
+
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, 'secure-token-storage.json'),
+      JSON.stringify({ on: 'false', migrated: true }),
+      'utf8'
+    )
+
+    const first = await launchAgainst(sandbox)
+    app = first.app
+
+    const capability = await readSafeStorageCapability(app)
+    const userDataDir = await resolveUserDataDir(app)
+    const registryFile = path.join(userDataDir, 'connections.json')
+    const saved = await saveRegistrySecrets(first.page, fake.url, SENTINEL_TOKEN, SENTINEL_HEADER)
+
+    if (capability.available) {
+      expect(saved.error, 'malformed policy must resolve to secure storage').toBeNull()
+      expect(fs.existsSync(registryFile), 'the successful registry save must create connections.json').toBe(true)
+      const registry = JSON.parse(readIfExists(registryFile).toString('utf8'))
+      const composed = registry.connections.find((entry: { label?: string }) => entry.label === 'E2E at-rest composed')
+      expect(composed?.token?.encoding).toBe('safeStorage')
+      expectOwnerOnlyMode(registryFile, 'the composed connections.json must be owner-only')
+      expect(saved.connectionId).not.toBeNull()
+      const beforeToken = fake.sessionTokens.length
+      const beforeHeader = fake.accessHeaderValues.length
+      await exerciseRegistryConnection(first.page, saved.connectionId!)
+      expect(fake.sessionTokens.slice(beforeToken), 'the composed registry path must send the stored token').toContain(
+        SENTINEL_TOKEN
+      )
+      expect(
+        fake.accessHeaderValues.slice(beforeHeader),
+        'the composed registry path must send the stored header'
+      ).toContain(SENTINEL_HEADER)
+    } else {
+      expect(saved.error, 'malformed policy must refuse without secure storage').not.toBeNull()
+    }
+
+    const needles = secretNeedles(SENTINEL_TOKEN, SENTINEL_HEADER)
+    expect(scanTreeForSecret(userDataDir, needles), 'malformed policy leaked a token or header').toEqual([])
     expect(
-      fake.sessionTokens.slice(before),
-      'the app must send the exact stored token to the gateway after a restart',
-    ).toContain(SENTINEL_TOKEN)
+      scanTreeForSecret(sandbox.hermesHome, needles),
+      'malformed policy leaked a token or header into HERMES_HOME'
+    ).toEqual([])
+  })
+
+  test('duplicate policy members cannot downgrade composed token and header storage', async () => {
+    const fake = gateway!
+    sandbox = createSandbox('at-rest-duplicate-policy')
+
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, 'secure-token-storage.json'),
+      '{"on":true,"on":false,"migrated":false,"migrated":true}',
+      'utf8'
+    )
+
+    const first = await launchAgainst(sandbox)
+    app = first.app
+
+    const capability = await readSafeStorageCapability(first.app)
+    const userDataDir = await resolveUserDataDir(first.app)
+    const registryFile = path.join(userDataDir, 'connections.json')
+    const saved = await saveRegistrySecrets(first.page, fake.url, SENTINEL_TOKEN, SENTINEL_HEADER)
+
+    if (capability.available) {
+      expect(saved.error, 'duplicate policy members must resolve to secure storage').toBeNull()
+      expect(saved.connectionId).not.toBeNull()
+      const registry = JSON.parse(readIfExists(registryFile).toString('utf8'))
+      const composed = registry.connections.find((entry: { label?: string }) => entry.label === 'E2E at-rest composed')
+      expect(composed?.token?.encoding).toBe('safeStorage')
+      expect(composed?.headers?.['X-E2E-Access-Secret']?.encoding).toBe('safeStorage')
+      expectOwnerOnlyMode(registryFile, 'the duplicate-policy connections.json must be owner-only')
+
+      const beforeToken = fake.sessionTokens.length
+      const beforeHeader = fake.accessHeaderValues.length
+      await exerciseRegistryConnection(first.page, saved.connectionId!)
+      expect(fake.sessionTokens.slice(beforeToken), 'duplicate policy must preserve the stored token').toContain(
+        SENTINEL_TOKEN
+      )
+      expect(fake.accessHeaderValues.slice(beforeHeader), 'duplicate policy must preserve the stored header').toContain(
+        SENTINEL_HEADER
+      )
+    } else {
+      expect(saved.error, 'duplicate policy members must refuse without secure storage').not.toBeNull()
+    }
+
+    const needles = secretNeedles(SENTINEL_TOKEN, SENTINEL_HEADER)
+    expect(scanTreeForSecret(userDataDir, needles), 'duplicate policy leaked a token or header').toEqual([])
+    expect(scanTreeForSecret(sandbox.hermesHome, needles), 'duplicate policy leaked into HERMES_HOME').toEqual([])
+  })
+
+  test('renderer-supplied plaintext header envelopes cannot bypass secure persistence', async () => {
+    const fake = gateway!
+    sandbox = createSandbox('at-rest-header-envelope')
+
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, 'secure-token-storage.json'),
+      JSON.stringify({ on: true, migrated: true }),
+      'utf8'
+    )
+
+    const first = await launchAgainst(sandbox)
+    app = first.app
+
+    const userDataDir = await resolveUserDataDir(first.app)
+    const registryFile = path.join(userDataDir, 'connections.json')
+    const saved = await saveRegistrySecrets(first.page, fake.url, SENTINEL_TOKEN, {
+      encoding: 'plain',
+      value: SENTINEL_HEADER
+    })
+
+    expect(saved.error, 'a renderer-supplied header envelope must be rejected').not.toBeNull()
+    expect(saved.connectionId).toBeNull()
+    const needles = secretNeedles(SENTINEL_TOKEN, SENTINEL_HEADER)
+    expect(scanTreeForSecret(userDataDir, needles)).toEqual([])
+    expect(scanTreeForSecret(sandbox.hermesHome, needles)).toEqual([])
+
+    if (fs.existsSync(registryFile)) {
+      const registry = JSON.parse(readIfExists(registryFile).toString('utf8'))
+      expect(registry.connections.some((entry: { label?: string }) => entry.label === 'E2E at-rest composed')).toBe(
+        false
+      )
+    }
+  })
+
+  /**
+   * Plaintext remains available only through a fully valid, persisted opt-out
+   * policy. This explicitly preserves the migration/compatibility boundary.
+   */
+  test('a fully valid persisted opt-out keeps plaintext storage explicit and functional', async () => {
+    const fake = gateway!
+    sandbox = createSandbox('at-rest-explicit-opt-out')
+
+    fs.writeFileSync(
+      path.join(sandbox.userDataDir, 'secure-token-storage.json'),
+      JSON.stringify({ on: false, migrated: true }),
+      'utf8'
+    )
+
+    const first = await launchAgainst(sandbox)
+    app = first.app
+
+    const userDataDir = await resolveUserDataDir(app)
+    const connectionFile = path.join(userDataDir, 'connection.json')
+    const saved = await saveRemoteToken(first.page, fake.url, SENTINEL_TOKEN)
+
+    expect(saved.error).toBeNull()
+    expect(saved.config?.remoteTokenSet).toBe(true)
+    expect(storedTokenEncoding(connectionFile)).toBe('plain')
+    expectOwnerOnlyMode(connectionFile, 'explicit opt-out connection.json must be owner-only')
+
+    await app.close().catch(() => undefined)
+    app = null
+
+    const second = await launchAgainst(sandbox)
+    app = second.app
+    const beforeToken = fake.sessionTokens.length
+    await exerciseStoredToken(second.page, fake.url)
+
+    expect(fake.sessionTokens.slice(beforeToken), 'explicit opt-out must preserve token compatibility').toContain(
+      SENTINEL_TOKEN
+    )
   })
 
   /**
@@ -744,7 +979,7 @@ test.describe('remote gateway session token at rest', () => {
 
     test.info().annotations.push({
       description: `isEncryptionAvailable=${capability.available} backend=${capability.backend}`,
-      type: 'safeStorage',
+      type: 'safeStorage'
     })
 
     if (!capability.available) {
@@ -786,7 +1021,7 @@ test.describe('remote gateway session token at rest', () => {
 
     expectOwnerOnlyMode(
       connectionFile,
-      'a pre-existing world-readable connection.json was not tightened when the app read it',
+      'a pre-existing world-readable connection.json was not tightened when the app read it'
     )
 
     // The tighten must be a chmod, not a rewrite. It sits INSIDE the function
@@ -795,7 +1030,7 @@ test.describe('remote gateway session token at rest', () => {
     // ctime only, which is what makes the placement safe — this pins it.
     expect(
       Math.abs(fs.statSync(connectionFile).mtimeMs - seededMtimeMs),
-      'tightening must not rewrite the file: mtime is the config cache key, so moving it would invalidate the cache the tighten sits inside',
+      'tightening must not rewrite the file: mtime is the config cache key, so moving it would invalidate the cache the tighten sits inside'
     ).toBeLessThan(1)
 
     // And tightening must not have cost the user their credential — the whole
@@ -833,7 +1068,7 @@ test.describe('remote gateway session token at rest', () => {
     fs.writeFileSync(
       connectionFile,
       `{"mode":"remote","remote":{"authMode":"token","token":{"encoding":"plain","value":"${SENTINEL_TOKEN}`,
-      { encoding: 'utf8', mode: 0o644 },
+      { encoding: 'utf8', mode: 0o644 }
     )
     fs.chmodSync(connectionFile, 0o644)
     expect(fs.statSync(connectionFile).mode & 0o077, 'the fixture must start group/other-accessible').not.toBe(0)
@@ -851,56 +1086,28 @@ test.describe('remote gateway session token at rest', () => {
 
     expect(
       reread.mode,
-      'the fixture must be unparseable, so the app falls back to local — otherwise this test proves nothing about ordering',
+      'the fixture must be unparseable, so the app falls back to local — otherwise this test proves nothing about ordering'
     ).toBe('local')
 
     expectOwnerOnlyMode(
       connectionFile,
-      'a corrupt world-readable connection.json still holding token bytes was left group/other-accessible',
+      'a corrupt world-readable connection.json still holding token bytes was left group/other-accessible'
     )
 
     // Same cache invariant as above: chmod, not rewrite.
     expect(
       Math.abs(fs.statSync(connectionFile).mtimeMs - seededMtimeMs),
-      'tightening must not rewrite the file: mtime is the config cache key',
+      'tightening must not rewrite the file: mtime is the config cache key'
     ).toBeLessThan(1)
   })
 
   /**
-   * DEFERRED GAP — legacy plaintext payloads are not migrated.
-   *
-   * Held as `fixme` rather than deleted: the fixture below is the correct
-   * fixture for the population that a migration must eventually cover, and
-   * the harness (seed → boot-poll → authoritative re-save → raw-bytes scan →
-   * wire check) is the harness such a migration needs. Keeping it typechecked
-   * and listed makes the gap visible in `--list` and in every report; deleting
-   * it would make the gap invisible and cost the next implementer this setup.
-   *
-   * It is NOT enabled because the migration it asserted was reviewed
-   * DO NOT SHIP. Before this can be un-fixme'd, three prerequisites (see the
-   * header, and the matching note in electron/main.ts readDesktopConnectionConfig):
-   *
-   *   1. Sequence with #62319's opt-in plaintext marker, so a user who
-   *      deliberately chose plaintext is not silently overridden. This
-   *      fixture has NO marker, so it stays in scope for migration — but the
-   *      implementation must be able to tell the two apart.
-   *   2. Write through the config sanitizer, not around it.
-   *   3. Surface ROTATION guidance. Re-encrypting cannot un-expose a secret
-   *      that is already in a backup; it only prevents future exposure.
-   *
-   * Un-fixme'ing this without (1) risks destroying a deliberate user choice,
-   * and without (3) it reports a remediation it did not actually perform.
+   * A no-marker legacy plaintext file is migrated by the startup transition.
+   * The explicit opt-out state is `{ on: false, migrated: true }`, so this
+   * fixture remains an unambiguous migration contract and checks the real
+   * connection.json write path plus restart usability.
    */
   test('an existing plaintext connection.json is migrated off plaintext and keeps working', async () => {
-    test.fixme(
-      true,
-      'Deferred: legacy plaintext connection.json is intentionally NOT migrated. ' +
-        'Affected population is pre-release bb/gui installs (incl. the desktop-pr20059-installers build) ' +
-        'plus hand-edited configs — mainline never wrote a plaintext gateway token. ' +
-        'Blocked on: (1) #62319 opt-in-marker coordination, (2) writing through the config sanitizer, ' +
-        '(3) surfacing token-rotation guidance. Re-encrypting alone does not remediate an already-backed-up secret.',
-    )
-
     const fake = gateway!
     sandbox = createSandbox('at-rest-migrate')
 
@@ -922,13 +1129,13 @@ test.describe('remote gateway session token at rest', () => {
           remote: {
             authMode: 'token',
             token: { encoding: 'plain', value: SENTINEL_TOKEN },
-            url: fake.url,
-          },
+            url: fake.url
+          }
         },
         null,
-        2,
+        2
       ),
-      'utf8',
+      'utf8'
     )
 
     const launched = await launchAgainst(sandbox)
@@ -938,7 +1145,7 @@ test.describe('remote gateway session token at rest', () => {
 
     test.info().annotations.push({
       description: `isEncryptionAvailable=${capability.available} backend=${capability.backend}`,
-      type: 'safeStorage',
+      type: 'safeStorage'
     })
 
     if (!capability.available) {
@@ -947,7 +1154,7 @@ test.describe('remote gateway session token at rest', () => {
       // Asserting either outcome here would be inventing policy.
       test.skip(
         true,
-        'secure storage unavailable on this host — the correct migration policy for an existing plaintext file is undecided',
+        'secure storage unavailable on this host — the correct migration policy for an existing plaintext file is undecided'
       )
 
       return
@@ -984,16 +1191,15 @@ test.describe('remote gateway session token at rest', () => {
     expect(
       scanTreeForSecret(userDataDir, needles),
       'an existing plaintext gateway token must not remain readable under userData after the app has run ' +
-        `(stored token encoding is still "${storedTokenEncoding(connectionFile)}")`,
+        `(stored token encoding is still "${storedTokenEncoding(connectionFile)}")`
     ).toEqual([])
 
     // And the migration must not have cost the user their credential.
     const before = fake.sessionTokens.length
     await exerciseStoredToken(launched.page, fake.url)
 
-    expect(
-      fake.sessionTokens.slice(before),
-      'the migrated token must still reach the gateway unchanged',
-    ).toContain(SENTINEL_TOKEN)
+    expect(fake.sessionTokens.slice(before), 'the migrated token must still reach the gateway unchanged').toContain(
+      SENTINEL_TOKEN
+    )
   })
 })

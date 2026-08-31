@@ -919,7 +919,10 @@ test('resolveDirectoryForIpc accepts directory symlinks or junctions', async () 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 function readMain() {
-  return fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8').replace(/\r\n/g, '\n')
+  return ['main.ts', 'secret-storage-oauth.ts', 'secret-storage-connections.ts', 'secret-storage-ssh.ts']
+    .map((name) => fs.readFileSync(path.join(__dirname, name), 'utf8'))
+    .join('\n')
+    .replace(/\r\n/g, '\n')
 }
 
 test('registry JSON helpers retain native OAuth bearer authentication', () => {
@@ -963,6 +966,51 @@ test('coerceDesktopConnectionConfig routes token persistence through resolvePers
     'the strict coercion must live in the helper, not be duplicated at the call site'
   )
   assert.match(body, /encryptSecret: encryptDesktopSecret\b/, 'the helper must encrypt via encryptDesktopSecret')
+  assert.match(
+    body,
+    /encryptIncomingRemoteHeaders\(input\.remoteHeaders, existingBlock\.headers/,
+    'v1 remote headers must cross the trusted encryption boundary before persistence'
+  )
+  assert.doesNotMatch(
+    body,
+    /const remoteHeaders =\s*input\.remoteHeaders\s*&&[^\n]+\? input\.remoteHeaders/,
+    'v1 saves must not persist renderer-supplied header envelopes verbatim'
+  )
+})
+
+test('secret storage transitions recover from crashes before committing policy', () => {
+  const source = readMain()
+  const transitionStart = source.indexOf('function runSecretStorageTransition(')
+  const migrationStart = source.indexOf('function migrateLegacyEncryptedSecretsOnce(')
+  const transition = source.slice(transitionStart, migrationStart)
+
+  assert.notEqual(transitionStart, -1)
+  assert.match(transition, /writeSecretStorageTransition\(\{ targetOn, targetMigrated \}\)/)
+  assert.ok(
+    transition.indexOf('writeSecretStorageTransition') < transition.indexOf('rewriteAllStoredSecrets'),
+    'the recovery marker must be durable before any destination rewrite'
+  )
+  assert.ok(
+    transition.indexOf('rewriteAllStoredSecrets') < transition.indexOf('setSecretStoragePolicy'),
+    'the policy must not commit before all destination rewrites finish'
+  )
+  assert.ok(
+    transition.indexOf('setSecretStoragePolicy') < transition.indexOf('clearSecretStorageTransition'),
+    'the marker must remain until the target policy is durably committed'
+  )
+  assert.match(source, /recoverSecretStorageTransition\(\)\s*\n\s*const policy = secretStoragePolicy\(\)/)
+})
+
+test('native OAuth publication uses atomic predecessor-preserving writes', () => {
+  const source = readMain()
+  const ioStart = source.indexOf('function _nativeTokenStoreIo(): NativeTokenStoreIo')
+  const ioEnd = source.indexOf('\n}\n\nfunction _persistNativeTokens', ioStart)
+  const io = source.slice(ioStart, ioEnd)
+
+  assert.match(io, /readBackupStoreText/)
+  assert.match(io, /writeSecretFileAtomic\(backup/)
+  assert.match(io, /writeSecretFileAtomic\(target, text/)
+  assert.doesNotMatch(io, /fs\.writeFileSync\(_nativeTokenStorePath\(\)/)
 })
 
 test('connection-config save and apply IPC handlers route payloads through coerceDesktopConnectionConfig', () => {

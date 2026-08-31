@@ -175,8 +175,9 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   saveConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:save', payload),
   applyConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:apply', payload),
   testConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:test', payload),
-  // Opt-in OS-keychain encryption for stored gateway secrets (default off —
-  // see secret-storage-policy.ts). get never touches the OS keychain.
+  // OS-keychain encryption for stored gateway secrets (default on, with an
+  // explicit opt-out — see secret-storage-policy.ts). get never touches the
+  // OS keychain while the opt-out is active.
   getSecretStorageEncryption: () => ipcRenderer.invoke('hermes:secret-storage:get'),
   setSecretStorageEncryption: (on: boolean) => ipcRenderer.invoke('hermes:secret-storage:set', on),
   // v2 multi-connection registry: named agent sources (local / remote / cloud / ssh).

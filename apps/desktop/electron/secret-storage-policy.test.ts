@@ -2,8 +2,9 @@
  * Tests for electron/secret-storage-policy.ts — the "is OS-keychain
  * encryption enabled at all?" decision seam.
  *
- * The behavior this file pins: keychain-backed encryption is OPT-IN
- * (default OFF), and once the one-shot legacy migration has run, a
+ * The behavior this file pins: keychain-backed encryption is the safe default,
+ * and plaintext is an explicit user choice. Once the one-shot legacy
+ * migration has run, a
  * safeStorage blob under an opted-out policy reads as 'drop' — i.e. the
  * caller must treat it as absent WITHOUT touching safeStorage, so a broken
  * macOS login keychain can never raise its password dialog on launch.
@@ -42,23 +43,38 @@ function fakeIo(initial: string | null = null): SecretStoragePolicyIo & { fileTe
 
 // ── defaults ────────────────────────────────────────────────────────────────
 
-test('missing policy file defaults to encryption OFF, not migrated', () => {
+test('missing policy file defaults to encryption ON, not migrated', () => {
   const policy = readSecretStoragePolicy(fakeIo())
 
-  assert.deepEqual(policy, { on: false, migrated: false })
+  assert.deepEqual(policy, { on: true, migrated: false })
 })
 
-test('corrupt or non-object policy file reads as the default', () => {
+test('corrupt or non-object policy file defaults to encryption ON', () => {
   for (const bad of ['not-json', '[]', '"on"', 'null', '123']) {
-    assert.deepEqual(readSecretStoragePolicy(fakeIo(bad)), { on: false, migrated: false })
+    assert.deepEqual(readSecretStoragePolicy(fakeIo(bad)), { on: true, migrated: false })
   }
 })
 
-test('truthy-but-not-true values do NOT enable encryption', () => {
-  // Strict === true coercion: a hand-edited "on": 1 or "yes" must not turn
-  // keychain prompts back on.
-  for (const bad of ['{"on":1}', '{"on":"yes"}', '{"on":"true"}']) {
-    assert.equal(readSecretStoragePolicy(fakeIo(bad)).on, false)
+test('malformed policy objects default to encryption ON instead of plaintext', () => {
+  for (const bad of [
+    '{"on":1,"migrated":true}',
+    '{"on":"yes","migrated":true}',
+    '{"on":"true","migrated":true}',
+    '{"on":false}',
+    '{"on":false,"migrated":true,"future":false}',
+    '{"on":false,"migrated":null}'
+  ]) {
+    assert.deepEqual(readSecretStoragePolicy(fakeIo(bad)), { on: true, migrated: false })
+  }
+})
+
+test('duplicate policy members default to encryption ON instead of last-key-wins plaintext', () => {
+  for (const bad of [
+    '{"on":true,"on":false,"migrated":true}',
+    '{"on":false,"migrated":false,"migrated":true}',
+    '{"nested":{"on":true,"on":false},"on":false,"migrated":true}'
+  ]) {
+    assert.deepEqual(readSecretStoragePolicy(fakeIo(bad)), { on: true, migrated: false })
   }
 })
 

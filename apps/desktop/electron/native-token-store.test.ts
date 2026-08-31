@@ -21,7 +21,12 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import { type NativeTokenSet, parseStoredTokenSet, parseTokenResponse } from './native-oauth'
-import { loadNativeTokenSet, type NativeTokenStoreIo, persistNativeTokenSet } from './native-token-store'
+import {
+  loadNativeTokenSet,
+  type NativeTokenStoreIo,
+  persistNativeTokenSet,
+  rewriteNativeTokenStore
+} from './native-token-store'
 
 const GATEWAY = 'https://gw.example.com'
 
@@ -239,29 +244,57 @@ test('an array store file loads as signed out instead of throwing', () => {
   assert.deepEqual(disk.logs, [])
 })
 
-test('an array store file is replaced by a real map rather than swallowing the write', () => {
+test('an array store file cannot be overwritten as a map', () => {
   const disk = createFakeDisk('[]')
 
-  persistNativeTokenSet(GATEWAY, TOKENS, disk.io)
-
-  const written = JSON.parse(disk.fileText()!)
-
-  // Assigning store[baseUrl] on an array sets a non-index property, which
-  // JSON.stringify drops — the write would report success and the tokens would
-  // be gone on the next launch.
-  assert.equal(Array.isArray(written), false)
-  assert.ok(written[GATEWAY], 'the gateway entry must survive serialization')
-  // And it really does come back after a restart.
-  assert.deepEqual(loadNativeTokenSet(GATEWAY, createFakeDisk(disk.fileText()).io), TOKENS)
+  assert.throws(() => persistNativeTokenSet(GATEWAY, TOKENS, disk.io), /corrupt/i)
+  assert.equal(disk.fileText(), '[]')
 })
 
+test('a corrupt store cannot be overwritten as an empty map', () => {
+  const disk = createFakeDisk('{not json')
+
+  assert.throws(() => persistNativeTokenSet(GATEWAY, TOKENS, disk.io), /corrupt/i)
+  assert.equal(disk.fileText(), '{not json')
+})
+
+test('a corrupt primary recovers from the last complete predecessor', () => {
+  const backup = createFakeDisk()
+  persistNativeTokenSet(GATEWAY, TOKENS, backup.io)
+  const predecessor = backup.fileText()!
+  const disk = createFakeDisk('{truncated', { readBackupStoreText: () => predecessor })
+
+  assert.deepEqual(loadNativeTokenSet(GATEWAY, disk.io), TOKENS)
+  persistNativeTokenSet(GATEWAY, { ...TOKENS, accessToken: 'AT-new' }, disk.io)
+  assert.deepEqual(loadNativeTokenSet(GATEWAY, disk.io), { ...TOKENS, accessToken: 'AT-new' })
+})
+
+test('native migration publishes one complete replacement and reports whether it changed bytes', () => {
+  const disk = createFakeDisk()
+  persistNativeTokenSet(GATEWAY, { ...TOKENS, accessToken: 'AT-legacy' }, disk.io)
+  const changed = rewriteNativeTokenStore(
+    secret => secret.encoding === 'safeStorage',
+    secret => ({ ...secret, value: `${secret.value}x` }),
+    disk.io
+  )
+
+  assert.equal(changed, true)
+  assert.equal(
+    rewriteNativeTokenStore(
+      () => false,
+      secret => secret,
+      disk.io
+    ),
+    false
+  )
+  assert.equal(JSON.parse(disk.fileText()!)[GATEWAY].value.endsWith('x'), true)
+})
 test('a corrupt decrypted blob is reported and loads as signed out', () => {
   const disk = createFakeDisk(JSON.stringify({ [GATEWAY]: { encoding: 'safeStorage', value: 'bm90LWpzb24=' } }))
 
   assert.equal(loadNativeTokenSet(GATEWAY, disk.io), null)
   assert.match(disk.logs[0], /failed to load stored tokens for https:\/\/gw\.example\.com/)
 })
-
 test('a decrypted blob missing accessToken is rejected, not half-restored', () => {
   const plaintext = JSON.stringify({ refreshToken: 'RT-only', provider: 'nous' })
 
@@ -284,28 +317,28 @@ test('a non-Error decryption failure keeps its detail in the log', () => {
   assert.match(disk.logs[0], /keychain exploded/)
 })
 
-test('an unwritable store file is logged rather than thrown', () => {
+test('an unwritable store file propagates the failure and leaves callers in control', () => {
   const disk = createFakeDisk(null, {
     writeStoreText: () => {
       throw new Error('EACCES: permission denied')
     }
   })
 
-  assert.doesNotThrow(() => persistNativeTokenSet(GATEWAY, TOKENS, disk.io))
-  assert.match(disk.logs[0], /failed to persist tokens: EACCES/)
+  assert.throws(() => persistNativeTokenSet(GATEWAY, TOKENS, disk.io), /EACCES/)
+  assert.deepEqual(disk.logs, [])
 })
 
-test('a non-Error write failure keeps its detail in the log', () => {
+test('a non-Error write failure propagates its detail', () => {
   const disk = createFakeDisk(null, {
     writeStoreText: () => {
       throw 'disk went away'
     }
   })
 
-  // `(error as Error).message` on a thrown string reads as undefined and loses
-  // the only diagnostic there was.
-  assert.doesNotThrow(() => persistNativeTokenSet(GATEWAY, TOKENS, disk.io))
-  assert.equal(disk.logs[0], '[native-oauth] failed to persist tokens: disk went away')
+  assert.throws(
+    () => persistNativeTokenSet(GATEWAY, TOKENS, disk.io),
+    error => error === 'disk went away'
+  )
 })
 
 test('an unusable keychain fails the write loudly and writes nothing', () => {
