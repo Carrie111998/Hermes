@@ -20,8 +20,11 @@ import type { ServerResponse } from 'node:http'
 import os from 'node:os'
 import nodePath from 'node:path'
 
-/** A canned assistant reply used for every chat completion request. */
+/** A canned assistant reply used for every ordinary chat completion request. */
 export const MOCK_REPLY = 'Hello from the mock inference server! The full boot chain is working.'
+export const FOLLOW_UP_TRIGGER = 'E2E_FOLLOW_UP_DIRECTIVE'
+export const FOLLOW_UP_REPLY =
+  'The requested change is complete.\n\n::followup{p1="Run the tests" p2="Open a PR"}'
 
 export interface MockServerOptions {
   /** Pause the matching stream after its first token for session-switch E2E coverage. */
@@ -615,12 +618,17 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
             return
           }
 
+          const reply =
+            typeof lastUserMessage?.content === 'string' && lastUserMessage.content.includes(FOLLOW_UP_TRIGGER)
+              ? FOLLOW_UP_REPLY
+              : MOCK_REPLY
+
           if (stream) {
             const holdThisStream = Boolean(
               options.holdFirstStreamForPrompt && typeof lastUserMessage?.content === 'string' &&
                 lastUserMessage.content.includes(options.holdFirstStreamForPrompt),
             )
-            streamTextResponse(res, model, MOCK_REPLY, holdThisStream || holdThisCompletion ? () => {
+            streamTextResponse(res, model, reply, holdThisStream || holdThisCompletion ? () => {
               if (holdThisCompletion) {
                 heldCompletionCount++
               }
@@ -631,9 +639,9 @@ export function startMockServer(options: MockServerOptions = {}): Promise<MockSe
             if (holdThisCompletion) {
               heldCompletionCount++
               resolveHeldStreamStarted?.()
-              void heldStreamReleased.then(() => nonStreamingTextResponse(res, model, MOCK_REPLY))
+              void heldStreamReleased.then(() => nonStreamingTextResponse(res, model, reply))
             } else {
-              nonStreamingTextResponse(res, model, MOCK_REPLY)
+              nonStreamingTextResponse(res, model, reply)
             }
           }
         })

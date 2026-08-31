@@ -1,11 +1,18 @@
-import { expect, test } from './test'
+import * as fs from 'node:fs'
+import * as path from 'node:path'
 
 import {
   PACKAGED_BINARY_PATH,
   type PackagedAppFixture,
   packagedBinaryExists,
   setupPackagedApp,
+  waitForAppReady,
+  writeEnvFile,
+  writeMockProviderConfig,
 } from './fixtures'
+import { FOLLOW_UP_TRIGGER, type MockServer, startMockServer } from './mock-server'
+import { RealSessionBuilder } from './real-session-builder'
+import { expect, test } from './test'
 import { expectVisualSnapshot } from './visual-snapshot'
 
 /**
@@ -19,6 +26,7 @@ import { expectVisualSnapshot } from './visual-snapshot'
  */
 
 let fixture: PackagedAppFixture | null = null
+let mock: MockServer | null = null
 
 test.beforeAll(async () => {
   test.skip(
@@ -26,12 +34,52 @@ test.beforeAll(async () => {
     `Built app binary not found: ${PACKAGED_BINARY_PATH}. Run 'npm run pack' first.`,
   )
 
-  fixture = await setupPackagedApp()
+  const hermesCliOverride = process.env.HERMES_DESKTOP_HERMES
+
+  const hermesCli =
+    hermesCliOverride && fs.existsSync(hermesCliOverride) ? hermesCliOverride : undefined
+
+  const followUpSource = path.resolve(import.meta.dirname, 'fixtures', 'follow-up-plugin.js')
+  mock = await startMockServer()
+
+  try {
+    const prepareSandbox = async (sandbox: PackagedAppFixture['sandbox']) => {
+      const followUpDir = path.join(sandbox.hermesHome, 'desktop-plugins', 'follow-up')
+
+      fs.mkdirSync(followUpDir, { recursive: true })
+      fs.copyFileSync(followUpSource, path.join(followUpDir, 'plugin.js'))
+      writeMockProviderConfig(sandbox.hermesHome, mock!.url)
+      writeEnvFile(sandbox.hermesHome)
+
+      const builder = await RealSessionBuilder.start(sandbox.hermesHome)
+
+      try {
+        await builder.createSession({
+          title: 'Packaged Follow-up',
+          turns: [FOLLOW_UP_TRIGGER],
+        })
+      } finally {
+        await builder.close()
+      }
+    }
+
+    fixture = await setupPackagedApp({
+      env: hermesCli ? { HERMES_DESKTOP_HERMES: hermesCli } : undefined,
+      keepSandbox: process.env.HERMES_E2E_KEEP_SANDBOX === '1',
+      prepareSandbox,
+    })
+  } catch (error) {
+    await mock.close()
+    mock = null
+    throw error
+  }
 })
 
 test.afterAll(async () => {
   await fixture?.cleanup()
+  await mock?.close()
   fixture = null
+  mock = null
 })
 
 test('window opens with the Hermes title', async () => {
@@ -44,6 +92,27 @@ test('renderer loads and shows DOM content', async () => {
   await page.waitForSelector('#root', { state: 'attached', timeout: 30_000 })
   const childCount = await page.locator('#root > *').count()
   expect(childCount).toBeGreaterThan(0)
+})
+
+test('packaged renderer activates Follow-up and renders its directive card', async () => {
+  const page = fixture!.page
+
+  await waitForAppReady(fixture!, 120_000)
+  const session = page.getByRole('button', { name: 'Packaged Follow-up' })
+  await session.waitFor({ state: 'visible', timeout: 30_000 })
+  await session.click()
+
+  await expect(page.getByText(FOLLOW_UP_TRIGGER)).toBeVisible({ timeout: 30_000 })
+  await expect(page.getByText('Follow-up', { exact: true })).toBeVisible({ timeout: 30_000 })
+  await expect(page.getByRole('button', { name: /Run the tests/ })).toBeVisible()
+  const openPrButton = page.getByRole('button', { name: /Open a PR/ })
+
+  await expect(openPrButton).toBeVisible()
+  await openPrButton.click()
+
+  const composer = page.locator('[data-slot="composer-rich-input"]:visible').first()
+
+  await expect(composer).toContainText('Open a PR')
 })
 
 test('HUD composer remains fully inside the transparent window', async () => {
