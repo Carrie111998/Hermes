@@ -16469,6 +16469,8 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     """
     spectator = ws.query_params.get("spectator", "")
     if spectator:
+        if ws.url.path != "/api/ws":
+            return "spectator_scope", "spectator"
         if hmac.compare_digest(spectator.encode(), _SPECTATOR_TOKEN.encode()):
             return None, "spectator"
         return "spectator_mismatch", "spectator"
@@ -16479,6 +16481,8 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     # read-only method fence as the browser spectator token.
     spectator_relay = ws.query_params.get("spectator_relay", "")
     if spectator_relay:
+        if ws.url.path != "/api/ws":
+            return "spectator_relay_scope", "spectator"
         expected = os.environ.get("HERMES_SPECTATOR_RELAY_TOKEN", "")
         if expected and hmac.compare_digest(
             spectator_relay.encode(), expected.encode()

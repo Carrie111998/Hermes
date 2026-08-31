@@ -204,7 +204,10 @@ def test_desktop_relay_credential_maps_to_spectator_fence(monkeypatch):
 
     token = "z" * 43
     monkeypatch.setenv("HERMES_SPECTATOR_RELAY_TOKEN", token)
-    ws = SimpleNamespace(query_params={"spectator_relay": token})
+    ws = SimpleNamespace(
+        query_params={"spectator_relay": token},
+        url=SimpleNamespace(path="/api/ws"),
+    )
     assert web_server._ws_auth_reason(ws) == (None, "spectator")
 
     ws.query_params["spectator_relay"] = "wrong"
@@ -212,3 +215,29 @@ def test_desktop_relay_credential_maps_to_spectator_fence(monkeypatch):
         "spectator_relay_mismatch",
         "spectator",
     )
+
+
+def test_spectator_credentials_are_scoped_to_gateway_ws(monkeypatch):
+    import hermes_cli.web_server as web_server
+
+    relay_token = "z" * 43
+    monkeypatch.setenv("HERMES_SPECTATOR_RELAY_TOKEN", relay_token)
+
+    for path in (
+        "/api/audio/speak-stream",
+        "/api/console",
+        "/api/events",
+        "/api/pty",
+        "/api/pub",
+    ):
+        browser = SimpleNamespace(
+            query_params={"spectator": web_server._SPECTATOR_TOKEN},
+            url=SimpleNamespace(path=path),
+        )
+        relay = SimpleNamespace(
+            query_params={"spectator_relay": relay_token},
+            url=SimpleNamespace(path=path),
+        )
+
+        assert web_server._ws_auth_reason(browser) == ("spectator_scope", "spectator")
+        assert web_server._ws_auth_reason(relay) == ("spectator_relay_scope", "spectator")

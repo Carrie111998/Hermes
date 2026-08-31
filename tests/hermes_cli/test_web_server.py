@@ -5310,6 +5310,53 @@ class TestSpectatorServerScope:
             frozenset({"session.subscribe", "session.unsubscribe"})
         ]
 
+    def test_scoped_credential_rejected_by_every_non_gateway_ws(self, monkeypatch):
+        from starlette.websockets import WebSocketDisconnect
+
+        monkeypatch.setattr(self.ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+
+        for path in (
+            "/api/audio/speak-stream",
+            "/api/console",
+            "/api/events",
+            "/api/pty",
+            "/api/pub",
+        ):
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                with self.client.websocket_connect(
+                    f"{path}?spectator={self.ws._SPECTATOR_TOKEN}"
+                ):
+                    pass
+
+            assert exc_info.value.code == 4401, path
+
+    def test_gateway_ws_selects_live_desktop_relay(self, monkeypatch):
+        import hermes_cli.spectator_relay as spectator_relay
+        from tui_gateway import ws as gateway_ws_module
+
+        relay_calls = []
+
+        async def fake_relay(socket):
+            relay_calls.append(socket)
+            await socket.accept()
+            await socket.close()
+
+        async def forbidden_dashboard_gateway(*_args, **_kwargs):
+            raise AssertionError("dashboard-local gateway path reached")
+
+        monkeypatch.setattr(self.ws, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
+        monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+        monkeypatch.setattr(spectator_relay, "has_live_desktop_descriptors", lambda: True)
+        monkeypatch.setattr(spectator_relay, "relay_spectator_ws", fake_relay)
+        monkeypatch.setattr(gateway_ws_module, "handle_ws", forbidden_dashboard_gateway)
+
+        with self.client.websocket_connect(
+            f"/api/ws?spectator={self.ws._SPECTATOR_TOKEN}"
+        ):
+            pass
+
+        assert len(relay_calls) == 1
+
 
 class TestDashboardComponentHealth:
     """Component-health rollup: error middleware, /api/status components, self-test."""

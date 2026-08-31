@@ -23,12 +23,14 @@ import { BotRow } from './bot-row'
 import { translateBots } from './i18n-test-helper'
 import type { RosterRow } from './types'
 
-const { ensureAgent, ensureBotMetadata, notifyError, openRosterBot, requestProfile, warmAgent, warmProfile } =
+const { ensureAgent, ensureBotMetadata, notify, notifyError, openRosterBot, openSession, requestProfile, warmAgent, warmProfile } =
   vi.hoisted(() => ({
     ensureAgent: vi.fn(),
     ensureBotMetadata: vi.fn(),
+    notify: vi.fn(),
     notifyError: vi.fn(),
     openRosterBot: vi.fn(),
+    openSession: vi.fn(),
     requestProfile: vi.fn(),
     warmAgent: vi.fn(),
     warmProfile: vi.fn()
@@ -39,7 +41,7 @@ vi.mock('@hermes/plugin-sdk', async importOriginal => {
 
   return {
     ...sdk,
-    host: { ...sdk.host, ensureAgent, notifyError, requestProfile, warmAgent, warmProfile },
+    host: { ...sdk.host, ensureAgent, notify, notifyError, openSession, requestProfile, warmAgent, warmProfile },
     // The plugin bundle normally lands via `ctx.i18n.register` at load, so
     // without this every localized label in the row renders empty.
     usePluginI18n: () => translateBots
@@ -58,8 +60,8 @@ vi.mock('./roster-actions', () => ({ openRosterBot }))
 
 const noop = () => undefined
 
-function renderRow(bot: RosterRow) {
-  render(<BotRow bot={bot} onDelete={noop} onEdit={noop} onGroup={noop} />)
+function renderRow(bot: RosterRow, spectator = false) {
+  render(<BotRow bot={bot} onDelete={noop} onEdit={noop} onGroup={noop} spectator={spectator} />)
 
   return screen.getByRole('button')
 }
@@ -68,6 +70,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   ensureBotMetadata.mockResolvedValue({ pinned: true })
   openRosterBot.mockResolvedValue(true)
+  openSession.mockResolvedValue(undefined)
   requestProfile.mockResolvedValue({})
 })
 
@@ -100,6 +103,27 @@ describe('pre-warm is hover-scoped, never roster-wide', () => {
 })
 
 describe('the row delegates the open and claims no activation authority', () => {
+  it('opens only the persisted conversation in spectator mode', async () => {
+    const bot = {
+      name: 'research',
+      preferred_session: { id: 'stored-1', message_count: 2 }
+    } as RosterRow
+
+    fireEvent.click(renderRow(bot, true))
+
+    await vi.waitFor(() =>
+      expect(openSession).toHaveBeenCalledWith('stored-1', {
+        intent: 'main',
+        awaitHydration: true,
+        expectHistory: true,
+        keepAllProfilesScope: false
+      })
+    )
+    expect(openRosterBot).not.toHaveBeenCalled()
+    expect(warmAgent).not.toHaveBeenCalled()
+    expect(warmProfile).not.toHaveBeenCalled()
+  })
+
   it('hands a remote Connections row to openRosterBot without activating it', async () => {
     const bot = {
       connectionId: 'work',
