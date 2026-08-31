@@ -102,6 +102,7 @@ import {
   resolveTimeoutMs,
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
+import { chooseWindowsDefaultHermesHome } from './hermes-home'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
@@ -416,21 +417,33 @@ if (INSTALL_STAMP) {
 //   Windows: %LOCALAPPDATA%\hermes (matches install.ps1)
 //   macOS / Linux: ~/.hermes (matches install.sh)
 //
-// Special case for Windows: if the user has a legacy ~/.hermes directory
-// (e.g., from a prior pip install or a manual setup) AND no
-// %LOCALAPPDATA%\hermes yet, prefer the legacy path so we don't orphan their
-// existing config / sessions / .env. New installs go to %LOCALAPPDATA%.
+// Special case for Windows: a legacy ~/.hermes directory (e.g., from a prior
+// pip install or a manual setup) may coexist with %LOCALAPPDATA%\hermes. When
+// both exist, chooseWindowsDefaultHermesHome() prefers the one that carries a
+// config marker so a stray, nearly-empty %LOCALAPPDATA%\hermes (left behind by
+// a backend once launched against the default) cannot silently capture the
+// launch away from a fully configured ~/.hermes — see hermes-home.ts for the
+// 2026-08-13 / 2026-08-31 incidents this pins. New installs go to
+// %LOCALAPPDATA%.
 //
 // HERMES_DESKTOP_USER_DATA_DIR (used by test:desktop:fresh) puts the sandbox
 // HERMES_HOME beneath the throwaway userData dir so a fresh-install run never
 // touches the user's real ~/.hermes / %LOCALAPPDATA%\hermes.
+//
+// Returns { home, source, warning } — the caller logs all three so the chosen
+// home is visible in every launch log (the silent fallback is what made the
+// stray-home failures cost hours).
 function resolveHermesHome() {
   if (process.env.HERMES_HOME) {
-    return normalizeHermesHomeRoot(process.env.HERMES_HOME)
+    return { home: normalizeHermesHomeRoot(process.env.HERMES_HOME), source: 'HERMES_HOME env', warning: null }
   }
 
   if (USER_DATA_OVERRIDE) {
-    return path.join(path.resolve(USER_DATA_OVERRIDE), 'hermes-home')
+    return {
+      home: path.join(path.resolve(USER_DATA_OVERRIDE), 'hermes-home'),
+      source: 'user-data override',
+      warning: null
+    }
   }
 
   if (IS_WINDOWS) {
@@ -443,27 +456,30 @@ function resolveHermesHome() {
     const fromRegistry = readWindowsUserEnvVar('HERMES_HOME')
 
     if (fromRegistry) {
-      return normalizeHermesHomeRoot(fromRegistry)
+      return { home: normalizeHermesHomeRoot(fromRegistry), source: 'HKCU registry HERMES_HOME', warning: null }
     }
   }
 
   if (IS_WINDOWS && process.env.LOCALAPPDATA) {
-    const localappdata = path.join(process.env.LOCALAPPDATA, 'hermes')
-    const legacy = path.join(app.getPath('home'), '.hermes')
+    const decision = chooseWindowsDefaultHermesHome({
+      localAppDataHome: path.join(process.env.LOCALAPPDATA, 'hermes'),
+      legacyHome: path.join(app.getPath('home'), '.hermes')
+    })
 
-    // Migrate transparently to LOCALAPPDATA, but honour an existing legacy
-    // ~/.hermes setup (no LOCALAPPDATA install yet) so users don't lose state.
-    if (!directoryExists(localappdata) && directoryExists(legacy)) {
-      return legacy
-    }
-
-    return localappdata
+    return { home: decision.home, source: `windows default (${decision.reason})`, warning: decision.warning }
   }
 
-  return path.join(app.getPath('home'), '.hermes')
+  return { home: path.join(app.getPath('home'), '.hermes'), source: 'posix default', warning: null }
 }
 
-const HERMES_HOME = resolveHermesHome()
+const HERMES_HOME_RESOLUTION = resolveHermesHome()
+const HERMES_HOME = HERMES_HOME_RESOLUTION.home
+
+console.log(`[hermes] HERMES_HOME = ${HERMES_HOME} (source: ${HERMES_HOME_RESOLUTION.source})`)
+
+if (HERMES_HOME_RESOLUTION.warning) {
+  console.warn(`[hermes] HERMES_HOME ambiguity: ${HERMES_HOME_RESOLUTION.warning}`)
+}
 
 function hermesManagedNodePathEntries() {
   // NOTE: keep this ordering in sync with iter_hermes_node_dirs() in
