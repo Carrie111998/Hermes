@@ -1071,6 +1071,12 @@ def list_profiles() -> List[ProfileInfo]:
                 continue
             if named_profile_is_deleted(entry):
                 continue
+            # ``create_profile`` always seeds SOUL.md, while infrastructure
+            # directories under profiles/ do not represent user-facing bots.
+            # Config is deliberately not the marker because setup may not
+            # have run for a newly created profile yet.
+            if not (entry / "SOUL.md").exists():
+                continue
             model, provider = _read_config_model(entry)
             alias_name = alias_map.get(normalize_profile_name(name))
             if alias_name:

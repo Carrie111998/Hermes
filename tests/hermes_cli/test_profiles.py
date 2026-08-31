@@ -529,6 +529,17 @@ class TestListProfiles:
         assert "alpha" in names
         assert "beta" in names
 
+    def test_excludes_internal_directories_without_profile_marker(self, profile_env):
+        profiles_root = profile_env / ".hermes" / "profiles"
+        create_profile("helper", no_alias=True)
+        for name in ("sessions", "skills", "cron", "logs"):
+            (profiles_root / name).mkdir()
+
+        names = [profile.name for profile in list_profiles()]
+
+        assert "helper" in names
+        assert not {"sessions", "skills", "cron", "logs"} & set(names)
+
 
 # ===================================================================
 # TestActiveProfile
@@ -1175,5 +1186,4 @@ class TestResolveProfileEnvSpelling:
         # No HERMES_HOME: the platform default root applies (existing contract).
         monkeypatch.delenv("HERMES_HOME", raising=False)
         assert Path(resolve_profile_env("default")) == _get_default_hermes_home()
-
 
