@@ -1843,6 +1843,29 @@ class FeishuAdapter(BasePlatformAdapter):
         # so capture the client reference first.
         ws_client = self._ws_client
         ws_thread_loop = self._ws_thread_loop
+        # Some official SDK websocket workers expose only a synchronous
+        # stop/close/disconnect primitive rather than ``_disconnect``.
+        # Invoke that primitive before dropping the client reference, with a
+        # bounded wait so a blocked SDK worker cannot stall gateway teardown.
+        if ws_client is not None and not hasattr(ws_client, "_disconnect"):
+            for method_name in ("stop", "close", "disconnect"):
+                method = getattr(ws_client, method_name, None)
+                if not callable(method):
+                    continue
+                try:
+                    await asyncio.wait_for(asyncio.to_thread(method), timeout=3.0)
+                except asyncio.TimeoutError:
+                    logger.debug(
+                        "[Feishu] websocket client %s() did not return within 3s",
+                        method_name,
+                    )
+                except Exception:
+                    logger.debug(
+                        "[Feishu] websocket client %s() failed during disconnect",
+                        method_name,
+                        exc_info=True,
+                    )
+                break
         self._disable_websocket_auto_reconnect()
         await self._stop_webhook_server()
 

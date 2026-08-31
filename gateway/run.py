@@ -15733,6 +15733,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     cleanup_all_browsers()
                 except Exception as _e:
                     logger.debug("cleanup_all_browsers (%s) error: %s", phase, _e)
+                try:
+                    # LSP servers are long-lived children of the gateway but
+                    # are not terminal-tool registry entries. Shut down the
+                    # singleton explicitly so pyright/tsserver and any
+                    # descendants are reaped before systemd evaluates the
+                    # service cgroup.
+                    from agent.lsp import shutdown_service
+                    shutdown_service()
+                except Exception as _e:
+                    logger.debug("shutdown_lsp_service (%s) error: %s", phase, _e)
                 return _marked_cron_jobs
 
             # Thread-based shutdown watchdog (#66892): asyncio timeouts cannot
