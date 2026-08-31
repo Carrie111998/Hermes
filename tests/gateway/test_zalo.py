@@ -336,6 +336,24 @@ class TestConnectionLifecycle:
         connect_polling.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_connect_wires_plugin_handlers_after_successful_start(self, monkeypatch):
+        monkeypatch.delenv("ZALO_BOT_TOKEN", raising=False)
+        adapter = zalo.ZaloBotAdapter(PlatformConfig(enabled=True, token="tok"))
+        monkeypatch.setattr(
+            zalo.httpx,
+            "AsyncClient",
+            lambda **_kwargs: SimpleNamespace(aclose=AsyncMock()),
+        )
+        monkeypatch.setattr(adapter, "_acquire_platform_lock", lambda *_args: True)
+        monkeypatch.setattr(adapter, "_probe_bot", AsyncMock(return_value=True))
+        monkeypatch.setattr(adapter, "_poll_loop", AsyncMock(return_value=None))
+        wire_handlers = MagicMock()
+        monkeypatch.setattr(adapter, "_wire_plugin_handlers", wire_handlers)
+
+        assert await adapter.connect() is True
+        wire_handlers.assert_called_once_with(None)
+
+    @pytest.mark.asyncio
     async def test_connect_accepts_runner_reconnect_keyword(self, monkeypatch):
         monkeypatch.delenv("ZALO_BOT_TOKEN", raising=False)
         adapter = zalo.ZaloBotAdapter(PlatformConfig(enabled=True, token="tok"))

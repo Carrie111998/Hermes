@@ -347,6 +347,8 @@ class ZaloBotAdapter(BasePlatformAdapter):
     async def _connect_polling(self) -> bool:
         self._poll_task = asyncio.create_task(self._poll_loop())
         self._mark_connected()
+        # Plugin handlers for polling operate through this adapter instance.
+        self._wire_plugin_handlers(None)
         logger.info("[%s] Long polling started (getUpdates)", self.name)
         return True
 
