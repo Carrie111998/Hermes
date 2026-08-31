@@ -530,8 +530,8 @@ function MarkdownTextSurface({
         // Inline code must not vote when an ancestor resolves `dir="auto"`
         // (HTML's algorithm skips descendants that carry their own dir),
         // mirroring the CSS isolate that already keeps it out of the
-        // plaintext scan. Fenced code never reaches this override; it goes
-        // through the code plugin's CodeCard path.
+        // plaintext scan. Fenced code reaches the SyntaxHighlighter override
+        // below instead.
         inlineCode: ({ className, ...props }: ComponentProps<'code'>) => (
           <code className={className} dir="ltr" {...props} />
         ),
