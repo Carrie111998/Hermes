@@ -1107,6 +1107,42 @@ class TestForceReloadSymmetry:
         assert mgr.invoke_hook("subagent_stop", parent_session_id="p1") == ["ok"]
         assert seen["thread"] is caller
 
+    def test_delivery_critical_hook_is_serial_and_never_uses_timeout_worker(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.01
+        )
+        entered, release = threading.Event(), threading.Event()
+        calls, results = [], []
+
+        def callback(**_kwargs):
+            calls.append(threading.current_thread().name)
+            entered.set()
+            release.wait(timeout=1.0)
+            return "recorded"
+
+        mgr = PluginManager()
+        key = ("post_tool_call", id(callback))
+        mgr._hooks["post_tool_call"] = [callback]
+        mgr._delivery_critical_hooks.add(key)
+        mgr._delivery_critical_hook_locks[key] = threading.RLock()
+        first = threading.Thread(
+            target=lambda: results.extend(mgr.invoke_hook("post_tool_call")),
+            name="first-caller",
+        )
+        second = threading.Thread(
+            target=lambda: results.extend(mgr.invoke_hook("post_tool_call")),
+            name="second-caller",
+        )
+        first.start()
+        assert entered.wait(timeout=1.0)
+        second.start()
+        assert len(calls) == 1
+        release.set()
+        first.join(timeout=1.0)
+        second.join(timeout=1.0)
+        assert calls == ["first-caller", "second-caller"]
+        assert results == ["recorded", "recorded"]
+
     def test_hung_callback_suppresses_repeat_fires(self, monkeypatch):
         """A still-running timed-out callback must not spawn another worker."""
         import time

@@ -3389,7 +3389,9 @@ class PluginContext:
         )
         return count
 
-    def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
+    def register_hook(
+        self, hook_name: str, callback: Callable, *, delivery_critical: bool = False,
+    ) -> PluginRegistration:
         """Register a lifecycle hook callback.
 
         Unknown hook names produce a warning but are still stored so
@@ -3405,10 +3407,14 @@ class PluginContext:
             )
         callbacks = self._manager._hooks.setdefault(hook_name, [])
         callbacks.append(callback)
+        callback_key = (hook_name, id(callback))
+        if delivery_critical:
+            self._manager._delivery_critical_hooks.add(callback_key)
+            self._manager._delivery_critical_hook_locks[callback_key] = threading.RLock()
         handle = self._track(
             "hook", hook_name,
-            lambda: self._manager._remove_callback(
-                self._manager._hooks, hook_name, callback
+            lambda: self._manager._remove_hook_registration(
+                hook_name, callback, callback_key
             ),
         )
         logger.debug("Plugin %s registered hook: %s", self.manifest.name, hook_name)
@@ -3799,6 +3805,8 @@ class PluginManager:
         self._hook_timeout_suppressed_until: Dict[tuple, float] = {}
         self._hook_timeout_lock = threading.Lock()
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
+        self._delivery_critical_hooks: Set[tuple] = set()
+        self._delivery_critical_hook_locks: Dict[tuple, threading.RLock] = {}
         # Registration handles are kept both per plugin (ownership lookup) and
         # globally (reverse-order teardown for overrides spanning plugins).
         #
@@ -3942,6 +3950,14 @@ class PluginManager:
         self._remove_identity(callbacks, callback)
         if not callbacks:
             mapping.pop(key, None)
+
+    def _remove_hook_registration(
+        self, hook_name: str, callback: Callable, callback_key: tuple,
+    ) -> None:
+        """Remove one hook and its optional delivery-critical metadata."""
+        self._remove_callback(self._hooks, hook_name, callback)
+        self._delivery_critical_hooks.discard(callback_key)
+        self._delivery_critical_hook_locks.pop(callback_key, None)
 
     def _restore_mapping(
         self,
@@ -5616,7 +5632,11 @@ class PluginManager:
             callback_name = getattr(cb, "__name__", repr(cb))
             callback_key = (hook_name, id(cb))
             try:
-                if use_timeout:
+                if callback_key in self._delivery_critical_hooks:
+                    lock = self._delivery_critical_hook_locks[callback_key]
+                    with lock:
+                        ret = self._invoke_hook_callback(cb, kwargs)
+                elif use_timeout:
                     token = object()
                     now = time.monotonic()
                     with self._hook_timeout_lock:
