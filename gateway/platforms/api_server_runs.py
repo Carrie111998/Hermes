@@ -844,7 +844,9 @@ async def _handle_runs(
                         _clear_turn_process_ownership(agent)
                         # /v1/runs owns its agent lifecycle, so it records
                         # the declared conversation itself rather than
-                        # through _run_agent's bind_declared_conversation.
+                        # through _run_agent's bind_declared_conversation
+                        # -- carrying the same precedence gate, which an
+                        # explicit body session_id turns off.
                         if _declared_selected:
                             self._bind_declared_conversation(
                                 getattr(agent, "session_id", None) or session_id,
