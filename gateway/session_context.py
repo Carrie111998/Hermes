@@ -115,6 +115,17 @@ _BROWSER_CONTROL_TRANSPORT_FAMILY: ContextVar = ContextVar(
 # masks any leaked process env value.
 _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 
+# The durable execution id (cron.executions.db primary key) for the cron job
+# currently bound to this task, set alongside HERMES_CRON_SESSION in
+# run_job(). Lets in-process trusted code (native plugins) correlate a
+# cron-triggered tool call back to the exact execution record -- e.g. for
+# audit journals that need to join against cron's own execution ledger --
+# without re-deriving an identifier from the session id's naming convention,
+# which is display-only and not guaranteed unique per attempt (retries reuse
+# the same job id). _UNSET outside a bound cron job (same fallback semantics
+# as HERMES_CRON_SESSION).
+_CRON_EXECUTION_ID: ContextVar = ContextVar("HERMES_CRON_EXECUTION_ID", default=_UNSET)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -160,6 +171,7 @@ _VAR_MAP = {
     "HERMES_BROWSER_CONTROL_PRINCIPAL": _BROWSER_CONTROL_PRINCIPAL,
     "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY": _BROWSER_CONTROL_TRANSPORT_FAMILY,
     "HERMES_CRON_SESSION": _CRON_SESSION,
+    "HERMES_CRON_EXECUTION_ID": _CRON_EXECUTION_ID,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,

@@ -43,6 +43,7 @@ class _FakeCronAgent:
         assert result["approved"] is False
         assert result["outcome"] == "blocked"
         assert get_session_env("HERMES_CRON_SESSION") == "1"
+        assert get_session_env("HERMES_CRON_EXECUTION_ID") == "test-execution-id"
         return {
             "completed": True,
             "failed": False,
@@ -121,7 +122,8 @@ def test_run_job_cron_execute_code_deny_does_not_pollute_later_gateway_execute_c
             "name": "Context Isolation",
             "prompt": "Run safely",
             "schedule_display": "manual",
-        }
+        },
+        execution_id="test-execution-id",
     )
 
     assert success is True
@@ -129,6 +131,8 @@ def test_run_job_cron_execute_code_deny_does_not_pollute_later_gateway_execute_c
     assert final_response == "cron execute_code blocked"
     assert os.environ.get("HERMES_CRON_SESSION") is None
     assert get_session_env("HERMES_CRON_SESSION") == ""
+    assert os.environ.get("HERMES_CRON_EXECUTION_ID") is None
+    assert get_session_env("HERMES_CRON_EXECUTION_ID") == ""
 
     # A completed in-process job must restore the truly-unset ContextVar state,
     # not leave an explicit empty value that shadows the standalone cron env
