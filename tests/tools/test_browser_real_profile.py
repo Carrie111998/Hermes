@@ -266,7 +266,7 @@ class TestRealProfileCdpLaunch:
 
     def _reset(self):
         import tools.browser_tool as bt
-        bt._real_profile_cdp_cache.clear()
+        bt._real_profile_states.clear()
 
     def test_consent_off_is_noop(self):
         import tools.browser_tool as bt
@@ -434,6 +434,111 @@ class TestRealProfileCdpLaunch:
         assert err and "initialized from 'Profile 2'" in err
         assert "real_profile_pin is now 'Profile 4'" in err
         snapshot.assert_not_called()
+        self._reset()
+
+    def test_consent_revocation_is_scoped_to_active_hermes_home(self, tmp_path):
+        import tools.browser_tool as bt
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        self._reset()
+        token_a = set_hermes_home_override(tmp_path / "profile-a")
+        try:
+            state_a = bt._real_profile_state()
+            browser_a = Mock()
+            browser_a.poll.return_value = None
+            state_a["cache"]["cdp"] = "http://127.0.0.1:41000"
+            state_a["chrome_procs"].append(browser_a)
+        finally:
+            reset_hermes_home_override(token_a)
+
+        token_b = set_hermes_home_override(tmp_path / "profile-b")
+        try:
+            state_b = bt._real_profile_state()
+            with patch.object(bt, "_use_real_profile", return_value=False), \
+                 patch.object(bt, "_agent_browser_close_session") as close, \
+                 patch("hermes_cli.browser_connect.cleanup_real_profile_snapshots",
+                       return_value=True):
+                cdp, err = bt._real_profile_cdp()
+        finally:
+            reset_hermes_home_override(token_b)
+
+        assert cdp is None and err is None
+        assert state_a is not state_b
+        close.assert_called_once_with(state_b["session"])
+        assert state_a["cache"]["cdp"] == "http://127.0.0.1:41000"
+        assert state_a["chrome_procs"] == [browser_a]
+        browser_a.terminate.assert_not_called()
+        self._reset()
+
+    @pytest.mark.parametrize(
+        "failure",
+        ["missing-agent-browser", "timeout", "oserror", "nonzero", "missing-cdp"],
+    )
+    def test_post_launch_attach_failures_reap_provisional_chrome(self, tmp_path, failure):
+        import tools.browser_tool as bt
+
+        self._reset()
+
+        class FakeChrome:
+            def __init__(self):
+                self.terminated = False
+                self.waited = False
+                self.killed = False
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                self.waited = True
+
+            def kill(self):
+                self.killed = True
+
+        chrome = FakeChrome()
+
+        def fake_popen(argv, **kwargs):
+            (tmp_path / "DevToolsActivePort").write_text(
+                "41000\n/devtools/browser/provisional\n"
+            )
+            return chrome
+
+        find_effect = (
+            FileNotFoundError("missing") if failure == "missing-agent-browser" else None
+        )
+        run_effect = None
+        run_result = Mock(returncode=0, stdout="", stderr="")
+        if failure == "timeout":
+            run_effect = bt.subprocess.TimeoutExpired("agent-browser", 1)
+        elif failure == "oserror":
+            run_effect = OSError("attach failed")
+        elif failure == "nonzero":
+            run_result = Mock(returncode=1, stdout="", stderr="attach rejected")
+
+        cdp_results = [None, None] if failure == "missing-cdp" else [None]
+        with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch("hermes_cli.browser_connect.detect_default_chromium",
+                   return_value="chrome"), \
+             patch("hermes_cli.browser_connect.snapshot_real_profile",
+                   return_value=(str(tmp_path), None)), \
+             patch("hermes_cli.browser_connect.chromium_executable",
+                   return_value="/usr/bin/chrome"), \
+             patch.object(bt.subprocess, "Popen", side_effect=fake_popen), \
+             patch.object(bt, "_agent_browser_get_cdp", side_effect=cdp_results), \
+             patch.object(bt, "_find_agent_browser", return_value="agent-browser",
+                          side_effect=find_effect), \
+             patch.object(bt.subprocess, "run", return_value=run_result,
+                          side_effect=run_effect), \
+             patch.object(bt, "_is_headed_mode", return_value=False):
+            cdp, err = bt._real_profile_cdp()
+
+        assert cdp is None and err
+        assert chrome.terminated is True
+        assert chrome.waited is True
+        assert chrome.killed is False
+        assert bt._real_profile_state()["chrome_procs"] == []
         self._reset()
 
     def test_cdp_on_data_dir_matches_devtoolsactiveport(self, tmp_path):
@@ -668,7 +773,7 @@ class TestChannelIdentity:
         """A channel default → _real_profile_cdp fails closed, never launches."""
         import tools.browser_tool as bt
         import hermes_cli.browser_connect as bc
-        bt._real_profile_cdp_cache.clear()
+        bt._real_profile_states.clear()
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium",
                    return_value=bc.UNSUPPORTED_CHANNEL), \
@@ -677,7 +782,7 @@ class TestChannelIdentity:
         assert cdp is None
         assert err and "pre-release" in err.lower()
         snap.assert_not_called()  # never even snapshotted a stable profile
-        bt._real_profile_cdp_cache.clear()
+        bt._real_profile_states.clear()
 
     def test_data_dir_rejects_sentinel(self):
         import hermes_cli.browser_connect as bc
@@ -853,7 +958,7 @@ class TestReviewBugFixes:
     # ── Bug 5: lightpanda engine + consent fails with an actionable message ──
     def test_lightpanda_engine_fails_actionably(self):
         import tools.browser_tool as bt
-        bt._real_profile_cdp_cache.clear()
+        bt._real_profile_states.clear()
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch.object(bt, "_using_lightpanda_engine", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium") as det:
@@ -861,7 +966,7 @@ class TestReviewBugFixes:
         assert cdp is None
         assert err and "lightpanda" in err.lower() and "browser.engine" in err.lower()
         det.assert_not_called()  # guard fires before detection
-        bt._real_profile_cdp_cache.clear()
+        bt._real_profile_states.clear()
 
 
 class TestReviewRound3:
@@ -1038,7 +1143,7 @@ class TestReviewRound3:
              patch.object(bt, "_agent_browser_close_session",
                           side_effect=lambda *_: called.__setitem__("close", called["close"] + 1)), \
              patch.object(bt, "_terminate_real_profile_chrome",
-                          side_effect=lambda: called.__setitem__("terminate", called["terminate"] + 1)), \
+                          side_effect=lambda *_: called.__setitem__("terminate", called["terminate"] + 1)), \
              patch("hermes_cli.browser_connect.cleanup_real_profile_snapshots",
                    side_effect=lambda: (called.__setitem__("cleanup", called["cleanup"] + 1), True)[1]):
             cdp, err = bt._real_profile_cdp()
@@ -1058,7 +1163,9 @@ class TestReviewRound3:
 
     def test_cached_cdp_rejects_changed_managed_data_dir(self, tmp_path):
         import tools.browser_tool as bt
-        bt._real_profile_cdp_cache["cdp"] = "http://127.0.0.1:9251"
+        bt._real_profile_states.clear()
+        state = bt._real_profile_state()
+        state["cache"]["cdp"] = "http://127.0.0.1:9251"
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch.object(bt, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="edge"), \
@@ -1074,9 +1181,9 @@ class TestReviewRound3:
             cdp, err = bt._real_profile_cdp()
         assert cdp is None
         assert err and "missing managed edge profile" in err
-        close.assert_called_once_with(bt._REAL_PROFILE_SESSION)
-        terminate.assert_called_once_with()
-        assert "cdp" not in bt._real_profile_cdp_cache
+        close.assert_called_once_with(state["session"])
+        terminate.assert_called_once_with(state)
+        assert "cdp" not in state["cache"]
 
     def test_cleanup_terminates_only_managed_profile_browser(self, tmp_path, monkeypatch):
         import hermes_cli.browser_connect as bc
@@ -1130,7 +1237,7 @@ class TestReviewRound3:
         must NOT be called — otherwise it rewrites cookie DBs under a live
         browser."""
         import tools.browser_tool as bt
-        bt._real_profile_cdp_cache.clear()
+        bt._real_profile_states.clear()
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch.object(bt, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
@@ -1142,12 +1249,12 @@ class TestReviewRound3:
             cdp, err = bt._real_profile_cdp()
         assert cdp == "http://127.0.0.1:9251" and err is None
         snap.assert_not_called()  # ← the fix: no overlay while a live browser owns the dir
-        bt._real_profile_cdp_cache.clear()
+        bt._real_profile_states.clear()
 
     def test_relaunch_path_does_snapshot(self, tmp_path):
         """When there's no reusable session, the overlay DOES run (relaunch)."""
         import tools.browser_tool as bt
-        bt._real_profile_cdp_cache.clear()
+        bt._real_profile_states.clear()
         proc = Mock(returncode=0, stdout="", stderr="")
 
         class FakeChrome:
@@ -1173,7 +1280,7 @@ class TestReviewRound3:
             cdp, err = bt._real_profile_cdp()
         assert err is None
         snap.assert_called_once()
-        bt._real_profile_cdp_cache.clear()
+        bt._real_profile_states.clear()
 
 
 class TestWindowsLockedProfileCopy:
