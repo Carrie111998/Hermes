@@ -46,8 +46,10 @@ export interface CanonicalSession {
 }
 
 export interface SessionPreview {
+  id?: string
   /** Unix seconds, not milliseconds. */
   last_active?: number
+  message_count?: number
   preview?: string
 }
 
@@ -84,6 +86,9 @@ export interface RosterRow {
   handle?: string
   has_avatar?: boolean
   last_session?: SessionPreview | null
+  preferred_session?: SessionPreview | null
+  model?: string
+  provider?: string
   remoteSource?: boolean
   route?: ProfileRoute
   sourceError?: null | string

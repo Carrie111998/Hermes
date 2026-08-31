@@ -1,8 +1,8 @@
 import type { BillingBlock } from '@hermes/shared'
 
+import { finalizeInterruptedMessages } from '@/app/session/hooks/use-prompt-actions/rewind'
 import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { translateNow } from '@/i18n'
-import { finalizeInterruptedMessages } from '@/app/session/hooks/use-prompt-actions/rewind'
 import { textPart } from '@/lib/chat-messages'
 import { coerceGatewayText, coerceThinkingText } from '@/lib/chat-runtime'
 import { playCompletionSound } from '@/lib/completion-sound'

@@ -21,11 +21,13 @@ describe('spectator service worker registration', () => {
   it('registers without forcing a waiting worker to activate', async () => {
     window.__HERMES_SPECTATOR__ = true
     const addEventListener = vi.fn()
+
     const registration = {
       addEventListener,
       installing: null,
       waiting: { postMessage: vi.fn() }
     } as unknown as ServiceWorkerRegistration
+
     const register = vi.fn().mockResolvedValue(registration)
     Object.defineProperty(navigator, 'serviceWorker', {
       configurable: true,

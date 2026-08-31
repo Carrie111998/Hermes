@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { isSpectatorMode, spectatorRoster } from './data'
 import { spectatorSessionOpenPlan } from './bot-row'
+import { isSpectatorMode, spectatorRoster } from './data'
 
 describe('spectator roster', () => {
   afterEach(() => {
@@ -15,6 +15,7 @@ describe('spectator roster', () => {
     window.__HERMES_SPECTATOR__ = true
     window.__HERMES_SPECTATOR_TOKEN__ = 'read-only-token'
     window.__HERMES_BASE_PATH__ = '/hermes'
+
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(
         JSON.stringify({
@@ -64,9 +65,7 @@ describe('spectator roster', () => {
 
   it('opens only an existing persisted conversation without a profile mutation target', () => {
     expect(spectatorSessionOpenPlan(undefined)).toBeNull()
-    expect(
-      spectatorSessionOpenPlan({ id: 'stored-1', message_count: 2 } as never)
-    ).toEqual({
+    expect(spectatorSessionOpenPlan({ id: 'stored-1', message_count: 2 } as never)).toEqual({
       sessionId: 'stored-1',
       options: {
         intent: 'main',

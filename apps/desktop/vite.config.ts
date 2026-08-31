@@ -101,6 +101,68 @@ const emojibaseAssets = () => ({
   }
 })
 
+const spectatorPwaAssets = () => ({
+  name: 'hermes:spectator-pwa-assets',
+  generateBundle(
+    this: { emitFile: (asset: { type: 'asset'; fileName: string; source: string }) => void },
+    _options: unknown,
+    bundle: Record<string, unknown>
+  ) {
+    let commit = process.env.GITHUB_SHA || 'development'
+
+    try {
+      const stamp = JSON.parse(fs.readFileSync(path.resolve(__dirname, 'build/install-stamp.json'), 'utf8'))
+      if (typeof stamp.commit === 'string' && stamp.commit) commit = stamp.commit
+    } catch {
+      // Development/fallback builds keep the explicit development cache key.
+    }
+
+    const immutable = Object.keys(bundle).filter(file => file.startsWith('assets/'))
+    const source = `const CACHE_PREFIX = 'hermes-spectator-';
+const CACHE_NAME = CACHE_PREFIX + ${JSON.stringify(commit)};
+const IMMUTABLE = ${JSON.stringify(immutable)};
+const STATIC = ['manifest.webmanifest', 'apple-touch-icon.png', 'pwa-192.png', 'pwa-512.png', 'spectator-offline.html'];
+const scoped = path => new URL(path, self.registration.scope).toString();
+
+self.addEventListener('install', event => {
+  event.waitUntil(caches.open(CACHE_NAME).then(cache => Promise.all(
+    [...IMMUTABLE, ...STATIC].map(path => cache.add(scoped(path)).catch(() => undefined))
+  )));
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(caches.keys().then(keys => Promise.all(
+    keys.filter(key => key.startsWith(CACHE_PREFIX) && key !== CACHE_NAME).map(key => caches.delete(key))
+  )));
+});
+
+self.addEventListener('fetch', event => {
+  const request = event.request;
+  if (request.method !== 'GET') return;
+  const url = new URL(request.url);
+  if (url.origin !== self.location.origin || url.pathname.includes('/api/') || url.pathname.includes('/auth/')) return;
+
+  if (request.mode === 'navigate') {
+    event.respondWith(fetch(request).catch(() => caches.match(scoped('spectator-offline.html'))));
+    return;
+  }
+
+  const relative = url.pathname.slice(new URL(self.registration.scope).pathname.length);
+  if (!IMMUTABLE.includes(relative) && !STATIC.includes(relative)) return;
+  event.respondWith(caches.match(request).then(cached => cached || fetch(request)));
+});
+
+self.addEventListener('message', event => {
+  if (event.data === 'SKIP_WAITING') self.skipWaiting();
+});
+`
+
+    this.emitFile({ type: 'asset', fileName: 'spectator-sw.js', source })
+    this.emitFile({ type: 'asset', fileName: 'spectator-version.json', source: JSON.stringify({ commit }) })
+  }
+})
+
+
 export default defineConfig(({ command }) => ({
   base: './',
   plugins: [react(), babel({ presets: [compilerPreset()] }), tailwindcss(), emojibaseAssets(), spectatorPwaAssets()],

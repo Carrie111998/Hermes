@@ -46,9 +46,9 @@ describe('browser spectator transport', () => {
     window.__HERMES_SPECTATOR_TOKEN__ = 'read-only-secret'
     vi.mocked(fetch).mockResolvedValueOnce(jsonResponse({ sessions: [] }))
 
-    await expect(
-      browserSpectatorApi({ path: '/api/sessions?limit=40', profile: 'hermes2' })
-    ).resolves.toEqual({ sessions: [] })
+    await expect(browserSpectatorApi({ path: '/api/sessions?limit=40', profile: 'hermes2' })).resolves.toEqual({
+      sessions: []
+    })
 
     expect(fetch).toHaveBeenCalledWith(
       '/api/sessions?limit=40&profile=hermes2',

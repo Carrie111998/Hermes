@@ -88,17 +88,17 @@ interface BotRowProps {
 export function spectatorSessionOpenPlan(previewSession: RosterRow['last_session']) {
   const sessionId = previewSession?.id
 
-  if (!sessionId) return null
+  if (!sessionId) {return null}
 
-  const hasAuthoritativeCount =
-    typeof previewSession.message_count === 'number' && Number.isFinite(previewSession.message_count)
+  const messageCount = previewSession.message_count
+  const hasAuthoritativeCount = typeof messageCount === 'number' && Number.isFinite(messageCount)
 
   return {
     sessionId,
     options: {
       intent: 'main' as const,
       awaitHydration: true,
-      expectHistory: hasAuthoritativeCount ? previewSession.message_count > 0 : true,
+      expectHistory: hasAuthoritativeCount ? messageCount > 0 : true,
       keepAllProfilesScope: false
     }
   }
@@ -151,7 +151,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle, spectator =
   // (age label, pulse dot) follow the same rule via botActivitySession:
   // the canonical Bot Chat is hidden from last_session, so keying age off
   // last_session alone shows "6d ago" on a bot you just messaged.
-  const previewSession = bot.canonical_session || last
+  const previewSession = bot.canonical_session || bot.preferred_session || last
   const activitySession = botActivitySession(bot)
   // A live kanban/tool worker counts as activity (#90268): fresh age while it
   // runs, falling back to chat activity when it ends.
@@ -190,10 +190,13 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle, spectator =
   // DM previews read like DMs: strip the delivery prefix, keep the message.
   const spectatorPreview =
     bot.description || [bot.provider, bot.model].filter(Boolean).join(' · ') || 'Configured Hermes profile'
+
   const displayPreview = spectator
     ? spectatorPreview
     : stripPreviewMarkdown(
-        fromBot ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…' : previewSession?.preview || ''
+        fromBot
+          ? (previewSession?.preview || '').replace(A2A_PREFIX_RE, '').trim() || '…'
+          : previewSession?.preview || ''
       )
 
   const handle = botHandle(bot.name, bot)
@@ -205,7 +208,8 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle, spectator =
     .join(' · ')
 
   const warm = () => {
-    if (spectator) return
+    if (spectator) {return}
+
     // Multi-source row: pre-dial the agent's OWN source (feature-detected).
     if (bot.sourceScoped && typeof host.warmAgent === 'function') {
       try {
@@ -231,6 +235,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle, spectator =
   // Rows and Active Now share the exact-owner open path; only that path may
   // activate a source and resolve the canonical Bot Chat.
   const spectatorOpenPlan = spectatorSessionOpenPlan(previewSession)
+
   const open = async () => {
     if (spectator) {
       if (!spectatorOpenPlan) {
@@ -239,6 +244,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle, spectator =
           title: displayName(bot, meta),
           message: 'This bot has no conversation to observe yet.'
         })
+
         return
       }
 
@@ -247,6 +253,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle, spectator =
       } catch (error) {
         host.notifyError?.(error, `Could not open ${displayName(bot, meta)}'s conversation`)
       }
+
       return
     }
 
@@ -255,8 +262,8 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle, spectator =
 
   const row = (
     <RowButton
-      aria-label={rowTooltip}
       aria-disabled={(spectator && !spectatorOpenPlan) || undefined}
+      aria-label={rowTooltip}
       className={cn(
         'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
         (!spectator || spectatorOpenPlan) && 'hover:bg-(--chrome-action-hover)',
@@ -327,7 +334,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle, spectator =
     </RowButton>
   )
 
-  if (spectator) return row
+  if (spectator) {return row}
 
   return (
     <ContextMenu>

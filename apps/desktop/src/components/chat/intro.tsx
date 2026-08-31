@@ -160,6 +160,7 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
 
 export function Intro({ personality, seed, spectator = false }: IntroProps) {
   const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
+
   const copy = spectator
     ? { headline: 'Hermes spectator', body: 'Select a session to view it. This iPad app is read-only.' }
     : resolveCopy(personality, mountSeed + (seed ?? 0))

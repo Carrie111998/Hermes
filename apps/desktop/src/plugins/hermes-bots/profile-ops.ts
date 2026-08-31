@@ -162,11 +162,12 @@ interface ProfilesGetAssetResult {
 async function spectatorAvatar(name: string): Promise<string> {
   const token = window.__HERMES_SPECTATOR_TOKEN__ || ''
   const base = String(window.__HERMES_BASE_PATH__ || '').replace(/\/$/, '')
+
   const response = await fetch(`${base}/api/profiles/${encodeURIComponent(name)}/avatar`, {
     headers: { 'X-Hermes-Spectator-Token': token }
   })
 
-  if (!response.ok) throw new Error(`profile avatar request failed (${response.status})`)
+  if (!response.ok) {throw new Error(`profile avatar request failed (${response.status})`)}
   const blob = await response.blob()
 
   return new Promise((resolve, reject) => {
@@ -178,7 +179,7 @@ async function spectatorAvatar(name: string): Promise<string> {
 }
 
 export function pullServerAvatars(roster: RosterRow[], { spectator = false }: { spectator?: boolean } = {}) {
-  if (!spectator) pushLocalAvatars(roster)
+  if (!spectator) {pushLocalAvatars(roster)}
 
   for (const bot of roster) {
     const key = botMetaKey(bot)

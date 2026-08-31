@@ -174,7 +174,7 @@ export function useGatewayBoot({
   }
 
   useEffect(() => {
-    if (!isBrowserSpectator()) return
+    if (!isBrowserSpectator()) {return}
 
     let cancelled = false
     let reconnecting = false
@@ -195,7 +195,7 @@ export function useGatewayBoot({
     }
 
     const connect = async () => {
-      if (cancelled || reconnecting || gateway.connectionState === 'open') return
+      if (cancelled || reconnecting || gateway.connectionState === 'open') {return}
       reconnecting = true
 
       try {
@@ -205,11 +205,13 @@ export function useGatewayBoot({
           progress: 90
         })
         const connection = await browserSpectatorConnection()
-        if (cancelled) return
+
+        if (cancelled) {return}
 
         publish(connection)
         await gateway.connect(connection.wsUrl)
-        if (cancelled) return
+
+        if (cancelled) {return}
 
         reconnectAttempt = 0
         $activeGatewayProfile.set('default')
@@ -220,7 +222,7 @@ export function useGatewayBoot({
         ])
         completeDesktopBoot('Spectator connected')
       } catch (error) {
-        if (cancelled) return
+        if (cancelled) {return}
         const message = error instanceof Error ? error.message : String(error)
         failDesktopBoot(message)
         setSessionsLoading(false)
@@ -230,7 +232,7 @@ export function useGatewayBoot({
     }
 
     const scheduleReconnect = () => {
-      if (cancelled || reconnecting || reconnectTimer !== null || gateway.connectionState === 'open') return
+      if (cancelled || reconnecting || reconnectTimer !== null || gateway.connectionState === 'open') {return}
       const delay = reconnectBackoffDelayMs(reconnectAttempt)
       reconnectAttempt += 1
       reconnectTimer = setTimeout(() => {
@@ -244,6 +246,7 @@ export function useGatewayBoot({
 
     const offState = gateway.onState(state => {
       reportPrimaryGatewayState(state)
+
       if (state === 'open') {
         reconnectAttempt = 0
         clearReconnectTimer()
@@ -251,10 +254,12 @@ export function useGatewayBoot({
         scheduleReconnect()
       }
     })
+
     const offEvent = gateway.onEvent(event => callbacksRef.current.handleGatewayEvent({ ...event, profile: 'default' }))
     const onOnline = () => void connect()
+
     const onVisible = () => {
-      if (document.visibilityState === 'visible') void connect()
+      if (document.visibilityState === 'visible') {void connect()}
     }
 
     window.addEventListener('online', onOnline)

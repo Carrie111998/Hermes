@@ -732,6 +732,20 @@ def _has_valid_session_token(request: Request) -> bool:
     return hmac.compare_digest(auth.encode(), expected.encode())
 
 
+def _has_valid_spectator_token(request: Request) -> bool:
+    token = request.headers.get(_SPECTATOR_HEADER_NAME, "")
+    return bool(token) and hmac.compare_digest(token.encode(), _SPECTATOR_TOKEN.encode())
+
+
+def _spectator_request_is_allowed(method: str, path: str) -> bool:
+    if method.upper() != "GET":
+        return False
+    return any(
+        path == prefix or path.startswith(f"{prefix}/")
+        for prefix in _SPECTATOR_READ_API_PREFIXES
+    )
+
+
 # Routes that may also authenticate via a ``?token=`` query param, for download
 # links opened by the OS shell or a new browser tab where the session header
 # can't be set. Kept narrow — same query-token tradeoff as the /api/pty WS.
@@ -1073,6 +1087,8 @@ async def _plugin_api_runtime_gate(request: Request, call_next):
 
 @app.middleware("http")
 async def _dashboard_auth_gate(request: Request, call_next):
+    if getattr(request.state, "spectator_authenticated", False):
+        return await call_next(request)
     from hermes_cli.dashboard_auth.middleware import gated_auth_middleware
     return await gated_auth_middleware(request, call_next)
 
@@ -1084,6 +1100,8 @@ async def auth_middleware(request: Request, call_next):
     # presenting a bearer token on a registered token route) carries
     # ``token_authenticated`` — never bounce it through the cookie/session gate.
     if getattr(request.state, "token_authenticated", False):
+        return await call_next(request)
+    if getattr(request.state, "spectator_authenticated", False):
         return await call_next(request)
     # When the OAuth gate is active, cookie-based auth (gated_auth_middleware
     # above) is authoritative.  The legacy _SESSION_TOKEN path is loopback-only
@@ -1113,6 +1131,17 @@ async def _token_auth_seam(request: Request, call_next):
     """
     from hermes_cli.dashboard_auth.token_auth import token_auth_middleware
     return await token_auth_middleware(request, call_next)
+
+
+@app.middleware("http")
+async def _spectator_scope_gate(request: Request, call_next):
+    """Authenticate the iPad credential and enforce its read-only route scope."""
+    if not _has_valid_spectator_token(request):
+        return await call_next(request)
+    if not _spectator_request_is_allowed(request.method, request.url.path):
+        return JSONResponse(status_code=403, content={"detail": "Spectator is read-only"})
+    request.state.spectator_authenticated = True
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -18063,13 +18092,12 @@ def mount_spa(application: FastAPI):
             gated = bool(getattr(app.state, "auth_required", False))
             spectator_prefix = f"{prefix}/spectator"
             assignments = [
+                f'window.__HERMES_SPECTATOR_TOKEN__={json.dumps(_SPECTATOR_TOKEN)};',
                 f'window.__HERMES_BASE_PATH__={json.dumps(prefix)};',
                 f'window.__HERMES_SPECTATOR_BASE_PATH__={json.dumps(spectator_prefix)};',
                 "window.__HERMES_SPECTATOR__=true;",
                 f"window.__HERMES_AUTH_REQUIRED__={'true' if gated else 'false'};",
             ]
-            if not gated:
-                assignments.insert(0, f'window.__HERMES_SESSION_TOKEN__={json.dumps(_SESSION_TOKEN)};')
             bootstrap = f"<script>{''.join(assignments)}</script>"
             html = html.replace("</head>", f"{bootstrap}</head>", 1)
             return HTMLResponse(

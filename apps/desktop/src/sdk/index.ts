@@ -42,6 +42,7 @@ import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
 import type { WorkspaceMode } from '@/contrib/types'
 import { deleteProfile, getLogs, getStatus, hermesApi, type HermesGateway } from '@/hermes'
+import { isBrowserSpectator } from '@/platform/browser-spectator'
 import {
   $gateway,
   activeGatewayConnectionId,
@@ -54,7 +55,6 @@ import {
   retireLocalProfileGateways
 } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
-import { isBrowserSpectator } from '@/platform/browser-spectator'
 import {
   $activeGatewayProfile,
   $gatewaySwapTarget,

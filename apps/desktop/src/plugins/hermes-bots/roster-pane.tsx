@@ -486,6 +486,7 @@ export function BotsPane() {
 
     mergeServerMeta(activeSourceRoster, data?.fetchedAt || 0)
     pullServerAvatars(activeSourceRoster, { spectator })
+
     if (!spectator) {
       trackInboundActivity(roster)
       backfillMessagingProtocol(activeSourceRoster)
@@ -612,42 +613,42 @@ export function BotsPane() {
         </span>
         {spectator ? null : (
           <div className="flex items-center gap-0.5">
-          <Tip
-            label={activityToasts ? 'Activity toasts on — click to silence' : 'Activity toasts off — click to enable'}
-          >
-            <Button
-              className="rounded-md text-(--ui-text-tertiary) hover:text-foreground"
-              onClick={() => setActivityToasts(!activityToasts)}
-              size="icon-xs"
-              variant="ghost"
+            <Tip
+              label={activityToasts ? 'Activity toasts on — click to silence' : 'Activity toasts off — click to enable'}
             >
-              <Codicon name={activityToasts ? 'bell' : 'bell-slash'} />
-            </Button>
-          </Tip>
-          <DropdownMenu>
-            <Tip label="New…">
-              <DropdownMenuTrigger asChild>
-                <Button
-                  aria-label={b.roster.newBotOrGroup}
-                  className="rounded-md text-(--ui-text-tertiary) hover:text-foreground"
-                  size="icon-xs"
-                  variant="ghost"
-                >
-                  <Codicon name="add" />
-                </Button>
-              </DropdownMenuTrigger>
+              <Button
+                className="rounded-md text-(--ui-text-tertiary) hover:text-foreground"
+                onClick={() => setActivityToasts(!activityToasts)}
+                size="icon-xs"
+                variant="ghost"
+              >
+                <Codicon name={activityToasts ? 'bell' : 'bell-slash'} />
+              </Button>
             </Tip>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem onSelect={() => setCreateOpen(true)}>
-                <Codicon className="mr-1.5" name="hubot" />
-                {b.bot.newTitle}
-              </DropdownMenuItem>
-              <DropdownMenuItem disabled={activeSourceRoster.length < 2} onSelect={() => setGroupCreateOpen(true)}>
-                <Codicon className="mr-1.5" name="organization" />
-                {b.group.newTitle}
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+            <DropdownMenu>
+              <Tip label="New…">
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    aria-label={b.roster.newBotOrGroup}
+                    className="rounded-md text-(--ui-text-tertiary) hover:text-foreground"
+                    size="icon-xs"
+                    variant="ghost"
+                  >
+                    <Codicon name="add" />
+                  </Button>
+                </DropdownMenuTrigger>
+              </Tip>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem onSelect={() => setCreateOpen(true)}>
+                  <Codicon className="mr-1.5" name="hubot" />
+                  {b.bot.newTitle}
+                </DropdownMenuItem>
+                <DropdownMenuItem disabled={activeSourceRoster.length < 2} onSelect={() => setGroupCreateOpen(true)}>
+                  <Codicon className="mr-1.5" name="organization" />
+                  {b.group.newTitle}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
           </div>
         )}
       </div>

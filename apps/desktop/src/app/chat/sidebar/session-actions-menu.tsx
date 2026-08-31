@@ -612,11 +612,16 @@ export function SessionActionsMenu({ children, align = 'end', sideOffset = 6, ..
 
 interface SessionContextMenuProps extends SessionActions {
   children: React.ReactNode
+  disabled?: boolean
 }
 
-export function SessionContextMenu({ children, ...actions }: SessionContextMenuProps) {
+export function SessionContextMenu({ children, disabled = false, ...actions }: SessionContextMenuProps) {
   const { t } = useI18n()
   const { deleteDialog, onCloseAutoFocus, renameDialog, renderItems } = useSessionActions(actions)
+
+  if (disabled) {
+    return <>{children}</>
+  }
 
   return (
     <>

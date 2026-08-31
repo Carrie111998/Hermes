@@ -111,11 +111,7 @@ export class HermesSpectatorGateway extends HermesGateway {
     return result
   }
 
-  private async subscribe<T>(
-    params: Record<string, unknown>,
-    timeoutMs?: number,
-    signal?: AbortSignal
-  ): Promise<T> {
+  private async subscribe<T>(params: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
     const target = String(params.session_id ?? '').trim()
 
     if (!target) {
@@ -138,24 +134,14 @@ export class HermesSpectatorGateway extends HermesGateway {
     const cursor = this.cursors.get(target)
     const requestParams = cursor ? { ...cleanParams, cursor } : cleanParams
 
-    let result = await super.request<SpectatorSubscriptionResult>(
-      'session.subscribe',
-      requestParams,
-      timeoutMs,
-      signal
-    )
+    let result = await super.request<SpectatorSubscriptionResult>('session.subscribe', requestParams, timeoutMs, signal)
 
     // The session-selection path hydrates the durable REST transcript before
     // it calls subscribe. A gap therefore means that hydration is already the
     // authoritative baseline: clear the stale cursor and attach at "now".
     if (result.replay_gap && !result.subscribed) {
       this.cursors.delete(target)
-      result = await super.request<SpectatorSubscriptionResult>(
-        'session.subscribe',
-        cleanParams,
-        timeoutMs,
-        signal
-      )
+      result = await super.request<SpectatorSubscriptionResult>('session.subscribe', cleanParams, timeoutMs, signal)
     }
 
     if (result.subscribed) {
@@ -167,11 +153,7 @@ export class HermesSpectatorGateway extends HermesGateway {
     return result as T
   }
 
-  private async unsubscribe<T>(
-    params: Record<string, unknown>,
-    timeoutMs?: number,
-    signal?: AbortSignal
-  ): Promise<T> {
+  private async unsubscribe<T>(params: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal): Promise<T> {
     const result = await super.request<T>('session.unsubscribe', params, timeoutMs, signal)
     const target = String(params.session_id ?? '').trim()
 

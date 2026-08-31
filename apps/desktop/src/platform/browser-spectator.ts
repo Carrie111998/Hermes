@@ -40,7 +40,10 @@ function requestPath(request: HermesApiRequest): string {
   }
 
   const parsed = new URL(request.path, window.location.origin)
-  const allowed = READ_ONLY_PREFIXES.some(prefix => parsed.pathname === prefix || parsed.pathname.startsWith(`${prefix}/`))
+
+  const allowed = READ_ONLY_PREFIXES.some(
+    prefix => parsed.pathname === prefix || parsed.pathname.startsWith(`${prefix}/`)
+  )
 
   if (!allowed) {
     throw new Error(`Spectator endpoint is not read-enabled: ${parsed.pathname}`)
@@ -100,7 +103,10 @@ export async function browserSpectatorApi<T>(request: HermesApiRequest): Promise
     })
 
     if (response.status === 401 && window.__HERMES_AUTH_REQUIRED__) {
-      const body = (await response.clone().json().catch(() => null)) as null | { login_url?: string }
+      const body = (await response
+        .clone()
+        .json()
+        .catch(() => null)) as null | { login_url?: string }
 
       if (body?.login_url) {
         window.location.assign(body.login_url)

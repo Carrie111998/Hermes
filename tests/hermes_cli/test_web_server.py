@@ -5293,7 +5293,7 @@ class TestSpectatorServerScope:
 
         captured = []
 
-        async def fake_handle_ws(socket, *, allowed_methods=None):
+        async def fake_handle_ws(socket, *, allowed_methods=None, auth_identity=None, subprotocol=None):
             captured.append(allowed_methods)
             await socket.accept()
             await socket.close()

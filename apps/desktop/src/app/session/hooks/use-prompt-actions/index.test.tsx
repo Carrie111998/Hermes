@@ -2752,6 +2752,7 @@ describe('usePromptActions file attachment sync', () => {
     })
     expect(calls[1]?.params).toEqual({
       session_id: RUNTIME_SESSION_ID,
+      display_text: 'convert this to epub',
       text: '@file:.hermes/desktop-attachments/report.txt\n\nconvert this to epub'
     })
   })
@@ -2806,7 +2807,11 @@ describe('usePromptActions file attachment sync', () => {
     })
     expect(calls[1]).toEqual({
       method: 'prompt.submit',
-      params: { session_id: RUNTIME_SESSION_ID, text: '@file:.hermes/desktop-attachments/report.txt\n\nsummarize' }
+      params: {
+        session_id: RUNTIME_SESSION_ID,
+        display_text: 'summarize',
+        text: '@file:.hermes/desktop-attachments/report.txt\n\nsummarize'
+      }
     })
   })
 
@@ -3184,7 +3189,11 @@ describe('usePromptActions file attachment sync', () => {
     expect(calls[0]?.params).not.toHaveProperty('data_url')
     expect(calls[1]).toEqual({
       method: 'prompt.submit',
-      params: { session_id: RUNTIME_SESSION_ID, text: '@file:data/report.txt\n\nsummarize' }
+      params: {
+        session_id: RUNTIME_SESSION_ID,
+        display_text: 'summarize',
+        text: '@file:data/report.txt\n\nsummarize'
+      }
     })
   })
 })

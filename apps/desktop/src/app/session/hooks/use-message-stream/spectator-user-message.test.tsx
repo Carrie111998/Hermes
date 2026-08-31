@@ -18,6 +18,7 @@ function Harness() {
   const activeSessionIdRef = useRef<string | null>(SID)
   const sessionStateByRuntimeIdRef = useRef(sessionStates)
   const queryClientRef = useRef(new QueryClient())
+
   const stream = useMessageStream({
     activeSessionIdRef,
     hydrateFromStoredSession: vi.fn(async () => undefined),
@@ -28,6 +29,7 @@ function Harness() {
     updateSessionState: (sessionId, updater) => {
       const next = updater(sessionStates.get(sessionId) ?? createClientSessionState())
       sessionStates.set(sessionId, next)
+
       return next
     }
   })
@@ -35,6 +37,7 @@ function Harness() {
   useEffect(() => {
     handleEvent = stream.handleGatewayEvent
   }, [stream.handleGatewayEvent])
+
   return null
 }
 
@@ -74,6 +77,7 @@ describe('spectator accepted user-message mirror', () => {
       text: 'Reply exactly: IPAD LIVE RELAY OK',
       timestamp: 123
     }
+
     emit(payload)
     emit(payload)
 

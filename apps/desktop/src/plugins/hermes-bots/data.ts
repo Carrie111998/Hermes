@@ -621,16 +621,18 @@ export function isSpectatorMode(): boolean {
 export async function spectatorRoster(): Promise<RosterSnapshot> {
   const token = typeof window !== 'undefined' ? window.__HERMES_SPECTATOR_TOKEN__ : ''
 
-  if (!token) throw new Error('spectator credential unavailable')
+  if (!token) {throw new Error('spectator credential unavailable')}
 
   const base = String(window.__HERMES_BASE_PATH__ || '').replace(/\/$/, '')
+
   const response = await fetch(`${base}/api/profiles?bot_roster=true`, {
     headers: { 'X-Hermes-Spectator-Token': token }
   })
 
-  if (!response.ok) throw new Error(`profile roster request failed (${response.status})`)
+  if (!response.ok) {throw new Error(`profile roster request failed (${response.status})`)}
 
   const payload = await response.json()
+
   const profiles = (Array.isArray(payload?.profiles) ? payload.profiles : [])
     .map((profile: Record<string, unknown>) => ({
       name: String(profile?.name || '').trim(),
@@ -850,11 +852,12 @@ function mergeMultiSourceRoster(
   // (for example This Device plus its Tailscale URL). Treat matching install
   // ids as one source so the rich active row is not cloned as a remote bot.
   const sources = Array.isArray(union?.sources) ? union.sources : []
-  const activeSourceId =
-    activeId || String(sources.find(source => source?.kind === 'local')?.connectionId || '').trim()
+  const activeSourceId = activeId || String(sources.find(source => source?.kind === 'local')?.connectionId || '').trim()
+
   const activeInstallId = String(
     sources.find(source => String(source?.connectionId || '').trim() === activeSourceId)?.installId || ''
   ).trim()
+
   const activeSourceIds = new Set(activeSourceId ? [activeSourceId] : [])
 
   if (activeInstallId) {
@@ -862,7 +865,7 @@ function mergeMultiSourceRoster(
       if (String(source?.installId || '').trim() === activeInstallId) {
         const connectionId = String(source?.connectionId || '').trim()
 
-        if (connectionId) activeSourceIds.add(connectionId)
+        if (connectionId) {activeSourceIds.add(connectionId)}
       }
     }
   }
@@ -921,6 +924,7 @@ function mergeMultiSourceRoster(
       : activeId
         ? connectionId === activeId
         : agent.connectionKind === 'local'
+
     const row = isActiveSource ? activeByName.get(profile) : null
 
     if (row) {

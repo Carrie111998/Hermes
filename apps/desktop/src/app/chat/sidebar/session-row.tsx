@@ -24,6 +24,7 @@ import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
+import { isBrowserSpectator } from '@/platform/browser-spectator'
 import { $sidebarRowMeta } from '@/store/layout'
 import { normalizeProfileKey } from '@/store/profile'
 import { $projects } from '@/store/projects'
@@ -143,6 +144,7 @@ function SidebarSessionRowImpl({
   ...rest
 }: SidebarSessionRowProps) {
   const { t } = useI18n()
+  const spectator = isBrowserSpectator()
   const r = t.sidebar.row
   const { cancelPrewarm, startPrewarm } = useProfilePrewarm(session.profile)
   const title = sessionTitle(session)
@@ -307,36 +309,39 @@ function SidebarSessionRowImpl({
           {node}
         </span>
       ))}
-      <SessionActionsMenu
-        onArchive={onArchive}
-        onBranch={onBranch}
-        onDelete={onDelete}
-        onPin={onPin}
-        onToggleUnread={onToggleUnread}
-        pinned={isPinned}
-        profile={session.profile}
-        sessionId={session.id}
-        title={title}
-        unread={unread}
-      >
-        <Button
-          aria-label={r.sessionActions}
-          className={cn(
-            'size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!',
-            trailing.length > 0 && 'absolute right-0',
-            pr && KEBAB_YIELDS
-          )}
-          size="icon"
-          variant="ghost"
+      {spectator ? null : (
+        <SessionActionsMenu
+          onArchive={onArchive}
+          onBranch={onBranch}
+          onDelete={onDelete}
+          onPin={onPin}
+          onToggleUnread={onToggleUnread}
+          pinned={isPinned}
+          profile={session.profile}
+          sessionId={session.id}
+          title={title}
+          unread={unread}
         >
-          <Codicon name="kebab-vertical" size="0.875rem" />
-        </Button>
-      </SessionActionsMenu>
+          <Button
+            aria-label={r.sessionActions}
+            className={cn(
+              'size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!',
+              trailing.length > 0 && 'absolute right-0',
+              pr && KEBAB_YIELDS
+            )}
+            size="icon"
+            variant="ghost"
+          >
+            <Codicon name="kebab-vertical" size="0.875rem" />
+          </Button>
+        </SessionActionsMenu>
+      )}
     </div>
   )
 
   return (
     <SessionContextMenu
+      disabled={spectator}
       onArchive={onArchive}
       onBranch={onBranch}
       onDelete={onDelete}
@@ -377,27 +382,31 @@ function SidebarSessionRowImpl({
         // target (the session drop denies: side chrome hosts no main tile);
         // over the tree only the session drop does (no sortable row there).
         // Whichever one the release lands on is the one that commits.
-        {...dragHandleProps}
-        onPointerDown={event => {
-          // The grabber already carries these same listeners, and the ⋯
-          // cluster keeps its own gestures.
-          if ((event.target as HTMLElement).closest('[data-reorder-handle], [data-row-actions]')) {
-            return
-          }
+        {...(spectator ? {} : dragHandleProps)}
+        onPointerDown={
+          spectator
+            ? undefined
+            : event => {
+                // The grabber already carries these same listeners, and the ⋯
+                // cluster keeps its own gestures.
+                if ((event.target as HTMLElement).closest('[data-reorder-handle], [data-row-actions]')) {
+                  return
+                }
 
-          // A POINTER drag on the shared drag session (never native HTML5 DnD:
-          // no macOS snap-back, Esc aborts instantly). Sub-threshold releases
-          // stay ordinary clicks, so resume / pin / open-in-window are
-          // untouched.
-          startSessionDrag({ id: session.id, profile: session.profile || 'default', title }, event)
-          dragHandleProps?.onPointerDown?.(event)
-        }}
+                // A POINTER drag on the shared drag session (never native HTML5 DnD:
+                // no macOS snap-back, Esc aborts instantly). Sub-threshold releases
+                // stay ordinary clicks, so resume / pin / open-in-window are
+                // untouched.
+                startSessionDrag({ id: session.id, profile: session.profile || 'default', title }, event)
+                dragHandleProps?.onPointerDown?.(event)
+              }
+        }
         // Hovering a row from another profile (the all-profiles view) telegraphs
         // a cross-profile resume — start that backend's spawn now so the click
         // doesn't pay the full cold boot. Same-profile rows no-op inside
         // prewarmProfileBackend.
-        onPointerEnter={startPrewarm}
-        onPointerLeave={cancelPrewarm}
+        onPointerEnter={spectator ? undefined : startPrewarm}
+        onPointerLeave={spectator ? undefined : cancelPrewarm}
         ref={ref}
         style={style}
         {...rest}
