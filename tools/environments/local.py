@@ -1947,7 +1947,8 @@ class LocalEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
-                  stdin_data: str | None = None) -> subprocess.Popen:
+                  stdin_data: str | None = None,
+                  merge_stderr: bool = True) -> subprocess.Popen:
         bash = _find_bash()
         # For login-shell invocations (used by init_session to build the
         # environment snapshot), prepend sources for the user's bashrc /
@@ -1998,7 +1999,11 @@ class LocalEnvironment(BaseEnvironment):
             encoding="utf-8",
             errors="replace",
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            # File operations need stdout as an exact data channel. Merging
+            # stderr here lets BASH_ENV / shell-hook warnings become part of
+            # a file read or patch payload (#94078). Interactive terminal
+            # commands still merge (default) so those diagnostics stay visible.
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True,
             cwd=_popen_cwd,

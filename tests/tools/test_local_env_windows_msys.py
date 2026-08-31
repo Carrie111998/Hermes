@@ -311,7 +311,7 @@ class TestWrapCommandWindowsNativeCwd:
     def test_init_session_bootstrap_rewrites_backslash_snapshot_paths(self, monkeypatch):
         captured = {}
 
-        def fake_run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+        def fake_run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None, merge_stderr=True):
             captured.setdefault("script", cmd_string)  # bootstrap only; ignore the failure-path probe
             raise RuntimeError("stop after capturing bootstrap")
 

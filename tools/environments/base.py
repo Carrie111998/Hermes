@@ -710,11 +710,17 @@ class BaseEnvironment(ABC):
         login: bool = False,
         timeout: int = 120,
         stdin_data: str | None = None,
+        merge_stderr: bool = True,
     ) -> ProcessHandle:
         """Spawn a bash process to run *cmd_string*.
 
         Returns a ProcessHandle (subprocess.Popen or _ThreadedProcessHandle).
         Must be overridden by every backend.
+
+        ``merge_stderr=False`` asks the backend to keep stderr off the
+        stdout pipe so internal file-operation consumers get an exact
+        data channel (#94078). Backends that cannot split streams may
+        ignore the flag.
         """
         raise NotImplementedError(f"{type(self).__name__} must implement _run_bash()")
 
@@ -1230,6 +1236,34 @@ class BaseEnvironment(ABC):
 
         drain_thread = threading.Thread(target=_drain, daemon=True)
         drain_thread.start()
+
+        # When stdout and stderr are separate pipes (file-operation path),
+        # drain stderr too or a chatty hook can fill the pipe and deadlock
+        # the child. Terminal commands still merge stderr into stdout, so
+        # proc.stderr is None there.
+        stderr_chunks: list[str] = []
+        stderr_thread: threading.Thread | None = None
+        if getattr(proc, "stderr", None) is not None:
+            def _drain_stderr() -> None:
+                stream = proc.stderr
+                try:
+                    data = stream.read() if stream is not None else None
+                except Exception:
+                    return
+                if not data:
+                    return
+                if isinstance(data, bytes):
+                    stderr_chunks.append(data.decode("utf-8", errors="replace"))
+                else:
+                    stderr_chunks.append(str(data))
+
+            stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+            stderr_thread.start()
+
+        def _join_io(timeout: float = 2) -> None:
+            drain_thread.join(timeout=timeout)
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=timeout)
         deadline = time.monotonic() + timeout
         _now = time.monotonic()
         _activity_state = {
@@ -1268,11 +1302,12 @@ class BaseEnvironment(ABC):
                             _tid, _pid, _iter_count, time.monotonic() - _activity_state["start"],
                         )
                     self._kill_process(proc)
-                    drain_thread.join(timeout=2)
+                    _join_io()
                     return self._finalize_wait_result(
                         output,
                         output.render(suffix="\n[Command interrupted]"),
                         130,
+                        stderr="".join(stderr_chunks),
                     )
                 if time.monotonic() > deadline:
                     if _DEBUG_INTERRUPT:
@@ -1282,7 +1317,7 @@ class BaseEnvironment(ABC):
                             _tid, _pid, _iter_count, timeout,
                         )
                     self._kill_process(proc)
-                    drain_thread.join(timeout=2)
+                    _join_io()
                     timeout_msg = f"\n[Command timed out after {timeout}s]"
                     return self._finalize_wait_result(
                         output,
@@ -1290,6 +1325,7 @@ class BaseEnvironment(ABC):
                         if output.total_chars == 0
                         else output.render(suffix=timeout_msg),
                         124,
+                        stderr="".join(stderr_chunks),
                     )
                 # Periodic activity touch so the gateway knows we're alive
                 touch_activity_if_due(_activity_state, "terminal command running")
@@ -1340,7 +1376,7 @@ class BaseEnvironment(ABC):
                 )
             try:
                 self._kill_process(proc)
-                drain_thread.join(timeout=2)
+                _join_io()
             except Exception:
                 pass  # cleanup is best-effort
             raise
@@ -1348,10 +1384,15 @@ class BaseEnvironment(ABC):
         # Drain thread now exits promptly after bash does (~300ms idle
         # check).  A short join is enough; a long one would be a bug since
         # it means the non-blocking loop itself stopped cooperating.
-        drain_thread.join(timeout=2)
+        _join_io()
 
         try:
             proc.stdout.close()
+        except Exception:
+            pass
+        try:
+            if getattr(proc, "stderr", None) is not None:
+                proc.stderr.close()
         except Exception:
             pass
 
@@ -1373,7 +1414,9 @@ class BaseEnvironment(ABC):
         if stdin_thread is not None:
             stdin_thread.join(timeout=5)
         rendered = output.render()
-        result = self._finalize_wait_result(output, rendered, proc.returncode)
+        result = self._finalize_wait_result(
+            output, rendered, proc.returncode, stderr="".join(stderr_chunks)
+        )
         stdin_errors = getattr(proc, "_hermes_stdin_errors", None)
         if stdin_errors:
             err = str(stdin_errors[0])
@@ -1383,9 +1426,12 @@ class BaseEnvironment(ABC):
 
     @staticmethod
     def _finalize_wait_result(collector: "_BoundedOutputCollector",
-                              rendered: str, returncode: int | None) -> dict:
+                              rendered: str, returncode: int | None,
+                              stderr: str = "") -> dict:
         """Assemble a wait result, attaching spill metadata when overflow occurred."""
         result = {"output": rendered, "returncode": returncode}
+        if stderr:
+            result["stderr"] = stderr
         spill = collector.close_spill()
         if spill:
             result["output_total_chars"] = collector.total_chars
@@ -1476,6 +1522,7 @@ class BaseEnvironment(ABC):
         stdin_data: str | None = None,
         rewrite_compound_background: bool = True,
         bounded_capture: bool = False,
+        merge_stderr: bool = True,
     ) -> dict:
         """Execute a command, return {"output": str, "returncode": int}.
 
@@ -1487,6 +1534,11 @@ class BaseEnvironment(ABC):
         full-fidelity consumers — file operations ``cat`` reads that feed
         the patch engine, code-execution RPC reads, log reads — MUST leave
         it False: truncating those corrupts data, not just display.
+
+        ``merge_stderr=False`` keeps hook/diagnostic stderr off the stdout
+        used as a file-operation data channel (#94078). Failed commands still
+        append stderr so error text is not lost. The default remains merged
+        so interactive terminal commands keep showing shell-hook warnings.
         """
         self._before_execute()
 
@@ -1520,13 +1572,25 @@ class BaseEnvironment(ABC):
         login = not self._snapshot_ready and not self._prefer_nonlogin
 
         proc = self._run_bash(
-            wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
+            wrapped,
+            login=login,
+            timeout=effective_timeout,
+            stdin_data=effective_stdin,
+            merge_stderr=merge_stderr,
         )
         result = self._wait_for_process(
             proc, timeout=effective_timeout, bounded_capture=bounded_capture
         )
         self._update_cwd(result)
 
+        if not merge_stderr:
+            # Success (exit 0): stdout is the data. Any other outcome —
+            # nonzero *or* a missing code (killed/interrupted before
+            # wait set one) — keeps stderr so rg/python diagnostics
+            # that used to ride the merged pipe are not dropped.
+            extra = result.pop("stderr", "") or ""
+            if result.get("returncode") != 0:
+                result["output"] = f"{result.get('output') or ''}{extra}"
         return result
 
     # ------------------------------------------------------------------

@@ -601,6 +601,7 @@ class VercelSandboxEnvironment(BaseEnvironment):
         login: bool = False,
         timeout: int = 120,
         stdin_data: str | None = None,
+        merge_stderr: bool = True,
     ):
         """Run a bash command in the Vercel sandbox.
 
@@ -615,6 +616,7 @@ class VercelSandboxEnvironment(BaseEnvironment):
         """
         del timeout
         del stdin_data
+        del merge_stderr
 
         sandbox = self._sandbox
         if sandbox is None:

@@ -15,7 +15,7 @@ class _TestableEnv(BaseEnvironment):
     def __init__(self, cwd="/tmp", timeout=10):
         super().__init__(cwd=cwd, timeout=timeout)
 
-    def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+    def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None, merge_stderr=True):
         raise NotImplementedError("Use mock")
 
     def cleanup(self):
@@ -139,7 +139,7 @@ class TestAtomicSnapshotWrite:
         env = _TestableEnv()
         captured = {}
 
-        def fake_run_bash(cmd_string, *, login=False, timeout=120, stdin_data=None):
+        def fake_run_bash(cmd_string, *, login=False, timeout=120, stdin_data=None, merge_stderr=True):
             captured.setdefault("cmd", cmd_string)  # only the bootstrap; ignore the failure-path probe
             raise RuntimeError("stop after capture")
 
@@ -159,7 +159,7 @@ class TestAtomicSnapshotWrite:
         env = _TestableEnv()
         captured = {}
 
-        def fake_run_bash(cmd_string, *, login=False, timeout=120, stdin_data=None):
+        def fake_run_bash(cmd_string, *, login=False, timeout=120, stdin_data=None, merge_stderr=True):
             captured.setdefault("cmd", cmd_string)  # only the bootstrap; ignore the failure-path probe
             raise RuntimeError("stop after capture")
 
@@ -272,7 +272,7 @@ class TestSnapshotFileModes:
             def get_temp_dir(self):
                 return self._temp_dir
 
-            def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+            def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None, merge_stderr=True):
                 proc = subprocess.Popen(
                     ["/bin/bash", "-lc", cmd_string],
                     stdout=subprocess.PIPE,
@@ -364,7 +364,7 @@ class TestInitSessionFailure:
         """Login snapshot failure + working non-login probe → don't use bash -l."""
         env = _TestableEnv()
 
-        def mock_run_bash(cmd, *, login=False, timeout=120, stdin_data=None):
+        def mock_run_bash(cmd, *, login=False, timeout=120, stdin_data=None, merge_stderr=True):
             mock = MagicMock()
             mock.poll.return_value = 0
             mock.stdout = iter([])
@@ -382,7 +382,7 @@ class TestInitSessionFailure:
 
         calls = []
 
-        def track_run_bash(cmd, *, login=False, timeout=120, stdin_data=None):
+        def track_run_bash(cmd, *, login=False, timeout=120, stdin_data=None, merge_stderr=True):
             calls.append({"login": login})
             mock = MagicMock()
             mock.poll.return_value = 0

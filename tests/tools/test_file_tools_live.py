@@ -97,6 +97,15 @@ class TestLocalEnvironmentExecute:
         assert result["output"] == "exact"
         _assert_clean(result["output"])
 
+    def test_merged_stderr_still_shows_bash_env_hook(self, env, tmp_path, monkeypatch):
+        """Interactive terminal commands keep hook diagnostics on the merged pipe."""
+        hook = tmp_path / "hook.sh"
+        hook.write_text("printf 'HOOK_WARNING\\n' >&2\n")
+        monkeypatch.setenv("BASH_ENV", str(hook))
+        result = env.execute("printf 'PAYLOAD\\n'")
+        assert result["returncode"] == 0
+        assert "HOOK_WARNING" in result["output"]
+        assert "PAYLOAD" in result["output"]
 
     def test_cat_deterministic_content(self, env, tmp_path):
         f = tmp_path / "det.txt"
@@ -105,6 +114,50 @@ class TestLocalEnvironmentExecute:
         assert result["returncode"] == 0
         assert result["output"] == SIMPLE_CONTENT
         _assert_clean(result["output"])
+
+    def test_split_stderr_still_appended_on_failure(self, env, tmp_path, monkeypatch):
+        """File-ops split streams on success; failures still keep stderr text."""
+        hook = tmp_path / "hook.sh"
+        hook.write_text("printf 'HOOK_WARNING\\n' >&2\n")
+        monkeypatch.setenv("BASH_ENV", str(hook))
+        result = env.execute("printf 'PAYLOAD\\n'; printf 'CMD_ERR\\n' >&2; exit 3", merge_stderr=False)
+        assert result["returncode"] == 3
+        assert "PAYLOAD" in result["output"]
+        assert "CMD_ERR" in result["output"]
+
+    def test_split_stderr_kept_when_returncode_is_none(self, env, tmp_path, monkeypatch):
+        """A missing wait code must not drop captured stderr (#94078 review)."""
+        hook = tmp_path / "hook.sh"
+        hook.write_text("printf 'HOOK_WARNING\\n' >&2\n")
+        monkeypatch.setenv("BASH_ENV", str(hook))
+        real_wait = env._wait_for_process
+
+        def wait_without_code(proc, **kwargs):
+            result = real_wait(proc, **kwargs)
+            result["returncode"] = None
+            return result
+
+        monkeypatch.setattr(env, "_wait_for_process", wait_without_code)
+        result = env.execute("printf 'PAYLOAD\\n'; printf 'CMD_ERR\\n' >&2", merge_stderr=False)
+        assert result["returncode"] is None
+        assert "PAYLOAD" in result["output"]
+        assert "CMD_ERR" in result["output"]
+
+
+class TestFileOpsExactStdout:
+    def test_read_file_drops_bash_env_hook_warning(self, tmp_path, monkeypatch):
+        """Internal file-ops must not treat shell-hook stderr as file bytes (#94078)."""
+        hook = tmp_path / "hook.sh"
+        hook.write_text("printf 'HOOK_WARNING\\n' >&2\n")
+        monkeypatch.setenv("BASH_ENV", str(hook))
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+        ops = ShellFileOperations(env, cwd=str(tmp_path))
+        target = tmp_path / "payload.txt"
+        target.write_text("PAYLOAD\n")
+        result = ops.read_file(str(target))
+        assert result.error is None
+        assert "HOOK_WARNING" not in (result.content or "")
+        assert "PAYLOAD" in (result.content or "")
 
 
 # ── _has_command ─────────────────────────────────────────────────────────

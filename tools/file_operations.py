@@ -414,10 +414,10 @@ def _search_stdout_and_limit(result: ExecuteResult) -> tuple[str, Optional[str]]
 def _split_tool_diagnostics(output: str) -> tuple[str, str]:
     """Separate rg/grep diagnostic lines from real match output.
 
-    ``_exec`` runs commands with ``stderr=subprocess.STDOUT``, so error and
-    warning text from ``rg``/``grep`` is interleaved with match lines in a
-    single stream. Diagnostics must not be parsed as matches, and on a hard
-    failure they are the error message to surface.
+    Failed commands still append stderr so ``rg``/``grep`` diagnostics remain
+    in the captured output. On success, stdout is exact match text. Diagnostics
+    must not be parsed as matches, and on a hard failure they are the error
+    message to surface.
 
     Returns ``(diagnostics, payload)`` where ``payload`` contains only lines
     that look like real search output — a match line (``file:line:content``),
@@ -992,7 +992,12 @@ class ShellFileOperations(FileOperations):
         # Resolve cwd from the live env so `cd` commands are picked up.
         # Fall through to init-time self.cwd only if the env doesn't track cwd.
         effective_cwd = cwd or getattr(self.env, 'cwd', None) or self.cwd
-        result = self.env.execute(command, cwd=effective_cwd, **kwargs)
+        # Keep stdout exact: BASH_ENV / shell-hook warnings on stderr must
+        # not become part of a file read, write verify, or patch payload
+        # (#94078). Interactive terminal execute() still merges by default.
+        result = self.env.execute(
+            command, cwd=effective_cwd, merge_stderr=False, **kwargs
+        )
         exit_code = result.get("returncode", 0)
         # A stdin write failure with an otherwise-clean child exit is still
         # a failure: the child never received the intended input. write_file
@@ -3279,8 +3284,8 @@ class ShellFileOperations(FileOperations):
         result = self._exec(cmd, timeout=60)
         stdout, limit_reason = _search_stdout_and_limit(result)
 
-        # _exec merges stderr into stdout (stderr=subprocess.STDOUT), so rg's
-        # diagnostic lines ("rg: <file>: <error>", "rg: regex parse error:")
+        # Failed _exec still appends stderr, so rg's diagnostic lines
+        # ("rg: <file>: <error>", "rg: regex parse error:")
         # are interleaved with match output. Split them out: diagnostics must
         # not be parsed as matches, and on a hard error they ARE the message.
         diagnostics, payload = _split_tool_diagnostics(stdout)
@@ -3494,8 +3499,8 @@ class ShellFileOperations(FileOperations):
         """Shared grep output parsing for the plain and pruned variants."""
         stdout, limit_reason = _search_stdout_and_limit(result)
 
-        # _exec merges stderr into stdout, so grep's diagnostic lines
-        # ("grep: <file>: <error>") are interleaved with matches. Split them
+        # Failed _exec still appends stderr, so grep's diagnostic lines
+        # ("grep: <file>: <error>") stay available. Split them
         # out so they're never parsed as matches and so a hard error has a
         # clean message.
         diagnostics, payload = _split_tool_diagnostics(stdout)

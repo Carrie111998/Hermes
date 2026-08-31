@@ -407,8 +407,10 @@ class ModalEnvironment(BaseEnvironment):
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,
-                  stdin_data: str | None = None):
+                  stdin_data: str | None = None,
+                  merge_stderr: bool = True):
         """Return a _ThreadedProcessHandle wrapping an async Modal sandbox exec."""
+        del merge_stderr
         sandbox = self._sandbox
         worker = self._worker
 
