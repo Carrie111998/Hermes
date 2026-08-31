@@ -19,8 +19,10 @@ compared locally. Two mutually exclusive bind modes:
     ``(uid={username})``; use ``(sAMAccountName={username})`` for AD) for
     exactly one entry, then re-binds as the found DN. Email / display
     name come from the entry, and ``refresh_session`` re-checks the DN
-    still exists so disabled accounts are cut off at the next
-    access-token expiry.
+    still exists, so a *deleted or moved* account is cut off at the
+    next access-token expiry. A merely **disabled** account still
+    exists at its DN, so the probe cannot see it: that session keeps
+    refreshing until the refresh token expires.
 
 Sessions are stateless HMAC-signed tokens minted by this provider (same
 scheme as ``plugins/dashboard_auth/basic``): ``verify_session`` — called
