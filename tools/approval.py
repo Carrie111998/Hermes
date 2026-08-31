@@ -417,6 +417,19 @@ _CREDENTIAL_FILES = (
     r'(?:~|\$home|\$\{home\})/\.'
     r'(?:netrc|pgpass|npmrc|pypirc)\b'
 )
+# Credential DIRECTORIES under $HOME. ``build_write_denied_prefixes`` in
+# agent/file_safety.py already denies every one of these to write_file/patch,
+# but the terminal path had no matching rule, so `echo x >> ~/.aws/credentials`,
+# `cp evil ~/.kube/config`, and `sed -i ... ~/.docker/config.json` were
+# auto-approved — an unpaired half-door of the same shape as the cp/mv gap
+# fixed in #14639. Mirrors _SSH_SENSITIVE_PATH (the .ssh member of this same
+# family) and stays a PREFIX match so any file beneath the directory is covered.
+# ``.config`` is enumerated, not taken wholesale: it also holds ordinary app
+# config, and gating all of it would prompt on routine editor/service edits.
+_CREDENTIAL_DIRS = (
+    r'(?:~|\$home|\$\{home\})/\.'
+    r'(?:aws|gnupg|kube|docker|azure|config/gh|config/gcloud)(?:/|$)'
+)
 # macOS: /etc, /var, /tmp, /home are symlinks to /private/{etc,var,tmp,home}.
 # A command written to target /private/etc/sudoers works identically to
 # /etc/sudoers on macOS but bypasses a plain "/etc/" pattern check. Match
@@ -434,11 +447,13 @@ _SENSITIVE_WRITE_TARGET = (
     rf'{_HERMES_ENV_PATH}|'
     rf'{_HERMES_CONFIG_PATH}|'
     rf'{_SHELL_RC_FILES}|'
+    rf'{_CREDENTIAL_DIRS}|'
     rf'{_CREDENTIAL_FILES})'
 )
 _USER_SENSITIVE_WRITE_TARGET = (
     rf'(?:{_SSH_SENSITIVE_PATH}|'
     rf'{_SHELL_RC_FILES}|'
+    rf'{_CREDENTIAL_DIRS}|'
     rf'{_CREDENTIAL_FILES})'
 )
 _PROJECT_SENSITIVE_WRITE_TARGET = rf'(?:{_PROJECT_ENV_PATH}|{_PROJECT_CONFIG_PATH})'
