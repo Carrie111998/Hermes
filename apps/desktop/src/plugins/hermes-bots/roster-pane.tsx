@@ -592,7 +592,7 @@ export function BotsPane() {
       <div className="flex min-w-0 items-center gap-1.5 px-2 py-1 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)">
         <GatewayKindGlyph kind={section.option?.kind} />
         <span className="min-w-0 flex-1 truncate">
-          {section.option?.label || section.option?.connectionId || 'Current gateway'}
+          {section.option?.label || section.option?.connectionId || b.roster.currentGateway}
         </span>
         <span className="shrink-0 font-normal tabular-nums">{section.rows.length}</span>
       </div>
@@ -604,11 +604,11 @@ export function BotsPane() {
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between gap-2 px-2.5 pt-2.5 pb-1.5">
         <span className="text-[0.6875rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)">
-          Bots
+          {b.paneTitle}
         </span>
         <div className="flex items-center gap-0.5">
           <Tip
-            label={activityToasts ? 'Activity toasts on — click to silence' : 'Activity toasts off — click to enable'}
+            label={activityToasts ? b.roster.activityToastsOn : b.roster.activityToastsOff}
           >
             <Button
               className="rounded-md text-(--ui-text-tertiary) hover:text-foreground"
@@ -620,7 +620,7 @@ export function BotsPane() {
             </Button>
           </Tip>
           <DropdownMenu>
-            <Tip label="New…">
+            <Tip label={b.roster.newMenuTip}>
               <DropdownMenuTrigger asChild>
                 <Button
                   aria-label={b.roster.newBotOrGroup}
@@ -662,10 +662,10 @@ export function BotsPane() {
           )}
           {showRosterFilters ? (
             <DropdownMenu key={'roster-filters'}>
-              <Tip label={activeFilterCount ? `Filters (${activeFilterCount} active)` : 'Filter roster'}>
+              <Tip label={b.roster.filterRoster(activeFilterCount)}>
                 <DropdownMenuTrigger asChild>
                   <Button
-                    aria-label={activeFilterCount ? `Filter roster, ${activeFilterCount} active` : 'Filter roster'}
+                    aria-label={b.roster.filterRoster(activeFilterCount)}
                     className={cn(
                       'size-7 shrink-0 rounded-md text-(--ui-text-tertiary) hover:text-foreground',
                       activeFilterCount && 'text-(--ui-accent)'
@@ -708,7 +708,7 @@ export function BotsPane() {
                 {gatewayOptions.length > 1 ? (
                   <DropdownMenuItem onSelect={() => setGatewayFilter('all')}>
                     <Codicon className="mr-1.5" name="globe" />
-                    <span className="min-w-0 flex-1">All gateways</span>
+                    <span className="min-w-0 flex-1">{b.roster.allGateways}</span>
                     {gatewayFilter === 'all' ? <Codicon name="check" /> : null}
                   </DropdownMenuItem>
                 ) : null}

@@ -2014,6 +2014,7 @@ export const ja = defineLocale({
 
   composer: {
     message: 'メッセージ',
+    addContext: 'コンテキストを追加',
     wakingProfile: profile => `${profile} を起動中…`,
     placeholderStarting: 'Hermes を起動中...',
     placeholderReconnecting: 'Hermes に再接続中…',

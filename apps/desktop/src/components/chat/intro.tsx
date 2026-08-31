@@ -1,5 +1,6 @@
 import { useState } from 'react'
 
+import { type Locale, useI18n } from '@/i18n'
 import { capitalize, normalize } from '@/lib/text'
 
 import introCopyJsonl from './intro-copy.jsonl?raw'
@@ -41,6 +42,25 @@ const FALLBACK_COPY: IntroCopy[] = [
   {
     headline: 'What needs attention?',
     body: "Send the context you have. I'll help sort it into a plan or a fix."
+  }
+]
+
+const PT_BR_NEUTRAL_COPY: IntroCopy[] = [
+  {
+    headline: 'O que vamos construir hoje?',
+    body: 'Descreva a tarefa com suas palavras. Vou escolher as ferramentas certas, explicar o plano e confirmar antes de qualquer etapa arriscada.'
+  },
+  {
+    headline: 'Comece por qualquer lugar.',
+    body: 'Envie o caminho de um arquivo, um erro ou uma ideia inicial. Vou investigar, sugerir os próximos passos e manter tudo reversível.'
+  },
+  {
+    headline: 'Seu espaço de trabalho, a uma mensagem de distância.',
+    body: 'Buscar no projeto, editar arquivos, rodar testes ou preparar uma revisão: diga o objetivo e eu cuido da parte mecânica.'
+  },
+  {
+    headline: 'Pronto quando você estiver.',
+    body: 'Digite uma tarefa, pergunta ou trecho. Eu lembro da sessão, cito minhas fontes e paro para perguntar quando não tenho certeza.'
   }
 ]
 
@@ -141,14 +161,49 @@ function fallbackCopyForPersonality(personalityKey: string): IntroCopy[] {
   ]
 }
 
+function ptBrFallbackCopyForPersonality(personalityKey: string): IntroCopy[] {
+  const label = titleize(personalityKey)
+
+  return [
+    {
+      headline: `O modo ${label} está ativo. Em que vamos trabalhar?`,
+      body: 'Envie a tarefa, o arquivo ou uma ideia inicial. Vou usar a personalidade configurada e manter o trabalho baseado neste projeto.'
+    },
+    {
+      headline: `O que o Hermes no modo ${label} precisa ver?`,
+      body: 'Traga o contexto ou a parte travada. Vou me adaptar à personalidade configurada.'
+    },
+    {
+      headline: `O modo ${label} está pronto.`,
+      body: 'Envie o problema, arquivo ou ideia. Vou seguir a personalidade que você configurou.'
+    },
+    {
+      headline: `O que o Hermes no modo ${label} deve resolver?`,
+      body: 'Coloque a tarefa aqui. Vou manter o trabalho baseado no projeto.'
+    },
+    {
+      headline: 'Por onde começamos?',
+      body: `Dê o contexto e eu responderei no modo ${label}.`
+    }
+  ]
+}
+
 function pickCopy(copies: IntroCopy[], seed = 0): IntroCopy {
   return copies[Math.abs(seed) % copies.length] || FALLBACK_COPY[0]
 }
 
 const WORDMARK = 'HERMES AGENT'
 
-function resolveCopy(personality?: string, seed?: number): IntroCopy {
+export function resolveIntroCopy(personality?: string, seed?: number, locale: Locale = 'en'): IntroCopy {
   const personalityKey = normalizeKey(personality)
+
+  if (locale === 'pt-br') {
+    const copies = NEUTRAL_PERSONALITIES.has(personalityKey)
+      ? PT_BR_NEUTRAL_COPY
+      : ptBrFallbackCopyForPersonality(personalityKey)
+
+    return pickCopy(copies, seed)
+  }
 
   const copies = NEUTRAL_PERSONALITIES.has(personalityKey)
     ? INTRO_COPY_BY_PERSONALITY[personalityKey] || neutralCopy()
@@ -158,8 +213,9 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
 }
 
 export function Intro({ personality, seed }: IntroProps) {
+  const { locale } = useI18n()
   const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
-  const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
+  const copy = resolveIntroCopy(personality, mountSeed + (seed ?? 0), locale)
 
   return (
     <div
@@ -174,3 +230,4 @@ export function Intro({ personality, seed }: IntroProps) {
     </div>
   )
 }
+

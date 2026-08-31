@@ -163,6 +163,7 @@ registry.registerMany([
     data: {
       placement: 'left',
       collapsible: true,
+      tabTitle: () => translateNow('commandCenter.sections.sessions'),
       dock: { pane: 'workspace', pos: 'left' },
       revealAliases: ['chat-sidebar'],
       // Standing chrome: no close gestures at all — the tab is shown/hidden

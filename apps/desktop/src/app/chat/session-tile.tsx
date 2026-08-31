@@ -31,9 +31,9 @@ import { $layoutTree, closeTreePane, moveTreePane, setTreeGroupTabStrip } from '
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { transcribeAudio } from '@/hermes'
-import { useI18n } from '@/i18n'
+import { translateNow, useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
-import { NEW_SESSION_TITLE, sessionTitle } from '@/lib/chat-runtime'
+import { sessionTitle } from '@/lib/chat-runtime'
 import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
 import { createComposerAttachmentScope, draftTitleFor } from '@/store/composer'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
@@ -452,7 +452,7 @@ function tileTitle(storedSessionId: string): string {
   const stored = tileStoredRow(storedSessionId)
   const explicit = $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)?.workspaceTabTitle
 
-  return stored ? sessionTitle(stored) : explicit || NEW_SESSION_TITLE
+  return stored ? sessionTitle(stored) : explicit || translateNow('commandCenter.nav.newChat.title')
 }
 
 /** The `@session` link payload for a tile tab drag — id + owning profile + title.
@@ -460,7 +460,7 @@ function tileTitle(storedSessionId: string): string {
 function tileDragPayload(storedSessionId: string): SessionDragPayload {
   const stored = tileStoredRow(storedSessionId)
   const explicit = $sessionTiles.get().find(tile => tile.storedSessionId === storedSessionId)?.workspaceTabTitle
-  const title = stored ? sessionTitle(stored) : explicit || draftTitleFor(storedSessionId) || NEW_SESSION_TITLE
+  const title = stored ? sessionTitle(stored) : explicit || draftTitleFor(storedSessionId) || translateNow('commandCenter.nav.newChat.title')
 
   return { id: storedSessionId, profile: stored?.profile ?? '', title }
 }
