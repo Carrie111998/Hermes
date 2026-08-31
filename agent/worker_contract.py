@@ -8,6 +8,8 @@ task is complete.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import math
 from typing import Any, Mapping
 
 
@@ -41,13 +43,9 @@ def _require_text(name: str, value: Any) -> str:
 def _validate_texts(name: str, values: Any) -> tuple[str, ...]:
     if values is None:
         return ()
-    if isinstance(values, (str, bytes)):
+    if not isinstance(values, (list, tuple)):
         raise ContractValidationError(f"{name} must be a sequence of strings")
-    try:
-        normalized = tuple(_require_text(f"{name}[{index}]", value) for index, value in enumerate(values))
-    except TypeError as exc:
-        raise ContractValidationError(f"{name} must be a sequence of strings") from exc
-    return normalized
+    return tuple(_require_text(f"{name}[{index}]", value) for index, value in enumerate(values))
 
 
 def _validate_choice(name: str, value: Any, choices: set[str]) -> str:
@@ -56,6 +54,37 @@ def _validate_choice(name: str, value: Any, choices: set[str]) -> str:
         allowed = ", ".join(sorted(choices))
         raise ContractValidationError(f"{name} must be one of: {allowed}")
     return value
+
+
+def _validate_timestamp(name: str, value: Any) -> str:
+    timestamp = _require_text(name, value)
+    try:
+        parsed = datetime.fromisoformat(timestamp)
+    except ValueError as exc:
+        raise ContractValidationError(f"{name} must be a timezone-aware ISO-8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ContractValidationError(f"{name} must be a timezone-aware ISO-8601 timestamp")
+    return timestamp
+
+
+def _validate_json_value(name: str, value: Any) -> None:
+    if value is None or isinstance(value, (bool, int, str)):
+        return
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return
+        raise ContractValidationError(f"{name} must contain only JSON-compatible values")
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            _validate_json_value(f"{name}[{index}]", item)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ContractValidationError(f"{name} must contain only JSON-compatible values")
+            _validate_json_value(f"{name}.{key}", item)
+        return
+    raise ContractValidationError(f"{name} must contain only JSON-compatible values")
 
 
 @dataclass(frozen=True)
@@ -92,29 +121,35 @@ class EvidencePacket:
             raise ContractValidationError("observations require sources")
         if conclusions and not sources:
             raise ContractValidationError("conclusions require sources")
-        _require_text("freshness", self.freshness)
+        _validate_timestamp("freshness", self.freshness)
         next_actions = _validate_texts("reversible_next_actions", self.reversible_next_actions)
         if not next_actions:
             raise ContractValidationError("reversible_next_actions must not be empty")
-        _validate_choice("outcome", self.outcome, _OUTCOMES)
+        outcome = _validate_choice("outcome", self.outcome, _OUTCOMES)
+        if outcome == "completed" and not observations:
+            raise ContractValidationError("completed outcome requires source-backed observations")
         return self
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
         return {
             "kind": "evidence_packet",
-            "observations": list(self.observations),
-            "sources": list(self.sources),
-            "hypotheses": list(self.hypotheses),
-            "conclusions": list(self.conclusions),
-            "unknowns": list(self.unknowns),
-            "confidence": self.confidence,
-            "evidence_class": self.evidence_class,
-            "artifacts": list(self.artifacts),
-            "limitations": list(self.limitations),
-            "freshness": self.freshness,
-            "reversible_next_actions": list(self.reversible_next_actions),
-            "outcome": self.outcome,
+            "observations": list(_validate_texts("observations", self.observations)),
+            "sources": list(_validate_texts("sources", self.sources)),
+            "hypotheses": list(_validate_texts("hypotheses", self.hypotheses)),
+            "conclusions": list(_validate_texts("conclusions", self.conclusions)),
+            "unknowns": list(_validate_texts("unknowns", self.unknowns)),
+            "confidence": _validate_choice("confidence", self.confidence, _CONFIDENCES),
+            "evidence_class": _validate_choice(
+                "evidence_class", self.evidence_class, _EVIDENCE_CLASSES
+            ),
+            "artifacts": list(_validate_texts("artifacts", self.artifacts)),
+            "limitations": list(_validate_texts("limitations", self.limitations)),
+            "freshness": _validate_timestamp("freshness", self.freshness),
+            "reversible_next_actions": list(
+                _validate_texts("reversible_next_actions", self.reversible_next_actions)
+            ),
+            "outcome": _validate_choice("outcome", self.outcome, _OUTCOMES),
         }
 
 
@@ -154,14 +189,16 @@ class ObjectiveStack:
         self.validate()
         return {
             "kind": "objective_stack",
-            "profile": self.profile,
-            "authority": self.authority,
-            "mission": self.mission,
-            "task_id": self.task_id,
-            "owner_id": self.owner_id,
-            "repository": self.repository,
-            "constraints": list(self.constraints),
-            "forbidden_actions": list(self.forbidden_actions),
+            "profile": _require_text("profile", self.profile),
+            "authority": _require_text("authority", self.authority),
+            "mission": _require_text("mission", self.mission),
+            "task_id": _require_text("task_id", self.task_id),
+            "owner_id": _require_text("owner_id", self.owner_id),
+            "repository": _require_text("repository", self.repository),
+            "constraints": list(_validate_texts("constraints", self.constraints)),
+            "forbidden_actions": list(
+                _validate_texts("forbidden_actions", self.forbidden_actions)
+            ),
             "hidden_objectives": [],
             "conflicts": [],
         }
@@ -196,14 +233,16 @@ class CapabilityRecord:
         self.validate()
         return {
             "kind": "capability",
-            "name": self.name,
-            "owner_profile": self.owner_profile,
-            "authority": self.authority,
-            "evidence_class": self.evidence_class,
-            "status": self.status,
+            "name": _require_text("name", self.name),
+            "owner_profile": _require_text("owner_profile", self.owner_profile),
+            "authority": _require_text("authority", self.authority),
+            "evidence_class": _validate_choice(
+                "evidence_class", self.evidence_class, _EVIDENCE_CLASSES
+            ),
+            "status": _validate_choice("status", self.status, _CAPABILITY_STATUSES),
             "tested_at": self.tested_at,
             "source_sha": self.source_sha,
-            "limitations": list(self.limitations),
+            "limitations": list(_validate_texts("limitations", self.limitations)),
         }
 
 
@@ -217,12 +256,15 @@ class ConsensusRecord:
     status: str = "pending"
 
     def validate(self) -> "ConsensusRecord":
+        if not isinstance(self.worker_reports, (list, tuple)):
+            raise ContractValidationError("worker_reports must be a stable sequence of objects")
         if not self.worker_reports:
             raise ContractValidationError("worker_reports must not be empty")
         workers: set[str] = set()
         for index, report in enumerate(self.worker_reports):
             if not isinstance(report, Mapping):
                 raise ContractValidationError(f"worker_reports[{index}] must be an object")
+            _validate_json_value(f"worker_reports[{index}]", report)
             worker = _require_text(f"worker_reports[{index}].worker", report.get("worker"))
             if worker in workers:
                 raise ContractValidationError("worker_reports must contain independent workers; duplicate worker")
@@ -239,9 +281,9 @@ class ConsensusRecord:
         return {
             "kind": "consensus",
             "worker_reports": [dict(report) for report in self.worker_reports],
-            "agreement": list(self.agreement),
-            "dissent": list(self.dissent),
-            "status": self.status,
+            "agreement": list(_validate_texts("agreement", self.agreement)),
+            "dissent": list(_validate_texts("dissent", self.dissent)),
+            "status": _validate_choice("status", self.status, _CONSENSUS_STATUSES),
         }
 
 
@@ -272,9 +314,9 @@ class WorkerMode:
         self.validate()
         return {
             "kind": "worker_mode",
-            "name": self.name,
-            "verbosity": self.verbosity,
-            "directness": self.directness,
+            "name": _require_text("name", self.name),
+            "verbosity": _validate_choice("verbosity", self.verbosity, _VERBOSITIES),
+            "directness": _validate_choice("directness", self.directness, _DIRECTNESS),
             "requires_citations": True,
             "requires_uncertainty": True,
             "humor_enabled": self.humor_enabled,
