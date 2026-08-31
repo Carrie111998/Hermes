@@ -1448,7 +1448,7 @@ def transcribe_recording(wav_path: str, model: Optional[str] = None) -> Dict[str
     from tools.transcription_tools import MAX_FILE_SIZE, transcribe_audio
 
     try:
-        result = transcribe_audio(wav_path, model=model)
+        result = transcribe_audio(wav_path, model=model, source="voice_mode")
     except Exception as exc:
         logger.error(
             "Voice STT failure provider=unknown stage=transcribe "
@@ -1534,8 +1534,8 @@ def _transcribe_wav_in_chunks(
             return _safe_stt_failure_result("unknown", "no_chunks")
 
         logger.info("Transcribing oversized WAV: stage=chunk chunks=%d", len(chunk_paths))
-        for chunk_path in chunk_paths:
-            result = transcribe_audio(chunk_path, model=model)
+        for index, chunk_path in enumerate(chunk_paths, start=1):
+            result = transcribe_audio(chunk_path, model=model, source="voice_mode")
             if not result.get("success"):
                 provider, error_code = _stt_failure_metadata(result)
                 logger.info(
