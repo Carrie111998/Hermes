@@ -13,7 +13,7 @@ Peers are resolved from config.yaml under ``a2a_agents``::
     a2a_agents:
       researcher:
         url: "http://localhost:9999"
-        auth: { type: bearer, token: "sk-..." }
+        auth: { type: bearer, token_env: "A2A_RESEARCHER_TOKEN" }
         timeout: 120
         capabilities: [web_search, research]
 
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,6 +36,7 @@ from . import protocol, security
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 120
+_A2A_CLIENT_USER_AGENT = "Hermes-A2A-Client/1.0"
 _ORCHESTRATE_MAX_WORKERS = 6  # max parallel peers for fan-out
 
 
@@ -69,9 +71,16 @@ def _resolve_peer(agent: str) -> Optional[dict]:
 
 
 def _auth_header(auth: dict) -> dict:
-    if auth and auth.get("type") == "bearer" and auth.get("token"):
-        return {"Authorization": f"Bearer {auth['token']}"}
-    return {}
+    if not auth or auth.get("type") != "bearer":
+        return {}
+    token_env = str(auth.get("token_env") or "").strip()
+    if token_env:
+        token = os.getenv(token_env, "").strip()
+        if not token:
+            raise ValueError(f"A2A bearer token environment variable is missing: {token_env}")
+        return {"Authorization": f"Bearer {token}"}
+    token = str(auth.get("token") or "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 # --------------------------------------------------------------------------
@@ -79,14 +88,20 @@ def _auth_header(auth: dict) -> dict:
 # --------------------------------------------------------------------------
 
 def _http_get_json(url: str, headers: dict, timeout: int) -> dict:
-    req = urllib.request.Request(url, headers=headers, method="GET")
+    request_headers = {"User-Agent": _A2A_CLIENT_USER_AGENT, **headers}
+    req = urllib.request.Request(url, headers=request_headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
         return json.loads(resp.read().decode("utf-8"))
 
 
 def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     data = json.dumps(body).encode("utf-8")
-    hdrs = {"Content-Type": "application/json", "A2A-Version": protocol.PROTOCOL_VERSION, **headers}
+    hdrs = {
+        "Content-Type": "application/json",
+        "A2A-Version": protocol.PROTOCOL_VERSION,
+        "User-Agent": _A2A_CLIENT_USER_AGENT,
+        **headers,
+    }
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
         return json.loads(resp.read().decode("utf-8"))

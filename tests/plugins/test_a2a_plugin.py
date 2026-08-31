@@ -539,6 +539,49 @@ class TestClientTools:
         assert tools._rpc_url("http://base:3", {"url": "http://legacy:1/"}) == "http://legacy:1/"
         assert tools._rpc_url("http://base:3/", None) == "http://base:3"
 
+    def test_http_post_sets_a2a_client_user_agent(self, monkeypatch):
+        captured = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{}'
+
+        def fake_urlopen(request, timeout):
+            captured["user_agent"] = request.get_header("User-agent")
+            captured["a2a_version"] = request.get_header("A2a-version")
+            return Response()
+
+        monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
+        tools._http_post_json("https://peer.example/", {"jsonrpc": "2.0"}, {}, 5)
+
+        assert captured == {
+            "user_agent": "Hermes-A2A-Client/1.0",
+            "a2a_version": protocol.PROTOCOL_VERSION,
+        }
+
+    def test_auth_header_resolves_bearer_token_from_environment(self, monkeypatch):
+        monkeypatch.setenv("A2A_OUTBOUND_EDGE_TOKEN", "secret-from-bws")
+
+        assert tools._auth_header({
+            "type": "bearer",
+            "token_env": "A2A_OUTBOUND_EDGE_TOKEN",
+        }) == {"Authorization": "Bearer secret-from-bws"}
+
+    def test_auth_header_fails_closed_when_token_environment_is_missing(self, monkeypatch):
+        monkeypatch.delenv("A2A_OUTBOUND_EDGE_TOKEN", raising=False)
+
+        with pytest.raises(ValueError, match="A2A_OUTBOUND_EDGE_TOKEN"):
+            tools._auth_header({
+                "type": "bearer",
+                "token_env": "A2A_OUTBOUND_EDGE_TOKEN",
+            })
+
     def test_list_no_peers(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setattr(tools, "_load_config", lambda: {})
