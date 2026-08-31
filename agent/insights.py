@@ -763,6 +763,29 @@ class InsightsEngine:
         result.sort(key=lambda x: (x["total_tokens"], x["sessions"]), reverse=True)
         return result
 
+    def _add_session_token_totals_to_platform_data(
+        self,
+        platform_data: Dict[str, Dict[str, Any]],
+        sessions: List[Dict],
+    ) -> None:
+        """Add session-level token aggregates to platform_data.
+
+        Sums input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+        and sets total_tokens = sum of those four fields.
+        """
+        for s in sessions:
+            src = s.get("source") or "unknown"
+            d = platform_data[src]
+            inp = s.get("input_tokens") or 0
+            out = s.get("output_tokens") or 0
+            cr = s.get("cache_read_tokens") or 0
+            cw = s.get("cache_write_tokens") or 0
+            d["input_tokens"] += inp
+            d["output_tokens"] += out
+            d["cache_read_tokens"] += cr
+            d["cache_write_tokens"] += cw
+            d["total_tokens"] += inp + out + cr + cw
+
     def _compute_platform_breakdown(
         self,
         sessions: List[Dict],
@@ -793,18 +816,7 @@ class InsightsEngine:
         # If caller didn't supply a window, or the model-usage table is
         # missing/empty, keep the legacy session-counter path.
         if cutoff is None:
-            for s in sessions:
-                src = s.get("source") or "unknown"
-                d = platform_data[src]
-                inp = s.get("input_tokens") or 0
-                out = s.get("output_tokens") or 0
-                cr = s.get("cache_read_tokens") or 0
-                cw = s.get("cache_write_tokens") or 0
-                d["input_tokens"] += inp
-                d["output_tokens"] += out
-                d["cache_read_tokens"] += cr
-                d["cache_write_tokens"] += cw
-                d["total_tokens"] += inp + out + cr + cw
+            self._add_session_token_totals_to_platform_data(platform_data, sessions)
             result = [
                 {"platform": platform, **data}
                 for platform, data in platform_data.items()
@@ -814,18 +826,7 @@ class InsightsEngine:
 
         usage_rows = self._get_model_usage(cutoff, source)
         if not usage_rows:
-            for s in sessions:
-                src = s.get("source") or "unknown"
-                d = platform_data[src]
-                inp = s.get("input_tokens") or 0
-                out = s.get("output_tokens") or 0
-                cr = s.get("cache_read_tokens") or 0
-                cw = s.get("cache_write_tokens") or 0
-                d["input_tokens"] += inp
-                d["output_tokens"] += out
-                d["cache_read_tokens"] += cr
-                d["cache_write_tokens"] += cw
-                d["total_tokens"] += inp + out + cr + cw
+            self._add_session_token_totals_to_platform_data(platform_data, sessions)
             result = [
                 {"platform": platform, **data}
                 for platform, data in platform_data.items()
