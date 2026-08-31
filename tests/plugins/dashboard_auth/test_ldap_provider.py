@@ -510,3 +510,85 @@ class TestSearchThenBindLogin:
             p.complete_password_login(username="alice", password="s3cret")
         with pytest.raises(InvalidCredentialsError):
             p.complete_password_login(username="bob", password="hunter2")
+
+
+class TestGroupRestriction:
+    def test_member_allowed(self):
+        p = make_provider(
+            user_dn_template="uid={username},ou=people," + BASE_DN,
+            require_group=GROUP_DN,
+            connection_factory=mock_factory(),
+        )
+        s = p.complete_password_login(username="alice", password="s3cret")
+        assert s.user_id == "alice"
+
+    def test_non_member_rejected_generically(self):
+        # bob's password is correct but he is not in hermes-users →
+        # the SAME generic error as a wrong password (no group oracle).
+        p = make_provider(
+            user_dn_template="uid={username},ou=people," + BASE_DN,
+            require_group=GROUP_DN,
+            connection_factory=mock_factory(),
+        )
+        with pytest.raises(InvalidCredentialsError):
+            p.complete_password_login(username="bob", password="hunter2")
+
+    def test_group_check_in_search_mode(self):
+        p = ldap_plugin.LdapAuthProvider(
+            server_url="ldaps://ldap.example.com",
+            secret=SECRET,
+            bind_dn=f"cn=hermes,ou=svc,{BASE_DN}",
+            bind_password="svc-secret",
+            user_search_base=f"ou=people,{BASE_DN}",
+            require_group=GROUP_DN,
+            connection_factory=mock_factory(),
+        )
+        assert p.complete_password_login(
+            username="alice", password="s3cret"
+        ).user_id == "alice"
+        with pytest.raises(InvalidCredentialsError):
+            p.complete_password_login(username="bob", password="hunter2")
+
+
+class TestRefreshDirectoryCheck:
+    def make(self, entries=MOCK_ENTRIES, **overrides):
+        kwargs = dict(
+            server_url="ldaps://ldap.example.com",
+            secret=SECRET,
+            bind_dn=f"cn=hermes,ou=svc,{BASE_DN}",
+            bind_password="svc-secret",
+            user_search_base=f"ou=people,{BASE_DN}",
+            connection_factory=mock_factory(entries),
+        )
+        kwargs.update(overrides)
+        return ldap_plugin.LdapAuthProvider(**kwargs)
+
+    def test_refresh_ok_while_user_exists(self):
+        p = self.make()
+        s = p.complete_password_login(username="alice", password="s3cret")
+        s2 = p.refresh_session(refresh_token=s.refresh_token)
+        assert s2.user_id == "alice"
+        assert s2.email == "alice@example.com"
+
+    def test_refresh_rejected_after_user_removed(self):
+        p = self.make()
+        s = p.complete_password_login(username="alice", password="s3cret")
+        # Simulate account deletion: swap in a directory without alice.
+        gone = {k: v for k, v in MOCK_ENTRIES.items() if k != ALICE_DN}
+        p._factory = mock_factory(gone)
+        with pytest.raises(RefreshExpiredError):
+            p.refresh_session(refresh_token=s.refresh_token)
+
+    def test_refresh_directory_down_is_provider_error(self):
+        p = self.make()
+        s = p.complete_password_login(username="alice", password="s3cret")
+        p._factory = broken_factory
+        with pytest.raises(ProviderError):
+            p.refresh_session(refresh_token=s.refresh_token)
+
+    def test_refresh_check_can_be_disabled(self):
+        p = self.make(verify_user_on_refresh=False)
+        s = p.complete_password_login(username="alice", password="s3cret")
+        p._factory = broken_factory  # directory gone — token-only refresh
+        s2 = p.refresh_session(refresh_token=s.refresh_token)
+        assert s2.user_id == "alice"

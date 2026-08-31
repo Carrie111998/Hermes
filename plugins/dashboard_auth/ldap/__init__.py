@@ -564,7 +564,77 @@ class LdapAuthProvider(DashboardAuthProvider):
         }
 
     def _user_in_group(self, conn, user_dn: str, username: str) -> bool:
-        raise NotImplementedError  # Task 5
+        """BASE-scope membership probe on the require_group entry.
+
+        Covers the three common group schemas in one filter:
+        groupOfNames (member), groupOfUniqueNames (uniqueMember), and
+        posixGroup (memberUid — matched by username, not DN). Runs on the
+        user's own freshly-bound connection in both modes, so the
+        directory ACLs must let authenticated users read the group entry
+        (the default on OpenLDAP and AD).
+        """
+        import ldap3
+        from ldap3.core.exceptions import LDAPException
+        from ldap3.utils.conv import escape_filter_chars
+
+        dn_esc = escape_filter_chars(user_dn)
+        uid_esc = escape_filter_chars(username)
+        flt = (
+            f"(|(member={dn_esc})"
+            f"(uniqueMember={dn_esc})"
+            f"(memberUid={uid_esc}))"
+        )
+        try:
+            ok = conn.search(
+                search_base=self._require_group,
+                search_filter=flt,
+                search_scope=ldap3.BASE,
+                attributes=[],
+            )
+        except LDAPException as exc:
+            raise ProviderError(
+                f"LDAP group check failed: {exc}"
+            ) from exc
+        return bool(ok and conn.entries)
 
     def _user_still_present(self, user_dn: str) -> bool:
-        raise NotImplementedError  # Task 5
+        """Refresh-time existence probe (search mode only).
+
+        BASE-scope search on the user's DN with the service account.
+        False → the account was deleted/moved (caller raises
+        RefreshExpiredError). ProviderError propagates when the directory
+        is unreachable — per the framework contract the middleware then
+        503s without clearing cookies.
+        """
+        if not user_dn:
+            return False
+        import ldap3
+        from ldap3.core.exceptions import LDAPException
+
+        conn = self._bind(
+            user=self._bind_dn or None,
+            password=self._bind_password or None,
+        )
+        if conn is None:
+            raise ProviderError(
+                "LDAP service-account bind was rejected during refresh"
+            )
+        try:
+            ok = conn.search(
+                search_base=user_dn,
+                search_filter="(objectClass=*)",
+                search_scope=ldap3.BASE,
+                attributes=[],
+            )
+            return bool(ok and conn.entries)
+        except LDAPException:
+            # A BASE search on a nonexistent DN raises noSuchObject on
+            # many servers rather than returning an empty result — that
+            # is "user gone", not an outage (the bind above already
+            # proved the directory reachable).
+            return False
+        finally:
+            try:
+                conn.unbind()
+            except Exception:  # noqa: BLE001
+                pass
