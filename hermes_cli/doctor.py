@@ -474,6 +474,43 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
             "optimize-storage' with the gateway stopped)",
         ))
 
+    # #98743: an interrupted CJK-bigram backfill freezes its markers
+    # forever (only the optimize-storage loop ever advances them), leaving
+    # CJK search silently on trigram/LIKE. Surface it at ANY database
+    # size — the stuck state is invisible otherwise.
+    cjk_pending = stats.get("fts_cjk_rebuild_pending")
+    if cjk_pending:
+        cjk_hw = stats.get("fts_cjk_rebuild_high_water")
+        cjk_done = stats.get("fts_cjk_rebuild_progress")
+        cjk_detail = (
+            "(resumes automatically on the next writable open with the "
+            "CJK extension, or run 'hermes sessions optimize-storage')"
+        )
+        if isinstance(cjk_hw, int) and isinstance(cjk_done, int) and cjk_hw > 0:
+            pct = min(100, int(100 * cjk_done / cjk_hw))
+            lines.append((
+                "warn",
+                f"CJK FTS backfill interrupted at {pct}% "
+                f"({cjk_done:,}/{cjk_hw:,} rows) — CJK search is falling "
+                f"back to trigram/LIKE",
+                cjk_detail,
+            ))
+        else:
+            lines.append((
+                "warn",
+                "CJK FTS backfill interrupted — CJK search is falling back "
+                "to trigram/LIKE",
+                cjk_detail,
+            ))
+    if stats.get("fts_cjk_stale"):
+        lines.append((
+            "warn",
+            "CJK FTS index is marked stale (a process without the CJK "
+            "extension dropped its triggers)",
+            "(run 'hermes sessions optimize-storage' on a host with the "
+            "CJK extension to rebuild it from scratch)",
+        ))
+
     # Advisory: oversized database. Suggest auto_prune, and — when the v23
     # FTS rebuild is pending OR the DB still carries the legacy inline
     # trigram layout (fts_storage_version marker absent) — the offline
