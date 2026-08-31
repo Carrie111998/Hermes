@@ -40,6 +40,7 @@ def test_zizmor_summary_preserves_counts_when_raw_capture_is_bounded():
         "by_severity": {"High": 2},
         "by_confidence": {"High": 1, "Medium": 1},
         "by_ident": {"github-app": 2},
+        "high_confidence_high_severity": 1,
     }
 
 
@@ -83,7 +84,21 @@ def test_receipt_binds_results_to_exact_git_identity(tmp_path):
             return SimpleNamespace(returncode=0, stdout="feature/audit\n", stderr="")
         if command[:3] == ("git", "status", "--porcelain"):
             return SimpleNamespace(returncode=0, stdout=" M local.txt\n", stderr="")
-        return SimpleNamespace(returncode=0, stdout='{"ok": true}\n', stderr="")
+        if command[-1:] == ("--version",):
+            executable = Path(command[0]).name
+            versions = {
+                "zizmor": "zizmor 1.30.0\n",
+                "lint-imports": "import-linter 2.14\n",
+                "pip-audit": "pip-audit 2.10.1\n",
+            }
+            return SimpleNamespace(returncode=0, stdout=versions[executable], stderr="")
+        if Path(command[0]).name == "zizmor":
+            return SimpleNamespace(returncode=0, stdout="[]\n", stderr="")
+        if Path(command[0]).name == "pip-audit":
+            return SimpleNamespace(
+                returncode=0, stdout='{"dependencies": []}\n', stderr=""
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     receipt = run_audits(repo_root=repo, tool_root=tool_root, runner=fake_runner)
 
@@ -93,6 +108,97 @@ def test_receipt_binds_results_to_exact_git_identity(tmp_path):
     assert receipt["ok"] is True
     assert len(receipt["audits"]) == 3
     assert all(row["stdout_sha256"].startswith("sha256:") for row in receipt["audits"])
+
+
+def test_receipt_fails_when_observed_tool_version_differs(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    tool_root = tmp_path / "bin"
+
+    def fake_runner(argv, **kwargs):
+        command = tuple(str(part) for part in argv)
+        if command[:2] == ("git", "rev-parse"):
+            return SimpleNamespace(returncode=0, stdout=f"{'b' * 40}\n", stderr="")
+        if command[:2] == ("git", "branch"):
+            return SimpleNamespace(returncode=0, stdout="feature/audit\n", stderr="")
+        if command[:2] == ("git", "status"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command[-1:] == ("--version",):
+            executable = Path(command[0]).name
+            versions = {
+                "zizmor": "zizmor 9.9.9\n",
+                "lint-imports": "import-linter 2.14\n",
+                "pip-audit": "pip-audit 2.10.1\n",
+            }
+            return SimpleNamespace(returncode=0, stdout=versions[executable], stderr="")
+        if Path(command[0]).name == "zizmor":
+            return SimpleNamespace(returncode=0, stdout="[]\n", stderr="")
+        if Path(command[0]).name == "pip-audit":
+            return SimpleNamespace(
+                returncode=0, stdout='{"dependencies": []}\n', stderr=""
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    receipt = run_audits(repo_root=repo, tool_root=tool_root, runner=fake_runner)
+
+    zizmor = receipt["audits"][0]
+    assert zizmor["observed_version"] == "9.9.9"
+    assert zizmor["version_matches"] is False
+    assert receipt["ok"] is False
+
+
+def test_zizmor_high_confidence_high_severity_finding_fails_policy(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    tool_root = tmp_path / "bin"
+    finding = json.dumps(
+        [
+            {
+                "ident": "template-injection",
+                "determinations": {"severity": "High", "confidence": "High"},
+                "locations": [{}],
+            }
+        ]
+    )
+
+    def fake_runner(argv, **kwargs):
+        command = tuple(str(part) for part in argv)
+        if command[:2] == ("git", "rev-parse"):
+            return SimpleNamespace(returncode=0, stdout=f"{'c' * 40}\n", stderr="")
+        if command[:2] == ("git", "branch"):
+            return SimpleNamespace(returncode=0, stdout="feature/audit\n", stderr="")
+        if command[:2] == ("git", "status"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command[-1:] == ("--version",):
+            executable = Path(command[0]).name
+            versions = {
+                "zizmor": "zizmor 1.30.0\n",
+                "lint-imports": "import-linter 2.14\n",
+                "pip-audit": "pip-audit 2.10.1\n",
+            }
+            return SimpleNamespace(returncode=0, stdout=versions[executable], stderr="")
+        if Path(command[0]).name == "zizmor":
+            return SimpleNamespace(returncode=0, stdout=finding, stderr="")
+        if Path(command[0]).name == "pip-audit":
+            return SimpleNamespace(
+                returncode=0, stdout='{"dependencies": []}\n', stderr=""
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    receipt = run_audits(repo_root=repo, tool_root=tool_root, runner=fake_runner)
+
+    zizmor = receipt["audits"][0]
+    assert zizmor["returncode"] == 0
+    assert zizmor["summary"]["high_confidence_high_severity"] == 1
+    assert zizmor["policy_ok"] is False
+    assert receipt["ok"] is False
+
+
+def test_app_token_requires_complete_credential_pair():
+    action = (REPO_ROOT / ".github" / "actions" / "get-app-token" / "action.yml").read_text()
+
+    assert "PRIVATE_KEY: ${{ inputs.private-key }}" in action
+    assert 'if [ -n "$CLIENT_ID" ] && [ -n "$PRIVATE_KEY" ]; then' in action
 
 
 def test_script_runs_directly_from_its_file_path():

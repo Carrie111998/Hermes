@@ -8,6 +8,7 @@ from collections import Counter
 from collections.abc import Sequence
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,11 @@ class AuditCommand:
     name: str
     argv: tuple[str, ...]
     expected_version: str
+
+    @property
+    def version_argv(self) -> tuple[str, ...]:
+        """Return the command used to observe the installed tool realization."""
+        return (self.argv[0], "--version")
 
 
 class AuditProcessResult(Protocol):
@@ -163,6 +169,12 @@ def _bounded_output(text: str) -> str:
     return text[:_MAX_CAPTURE_CHARS] + "\n...[capture truncated]"
 
 
+def _extract_version(stdout: str, stderr: str) -> str | None:
+    """Extract a concrete semantic version from a tool's observed output."""
+    match = re.search(r"(?<!\d)(\d+(?:\.\d+){1,3})(?!\d)", f"{stdout}\n{stderr}")
+    return match.group(1) if match else None
+
+
 def _summarize_json_output(name: str, stdout: str) -> dict[str, Any] | None:
     try:
         payload = json.loads(stdout)
@@ -170,22 +182,28 @@ def _summarize_json_output(name: str, stdout: str) -> dict[str, Any] | None:
         return None
 
     if name == "zizmor" and isinstance(payload, list):
+        determinations = [row.get("determinations", {}) for row in payload]
         return {
             "finding_groups": len(payload),
             "locations": sum(len(row.get("locations", [])) for row in payload),
             "by_severity": dict(
                 Counter(
-                    row.get("determinations", {}).get("severity", "Unknown")
-                    for row in payload
+                    determination.get("severity", "Unknown")
+                    for determination in determinations
                 )
             ),
             "by_confidence": dict(
                 Counter(
-                    row.get("determinations", {}).get("confidence", "Unknown")
-                    for row in payload
+                    determination.get("confidence", "Unknown")
+                    for determination in determinations
                 )
             ),
             "by_ident": dict(Counter(row.get("ident", "unknown") for row in payload)),
+            "high_confidence_high_severity": sum(
+                determination.get("severity") == "High"
+                and determination.get("confidence") == "High"
+                for determination in determinations
+            ),
         }
     if name == "pip-audit" and isinstance(payload, dict):
         dependencies = payload.get("dependencies", [])
@@ -194,6 +212,19 @@ def _summarize_json_output(name: str, stdout: str) -> dict[str, Any] | None:
             "vulnerabilities": sum(len(row.get("vulns", [])) for row in dependencies),
         }
     return None
+
+
+def _policy_ok(
+    name: str, returncode: int, summary: dict[str, Any] | None
+) -> bool:
+    """Evaluate audit findings instead of treating process success as policy success."""
+    if returncode != 0:
+        return False
+    if name == "zizmor":
+        return summary is not None and summary["high_confidence_high_severity"] == 0
+    if name == "pip-audit":
+        return summary is not None and summary["vulnerabilities"] == 0
+    return True
 
 
 def run_audits(
@@ -230,6 +261,16 @@ def run_audits(
             tool_root=tool_root,
             requirements_path=requirements_path,
         ):
+            version_result = _run(
+                runner, command.version_argv, repo_root=repo_root, timeout=30
+            )
+            version_stdout = str(version_result.stdout or "")
+            version_stderr = str(version_result.stderr or "")
+            observed_version = _extract_version(version_stdout, version_stderr)
+            version_matches = (
+                version_result.returncode == 0
+                and observed_version == command.expected_version
+            )
             if command.name == "pip-audit" and export_result.returncode != 0:
                 result: AuditProcessResult = SkippedAuditResult(
                     returncode=1,
@@ -240,14 +281,24 @@ def run_audits(
                 result = _run(runner, command.argv, repo_root=repo_root, timeout=600)
             stdout = str(result.stdout or "")
             stderr = str(result.stderr or "")
+            summary = _summarize_json_output(command.name, stdout)
             audits.append({
                 "name": command.name,
                 "expected_version": command.expected_version,
+                "observed_version": observed_version,
+                "version_matches": version_matches,
+                "version_command": list(command.version_argv),
+                "version_returncode": int(version_result.returncode),
+                "version_stdout_sha256": _sha256(version_stdout),
+                "version_stderr_sha256": _sha256(version_stderr),
+                "version_stdout": _bounded_output(version_stdout),
+                "version_stderr": _bounded_output(version_stderr),
                 "command": list(command.argv),
                 "returncode": int(result.returncode),
                 "stdout_sha256": _sha256(stdout),
                 "stderr_sha256": _sha256(stderr),
-                "summary": _summarize_json_output(command.name, stdout),
+                "summary": summary,
+                "policy_ok": _policy_ok(command.name, result.returncode, summary),
                 "stdout": _bounded_output(stdout),
                 "stderr": _bounded_output(stderr),
             })
@@ -264,7 +315,8 @@ def run_audits(
         },
         "read_only": True,
         "auto_fix": False,
-        "ok": all(row["returncode"] == 0 for row in (*preparations, *audits)),
+        "ok": all(row["returncode"] == 0 for row in preparations)
+        and all(row["version_matches"] and row["policy_ok"] for row in audits),
         "preparations": preparations,
         "audits": audits,
     }
