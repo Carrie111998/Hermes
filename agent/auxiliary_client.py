@@ -5444,6 +5444,7 @@ def resolve_provider_client(
             resolve_api_key_provider_credentials,
             resolve_external_process_provider_credentials,
         )
+        from hermes_cli import runtime_provider as _runtime_provider
     except ImportError:
         logger.debug("hermes_cli.auth not available for provider %s", provider)
         return None, None
@@ -5466,7 +5467,15 @@ def resolve_provider_client(
             final_model = _normalize_resolved_model(model or default_model, provider)
             return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode else (client, final_model))
 
-        creds = resolve_api_key_provider_credentials(provider)
+        override = None
+        if provider == "gemini":
+            override = _runtime_provider._resolve_configured_api_key_provider_override(
+                provider,
+                explicit_api_key=explicit_api_key,
+                explicit_base_url=explicit_base_url,
+            )
+
+        creds = override or resolve_api_key_provider_credentials(provider)
         api_key = str(creds.get("api_key", "")).strip()
         # Honour an explicit api_key override (e.g. from a fallback_model entry
         # or a custom_providers entry) so callers that pass an explicit
@@ -5484,27 +5493,29 @@ def resolve_provider_client(
             return None, None
 
         raw_base_url = str(creds.get("base_url", "")).strip().rstrip("/") or pconfig.inference_base_url
-        base_url = _to_openai_base_url(raw_base_url)
-        # Honour an explicit base_url override from the caller — used when a
-        # fallback_model entry (or custom_providers lookup) routes through a
-        # built-in provider name but targets a user-specified endpoint.
         if explicit_base_url:
-            base_url = _to_openai_base_url(explicit_base_url.strip().rstrip("/"))
+            raw_base_url = explicit_base_url.strip().rstrip("/") or raw_base_url
+        base_url = _to_openai_base_url(raw_base_url)
 
-        default_model = _get_aux_model_for_provider(provider)
+        default_model = creds.get("model") or _get_aux_model_for_provider(provider)
         final_model = _normalize_resolved_model(model or default_model, provider)
+        extra_headers = dict(creds.get("extra_headers") or {})
 
         if provider == "gemini":
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
             if is_native_gemini_base_url(base_url):
-                client = GeminiNativeClient(api_key=api_key, base_url=base_url)
+                client = GeminiNativeClient(
+                    api_key=api_key,
+                    base_url=base_url,
+                    default_headers=extra_headers or None,
+                )
                 logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
                 return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                         else (client, final_model))
 
         # Provider-specific headers
-        headers = {}
+        headers = dict(extra_headers)
         if base_url_host_matches(base_url, "api.kimi.com"):
             headers["User-Agent"] = "claude-code/0.1.0"
         elif base_url_host_matches(base_url, "githubcopilot.com"):

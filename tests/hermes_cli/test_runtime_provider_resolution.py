@@ -3377,6 +3377,52 @@ def test_named_custom_provider_non_dict_extra_headers_ignored(monkeypatch):
     assert "extra_headers" not in rp.resolve_runtime_provider(requested="emptyheaders")
 
 
+def test_configured_api_key_provider_without_key_raises_auth_error(monkeypatch):
+    """A ``providers.<name>`` entry (auth_type=api_key) with no resolvable
+    key must raise AuthError instead of silently returning an unusable
+    runtime dict — otherwise callers proceed to send unauthenticated
+    requests that fail confusingly downstream. (PR #72958 review)
+    """
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "gemini": {
+                    "base_url": "https://gemini-gateway.example.com/v1",
+                    "api_key": "",
+                }
+            }
+        },
+    )
+
+    with pytest.raises(rp.AuthError, match="No usable API key"):
+        rp._resolve_configured_api_key_provider_override("gemini")
+
+
+def test_configured_api_key_provider_placeholder_key_raises_auth_error(monkeypatch):
+    """A placeholder value like 'changeme' must not be treated as usable."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "gemini": {
+                    "base_url": "https://gemini-gateway.example.com/v1",
+                    "api_key": "changeme",
+                }
+            }
+        },
+    )
+
+    with pytest.raises(rp.AuthError, match="No usable API key"):
+        rp._resolve_configured_api_key_provider_override("gemini")
+
+
 def test_providers_dict_entry_surfaces_extra_headers(monkeypatch):
     """New-style providers: dict entries also surface extra_headers."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

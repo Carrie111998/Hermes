@@ -673,6 +673,15 @@ def _resolve_configured_api_key_provider_override(
         creds = resolve_api_key_provider_credentials(provider)
         api_key = creds.get("api_key", "")
 
+    if not has_usable_secret(api_key):
+        key_env_hint = f"providers.{provider}.key_env" + (f" ({key_env})" if key_env else "")
+        raise AuthError(
+            f"No usable API key found for configured provider '{provider}'. "
+            f"Set providers.{provider}.api_key or {key_env_hint}.",
+            provider=provider,
+            code="missing_api_key",
+        )
+
     result = {
         "provider": provider,
         "api_mode": _parse_api_mode(entry.get("api_mode") or entry.get("transport"))
@@ -686,7 +695,6 @@ def _resolve_configured_api_key_provider_override(
     if entry.get("default_model") or entry.get("model"):
         result["model"] = entry.get("default_model") or entry.get("model")
     _lift_extra_headers(entry, result)
-    _lift_max_output_tokens(entry, result)
     return result
 
 

@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from hermes_cli.auth import PROVIDER_REGISTRY, resolve_provider, resolve_api_key_provider_credentials
+from hermes_cli.auth import AuthError, PROVIDER_REGISTRY, resolve_provider, resolve_api_key_provider_credentials
 from hermes_cli.models import _PROVIDER_MODELS, _PROVIDER_LABELS, _PROVIDER_ALIASES, normalize_provider
 from hermes_cli.model_normalize import normalize_model_for_provider, detect_vendor
 from agent.model_metadata import get_model_context_length
@@ -327,6 +327,40 @@ class TestGeminiAgentInit:
             resolve_provider_client("gemini")
         assert mock_client.called
         mock_openai.assert_not_called()
+
+    def test_gemini_resolve_provider_client_honors_configured_gateway_override(self, monkeypatch):
+        """A ``providers.gemini`` enterprise-gateway override must reach the
+        auxiliary resolution path too, not just the main runtime resolver
+        (PR #72958 review comment on agent/auxiliary_client.py).
+        """
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_BASE_URL", raising=False)
+        import hermes_cli.runtime_provider as rp
+        monkeypatch.setattr(
+            rp,
+            "load_config",
+            lambda: {
+                "providers": {
+                    "gemini": {
+                        "base_url": "https://enterprise-gateway.example.com/v1beta",
+                        "api_key": "enterprise-gateway-key",
+                        "extra_headers": {"X-Gateway-Auth": "corp-token"},
+                    }
+                }
+            },
+        )
+        with patch("agent.gemini_native_adapter.GeminiNativeClient") as mock_client, \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client.return_value = MagicMock()
+            from agent.auxiliary_client import resolve_provider_client
+            resolve_provider_client("gemini")
+        assert mock_client.called
+        mock_openai.assert_not_called()
+        _, kwargs = mock_client.call_args
+        assert kwargs["api_key"] == "enterprise-gateway-key"
+        assert kwargs["base_url"] == "https://enterprise-gateway.example.com/v1beta"
+        assert kwargs["default_headers"] == {"X-Gateway-Auth": "corp-token"}
 
 
 # ── models.dev Integration ──
