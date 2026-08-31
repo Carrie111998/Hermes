@@ -5691,6 +5691,14 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
 
 
 def _write_config_key(key_path: str, value):
+    # Write-path cache bypass: `_load_cfg_raw` caches keyed on mtime, and the
+    # read-mutate-save round-trip below must always merge the file's true
+    # current state - a manual edit that landed ahead of a stale cache fill
+    # (same-mtime window) would otherwise be silently clobbered on save.
+    # Force a fresh disk read on every write; behavioral reads keep the cache.
+    global _cfg_cache, _cfg_mtime
+    _cfg_cache = None
+    _cfg_mtime = None
     # Write-back round-trip: raw read is mandatory — saving the managed-
     # overlaid / env-expanded view would persist those values into the file.
     cfg = _load_cfg_raw()
