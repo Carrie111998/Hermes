@@ -2254,6 +2254,7 @@ def run_conversation(
         # an assistant message makes the model echo it and self-replicate
         # (#81841). Dropping before repair lets repair_message_sequence fix
         # any user→user adjacency the filter creates.
+        _messages_before_ghost_filter = messages
         messages = [
             msg for msg in messages
             if not (
@@ -2271,6 +2272,14 @@ def run_conversation(
                 )
             )
         ]
+        from agent.agent_runtime_helpers import preserve_current_turn_user_idx
+
+        preserve_current_turn_user_idx(
+            agent, _messages_before_ghost_filter, messages
+        )
+        current_turn_user_idx = getattr(
+            agent, "_persist_user_message_idx", current_turn_user_idx
+        )
 
         # Defensive: repair malformed role-alternation before API call.
         # Catches cases where the history got wedged into a
@@ -2284,6 +2293,12 @@ def run_conversation(
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
         from agent.agent_runtime_helpers import repair_message_sequence_with_cursor
         repaired_seq = repair_message_sequence_with_cursor(agent, messages)
+        # Both the ghost-row rebuild and repair may move the current user dict.
+        # Keep the loop's API-injection anchor aligned with the canonical typed
+        # owner even when filtering alone changed the index and repair is a no-op.
+        current_turn_user_idx = getattr(
+            agent, "_persist_user_message_idx", current_turn_user_idx
+        )
         if repaired_seq > 0:
             request_logger.info(
                 "Repaired %s message-alternation violations before request (session=%s)",

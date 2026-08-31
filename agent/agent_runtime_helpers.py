@@ -622,6 +622,11 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
         return 0
 
     repairs = 0
+    current_turn_message = None
+    current_turn_owner = None
+    current_turn_idx = getattr(agent, "_persist_user_message_idx", None)
+    if isinstance(current_turn_idx, int) and 0 <= current_turn_idx < len(messages):
+        current_turn_message = messages[current_turn_idx]
 
     # Pass 0: merge consecutive assistant messages. Runs BEFORE Pass 1 so
     # the merged turn's union of tool_call ids is known when Pass 1
@@ -919,6 +924,8 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 # bytes previously sent for the pre-merge message) — drop it
                 # so replay can't substitute stale bytes.
                 drop_stale_api_content(prev)
+                if msg is current_turn_message:
+                    current_turn_owner = prev
                 repairs += 1
                 continue
         merged.append(msg)
@@ -927,6 +934,13 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
         # Rewrite in place so downstream paths (persistence, return
         # value, session DB flush) see the repaired sequence.
         messages[:] = merged
+
+    if current_turn_message is not None:
+        owner = current_turn_owner or current_turn_message
+        agent._persist_user_message_idx = next(
+            (index for index, message in enumerate(messages) if message is owner),
+            -1,
+        )
 
     return repairs
 
@@ -969,6 +983,26 @@ def repair_message_sequence_with_cursor(agent, messages: List[Dict]) -> int:
 
     return repairs
 
+
+def preserve_current_turn_user_idx(
+    agent, previous_messages: List[Dict], messages: List[Dict]
+) -> None:
+    """Carry typed current-turn ownership across an identity-preserving rebuild."""
+    current_turn_idx = getattr(agent, "_persist_user_message_idx", None)
+    if not (
+        isinstance(current_turn_idx, int)
+        and 0 <= current_turn_idx < len(previous_messages)
+    ):
+        return
+    current_turn_message = previous_messages[current_turn_idx]
+    agent._persist_user_message_idx = next(
+        (
+            index
+            for index, message in enumerate(messages)
+            if message is current_turn_message
+        ),
+        -1,
+    )
 
 
 def strip_think_blocks(agent, content: str) -> str:
