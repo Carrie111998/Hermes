@@ -74,7 +74,15 @@ def _resolve_requests_verify(base_url: str = "") -> bool | str:
             from hermes_cli.config import get_custom_provider_tls_settings
             tls = get_custom_provider_tls_settings(base_url)
             if tls.get("ssl_verify") is False:
-                return False
+                # Same policy as the httpx chat client: ssl_verify:false is a
+                # local-development escape hatch only. For publicly routable
+                # hosts fall through to default verification instead of
+                # probing without any checks.
+                from agent.ssl_verify import _is_local_host
+                from urllib.parse import urlparse
+
+                if _is_local_host(urlparse(base_url).hostname or ""):
+                    return False
             ca = tls.get("ssl_ca_cert")
             if isinstance(ca, str) and ca and os.path.isfile(ca):
                 return ca

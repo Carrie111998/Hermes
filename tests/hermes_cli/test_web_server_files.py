@@ -1,6 +1,8 @@
 """Tests for the dashboard-managed file browser API."""
 
+import time
 from types import SimpleNamespace
+import urllib.parse
 
 import pytest
 from starlette.testclient import TestClient
@@ -130,6 +132,68 @@ def test_download_authenticates_via_query_token(forced_files_client):
     assert client.get(
         "/api/files/download", params={"path": str(file_path)}
     ).status_code == 401
+
+
+def test_download_link_mints_short_lived_signed_url(forced_files_client):
+    client, root = forced_files_client
+    file_path = _seed_file(client, root, name="out/demo.mp4")
+
+    minted = client.post("/api/files/download-link", json={"path": str(file_path)})
+    assert minted.status_code == 200
+    url = minted.json()["url"]
+    assert url.startswith("/api/files/download?")
+    assert "token=" not in url  # no session material in the link
+
+    # The signed link works without the session header — mirrors a
+    # browser/shell-opened download that can't set the session header.
+    del client.headers[web_server._SESSION_HEADER_NAME]
+
+    ok = client.get(url)
+    assert ok.status_code == 200
+    assert ok.content == b"hello"
+    assert ok.headers["content-disposition"].startswith("attachment;")
+
+
+def test_download_link_is_path_bound_and_expiring(forced_files_client):
+    client, root = forced_files_client
+    file_path = _seed_file(client, root, name="out/demo.mp4")
+    other_file = _seed_file(client, root, name="out/other.txt")
+
+    qs = web_server._sign_download_link(str(file_path))
+    params = dict(part.split("=", 1) for part in qs.split("&"))
+
+    # A signature minted for one path must not authorize a different path.
+    tampered = (
+        "/api/files/download?path="
+        + urllib.parse.quote(str(other_file), safe="")
+        + f"&exp={params['exp']}&sig={params['sig']}"
+    )
+    del client.headers[web_server._SESSION_HEADER_NAME]
+    assert client.get(tampered).status_code == 401
+
+    # An expired link is rejected even with a valid signature.
+    stale = web_server._sign_download_link(
+        str(file_path), now=int(time.time()) - web_server._DOWNLOAD_LINK_TTL - 1
+    )
+    assert client.get(f"/api/files/download?{stale}").status_code == 401
+
+
+def test_download_link_endpoint_requires_auth_and_existing_file(forced_files_client):
+    client, root = forced_files_client
+
+    del client.headers[web_server._SESSION_HEADER_NAME]
+    assert (
+        client.post("/api/files/download-link", json={"path": "/tmp/whatever"}).status_code
+        == 401
+    )
+
+    client.headers[web_server._SESSION_HEADER_NAME] = web_server._SESSION_TOKEN
+    assert (
+        client.post(
+            "/api/files/download-link", json={"path": str(root / "does-not-exist.txt")}
+        ).status_code
+        == 404
+    )
 
 
 def test_stream_requires_header_auth_and_supports_ranges(forced_files_client):

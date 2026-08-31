@@ -12931,16 +12931,23 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
-                            # shell=True is intentional: quick_commands are user-defined
-                            # shell snippets from config.yaml — not agent/LLM controlled.
-                            # Sanitize env to prevent credential leakage —
-                            # quick commands run in the CLI process which
-                            # has all API keys in os.environ.
+                            # argv-first hardening: commands with no shell
+                            # syntax run without a shell, so metacharacters in
+                            # arguments stay inert. Commands the operator wrote
+                            # with explicit shell operators (&&, pipes,
+                            # redirects, …) run through the shell unchanged.
+                            # quick_commands are trusted user-defined snippets
+                            # from config.yaml. Sanitize env to prevent
+                            # credential leakage — quick commands run in the
+                            # CLI process which has all API keys in os.environ.
                             from tools.environments.local import build_subprocess_env
                             sanitized_env = build_subprocess_env()
-                            from hermes_cli._subprocess_compat import windows_hide_flags
-                            result = subprocess.run(
-                                exec_cmd, shell=True, capture_output=True,
+                            from hermes_cli._subprocess_compat import (
+                                run_configured_command,
+                                windows_hide_flags,
+                            )
+                            result = run_configured_command(
+                                exec_cmd, capture_output=True,
                                 text=True, encoding="utf-8", errors="replace", timeout=30, env=sanitized_env,
                                 # No console flash on Windows (#56747).
                                 creationflags=windows_hide_flags(),

@@ -2734,7 +2734,11 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         return build_moa_facade(agent, getattr(agent, "model", None) or "default")
     ssl_ca_cert = client_kwargs.pop("ssl_ca_cert", None)
     ssl_verify_cfg = client_kwargs.pop("ssl_verify", None)
-    httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
+    httpx_verify = resolve_httpx_verify(
+        ca_bundle=ssl_ca_cert,
+        ssl_verify=ssl_verify_cfg,
+        base_url=str(client_kwargs.get("base_url") or ""),
+    )
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
     if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):

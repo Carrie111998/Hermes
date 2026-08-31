@@ -3780,6 +3780,23 @@ class TestThemeBootstrapCSS:
         head = resp.text.split("</head>")[0]
         assert "hermes-theme-bootstrap" in head
 
+    def test_serve_index_sets_strict_csp_with_nonce(self, tmp_path, monkeypatch):
+        client = self._mount_spa_client(tmp_path, monkeypatch)
+        resp = client.get("/chat")
+        assert resp.status_code == 200
+        csp = resp.headers.get("content-security-policy")
+        assert csp is not None
+        # script-src is the XSS-critical directive: only self-hosted bundle
+        # scripts plus the per-response nonce, never bare inline.
+        assert "script-src 'self' 'nonce-" in csp
+        assert "'unsafe-inline'" not in csp.split("script-src", 1)[1].split(";", 1)[0]
+        assert "frame-ancestors 'none'" in csp
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+        # The inline bootstrap script carries the exact nonce from the header.
+        nonce = csp.split("'nonce-", 1)[1].split("'", 1)[0]
+        assert nonce
+        assert f'<script nonce="{nonce}">' in resp.text
+
 
 
 

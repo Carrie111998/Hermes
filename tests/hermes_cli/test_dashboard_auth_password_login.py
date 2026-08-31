@@ -373,3 +373,16 @@ class TestLoginPageRender:
         finally:
             clear_providers()
 
+    def test_csp_nonce_applied_to_inline_style_and_script(self):
+        clear_providers()
+        register_provider(PasswordProvider())
+        try:
+            html = render_login_html(nonce="abcdefghijklmnop")
+            assert '<style nonce="abcdefghijklmnop">' in html
+            assert '<script nonce="abcdefghijklmnop">' in html
+            # Without a nonce the tags stay bare (backward compatible).
+            assert "<style>" in render_login_html()
+            assert "<script>" in render_login_html()
+        finally:
+            clear_providers()
+

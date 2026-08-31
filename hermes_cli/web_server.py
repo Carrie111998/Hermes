@@ -678,6 +678,7 @@ app.add_middleware(
 # Keep the upstream list minimal — only truly non-sensitive, read-only
 # endpoints belong there.
 # ---------------------------------------------------------------------------
+from hermes_cli.dashboard_auth.csp import build_spa_csp as _build_spa_csp
 from hermes_cli.dashboard_auth.public_paths import (
     PUBLIC_API_PATHS as _PUBLIC_API_PATHS,
 )
@@ -703,17 +704,76 @@ def _has_valid_session_token(request: Request) -> bool:
     return hmac.compare_digest(auth.encode(), expected.encode())
 
 
-# Routes that may also authenticate via a ``?token=`` query param, for download
+# Routes that may also authenticate via a signed query string, for download
 # links opened by the OS shell or a new browser tab where the session header
-# can't be set. Kept narrow — same query-token tradeoff as the /api/pty WS.
+# can't be set. Kept narrow.
 _QUERY_TOKEN_API_PATHS: frozenset[str] = frozenset({"/api/files/download"})
+
+# ---------------------------------------------------------------------------
+# Short-lived signed download links.
+#
+# ``/api/files/download`` historically accepted the raw session token as a
+# ``?token=`` query param so shell/browser-opened downloads (which can't set
+# the session header) could authenticate. The token then travelled inside URLs
+# that leak into browser history, proxy/access logs, and the shell's argv.
+#
+# Replacement: an HMAC-signed link bound to one path and a short expiry. The
+# URL stays openable by anything that can open a URL (``<img>``, OS shell,
+# new tab) but reveals nothing about ``_SESSION_TOKEN`` and self-expires after
+# ``_DOWNLOAD_LINK_TTL`` seconds. The signature is computed over the session
+# token *at call time* because ``_apply_ssh_session_token`` may rotate it.
+# ---------------------------------------------------------------------------
+
+_DOWNLOAD_LINK_TTL = 60  # seconds
+
+
+def _sign_download_link(path: str, now: Optional[int] = None) -> str:
+    """Build the query string for a short-lived, path-bound signed link."""
+    now = int(time.time()) if now is None else int(now)
+    msg = f"{path}:{now}".encode()
+    sig = hmac.new(_SESSION_TOKEN.encode(), msg, hashlib.sha256).hexdigest()[:32]
+    return f"path={urllib.parse.quote(path, safe='')}&exp={now}&sig={sig}"
+
+
+def _verify_download_link(path: str, exp: int, sig: str) -> bool:
+    """True when ``sig`` is a valid HMAC over ``path:exp`` and the link is fresh."""
+    if int(time.time()) > int(exp) + _DOWNLOAD_LINK_TTL:
+        return False  # expired
+    expected = hmac.new(
+        _SESSION_TOKEN.encode(), f"{path}:{exp}".encode(), hashlib.sha256
+    ).hexdigest()[:32]
+    return hmac.compare_digest(sig, expected)
 
 
 def _has_valid_query_token(request: Request, path: str) -> bool:
     if path not in _QUERY_TOKEN_API_PATHS:
         return False
+    # Modern path: a short-lived signed link (path/exp/sig). No session
+    # material is exposed and the link self-expires. The signature binds the
+    # link to the exact path it was minted for, so a leaked link cannot be
+    # rewritten to download a different file.
+    exp_raw = request.query_params.get("exp", "")
+    sig = request.query_params.get("sig", "")
+    file_path = request.query_params.get("path", "")
+    if exp_raw and sig and file_path:
+        try:
+            exp = int(exp_raw)
+        except ValueError:
+            exp = -1
+        if _verify_download_link(file_path, exp, sig):
+            return True
+    # Legacy raw ``?token=`` — deprecated. Still accepted so existing links and
+    # open flows keep working through the two-release deprecation window, but
+    # every use is logged so the remaining consumers can be migrated and the
+    # param removed.
     token = request.query_params.get("token", "")
-    return bool(token) and hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
+    if token:
+        _log.warning(
+            "DEPRECATED ?token= query auth on %s — use a signed download link instead",
+            path,
+        )
+        return hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode())
+    return False
 
 
 def _require_token(request: Request) -> None:
@@ -2878,19 +2938,48 @@ def _managed_file_response(
     )
 
 
+class DownloadLinkRequest(BaseModel):
+    path: str
+
+
+@app.post("/api/files/download-link")
+async def create_download_link(payload: DownloadLinkRequest, request: Request):
+    """Return a short-lived signed URL for ``/api/files/download``.
+
+    Authenticated callers (session header, or the OAuth gate's verified
+    session) trade their credential for a path-bound, self-expiring link that
+    can be handed to a shell or browser without putting the session token in a
+    URL. The signed URL contains no session material and stops working after
+    ``_DOWNLOAD_LINK_TTL`` seconds.
+    """
+    _require_token(request)
+    # Resolve through the managed-files policy so a link can only be minted
+    # for a file the caller could already download (same guards as the
+    # download endpoint: exists, is a file, not sensitive).
+    _policy, target, _display = _resolve_managed_path(payload.path, request)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    if _is_sensitive_path(target):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
+    query = _sign_download_link(payload.path)
+    return {"url": f"/api/files/download?{query}"}
+
+
 @app.get("/api/files/download")
 async def download_managed_file(request: Request, path: str):
     """Stream a managed file as an attachment download.
 
     Remote clients (desktop app, browser dashboard) open agent-written files
     that live on *this* gateway's disk, not theirs. Auth-gated like every other
-    managed-files route — ``auth_middleware`` additionally accepts the session
-    token as a ``?token=`` query param here so a shell/browser-opened download
-    (which can't set the session header) still authenticates. See ``/api/pty``
-    for the same query-token precedent. Chromium identifies ``<audio>`` and
-    ``<video>`` subresource requests through ``Sec-Fetch-Dest``; serve those
-    inline for compatibility with Desktop builds that still use this route as
-    their player source, while preserving attachment semantics for ordinary
+    managed-files route — ``auth_middleware`` additionally accepts a short-lived
+    signed link (``path``/``exp``/``sig``, minted by ``POST /api/files/download-link``)
+    here so a shell/browser-opened download (which can't set the session header)
+    still authenticates without exposing the session token in the URL. The
+    legacy ``?token=`` query param is deprecated and still accepted during the
+    migration window. Chromium identifies ``<audio>`` and ``<video>``
+    subresource requests through ``Sec-Fetch-Dest``; serve those inline for
+    compatibility with Desktop builds that still use this route as their
+    player source, while preserving attachment semantics for ordinary
     link/document requests.
     """
     fetch_destination = request.headers.get("sec-fetch-dest", "").lower()
@@ -2922,6 +3011,30 @@ async def stream_managed_file(request: Request, path: str):
     )
 
 
+def _audit_file_write(action: str, path: str, request: Request) -> None:
+    """Record a dashboard-managed file mutation for post-incident audit.
+
+    The dashboard file API can read/write the whole home directory outside a
+    container, protected only by the session token. Any write is a potential
+    post-XSS or post-theft artifact, so every successful mutation is logged
+    with the target path, the identity that performed it (OAuth session user
+    when gated, otherwise the loopback token), and the client address.
+    """
+    identity = "token"
+    session = getattr(request.state, "session", None)
+    if session is not None:
+        identity = getattr(session, "user_id", None) or getattr(
+            session, "provider", None
+        ) or "session"
+    _log.warning(
+        "FILE WRITE action=%s path=%s identity=%s client=%s",
+        action,
+        path,
+        identity,
+        request.client.host if request.client else "?",
+    )
+
+
 @app.post("/api/files/upload")
 async def upload_managed_file(payload: ManagedFileUpload, request: Request):
     policy, target, display_path = _resolve_managed_path(payload.path, request, for_write=True)
@@ -2938,6 +3051,7 @@ async def upload_managed_file(payload: ManagedFileUpload, request: Request):
         raise HTTPException(status_code=403, detail="File is not writable")
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not write file: {exc}")
+    _audit_file_write("upload", display_path, request)
 
     return {
         "ok": True,
@@ -3012,6 +3126,7 @@ async def upload_managed_file_stream(
         if not renamed:
             tmp_path.unlink(missing_ok=True)
         await file.close()
+    _audit_file_write("upload-stream", display_path, request)
 
     return {
         "ok": True,
@@ -3033,6 +3148,7 @@ async def create_managed_directory(payload: ManagedDirectoryCreate, request: Req
         raise HTTPException(status_code=403, detail="Directory is not writable")
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not create directory: {exc}")
+    _audit_file_write("mkdir", display_path, request)
 
     return {
         "ok": True,
@@ -3063,6 +3179,7 @@ async def delete_managed_file(payload: ManagedFileDelete, request: Request):
     except OSError as exc:
         status_code = 409 if target.is_dir() and not payload.recursive else 500
         raise HTTPException(status_code=status_code, detail=f"Could not delete path: {exc}")
+    _audit_file_write("delete", display_path, request)
 
     return {"ok": True, "path": display_path, **_managed_response_meta(policy)}
 
@@ -17789,9 +17906,13 @@ def mount_spa(application: FastAPI):
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
+        # Per-response nonce for the inline bootstrap script so the SPA can
+        # carry a strict ``script-src`` CSP without allowing arbitrary inline
+        # scripts. Fresh per request, so a leaked nonce can't be replayed.
+        csp_nonce = secrets.token_urlsafe(16)
         if gated:
             bootstrap_script = (
-                f"<script>"
+                f'<script nonce="{csp_nonce}">'
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
@@ -17799,7 +17920,7 @@ def mount_spa(application: FastAPI):
             )
         else:
             bootstrap_script = (
-                f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
+                f'<script nonce="{csp_nonce}">window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
@@ -17827,7 +17948,11 @@ def mount_spa(application: FastAPI):
         html = html.replace("</head>", f"{bootstrap_script}</head>", 1)
         return HTMLResponse(
             html,
-            headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Content-Security-Policy": _build_spa_csp(csp_nonce),
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     # When served behind a path-prefix proxy, the built CSS contains

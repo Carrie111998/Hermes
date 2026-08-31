@@ -16,6 +16,7 @@ The routes:
 from __future__ import annotations
 
 import logging
+import secrets
 import threading
 import time
 from collections import defaultdict, deque
@@ -31,6 +32,7 @@ from hermes_cli.dashboard_auth import (
     list_session_providers,
 )
 from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+from hermes_cli.dashboard_auth.csp import build_login_csp
 from hermes_cli.dashboard_auth.base import (
     InvalidCodeError,
     InvalidCredentialsError,
@@ -139,9 +141,16 @@ async def login_page(request: Request) -> HTMLResponse:
     next_path = _validate_post_login_target(
         request.query_params.get("next", "")
     )
+    # Per-response nonce for the page's inline <style>/<script> so it can
+    # carry a strict CSP (script-src 'self' + nonce) pre-auth.
+    nonce = secrets.token_urlsafe(16)
     return HTMLResponse(
-        render_login_html(next_path=next_path),
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+        render_login_html(next_path=next_path, nonce=nonce),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Content-Security-Policy": build_login_csp(nonce),
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

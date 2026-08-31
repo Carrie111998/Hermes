@@ -8,6 +8,7 @@ import {
   gatewayMediaDataUrl,
   isInlineMediaSrc,
   isRemoteGateway,
+  mediaExternalLink,
   mediaExternalUrl,
   mediaGatewayStreamUrl,
   resolveMediaDisplaySrc,
@@ -74,6 +75,114 @@ describe('mediaExternalUrl', () => {
   it('falls back to file:// when remote connection lacks a token', () => {
     $connection.set({ mode: 'remote', baseUrl: 'https://gw' } as never)
     expect(mediaExternalUrl('/tmp/a.png')).toBe('file:///tmp/a.png')
+  })
+})
+
+describe('mediaExternalLink', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    $connection.set(null)
+  })
+
+  it('passes a plain https URL through untouched', async () => {
+    $connection.set({ mode: 'remote', baseUrl: 'https://gw', token: 't' } as never)
+
+    await expect(mediaExternalLink('https://example.com/a.png')).resolves.toBe('https://example.com/a.png')
+  })
+
+  it('mints a signed link for a gateway-local path in token mode', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ url: '/api/files/download?path=%2Ftmp%2Fa%20b.png&exp=1&sig=abc' })
+    }))
+
+    vi.stubGlobal('fetch', fetchMock)
+    $connection.set({ mode: 'remote', baseUrl: 'https://gw', token: 's e/cret' } as never)
+
+    await expect(mediaExternalLink('file:///tmp/a b.png')).resolves.toBe(
+      'https://gw/api/files/download?path=%2Ftmp%2Fa%20b.png&exp=1&sig=abc'
+    )
+
+    expect(fetchMock).toHaveBeenCalledWith('https://gw/api/files/download-link', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Hermes-Session-Token': 's e/cret'
+      },
+      body: JSON.stringify({ path: '/tmp/a b.png' })
+    })
+  })
+
+  it('re-mints a signed link for a legacy download URL carrying ?token=', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({ url: '/api/files/download?path=%2Ftmp%2Fa.png&exp=1&sig=def' })
+    }))
+
+    vi.stubGlobal('fetch', fetchMock)
+    $connection.set({ mode: 'remote', baseUrl: 'https://gw', token: 't' } as never)
+
+    await expect(mediaExternalLink('https://gw/api/files/download?path=%2Ftmp%2Fa.png&token=t')).resolves.toBe(
+      'https://gw/api/files/download?path=%2Ftmp%2Fa.png&exp=1&sig=def'
+    )
+
+    expect(fetchMock).toHaveBeenCalledWith('https://gw/api/files/download-link', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Hermes-Session-Token': 't'
+      },
+      body: JSON.stringify({ path: '/tmp/a.png' })
+    })
+  })
+
+  it('does not send the session token to a download URL on another origin', async () => {
+    const fetchMock = vi.fn()
+
+    vi.stubGlobal('fetch', fetchMock)
+    $connection.set({ mode: 'remote', baseUrl: 'https://gw', token: 'live-secret' } as never)
+
+    const hostile = 'https://attacker.example/api/files/download?path=%2Ftmp%2Fa.png'
+
+    await expect(mediaExternalLink(hostile)).resolves.toBe(hostile)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the legacy token URL when the endpoint fails', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false })))
+    $connection.set({ mode: 'remote', baseUrl: 'https://gw', token: 's e/cret' } as never)
+
+    await expect(mediaExternalLink('/tmp/a b.png')).resolves.toBe(
+      'https://gw/api/files/download?path=%2Ftmp%2Fa%20b.png&token=s%20e%2Fcret'
+    )
+  })
+
+  it('keeps the file:// form in local mode without contacting the gateway', async () => {
+    const fetchMock = vi.fn()
+
+    vi.stubGlobal('fetch', fetchMock)
+    $connection.set({ mode: 'local' } as never)
+
+    await expect(mediaExternalLink('/tmp/a.png')).resolves.toBe('file:///tmp/a.png')
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  // Regression: a tokenless OAuth remote exposes no renderer token, so the
+  // signed-link endpoint is unreachable. The function must NOT return a
+  // gateway-local file:// URL (the file lives on the gateway — opening that
+  // path locally is a dead click, the exact bug #94833 removes). The caller
+  // routes tokenless remote opens through the authenticated desktop bridge
+  // (downloadGatewayMediaFile) instead.
+  it('never returns a gateway-local file:// on a tokenless remote', async () => {
+    const fetchMock = vi.fn()
+
+    vi.stubGlobal('fetch', fetchMock)
+    $connection.set({ authMode: 'oauth', mode: 'remote', token: null } as never)
+
+    const result = await mediaExternalLink('/srv/merittas/report.png')
+
+    expect(result).toBe('/srv/merittas/report.png')
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 })
 

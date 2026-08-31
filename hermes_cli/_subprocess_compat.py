@@ -46,6 +46,9 @@ __all__ = [
     "bounded_git_probe",
     "bounded_probe_run",
     "noninteractive_git_env",
+    "command_needs_shell",
+    "resolve_configured_argv",
+    "run_configured_command",
 ]
 
 
@@ -53,6 +56,151 @@ IS_WINDOWS = sys.platform == "win32"
 
 # Private launcher-to-child metadata. This is diagnostic state, not user config.
 _WINDOWS_GATEWAY_BREAKAWAY_ENV = "_HERMES_GATEWAY_BREAKAWAY"
+
+
+# Control operators that argv execution cannot express. Detected via shlex
+# tokenization (punctuation_chars=True) so that operators INSIDE quotes stay
+# part of an argument — a `;` in a quoted filename must not force the shell
+# (and must not become a second command). Operators OUTSIDE quotes (real
+# pipelines, ``&&``/``;`` chains, redirects, subshells, ``$`` expansion) are
+# returned as standalone tokens and force the shell fallback.
+_SHELL_CONTROL_OPERATORS: frozenset[str] = frozenset({
+    "&&", "||", "|", ";", "&", "<", ">", "(", ")", "{", "}", "$",
+})
+
+# Expansion/glob characters that survive shlex tokenization inside an argument
+# token (shlex strips quotes, and whitespace_split keeps ``$HOME`` / ``*.py``
+# as single tokens), so a glob, tilde, ``$VAR``, backtick, or history-expansion
+# bang still needs a real shell.
+_SHELL_EXPANSION_CHARS: frozenset[str] = frozenset("$*?[]~`!#")
+
+# Characters that shlex consumes rather than returns as tokens (multi-line
+# commands, comments) — presence anywhere in the raw string forces the shell.
+_SHELL_RAW_ONLY_CHARS: tuple[str, ...] = ("\n", "\r", "#")
+
+# Commands in the Node ecosystem commonly resolve to Windows batch launchers.
+# Keep this list deliberately narrow: shell builtins such as ``echo`` must not
+# be sent through PATH resolution because they have no executable on disk.
+_NODE_LAUNCHER_NAMES: frozenset[str] = frozenset({
+    "bun",
+    "corepack",
+    "eslint",
+    "node",
+    "npm",
+    "npx",
+    "playwright",
+    "pnpm",
+    "prettier",
+    "tsc",
+    "tsx",
+    "yarn",
+})
+
+
+def command_needs_shell(command: str) -> bool:
+    """Return True when *command* uses shell syntax that argv can't express.
+
+    ``split_command_line()`` + ``subprocess.run(argv)`` is the hardened default
+    for user-configured commands: no shell is spawned, so metacharacters in
+    arguments stay inert. When the command genuinely needs a shell (pipes,
+    redirects, ``&&``/``;`` chains, ``$VAR``, globs, tilde, …) this returns
+    True so the caller can fall back to ``shell=True`` and keep the exact
+    behavior the operator wrote.
+
+    This is argv-first *hardening for simple commands*, not a shell-injection
+    sandbox. The command strings are operator-authored config (quick_commands,
+    goal gates, MCP bootstrap steps) — trusted programs, not untrusted input.
+    A helper cannot tell operator-written shell syntax from an injected
+    unquoted operator once both are in one string, so an unquoted ``;`` or
+    ``|`` forces the shell and the whole string runs exactly as written. The
+    property this delivers: commands without shell syntax never touch a shell
+    (metacharacters in their arguments are inert), and shell syntax inside
+    quotes stays data (``echo 'a;b'`` prints ``a;b``, never runs a second
+    command).
+
+    Detection is token-based (shlex with ``punctuation_chars=True``): shell
+    operators only count OUTSIDE quotes. ``echo "a;b"`` stays argv (the ``;``
+    is data, not a separator); ``touch x; rm -rf /`` is shell (the ``;`` is a
+    real separator the operator wrote).
+    """
+    if not command or not command.strip():
+        return False
+    if any(ch in command for ch in _SHELL_RAW_ONLY_CHARS):
+        return True
+    import shlex
+
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        # Unbalanced quotes — can't tokenize; let the shell decide.
+        return True
+    for tok in tokens:
+        if tok in _SHELL_CONTROL_OPERATORS:
+            return True
+        if any(ch in tok for ch in _SHELL_EXPANSION_CHARS):
+            return True
+    return False
+
+
+def run_configured_command(command: str, **kwargs) -> "subprocess.CompletedProcess[str]":
+    """Run a user-configured command string, argv-first when possible.
+
+    Commands that contain no shell metacharacters are executed as ``argv`` via
+    :func:`split_command_line` (Windows-safe). Commands that use shell syntax
+    (``&&``, pipes, redirects, globs, ``$VAR``, …) fall back to ``shell=True``
+    exactly as before — this preserves every existing quick command / goal gate
+    / MCP bootstrap while removing the shell from the common simple-command
+    path.
+
+    This is argv-first hardening for simple commands, not an injection
+    sandbox: the strings are operator-authored config, so an unquoted ``;``
+    (a real operator choice) runs through the shell with both parts, exactly
+    as the operator wrote them. What is guaranteed: a command with no shell
+    syntax never spawns a shell, so metacharacters in its arguments are
+    inert.
+
+    All ``**kwargs`` are forwarded to ``subprocess.run`` (``cwd``, ``env``,
+    ``timeout``, ``capture_output``, ``encoding``, ``creationflags``, …).
+    """
+    if command_needs_shell(command):
+        return subprocess.run(command, shell=True, **kwargs)
+    try:
+        argv = split_command_line(command)
+    except ValueError:
+        # Unbalanced quotes — shlex can't tokenize it, so let the shell decide.
+        return subprocess.run(command, shell=True, **kwargs)
+    if not argv:
+        # Empty/whitespace-only command: match shell behavior (exit 0, no-op).
+        return subprocess.run(command, shell=True, **kwargs)
+    return subprocess.run(resolve_configured_argv(argv), **kwargs)
+
+
+def resolve_configured_argv(argv: Sequence[str]) -> list[str]:
+    """Resolve configured Node commands before an argv-based spawn.
+
+    ``split_command_line`` intentionally returns the command as written. On
+    Windows that leaves ``npm``/``npx`` as a bare name even though the actual
+    launcher on PATH is ``npm.cmd``/``npx.cmd``. Resolve those known Node
+    commands through ``shutil.which`` before passing the argv to
+    ``subprocess``. Explicit ``.cmd`` commands are resolved too, so custom
+    batch launchers receive the same treatment.
+
+    Other commands are returned unchanged; in particular, shell builtins are
+    not transformed into impossible filesystem paths. The helper is also
+    used by async subprocess callers so sync and async configured-command
+    execution share the same Windows contract.
+    """
+    if not argv:
+        return []
+
+    executable = str(argv[0])
+    basename = executable.replace(chr(92), "/").rsplit("/", 1)[-1].lower()
+    stem = basename[:-4] if basename.endswith(".cmd") else basename
+    if stem not in _NODE_LAUNCHER_NAMES and not basename.endswith(".cmd"):
+        return list(argv)
+    return resolve_node_command(executable, argv[1:])
 
 
 def split_command_line(line: str) -> list[str]:

@@ -47,6 +47,9 @@ def test_resolve_aux_verify_ssl_verify_false(clean_tls_env, monkeypatch):
         "get_custom_provider_tls_settings",
         lambda *a, **k: {"ssl_verify": False},
     )
-    assert auxiliary_client._resolve_aux_verify("https://ollama.example.com/v1") is False
+    # Local gateway: the escape hatch is honored.
+    assert auxiliary_client._resolve_aux_verify("http://localhost:11434/v1") is False
+    # Public host: refused — falls back to default verification.
+    assert auxiliary_client._resolve_aux_verify("https://ollama.example.com/v1") is True
 
 
