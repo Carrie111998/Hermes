@@ -662,9 +662,12 @@ def _run_agent_tool_execution_middleware(
                         state["args"] = modified_args
                     return block_msg
                 except Exception as exc:
-                    from ashare.harness.errors import RepairableRuntimeFault
-                    if isinstance(exc, RepairableRuntimeFault):
-                        raise
+                    from hermes_cli.plugins import DeliveryCriticalHookError
+                    if isinstance(exc, DeliveryCriticalHookError):
+                        return (
+                            "BLOCKED: a delivery-critical pre-tool policy "
+                            "failed before dispatch"
+                        )
                     return None
 
             def _pre_tool_operation():

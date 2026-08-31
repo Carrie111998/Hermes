@@ -44,6 +44,13 @@ def has_hook(hook_name: str) -> bool:
     return plugins.has_hook(hook_name)
 
 
+def has_applicable_required_hook(hook_name: str, **kwargs: Any) -> bool:
+    """Return whether a required plugin gate applies to this exact turn."""
+    from hermes_cli import plugins
+
+    return plugins.has_applicable_required_hook(hook_name, **kwargs)
+
+
 def finalize_session(**kwargs: Any) -> List[Any]:
     """Notify observers and hard-close one core-owned Relay conversation."""
     try:

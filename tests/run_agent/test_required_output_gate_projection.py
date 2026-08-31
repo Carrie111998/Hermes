@@ -102,11 +102,10 @@ def test_gate_hides_length_nudge_and_pre_authorization_tool_text(tmp_path):
             return {
                 "action": "ALLOW",
                 "content": "authorized answer",
-                "content_sha256": "authorized-hash",
             }
         if name == "assistant_persist_receipt":
             receipts.append(kwargs)
-            return {"action": "COMMITTED", "message_id": str(kwargs["message_id"])}
+            return {"action": "COMMITTED", "message_id": kwargs["message_id"]}
         return None
 
     def _execute(_assistant, messages, _task_id, _api_call_count=0):
@@ -117,8 +116,8 @@ def test_gate_hides_length_nudge_and_pre_authorization_tool_text(tmp_path):
     try:
         with (
             patch(
-                "hermes_cli.lifecycle.has_hook",
-                side_effect=lambda name: name == "assistant_persist_gate",
+                "hermes_cli.lifecycle.has_applicable_required_hook",
+                side_effect=lambda name, **_: name == "assistant_persist_gate",
             ),
             patch(
                 "hermes_cli.lifecycle.invoke_required_hook",
@@ -145,4 +144,3 @@ def test_gate_hides_length_nudge_and_pre_authorization_tool_text(tmp_path):
     assert result["final_response"] == "authorized answer"
     assert receipts and receipts[-1]["persisted_content"] == "authorized answer"
     agent.interim_assistant_callback.assert_not_called()
-

@@ -104,6 +104,10 @@ class PluginToolOverrideError(PermissionError):
     """
 
 
+class DeliveryCriticalHookError(RuntimeError):
+    """Raised when a delivery-critical compatibility hook cannot decide."""
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -3390,13 +3394,20 @@ class PluginContext:
         return count
 
     def register_hook(
-        self, hook_name: str, callback: Callable, *, delivery_critical: bool = False,
+        self,
+        hook_name: str,
+        callback: Callable,
+        *,
+        delivery_critical: bool = False,
+        applies: Optional[Callable[..., bool]] = None,
     ) -> PluginRegistration:
         """Register a lifecycle hook callback.
 
         Unknown hook names produce a warning but are still stored so
         forward-compatible plugins don't break.
         """
+        if applies is not None and not callable(applies):
+            raise TypeError("hook applies predicate must be callable")
         if hook_name not in VALID_HOOKS:
             logger.warning(
                 "Plugin '%s' registered unknown hook '%s' "
@@ -3408,6 +3419,8 @@ class PluginContext:
         callbacks = self._manager._hooks.setdefault(hook_name, [])
         callbacks.append(callback)
         callback_key = (hook_name, id(callback))
+        if applies is not None:
+            self._manager._hook_applies[callback_key] = applies
         if delivery_critical:
             self._manager._delivery_critical_hooks.add(callback_key)
             self._manager._delivery_critical_hook_locks[callback_key] = threading.RLock()
@@ -3807,6 +3820,7 @@ class PluginManager:
         self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
         self._delivery_critical_hooks: Set[tuple] = set()
         self._delivery_critical_hook_locks: Dict[tuple, threading.RLock] = {}
+        self._hook_applies: Dict[tuple, Callable[..., bool]] = {}
         # Registration handles are kept both per plugin (ownership lookup) and
         # globally (reverse-order teardown for overrides spanning plugins).
         #
@@ -3958,6 +3972,7 @@ class PluginManager:
         self._remove_callback(self._hooks, hook_name, callback)
         self._delivery_critical_hooks.discard(callback_key)
         self._delivery_critical_hook_locks.pop(callback_key, None)
+        self._hook_applies.pop(callback_key, None)
 
     def _restore_mapping(
         self,
@@ -5632,6 +5647,11 @@ class PluginManager:
             callback_name = getattr(cb, "__name__", repr(cb))
             callback_key = (hook_name, id(cb))
             try:
+                applies = getattr(self, "_hook_applies", {}).get(callback_key)
+                if applies is not None and not bool(
+                    self._invoke_hook_callback(applies, kwargs)
+                ):
+                    continue
                 if callback_key in self._delivery_critical_hooks:
                     lock = self._delivery_critical_hook_locks[callback_key]
                     with lock:
@@ -5715,6 +5735,10 @@ class PluginManager:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
+                if callback_key in self._delivery_critical_hooks:
+                    raise DeliveryCriticalHookError(
+                        f"delivery-critical hook {hook_name!r} failed"
+                    ) from exc
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
                     hook_name,
@@ -5725,7 +5749,15 @@ class PluginManager:
 
     def invoke_required_hook(self, hook_name: str, **kwargs: Any) -> Any:
         """Invoke one fail-closed Host gate without compatibility isolation."""
-        callbacks = self._hooks.get(hook_name, [])
+        callbacks = []
+        for callback in self._hooks.get(hook_name, []):
+            callback_key = (hook_name, id(callback))
+            applies = getattr(self, "_hook_applies", {}).get(callback_key)
+            if applies is not None and not bool(
+                self._invoke_hook_callback(applies, kwargs)
+            ):
+                continue
+            callbacks.append(callback)
         if not callbacks:
             return None
         if len(callbacks) != 1:
@@ -5733,6 +5765,20 @@ class PluginManager:
                 f"required Host gate {hook_name!r} must have exactly one owner"
             )
         return self._invoke_hook_callback(callbacks[0], kwargs)
+
+    def has_applicable_required_hook(self, hook_name: str, **kwargs: Any) -> bool:
+        """Return whether this exact turn arms a fail-closed Host gate."""
+        for callback in self._hooks.get(hook_name, []):
+            callback_key = (hook_name, id(callback))
+            applies = getattr(self, "_hook_applies", {}).get(callback_key)
+            if applies is None:
+                return True
+            try:
+                if bool(self._invoke_hook_callback(applies, kwargs)):
+                    return True
+            except Exception:
+                return True
+        return False
 
     def _subscribe_event(
         self,
@@ -6511,6 +6557,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 def invoke_required_hook(hook_name: str, **kwargs: Any) -> Any:
     """Invoke a single Host gate and propagate registration/callback errors."""
     return _delivery_manager().invoke_required_hook(hook_name, **kwargs)
+
+
+def has_applicable_required_hook(hook_name: str, **kwargs: Any) -> bool:
+    """Return whether a required Host gate applies to this exact turn."""
+    return _delivery_manager().has_applicable_required_hook(hook_name, **kwargs)
 
 
 def render_system_prompt_sections(

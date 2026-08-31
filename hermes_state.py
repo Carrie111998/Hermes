@@ -13149,9 +13149,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return self._execute_write(_do)
 
     def update_assistant_message_content(
-        self, session_id: str, message_row_id: int, content: str
+        self,
+        session_id: str,
+        message_row_id: int,
+        content: str,
+        *,
+        expected_content: Optional[str] = None,
+        clear_private: bool = False,
     ) -> bool:
-        """Replace one exact active assistant row after a required Host gate."""
+        """Replace one exact active assistant row, optionally by content CAS."""
         if (
             not session_id
             or not isinstance(message_row_id, int)
@@ -13161,18 +13167,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ):
             return False
         encoded = self._encode_content(content)
+        encoded_expected = (
+            self._encode_content(expected_content)
+            if isinstance(expected_content, str)
+            else None
+        )
 
         def _do(conn):
             row = conn.execute(
-                "SELECT role, active FROM messages WHERE id = ? AND session_id = ?",
+                "SELECT role, active, content FROM messages "
+                "WHERE id = ? AND session_id = ?",
                 (message_row_id, session_id),
             ).fetchone()
-            if row is None or row["role"] != "assistant" or row["active"] != 1:
+            if (
+                row is None
+                or row["role"] != "assistant"
+                or row["active"] != 1
+                or (
+                    encoded_expected is not None
+                    and row["content"] != encoded_expected
+                )
+            ):
                 return False
+            assignments = "content = ?"
+            if clear_private:
+                assignments += (
+                    ", reasoning = NULL, reasoning_content = NULL, "
+                    "reasoning_details = NULL, codex_reasoning_items = NULL, "
+                    "codex_message_items = NULL, api_content = NULL"
+                )
+            where_expected = " AND content = ?" if encoded_expected is not None else ""
+            params = [encoded, message_row_id, session_id]
+            if encoded_expected is not None:
+                params.append(encoded_expected)
             updated = conn.execute(
-                "UPDATE messages SET content = ? WHERE id = ? AND session_id = ? "
-                "AND role = 'assistant' AND active = 1",
-                (encoded, message_row_id, session_id),
+                f"UPDATE messages SET {assignments} "
+                "WHERE id = ? AND session_id = ? "
+                f"AND role = 'assistant' AND active = 1{where_expected}",
+                params,
             )
             return updated.rowcount == 1
 

@@ -1,3 +1,4 @@
+import hashlib
 from types import SimpleNamespace
 from typing import Any
 
@@ -128,6 +129,91 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert isinstance(result["messages"][-1]["timestamp"], float)
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1] == result["messages"][-1]
+
+
+def test_output_transform_precedes_and_matches_persistence(monkeypatch):
+    """The delivered transformed body is the byte-identical durable body."""
+
+    def invoke(name, **_kwargs):
+        return ["transformed body"] if name == "transform_llm_output" else []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "model body"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="model body",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="q",
+        original_user_message="q",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+    assert result["final_response"] == "transformed body"
+    assert result["response_transformed"] is True
+    assert result["pre_transform_response"] == "model body"
+    assert agent.persisted_messages[-1]["content"] == "transformed body"
+
+
+def test_delivery_order_is_transform_candidate_gate_commit_receipt(monkeypatch):
+    order: list[str] = []
+
+    def invoke(name, **_kwargs):
+        if name == "transform_llm_output":
+            order.append("transform")
+            return ["transformed body"]
+        return []
+
+    def required(name, **kwargs):
+        if name == "assistant_final_candidate_gate":
+            order.append("candidate")
+            assert kwargs["response_text"] == "transformed body"
+            return {"action": "ALLOW"}
+        if name == "assistant_persist_gate":
+            order.append("persist_gate")
+            assert kwargs["response_text"] == "transformed body"
+            return {"action": "ALLOW"}
+        if name == "assistant_persist_receipt":
+            order.append("receipt")
+            assert kwargs["persisted_content"] == "transformed body"
+            return {"action": "COMMITTED"}
+        return None
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_required_hook", required)
+    agent = FakeAgent()
+    original_persist = agent._persist_session
+
+    def persist(messages, history):
+        order.append("commit")
+        original_persist(messages, history)
+
+    agent._persist_session = persist
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "model body", "_row_id": 51},
+    ]
+    result = finalize_turn(
+        agent, final_response="model body", api_call_count=1,
+        interrupted=False, failed=False, messages=messages,
+        conversation_history=[], effective_task_id="task", turn_id="turn",
+        user_message="q", original_user_message="q",
+        _should_review_memory=False, _turn_exit_reason="text_response(final)",
+    )
+
+    assert result["final_response"] == "transformed body"
+    assert order == ["transform", "candidate", "persist_gate", "commit", "receipt"]
 
 
 def test_fallback_timestamp_survives_delayed_sqlite_persistence(
@@ -285,13 +371,12 @@ def test_required_gate_rewrites_committed_tail_and_receipts_exact_body(
             return {
                 "action": "ALLOW",
                 "content": "authorized body",
-                "content_sha256": "gate-hash",
             }
         if name == "assistant_persist_receipt":
             seen_receipt.update(kwargs)
             assert kwargs["message_id"] == kwargs["persisted_message_id"]
             assert kwargs["assistant_response"] == kwargs["persisted_content"]
-            return {"action": "COMMITTED", "message_id": str(kwargs["message_id"])}
+            return {"action": "COMMITTED", "message_id": kwargs["message_id"]}
         return None
 
     monkeypatch.setattr("hermes_cli.lifecycle.invoke_required_hook", required)
@@ -324,8 +409,15 @@ def test_required_gate_rewrites_committed_tail_and_receipts_exact_body(
 
     assert result["final_response"] == "authorized body"
     assert agent.persisted_messages[-1]["content"] == "authorized body"
-    assert seen_receipt["message_id"] == 41
+    assert seen_receipt["message_id"] == "41"
     assert seen_receipt["persisted_content"] == "authorized body"
+    expected_hash = hashlib.sha256(b"authorized body").hexdigest()
+    assert seen_receipt["response_sha256"] == expected_hash
+    assert seen_receipt["receipt"] == {
+        "message_id": "41",
+        "content_sha256": expected_hash,
+        "committed": True,
+    }
 
 
 def test_required_gate_updates_exact_sqlite_row(monkeypatch, tmp_path):
@@ -338,11 +430,10 @@ def test_required_gate_updates_exact_sqlite_row(monkeypatch, tmp_path):
             return {
                 "action": "ALLOW",
                 "content": "authorized body",
-                "content_sha256": "gate-hash",
             }
         if name == "assistant_persist_receipt":
             receipts.append(kwargs)
-            return {"action": "COMMITTED", "message_id": str(kwargs["message_id"])}
+            return {"action": "COMMITTED", "message_id": kwargs["message_id"]}
         return None
 
     monkeypatch.setattr("hermes_cli.lifecycle.invoke_required_hook", required)
@@ -386,6 +477,63 @@ def test_required_gate_updates_exact_sqlite_row(monkeypatch, tmp_path):
         db.close()
 
 
+def test_receipt_failure_compensates_exact_sqlite_row(monkeypatch, tmp_path):
+    """An unsealed body is replaced by CAS before any result is released."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+
+    def required(name, **_kwargs):
+        if name == "assistant_persist_gate":
+            return {"action": "ALLOW", "content": "authorized body"}
+        if name == "assistant_persist_receipt":
+            raise RuntimeError("seal failed")
+        return None
+
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_required_hook", required)
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("sess-test", source="cli")
+    agent = FakeAgent()
+    agent._session_db = db
+    messages = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "provisional", "reasoning": "private"},
+    ]
+    db.append_messages_batch("sess-test", messages)
+    for message in messages:
+        message["_db_persisted"] = True
+
+    try:
+        result = finalize_turn(
+            agent,
+            final_response="untrusted body",
+            api_call_count=1,
+            interrupted=False,
+            failed=False,
+            messages=messages,
+            conversation_history=[],
+            effective_task_id="task",
+            turn_id="turn",
+            user_message="q",
+            original_user_message="q",
+            _should_review_memory=False,
+            _turn_exit_reason="text_response(final)",
+        )
+        stored = db.get_messages_as_conversation(
+            "sess-test", include_row_ids=True
+        )
+    finally:
+        db.close()
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["turn_exit_reason"] == "assistant_persist_receipt_failed"
+    assert "not released" in result["final_response"]
+    assert stored[-1]["content"] == result["final_response"]
+    assert "reasoning" not in stored[-1]
+    assert "authorized body" not in stored[-1]["content"]
+
+
 def test_stream_recovery_cannot_bypass_required_gate(monkeypatch):
     """A blank terminal object with streamed text is still Host-authorized."""
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
@@ -397,10 +545,9 @@ def test_stream_recovery_cannot_bypass_required_gate(monkeypatch):
             return {
                 "action": "ALLOW",
                 "content": "authorized streamed body",
-                "content_sha256": "gate-hash",
             }
         if name == "assistant_persist_receipt":
-            return {"action": "COMMITTED", "message_id": str(kwargs["message_id"])}
+            return {"action": "COMMITTED", "message_id": kwargs["message_id"]}
         return None
 
     monkeypatch.setattr("hermes_cli.lifecycle.invoke_required_hook", required)

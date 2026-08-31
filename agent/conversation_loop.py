@@ -126,7 +126,9 @@ RUN_BUDGET_WRAPUP_NOTICE = (
 )
 
 
-def _required_assistant_persist_gate_active() -> bool:
+def _required_assistant_persist_gate_active(
+    agent: Any, effective_task_id: str, turn_id: str,
+) -> bool:
     """Whether a Host owns the terminal assistant body for this process.
 
     While this gate is installed, model text accompanying a tool call is an
@@ -136,9 +138,16 @@ def _required_assistant_persist_gate_active() -> bool:
     failure at the terminal boundary.
     """
     try:
-        from hermes_cli.lifecycle import has_hook
+        from hermes_cli.lifecycle import has_applicable_required_hook
 
-        return bool(has_hook("assistant_persist_gate"))
+        return bool(has_applicable_required_hook(
+            "assistant_persist_gate",
+            session_id=getattr(agent, "session_id", None) or "",
+            task_id=effective_task_id,
+            turn_id=turn_id,
+            model=getattr(agent, "model", "") or "",
+            platform=getattr(agent, "platform", "") or "",
+        ))
     except Exception:
         logger.warning(
             "Unable to inspect assistant_persist_gate; suppressing interim "
@@ -7467,7 +7476,9 @@ def run_conversation(
                 # Generic Hermes sessions without the gate retain their normal
                 # interim narration behavior.
                 _hard_output_gate_pending = (
-                    _required_assistant_persist_gate_active()
+                    _required_assistant_persist_gate_active(
+                        agent, effective_task_id, turn_id,
+                    )
                 )
                 if _hard_output_gate_pending:
                     assistant_msg["content"] = ""
@@ -8352,78 +8363,6 @@ def run_conversation(
                 ):
                     messages.pop()
 
-                # Optional Host-owned no-tool candidate gate.  It runs before
-                # any candidate emit or Session flush.  CONTINUE is append-only
-                # role-valid scaffolding and both rows are explicitly
-                # non-durable; REPLACE becomes the sole candidate that can
-                # reach the normal finalization path.
-                from agent.final_candidate_gate import (
-                    FinalCandidateGateError as _FinalCandidateGateError,
-                    continuation_messages as _candidate_continuation_messages,
-                    evaluate_final_candidate as _evaluate_final_candidate,
-                )
-
-                _remaining_iterations = min(
-                    max(0, agent.max_iterations - api_call_count),
-                    max(0, int(agent.iteration_budget.remaining)),
-                )
-                _candidate_directive = _evaluate_final_candidate(
-                    response_text=final_response,
-                    session_id=getattr(agent, "session_id", None) or "",
-                    task_id=effective_task_id,
-                    turn_id=turn_id,
-                    model=getattr(agent, "model", "") or "",
-                    platform=getattr(agent, "platform", "") or "",
-                    finish_reason=finish_reason,
-                    iteration=api_call_count,
-                    max_iterations=agent.max_iterations,
-                    remaining_iterations=_remaining_iterations,
-                )
-                if (
-                    _candidate_directive is not None
-                    and _candidate_directive["action"] == "CONTINUE"
-                ):
-                    _candidate_signature = (
-                        _candidate_directive["state_revision"],
-                        _candidate_directive["pending_sha256"],
-                    )
-                    _seen_candidate_signatures = getattr(
-                        agent, "_final_candidate_continue_signatures", set()
-                    )
-                    if _candidate_signature in _seen_candidate_signatures:
-                        raise _FinalCandidateGateError(
-                            "assistant final-candidate gate repeated an unchanged CONTINUE"
-                        )
-                    _seen_candidate_signatures.add(_candidate_signature)
-                    agent._final_candidate_continue_signatures = (
-                        _seen_candidate_signatures
-                    )
-                    _candidate_msg, _candidate_nudge = (
-                        _candidate_continuation_messages(
-                            final_msg, _candidate_directive
-                        )
-                    )
-                    append_message(messages, _candidate_msg)
-                    append_message(messages, _candidate_nudge)
-                    agent._session_messages = messages
-                    final_response = None
-                    continue
-                if (
-                    _candidate_directive is not None
-                    and _candidate_directive["action"] == "REPLACE"
-                ):
-                    final_response = _candidate_directive["content"]
-                    final_msg["content"] = final_response
-                    final_msg["finish_reason"] = "host_candidate_replaced"
-                elif (
-                    _candidate_directive is not None
-                    and _candidate_directive["action"] == "ALLOW"
-                    and "content" in _candidate_directive
-                ):
-                    final_response = _candidate_directive["content"]
-                    final_msg["content"] = final_response
-                    final_msg["finish_reason"] = "host_candidate_allowed"
-
                 try:
                     from agent.verification_stop import (
                         build_verify_on_stop_nudge,
@@ -8604,7 +8543,9 @@ def run_conversation(
                 # Unlike the tool-call exit, failure must NOT abort the turn:
                 # no side effect follows and _persist_session retries the write.
                 # Full incident narrative: tests/run_agent/test_81641_*.py.
-                if not _required_assistant_persist_gate_active():
+                if not _required_assistant_persist_gate_active(
+                    agent, effective_task_id, turn_id,
+                ):
                     try:
                         agent._flush_messages_to_session_db(messages, conversation_history)
                     except Exception:

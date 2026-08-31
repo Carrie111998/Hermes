@@ -137,6 +137,31 @@ class TestAppendMessagesBatch:
             "other-session", row_id, "should not move"
         ) is False
 
+    def test_update_assistant_content_supports_cas_and_private_clear(self, db):
+        rows = [{
+            "role": "assistant",
+            "content": "authorized",
+            "reasoning": "private",
+            "reasoning_content": "private-copy",
+        }]
+        db.append_messages_batch("sess-batch", rows)
+        row_id = rows[0]["_row_id"]
+
+        assert db.update_assistant_message_content(
+            "sess-batch", row_id, "must not land",
+            expected_content="different",
+            clear_private=True,
+        ) is False
+        assert db.update_assistant_message_content(
+            "sess-batch", row_id, "safe failure",
+            expected_content="authorized",
+            clear_private=True,
+        ) is True
+        stored = db.get_messages_as_conversation("sess-batch")[-1]
+        assert stored["content"] == "safe failure"
+        assert "reasoning" not in stored
+        assert "reasoning_content" not in stored
+
     def test_atomicity_all_or_nothing(self, db, monkeypatch):
         """A failure mid-batch leaves ZERO rows and untouched counters."""
         real_insert = SessionDB._insert_message_rows

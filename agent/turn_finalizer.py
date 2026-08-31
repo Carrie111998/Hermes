@@ -22,6 +22,7 @@ keep the exact logger name (``"agent.conversation_loop"``).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 
@@ -60,6 +61,11 @@ _VERIFICATION_CONTINUATION_FLAGS = (
 _LENGTH_CONTINUATION_FLAGS = (
     "_length_continuation_fragment",
     "_length_continuation_nudge",
+)
+
+_DELIVERY_FAILURE_RESPONSE = (
+    "The response was not released because its final persistence receipt "
+    "could not be verified. Please retry the request."
 )
 
 
@@ -180,6 +186,117 @@ def _ensure_authorized_assistant_row(
             pass
     tail.pop(_DB_PERSISTED_MARKER, None)
     agent._db_flush_scan_prefix = None
+
+
+def _apply_pre_delivery_transforms(
+    agent,
+    final_response,
+    *,
+    interrupted,
+    preserved_verification_fallback,
+    turn_exit_reason,
+    effective_task_id,
+    turn_id,
+    logger,
+):
+    """Build the exact body that later gates, persistence, and delivery see."""
+    response_transformed = False
+    pre_transform_response = None
+    if final_response and not interrupted:
+        try:
+            failed_mutations = getattr(agent, "_turn_failed_file_mutations", None) or {}
+            if failed_mutations and agent._file_mutation_verifier_enabled():
+                footer = agent._format_file_mutation_failure_footer(failed_mutations)
+                if footer:
+                    final_response = final_response.rstrip() + "\n\n" + footer
+        except Exception as exc:
+            logger.debug("file-mutation verifier footer failed: %s", exc)
+
+    if not interrupted:
+        try:
+            if agent._turn_completion_explainer_enabled():
+                stripped = (final_response or "").strip()
+                empty_terminal = stripped == "" or stripped == "(empty)"
+                partial_fragment = (
+                    not empty_terminal
+                    and not preserved_verification_fallback
+                    and not str(turn_exit_reason).startswith("text_response")
+                    and len(stripped) <= 24
+                    and stripped[-1:] not in {
+                        ".", "!", "?", "。", "！", "？", "`", ")",
+                    }
+                )
+                if (
+                    empty_terminal
+                    or partial_fragment
+                    or str(turn_exit_reason) == "partial_stream_recovery"
+                ):
+                    explanation = agent._format_turn_completion_explanation(
+                        turn_exit_reason,
+                        getattr(agent, "_last_persistence_error_cause", None),
+                    )
+                    if explanation:
+                        final_response = (
+                            explanation
+                            if empty_terminal
+                            else stripped + "\n\n" + explanation
+                        )
+        except Exception as exc:
+            logger.debug("turn-completion explainer failed: %s", exc)
+
+    if final_response and not interrupted:
+        try:
+            from hermes_cli.lifecycle import invoke_hook
+
+            results = invoke_hook(
+                "transform_llm_output",
+                response_text=final_response,
+                session_id=agent.session_id or "",
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+            for result in results:
+                if isinstance(result, str) and result:
+                    pre_transform_response = final_response
+                    final_response = result
+                    response_transformed = True
+                    break
+        except Exception as exc:
+            logger.warning("transform_llm_output hook failed: %s", exc)
+
+    return final_response, response_transformed, pre_transform_response
+
+
+def _compensate_failed_receipt(
+    agent, messages, *, message_id: int, expected_content: str,
+) -> str:
+    """Replace an unsealed persisted body by exact row/content identity."""
+    session_db = getattr(agent, "_session_db", None)
+    updater = getattr(session_db, "update_assistant_message_content", None)
+    if not callable(updater) or not updater(
+        agent.session_id or "",
+        message_id,
+        _DELIVERY_FAILURE_RESPONSE,
+        expected_content=expected_content,
+        clear_private=True,
+    ):
+        raise RuntimeError("failed to compensate an unsealed assistant body")
+
+    tail = messages[-1] if messages and isinstance(messages[-1], dict) else None
+    if not isinstance(tail, dict) or tail.get("_row_id") != message_id:
+        raise RuntimeError("persisted assistant receipt row is no longer the tail")
+    tail["content"] = _DELIVERY_FAILURE_RESPONSE
+    for key in (
+        "reasoning", "reasoning_content", "reasoning_details",
+        "codex_reasoning_items", "codex_message_items", "api_content",
+    ):
+        tail.pop(key, None)
+    saver = getattr(agent, "_save_session_log", None)
+    if callable(saver):
+        saver(messages)
+    return _DELIVERY_FAILURE_RESPONSE
 
 
 def finalize_turn(
@@ -373,16 +490,62 @@ def finalize_turn(
             final_response = _streamed
             _recovered_from_stream = True
 
-    # Optional Host-owned final-content gate. It runs before the terminal
-    # assistant row is flushed. Callback and ownership failures are fatal.
+    _pre_delivery_body = final_response
+    final_response, _response_transformed, _pre_transform_response = (
+        _apply_pre_delivery_transforms(
+            agent,
+            final_response,
+            interrupted=interrupted,
+            preserved_verification_fallback=preserved_verification_fallback,
+            turn_exit_reason=_turn_exit_reason,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            logger=logger,
+        )
+    )
+    if isinstance(final_response, str):
+        final_response = _sanitize_surrogates(final_response)
+
+    # The candidate gate sees the fully transformed body exactly once. It may
+    # allow or replace it, but can no longer trigger another provider turn.
+    _candidate_gate_applied = False
+    if final_response and not interrupted:
+        from agent.final_candidate_gate import evaluate_final_candidate
+
+        _remaining_iterations = min(
+            max(0, agent.max_iterations - api_call_count),
+            max(0, int(agent.iteration_budget.remaining)),
+        )
+        _candidate = evaluate_final_candidate(
+            response_text=final_response,
+            session_id=agent.session_id or "",
+            task_id=effective_task_id,
+            turn_id=turn_id,
+            model=agent.model,
+            platform=getattr(agent, "platform", None) or "",
+            finish_reason=str(_turn_exit_reason),
+            iteration=api_call_count,
+            max_iterations=agent.max_iterations,
+            remaining_iterations=_remaining_iterations,
+        )
+        if _candidate is not None:
+            _candidate_gate_applied = True
+            if "content" in _candidate:
+                final_response = _sanitize_surrogates(_candidate["content"])
+
+    # Optional Host-owned persistence gate. Callback and ownership failures
+    # are fatal. The Host may omit content/hash when it accepts the exact
+    # candidate supplied here; Hermes computes and verifies the real hash.
     _hard_persist_gate_applied = False
     _persist_gate_content_sha256 = None
     if final_response and not interrupted:
         from hermes_cli.lifecycle import invoke_required_hook as _invoke_required_hook
 
+        _candidate_sha256 = hashlib.sha256(final_response.encode("utf-8")).hexdigest()
         _persist_gate = _invoke_required_hook(
             "assistant_persist_gate",
             response_text=final_response,
+            response_sha256=_candidate_sha256,
             session_id=agent.session_id or "",
             task_id=effective_task_id,
             turn_id=turn_id,
@@ -393,13 +556,18 @@ def finalize_turn(
             if (
                 not isinstance(_persist_gate, dict)
                 or _persist_gate.get("action") != "ALLOW"
-                or not isinstance(_persist_gate.get("content"), str)
             ):
                 raise RuntimeError("assistant persistence aborted by Host gate")
-            final_response = _persist_gate["content"]
-            _persist_gate_content_sha256 = _persist_gate.get("content_sha256")
-            if not isinstance(_persist_gate_content_sha256, str):
-                raise RuntimeError("Host gate returned no content hash")
+            _gate_content = _persist_gate.get("content", final_response)
+            if not isinstance(_gate_content, str) or not _gate_content:
+                raise RuntimeError("Host gate returned invalid content")
+            final_response = _sanitize_surrogates(_gate_content)
+            _persist_gate_content_sha256 = hashlib.sha256(
+                final_response.encode("utf-8")
+            ).hexdigest()
+            _declared_hash = _persist_gate.get("content_sha256")
+            if _declared_hash is not None and _declared_hash != _persist_gate_content_sha256:
+                raise RuntimeError("Host gate content hash does not match its body")
             _hard_persist_gate_applied = True
 
     # Persist session to both JSON log and SQLite only after private retry
@@ -456,7 +624,11 @@ def finalize_turn(
                 agent,
                 messages,
                 final_response,
-                hard_gate=_hard_persist_gate_applied,
+                hard_gate=(
+                    _hard_persist_gate_applied
+                    or _candidate_gate_applied
+                    or final_response != _pre_delivery_body
+                ),
                 replace_blank_tail=_recovered_from_stream,
             )
 
@@ -488,6 +660,8 @@ def finalize_turn(
                     and getattr(_compressor, '_micro_compact_enabled', False) is True
                     and callable(getattr(_compressor, '_micro_compact', None))
                     and final_response
+                    and not _hard_persist_gate_applied
+                    and not _candidate_gate_applied
                     # compression.checkpoint_required: agent init already
                     # forces _micro_compact_enabled off, but the compressor
                     # attribute is plain state a future path could flip on a
@@ -549,24 +723,63 @@ def finalize_turn(
             if isinstance(_persisted_tail, dict)
             else None
         )
-        if not isinstance(_persisted_content, str):
-            raise RuntimeError("Session persistence returned no assistant body")
-        _receipt = _invoke_required_hook(
-            "assistant_persist_receipt",
-            session_id=agent.session_id or "",
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            message_id=_message_id,
-            assistant_response=final_response,
-            content_sha256=_persist_gate_content_sha256,
-            persisted_message_id=_message_id,
-            persisted_content=_persisted_content,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-        if not isinstance(_receipt, dict) or _receipt.get("action") != "COMMITTED":
-            raise RuntimeError(
-                "Host did not acknowledge the assistant persistence receipt"
+        if (
+            not isinstance(_message_id, int)
+            or isinstance(_message_id, bool)
+            or not isinstance(_persisted_content, str)
+            or _persisted_content != final_response
+        ):
+            raise RuntimeError("Session persistence returned no exact assistant receipt")
+        _persisted_sha256 = hashlib.sha256(
+            _persisted_content.encode("utf-8")
+        ).hexdigest()
+        if _persisted_sha256 != _persist_gate_content_sha256:
+            raise RuntimeError("persisted assistant body differs from authorized hash")
+        _message_id_text = str(_message_id)
+        _host_receipt = {
+            "message_id": _message_id_text,
+            "content_sha256": _persisted_sha256,
+            "committed": True,
+        }
+        try:
+            _receipt = _invoke_required_hook(
+                "assistant_persist_receipt",
+                session_id=agent.session_id or "",
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                message_id=_message_id_text,
+                response_text=final_response,
+                response_sha256=_persisted_sha256,
+                receipt=_host_receipt,
+                assistant_response=final_response,
+                content_sha256=_persisted_sha256,
+                persisted_message_id=_message_id_text,
+                persisted_content=_persisted_content,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+            if (
+                not isinstance(_receipt, dict)
+                or _receipt.get("action") != "COMMITTED"
+            ):
+                raise RuntimeError(
+                    "Host did not acknowledge the assistant persistence receipt"
+                )
+        except Exception as _receipt_err:
+            final_response = _compensate_failed_receipt(
+                agent,
+                messages,
+                message_id=_message_id,
+                expected_content=_persisted_content,
+            )
+            failed = True
+            completed = False
+            _turn_exit_reason = "assistant_persist_receipt_failed"
+            _cleanup_errors.append(f"persist_receipt: {_receipt_err}")
+            logger.error(
+                "finalize_turn: assistant persistence receipt failed: %s",
+                _receipt_err,
+                exc_info=True,
             )
 
     # The gateway owns a separate in-memory history snapshot. Keep it current
@@ -620,115 +833,6 @@ def finalize_turn(
         )
     else:
         logger.info(_diag_msg, *_diag_args)
-
-    # File-mutation verifier footer.
-    # If one or more ``write_file`` / ``patch`` calls failed during this
-    # turn and were never superseded by a successful write to the same
-    # path, append an advisory footer to the assistant response.  This
-    # catches the specific case — reported by Ben Eng (#15524-adjacent)
-    # — where a model issues a batch of parallel patches, half of them
-    # fail with "Could not find old_string", and the model summarises
-    # the turn claiming every file was edited.  The user then has to
-    # manually run ``git status`` to catch the lie.  With this footer
-    # the truth is surfaced on every turn, so over-claiming is
-    # structurally impossible past the model.
-    #
-    # Gate: only applied when a real text response exists for this
-    # turn and the user didn't interrupt.  Empty/interrupted turns
-    # already have other surface text that shouldn't be augmented.
-    if final_response and not interrupted and not _hard_persist_gate_applied:
-        try:
-            _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
-            if _failed and agent._file_mutation_verifier_enabled():
-                footer = agent._format_file_mutation_failure_footer(_failed)
-                if footer:
-                    final_response = final_response.rstrip() + "\n\n" + footer
-        except Exception as _ver_err:
-            logger.debug("file-mutation verifier footer failed: %s", _ver_err)
-
-    # Turn-completion explainer.
-    # When a turn ends abnormally after substantive work — empty content
-    # after retries, a partial/truncated stream, a still-pending tool
-    # result, or an iteration/budget limit — the user otherwise gets a
-    # blank or fragmentary response box with no consolidated reason why
-    # the agent stopped (#34452).  Surface a single user-visible
-    # explanation derived from ``_turn_exit_reason``, mirroring the
-    # file-mutation verifier footer pattern above.
-    #
-    # Gate carefully so healthy turns stay quiet:
-    #   - ``text_response(...)`` exits never produce an explanation
-    #     (handled inside the formatter), so a terse ``Done.`` is silent.
-    #   - We only ACT when there is no genuinely usable reply this turn:
-    #     an empty response, the "(empty)" terminal sentinel, or a
-    #     suspiciously short partial fragment with no terminating
-    #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted and not _hard_persist_gate_applied:
-        try:
-            if agent._turn_completion_explainer_enabled():
-                _stripped = (final_response or "").strip()
-                _is_empty_terminal = _stripped == "" or _stripped == "(empty)"
-                # A short fragment that is not a normal text_response exit
-                # and lacks sentence-ending punctuation is treated as a
-                # truncated partial (the "The" case from #34452).
-                _is_partial_fragment = (
-                    not _is_empty_terminal
-                    and not preserved_verification_fallback
-                    and not str(_turn_exit_reason).startswith("text_response")
-                    and len(_stripped) <= 24
-                    and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
-                )
-                _is_partial_stream_recovery = (
-                    str(_turn_exit_reason) == "partial_stream_recovery"
-                )
-                if (
-                    _is_empty_terminal
-                    or _is_partial_fragment
-                    or _is_partial_stream_recovery
-                ):
-                    _explanation = agent._format_turn_completion_explanation(
-                        _turn_exit_reason,
-                        getattr(agent, "_last_persistence_error_cause", None),
-                    )
-                    if _explanation:
-                        if _is_empty_terminal:
-                            # Replace the bare "(empty)"/blank sentinel with
-                            # the actionable explanation.
-                            final_response = _explanation
-                        else:
-                            # Keep the partial fragment, append the reason so
-                            # the user sees both what arrived and why it
-                            # stopped.
-                            final_response = (
-                                _stripped + "\n\n" + _explanation
-                            )
-        except Exception as _exp_err:
-            logger.debug("turn-completion explainer failed: %s", _exp_err)
-
-    _response_transformed = False
-    _pre_transform_response = None
-
-    # Plugin hook: transform_llm_output
-    # Fired once per turn after the tool-calling loop completes.
-    # Plugins can transform the LLM's output text before it's returned.
-    # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted and not _hard_persist_gate_applied:
-        try:
-            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _transform_results = _invoke_hook(
-                "transform_llm_output",
-                response_text=final_response,
-                session_id=agent.session_id or "",
-                model=agent.model,
-                platform=getattr(agent, "platform", None) or "",
-            )
-            for _hook_result in _transform_results:
-                if isinstance(_hook_result, str) and _hook_result:
-                    _pre_transform_response = final_response
-                    final_response = _hook_result
-                    _response_transformed = True
-                    break  # First non-empty string wins
-        except Exception as exc:
-            logger.warning("transform_llm_output hook failed: %s", exc)
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.

@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from hermes_cli.plugins import (
+    DeliveryCriticalHookError,
     ENTRY_POINTS_GROUP,
     VALID_HOOKS,
     PluginContext,
@@ -1142,6 +1143,20 @@ class TestForceReloadSymmetry:
         second.join(timeout=1.0)
         assert calls == ["first-caller", "second-caller"]
         assert results == ["recorded", "recorded"]
+
+    def test_delivery_critical_hook_failure_propagates(self):
+        def callback(**_kwargs):
+            raise ValueError("policy unavailable")
+
+        mgr = PluginManager()
+        key = ("pre_tool_call", id(callback))
+        mgr._hooks["pre_tool_call"] = [callback]
+        mgr._delivery_critical_hooks.add(key)
+        mgr._delivery_critical_hook_locks[key] = threading.RLock()
+
+        with pytest.raises(DeliveryCriticalHookError) as error:
+            mgr.invoke_hook("pre_tool_call", tool_name="write_file", args={})
+        assert isinstance(error.value.__cause__, ValueError)
 
     def test_hung_callback_suppresses_repeat_fires(self, monkeypatch):
         """A still-running timed-out callback must not spawn another worker."""
