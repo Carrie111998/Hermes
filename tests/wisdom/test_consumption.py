@@ -357,6 +357,54 @@ def test_returned_draft_invalidates_receipt_and_preserves_moderator_note(
     )
 
 
+def test_portal_submission_retires_exact_candidate_without_final_notice(
+    monkeypatch, tmp_path: Path
+):
+    client = Client(_files(2))
+    manager, _target = _manager(monkeypatch, tmp_path, client=client)
+    local_skill = tmp_path / "owner-skill"
+    local_skill.mkdir()
+    skill_id = manager.store.register_skill(
+        local_skill, content_hash="sha256:source", source_kind="local"
+    )
+    event_id = manager.store.emit_local_event(
+        kind="wisdom.candidate",
+        skill_id=skill_id,
+        content_hash="sha256:source",
+        payload={"skill_name": "owner-skill"},
+        session_id="telegram-session",
+        task_id="task-1",
+        qualification="high_usage",
+    )
+    assert event_id is not None
+    manager.store.record_draft({
+        "id": "draft-1",
+        "skill_id": skill_id,
+        "source_hash": "sha256:source",
+        "overlay_path": str(local_skill),
+        "state": "ready",
+        "description": "Owner copy",
+        "content_hash": "sha256:content",
+        "description_hash": "sha256:description",
+        "manifest_hash": "sha256:manifest",
+    })
+    client.drafts = [
+        SimpleNamespace(
+            id="draft-1",
+            slug="owner-skill",
+            state="pending_moderation",
+            moderationNote=None,
+            moderationDeciderUserId=None,
+            moderationDecidedAt=None,
+        )
+    ]
+
+    assert manager.poll_owner_decisions() == {"inserted": 0}
+    assert manager.store.draft("draft-1")["state"] == "pending_moderation"
+    assert manager.store.local_event(event_id)["state"] == "handled"
+    assert manager.notifications() == {"events": []}
+
+
 def test_update_recovers_when_swap_won_before_journal_advance(
     monkeypatch, tmp_path: Path
 ):

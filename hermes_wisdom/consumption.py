@@ -1077,7 +1077,22 @@ class WisdomConsumption:
             if not local or str(local["state"]) == draft.state:
                 continue
             previous = str(local["state"])
-            self.store.set_draft_state(draft.id, draft.state)
+            if draft.state == "declined":
+                self.store.set_draft_state(draft.id, draft.state)
+                self.store.dismiss_candidate(
+                    str(local["skill_id"]), str(local["source_hash"])
+                )
+            elif draft.state in {
+                "owner_approved",
+                "publishing",
+                "pending_moderation",
+                "changes_requested",
+                "published",
+                "invalidated",
+            }:
+                self.store.complete_contribution(draft.id, draft.state)
+            else:
+                self.store.set_draft_state(draft.id, draft.state)
             if draft.state not in {
                 "approved",
                 "rejected",

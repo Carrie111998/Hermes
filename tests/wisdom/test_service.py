@@ -28,13 +28,15 @@ class FakeClient:
     def __init__(self):
         self.uploaded = 0
         self.submissions = []
+        self.drafts = {}
+        self.declines = 0
 
     def upload_private_objects(self, objects):
         self.uploaded += len(objects)
 
     def submit_draft(self, **payload):
         self.submissions.append(payload)
-        return Draft(
+        draft = Draft(
             id="draft-1",
             orgId="org-1",
             ownerUserId="user-1",
@@ -52,6 +54,21 @@ class FakeClient:
             explanation=None,
             updatedAt="revision-1",
         )
+        self.drafts[draft.id] = draft
+        return draft
+
+    def draft(self, draft_id):
+        return SimpleNamespace(
+            draft=self.drafts[draft_id],
+            effective_policy={"publication_policy": "moderated"},
+        )
+
+    def decline(self, draft_id):
+        self.declines += 1
+        self.drafts[draft_id] = self.drafts[draft_id].model_copy(
+            update={"state": "declined"}
+        )
+        return {"state": "declined"}
 
 
 class InstallClient:
@@ -524,6 +541,138 @@ def test_telegram_candidate_publish_uses_normal_review_and_approval(
 
     assert reviewed == [("draft-1", True)]
     assert result["publication_state"] == "pending_moderation"
+
+
+def test_telegram_candidate_reconciles_portal_submission_without_duplicate_publish(
+    monkeypatch, tmp_path: Path
+):
+    skill = tmp_path / "skills" / "portal-approved-skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: portal-approved-skill\ndescription: Portal test.\n---\n"
+        "# Portal approved\n",
+        encoding="utf-8",
+    )
+    fake = FakeClient()
+    store = WisdomStore(tmp_path / "state")
+    store.installation_identity()
+    store.verify_installation_identity("nas_organisation:wisdom-local")
+    service = WisdomService(store=store, client=fake)
+    monkeypatch.setattr(service, "_eligible_paths", lambda: [skill])
+    monkeypatch.setattr(
+        "hermes_wisdom.service._config",
+        lambda: {
+            "enabled": True,
+            "disclosure_acknowledged_at": "2026-08-31T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_wisdom.service._scan_summary",
+        lambda _path: {
+            "guard": {"allowed": True, "findings": [], "reason": None},
+            "skill_evaluator": {"status": "disabled", "findings": []},
+        },
+    )
+    event_id = _qualified_candidate_event(service, skill)
+    drafted = service.draft_candidate(event_id)
+    fake.drafts[drafted["draft_id"]] = fake.drafts[drafted["draft_id"]].model_copy(
+        update={"state": "pending_moderation"}
+    )
+
+    result = service.approve_candidate(event_id)
+
+    assert result["publication_state"] == "pending_moderation"
+    assert result["already_advanced"] is True
+    assert len(fake.submissions) == 1
+    assert store.local_event(event_id)["state"] == "handled"
+    assert store.draft(drafted["draft_id"])["state"] == "pending_moderation"
+
+
+def test_telegram_candidate_reports_portal_publication_even_if_local_source_changed(
+    monkeypatch, tmp_path: Path
+):
+    skill = tmp_path / "skills" / "published-elsewhere"
+    skill.mkdir(parents=True)
+    source = skill / "SKILL.md"
+    source.write_text(
+        "---\nname: published-elsewhere\ndescription: Publication test.\n---\n"
+        "# Original\n",
+        encoding="utf-8",
+    )
+    fake = FakeClient()
+    store = WisdomStore(tmp_path / "state")
+    store.installation_identity()
+    store.verify_installation_identity("nas_organisation:wisdom-local")
+    service = WisdomService(store=store, client=fake)
+    monkeypatch.setattr(service, "_eligible_paths", lambda: [skill])
+    monkeypatch.setattr(
+        "hermes_wisdom.service._config",
+        lambda: {
+            "enabled": True,
+            "disclosure_acknowledged_at": "2026-08-31T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_wisdom.service._scan_summary",
+        lambda _path: {
+            "guard": {"allowed": True, "findings": [], "reason": None},
+            "skill_evaluator": {"status": "disabled", "findings": []},
+        },
+    )
+    event_id = _qualified_candidate_event(service, skill)
+    drafted = service.draft_candidate(event_id)
+    fake.drafts[drafted["draft_id"]] = fake.drafts[drafted["draft_id"]].model_copy(
+        update={"state": "published"}
+    )
+    source.write_text("# A newer local version\n", encoding="utf-8")
+
+    result = service.approve_candidate(event_id)
+
+    assert result["publication_state"] == "published"
+    assert result["already_advanced"] is True
+    assert len(fake.submissions) == 1
+
+
+def test_telegram_decline_withdraws_portal_submission(monkeypatch, tmp_path: Path):
+    skill = tmp_path / "skills" / "withdraw-from-telegram"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: withdraw-from-telegram\ndescription: Withdrawal test.\n---\n"
+        "# Withdraw\n",
+        encoding="utf-8",
+    )
+    fake = FakeClient()
+    store = WisdomStore(tmp_path / "state")
+    store.installation_identity()
+    store.verify_installation_identity("nas_organisation:wisdom-local")
+    service = WisdomService(store=store, client=fake)
+    monkeypatch.setattr(service, "_eligible_paths", lambda: [skill])
+    monkeypatch.setattr(
+        "hermes_wisdom.service._config",
+        lambda: {
+            "enabled": True,
+            "disclosure_acknowledged_at": "2026-08-31T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_wisdom.service._scan_summary",
+        lambda _path: {
+            "guard": {"allowed": True, "findings": [], "reason": None},
+            "skill_evaluator": {"status": "disabled", "findings": []},
+        },
+    )
+    event_id = _qualified_candidate_event(service, skill)
+    drafted = service.draft_candidate(event_id)
+    fake.drafts[drafted["draft_id"]] = fake.drafts[drafted["draft_id"]].model_copy(
+        update={"state": "pending_moderation"}
+    )
+
+    result = service.decline_candidate(event_id)
+
+    assert result["state"] == "declined"
+    assert result["withdrawn"] is True
+    assert fake.declines == 1
+    assert store.local_event(event_id)["state"] == "dismissed"
 
 
 def test_telegram_candidate_rejects_changed_source_before_any_upload(

@@ -470,6 +470,7 @@ class TestTelegramApprovalCallback:
             "skill_name": "telegram-skill",
             "state": "ready",
             "portal_url": "https://portal.test/review/draft-1",
+            "created": True,
         }
 
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
@@ -515,6 +516,89 @@ class TestTelegramApprovalCallback:
         ]["html"]
         assert "collective administrator" in html
         assert "https://portal.test/review/draft-1" in html
+
+    @pytest.mark.asyncio
+    async def test_wisdom_candidate_stale_publish_button_reports_portal_winner(self):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "wi:publish:event-1"
+        query.message = MagicMock(chat_id=12345, message_id=78)
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        service = MagicMock()
+        service.approve_candidate.return_value = {
+            "skill_name": "telegram-skill",
+            "publication_state": "published",
+            "already_advanced": True,
+            "portal_url": "https://portal.test/review/draft-1",
+        }
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(
+                    MagicMock(callback_query=query), MagicMock()
+                )
+
+        html = adapter._bot.do_api_request.await_args.kwargs["api_kwargs"][
+            "rich_message"
+        ]["html"]
+        assert "already published to your collective" in html
+        assert "https://portal.test/review/draft-1" in html
+        assert "Approve &amp; publish" not in html
+        assert "wi:publish:event-1" not in html
+
+    @pytest.mark.asyncio
+    async def test_wisdom_candidate_changes_requested_removes_publish_action(self):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "wi:publish:event-1"
+        query.message = MagicMock(chat_id=12345, message_id=78)
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        service = MagicMock()
+        service.approve_candidate.return_value = {
+            "skill_name": "telegram-skill",
+            "publication_state": "changes_requested",
+            "already_advanced": True,
+            "portal_url": "https://portal.test/review/draft-1",
+        }
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(
+                    MagicMock(callback_query=query), MagicMock()
+                )
+
+        html = adapter._bot.do_api_request.await_args.kwargs["api_kwargs"][
+            "rich_message"
+        ]["html"]
+        assert "requested changes" in html
+        assert "Approve &amp; publish" not in html
+        assert "https://portal.test/review/draft-1" in html
+
+    @pytest.mark.asyncio
+    async def test_wisdom_candidate_transient_failure_preserves_retry_controls(self):
+        adapter = _make_adapter()
+        adapter._bot.do_api_request.reset_mock()
+        query = AsyncMock()
+        query.data = "wi:publish:event-1"
+        query.message = MagicMock(chat_id=12345, message_id=78)
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        service = MagicMock()
+        service.approve_candidate.side_effect = TimeoutError("Gateway timed out")
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(
+                    MagicMock(callback_query=query), MagicMock()
+                )
+
+        adapter._bot.do_api_request.assert_not_awaited()
+        query.edit_message_text.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_wisdom_candidate_decline_callback_suppresses_exact_bytes(self):

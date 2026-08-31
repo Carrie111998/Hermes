@@ -874,9 +874,7 @@ class WisdomService:
     def _candidate_event_context(
         self, event_id: str
     ) -> tuple[dict[str, Any], str, str, str]:
-        event = self.store.local_event(event_id)
-        if event is None or event.get("kind") != "wisdom.candidate":
-            raise WisdomNotFound("local candidate not found")
+        event = self._candidate_event(event_id)
         if event.get("state") != "unread":
             raise WisdomConflict(
                 "this local candidate has already been handled",
@@ -903,26 +901,68 @@ class WisdomService:
         self._candidate_source(skill_name, local_skill_id)
         return event, local_skill_id, content_hash, skill_name
 
+    def _candidate_event(self, event_id: str) -> dict[str, Any]:
+        """Return a candidate event even after another surface resolved it.
+
+        A Telegram button can outlive the local unread marker.  Reading the
+        event is safe; mutation still goes through the authoritative draft
+        state and the exact-source checks below.
+        """
+        event = self.store.local_event(event_id)
+        if event is None or event.get("kind") != "wisdom.candidate":
+            raise WisdomNotFound("local candidate not found")
+        return event
+
+    def _existing_candidate_draft(
+        self, event: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Reconcile a candidate's existing draft with Gateway authority."""
+        local_skill_id = str(event["skill_id"])
+        content_hash = str(event["content_hash"])
+        existing = self.store.latest_draft_for_source(local_skill_id, content_hash)
+        if existing is None or str(existing["id"]).startswith("local:"):
+            return None
+
+        draft_id = str(existing["id"])
+        authoritative = self.client.draft(draft_id).draft
+        state = authoritative.state
+        if state == "declined":
+            self.store.set_draft_state(draft_id, state)
+            self.store.dismiss_candidate(local_skill_id, content_hash)
+        elif state in {
+            "owner_approved",
+            "publishing",
+            "pending_moderation",
+            "changes_requested",
+            "published",
+            "invalidated",
+        }:
+            self.store.complete_contribution(draft_id, state)
+        else:
+            self.store.set_draft_state(draft_id, state)
+        payload = event.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        return {
+            "draft_id": draft_id,
+            "skill_name": authoritative.slug
+            or str(payload.get("skill_name") or "Local skill"),
+            "qualification": str(event.get("qualification") or ""),
+            "state": state,
+            "portal_url": self.portal_review_url(draft_id),
+            "created": False,
+        }
+
     def draft_candidate(self, event_id: str) -> dict[str, Any]:
         """Create or resume an owner-private draft for one exact candidate."""
         self.require_setup()
+        event = self._candidate_event(event_id)
+        existing = self._existing_candidate_draft(event)
+        if existing is not None:
+            return existing
         event, local_skill_id, content_hash, skill_name = (
             self._candidate_event_context(event_id)
         )
         qualification = str(event.get("qualification") or "")
-        existing = self.store.latest_draft_for_source(local_skill_id, content_hash)
-        if existing is not None and not str(existing["id"]).startswith("local:"):
-            state = str(existing["state"])
-            if state not in {"declined", "invalidated"}:
-                draft_id = str(existing["id"])
-                return {
-                    "draft_id": draft_id,
-                    "skill_name": skill_name,
-                    "qualification": qualification,
-                    "state": state,
-                    "portal_url": self.portal_review_url(draft_id),
-                    "created": False,
-                }
 
         prepared = self.store.prepared_draft(local_skill_id, content_hash)
         prepared_result = (
@@ -954,13 +994,56 @@ class WisdomService:
         drafted = self.draft_candidate(event_id)
         state = str(drafted["state"])
         if state in {"pending_moderation", "published"}:
-            return {**drafted, "publication_state": state}
+            return {
+                **drafted,
+                "publication_state": state,
+                "already_advanced": True,
+            }
+        if state in {"changes_requested", "declined", "invalidated"}:
+            return {
+                **drafted,
+                "publication_state": state,
+                "already_advanced": True,
+            }
+
+        if state in {"owner_approved", "publishing"}:
+            return self._resume_candidate_publication(drafted)
+        if state != "ready":
+            raise WisdomConflict(
+                f"this private draft is currently {state.replace('_', ' ')}",
+                code=f"state_is_{state}",
+            )
 
         draft_id = str(drafted["draft_id"])
         # Approval still passes through the ordinary authoritative re-fetch and
         # three-hash receipt. The button is consent, not a bypass around review.
-        self.review(draft_id, acknowledge=True)
-        result = self.approve(draft_id)
+        try:
+            self.review(draft_id, acknowledge=True)
+            result = self.approve(draft_id)
+        except WisdomConflict:
+            # Portal approval and Telegram approval may race. Re-read Gateway
+            # and accept the committed winner instead of surfacing a stale
+            # button error or creating a second publication proposal.
+            event = self._candidate_event(event_id)
+            refreshed = self._existing_candidate_draft(event)
+            if refreshed is None:
+                raise
+            refreshed_state = str(refreshed["state"])
+            if refreshed_state in {"owner_approved", "publishing"}:
+                return self._resume_candidate_publication(refreshed)
+            if refreshed_state in {
+                "pending_moderation",
+                "published",
+                "changes_requested",
+                "declined",
+                "invalidated",
+            }:
+                return {
+                    **refreshed,
+                    "publication_state": refreshed_state,
+                    "already_advanced": True,
+                }
+            raise
         publication = result.get("publication")
         publication = publication if isinstance(publication, dict) else {}
         publication_state = str(publication.get("state") or "")
@@ -971,8 +1054,60 @@ class WisdomService:
             "approval": result,
         }
 
+    def _resume_candidate_publication(
+        self, drafted: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Resume the Gateway's idempotent publication coordinator."""
+        draft_id = str(drafted["draft_id"])
+        authoritative = self.client.draft(draft_id).draft
+        published = self.client.publish(
+            draft_id, content_hash=authoritative.contentHash
+        )
+        publication_state = str(published.get("state") or "")
+        if publication_state not in {"pending_moderation", "published"}:
+            raise WisdomValidationError(
+                "Gateway returned an invalid publication state"
+            )
+        self.store.complete_contribution(draft_id, publication_state)
+        self.store.consume_receipt(draft_id)
+        return {
+            **drafted,
+            "state": publication_state,
+            "publication_state": publication_state,
+            "approval": {"publication": published},
+        }
+
     def decline_candidate(self, event_id: str) -> dict[str, Any]:
-        """Suppress this exact local package version without a network write."""
+        """Decline local bytes or withdraw their existing private contribution."""
+        event = self._candidate_event(event_id)
+        existing = self._existing_candidate_draft(event)
+        if existing is not None:
+            state = str(existing["state"])
+            if state in {"published", "declined"}:
+                return {
+                    **existing,
+                    "already_advanced": True,
+                }
+            draft_id = str(existing["draft_id"])
+            try:
+                self.decline(draft_id)
+            except WisdomConflict:
+                refreshed = self._existing_candidate_draft(event)
+                if refreshed is not None and str(refreshed["state"]) in {
+                    "published",
+                    "declined",
+                }:
+                    return {
+                        **refreshed,
+                        "already_advanced": True,
+                    }
+                raise
+            return {
+                **existing,
+                "state": "declined",
+                "withdrawn": state == "pending_moderation",
+            }
+
         event, local_skill_id, content_hash, skill_name = (
             self._candidate_event_context(event_id)
         )

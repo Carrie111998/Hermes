@@ -7749,19 +7749,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name,
                     _redact_telegram_error_text(exc),
                 )
-                await self._edit_wisdom_candidate_card(
-                    query,
-                    skill_name="Local skill",
-                    qualification_reason=(
-                        "This skill met your local Collective Wisdom "
-                        "qualification rules."
-                    ),
-                    status=(
-                        "This action could not continue. Open Collective in Hermes "
-                        "to review the current state and try again."
-                    ),
-                    actions=[],
-                )
+                # A timeout or transient Gateway failure must not consume the
+                # user's only action surface. Leave the original rich card and
+                # its buttons intact so the exact action can be retried.
                 return
 
             skill_name = str(result.get("skill_name") or "Local skill")
@@ -7769,46 +7759,56 @@ class TelegramAdapter(BasePlatformAdapter):
                 str(result.get("qualification") or "")
             )
             portal_url = result.get("portal_url")
+            state = str(result.get("publication_state") or result.get("state") or "")
+            already_advanced = bool(result.get("already_advanced"))
+            view_action = (
+                [{"label": "View ↗", "url": str(portal_url)}]
+                if isinstance(portal_url, str)
+                else []
+            )
             if action == "draft":
-                actions = [
-                    {
-                        "label": "Approve & publish",
-                        "callback_data": f"wi:publish:{event_id}",
-                        "primary": True,
-                    },
-                    *(
-                        [{"label": "View ↗", "url": str(portal_url)}]
-                        if isinstance(portal_url, str)
-                        else []
-                    ),
-                    {
-                        "label": "Decline",
-                        "callback_data": f"wi:decline:{event_id}",
-                    },
-                ]
-                status = (
-                    "Private draft created. Nothing is shared until you approve it."
-                )
+                if state == "ready":
+                    actions = [
+                        {
+                            "label": "Approve & publish",
+                            "callback_data": f"wi:publish:{event_id}",
+                            "primary": True,
+                        },
+                        *view_action,
+                        {
+                            "label": "Decline",
+                            "callback_data": f"wi:decline:{event_id}",
+                        },
+                    ]
+                    status = (
+                        "Private draft created. Nothing is shared until you approve it."
+                        if result.get("created")
+                        else "Private draft is ready. Nothing is shared until you approve it."
+                    )
+                else:
+                    status, actions = self._wisdom_candidate_resolved_state(
+                        state, already_advanced=already_advanced, view_action=view_action
+                    )
             elif action == "publish":
-                state = str(
-                    result.get("publication_state") or result.get("state") or ""
-                )
-                status = (
-                    "Sent to your collective administrator for approval."
-                    if state == "pending_moderation"
-                    else "Published to your collective."
-                )
-                actions = (
-                    [{"label": "View ↗", "url": str(portal_url)}]
-                    if isinstance(portal_url, str)
-                    else []
+                status, actions = self._wisdom_candidate_resolved_state(
+                    state, already_advanced=already_advanced, view_action=view_action
                 )
             else:
-                status = (
-                    "Declined on this device. These exact bytes will not be "
-                    "suggested again."
-                )
-                actions = []
+                if state == "published":
+                    status = "This skill is already published to your collective."
+                    actions = view_action
+                elif result.get("withdrawn"):
+                    status = (
+                        "Withdrawn from collective review and declined on this device. "
+                        "These exact bytes will not be suggested again."
+                    )
+                    actions = view_action
+                else:
+                    status = (
+                        "Declined on this device. These exact bytes will not be "
+                        "suggested again."
+                    )
+                    actions = view_action
             await self._edit_wisdom_candidate_card(
                 query,
                 skill_name=skill_name,
@@ -8010,6 +8010,51 @@ class TelegramAdapter(BasePlatformAdapter):
                 return operation()
 
         return await asyncio.to_thread(scoped)
+
+    @staticmethod
+    def _wisdom_candidate_resolved_state(
+        state: str,
+        *,
+        already_advanced: bool,
+        view_action: List[Dict[str, Any]],
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        """Present authoritative draft outcomes without stale mutation controls."""
+        if state == "pending_moderation":
+            prefix = "Already sent" if already_advanced else "Sent"
+            return (
+                f"{prefix} to your collective administrator for approval.",
+                view_action,
+            )
+        if state == "published":
+            return (
+                "This skill is already published to your collective."
+                if already_advanced
+                else "Published to your collective.",
+                view_action,
+            )
+        if state == "changes_requested":
+            return (
+                "Your collective administrator requested changes. Open the draft "
+                "to review and revise it.",
+                view_action,
+            )
+        if state == "declined":
+            return (
+                "This exact draft was declined. Change the skill before suggesting "
+                "it again.",
+                view_action,
+            )
+        if state == "invalidated":
+            return (
+                "This draft was replaced or changed and can no longer be approved. "
+                "Open the current draft to continue.",
+                view_action,
+            )
+        return (
+            "The private draft is still being prepared. Open it to check its "
+            "current state.",
+            view_action,
+        )
 
     @staticmethod
     def _wisdom_candidate_html(
