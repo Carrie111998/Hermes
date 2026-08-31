@@ -55,7 +55,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple, TypeVar, cast
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -3952,14 +3952,18 @@ def is_zeroed_state_db(
         size = path.stat().st_size
     except OSError:
         return False
-    if size <= 0:
+    if size < 0:
         return False
     from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
 
     head = read_header_bytes_preopen(
         path, length=max(16, probe_bytes), force=force
     )
-    if not head or head.startswith(b"SQLite format 3"):
+    if head is None:
+        return False
+    if len(head) == 0:
+        return True
+    if head.startswith(b"SQLite format 3"):
         return False
     return all(byte == 0 for byte in head)
 
@@ -4965,7 +4969,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return self._get_read_conn()
 
     @contextmanager
-    def _read_ctx(self):
+    def _read_ctx(self) -> Iterator[sqlite3.Connection]:
         """Yield a connection for read-only statements.
 
         WAL: a read-only connection borrowed from a bounded pool with NO
@@ -5008,7 +5012,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._close_read_conn(conn)
             return
         with self._lock:
-            yield self._conn
+            yield cast(sqlite3.Connection, self._conn)
 
     # ── Core write helper ──
 
@@ -5915,6 +5919,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Session lifecycle
     # =========================================================================
 
+    _PROFILE_DIR_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+    def _own_profile_name(self) -> Optional[str]:
+        """The profile that owns THIS store, derived from ``db_path`` alone.
+
+        Every profile-tree ``state.db`` belongs to exactly one profile
+        (``<root>/state.db`` → ``default``,
+        ``<root>/profiles/<name>/state.db`` → ``<name>``), so the derivation
+        is a single match, never a guess — the same contract
+        :meth:`backfill_null_session_profiles` and the web listing's
+        ``row_profile`` stamp rely on. Path-based (not
+        ``get_active_profile_name()``) on purpose: a gateway serving a
+        NON-launch profile opens that profile's store directly, and the row
+        must be stamped with the store's owner, not the serving process's
+        launch profile. Returns ``None`` for stores outside the profile tree
+        (explicit ``db_path`` in tests, ad-hoc copies) — those rows keep the
+        legacy NULL rather than a fabricated owner.
+        """
+        try:
+            from hermes_constants import get_default_hermes_root
+
+            root = get_default_hermes_root().resolve()
+            parent = Path(self.db_path).resolve().parent
+            if parent == root:
+                return "default"
+            if parent.parent == root / "profiles" and self._PROFILE_DIR_RE.match(
+                parent.name
+            ):
+                return parent.name
+        except Exception:
+            logger.debug("own-profile derivation failed", exc_info=True)
+        return None
+
     def _insert_session_row(
         self,
         session_id: str,
@@ -5929,7 +5966,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         thread_id: str = None,
         parent_session_id: str = None,
         cwd: str = None,
-        profile_name: str = None,
+        profile_name: Optional[str] = None,
         git_repo_root: str = None,
         origin_json: str = None,
         display_name: str = None,
@@ -5968,7 +6005,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``thread_id``/``display_name``/``origin_json``) are inherited too, so a
         crash before the gateway re-records the peer can't strand the child
         without a recoverable routing mapping (#59527).
+
+        When the caller passes no ``profile_name`` at all, the row is stamped
+        with THIS store's own profile (:meth:`_own_profile_name`) instead of
+        NULL. Every ``state.db`` belongs to exactly one profile — the same
+        single-match contract :meth:`backfill_null_session_profiles` relies
+        on — so the stamp is derivation, not a guess. Rows minted NULL after
+        that one-shot #94724 backfill ran stayed NULL forever, and
+        profile-keyed consumers (desktop sidebar scope matching,
+        ``@session:<profile>/<id>`` deep links, the fail-closed owner ladder)
+        treat NULL as unowned: the session vanishes from the sidebar even
+        though its transcript is intact (#99222). Stores outside the profile
+        tree (explicit ``db_path`` in tests, ad-hoc copies) derive nothing
+        and keep NULL — never guess.
         """
+        if not (profile_name or "").strip():
+            profile_name = self._own_profile_name()
+
         def _do(conn):
             system_prompt_hash = self._store_system_prompt(conn, system_prompt)
             conn.execute(
@@ -6216,9 +6269,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         """INSERT INTO sessions (
                                id, source, user_id, session_key, chat_id,
                                chat_type, thread_id, display_name, origin_json,
-                               started_at
+                               profile_name, started_at
                            )
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                            ON CONFLICT(id) DO UPDATE SET
                                session_key = COALESCE(sessions.session_key, excluded.session_key),
                                chat_id = COALESCE(sessions.chat_id, excluded.chat_id),
@@ -6236,6 +6289,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             thread_id,
                             display_name,
                             origin_json,
+                            # Same ownership stamp as _insert_session_row: a
+                            # self-healed row is a first creation too, and an
+                            # unowned (NULL) row vanishes from profile-keyed
+                            # consumers (#99222).
+                            self._own_profile_name(),
                             time.time(),
                         ),
                     )
@@ -7045,6 +7103,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         profile_name: str = None,
         compression_lock_holder: str = None,
         require_compression_lease: bool = True,
+        require_lease_refresh: bool = False,
+        lease_ttl_seconds: float = 300.0,
         watermark: Optional[int] = None,
         watermark_ceiling: Optional[int] = None,
     ) -> None:
@@ -7069,8 +7129,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The caller captures ``MAX(id)`` immediately BEFORE that flush; only
         rows in ``(watermark, watermark_ceiling]`` are foreign concurrent
         tail. ``None`` = unbounded (no internal flush happened).
+
+        When *require_lease_refresh* is True and *compression_lock_holder* is
+        set, the lease is refreshed inside the same transaction before the
+        expiry check. This gives a refresher
+        that stopped due to transient DB failures one final chance to extend
+        the lease, preventing wasted compression work. The refresh uses the
+        same ``conn`` as the publication, so there is no TOCTOU window.
         """
         def _do(conn):
+            if require_lease_refresh and compression_lock_holder:
+                conn.execute(
+                    "UPDATE compression_locks SET expires_at = ? "
+                    "WHERE session_id = ? AND holder = ?",
+                    (time.time() + lease_ttl_seconds, parent_session_id,
+                     compression_lock_holder),
+                )
             lock_row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
                 (parent_session_id,),
@@ -7121,8 +7195,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     # compression-fork backfill (#59527 / cross-profile jump
                     # fix): the child stays on the parent's profile and keeps
                     # the gateway routing/origin columns so peer recovery
-                    # still works after a crash at the boundary.
-                    profile_name or parent["profile_name"],
+                    # still works after a crash at the boundary. When neither
+                    # names an owner (legacy NULL parent), stamp this store's
+                    # own profile so the rotated child doesn't extend the
+                    # unowned lineage (#99222).
+                    profile_name
+                    or parent["profile_name"]
+                    or self._own_profile_name(),
                     parent["user_id"],
                     parent["session_key"],
                     parent["chat_id"],
@@ -7438,10 +7517,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
+            # Merge-max with any longer live deadline so a later shorter
+            # write cannot reopen the thrash window (#96775). The error
+            # column always takes the latest diagnostic.
             conn.execute(
-                "UPDATE sessions SET compression_failure_cooldown_until = ?, "
+                "UPDATE sessions SET compression_failure_cooldown_until = CASE "
+                "WHEN compression_failure_cooldown_until IS NOT NULL "
+                " AND compression_failure_cooldown_until > ? "
+                "THEN compression_failure_cooldown_until ELSE ? END, "
                 "compression_failure_error = ? WHERE id = ?",
-                (cooldown_until, error, session_id),
+                (cooldown_until, cooldown_until, error, session_id),
             )
 
         try:
@@ -8116,11 +8201,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if not session_id:
             return None
         now = time.time()
-        row = self._conn.execute(
-            "SELECT holder FROM compression_locks "
-            "WHERE session_id = ? AND expires_at >= ?",
-            (session_id, now),
-        ).fetchone()
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT holder FROM compression_locks "
+                "WHERE session_id = ? AND expires_at >= ?",
+                (session_id, now),
+            ).fetchone()
         if row is None:
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
@@ -8194,11 +8280,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # No-op fast path: skip the transaction when there is nothing to
         # clear. Read-only, no write lock.
         try:
-            row = self._conn.execute(
-                "SELECT last_activity_description, last_activity_provenance "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            ).fetchone()
+            with self._read_ctx() as conn:
+                row = conn.execute(
+                    "SELECT last_activity_description, last_activity_provenance "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
         except sqlite3.Error:
             row = None
         if row is not None:
@@ -13491,7 +13578,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
             if not exists:
                 return []
-            delegate_ids = _collect_delegate_child_ids(self._conn, [session_id])
+            # Use the borrowed read connection, never self._conn: handing the
+            # shared writer connection to a helper here executes on it without
+            # self._lock — the same unsynchronized-read class as #99349/#90734.
+            delegate_ids = _collect_delegate_child_ids(conn, [session_id])
         return [session_id, *sorted(delegate_ids)]
 
     def delete_session(
@@ -15159,12 +15249,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         no handoff record.
         """
         try:
-            cur = self._conn.execute(
-                "SELECT handoff_state, handoff_platform, handoff_error "
-                "FROM sessions WHERE id = ?",
-                (session_id,),
-            )
-            row = cur.fetchone()
+            with self._read_ctx() as conn:
+                row = conn.execute(
+                    "SELECT handoff_state, handoff_platform, handoff_error "
+                    "FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
             if not row:
                 return None
             return {
@@ -15181,15 +15271,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         Used by the gateway's handoff watcher.
         """
         try:
-            cur = self._conn.execute(
-                "SELECT s.*, "
-                "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
-                "FROM sessions s "
-                "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
-                "WHERE s.handoff_state = 'pending' "
-                "ORDER BY s.started_at ASC"
-            )
-            return [self._session_row_dict(r) for r in cur.fetchall()]
+            with self._read_ctx() as conn:
+                rows = conn.execute(
+                    "SELECT s.*, "
+                    "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved "
+                    "FROM sessions s "
+                    "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
+                    "WHERE s.handoff_state = 'pending' "
+                    "ORDER BY s.started_at ASC"
+                ).fetchall()
+            return [self._session_row_dict(r) for r in rows]
         except Exception:
             return []
 
