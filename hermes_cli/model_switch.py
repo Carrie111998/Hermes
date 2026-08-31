@@ -2936,15 +2936,24 @@ def list_authenticated_providers(
             model_ids = curated.get(hermes_id, [])
             if hermes_id in _MODELS_DEV_PREFERRED:
                 model_ids = _merge_with_models_dev(hermes_id, model_ids)
-        # A providers.<built-in>.models block extends the provider's discovered
-        # catalog. Section 3 cannot emit it later because this built-in row owns
-        # the slug, so merge declarations here before applying max_models.
+        # A providers.<built-in>.models block normally extends the provider's
+        # discovered catalog. When discovery is explicitly disabled, treat the
+        # declared list as the picker allowlist, matching user-defined endpoint
+        # semantics. Section 3 cannot emit it later because this built-in row
+        # owns the slug.
         configured_models: list[str] = []
+        discover_models = True
         if isinstance(user_providers, dict):
             configured = user_providers.get(hermes_id)
             if isinstance(configured, dict):
                 configured_models = _declared_model_ids(configured.get("models"))
-        model_ids = list(dict.fromkeys([*configured_models, *model_ids]))
+                discover_models = configured.get("discover_models", True)
+        if isinstance(discover_models, str):
+            discover_models = discover_models.lower() not in {"false", "no", "0"}
+        if not discover_models:
+            model_ids = configured_models
+        else:
+            model_ids = list(dict.fromkeys([*configured_models, *model_ids]))
         total = len(model_ids)
         if hermes_id in _UNCAPPED_PICKER_PROVIDERS:
             top = model_ids  # Aggregator: show full catalog regardless of max_models
