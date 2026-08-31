@@ -476,6 +476,73 @@ def _job_output_dir(job_id: str) -> Path:
     return _current_cron_store().output_dir / text
 
 
+# Hard ceiling on results returned per poll — a client-supplied ``limit`` is
+# clamped into (0, _MAX_JOB_RESULTS] so a single request can't be made to walk
+# an unbounded number of saved output files.
+_MAX_JOB_RESULTS = 100
+_DEFAULT_JOB_RESULTS = 20
+
+
+def get_job_results(
+    job_id: str,
+    *,
+    after: Optional[str] = None,
+    limit: int = _DEFAULT_JOB_RESULTS,
+) -> Dict[str, Any]:
+    """Return the newest saved output files for ``job_id``, newest first.
+
+    Built for polling clients: pass the previous response's ``next_after``
+    (or the newest item's ``cursor``) back in as ``after`` to fetch only
+    output files strictly newer than that cursor — deduplication is exact
+    because cursors are the run's timestamp-based output filename, which is
+    monotonically increasing per job.
+
+    Raises ``ValueError`` for a malformed/path-escaping ``job_id`` (see
+    ``_job_output_dir``) so callers can turn that into a 400, never a leak
+    outside the cron output sandbox. A missing output directory (job has
+    never produced output, or was pruned to zero) is not an error — it
+    yields an empty result set.
+    """
+    job_output_dir = _job_output_dir(job_id)
+    try:
+        clamped_limit = int(limit)
+    except (TypeError, ValueError):
+        clamped_limit = _DEFAULT_JOB_RESULTS
+    clamped_limit = max(1, min(clamped_limit, _MAX_JOB_RESULTS))
+
+    cursor = str(after).strip() if after else ""
+    if cursor and ("/" in cursor or "\\" in cursor or cursor in {".", ".."}):
+        raise ValueError(f"Invalid cursor: {after!r}")
+
+    try:
+        files = sorted(
+            (f for f in job_output_dir.glob("*.md") if f.is_file()),
+            key=lambda f: f.name,
+            reverse=True,
+        )
+    except OSError:
+        files = []
+
+    if cursor:
+        files = [f for f in files if f.name > cursor]
+
+    page = files[:clamped_limit]
+    results = []
+    for f in page:
+        try:
+            content = f.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        results.append({"cursor": f.name, "content": content})
+
+    return {
+        "job_id": job_id,
+        "results": results,
+        "has_more": len(files) > clamped_limit,
+        "next_after": results[0]["cursor"] if results else (after or None),
+    }
+
+
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
     """Normalize legacy/single-skill and multi-skill inputs into a unique ordered list."""
     if skills is None:

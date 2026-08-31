@@ -510,6 +510,10 @@ Create a new scheduled job. Body accepts the same shape as `hermes cron` — pro
 
 Fetch a single job's definition and last-run state.
 
+### GET /api/jobs/\{job_id\}/results
+
+Poll a job's newest saved output files (its persisted run results), newest first. Supports `after=<cursor>` (only return results strictly newer than a previously-seen cursor — exact dedup for polling) and `limit=<n>` (clamped to 1-100, default 20). Each result carries a `cursor` (the underlying output filename) and `content` (the raw saved output, safe to render as a chat message). Returns an empty `results` list, not an error, if the job has no saved output yet.
+
 ### PATCH /api/jobs/\{job_id\}
 
 Update fields on an existing job (prompt, schedule, etc.). Partial updates are merged.

@@ -58,6 +58,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/api/jobs", adapter._handle_list_jobs)
     app.router.add_post("/api/jobs", adapter._handle_create_job)
     app.router.add_get("/api/jobs/{job_id}", adapter._handle_get_job)
+    app.router.add_get("/api/jobs/{job_id}/results", adapter._handle_get_job_results)
     app.router.add_patch("/api/jobs/{job_id}", adapter._handle_update_job)
     app.router.add_delete("/api/jobs/{job_id}", adapter._handle_delete_job)
     app.router.add_post("/api/jobs/{job_id}/pause", adapter._handle_pause_job)
@@ -206,6 +207,229 @@ class TestGetJob:
                 data = await resp.json()
                 assert data["job"] == SAMPLE_JOB
                 mock_get.assert_called_once_with(VALID_JOB_ID)
+
+
+# ---------------------------------------------------------------------------
+# 10b. test_get_job_results
+# ---------------------------------------------------------------------------
+
+class TestGetJobResults:
+    @pytest.mark.asyncio
+    async def test_get_job_results(self, adapter):
+        """GET /api/jobs/{id}/results returns the newest results page."""
+        app = _create_app(adapter)
+        mock_get = MagicMock(return_value=SAMPLE_JOB)
+        page = {
+            "job_id": VALID_JOB_ID,
+            "results": [{"cursor": "2026-01-02_00-00-00.md", "content": "hi"}],
+            "has_more": False,
+            "next_after": "2026-01-02_00-00-00.md",
+        }
+        mock_results = MagicMock(return_value=page)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), \
+                 patch(f"{_MOD}._cron_get", mock_get), \
+                 patch(f"{_MOD}._cron_get_results", mock_results):
+                resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}/results")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data == page
+                mock_results.assert_called_once_with(VALID_JOB_ID, after=None, limit=20)
+
+    @pytest.mark.asyncio
+    async def test_get_job_results_passes_after_and_limit(self, adapter):
+        """?after=<cursor>&limit=<n> forwards through, with limit clamped."""
+        app = _create_app(adapter)
+        mock_get = MagicMock(return_value=SAMPLE_JOB)
+        mock_results = MagicMock(return_value={
+            "job_id": VALID_JOB_ID, "results": [], "has_more": False, "next_after": None,
+        })
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), \
+                 patch(f"{_MOD}._cron_get", mock_get), \
+                 patch(f"{_MOD}._cron_get_results", mock_results):
+                resp = await cli.get(
+                    f"/api/jobs/{VALID_JOB_ID}/results",
+                    params={"after": "2026-01-01_00-00-00.md", "limit": "9999"},
+                )
+                assert resp.status == 200
+                mock_results.assert_called_once_with(
+                    VALID_JOB_ID, after="2026-01-01_00-00-00.md", limit=100,
+                )
+
+    @pytest.mark.asyncio
+    async def test_get_job_results_invalid_job_id(self, adapter):
+        """Path-escaping / malformed job_id is rejected with 400 before touching disk."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.get("/api/jobs/../../etc/results")
+                # aiohttp normalizes ".." path segments before routing; either a
+                # 404 (no matching route) or a 400 (rejected job_id) is an
+                # acceptable "never reaches the handler with an escaping id".
+                assert resp.status in (400, 404)
+
+    @pytest.mark.asyncio
+    async def test_get_job_results_job_not_found(self, adapter):
+        """404 when the job itself doesn't exist — never leaks output-dir contents."""
+        app = _create_app(adapter)
+        mock_get = MagicMock(return_value=None)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(f"{_MOD}._cron_get", mock_get):
+                resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}/results")
+                assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_get_job_results_bad_limit(self, adapter):
+        """Non-integer limit is rejected with 400."""
+        app = _create_app(adapter)
+        mock_get = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(f"{_MOD}._cron_get", mock_get):
+                resp = await cli.get(
+                    f"/api/jobs/{VALID_JOB_ID}/results", params={"limit": "not-a-number"},
+                )
+                assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_get_job_results_cursor_value_error_becomes_400(self, adapter):
+        """A ValueError raised by the store layer (e.g. bad cursor) maps to 400, not 500."""
+        app = _create_app(adapter)
+        mock_get = MagicMock(return_value=SAMPLE_JOB)
+        mock_results = MagicMock(side_effect=ValueError("Invalid cursor: '../evil'"))
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), \
+                 patch(f"{_MOD}._cron_get", mock_get), \
+                 patch(f"{_MOD}._cron_get_results", mock_results):
+                resp = await cli.get(
+                    f"/api/jobs/{VALID_JOB_ID}/results", params={"after": "../evil"},
+                )
+                assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_get_job_results_requires_auth(self, auth_adapter):
+        """401 without a valid bearer token when API_SERVER_KEY is configured."""
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}/results")
+                assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_get_job_results_cron_unavailable(self, adapter):
+        """501 when the cron module isn't available."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", False):
+                resp = await cli.get(f"/api/jobs/{VALID_JOB_ID}/results")
+                assert resp.status == 501
+
+
+# ---------------------------------------------------------------------------
+# 10c. Real temp-HERMES_HOME end-to-end: real cron store, real job, real
+# saved output files on disk, driven entirely through HTTP — no mocking of
+# _cron_get / _cron_get_results, so this exercises the actual resolution
+# chain (get_cron_output_dir -> job output dir -> API handler -> JSON body).
+# ---------------------------------------------------------------------------
+
+class TestGetJobResultsRealStore:
+    @pytest.mark.asyncio
+    async def test_polls_real_saved_output_end_to_end(self, tmp_path):
+        import time as _time
+
+        import cron.jobs as cron_jobs
+
+        job_id = "0123456789ab"  # valid 12-hex
+
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([{
+                "id": job_id,
+                "name": "e2e-job",
+                "schedule": "0 9 * * *",
+                "prompt": "do the thing",
+                "deliver": "local",
+                "enabled": True,
+            }])
+            cron_jobs.save_job_output(job_id, "# Run 1\nAll good.")
+            _time.sleep(1.01)
+            cron_jobs.save_job_output(job_id, "# Run 2\nStill good. 🎉")
+
+            adapter = _make_adapter(api_key="sk-secret")
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                with patch(f"{_MOD}._CRON_AVAILABLE", True), \
+                     patch(f"{_MOD}._cron_get", cron_jobs.get_job), \
+                     patch(f"{_MOD}._cron_get_results", cron_jobs.get_job_results):
+                    # No auth -> 401, never reaches disk.
+                    resp = await cli.get(f"/api/jobs/{job_id}/results")
+                    assert resp.status == 401
+
+                    headers = {"Authorization": "Bearer sk-secret"}
+
+                    # First page: newest result first, content preserved exactly.
+                    resp = await cli.get(f"/api/jobs/{job_id}/results", headers=headers)
+                    assert resp.status == 200
+                    data = await resp.json()
+                    assert len(data["results"]) == 2
+                    assert data["results"][0]["content"] == "# Run 2\nStill good. 🎉"
+                    assert data["results"][1]["content"] == "# Run 1\nAll good."
+                    assert data["has_more"] is False
+
+                    # Cursor-based polling: after the newest cursor, nothing new.
+                    cursor = data["results"][0]["cursor"]
+                    resp = await cli.get(
+                        f"/api/jobs/{job_id}/results",
+                        params={"after": cursor},
+                        headers=headers,
+                    )
+                    assert resp.status == 200
+                    assert (await resp.json())["results"] == []
+
+                    # A new run lands; polling with the old cursor sees only it.
+                    _time.sleep(1.01)
+                    cron_jobs.save_job_output(job_id, "# Run 3")
+                    resp = await cli.get(
+                        f"/api/jobs/{job_id}/results",
+                        params={"after": cursor},
+                        headers=headers,
+                    )
+                    data = await resp.json()
+                    assert [r["content"] for r in data["results"]] == ["# Run 3"]
+
+                    # Path-escaping cursor is rejected (400), not a filesystem read.
+                    resp = await cli.get(
+                        f"/api/jobs/{job_id}/results",
+                        params={"after": "../../../etc/passwd"},
+                        headers=headers,
+                    )
+                    assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_missing_output_dir_is_empty_not_error(self, tmp_path):
+        """A real job with no output directory yet (never run) polls cleanly empty."""
+        import cron.jobs as cron_jobs
+
+        job_id = "aaaaaaaaaaaa"
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([{
+                "id": job_id,
+                "name": "never-run",
+                "schedule": "0 9 * * *",
+                "prompt": "do the thing",
+                "deliver": "local",
+                "enabled": True,
+            }])
+            adapter = _make_adapter()
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                with patch(f"{_MOD}._CRON_AVAILABLE", True), \
+                     patch(f"{_MOD}._cron_get", cron_jobs.get_job), \
+                     patch(f"{_MOD}._cron_get_results", cron_jobs.get_job_results):
+                    resp = await cli.get(f"/api/jobs/{job_id}/results")
+                    assert resp.status == 200
+                    data = await resp.json()
+                    assert data["results"] == []
+                    assert data["has_more"] is False
 
 
 # ---------------------------------------------------------------------------
