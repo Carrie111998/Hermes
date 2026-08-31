@@ -518,6 +518,16 @@ def test_main_dry_run_requires_expected_calendar_decision(tmp_path, monkeypatch,
     assert '"status": "error"' in capsys.readouterr().out
 
 
+def test_synthetic_gate_is_deterministic_and_offline():
+    class NoClassifier:
+        def classify(self, fixture):
+            raise AssertionError("synthetic gate called external classifier")
+
+    result = triage.synthetic(NoClassifier())
+    assert result["category"] == "review"
+    assert result["reason_code"] == "ambiguous"
+
+
 def test_cutover_is_immutable_in_ledger(tmp_path):
     ledger = triage.Ledger(tmp_path / "ledger.db")
     ledger.pin_setting("cutover_at", "2026-08-30T12:00:00-03:00")
