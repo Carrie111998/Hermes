@@ -3115,6 +3115,13 @@ def run_conversation(
                     _xh = dict(api_kwargs.get("extra_headers") or {})
                     _xh["X-OpenRouter-Cache"] = "false"
                     api_kwargs["extra_headers"] = _xh
+                # Final provider-payload gate after every built-in text
+                # transformation. ASCII fallback and Codex Harmony preflight
+                # can each compose an active exact secret from a value that was
+                # harmless at the earlier message-copy boundary.
+                from agent.redact import redact_provider_api_kwargs
+
+                api_kwargs = redact_provider_api_kwargs(api_kwargs)
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
                 # follow-ups keep the default "agent" header (#3040).
@@ -3301,6 +3308,11 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    # Execution middleware is a trusted local extension, but
+                    # its payload still crosses the provider boundary. Rebind
+                    # after the dispatch-time Codex preflight as well, so no
+                    # retry or middleware-produced text bypasses the gate.
+                    next_api_kwargs = redact_provider_api_kwargs(next_api_kwargs)
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
