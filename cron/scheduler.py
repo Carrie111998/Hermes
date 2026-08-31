@@ -3154,9 +3154,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
+        execution_id = job.get("execution_id", "")
+        identifiers = f"job_id={job_id}"
+        if execution_id:
+            identifiers += f"\nrun_id={execution_id}"
         delivery_content = (
             f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
+            f"```text\n{identifiers}\n```\n"
             f"-------------\n\n"
             f"{content}\n\n"
             f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
@@ -7263,6 +7267,10 @@ def _run_one_job_body(
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+        # Keep the durable execution identifier attached to the in-memory job
+        # throughout output wrapping and delivery.  This lets every cron
+        # notification identify both the recurring job and this exact run.
+        job["execution_id"] = execution_id
     delivery_attempted = False
     delivery_error = None
     # Durable failure-incident bookkeeping for this run (see cron.incidents):
