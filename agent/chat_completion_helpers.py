@@ -1632,9 +1632,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     elapsed=_elapsed,
                 )
                 agent._emit_wait_notice(
-                    f"⏳ waiting on {api_kwargs.get('model', 'the provider')} — "
-                    f"{int(_elapsed)}s with no response yet (provider may be slow "
-                    f"or overloaded{_recovery})"
+                    f"⏳ 等待 {api_kwargs.get('model', 'the provider')} — "
+                    f"已 {int(_elapsed)} 秒无响应（对方可能较慢或过载{_recovery}）"
                 )
             except Exception:
                 logger.debug("wait-notice construction failed", exc_info=True)
@@ -1682,8 +1681,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             agent._emit_wait_notice(
-                f"⚠ no response from provider in {int(_elapsed)}s — "
-                f"reconnecting..."
+                f"⚠ 无响应：对方 {int(_elapsed)} 秒未返回 — 正在重新连接..."
             )
             agent._touch_activity(
                 f"codex stream killed after {int(_elapsed)}s with no first byte"
@@ -5248,9 +5246,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 else:
                     _recovery = ""
                 agent._emit_wait_notice(
-                    f"⏳ waiting on {api_kwargs.get('model', 'the provider')} — "
-                    f"{_waiting_secs}s with no output yet (provider may be "
-                    f"slow or overloaded, or the model is thinking{_recovery})"
+                    f"⏳ 等待 {api_kwargs.get('model', 'the provider')} — "
+                    f"已 {_waiting_secs} 秒无输出（对方可能较慢或过载，"
+                    f"或模型正在思考{_recovery}）"
                 )
             else:
                 # Chunks are flowing — keep the activity tracker fresh but
@@ -5310,8 +5308,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # the inner thread processes the closure.
             last_chunk_time["t"] = time.time()
             agent._emit_wait_notice(
-                f"⚠ no output from provider for {int(_stale_elapsed)}s — "
-                f"reconnecting..."
+                f"⚠ 无输出：对方 {int(_stale_elapsed)} 秒未返回 — 正在重新连接..."
             )
             agent._touch_activity(
                 f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"

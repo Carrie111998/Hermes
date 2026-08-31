@@ -230,7 +230,7 @@ def test_moa_heartbeat_survives_infinite_stale_timeout(monkeypatch):
 
     assert result is response
     assert len(notices) == 1
-    assert "waiting on openai-xai-wide" in notices[0]
+    assert "等待 openai-xai-wide" in notices[0]
     assert "auto-reconnect" not in notices[0]
 
 

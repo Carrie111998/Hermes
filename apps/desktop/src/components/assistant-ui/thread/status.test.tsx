@@ -70,6 +70,16 @@ describe('ResponseLoadingIndicator timer', () => {
 
     expect(screen.getByText('⏳ waiting on local-model — 30s with no output yet')).toBeTruthy()
   })
+
+  it('renders the Chinese queueing wait notice from the 429 backoff path', () => {
+    $activeSessionId.set('session-a')
+    $turnStartedAt.set(Date.now())
+    setSessionProviderWait('session-a', '⏳ 等待 qwen3.8-flash — 对方排队/限流中，45 秒后重试（第 2/4 次）')
+
+    renderIndicator()
+
+    expect(screen.getByText('⏳ 等待 qwen3.8-flash — 对方排队/限流中，45 秒后重试（第 2/4 次）')).toBeTruthy()
+  })
 })
 
 // The status line sits between tool rows and thinking headers, which the
