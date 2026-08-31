@@ -79,7 +79,6 @@ jobs:
           client-id: ${{ vars.APP_CLIENT_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY }}
           permission-actions: write
-          permission-contents: read
 
       - name: Trigger Deploy Site workflow
         env:
