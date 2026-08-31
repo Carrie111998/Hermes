@@ -5617,9 +5617,30 @@ class TelegramAdapter(BasePlatformAdapter):
             
         except Exception as e:
             safe_error = _redact_telegram_error_text(e)
-            logger.error("[%s] Failed to send Telegram message: %s", self.name, safe_error)
             err_str = str(e).lower()
             error_kind = classify_send_error(e)
+            # "forbidden" (bot blocked/kicked/not a member) and "not_found"
+            # (chat/user/group doesn't exist, e.g. bot never added to the
+            # configured chat) are *expected*, already-handled failure modes:
+            # send() returns a clean SendResult(success=False, ...) below and
+            # gateway.dead_targets.DeadTargetRegistry marks the target dead
+            # and self-heals on the next successful send (see
+            # tests/gateway/test_dead_targets.py). Logging these at ERROR
+            # meant Sentry's default LoggingIntegration (event_level=ERROR,
+            # wired fleet-wide via sitecustomize.py) filed a fresh issue for
+            # every occurrence of an ordinary config mistake -- e.g.
+            # NICHE-BOTS-C, a home-channel bot that was never invited to its
+            # configured chat. Downgrade to WARNING so it stays in the logs
+            # (and the config-fix path in the log message) without paging
+            # Sentry; genuinely unclassified/unexpected send failures still
+            # log at ERROR so they keep surfacing there.
+            if error_kind in ("forbidden", "not_found"):
+                logger.warning(
+                    "[%s] Failed to send Telegram message (%s, target likely unreachable): %s",
+                    self.name, error_kind, safe_error,
+                )
+            else:
+                logger.error("[%s] Failed to send Telegram message: %s", self.name, safe_error)
             # Message too long — content exceeded 4096 chars. Return failure so
             # stream consumer enters fallback mode and sends the remainder.
             if "message_too_long" in err_str or "too long" in err_str:
