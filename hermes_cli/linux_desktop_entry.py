@@ -77,8 +77,14 @@ def resolve_exec_command() -> str:
             # shebang resolves to the SYSTEM python and dies on the first
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
-            # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            # venv one), so prefix it explicitly. Do NOT resolve() it: in a
+            # uv-managed venv, venv/bin/python is a symlink to the base
+            # interpreter, and running THROUGH that symlink is what activates
+            # the venv (Python finds pyvenv.cfg next to it). resolve() would
+            # follow the symlink to the bare base interpreter with no venv,
+            # and `import hermes_cli` would fail silently (Terminal=false).
+            # abspath() only normalizes; it never follows the symlink.
+            argv = [os.path.abspath(sys.executable), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
@@ -105,8 +111,11 @@ def _needs_interpreter(bin_path: Path) -> bool:
         return False
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
-    # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
+    # a system path) would escape the venv when spawned by the DE. Compare
+    # against the UNRESOLVED interpreter dir: a venv console-script's shebang
+    # names the venv symlink path, and resolve() would map it to the base
+    # interpreter's dir and wrongly flag it as escaping.
+    exe_dir = os.path.dirname(os.path.abspath(sys.executable))
     return exe_dir not in shebang
 
 
