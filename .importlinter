@@ -28,7 +28,7 @@ forbidden_modules =
 allow_indirect_imports = true
 
 [importlinter:contract:gateway-session-context-leaf]
-name = Gateway session context stays dependency-light
+name = Gateway session context stays transitively dependency-light
 type = forbidden
 source_modules =
     gateway.session_context
@@ -36,7 +36,7 @@ forbidden_modules =
     hermes_cli
     plugins
     tools
-allow_indirect_imports = true
+allow_indirect_imports = false
 
 [importlinter:contract:plugin-capability-consent-leaf]
 name = Plugin capability consent stays independent of runtime layers
