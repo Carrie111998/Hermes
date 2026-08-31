@@ -75,7 +75,9 @@ async function loadPageProviders() {
         <MemoryRouter>
           <SystemActionsProvider>
             <ProfileProvider>
-              <PageHeaderProvider>{children}</PageHeaderProvider>
+              <PageHeaderProvider pluginTabs={[]}>
+                {children}
+              </PageHeaderProvider>
             </ProfileProvider>
           </SystemActionsProvider>
         </MemoryRouter>
