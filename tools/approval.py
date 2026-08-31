@@ -2657,6 +2657,24 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_request_sessions: dict[str, str] = {}  # request_id → session_key
+
+
+def _index_gateway_entry_locked(session_key: str, entry: _ApprovalEntry) -> None:
+    """Bind one pending request to its session while ``_lock`` is held."""
+    request_id = str(entry.data.get("request_id") or "")
+    if request_id:
+        _gateway_request_sessions[request_id] = session_key
+
+
+def _unindex_gateway_entries_locked(
+    session_key: str, entries: list[_ApprovalEntry]
+) -> None:
+    """Drop reverse-index rows owned by *session_key* while ``_lock`` is held."""
+    for entry in entries:
+        request_id = str(entry.data.get("request_id") or "")
+        if _gateway_request_sessions.get(request_id) == session_key:
+            _gateway_request_sessions.pop(request_id, None)
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2680,6 +2698,7 @@ def unregister_gateway_notify(session_key: str) -> None:
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        _unindex_gateway_entries_locked(session_key, entries)
     for entry in entries:
         entry.event.set()
 
@@ -2715,6 +2734,7 @@ def resolve_gateway_approval(session_key: str, choice: str,
             queue.clear()
         else:
             targets = [queue.pop(0)]
+        _unindex_gateway_entries_locked(session_key, targets)
         if not queue:
             _gateway_queues.pop(session_key, None)
 
@@ -2737,10 +2757,7 @@ def find_gateway_approval_session(request_id: str) -> Optional[str]:
     if not request_id:
         return None
     with _lock:
-        for session_key, entries in _gateway_queues.items():
-            if any(entry.data.get("request_id") == request_id for entry in entries):
-                return session_key
-    return None
+        return _gateway_request_sessions.get(request_id)
 
 
 def ack_gateway_approval(session_key: str, request_id: str) -> bool:
@@ -2834,6 +2851,7 @@ def clear_session(session_key: str) -> None:
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
+        _unindex_gateway_entries_locked(session_key, entries)
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
         # immediately so the old run can unwind instead of idling until timeout.
@@ -4311,12 +4329,14 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     entry = _ApprovalEntry(approval_data)
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
+        _index_gateway_entry_locked(session_key, entry)
 
     def _drop_entry() -> None:
         with _lock:
             queue = _gateway_queues.get(session_key, [])
             if entry in queue:
                 queue.remove(entry)
+                _unindex_gateway_entries_locked(session_key, [entry])
             if not queue:
                 _gateway_queues.pop(session_key, None)
 

@@ -696,7 +696,9 @@ def test_approval_respond_finds_exact_request_after_live_session_record_is_gone(
             "request_id": request_id,
         }
     )
-    approval._gateway_queues[session_key] = [entry]
+    with approval._lock:
+        approval._gateway_queues[session_key] = [entry]
+        approval._index_gateway_entry_locked(session_key, entry)
     try:
         response = server.handle_request(
             {
@@ -715,7 +717,9 @@ def test_approval_respond_finds_exact_request_after_live_session_record_is_gone(
         assert entry.event.is_set()
         assert approval.list_gateway_approvals(session_key) == []
     finally:
-        approval._gateway_queues.pop(session_key, None)
+        with approval._lock:
+            entries = approval._gateway_queues.pop(session_key, [])
+            approval._unindex_gateway_entries_locked(session_key, entries)
 
 
 def test_approval_respond_4001_when_nothing_resolves(server, monkeypatch):
