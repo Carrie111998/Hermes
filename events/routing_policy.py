@@ -212,6 +212,14 @@ _POLICY: Dict[EventType, _Spec] = {
     # axis pages via the disk_critical hook below, which forces
     # action_required regardless of this line.
     _E.RESOURCE_PRESSURE: _Spec(Attention.WARN, SECURITY),
+    # P6 fleet-controller audit pair (2026-08-31): TRACE on the low-traffic
+    # security topic beside the D7 detector they act on. Routine shadow
+    # passes batch and never page; a result carrying status=="failed"
+    # reaches a FAILED verdict via events.outcomes' "status" scan, and the
+    # generic verdict-promotion block below lifts it TRACE->WARN/Alerts —
+    # deliberately no fleet-specific hook, so the promotion cannot drift.
+    _E.CLAUDE_FLEET_PLAN: _Spec(Attention.TRACE, SECURITY),
+    _E.CLAUDE_FLEET_RESULT: _Spec(Attention.TRACE, SECURITY),
     _E.CODE_DRIFT: _Spec(Attention.WARN, ALERTS),           # hook: resolved → INFO
     # Base case is the common one: the limit was hit and a fallback absorbed
     # it, which is degraded-but-working. The conditional hook below upgrades

@@ -1,0 +1,15 @@
+{
+  "_comment": "P6 Claude fleet controller policy. SHADOW BY DESIGN: enforcement additionally requires approved_enforce_digest to equal FleetPolicy.digest() AND an --allow-enforce invocation flag. Changing mode to enforce without fresh explicit Diego approval is prohibited (storm-recovery board row 41).",
+  "mode": "shadow",
+  "policy_version": "p6-2026-08-31-1",
+  "fleet_min_roots": 30,
+  "d7_max_age_seconds": 360,
+  "idle_min_minutes": 30,
+  "strikes_required": 2,
+  "strike_max_age_seconds": 900,
+  "max_trees_per_pass": 1,
+  "max_tree_processes": 24,
+  "max_tree_rss_bytes": 2147483648,
+  "cooldown_seconds": 1800,
+  "approved_enforce_digest": null
+}

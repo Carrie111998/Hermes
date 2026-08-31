@@ -637,6 +637,35 @@ class EventType(Enum):
     # this type can reach (agents_memory 📚🚀🧠, watchdog_alerts's 26).
     AGENT_NOTE = ("agent_note", Priority.NORMAL, "🗒️")
 
+    # P6 Claude fleet controller audit pair — added 2026-08-31 (storm board
+    # row 41). The controller is the ACTION half of the spawn-churn defense:
+    # D7's spawn_latency axis (RESOURCE_PRESSURE above) detects; these two
+    # record what the fleet controller decided and what actually happened.
+    # Deliberately NOT overloaded onto RESOURCE_PRESSURE: a detector reading
+    # and a projected/executed process action are different audit species,
+    # and the 08-26 storm forensics ran aground precisely on actions that
+    # left no typed record. Emitted by claude_fleet_control.controller via
+    # cursorless EventBus.query()/emit() — the controller is NOT a
+    # subscriber and must never join subscriber_roster.json.
+    #
+    # CLAUDE_FLEET_PLAN payload: schema/policy versions, run/plan ids, mode,
+    # decision (no_action | shadow_projected | enforce_projected), trigger
+    # reasons, fleet_root_count, bounded D7 evidence metadata, the selected
+    # tree as identities only (pid:create_time — never command lines or
+    # transcript contents), and a rejection-reason histogram.
+    # CLAUDE_FLEET_RESULT payload: run/plan ids, status (no_action |
+    # shadow_projected | cancelled | hard_terminated | failed),
+    # executor_called, exited/surviving identities, detail. The "status" key
+    # name is load-bearing: events.outcomes scans it, so status=="failed"
+    # earns a FAILED verdict and routing's generic TRACE->WARN promotion —
+    # no fleet-specific hook exists. LOW priority: routine shadow telemetry
+    # batches in the security_and_system topic and never pages.
+    # Icons: abacus = counting/planning the fleet; control knobs = the
+    # bounded action lane reporting back. Both disjoint from their topic's
+    # existing glyphs (🧯 resource_pressure, 📐 backend_contract_drift).
+    CLAUDE_FLEET_PLAN = ("claude_fleet_plan", Priority.LOW, "🧮")
+    CLAUDE_FLEET_RESULT = ("claude_fleet_result", Priority.LOW, "🎛️")
+
     def __init__(self, type_string: str, default_priority: Priority, icon: str):
         # The icon is REQUIRED, and that is the whole point of it living here
         # rather than in a parallel dict — see the class docstring. Omitting it
