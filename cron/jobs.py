@@ -962,6 +962,48 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
     original = schedule
     schedule_lower = schedule.lower()
 
+    # Round-trip compatibility: parse_schedule emits "once at YYYY-MM-DD HH:MM"
+    # and "once in <duration>" as human-readable display strings, but those
+    # formats were never accepted as input.  Any caller that round-trips a job's
+    # .display field back as a new schedule (e.g. a UI that pre-fills the edit
+    # form with the current display) would get ValueError: Invalid schedule.
+    # Accept both display forms as first-class inputs so parse_schedule is
+    # idempotent over its own output (#89560).
+    if schedule_lower.startswith("once at "):
+        # "once at 2026-08-19 08:00" → treat as ISO timestamp
+        dt_str = schedule[len("once at "):].strip()
+        # Normalise space between date and time to T so dateutil/fromisoformat parses it
+        dt_str = dt_str.replace(" ", "T", 1)
+        try:
+            import dateutil.parser as _dup
+            _dt = _dup.parse(dt_str)
+        except Exception:
+            raise ValueError(
+                f"Invalid schedule '{original}': unrecognised 'once at' timestamp '{dt_str}'"
+            )
+        return {
+            "kind": "once",
+            "run_at": _dt.isoformat(),
+            "display": f"once at {_dt.strftime('%Y-%m-%d %H:%M')}",
+        }
+
+    if schedule_lower.startswith("once in "):
+        # "once in 2h 30m" → parse the duration and schedule relative to now
+        dur_str = schedule[len("once in "):].strip()
+        try:
+            _minutes = _parse_duration_to_minutes(dur_str)
+        except Exception:
+            raise ValueError(
+                f"Invalid schedule '{original}': unrecognised 'once in' duration '{dur_str}'"
+            )
+        import datetime as _dt_mod
+        _run_at = _dt_mod.datetime.utcnow() + _dt_mod.timedelta(minutes=_minutes)
+        return {
+            "kind": "once",
+            "run_at": _run_at.isoformat(),
+            "display": f"once in {dur_str}",
+        }
+
     # "every X" pattern → recurring interval, OR a documented natural-language
     # day/time phrase ("every monday 9am", "every day at 9am") → cron.
     if schedule_lower.startswith("every "):
