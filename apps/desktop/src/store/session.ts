@@ -393,6 +393,29 @@ export function idsShareLineage(
 }
 
 /**
+ * Whether a live runtime still belongs to the composer's durable session key.
+ *
+ * Mid-switch the route/composer key can already be chat B while the leftover
+ * busy runtime is still chat A (#59305 sibling). Steering then injects B's
+ * text into A's in-flight turn. Missing either id is insufficient evidence
+ * (keep historical steer). Same conversation across compression tips is yes.
+ */
+export function runtimeBelongsToComposerScope(
+  runtimeStoredSessionId: string | null | undefined,
+  composerKey: string | null | undefined,
+  sessions: readonly Pick<SessionInfo, '_lineage_root_id' | 'id'>[]
+): boolean {
+  const stored = runtimeStoredSessionId?.trim()
+  const key = composerKey?.trim()
+
+  if (!stored || !key) {
+    return true
+  }
+
+  return idsShareLineage(stored, key, sessions)
+}
+
+/**
  * Whether a composer draft/queue key should move from `fromKey` onto `toKey`.
  *
  * Only same-conversation rekeys are allowed (compression tip → lineage root).

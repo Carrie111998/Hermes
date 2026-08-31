@@ -13,6 +13,8 @@ import {
   setSecretRequest,
   setSudoRequest
 } from '@/store/prompts'
+import { $sessions } from '@/store/session'
+import { $sessionStates, clearAllSessionStates } from '@/store/session-states'
 
 import { type ComposerTarget, requestComposerSubmit } from '../focus'
 import { ComposerScopeProvider, ComposerSurfaceProvider, MAIN_COMPOSER_SCOPE } from '../scope'
@@ -25,6 +27,7 @@ interface SubmitHarnessOptions {
   compacting?: boolean
   inputDisabled?: boolean
   scopeTarget?: ComposerTarget
+  sessionId?: string
   sessionKey?: string | null
   submitOnHide?: boolean
   surfaceId?: string | null
@@ -40,6 +43,7 @@ function renderSubmitHook({
   compacting = false,
   inputDisabled = false,
   scopeTarget = 'main',
+  sessionId = 'runtime-session',
   sessionKey = 'stored-session',
   submitOnHide = false,
   surfaceId,
@@ -113,7 +117,7 @@ function renderSubmitHook({
         queueCurrentDraft,
         queueEdit: null,
         queuedPrompts: [],
-        sessionId: 'runtime-session',
+        sessionId,
         setComposerText: vi.fn(),
         stashAt: vi.fn()
       }),
@@ -352,6 +356,39 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(onSteer).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
     expect(queueCurrentDraft).not.toHaveBeenCalled()
+  })
+
+  it('does not steer a leftover busy runtime after the composer moved to another chat', async () => {
+    $sessions.set([
+      { id: 'stored-a', _lineage_root_id: 'stored-a' },
+      { id: 'stored-b', _lineage_root_id: 'stored-b' }
+    ] as never)
+    $sessionStates.set({
+      'runtime-a': { storedSessionId: 'stored-a', busy: true }
+    } as never)
+
+    const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      sessionId: 'runtime-a',
+      sessionKey: 'stored-b',
+      text: 'how can I tell how much context is left in hermes desktop?'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith('how can I tell how much context is left in hermes desktop?', {
+        composerScope: 'stored-b'
+      })
+    )
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
+    expect(onCancel).not.toHaveBeenCalled()
+
+    $sessions.set([])
+    clearAllSessionStates()
   })
 
   it('submits a normal turn while idle', async () => {
