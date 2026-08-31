@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 
 import type { SubmitTextOptions } from '@/app/session/hooks/use-prompt-actions/utils'
 import type { HermesGateway } from '@/hermes'
+import type { WorkspaceSubmitResult } from '@/lib/workspace-send-gate'
 
 import type { DroppedFile } from '../hooks/use-composer-actions'
 
@@ -55,7 +56,10 @@ export interface ChatBarProps {
   onPickImages?: () => void
   onRemoveAttachment?: (id: string) => void
   onSteer?: (text: string) => Promise<boolean> | boolean
-  onSubmit: (value: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
+  onSubmit: (
+    value: string,
+    options?: SubmitTextOptions
+  ) => Promise<WorkspaceSubmitResult | boolean> | WorkspaceSubmitResult | boolean
   onTranscribeAudio?: (audio: Blob) => Promise<string>
 }
 

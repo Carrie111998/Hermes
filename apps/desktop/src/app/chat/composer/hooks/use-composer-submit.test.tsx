@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { PaneVisibleContext } from '@/components/pane-shell/pane-visibility'
 import { $clarifyRequests } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
+import type { QueuedPromptEntry } from '@/store/composer-queue'
 import { $gateway } from '@/store/gateway'
 import {
   clearAllPrompts,
@@ -23,7 +24,9 @@ interface SubmitHarnessOptions {
   attachments?: ComposerAttachment[]
   busy?: boolean
   compacting?: boolean
-  inputDisabled?: boolean
+  disabled?: boolean
+
+  queuedPrompts?: QueuedPromptEntry[]
   scopeTarget?: ComposerTarget
   sessionKey?: string | null
   submitOnHide?: boolean
@@ -38,7 +41,9 @@ function renderSubmitHook({
   attachments = [],
   busy = false,
   compacting = false,
-  inputDisabled = false,
+  disabled = false,
+
+  queuedPrompts = [],
   scopeTarget = 'main',
   sessionKey = 'stored-session',
   submitOnHide = false,
@@ -90,6 +95,8 @@ function renderSubmitHook({
     )
   }
 
+  const drainNextQueued = vi.fn(async () => false)
+
   const hook = renderHook(
     () =>
       useComposerSubmit({
@@ -99,20 +106,20 @@ function renderSubmitHook({
         busy,
         compacting,
         clearDraft,
-        disabled: false,
+        disabled,
         draftRef,
-        drainNextQueued: vi.fn(async () => false),
+        drainNextQueued,
         editorRef,
         exitQueuedEdit: vi.fn(() => false),
         focusInput: vi.fn(),
-        inputDisabled,
+
         loadIntoComposer: vi.fn(),
         onCancel,
         onSteer,
         onSubmit,
         queueCurrentDraft,
         queueEdit: null,
-        queuedPrompts: [],
+        queuedPrompts,
         sessionId: 'runtime-session',
         setComposerText: vi.fn(),
         stashAt: vi.fn()
@@ -122,6 +129,9 @@ function renderSubmitHook({
 
   return {
     clearDraft,
+    draftRef,
+    drainNextQueued,
+    editorRef,
     hook,
     onCancel,
     onSteer,
@@ -256,7 +266,7 @@ describe('useComposerSubmit external request routing', () => {
   })
 
   it('does not submit through a disabled composer', () => {
-    const disabled = renderSubmitHook({ inputDisabled: true })
+    const disabled = renderSubmitHook({ disabled: true })
 
     requestComposerSubmit('do not send this', { target: 'main' })
 
@@ -560,5 +570,45 @@ describe('useComposerSubmit with a blocking prompt parked on the session', () =>
 
     // The approval card is still the turn's owner; only its own buttons answer it.
     expect(hasBlockingPromptRequest('runtime-session')).toBe(true)
+  })
+})
+
+describe('useComposerSubmit Sessions-switch barrier', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('leaves a foreground draft intact and never sends or queues while send is blocked', () => {
+    const { clearDraft, draftRef, hook, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      disabled: true,
+      text: 'keep this draft'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
+    expect(clearDraft).not.toHaveBeenCalled()
+    expect(draftRef.current).toBe('keep this draft')
+  })
+
+  it('does not drain the queue from a blocked attempt', () => {
+    const queuedPrompts: QueuedPromptEntry[] = [{ attachments: [], id: 'q1', queuedAt: 1, text: 'queued later' }]
+
+    const { drainNextQueued, hook, onSubmit } = renderSubmitHook({
+      disabled: true,
+      queuedPrompts,
+      text: ''
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    expect(drainNextQueued).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
   })
 })

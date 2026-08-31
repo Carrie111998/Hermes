@@ -272,4 +272,32 @@ describe('composer Enter submit — live DOM vs stale composer state (#39630)', 
     expect(onDrain).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
   })
+
+  it('blocks Enter send and queue drain while workspace send is blocked', async () => {
+    const onSubmit = vi.fn()
+    const onDrain = vi.fn()
+
+    const { getByTestId } = render(
+      <Harness
+        disabled
+        onCancel={vi.fn()}
+        onDrain={onDrain}
+        onQueue={vi.fn()}
+        onSubmit={onSubmit}
+        queued={['queued-1']}
+      />
+    )
+
+    const editor = getByTestId('editor')
+
+    await act(async () => {
+      editor.textContent = 'draft during sessions switch'
+      fireEvent.input(editor)
+      fireEvent.keyDown(editor, { key: 'Enter' })
+    })
+
+    expect(editor.textContent).toBe('draft during sessions switch')
+    expect(onDrain).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
 })

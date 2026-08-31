@@ -3,6 +3,7 @@ import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopAgentRoster, DesktopConnectionsRegistry } from '@/global'
+import { $notifications, clearNotifications } from '@/store/notifications'
 
 import { ProfileRail } from './profile-switcher'
 
@@ -16,6 +17,8 @@ const navigate = vi.fn()
 const selectConnection = vi.fn()
 const selectProfile = vi.fn()
 const getAgentRoster = vi.fn()
+const cancelPrewarm = vi.fn()
+const startPrewarm = vi.fn()
 
 vi.mock('react-router', () => ({
   useNavigate: () => navigate
@@ -38,10 +41,17 @@ vi.mock('@/i18n', () => ({
         failedSaveSoul: 'Failed to save SOUL.md',
         fleet: {
           allOnGateway: 'All profiles on this gateway',
+          consequence: 'Sessions moves to this gateway; the open chat stays on its current machine.',
           deleteOn: (gateway: string) => ` on ${gateway}`,
           gateway: (gateway: string) => `Profiles on ${gateway}`,
           gatewayUnreachable: (gateway: string) => `${gateway} · unreachable`,
           onGateway: (name: string, gateway: string) => `${name} · ${gateway}`,
+          routeInvalid: (gateway: string) => `Can't switch to ${gateway}. The profile route is missing or ambiguous.`,
+          unreachableTuple: (name: string, gateway: string) => `${name} · ${gateway} · unreachable`,
+          authRequiredTuple: (name: string, gateway: string) => `${name} · ${gateway} · sign-in required`,
+          switchFailed: (name: string, gateway: string, previous: string) =>
+            `Could not switch to ${name} on ${gateway}. You’re still on ${previous}. Nothing was sent.`,
+          switching: (name: string, gateway: string) => `Switching Sessions to ${name} on ${gateway}…`,
           switchTo: (name: string, gateway: string) => `Switch to ${name} on ${gateway}`
         },
         importProfile: 'Import profile…',
@@ -98,7 +108,7 @@ vi.mock('@/store/profile-share', () => ({
 }))
 
 vi.mock('./use-profile-prewarm', () => ({
-  useProfilePrewarm: () => ({ cancelPrewarm: vi.fn(), startPrewarm: vi.fn() })
+  useProfilePrewarm: () => ({ cancelPrewarm, startPrewarm })
 }))
 
 vi.mock('./use-profile-rail-refresh-on-active', () => ({
@@ -123,9 +133,10 @@ const connectionsRegistry = connectionsStore.$connectionsRegistry as ReturnType<
   typeof atom<DesktopConnectionsRegistry | null>
 >
 
-const { $profiles, $profileScope } = await import('@/store/profile')
+const { $profiles, $profileScope, $activeGatewayProfile } = await import('@/store/profile')
 const profiles = $profiles as ReturnType<typeof atom<Array<{ is_default: boolean; name: string }>>>
 const profileScope = $profileScope as ReturnType<typeof atom<string>>
+const gatewayProfile = $activeGatewayProfile as ReturnType<typeof atom<string>>
 const { _resetFleetRosterForTests } = await import('@/store/fleet-roster')
 
 const registry: DesktopConnectionsRegistry = {
@@ -202,12 +213,14 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
+  clearNotifications()
   vi.clearAllMocks()
   _resetFleetRosterForTests()
   hasMultipleConnections.set(false)
   connectionsRegistry.set(null)
   activeConnectionId.set(null)
   profileScope.set('default')
+  gatewayProfile.set('default')
   profiles.set([{ is_default: true, name: 'default' }])
   delete (window as { hermesDesktop?: unknown }).hermesDesktop
 })
@@ -250,12 +263,12 @@ describe('ProfileRail fleet mode', () => {
     expect(dividers).toEqual(['local', 'pandora', 'vps'])
 
     const local = screen.getByRole('group', { name: 'Profiles on This device' })
-    expect(within(local).getByRole('button', { name: 'default · This device' })).toBeTruthy()
-    expect(within(local).getByRole('button', { name: 'omer · This device' })).toBeTruthy()
+    expect(within(local).getByRole('button', { name: 'Switch to default on This device' })).toBeTruthy()
+    expect(within(local).getByRole('button', { name: 'Switch to omer on This device' })).toBeTruthy()
 
     // The active gateway's own squares are unchanged and unqualified.
     expect(screen.getByRole('button', { name: 'scout' })).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'default' })).toBeTruthy()
+    expect(screen.getByRole('status', { name: 'default · Pandora' })).toBeTruthy()
 
     // Fleet pill: "all on this gateway" replaces the default↔all toggle.
     expect(screen.getByRole('button', { name: 'All profiles on this gateway' })).toBeTruthy()
@@ -273,7 +286,7 @@ describe('ProfileRail fleet mode', () => {
         '[data-slot="profile-rail-divider"][data-connection-id="vps"] [data-slot="profile-rail-unreachable"]'
       )
     ).toBeTruthy()
-    expect(within(vps as HTMLElement).getByRole('button', { name: 'default · VPS' })).toBeTruthy()
+    expect(within(vps as HTMLElement).getByRole('button', { name: 'default · VPS · unreachable' })).toBeTruthy()
   })
 
   it('re-homes onto the exact (gateway, profile) when an at-rest square is clicked', async () => {
@@ -283,7 +296,7 @@ describe('ProfileRail fleet mode', () => {
     let settle: () => void = () => undefined
     selectConnection.mockImplementationOnce(() => new Promise<void>(resolve => (settle = resolve)))
 
-    const omer = screen.getByRole('button', { name: 'omer · This device' })
+    const omer = screen.getByRole('button', { name: 'Switch to omer on This device' })
     fireEvent.click(omer)
 
     expect(selectConnection).toHaveBeenCalledWith('local', { profile: 'omer' })
@@ -303,7 +316,7 @@ describe('ProfileRail fleet mode', () => {
     armFleet()
     await renderFleet()
 
-    fireEvent.click(screen.getByRole('button', { name: 'default · This device' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to default on This device' }))
 
     expect(selectConnection).toHaveBeenCalledWith('local', { profile: 'default' })
   })
@@ -316,6 +329,16 @@ describe('ProfileRail fleet mode', () => {
 
     expect(selectProfile).toHaveBeenCalledWith('scout')
     expect(selectConnection).not.toHaveBeenCalled()
+  })
+
+  it('does not prewarm active-gateway profiles while the fleet rail is visible', async () => {
+    armFleet()
+    await renderFleet()
+
+    fireEvent.pointerEnter(screen.getByRole('button', { name: 'scout' }))
+
+    expect(startPrewarm).not.toHaveBeenCalled()
+    expect(cancelPrewarm).not.toHaveBeenCalled()
   })
 
   it('keeps every group in its slot when a different gateway is active', async () => {
@@ -337,7 +360,7 @@ describe('ProfileRail fleet mode', () => {
       ['pandora', false],
       ['vps', false]
     ])
-    expect(screen.getByRole('button', { name: 'scout · Pandora' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Switch to scout on Pandora' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'omer' })).toBeTruthy()
   })
 
@@ -352,5 +375,237 @@ describe('ProfileRail fleet mode', () => {
 
     expect(screen.getByRole('button', { name: 'Profiles' })).toBeTruthy()
     expect(container.querySelector('[data-slot="profile-rail-rest-square"]')).toBeNull()
+  })
+
+  it('treats the active exact tuple as status rather than a second action', async () => {
+    armFleet()
+    await renderFleet()
+
+    expect(screen.getByRole('status', { name: 'default · Pandora' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'default' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Switch to default on Pandora' })).toBeNull()
+  })
+
+  it('labels other fleet actions with the exact tuple and explains the Sessions move', async () => {
+    armFleet()
+    await renderFleet()
+
+    const omer = screen.getByRole('button', { name: 'Switch to omer on This device' })
+    expect(omer.getAttribute('aria-description')).toBe(
+      'Sessions moves to this gateway; the open chat stays on its current machine.'
+    )
+    expect(screen.queryByRole('button', { name: /Open Bot Chat/i })).toBeNull()
+    expect(screen.queryByText('Open Bot Chat')).toBeNull()
+  })
+
+  it('announces pending and failure in a polite live region without moving focus', async () => {
+    armFleet()
+    await renderFleet()
+
+    let rejectSwitch: (error: Error) => void = () => undefined
+    selectConnection.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectSwitch = reject
+        })
+    )
+
+    const omer = screen.getByRole('button', { name: 'Switch to omer on This device' })
+    omer.focus()
+    fireEvent.click(omer)
+
+    const live = screen.getByRole('status', { name: /Switching Sessions to omer on This device/ })
+    expect(live.getAttribute('aria-live')).toBe('polite')
+    expect(globalThis.document.activeElement).toBe(omer)
+
+    await act(async () => {
+      rejectSwitch(new Error('dial failed'))
+      await Promise.resolve()
+    })
+
+    expect(
+      screen.getByRole('status', {
+        name: 'Could not switch to omer on This device. You’re still on default · Pandora. Nothing was sent.'
+      })
+    ).toBeTruthy()
+    expect($notifications.get()).toContainEqual(
+      expect.objectContaining({
+        title: 'Could not switch to omer on This device. You’re still on default · Pandora. Nothing was sent.'
+      })
+    )
+    expect(globalThis.document.activeElement).toBe(omer)
+  })
+
+  it('moves focus to the named active tuple after a successful gateway switch', async () => {
+    armFleet()
+    await renderFleet()
+
+    selectConnection.mockImplementationOnce(async () => {
+      activeConnectionId.set('local')
+      gatewayProfile.set('omer')
+      profiles.set([
+        { is_default: true, name: 'default' },
+        { is_default: false, name: 'omer' }
+      ])
+    })
+
+    const omer = screen.getByRole('button', { name: 'Switch to omer on This device' })
+    omer.focus()
+    fireEvent.click(omer)
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(globalThis.document.activeElement).toBe(screen.getByRole('status', { name: 'omer · This device' }))
+  })
+
+  it('moves focus to the default active tuple after a successful gateway switch', async () => {
+    armFleet()
+    await renderFleet()
+
+    selectConnection.mockImplementationOnce(async () => {
+      activeConnectionId.set('local')
+      gatewayProfile.set('default')
+      profiles.set([
+        { is_default: true, name: 'default' },
+        { is_default: false, name: 'omer' }
+      ])
+    })
+
+    const home = screen.getByRole('button', { name: 'Switch to default on This device' })
+    home.focus()
+    fireEvent.click(home)
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(globalThis.document.activeElement).toBe(screen.getByRole('status', { name: 'default · This device' }))
+  })
+
+  it('does not steal focus when the user moves to the composer while a gateway switch is pending', async () => {
+    armFleet()
+    await renderFleet()
+
+    let settleSwitch: () => void = () => undefined
+    selectConnection.mockImplementationOnce(
+      () =>
+        new Promise<void>(resolve => {
+          settleSwitch = () => {
+            activeConnectionId.set('local')
+            gatewayProfile.set('omer')
+            profiles.set([
+              { is_default: true, name: 'default' },
+              { is_default: false, name: 'omer' }
+            ])
+            resolve()
+          }
+        })
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to omer on This device' }))
+
+    const composer = globalThis.document.createElement('textarea')
+    globalThis.document.body.append(composer)
+    composer.focus()
+
+    await act(async () => {
+      settleSwitch()
+      await Promise.resolve()
+    })
+
+    expect(globalThis.document.activeElement).toBe(composer)
+    composer.remove()
+  })
+
+  it('treats a named active exact tuple as status, including mac-cockpit', async () => {
+    armFleet()
+    activeConnectionId.set('local')
+    gatewayProfile.set('mac-cockpit')
+    profiles.set([
+      { is_default: true, name: 'default' },
+      { is_default: false, name: 'mac-cockpit' }
+    ])
+    await renderFleet()
+
+    expect(screen.getByRole('status', { name: 'mac-cockpit · This device' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'mac-cockpit' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Switch to default on This device' })).toBeTruthy()
+  })
+
+  it('ignores a second rest-square click while a switch is pending and restores on failure', async () => {
+    armFleet()
+    await renderFleet()
+
+    let rejectFirst: (error: Error) => void = () => undefined
+    selectConnection.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectFirst = reject
+        })
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to omer on This device' }))
+    fireEvent.click(screen.getByRole('button', { name: 'default · VPS · unreachable' }))
+
+    expect(selectConnection).toHaveBeenCalledTimes(1)
+    expect(selectConnection).toHaveBeenCalledWith('local', { profile: 'omer' })
+
+    await act(async () => {
+      rejectFirst(new Error('dial failed'))
+      await Promise.resolve()
+    })
+
+    expect(activeConnectionId.get()).toBe('pandora')
+
+    fireEvent.click(screen.getByRole('button', { name: 'default · VPS · unreachable' }))
+    expect(selectConnection).toHaveBeenCalledWith('vps', { profile: 'default' })
+  })
+
+  it('shows profile plus connection on condensed trigger and rest rows', async () => {
+    armFleet()
+    profiles.set([
+      { is_default: true, name: 'default' },
+      ...Array.from({ length: 11 }, (_, index) => ({ is_default: false, name: `p${index + 1}` }))
+    ])
+    await renderFleet()
+
+    const trigger = screen.getByRole('button', { name: 'Profiles' })
+    expect(trigger.textContent).toContain('default · Pandora')
+
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(trigger)
+
+    expect(await screen.findByText('omer · This device')).toBeTruthy()
+    expect(screen.getByText('default · VPS · unreachable')).toBeTruthy()
+  })
+
+  it('keeps the fleet live region sr-only so the icon rail has no visible prose', async () => {
+    armFleet()
+    await renderFleet()
+
+    let settle: () => void = () => undefined
+    selectConnection.mockImplementationOnce(() => new Promise<void>(resolve => (settle = resolve)))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to omer on This device' }))
+
+    const live = screen.getByRole('status', { name: /Switching Sessions to omer on This device/ })
+    expect(live.className).toContain('sr-only')
+    expect(live.getAttribute('role')).toBe('status')
+    expect(live.getAttribute('aria-live')).toBe('polite')
+
+    await act(async () => {
+      settle()
+      await Promise.resolve()
+    })
+  })
+
+  it('names unreachable routes with the tuple and explicit text, never color only', async () => {
+    armFleet()
+    await renderFleet()
+
+    const vps = screen.getByRole('button', { name: /default · VPS · unreachable/ })
+    expect(vps.textContent || vps.getAttribute('aria-label')).toMatch(/unreachable/)
   })
 })

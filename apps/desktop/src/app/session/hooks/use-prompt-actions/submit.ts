@@ -12,12 +12,14 @@ import {
   stopVoicePlayback,
   takeVoicePlaybackInterrupted
 } from '@/lib/voice-playback'
+import { collectWorkspaceSendInput, evaluateWorkspaceSend, type WorkspaceSubmitResult } from '@/lib/workspace-send-gate'
 import {
   $composerAttachments,
   type ComposerAttachment,
   mainComposerScope,
   terminalContextBlocksFromDraft
 } from '@/store/composer'
+import { currentGatewaySwitchGeneration } from '@/store/gateway-switch'
 import { $hudMode } from '@/store/hud'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { consumePendingCredentialWarning, requestDesktopOnboarding } from '@/store/onboarding'
@@ -98,6 +100,33 @@ const MAIN_SUBMIT_SCOPE: NonNullable<SubmitPromptDeps['scope']> = {
   setMessages
 }
 
+function workspaceSendInput(
+  capturedGeneration?: number,
+  session?: { sessionId?: null | string; storedSessionId?: null | string }
+) {
+  return collectWorkspaceSendInput({
+    capturedGeneration,
+    sessionId: session?.sessionId,
+    storedSessionId: session?.storedSessionId
+  })
+}
+
+function workspaceSendBlocked(
+  capturedGeneration?: number,
+  session?: { sessionId?: null | string; storedSessionId?: null | string }
+): boolean {
+  return !evaluateWorkspaceSend(workspaceSendInput(capturedGeneration, session)).allowed
+}
+
+function workspaceSendReject(
+  capturedGeneration?: number,
+  session?: { sessionId?: null | string; storedSessionId?: null | string }
+): WorkspaceSubmitResult {
+  const verdict = evaluateWorkspaceSend(workspaceSendInput(capturedGeneration, session))
+
+  return { ok: false, reason: verdict.state }
+}
+
 /** The prompt submit pipeline, extracted from usePromptActions. */
 export function useSubmitPrompt(deps: SubmitPromptDeps) {
   const {
@@ -176,6 +205,20 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         (!options?.fromQueue && isTargetSessionBusy($sessionStates.get(), guardSessionId, busyRef.current))
       ) {
         return false
+      }
+
+      const capturedSwitchGeneration = currentGatewaySwitchGeneration()
+
+      const sendSession = {
+        sessionId: options?.sessionId ?? activeSessionIdRef.current,
+        storedSessionId: options?.storedSessionId ?? selectedStoredSessionIdRef.current
+      }
+
+      // Sessions-switch barrier: fail closed before any turn side effects.
+      // Bot Mode talking across machines is not a switch and does not set
+      // $pendingConnectionId / $gatewaySwitching.
+      if (workspaceSendBlocked(capturedSwitchGeneration, sendSession)) {
+        return workspaceSendReject(capturedSwitchGeneration, sendSession)
       }
 
       // Typing barge-in: a new send silences any in-flight spoken reply.
@@ -476,11 +519,23 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         )
       }
 
+      const liveSendSession = () => ({
+        sessionId: sessionId ?? sendSession.sessionId,
+        storedSessionId: targetStoredSessionId ?? sendSession.storedSessionId
+      })
+
       const abortForSessionSwitch = (optimisticSessionId: null | string): false => {
         dropOptimistic(optimisticSessionId)
         releaseBusy()
 
         return false
+      }
+
+      const abortForWorkspaceSend = (optimisticSessionId: null | string): WorkspaceSubmitResult => {
+        dropOptimistic(optimisticSessionId)
+        releaseBusy()
+
+        return workspaceSendReject(capturedSwitchGeneration, liveSendSession())
       }
 
       // Foreground-only state: a background queue drain must never write the
@@ -540,6 +595,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       }
 
       if (!options?.storedSessionId && !sessionId && routedStoredSessionId && routedSessionNeedsResume) {
+        if (workspaceSendBlocked(capturedSwitchGeneration, liveSendSession())) {
+          return abortForWorkspaceSend(sessionId)
+        }
+
         // The URL still names a durable conversation, but a profile
         // swap/reconnect left its volatile session binding incomplete or
         // cross-wired. Run the full profile-aware resume path. Creating here
@@ -601,6 +660,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           const resumed = cachedRuntimeId
             ? { session_id: cachedRuntimeId }
             : await singleFlightSessionResume(targetStoredSessionId, async () => {
+                if (workspaceSendBlocked(capturedSwitchGeneration, liveSendSession())) {
+                  throw new Error('sessions-switch-blocked')
+                }
+
                 const resumeProfile = await resolveSessionProfile(targetStoredSessionId)
 
                 return requestGateway<{ session_id: string }>('session.resume', {
@@ -632,12 +695,16 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
               activeSessionIdRef.current = sessionId
             }
           }
-        } catch {
+        } catch (err) {
           // A target stored conversation is not a new-chat draft. If its
           // runtime cannot be rebound, stop here rather than silently replacing
           // it with a contextless session (#55578). For a background/queued
           // drain this abort is a no-op on foreground state (both helpers are
           // targetIsCurrentView-guarded) and simply drops the queued send.
+          if (err instanceof Error && err.message === 'sessions-switch-blocked') {
+            return abortForWorkspaceSend(null)
+          }
+
           return abortForSessionSwitch(null)
         }
 
@@ -657,11 +724,19 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       }
 
       if (!sessionId) {
+        if (workspaceSendBlocked(capturedSwitchGeneration, liveSendSession())) {
+          return abortForWorkspaceSend(null)
+        }
+
         try {
           sessionId = await createBackendSessionForSend(bubbleText)
         } catch (err) {
           dropOptimistic(null)
           releaseBusy()
+
+          if (workspaceSendBlocked(capturedSwitchGeneration, liveSendSession())) {
+            return abortForWorkspaceSend(null)
+          }
 
           if (targetIsCurrentView()) {
             notifyError(err, copy.sessionUnavailable)
@@ -675,6 +750,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           // sessions mid-create (it closes the orphaned session itself) —
           // abort silently. Anything else is a real failure worth a toast.
           const createNullDrift = sessionDriftReason()
+
+          if (workspaceSendBlocked(capturedSwitchGeneration, liveSendSession())) {
+            return abortForWorkspaceSend(null)
+          }
 
           if (createNullDrift) {
             console.warn('[submit-drift-abort]', createNullDrift, { phase: 'post-create-null' })
@@ -701,7 +780,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         // synchronously, so it only still equals the id create returned when
         // nobody re-homed since.
         if (activeSessionIdRef.current !== sessionId) {
-          return abortForSessionSwitch(sessionId)
+          return workspaceSendBlocked(capturedSwitchGeneration, liveSendSession())
+            ? abortForWorkspaceSend(sessionId)
+            : abortForSessionSwitch(sessionId)
         }
 
         // Re-pin the baseline to the created chat for the rest of the
@@ -720,6 +801,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         targetStoredSessionId = selectedStoredSessionIdRef.current
 
         seedOptimistic(sessionId)
+      }
+
+      if (workspaceSendBlocked(capturedSwitchGeneration, liveSendSession())) {
+        return abortForWorkspaceSend(sessionId)
       }
 
       try {
@@ -753,6 +838,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         rewriteOptimistic(liveSessionId)
         const text = buildContextText(syncedAttachments)
 
+        if (workspaceSendBlocked(capturedSwitchGeneration, liveSendSession())) {
+          return abortForWorkspaceSend(liveSessionId)
+        }
+
         const submitParams = (targetId: string) => ({
           session_id: targetId,
           text,
@@ -782,16 +871,25 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         try {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current
 
+          const submitDriftReason = (): string | null =>
+            sessionDriftReason() ??
+            (workspaceSendBlocked(capturedSwitchGeneration, liveSendSession()) ? 'workspaceSendBlocked' : null)
+
           await withSessionNotFoundResume(
             sessionId,
             recoverStoredSessionId,
-            liveId =>
-              withSessionBusyRetry(() =>
+            liveId => {
+              if (workspaceSendBlocked(capturedSwitchGeneration, liveSendSession())) {
+                throw new SessionRecoveryAborted('workspaceSendBlocked', liveId)
+              }
+
+              return withSessionBusyRetry(() =>
                 requestGateway('prompt.submit', submitParams(liveId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
-              ),
+              )
+            },
             {
               requestGateway,
-              driftReason: sessionDriftReason,
+              driftReason: submitDriftReason,
               onRecovered: recoveredId => {
                 if (onRuntimeRecovered) {
                   onRuntimeRecovered(recoveredId)
@@ -820,7 +918,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           if (firstErr instanceof SessionRecoveryAborted) {
             console.warn('[submit-drift-abort]', firstErr.reason, { phase: 'post-resume-retry' })
 
-            return abortForSessionSwitch(sessionId)
+            return firstErr.reason === 'workspaceSendBlocked'
+              ? abortForWorkspaceSend(sessionId)
+              : abortForSessionSwitch(sessionId)
           }
 
           submitErr = firstErr

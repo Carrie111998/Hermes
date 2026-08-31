@@ -377,6 +377,10 @@ function modeIsRemoteLike(mode) {
   return mode === 'remote' || mode === 'cloud'
 }
 
+function exactDesktopConnectionMode(mode) {
+  return mode === 'local' || mode === 'ssh' || modeIsRemoteLike(mode) ? mode : null
+}
+
 function normalizeSshConfig(entry) {
   if (!entry || typeof entry !== 'object' || entry.mode !== 'ssh') {
     return null
@@ -486,7 +490,30 @@ function profileHasRemoteConnection(config, profile) {
 function localProfileEntry(existing) {
   const ssh = normalizeSshConfig(existing) || normalizeSshConfig(existing?.savedSsh)
 
-  return ssh ? { mode: 'local', savedSsh: ssh } : null
+  return ssh ? { mode: 'local', savedSsh: ssh } : { mode: 'local' }
+}
+
+// Keep this aligned with hermes_cli.profiles.validate_profile_name(). Profile
+// ids are canonical lowercase identities; display labels are a separate layer.
+const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
+
+function objectRecord(value) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : null
+}
+
+/** Exact profile identities explicitly persisted as local. Invalid or
+ * fallback-normalized modes are never treated as user intent. */
+function configuredLocalProfilesFromConfig(rawConfig) {
+  const config = objectRecord(rawConfig)
+  const profiles = objectRecord(config?.profiles)
+
+  if (!profiles) {
+    return []
+  }
+
+  return Object.entries(profiles)
+    .filter(([profile, rawEntry]) => PROFILE_NAME_RE.test(profile) && objectRecord(rawEntry)?.mode === 'local')
+    .map(([profile]) => profile)
 }
 
 function hostLabelFromBaseUrl(baseUrl) {
@@ -1006,11 +1033,13 @@ export {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
+  configuredLocalProfilesFromConfig,
   connectionScopeKey,
   cookiesHaveLiveSession,
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  exactDesktopConnectionMode,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,

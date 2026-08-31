@@ -219,6 +219,31 @@ export async function requestForBot<T = unknown>(
     }
   }
 
+  // An unscoped row is safe only while the ambient gateway is the sole
+  // registered source. Once multiple machines exist, presentation state is
+  // not routing authority; fail closed instead of sending a retained group
+  // member to whichever gateway Sessions currently shows.
+  if (typeof host.profileRoutes === 'function') {
+    try {
+      const routes = await host.profileRoutes()
+
+      const connectionIds = new Set(
+        (routes || []).map(candidate => String(candidate?.connectionId || '').trim()).filter(Boolean)
+      )
+
+      if (connectionIds.size > 1) {
+        throw new Error(`Cannot route unscoped bot ${String(bot?.name || 'default')} across multiple connections`)
+      }
+    } catch (error) {
+      // The SDK supplies a throwing compatibility stub on older/single-source
+      // Desktop builds. That state has no cross-machine route to confuse; real
+      // discovery failures on a fleet remain fail-closed.
+      if (!/connection routing unavailable/i.test(String((error as Error)?.message || error))) {
+        throw error
+      }
+    }
+  }
+
   try {
     return await host.request(method, params)
   } catch (error) {

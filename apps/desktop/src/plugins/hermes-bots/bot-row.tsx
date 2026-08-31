@@ -249,6 +249,11 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }: BotRowPro
             <Tip label={rowTooltip}>
               <span className="min-w-0 truncate text-[0.8125rem] font-medium">{displayName(bot, meta)}</span>
             </Tip>
+            {bot.remoteSource && gatewayLabel && gatewayLabel !== displayName(bot, meta) ? (
+              <span className="min-w-0 truncate text-[0.6875rem] font-normal text-(--ui-text-tertiary)">
+                {gatewayLabel}
+              </span>
+            ) : null}
           </div>
           {attention ? (
             <Tip label={BOT_ATTENTION_HINTS[attention.reason] || 'Needs attention'}>

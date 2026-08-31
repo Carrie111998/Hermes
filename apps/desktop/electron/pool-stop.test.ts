@@ -89,6 +89,19 @@ test('stop of an unknown key resolves without signalling anything', async () => 
   assert.equal(stopper.inFlight('ghost'), undefined)
 })
 
+test('stopIfCurrent never tears down a replacement installed under the same key', async () => {
+  const { addChild, events, pool, stopper } = harness()
+  addChild('selena')
+  const observed = pool.get('selena')!
+  const replacement: PoolStopEntry = { process: { exited: false, killed: false } satisfies Child }
+
+  pool.set('selena', replacement)
+
+  assert.equal(await stopper.stopIfCurrent('selena', observed), false)
+  assert.equal(pool.get('selena'), replacement)
+  assert.deepEqual(events, [])
+})
+
 test('stopAll stops every pooled backend and resolves after all exits', async () => {
   const { addChild, exitResolvers, pool, stopper } = harness()
   const a = addChild('a')

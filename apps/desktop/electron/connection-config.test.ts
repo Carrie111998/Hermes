@@ -21,11 +21,13 @@ import {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
+  configuredLocalProfilesFromConfig,
   connectionScopeKey,
   cookiesHaveLiveSession,
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  exactDesktopConnectionMode,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   isGatewayAuthRejection,
@@ -302,14 +304,67 @@ test('normalizeSshConfig strips a pasted "ssh " command prefix', () => {
   })
 })
 
-test('localProfileEntry preserves inactive SSH drafts but drops Cloud state', () => {
+test('localProfileEntry persists ordinary local intent and preserves inactive SSH drafts', () => {
   const ssh = { mode: 'ssh', host: 'box', user: 'alice', remoteHermesPath: '/hermes' }
+
+  assert.deepEqual(localProfileEntry({}), { mode: 'local' })
+  assert.deepEqual(localProfileEntry({ mode: 'local' }), { mode: 'local' })
   assert.deepEqual(localProfileEntry(ssh), { mode: 'local', savedSsh: ssh })
   assert.deepEqual(localProfileEntry({ mode: 'local', savedSsh: ssh }), {
     mode: 'local',
     savedSsh: ssh
   })
-  assert.equal(localProfileEntry({ mode: 'cloud', url: 'https://agent' }), null)
+  assert.deepEqual(localProfileEntry({ mode: 'cloud', url: 'https://agent' }), { mode: 'local' })
+})
+
+test('ordinary local intent survives persist/read/restart and external reread', () => {
+  const selected = {
+    mode: 'remote',
+    profiles: { 'mac-cockpit': localProfileEntry({}) },
+    remote: { url: 'https://linux.test' }
+  }
+
+  const disk = JSON.stringify(selected)
+  const restarted = JSON.parse(disk)
+
+  assert.deepEqual(configuredLocalProfilesFromConfig(restarted), ['mac-cockpit'])
+
+  // Re-saving the same at-rest identity retains the authoritative marker.
+  restarted.profiles['mac-cockpit'] = localProfileEntry(restarted.profiles['mac-cockpit'])
+  assert.deepEqual(configuredLocalProfilesFromConfig(JSON.parse(JSON.stringify(restarted))), ['mac-cockpit'])
+
+  // An external edit is reconstructed from the new bytes rather than stale
+  // process-local intent.
+  const externallyReread = JSON.parse(JSON.stringify({ ...restarted, profiles: { 'studio-mac': { mode: 'local' } } }))
+
+  assert.deepEqual(configuredLocalProfilesFromConfig(externallyReread), ['studio-mac'])
+})
+
+test('desktop connection input modes fail closed instead of inventing local intent', () => {
+  assert.equal(exactDesktopConnectionMode('local'), 'local')
+  assert.equal(exactDesktopConnectionMode('ssh'), 'ssh')
+  assert.equal(exactDesktopConnectionMode('remote'), 'remote')
+  assert.equal(exactDesktopConnectionMode('cloud'), 'cloud')
+
+  for (const mode of [undefined, null, '', 'locla', 'LOCAL', 'future-local', {}, []]) {
+    assert.equal(exactDesktopConnectionMode(mode), null)
+  }
+})
+
+test('configured local intent fails closed for malformed, unknown, and misspelled modes', () => {
+  const raw = {
+    profiles: {
+      'mac-cockpit': { mode: 'locla' },
+      Capitalized: { mode: 'local' },
+      unknown: { mode: 'future-local' },
+      missing: {},
+      remote: { mode: 'remote', url: 'https://example.test' },
+      valid: { mode: 'local' }
+    }
+  }
+
+  assert.deepEqual(configuredLocalProfilesFromConfig(raw), ['valid'])
+  assert.deepEqual(configuredLocalProfilesFromConfig({ profiles: [{ mode: 'local' }] }), [])
 })
 
 test('saved SSH drafts are inactive and explicit overrides take precedence', () => {

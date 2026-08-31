@@ -93,6 +93,7 @@ import {
   authModeFromStatus,
   buildGatewayWsUrl,
   buildGatewayWsUrlWithTicket,
+  configuredLocalProfilesFromConfig,
   connectionScopeKey,
   cookiesHaveLiveSession,
   cookiesHavePrivyAccessToken,
@@ -101,7 +102,6 @@ import {
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
-  localProfileEntry,
   modeIsRemoteLike,
   normalizeRemoteBaseUrl,
   normalizeRemoteHeaders,
@@ -114,7 +114,6 @@ import {
   profileSshOverride,
   type RegistryBackendRequestScope,
   remoteRequestMatchesBaseUrl,
-  resolveAuthMode,
   resolveProfileApiRequest,
   resolveProfileBackendRoute,
   resolveRemoteSshDashboardProfile,
@@ -123,7 +122,13 @@ import {
   tokenPreview,
   withTransientRetries
 } from './connection-config'
-import { applyConnectionConfigAtomically } from './connection-config-apply'
+import {
+  applyDesktopConnectionConfig,
+  coerceDesktopConnectionConfig as coerceDesktopConnectionConfigAtBoundary,
+  type DesktopConnectionConfig,
+  readDesktopConnectionConfigSnapshot,
+  saveDesktopConnectionConfig
+} from './connection-config-boundary'
 import {
   backendScopeKey,
   backendScopePrefix,
@@ -137,7 +142,6 @@ import {
   reconcileAppliedGlobalConnection,
   reconcileRegistryDrift,
   registrySourceOwnsPrimaryBackend,
-  rememberSshEnumeration,
   removeConnection,
   resolvedConnectionId,
   resolveRegistryLocalRoute,
@@ -145,12 +149,13 @@ import {
   setConnectionLaunchMode,
   setLastUsedConnection,
   setPrimaryConnection,
-  shouldDeferLocalEnumeration,
+  shouldCacheSshEnumeration,
   shouldRetrySshInventory,
   updateEligibility,
   upsertConnection
 } from './connection-registry'
 import type { RosterProfileMetadata } from './connection-registry'
+import { enumerateRegistryAgentSourcesObservational } from './connection-roster'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
@@ -1475,8 +1480,8 @@ let bootstrapRepairRequested = false
 // looping the user through a destructive venv reinstall.
 let bootstrapRepairAttempt = 0
 const MAX_BOOTSTRAP_REPAIR_SOFT_ATTEMPTS = 3
-let connectionConfigCache = null
-let connectionConfigCacheMtime = null
+let connectionConfigCache: DesktopConnectionConfig | null = null
+let connectionConfigCacheMtime: number | null = null
 let connectionRegistryCache = null
 let connectionRegistryCacheMtime = null
 let remoteHeaderRulesInstalled = false
@@ -8859,162 +8864,22 @@ function installRemoteHeaderRules() {
   })
 }
 
-// Validate + normalize the per-profile remote overrides map read from disk.
-// Drops malformed names/entries and keeps only the recognized fields so a
-// hand-edited or stale connection.json can't inject junk into resolution.
-function sanitizeConnectionProfiles(raw: Record<string, any>) {
-  if (!raw || typeof raw !== 'object') {
-    return {}
-  }
-
-  const out = {}
-
-  for (const [name, entry] of Object.entries(raw)) {
-    if (!entry || typeof entry !== 'object') {
-      continue
-    }
-
-    if (name !== 'default' && !PROFILE_NAME_RE.test(name)) {
-      continue
-    }
-
-    if (entry.mode === 'ssh') {
-      const ssh = normalizeSshConfig(entry)
-
-      if (ssh) {
-        if (entry.token && typeof entry.token === 'object') {
-          ssh.token = entry.token
-        }
-
-        out[name] = ssh
-      }
-
-      continue
-    }
-
-    const cleaned: {
-      mode: 'remote' | 'local' | 'cloud'
-      url?: string
-      authMode?: string
-      token?: object
-      headers?: object
-      org?: string
-      savedSsh?: object
-    } = {
-      mode: modeIsRemoteLike(entry.mode) ? entry.mode : 'local'
-    }
-
-    if (cleaned.mode === 'local') {
-      const savedSsh = normalizeSshConfig(entry.savedSsh)
-
-      if (savedSsh) {
-        cleaned.savedSsh = savedSsh
-      }
-    }
-
-    const url = String(entry.url || '').trim()
-
-    if (url) {
-      cleaned.url = url
-    }
-
-    cleaned.authMode = normAuthMode(entry.authMode)
-
-    if ((entry as any).token && typeof entry.token === 'object') {
-      cleaned.token = entry.token
-    }
-
-    const headers = normalizeRemoteHeaders((entry as any).headers)
-
-    if (Object.keys(headers).length > 0) {
-      cleaned.headers = headers
-    }
-
-    // Preserve the Hermes Cloud org tag on cloud-mode entries so Settings can
-    // reopen into the same org for a per-profile cloud connection.
-    if (cleaned.mode === 'cloud') {
-      const org = String(entry.org || '').trim()
-
-      if (org) {
-        cleaned.org = org
-      }
-    }
-
-    out[name] = cleaned
-  }
-
-  return out
-}
-
 function readDesktopConnectionConfig() {
-  // Check if file changed on disk since last read (e.g. modified by another
-  // process or an external tool).  Our own writes update the cache inline
-  // via writeDesktopConnectionConfig, but external changes would be missed.
-  let mtime = null
+  const snapshot = readDesktopConnectionConfigSnapshot({
+    cachedConfig: connectionConfigCache,
+    cachedMtime: connectionConfigCacheMtime,
+    readText: () => fs.readFileSync(DESKTOP_CONNECTION_CONFIG_PATH, 'utf8'),
+    statMtime: () => fs.statSync(DESKTOP_CONNECTION_CONFIG_PATH).mtimeMs,
+    // Tighten even malformed JSON because the file may still contain secret
+    // bytes. The shared boundary calls this immediately after the disk read and
+    // before parsing, preserving the original fail-safe ordering.
+    tighten: () => tightenSecretFileMode(DESKTOP_CONNECTION_CONFIG_PATH)
+  })
 
-  try {
-    mtime = fs.statSync(DESKTOP_CONNECTION_CONFIG_PATH).mtimeMs
-  } catch {
-    mtime = null
-  }
+  connectionConfigCache = snapshot.config
+  connectionConfigCacheMtime = snapshot.mtime
 
-  if (connectionConfigCache && connectionConfigCacheMtime === mtime) {
-    return connectionConfigCache
-  }
-
-  let config = { mode: 'local', remote: {}, profiles: {} }
-
-  try {
-    const raw = fs.readFileSync(DESKTOP_CONNECTION_CONFIG_PATH, 'utf8')
-    // Tighten an install written before this file was owner-only. Every write
-    // now goes out at 0600, but a file already on disk keeps its old 0644 bits
-    // until something chmods it, and waiting for the user's next Settings save
-    // would leave it group/other-readable indefinitely. Runs on a cache miss
-    // only (once per launch, plus after an external edit); chmod moves ctime,
-    // not mtime, so it cannot invalidate the cache it sits inside.
-    //
-    // Deliberately BEFORE JSON.parse, not after: a truncated or hand-mangled
-    // connection.json still contains the token bytes, and parse throws into the
-    // catch below, which swallows the error and falls back to local mode. With
-    // the tighten after the parse, exactly the file that is both corrupt AND
-    // world-readable would be the one file never tightened — and nothing would
-    // ever retry it, because the fallback config is not written back. The chmod
-    // needs only the path, so it has no reason to wait for valid JSON.
-    tightenSecretFileMode(DESKTOP_CONNECTION_CONFIG_PATH)
-
-    const parsed = JSON.parse(raw)
-
-    // NOT done here: migrating a legacy non-safeStorage token payload to
-    // ciphertext at rest. Deferred deliberately — it has to honor the opt-in
-    // plaintext choice PR #62319 adds (re-encrypting it converts a portable
-    // credential into a keychain-bound one and can lose the token), write
-    // through sanitizeConnectionProfiles below rather than persisting raw
-    // `parsed`, and tell the user to ROTATE, since every existing backup copy
-    // still holds the old secret. Do not add it without those three.
-
-    if (parsed && typeof parsed === 'object') {
-      const remote = parsed.remote && typeof parsed.remote === 'object' ? parsed.remote : {}
-      // authMode lives on the remote sub-object: 'oauth' (cookie + ws-ticket)
-      // or 'token' (legacy static session token). Default to 'token' for
-      // backward compatibility with configs written before OAuth support.
-      remote.authMode = remote.authMode === 'oauth' ? 'oauth' : 'token'
-      config = {
-        mode: parsed.mode === 'ssh' ? 'ssh' : modeIsRemoteLike(parsed.mode) ? parsed.mode : 'local',
-        remote,
-        // Per-profile remote overrides: each profile may point at its own
-        // backend (local spawn or its own remote URL). Preserved verbatim so
-        // profileRemoteOverride() can resolve them; normalized lazily on save.
-        profiles: sanitizeConnectionProfiles(parsed.profiles)
-      }
-    }
-  } catch {
-    // Missing or malformed connection settings should fall back to local.
-  }
-
-  connectionConfigCache = config
-  connectionConfigCacheMtime = mtime
-
-  return config
+  return snapshot.config
 }
 
 function writeDesktopConnectionConfig(config) {
@@ -9392,166 +9257,12 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
   }
 }
 
-// Build + validate a `{ url, authMode, token }` remote block. OAuth gateways
-// authenticate via the login-window session cookie (verified at connect time in
-// resolveRemoteBackend), so only token-auth remotes require a saved token.
-// `org` (optional) is the Hermes Cloud org slug/id the instance was discovered
-// under — persisted so Settings can reopen into the same org; omitted from the
-// block when empty so plain remote connections stay unchanged.
-function buildRemoteBlock(remoteUrl, authMode, token, org?: string, headers?: object) {
-  if (authMode !== 'oauth' && !decryptDesktopSecret(token)) {
-    throw new Error('Remote gateway session token is required.')
-  }
-
-  const block: { url: string; authMode: string; token: object; headers?: object; org?: string } = {
-    url: normalizeRemoteBaseUrl(remoteUrl),
-    authMode,
-    token
-  }
-
-  const remoteHeaders = normalizeRemoteHeaders(headers)
-
-  if (Object.keys(remoteHeaders).length > 0) {
-    block.headers = remoteHeaders
-  }
-
-  const orgValue = typeof org === 'string' ? org.trim() : ''
-
-  if (orgValue) {
-    block.org = orgValue
-  }
-
-  return block
+function desktopConnectionSecrets() {
+  return { decryptSecret: decryptDesktopSecret, encryptSecret: encryptDesktopSecret }
 }
 
 function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopConnectionConfig(), options: any = {}) {
-  const persistToken = options.persistToken !== false
-  const key = connectionScopeKey(input.profile)
-  // 'cloud' and 'remote' both persist a remote-shaped block; 'cloud' is
-  // remembered as its own provenance (Q6) and resolves to remote downstream.
-  // Anything else collapses to local.
-  const mode = input.mode === 'ssh' ? 'ssh' : modeIsRemoteLike(input.mode) ? input.mode : 'local'
-  const remoteLike = modeIsRemoteLike(mode)
-
-  // The block being edited: a per-profile entry or the global remote block.
-  const rawExistingBlock = key ? existing.profiles?.[key] || {} : existing.remote || {}
-  // Leaving a CLOUD connection unselects it: a cloud block's url/org/token
-  // describe a discovered Hermes Cloud instance, NOT a user-owned remote gateway,
-  // so switching to local or remote must NOT inherit them (otherwise the stale
-  // cloud URL lingers and re-selecting Cloud looks "already connected"). When the
-  // saved block was cloud and the new mode is not cloud, start from an empty
-  // block. (remote↔local toggles still preserve a real remote URL as before.)
-  const existingMode = key ? existing.profiles?.[key]?.mode : existing.mode
-  const leavingCloud = existingMode === 'cloud' && mode !== 'cloud'
-  const leavingSsh = rawExistingBlock.mode === 'ssh' && mode !== 'ssh' && mode !== 'local'
-  const existingBlock = leavingCloud || leavingSsh ? {} : rawExistingBlock
-  const remoteUrl = String(input.remoteUrl ?? existingBlock.url ?? '').trim()
-  // authMode: explicit input wins; otherwise inherit the saved value, default 'token'.
-  const authMode = resolveAuthMode(input.remoteAuthMode, existingBlock.authMode)
-  // Cloud org: only meaningful for 'cloud' mode. Explicit input wins; otherwise
-  // inherit the saved org. A plain 'remote' connection never carries an org
-  // (switching cloud→remote drops it), so it stays unset unless mode is cloud.
-  const cloudOrg = mode === 'cloud' ? String(input.cloudOrg ?? existingBlock.org ?? '').trim() : ''
-  const incomingToken = typeof input.remoteToken === 'string' ? input.remoteToken.trim() : ''
-
-  const remoteHeaders =
-    input.remoteHeaders && typeof input.remoteHeaders === 'object' ? input.remoteHeaders : existingBlock.headers
-
-  // Persist decision lives in hardening.resolvePersistedRemoteToken so the
-  // IPC-propagation seam (allowPlainTextToken → encryptDesktopSecret opt-in) is
-  // covered by a focused regression test. Pass allowPlainText through RAW — the
-  // helper coerces with `=== true`, so a truthy-non-true value never enables
-  // plain-text storage, and that strictness is asserted in exactly one place.
-  const nextToken = resolvePersistedRemoteToken({
-    incomingToken,
-    persistToken,
-    existingToken: existingBlock.token,
-    allowPlainText: input.allowPlainTextToken,
-    encryptSecret: encryptDesktopSecret
-  })
-
-  if (mode === 'ssh') {
-    const sshBlock = buildSshBlock(input, savedProfileSsh(existing, key) || rawExistingBlock)
-
-    if (key) {
-      const profiles = { ...(existing.profiles || {}), [key]: sshBlock }
-
-      return {
-        mode: existing.mode === 'ssh' || modeIsRemoteLike(existing.mode) ? existing.mode : 'local',
-        remote: existing.remote || {},
-        profiles
-      }
-    }
-
-    return { mode: 'ssh', remote: sshBlock, profiles: existing.profiles || {} }
-  }
-
-  if (key) {
-    // Per-profile scope: a remote/cloud entry pins this profile to its own
-    // backend; a local entry clears the override so the profile inherits the
-    // default. The mode tag (remote vs cloud) is preserved on the entry.
-    const profiles = { ...(existing.profiles || {}) }
-
-    if (remoteLike) {
-      profiles[key] = {
-        mode,
-        ...buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteHeaders)
-      }
-    } else {
-      const localEntry = localProfileEntry(rawExistingBlock)
-
-      if (localEntry) {
-        profiles[key] = localEntry
-      } else {
-        delete profiles[key]
-      }
-    }
-
-    return {
-      mode: existing.mode === 'ssh' || modeIsRemoteLike(existing.mode) ? existing.mode : 'local',
-      remote: existing.remote || {},
-      profiles
-    }
-  }
-
-  const nextRemote = remoteLike
-    ? buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteHeaders)
-    : existingMode === 'ssh'
-      ? rawExistingBlock
-      : { url: remoteUrl ? normalizeRemoteBaseUrl(remoteUrl) : remoteUrl, authMode, token: nextToken }
-
-  // Preserve per-profile overrides when saving the global connection.
-  return { mode, remote: nextRemote, profiles: existing.profiles || {} }
-}
-
-// Build an SSH connection block from a save payload, preserving an
-// already-adopted dashboard token from the existing block (the token is minted
-// + reconciled at bootstrap, never user-entered). `mode: 'ssh'` is stamped so
-// normalizeSshConfig/profileSshOverride recognize it.
-function buildSshBlock(input: any, existingBlock: any = {}) {
-  // `??` (not `||`) so an explicit '' (user CLEARED the field) wins over the
-  // saved value; only a truly absent (undefined) field inherits.
-  const merged = normalizeSshConfig({
-    mode: 'ssh',
-    host: input.sshHost ?? existingBlock.host,
-    user: input.sshUser ?? existingBlock.user,
-    port: input.sshPort ?? existingBlock.port,
-    keyPath: input.sshKeyPath ?? existingBlock.keyPath,
-    remoteHermesPath: input.sshRemoteHermesPath ?? existingBlock.remoteHermesPath,
-    remoteProfile: input.sshRemoteProfile ?? existingBlock.remoteProfile
-  })
-
-  if (!merged) {
-    throw new Error('SSH host is required.')
-  }
-
-  // Carry forward an already-adopted dashboard token unless the host changed
-  // (a different host invalidates the old dashboard's token).
-  if (existingBlock.token && existingBlock.host === merged.host) {
-    merged.token = existingBlock.token
-  }
-
-  return merged
+  return coerceDesktopConnectionConfigAtBoundary(input, existing, desktopConnectionSecrets(), options)
 }
 
 // Build a remote backend connection descriptor from an already-resolved remote
@@ -14292,7 +14003,7 @@ function revalidatePool() {
     entries: backendPool.entries(),
     log: rememberLog,
     probe: (connection, path, options) => fetchJsonForBackend(connection, path, options),
-    stopBackend: stopPoolBackend,
+    stopBackend: (poolKey, expected) => poolStopper.stopIfCurrent(poolKey, expected),
     tracker: remoteLiveness
   })
 }
@@ -14328,13 +14039,20 @@ function revalidateSuspectPoolAfterResume() {
       log: rememberLog,
       probe: (connection, path, options) => fetchJsonForBackend(connection, path, options),
       rebuild: poolKey => redialPoolBackendAfterResume(poolKey),
-      retire: async poolKey => {
-        await stopPoolBackend(poolKey)
+      retire: async (poolKey, expected) => {
+        const retired = await poolStopper.stopIfCurrent(poolKey, expected)
+
+        if (!retired) {
+          return false
+        }
+
         // The pool key doubles as the SSH scope for registry SSH backends and
         // resolves through sshScopeKey() for bare-profile remotes; both
         // teardown calls no-op when the scope holds no SSH state.
         await sshBootstrapCoordinator.cancelAndWait(poolKey)
         await teardownSshConnection(poolKey)
+
+        return true
       },
       tracker: remoteLiveness
     })
@@ -14934,156 +14652,80 @@ async function probeSshProfileInventory(connection) {
 }
 
 async function enumerateRegistryAgentSources(registry = readDesktopConnectionsRegistry()) {
-  // One dead source must not wedge the whole roster: ensureRegistryBackend on
-  // an unreachable remote can block up to the 45s readiness timeout, and the
-  // Bot Mode poll runs every 5s — each poll queued behind the dead dial, so
-  // the renderer painted stale rows for the entire outage (and the roster IPC
-  // hung >30s in live repro). Bound each source's enumeration; a timeout is
-  // reported like any other unreachable source and retried on the next poll.
-  const perSourceTimeoutMs = 10_000
+  const enumerations = await enumerateRegistryAgentSourcesObservational({
+    registry,
+    configuredLocalProfiles: configuredLocalProfilesFromConfig(readDesktopConnectionConfig()),
+    localRoute: resolveRegistryLocalRoute('default', {
+      globalRemote: globalRemoteActive(),
+      profileRemoteOverride: Boolean(profileHasRemoteOverride(primaryProfileKey()))
+    }),
+    primaryDescriptorPromise: backendConnectionState.getPromise(),
+    // Exact-key reads only: this seam cannot iterate the pool, touch LRU state,
+    // or create a missing entry.
+    pooledDescriptorPromises: {
+      get: poolKey => backendPool.get(poolKey)?.connectionPromise || null
+    },
+    cachedProfiles: sshRosterCache,
+    probeSshProfiles: connection => probeSshProfileInventory(connection),
+    readDescriptorProfiles: async (descriptor: any, connection) => {
+      const body: any = await getJsonForBackend(descriptor, '/api/profiles', { timeoutMs: 8_000 })
+      const installId = await probeConnectionInstallId(connection.id, descriptor)
 
-  const withEnumerationDeadline = async <T>(work: Promise<T>): Promise<T> => {
-    let timer: ReturnType<typeof setTimeout> | null = null
+      const profiles = Array.isArray(body?.profiles)
+        ? body.profiles.map(profile => String(profile?.name || '').trim()).filter(Boolean)
+        : []
 
-    try {
-      return await Promise.race([
-        work,
-        new Promise<never>((_resolve, reject) => {
-          timer = setTimeout(() => reject(new Error('roster enumeration timed out')), perSourceTimeoutMs)
-        })
-      ])
-    } finally {
-      if (timer !== null) {
-        clearTimeout(timer)
+      const profileMetadata = Array.isArray(body?.profiles)
+        ? Object.fromEntries(
+            body.profiles
+              .map(profile => {
+                const name = String(profile?.name || '').trim()
+
+                if (!name) {
+                  return null
+                }
+
+                const metadata: RosterProfileMetadata = {}
+
+                if (typeof profile?.display_name === 'string' && profile.display_name.trim()) {
+                  metadata.display_name = profile.display_name.trim()
+                }
+
+                if (typeof profile?.title === 'string' && profile.title.trim()) {
+                  metadata.title = profile.title.trim()
+                }
+
+                if (profile?.ui_meta && typeof profile.ui_meta === 'object') {
+                  metadata.ui_meta = profile.ui_meta
+                }
+
+                if (typeof profile?.has_avatar === 'boolean') {
+                  metadata.has_avatar = profile.has_avatar
+                }
+
+                return [name, metadata] as const
+              })
+              .filter((entry): entry is readonly [string, RosterProfileMetadata] => Boolean(entry))
+          )
+        : undefined
+
+      return {
+        profiles,
+        ...(installId ? { installId } : {}),
+        ...(profileMetadata ? { profileMetadata } : {})
       }
+    }
+  })
+
+  // Roster-only cache: preserve accepted transient-outage behavior without
+  // mutating routing, pool ownership, Sessions, API-home, or workspace state.
+  for (const enumeration of enumerations) {
+    if (shouldCacheSshEnumeration(enumeration)) {
+      sshRosterCache.set(enumeration.connection.id, enumeration.profiles)
     }
   }
 
-  return Promise.all(
-    registry.connections.map(async connection => {
-      let raw: {
-        connection: typeof connection
-        error?: string
-        installId?: string
-        profiles: null | string[]
-        profileMetadata?: Record<string, RosterProfileMetadata>
-      }
-
-      try {
-        // SSH roster listing must never spawn a dashboard. A stale
-        // sshConnections key used to fall into ensureRegistryBackend and
-        // respawn Spark/Mini every Bot Mode poll (~5s), then the mux died
-        // (ECONNRESET / liveness probe drop).
-        if (connection.kind === 'ssh') {
-          await probeSshProfileInventory(connection)
-          raw = { connection, profiles: null, error: 'connect-on-demand' }
-        } else {
-          // Same connect-on-demand courtesy for the forced-local path: when
-          // the primary route is remote, enumerating "This device" would
-          // SPAWN a local backend this user has never asked for — a phantom
-          // `default` agent that also forces -device handle disambiguation
-          // onto the real one (remote-gateway-only desktops showed their main
-          // agent twice, Aug 17 2026). Enumerate the local source only when
-          // it is the delegate route (local-primary desktops, unchanged
-          // behavior) or a forced-local child is ALREADY pooled (the user
-          // opened one).
-          if (connection.kind === 'local') {
-            const localRoute = resolveRegistryLocalRoute('default', {
-              globalRemote: globalRemoteActive(),
-              profileRemoteOverride: Boolean(profileHasRemoteOverride(primaryProfileKey()))
-            })
-
-            if (shouldDeferLocalEnumeration(localRoute, backendPool.keys(), connection.id)) {
-              return { connection, profiles: null, error: 'connect-on-demand' }
-            }
-          }
-
-          // Claim-guarded (#90812): this ~5s roster poll can race a renderer's
-          // own reconnect dial for the same connection; coalescing avoids
-          // bootstrapping a second SSH tunnel / remote dashboard.
-          const descriptor: any = await withEnumerationDeadline(
-            Promise.resolve(
-              backendDialClaims.run(backendScopeKey(connection.id, null), () =>
-                ensureRegistryBackend(connection.id, null)
-              )
-            )
-          )
-
-          const body: any = await getJsonForBackend(descriptor, '/api/profiles', { timeoutMs: 8_000 })
-
-          // Cached with a TTL, so the 5s roster poll usually pays zero extra
-          // requests for the backend-identity probe.
-          const installId = await probeConnectionInstallId(connection.id, descriptor)
-
-          const profiles = Array.isArray(body?.profiles)
-            ? body.profiles.map(p => String(p?.name || '').trim()).filter(Boolean)
-            : []
-
-          const profileMetadata = Array.isArray(body?.profiles)
-            ? Object.fromEntries(
-                body.profiles
-                  .map(profile => {
-                    const name = String(profile?.name || '').trim()
-
-                    if (!name) {
-                      return null
-                    }
-
-                    const metadata: RosterProfileMetadata = {}
-
-                    if (typeof profile?.display_name === 'string' && profile.display_name.trim()) {
-                      metadata.display_name = profile.display_name.trim()
-                    }
-
-                    if (typeof profile?.title === 'string' && profile.title.trim()) {
-                      metadata.title = profile.title.trim()
-                    }
-
-                    if (profile?.ui_meta && typeof profile.ui_meta === 'object') {
-                      metadata.ui_meta = profile.ui_meta
-                    }
-
-                    if (typeof profile?.has_avatar === 'boolean') {
-                      metadata.has_avatar = profile.has_avatar
-                    }
-
-                    return [name, metadata] as const
-                  })
-                  .filter((entry): entry is readonly [string, RosterProfileMetadata] => Boolean(entry))
-              )
-            : undefined
-
-          // The root HERMES_HOME is an agent too; enumerations that omit it
-          // (older backends list only named profiles) still get a default row.
-          if (!profiles.includes('default')) {
-            profiles.unshift('default')
-          }
-
-          raw = {
-            connection,
-            profiles,
-            ...(installId ? { installId } : {}),
-            ...(profileMetadata ? { profileMetadata } : {})
-          }
-        }
-      } catch (error: any) {
-        raw = { connection, profiles: null, error: String(error?.message || error) }
-      }
-
-      if (raw.profiles && raw.profiles.length > 0) {
-        sshRosterCache.set(connection.id, raw.profiles)
-      }
-
-      const remembered = rememberSshEnumeration(raw, sshRosterCache.get(connection.id), connection.kind)
-
-      return {
-        connection,
-        ...remembered,
-        ...(raw.installId ? { installId: raw.installId } : {}),
-        ...(raw.profileMetadata ? { profileMetadata: raw.profileMetadata } : {})
-      }
-    })
-  )
+  return enumerations
 }
 
 ipcMain.handle('hermes:agents:roster', async () => {
@@ -15102,7 +14744,7 @@ ipcMain.handle('hermes:agents:roster', async () => {
       connectionId: connection.id,
       label: connection.label,
       kind: connection.kind,
-      reachable: profiles !== null,
+      reachable: profiles !== null && !error,
       ...(installId ? { installId } : {}),
       ...(error ? { error } : {})
     }))
@@ -15420,36 +15062,38 @@ ipcMain.handle('hermes:cloud:agent-sign-in', async (_event, dashboardUrl) => {
 })
 ipcMain.handle('hermes:connection-config:save', async (_event, payload) => {
   assertCanMutateManagedPrimaryRouting()
-  const config = coerceDesktopConnectionConfig(payload)
-  writeDesktopConnectionConfig(config)
+
+  const config = saveDesktopConnectionConfig({
+    input: payload,
+    readConfig: readDesktopConnectionConfig,
+    secrets: desktopConnectionSecrets(),
+    writeConfig: writeDesktopConnectionConfig
+  })
 
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
 ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   assertCanMutateManagedPrimaryRouting()
-  const previousConfig = readDesktopConnectionConfig()
-  const previousRegistry = readDesktopConnectionsRegistry()
-  const config = coerceDesktopConnectionConfig(payload, previousConfig)
 
-  const key = connectionScopeKey(payload?.profile)
-  const scope = key || ''
-  const nextRegistry = key ? previousRegistry : reconcileAppliedGlobalConnection(previousRegistry, config)
-
-  await applyConnectionConfigAtomically({
-    previousConfig,
-    previousRegistry,
-    nextConfig: config,
-    nextRegistry,
+  const config = await applyDesktopConnectionConfig({
+    input: payload,
+    readConfig: readDesktopConnectionConfig,
+    readRegistry: readDesktopConnectionsRegistry,
+    reconcileRegistry: reconcileAppliedGlobalConnection,
+    secrets: desktopConnectionSecrets(),
+    writeConfig: writeDesktopConnectionConfig,
+    writeRegistry: writeDesktopConnectionsRegistry,
     // Exercise the same authenticated REST + real WebSocket legs before either
     // config file changes. A rejected OAuth session or blocked /api/ws leaves
     // the previous primary/current connection intact.
-    preflight: !key && modeIsRemoteLike(config.mode) ? () => testDesktopConnectionConfig(payload) : undefined,
-    writeConfig: writeDesktopConnectionConfig,
-    writeRegistry: writeDesktopConnectionsRegistry,
-    apply: () =>
+    preflight: candidate =>
+      !connectionScopeKey(payload?.profile) && modeIsRemoteLike(candidate.mode)
+        ? testDesktopConnectionConfig(payload)
+        : Promise.resolve(),
+    apply: (candidate, scope) =>
       applyConnectionChange({
         cancelAndWait: value => sshBootstrapCoordinator.cancelAndWait(value),
-        isPrimary: !key || key === primaryProfileKey(),
+        isPrimary: !scope || scope === primaryProfileKey(),
         rehomePrimary: () =>
           rehomePrimaryConnection({
             clearLocalBootstrapFailure: () => {
@@ -15457,7 +15101,7 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
               // the local-install latch so unsupported/failure escape paths can re-home.
               bootstrapFailure = null
             },
-            mode: config.mode,
+            mode: candidate.mode,
             notifyConnectionApplied: sendConnectionApplied,
             resumeFirstRunRemote: abandonFirstRunSetupChoiceForRemoteApply,
             teardownPrimaryBackend: teardownPrimaryBackendAndWait

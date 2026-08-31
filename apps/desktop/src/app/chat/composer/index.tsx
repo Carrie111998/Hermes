@@ -14,6 +14,7 @@ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
 import { useStoresSelector } from '@/lib/use-session-slice'
+import { useWorkspaceSendBlockedState } from '@/lib/use-workspace-send-blocked-state'
 import { cn } from '@/lib/utils'
 import { interceptsTypedVoiceStop } from '@/lib/voice-stop-word'
 import { sessionCompacting } from '@/store/compaction'
@@ -75,6 +76,7 @@ import {
   RICH_INPUT_SLOT
 } from './rich-editor'
 import { useComposerScope } from './scope'
+import { SessionsSwitchStatus } from './sessions-switch-status'
 import { ComposerStatusStack } from './status-stack'
 import { CodingStatusRow } from './status-stack/coding-row'
 import { SuggestionPills } from './suggestion-pills'
@@ -221,6 +223,10 @@ export function ChatBar({
   const { t } = useI18n()
   const gatewayState = useStore($gatewayState)
   const reconnecting = gatewayState === 'closed' || gatewayState === 'error'
+
+  const sendBlockedState = useWorkspaceSendBlockedState(sessionId, queueSessionKey)
+
+  const sendDisabled = disabled || sendBlockedState !== null
   const inputDisabled = disabled && !reconnecting
 
   // The draft engine — detached source of truth (DOM + draftRef + edge
@@ -367,13 +373,12 @@ export function ChatBar({
     busy,
     compacting,
     clearDraft,
-    disabled,
+    disabled: sendDisabled,
     draftRef,
     drainNextQueued,
     editorRef,
     exitQueuedEdit,
     focusInput,
-    inputDisabled,
     loadIntoComposer,
     // The submit engine's only cancel call is the Stop-button branch (busy +
     // empty composer) — an explicit halt, so it parks the queue.
@@ -662,7 +667,7 @@ export function ChatBar({
     if ((event.metaKey || event.ctrlKey) && !event.altKey && event.shiftKey && event.key.toLowerCase() === 'k') {
       event.preventDefault()
 
-      if (!busy) {
+      if (!busy && !sendDisabled) {
         void drainNextQueued()
       }
 
@@ -854,7 +859,7 @@ export function ChatBar({
     if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.shiftKey) {
       event.preventDefault()
 
-      if (busy && !disabled) {
+      if (busy && !sendDisabled) {
         // As with plain Enter, source the just-typed content from the DOM so a
         // fast keypress cannot queue a stale draft.
         const editorText = editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
@@ -882,7 +887,7 @@ export function ChatBar({
       const editorText = editorRef.current ? composerPlainText(editorRef.current) : draftRef.current
       const hasLivePayload = editorText.trim().length > 0 || attachments.length > 0
 
-      if (disabled) {
+      if (sendDisabled) {
         return
       }
 
@@ -976,7 +981,7 @@ export function ChatBar({
   } = useComposerVoice({
     busy,
     clearDraft,
-    disabled,
+    disabled: sendDisabled,
     focusInput,
     insertText,
     maxRecordingSeconds,
@@ -1022,7 +1027,7 @@ export function ChatBar({
         onToggleMute: conversation.toggleMute,
         status: conversation.status
       }}
-      disabled={disabled}
+      disabled={sendDisabled}
       foldVoice={foldVoice}
       hasComposerPayload={hasComposerPayload}
       minimal={minimal}
@@ -1346,6 +1351,7 @@ export function ChatBar({
                   <ContribSlot area={COMPOSER_AREAS.top} />
                   <VoiceActivity state={voiceActivityState} />
                   <VoicePlaybackActivity />
+                  <SessionsSwitchStatus state={sendBlockedState} />
                   {queueEdit && editingQueuedPrompt && (
                     <div className="flex items-center justify-between gap-2 rounded-lg border border-[color-mix(in_srgb,var(--dt-composer-ring)_32%,transparent)] bg-accent/18 px-2 py-1">
                       <div className="min-w-0 text-[0.7rem] text-muted-foreground/88">

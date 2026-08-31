@@ -26,6 +26,7 @@ import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-s
 import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
+import type { WorkspaceSubmitOutcome } from '@/lib/workspace-send-gate'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
 import { $introSplash } from '@/store/intro-splash'
@@ -99,7 +100,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onPickImages: () => void
   onRemoveAttachment: (id: string) => void
   onSteer: (text: string) => Promise<boolean> | boolean
-  onSubmit: (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
+  onSubmit: (text: string, options?: SubmitTextOptions) => Promise<WorkspaceSubmitOutcome> | WorkspaceSubmitOutcome
   onThreadMessagesChange: (messages: readonly ThreadMessage[]) => void
   onEdit: (message: AppendMessage) => Promise<void>
   onReload: (parentId: string | null) => Promise<void>

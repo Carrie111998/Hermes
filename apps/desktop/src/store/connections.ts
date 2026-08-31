@@ -100,6 +100,13 @@ export function _resetConnectionsForTests(): void {
   $pendingConnectionId.set(null)
 }
 
+/** Last explicit profile used on this connection, if any. Never invents one. */
+export function lastProfileForConnection(connectionId: string): string | null {
+  const profile = String($lastProfileByConnection.get()[connectionId] ?? '').trim()
+
+  return profile || null
+}
+
 export function setConnectionsRegistry(registry: DesktopConnectionsRegistry): void {
   $connectionsRegistry.set(registry)
 }

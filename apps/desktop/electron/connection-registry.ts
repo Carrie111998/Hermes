@@ -522,6 +522,86 @@ export function shouldDeferLocalEnumeration(
   return ![...poolKeys].some(key => String(key).startsWith(prefix))
 }
 
+export type RegistryLocalRosterPlan =
+  | { action: 'defer' }
+  | { action: 'enumerate-existing-delegate' }
+  | { action: 'enumerate-existing-pooled'; poolKey: string }
+  | { action: 'seed'; profiles: string[] }
+
+interface RegistryLocalRosterOptions {
+  configuredLocalProfiles: Iterable<string>
+  route: RegistryLocalRoute
+}
+
+/**
+ * Plan local roster polling without touching a backend or routing state.
+ * Persisted exact local identities win even when local owns the primary: a
+ * roster refresh must not broaden them by inventorying every profile under the
+ * primary HERMES_HOME.
+ */
+export function planRegistryLocalRoster({
+  configuredLocalProfiles,
+  route
+}: RegistryLocalRosterOptions): RegistryLocalRosterPlan {
+  const profiles = [
+    ...new Set([...configuredLocalProfiles].filter(profile => PROFILE_NAME_RE.test(String(profile))).map(String))
+  ]
+
+  if (profiles.length > 0) {
+    return { action: 'seed', profiles }
+  }
+
+  if (route.delegate) {
+    return { action: 'enumerate-existing-delegate' }
+  }
+
+  return route.poolKey ? { action: 'enumerate-existing-pooled', poolKey: route.poolKey } : { action: 'defer' }
+}
+
+interface EnumerateRegistryLocalSourceOptions<TDescriptor> extends RegistryLocalRosterOptions {
+  getDelegateDescriptor: () => null | Promise<null | TDescriptor>
+  getPooledDescriptor: (poolKey: string) => null | Promise<null | TDescriptor>
+}
+
+export type RegistryLocalSourceResolution<TDescriptor> =
+  | { action: 'descriptor'; descriptor: TDescriptor }
+  | { action: 'seed'; error: 'connect-on-demand'; profiles: null | string[] }
+
+/**
+ * Resolve only an already-owned descriptor. This boundary deliberately has no
+ * dial/ensure/start callback: production roster polling can inspect the exact
+ * primary descriptor or exact forced-local pool entry, but cannot create or
+ * retarget a backend.
+ */
+export async function enumerateRegistryLocalSource<TDescriptor>({
+  getDelegateDescriptor,
+  getPooledDescriptor,
+  ...options
+}: EnumerateRegistryLocalSourceOptions<TDescriptor>): Promise<RegistryLocalSourceResolution<TDescriptor>> {
+  const plan = planRegistryLocalRoster(options)
+
+  if (plan.action === 'seed') {
+    return { action: 'seed', profiles: plan.profiles, error: 'connect-on-demand' }
+  }
+
+  if (plan.action === 'defer') {
+    return { action: 'seed', profiles: null, error: 'connect-on-demand' }
+  }
+
+  const descriptorPromise =
+    plan.action === 'enumerate-existing-delegate' ? getDelegateDescriptor() : getPooledDescriptor(plan.poolKey)
+
+  if (!descriptorPromise) {
+    return { action: 'seed', profiles: null, error: 'connect-on-demand' }
+  }
+
+  const descriptor = await descriptorPromise
+
+  return descriptor
+    ? { action: 'descriptor', descriptor }
+    : { action: 'seed', profiles: null, error: 'connect-on-demand' }
+}
+
 // ── Union agent roster ──────────────────────────────────────────────────────
 
 export interface ConnectionAgents {
@@ -618,7 +698,15 @@ export function shouldRetrySshInventory(
   return nowMs - lastAttemptMs >= retryAfterMs
 }
 
-const PROFILE_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/
+/** Synthetic connect-on-demand rows make an undialed SSH source clickable but
+ * are not successful inventory. Never promote that default seed into the
+ * success cache or the retry policy will treat it as authoritative forever. */
+export function shouldCacheSshEnumeration(enumeration: Pick<ConnectionAgents, 'error' | 'profiles'>): boolean {
+  return Boolean(enumeration.error !== 'connect-on-demand' && enumeration.profiles && enumeration.profiles.length > 0)
+}
+
+// Keep this aligned with hermes_cli.profiles.validate_profile_name().
+const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 
 /** Turn `ls ~/.hermes/profiles` output into roster names. Always includes
  *  `default`. Drops rollback snapshots and junk lines. */

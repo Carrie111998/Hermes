@@ -1865,6 +1865,14 @@ export const en: Translations = {
       gatewayUnreachable: gateway => `${gateway} · unreachable`,
       onGateway: (name, gateway) => `${name} · ${gateway}`,
       switchTo: (name, gateway) => `Switch to ${name} on ${gateway}`,
+      consequence: 'Sessions moves to this gateway; the open chat stays on its current machine.',
+      switching: (name, gateway) => `Switching Sessions to ${name} on ${gateway}…`,
+      switchFailed: (name, gateway, previous) =>
+        `Could not switch to ${name} on ${gateway}. You’re still on ${previous}. Nothing was sent.`,
+      routeInvalid: gateway => `Can't switch to ${gateway}. The profile route is missing or ambiguous.`,
+      unreachableTuple: (name, gateway) => `${name} · ${gateway} · unreachable`,
+      authRequiredTuple: (name, gateway) => `${name} · ${gateway} · sign-in required`,
+      unsupportedBuild: 'This gateway build cannot switch Sessions from here.',
       deleteOn: gateway => ` on ${gateway}`
     },
     remoteOverride: {
@@ -2368,6 +2376,16 @@ export const en: Translations = {
     steer: 'Steer the current run',
     stop: 'Stop',
     send: 'Send',
+    sessionsSwitchingSendBlocked: "Can't send while Sessions is switching. Your draft is saved.",
+    workspaceAuthRequiredSendBlocked:
+      "Can't send until this workspace is connected and authorized. Your draft is saved.",
+    workspaceRouteInvalidSendBlocked:
+      "Can't send because this chat's workspace route is unavailable. Your draft is saved.",
+    workspaceSwitchFailedSendBlocked:
+      "Can't send because the Sessions switch failed. You're still on the previous workspace, and your draft is saved.",
+    workspaceUnreachableSendBlocked: "Can't send because this workspace is unreachable. Your draft is saved.",
+    workspaceUnsupportedBuildSendBlocked:
+      "Can't send because this workspace needs a compatible Hermes Desktop build. Your draft is saved.",
     speaking: 'Speaking',
     transcribing: 'Transcribing',
     thinking: 'Thinking',

@@ -10,6 +10,9 @@ import {
   getQueuedPrompts,
   parkQueuedPrompts
 } from '@/store/composer-queue'
+import { $pendingConnectionId } from '@/store/connections'
+import { $gatewaySwitching, endGatewaySwitch } from '@/store/gateway-switch'
+import { $notifications, clearNotifications } from '@/store/notifications'
 import { $sessions, setSessions } from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
@@ -46,7 +49,10 @@ function Harness({
   enabled?: boolean
   runtimeMap: MutableRefObject<Map<string, string>>
   selectedStoredSessionId?: string | null
-  submitText: (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
+  submitText: (
+    text: string,
+    options?: SubmitTextOptions
+  ) => Promise<boolean | { ok: false; reason: 'switching' } | { ok: true }> | boolean
 }) {
   useBackgroundQueueDrain({
     enabled,
@@ -71,6 +77,10 @@ describe('useBackgroundQueueDrain', () => {
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
     $sessions.set([])
+    $pendingConnectionId.set(null)
+    endGatewaySwitch()
+    $gatewaySwitching.set(false)
+    clearNotifications()
     clearAllSessionStates()
   })
 
@@ -220,6 +230,79 @@ describe('useBackgroundQueueDrain', () => {
     })
 
     expect(submitText).toHaveBeenCalledTimes(2)
+    expect(getQueuedPrompts('stored-session-a')).toHaveLength(0)
+  })
+
+  it('treats a Sessions-switch block as a deferral across more than four retry intervals', async () => {
+    vi.useFakeTimers()
+
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => false)
+
+    enqueueQueuedPrompt('stored-session-a', { text: 'wait out the switch', attachments: [] })
+    $pendingConnectionId.set('pop-os-hermes')
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750 * 5)
+      await Promise.resolve()
+    })
+
+    expect(submitText).not.toHaveBeenCalled()
+    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+    expect($notifications.get().some(item => item.id.includes('queue-stuck'))).toBe(false)
+
+    $pendingConnectionId.set(null)
+    submitText.mockResolvedValue(true)
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750)
+      await Promise.resolve()
+    })
+
+    expect(submitText).toHaveBeenCalledTimes(1)
+    expect(getQueuedPrompts('stored-session-a')).toHaveLength(0)
+  })
+
+  it('retains a background queue and spends no failure budget when submit returns a switching deferral', async () => {
+    vi.useFakeTimers()
+
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+
+    const submitText = vi.fn(async (): Promise<boolean | { ok: false; reason: 'switching' }> => ({
+      ok: false,
+      reason: 'switching'
+    }))
+
+    enqueueQueuedPrompt('stored-session-a', { text: 'wait out the switch result', attachments: [] })
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750 * 5)
+      await Promise.resolve()
+    })
+
+    expect(submitText.mock.calls.length).toBeGreaterThan(0)
+    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+    expect($notifications.get().some(item => item.id.includes('queue-stuck'))).toBe(false)
+
+    submitText.mockResolvedValue(true)
+    const { $pendingConnectionId } = await import('@/store/connections')
+
+    await act(async () => {
+      $pendingConnectionId.set('pop-os-hermes')
+      await Promise.resolve()
+      $pendingConnectionId.set(null)
+      await vi.advanceTimersByTimeAsync(0)
+      await Promise.resolve()
+    })
+
     expect(getQueuedPrompts('stored-session-a')).toHaveLength(0)
   })
 })

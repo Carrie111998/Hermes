@@ -13,6 +13,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
 import { normalize } from '@/lib/text'
 import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
+import { collectWorkspaceSendInput, evaluateWorkspaceSend, isSubmitAccepted } from '@/lib/workspace-send-gate'
 import { clearClarifyRequest } from '@/store/clarify'
 import {
   $composerAttachments,
@@ -32,14 +33,14 @@ import {
   $currentCwd,
   $messages,
   $terminalBackend,
-  getSessionOwnerHint,
   setActiveSessionId,
   setAwaitingResponse,
   setBusy,
   setMessages,
   setTurnStartedAt
 } from '@/store/session'
-import { $sessionStates, isSessionRemote } from '@/store/session-states'
+import { isSessionOwnerRoute } from '@/store/session-request-router'
+import { $sessionStates, isSessionRemote, knownOwnerForSession } from '@/store/session-states'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
@@ -493,21 +494,34 @@ export function usePromptActions({
   // "session not found".
   const requestForPromptSession = useCallback<GatewayRequest>(
     (method, params = {}, timeoutMs) => {
-      const storedSessionId = selectedStoredSessionIdRef.current
-      const owner = storedSessionId ? getSessionOwnerHint(storedSessionId) : undefined
+      const parameterSessionId = typeof params.session_id === 'string' ? params.session_id : null
+
+      const storedForRuntime = parameterSessionId
+        ? ([...runtimeIdByStoredSessionIdRef.current].find(([, runtimeId]) => runtimeId === parameterSessionId)?.[0] ??
+          null)
+        : null
+
+      const routingSessionId = storedForRuntime || parameterSessionId || selectedStoredSessionIdRef.current
+      const owner = knownOwnerForSession(routingSessionId)
       const ambientConnection = $connection.get()
 
-      const connectionId =
-        owner?.connectionId ||
-        (ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || '' : '')
+      if (isSessionOwnerRoute(owner)) {
+        return requestGatewayForAgent(owner.connectionId, owner.profile || 'default', method, params, timeoutMs)
+      }
 
-      if (connectionId) {
-        return requestGatewayForAgent(connectionId, owner?.profile || 'default', method, params, timeoutMs)
+      // Preserve the established ambient-primary contract for bare profile
+      // owners and legacy rows. Exact queued/tile targets take the route above;
+      // an untagged remote primary still uses its registered connection.
+      const ambientConnectionId =
+        ambientConnection?.mode === 'remote' ? ambientConnection.connectionId?.trim() || '' : ''
+
+      if (ambientConnectionId) {
+        return requestGatewayForAgent(ambientConnectionId, 'default', method, params, timeoutMs)
       }
 
       return timeoutMs === undefined ? requestGateway(method, params) : requestGateway(method, params, timeoutMs)
     },
-    [requestGateway, selectedStoredSessionIdRef]
+    [requestGateway, runtimeIdByStoredSessionIdRef, selectedStoredSessionIdRef]
   )
 
   const submitPromptText = useSubmitPrompt({
@@ -625,7 +639,7 @@ export function usePromptActions({
     resumeStoredSession,
     selectedStoredSessionIdRef,
     startFreshSessionDraft,
-    submitPromptText,
+    submitPromptText: async (...args) => isSubmitAccepted(await submitPromptText(...args)),
     updateSessionState
   })
 
@@ -765,8 +779,20 @@ export function usePromptActions({
       // reaches the live model mid-turn, so a stale target delivers the user's
       // correction into a conversation they are no longer looking at.
       const sessionId = activeSessionIdRef.current
+      const storedSessionId = selectedStoredSessionIdRef.current
 
       if (!text || !sessionId) {
+        return false
+      }
+
+      if (
+        !evaluateWorkspaceSend(
+          collectWorkspaceSendInput({
+            sessionId,
+            storedSessionId
+          })
+        ).allowed
+      ) {
         return false
       }
 
@@ -799,7 +825,10 @@ export function usePromptActions({
           })
 
         try {
-          const result = await requestGateway<SessionRedirectResponse>('session.redirect', { session_id: id, text })
+          const result = await requestForPromptSession<SessionRedirectResponse>('session.redirect', {
+            session_id: id,
+            text
+          })
 
           if (result?.status === 'redirected') {
             triggerHaptic('submit')
@@ -829,8 +858,8 @@ export function usePromptActions({
         // A stale runtime id after reconnect 404s ("session not found"): the
         // shared resolver resumes the stored session and retries once, so a
         // correction right after a reconnect isn't lost to the race.
-        const { result } = await withSessionNotFoundResume(sessionId, selectedStoredSessionIdRef.current, send, {
-          requestGateway,
+        const { result } = await withSessionNotFoundResume(sessionId, storedSessionId, send, {
+          requestGateway: requestForPromptSession,
           onRecovered: recoveredId => {
             activeSessionIdRef.current = recoveredId
             setActiveSessionId(recoveredId)
@@ -844,7 +873,13 @@ export function usePromptActions({
 
       return false
     },
-    [activeSessionIdRef, appendSessionTextMessage, requestGateway, selectedStoredSessionIdRef, updateSessionState]
+    [
+      activeSessionIdRef,
+      appendSessionTextMessage,
+      requestForPromptSession,
+      selectedStoredSessionIdRef,
+      updateSessionState
+    ]
   )
 
   // After a durable rewind the surviving bubbles' cached rowIds are stale (the

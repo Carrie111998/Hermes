@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { DesktopConnectionsRegistry } from '@/global'
 import { $findInPage } from '@/store/find-in-page'
+import { $notifications, clearNotifications } from '@/store/notifications'
 
 import { ConnectionSwitcher } from './connection-switcher'
 
@@ -23,6 +24,7 @@ vi.mock('@/store/connections', () => ({
   $connectionsRegistry: atom<DesktopConnectionsRegistry | null>(null),
   $pendingConnectionId: atom<null | string>(null),
   initializeConnectionsRegistry: vi.fn(async () => null),
+  lastProfileForConnection: vi.fn(() => 'default'),
   refreshConnectionsRegistry: vi.fn(async () => null),
   selectConnection: vi.fn(async () => undefined)
 }))
@@ -51,7 +53,11 @@ vi.mock('@/i18n', () => ({
       profiles: {
         switchConnectionFailed: (name: string) => `Could not connect to ${name}`,
         switchToConnection: (name: string) => `Switch to ${name}`,
-        connectGateway: 'Manage gateways…'
+        connectGateway: 'Manage gateways…',
+        fleet: {
+          routeInvalid: (gateway: string) => `Can't switch to ${gateway}. The profile route is missing or ambiguous.`,
+          unsupportedBuild: 'This gateway build cannot switch Sessions from here.'
+        }
       },
       settings: {
         connections: {
@@ -77,6 +83,7 @@ const $desktopBoot = bootStore.$desktopBoot
 const $pendingConnectionId = connectionStore.$pendingConnectionId
 const initializeConnectionsRegistry = vi.mocked(connectionStore.initializeConnectionsRegistry)
 const refreshConnectionsRegistry = vi.mocked(connectionStore.refreshConnectionsRegistry)
+const lastProfileForConnection = vi.mocked(connectionStore.lastProfileForConnection)
 const selectConnection = vi.mocked(connectionStore.selectConnection)
 const isAuxiliaryWindow = vi.mocked(windowStore.isAuxiliaryWindow)
 const isPeerInstanceWindow = vi.mocked(windowStore.isPeerInstanceWindow)
@@ -114,6 +121,8 @@ afterEach(() => {
   })
   $pendingConnectionId.set(null)
   $findInPage.set({ active: false, query: '', matchOrdinal: 0, matchCount: 0 })
+  clearNotifications()
+  lastProfileForConnection.mockReturnValue('default')
   isAuxiliaryWindow.mockReturnValue(false)
   isPeerInstanceWindow.mockReturnValue(false)
 })
@@ -195,7 +204,7 @@ describe('ConnectionSwitcher', () => {
 
     fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
     fireEvent.click(screen.getByRole('menuitemradio', { name: 'Homelab' }))
-    expect(selectConnection).toHaveBeenCalledWith('homelab')
+    expect(selectConnection).toHaveBeenCalledWith('homelab', { profile: 'default' })
 
     fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
     fireEvent.click(screen.getByRole('menuitem', { name: 'Manage gateways…' }))
@@ -324,7 +333,7 @@ describe('ConnectionSwitcher', () => {
     expect((screen.getByPlaceholderText('Search gateways…') as HTMLInputElement).value).toBe('')
 
     fireEvent.click(screen.getByRole('menuitemradio', { name: 'Studio 10' }))
-    expect(selectConnection).toHaveBeenCalledWith('studio-10')
+    expect(selectConnection).toHaveBeenCalledWith('studio-10', { profile: 'default' })
 
     fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
     expect((screen.getByPlaceholderText('Search gateways…') as HTMLInputElement).value).toBe('')
@@ -413,7 +422,7 @@ describe('ConnectionSwitcher', () => {
 
       fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
       expect(screen.queryByRole('menuitemradio', { name: 'W2Probe' })).toBeNull()
-      fireEvent.keyDown(document, { key: 'Escape' })
+      fireEvent.keyDown(globalThis.document, { key: 'Escape' })
 
       // The save lands in Electron's registry…
       electronRegistry = after
@@ -437,5 +446,18 @@ describe('ConnectionSwitcher', () => {
       refreshConnectionsRegistry.mockResolvedValue(null)
       delete (window as { hermesDesktop?: unknown }).hermesDesktop
     }
+  })
+
+  it('never calls selectConnection without an exact profile tuple', async () => {
+    lastProfileForConnection.mockReturnValue(null)
+    $connectionsRegistry.set(registry([connection('local', 'This device', 'local'), connection('homelab', 'Homelab')]))
+    render(<ConnectionSwitcher onConnect={onConnect} />)
+
+    const trigger = screen.getByRole('button', { name: 'Registered gateways: This device' })
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Homelab' }))
+
+    expect(selectConnection).not.toHaveBeenCalled()
+    expect($notifications.get().some(item => /profile route is missing or ambiguous/.test(item.message))).toBe(true)
   })
 })

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import {
   ensureHealthyPooledRemoteBackendForDispatch,
+  POOLED_REMOTE_DISPATCH_COLD_START_PROBE_TIMEOUT_MS,
   POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS,
   REMOTE_LIVENESS_FAILURE_LIMIT,
   REMOTE_LIVENESS_FAILURE_WINDOW_MS,
@@ -260,43 +261,164 @@ describe('revalidateRemoteConnection', () => {
 })
 
 describe('ensureHealthyPooledRemoteBackendForDispatch', () => {
-  it('retires a dead cached descriptor and gives dispatch the replacement', async () => {
+  type Probe = (
+    connection: { baseUrl: string; mode: string },
+    path: string,
+    options: { timeoutMs: number }
+  ) => Promise<unknown>
+
+  function harness() {
     const stale = { baseUrl: 'http://127.0.0.1:49525', mode: 'remote' }
     const replacement = { baseUrl: 'http://127.0.0.1:53968', mode: 'remote' }
     const stalePromise = Promise.resolve(stale)
-    let currentPromise: Promise<typeof stale> | null = stalePromise
+    const replacementPromise = Promise.resolve(replacement)
+    const current = { promise: stalePromise as Promise<typeof stale> | null }
 
     const retire = vi.fn(async () => {
-      currentPromise = null
+      current.promise = null
     })
 
     const reconnect = vi.fn(async () => {
-      currentPromise = Promise.resolve(replacement)
+      current.promise = replacementPromise
 
       return replacement
     })
 
-    const probe = vi.fn(async connection => {
-      if (connection === stale) {
-        throw new Error('connect ECONNREFUSED 127.0.0.1:49525')
-      }
-    })
-
-    await expect(
+    const run = (probe: Probe) =>
       ensureHealthyPooledRemoteBackendForDispatch({
         connectionPromise: stalePromise,
-        currentConnectionPromise: () => currentPromise,
+        currentConnectionPromise: () => current.promise,
         probe,
         reconnect,
         retire
       })
-    ).resolves.toBe(replacement)
 
-    expect(probe).toHaveBeenCalledWith(stale, '/api/status', {
+    return { current, reconnect, replacement, replacementPromise, retire, run, stale }
+  }
+
+  function transientError(code = 'ECONNREFUSED') {
+    return Object.assign(new Error(`connect ${code} 127.0.0.1:49525`), { code })
+  }
+
+  it('retries the same descriptor after one transient cold-start timeout and keeps it when healthy', async () => {
+    const test = harness()
+
+    const probe = vi
+      .fn<Probe>()
+      .mockRejectedValueOnce(new Error(`Timed out connecting to Hermes backend after 2500ms`))
+      .mockResolvedValueOnce({ ok: true })
+
+    await expect(test.run(probe)).resolves.toBe(test.stale)
+
+    expect(probe).toHaveBeenNthCalledWith(1, test.stale, '/api/status', {
       timeoutMs: POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS
     })
-    expect(retire).toHaveBeenCalledOnce()
-    expect(reconnect).toHaveBeenCalledOnce()
+    expect(probe).toHaveBeenNthCalledWith(2, test.stale, '/api/status', {
+      timeoutMs: POOLED_REMOTE_DISPATCH_COLD_START_PROBE_TIMEOUT_MS
+    })
+    expect(test.retire).not.toHaveBeenCalled()
+    expect(test.reconnect).not.toHaveBeenCalled()
+  })
+
+  it('uses a separate bounded timeout for the one cold-start retry', () => {
+    expect(POOLED_REMOTE_DISPATCH_COLD_START_PROBE_TIMEOUT_MS).toBeGreaterThan(POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS)
+    expect(POOLED_REMOTE_DISPATCH_COLD_START_PROBE_TIMEOUT_MS).toBeLessThanOrEqual(REMOTE_LIVENESS_TIMEOUT_MS)
+  })
+
+  it('retires once and reconnects once after persistent transient probe failure', async () => {
+    const test = harness()
+    const events: string[] = []
+
+    const probe = vi.fn<Probe>(async () => {
+      events.push(`probe-${probe.mock.calls.length}`)
+      throw transientError()
+    })
+
+    test.retire.mockImplementationOnce(async () => {
+      events.push('retire')
+      test.current.promise = null
+    })
+    test.reconnect.mockImplementationOnce(async () => {
+      events.push('reconnect')
+      test.current.promise = test.replacementPromise
+
+      return test.replacement
+    })
+
+    await expect(test.run(probe)).resolves.toBe(test.replacement)
+
+    expect(events).toEqual(['probe-1', 'probe-2', 'retire', 'reconnect'])
+    expect(test.retire).toHaveBeenCalledOnce()
+    expect(test.reconnect).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    Object.assign(new Error('401: unauthorized'), { statusCode: 401 }),
+    new Error('403: forbidden'),
+    new Error('404: socket hang up'),
+    new Error('500: read ECONNRESET'),
+    Object.assign(new Error('socket hang up'), { needsOauthLogin: true }),
+    new Error('Invalid JSON from http://127.0.0.1:49525/api/status (status 200): read ECONNRESET')
+  ])('retires immediately on $message without a cold-start retry', async error => {
+    const test = harness()
+    const probe = vi.fn<Probe>().mockRejectedValue(error)
+
+    await expect(test.run(probe)).resolves.toBe(test.replacement)
+
+    expect(probe).toHaveBeenCalledOnce()
+    expect(test.retire).toHaveBeenCalledOnce()
+    expect(test.retire).toHaveBeenCalledWith(error)
+    expect(test.reconnect).toHaveBeenCalledOnce()
+  })
+
+  it('does not retry or retire the old entry when a replacement wins after the first failure', async () => {
+    const test = harness()
+
+    const probe = vi.fn<Probe>(async () => {
+      test.current.promise = test.replacementPromise
+      throw transientError('ETIMEDOUT')
+    })
+
+    await expect(test.run(probe)).resolves.toBe(test.replacement)
+
+    expect(probe).toHaveBeenCalledOnce()
+    expect(test.retire).not.toHaveBeenCalled()
+    expect(test.reconnect).toHaveBeenCalledOnce()
+  })
+
+  it('returns through reconnect when a replacement wins during a successful retry', async () => {
+    const test = harness()
+
+    const probe = vi
+      .fn<Probe>()
+      .mockRejectedValueOnce(transientError())
+      .mockImplementationOnce(async () => {
+        test.current.promise = test.replacementPromise
+      })
+
+    await expect(test.run(probe)).resolves.toBe(test.replacement)
+
+    expect(probe).toHaveBeenCalledTimes(2)
+    expect(test.retire).not.toHaveBeenCalled()
+    expect(test.reconnect).toHaveBeenCalledOnce()
+  })
+
+  it('does not retire the old entry when a replacement wins during a failed retry', async () => {
+    const test = harness()
+
+    const probe = vi
+      .fn<Probe>()
+      .mockRejectedValueOnce(transientError())
+      .mockImplementationOnce(async () => {
+        test.current.promise = test.replacementPromise
+        throw transientError('ETIMEDOUT')
+      })
+
+    await expect(test.run(probe)).resolves.toBe(test.replacement)
+
+    expect(probe).toHaveBeenCalledTimes(2)
+    expect(test.retire).not.toHaveBeenCalled()
+    expect(test.reconnect).toHaveBeenCalledOnce()
   })
 })
 
@@ -320,7 +442,7 @@ describe('revalidatePooledRemoteBackends', () => {
 
     const unreachable = new Set<string>()
     const log = vi.fn()
-    const stopBackend = vi.fn()
+    const stopBackend = vi.fn(async () => true)
 
     const probe = vi.fn(async (connection: TestRemoteConnection) => {
       if ([...unreachable].some(base => connection.remoteBaseUrl?.startsWith(base))) {
@@ -391,7 +513,10 @@ describe('revalidatePooledRemoteBackends', () => {
     }
 
     await expect(pool.run(tracker)).resolves.toEqual({ dropped: ['coder'] })
-    expect(pool.stopBackend).toHaveBeenCalledWith('coder')
+    expect(pool.stopBackend).toHaveBeenCalledWith(
+      'coder',
+      expect.objectContaining({ remoteBaseUrl: 'https://remote.example.com/' })
+    )
   })
 
   it('clears the streak when the host answers again', async () => {
@@ -430,6 +555,23 @@ describe('revalidatePooledRemoteBackends', () => {
 
     await expect(pool.run(tracker)).resolves.toEqual({ dropped: ['coder'] })
     expect(pool.stopBackend).toHaveBeenCalledTimes(1)
-    expect(pool.stopBackend).toHaveBeenCalledWith('coder')
+    expect(pool.stopBackend).toHaveBeenCalledWith(
+      'coder',
+      expect.objectContaining({ remoteBaseUrl: 'https://dead.example.com' })
+    )
+  })
+
+  it('does not drop a replacement that wins while the stale descriptor is being probed', async () => {
+    const pool = harness([['coder', { process: null, remoteBaseUrl: 'https://dead.example.com' }]])
+    pool.unreachable.add('https://dead.example.com')
+    pool.stopBackend.mockResolvedValue(false)
+    const tracker = new RemoteLivenessTracker(1)
+
+    await expect(pool.run(tracker)).resolves.toEqual({ dropped: [] })
+    expect(pool.stopBackend).toHaveBeenCalledWith(
+      'coder',
+      expect.objectContaining({ remoteBaseUrl: 'https://dead.example.com' })
+    )
+    expect(pool.log).toHaveBeenCalledWith(expect.stringContaining('was replaced during liveness probe'))
   })
 })

@@ -752,6 +752,14 @@ export const $sessionResumeRequest = atom<SessionResumeRequest | null>(null)
 const SESSION_OWNER_HINT_LIMIT = 256
 const SESSION_OWNER_HINTS_KEY = 'hermes.desktop.sessionOwnerHints.v1'
 const sessionOwnerHints = new Map<string, { id: string; route: SessionOwnerRoute }>()
+/** Subscription epoch for consumers whose owner resolution reads the bounded
+ * hint map. The map remains the data owner; this atom only invalidates derived
+ * snapshots when membership changes. */
+export const $sessionOwnerHintsVersion = atom(0)
+
+function publishSessionOwnerHintsChanged(): void {
+  $sessionOwnerHintsVersion.set($sessionOwnerHintsVersion.get() + 1)
+}
 
 function sessionOwnerHintKey(sessionId: string, route: Pick<SessionOwnerRoute, 'connectionId' | 'profile'>): string {
   return JSON.stringify([route.connectionId.trim(), route.profile.trim() || 'default', sessionId])
@@ -840,6 +848,7 @@ hydrateSessionOwnerHints()
 export function setSessionOwnerHint(sessionId: string, route: SessionOwnerRoute): void {
   if (rememberSessionOwnerHint(sessionId, route)) {
     persistSessionOwnerHints()
+    publishSessionOwnerHintsChanged()
   }
 }
 
@@ -864,6 +873,7 @@ export function forgetSessionOwnerHintsForConnection(connectionId: string): void
 
   if (changed) {
     persistSessionOwnerHints()
+    publishSessionOwnerHintsChanged()
   }
 }
 
@@ -909,7 +919,12 @@ export function sessionOwnerRouteFromRow(
 
 /** @internal Tests: forget every in-memory hint (storage untouched unless asked). */
 export function _resetSessionOwnerHintsForTests({ storage = false }: { storage?: boolean } = {}): void {
+  const changed = sessionOwnerHints.size > 0
   sessionOwnerHints.clear()
+
+  if (changed) {
+    publishSessionOwnerHintsChanged()
+  }
 
   if (storage) {
     writeJson(SESSION_OWNER_HINTS_KEY, null)

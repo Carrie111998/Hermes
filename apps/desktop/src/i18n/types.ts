@@ -1584,6 +1584,13 @@ export interface Translations {
       gatewayUnreachable: (gateway: string) => string
       onGateway: (name: string, gateway: string) => string
       switchTo: (name: string, gateway: string) => string
+      consequence: string
+      switching: (name: string, gateway: string) => string
+      switchFailed: (name: string, gateway: string, previous: string) => string
+      routeInvalid: (gateway: string) => string
+      unreachableTuple: (name: string, gateway: string) => string
+      authRequiredTuple: (name: string, gateway: string) => string
+      unsupportedBuild: string
       deleteOn: (gateway: string) => string
     }
     remoteOverride: {
@@ -2015,6 +2022,12 @@ export interface Translations {
     steer: string
     stop: string
     send: string
+    sessionsSwitchingSendBlocked: string
+    workspaceAuthRequiredSendBlocked: string
+    workspaceRouteInvalidSendBlocked: string
+    workspaceSwitchFailedSendBlocked: string
+    workspaceUnreachableSendBlocked: string
+    workspaceUnsupportedBuildSendBlocked: string
     speaking: string
     transcribing: string
     thinking: string

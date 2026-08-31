@@ -29,6 +29,7 @@ import type { ProfileRoute, RosterRow } from './types'
 
 const { hostMock } = vi.hoisted(() => ({
   hostMock: {
+    profileRoutes: vi.fn(),
     request: vi.fn(),
     requestProfile: vi.fn(),
     state: { connectionId: { get: vi.fn(() => 'local') } }
@@ -59,6 +60,7 @@ const hostedRow = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  hostMock.profileRoutes.mockResolvedValue([{ connectionId: 'local', profile: 'default' }])
   hostMock.state.connectionId.get.mockReturnValue('local')
   indexAliasRoutes([])
 })
@@ -272,6 +274,18 @@ describe('requestForBot rides the bot’s own source', () => {
     expect(hostMock.request).not.toHaveBeenCalled()
 
     hostMock.requestProfile = vi.fn()
+  })
+
+  it('fails closed for an unscoped retained bot when several machines are registered', async () => {
+    hostMock.profileRoutes.mockResolvedValue([
+      { connectionId: 'local', profile: 'default' },
+      { connectionId: 'remote-a', profile: 'default' }
+    ])
+
+    await expect(requestForBot({ name: 'legacy-local' }, 'prompt.submit', {})).rejects.toThrow(
+      /Cannot route unscoped bot legacy-local across multiple connections/
+    )
+    expect(hostMock.request).not.toHaveBeenCalled()
   })
 
   it('coerces a JSON-RPC rejection into an Error with a string name (#94471)', async () => {

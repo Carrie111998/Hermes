@@ -17,6 +17,7 @@ import {
   buildAgentRoster,
   connectionDialFieldsChanged,
   connectionIdForLabel,
+  enumerateRegistryLocalSource,
   labelKey,
   labelSlug,
   LOCAL_CONNECTION_ID,
@@ -37,6 +38,7 @@ import {
   setConnectionLaunchMode,
   setLastUsedConnection,
   setPrimaryConnection,
+  shouldCacheSshEnumeration,
   shouldDeferLocalEnumeration,
   shouldRetrySshInventory,
   uniqueLabel,
@@ -725,6 +727,86 @@ test('local enumeration: forced-local route defers until a local child exists (r
   assert.equal(shouldDeferLocalEnumeration(route, ['conn:local::default']), false)
 })
 
+test('local enumeration: delegate route seeds exact persisted identity without dialing or broad inventory', async () => {
+  const route = resolveRegistryLocalRoute('default', {})
+  let delegateDialCount = 0
+  let pooledReadCount = 0
+
+  const resolution = await enumerateRegistryLocalSource({
+    configuredLocalProfiles: ['mac-cockpit'],
+    route,
+    getDelegateDescriptor: async () => {
+      delegateDialCount += 1
+
+      return { port: 9119 }
+    },
+    getPooledDescriptor: () => {
+      pooledReadCount += 1
+
+      return Promise.resolve({ port: 9119 })
+    }
+  })
+
+  assert.deepEqual(resolution, {
+    action: 'seed',
+    error: 'connect-on-demand',
+    profiles: ['mac-cockpit']
+  })
+  assert.equal(delegateDialCount, 0)
+  assert.equal(pooledReadCount, 0)
+})
+
+test('local enumeration: remote primary exposes only explicit local intent without dialing or routing mutation', async () => {
+  const activeRouting = { connectionId: 'pop-os-hermes', profile: 'default', sessionId: 'linux-session' }
+  const beforeRouting = { ...activeRouting }
+  const route = resolveRegistryLocalRoute('default', { globalRemote: true })
+  let localDialCount = 0
+  let pooledReadCount = 0
+
+  const localResolution = await enumerateRegistryLocalSource({
+    configuredLocalProfiles: ['mac-cockpit'],
+    route,
+    getDelegateDescriptor: async () => {
+      localDialCount += 1
+
+      return { port: 9119 }
+    },
+    getPooledDescriptor: () => {
+      pooledReadCount += 1
+
+      return Promise.resolve({ port: 9119 })
+    }
+  })
+
+  assert.equal(localResolution.action, 'seed')
+
+  if (localResolution.action !== 'seed') {
+    throw new Error('explicit local intent must not resolve a backend descriptor')
+  }
+
+  const { action: _action, ...localEnumeration } = localResolution
+
+  const roster = buildAgentRoster([
+    { connection: { id: 'local', kind: 'local', label: 'This device' }, ...localEnumeration },
+    {
+      connection: { id: 'pop-os-hermes', kind: 'remote', label: 'pop-os-hermes', url: 'https://linux.test' },
+      profiles: ['default']
+    }
+  ])
+
+  assert.deepEqual(
+    roster.map(agent => `${agent.connectionId}::${agent.profile}`),
+    ['local::mac-cockpit', 'pop-os-hermes::default']
+  )
+  assert.equal(
+    roster.some(agent => `${agent.connectionId}::${agent.profile}` === 'local::default'),
+    false
+  )
+  assert.equal(localDialCount, 0)
+  assert.equal(pooledReadCount, 0)
+  assert.deepEqual(activeRouting, beforeRouting)
+})
+
 // --- buildAgentRoster (union roster + @name-device rule) ---
 
 test('roster: unique profiles keep bare handles; duplicates get @name-device', () => {
@@ -813,9 +895,16 @@ test('shouldRetrySshInventory: first try, cooldown, then retry; cache never retr
   assert.equal(shouldRetrySshInventory(true, 1_000, 120_000, 60_000), false)
 })
 
+test('synthetic connect-on-demand SSH seeds never become successful inventory cache', () => {
+  assert.equal(shouldCacheSshEnumeration({ error: 'connect-on-demand', profiles: ['default'] }), false)
+  assert.equal(shouldCacheSshEnumeration({ error: 'offline', profiles: ['default'] }), true)
+  assert.equal(shouldCacheSshEnumeration({ profiles: ['default', 'builder'] }), true)
+  assert.equal(shouldCacheSshEnumeration({ error: 'offline', profiles: null }), false)
+})
+
 test('parseRemoteProfileListing: Mini/Spark dirs become roster names and drop rollbacks', () => {
   const listed = parseRemoteProfileListing(
-    ['bob', 'dixie', 'goose', 'rambo', 'bob.rollback-old', '.hidden', '', 'not a name'].join('\n')
+    ['bob', 'dixie', 'goose', 'rambo', 'Capitalized', 'bob.rollback-old', '.hidden', '', 'not a name'].join('\n')
   )
 
   assert.deepEqual(listed, ['default', 'bob', 'dixie', 'goose', 'rambo'])

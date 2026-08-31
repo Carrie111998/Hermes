@@ -922,6 +922,10 @@ function readMain() {
   return fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8').replace(/\r\n/g, '\n')
 }
 
+function readConnectionConfigBoundary() {
+  return fs.readFileSync(path.join(__dirname, 'connection-config-boundary.ts'), 'utf8').replace(/\r\n/g, '\n')
+}
+
 test('registry JSON helpers retain native OAuth bearer authentication', () => {
   const source = readMain()
   const postStart = source.indexOf('async function postJsonForBackend(')
@@ -939,9 +943,9 @@ test('registry JSON helpers retain native OAuth bearer authentication', () => {
 })
 
 test('coerceDesktopConnectionConfig routes token persistence through resolvePersistedRemoteToken', () => {
-  const source = readMain()
-  const fnStart = source.indexOf('function coerceDesktopConnectionConfig(')
-  assert.notEqual(fnStart, -1, 'coerceDesktopConnectionConfig must exist in main.ts')
+  const source = readConnectionConfigBoundary()
+  const fnStart = source.indexOf('export function coerceDesktopConnectionConfig(')
+  assert.notEqual(fnStart, -1, 'coerceDesktopConnectionConfig must exist at the executable boundary')
   const fnEnd = source.indexOf('\nfunction ', fnStart + 1)
   const body = source.slice(fnStart, fnEnd === -1 ? undefined : fnEnd)
 
@@ -962,20 +966,22 @@ test('coerceDesktopConnectionConfig routes token persistence through resolvePers
     /allowPlainText: input\.allowPlainTextToken === true/,
     'the strict coercion must live in the helper, not be duplicated at the call site'
   )
-  assert.match(body, /encryptSecret: encryptDesktopSecret\b/, 'the helper must encrypt via encryptDesktopSecret')
+  assert.match(body, /encryptSecret: secrets\.encryptSecret\b/, 'the helper must use the production secret codec')
 })
 
-test('connection-config save and apply IPC handlers route payloads through coerceDesktopConnectionConfig', () => {
+test('connection-config save and apply IPC handlers route payloads through the executable boundary', () => {
   const source = readMain()
 
-  for (const channel of ['hermes:connection-config:save', 'hermes:connection-config:apply']) {
+  for (const [channel, boundary] of [
+    ['hermes:connection-config:save', 'saveDesktopConnectionConfig'],
+    ['hermes:connection-config:apply', 'applyDesktopConnectionConfig']
+  ]) {
     const handlerStart = source.indexOf(`ipcMain.handle('${channel}'`)
     assert.notEqual(handlerStart, -1, `${channel} handler must exist`)
     const handlerBody = source.slice(handlerStart, handlerStart + 400)
-    assert.match(
-      handlerBody,
-      /coerceDesktopConnectionConfig\(payload(?:, previousConfig)?\)/,
-      `${channel} must coerce its payload (the propagation seam) before persisting`
+    assert.ok(
+      handlerBody.includes(`${boundary}({`) && handlerBody.includes('input: payload'),
+      `${channel} must route its payload through ${boundary}`
     )
   }
 })

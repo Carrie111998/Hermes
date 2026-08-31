@@ -2,6 +2,12 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
+import {
+  isSessionsSwitchInFlight,
+  isSubmitAccepted,
+  isSubmitDeferred,
+  type WorkspaceSubmitResult
+} from '@/lib/workspace-send-gate'
 import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
@@ -12,13 +18,18 @@ import {
   removeQueuedPrompt,
   shouldAutoDrain
 } from '@/store/composer-queue'
+import { $pendingConnectionId } from '@/store/connections'
+import { $gatewaySwitching } from '@/store/gateway-switch'
 import { notify } from '@/store/notifications'
 import { $sessions, idsShareLineage } from '@/store/session'
 import { $workingSessionIds } from '@/store/session-states'
 
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
 
-type SubmitQueuedPrompt = (text: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
+type SubmitQueuedPrompt = (
+  text: string,
+  options?: SubmitTextOptions
+) => Promise<WorkspaceSubmitResult | boolean> | WorkspaceSubmitResult | boolean
 
 interface BackgroundQueueDrainOptions {
   enabled: boolean
@@ -47,6 +58,9 @@ export function useBackgroundQueueDrain({
   const queuedPromptsBySession = useStore($queuedPromptsBySession)
   const parkedQueueSessions = useStore($parkedQueueSessions)
   const workingSessionIds = useStore($workingSessionIds)
+  const pendingConnectionId = useStore($pendingConnectionId)
+  const gatewaySwitching = useStore($gatewaySwitching)
+  const sessionsSwitching = isSessionsSwitchInFlight({ gatewaySwitching, pendingConnectionId })
   const submitTextRef = useRef(submitText)
   const drainingSessionIdsRef = useRef(new Set<string>())
   const drainFailuresRef = useRef(new Map<string, number>())
@@ -91,6 +105,15 @@ export function useBackgroundQueueDrain({
       drainingSessionIdsRef.current.add(sessionKey)
 
       const onFail = () => {
+        if (
+          isSessionsSwitchInFlight({
+            gatewaySwitching: $gatewaySwitching.get(),
+            pendingConnectionId: $pendingConnectionId.get()
+          })
+        ) {
+          return
+        }
+
         const failures = (drainFailuresRef.current.get(entry.id) ?? 0) + 1
         drainFailuresRef.current.set(entry.id, failures)
 
@@ -127,7 +150,11 @@ export function useBackgroundQueueDrain({
             })
           )
 
-          if (accepted === false) {
+          if (isSubmitDeferred(accepted)) {
+            return 'deferred'
+          }
+
+          if (!isSubmitAccepted(accepted)) {
             return false
           }
 
@@ -138,7 +165,7 @@ export function useBackgroundQueueDrain({
           return true
         })
         .then(accepted => {
-          if (!accepted) {
+          if (accepted === false) {
             onFail()
           }
         })
@@ -151,7 +178,7 @@ export function useBackgroundQueueDrain({
   )
 
   useEffect(() => {
-    if (!enabled) {
+    if (!enabled || sessionsSwitching) {
       return
     }
 
@@ -194,6 +221,7 @@ export function useBackgroundQueueDrain({
     queuedPromptsBySession,
     retryTick,
     selectedStoredSessionId,
+    sessionsSwitching,
     workingSessionIds
   ])
 }

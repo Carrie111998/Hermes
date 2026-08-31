@@ -4,6 +4,7 @@ import { type RefObject, useCallback, useEffect, useRef, useState } from 'react'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { useSessionSlice } from '@/lib/use-session-slice'
+import { isSessionsSwitchInFlight, isSubmitAccepted, isSubmitDeferred } from '@/lib/workspace-send-gate'
 import { type ComposerAttachment } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import {
@@ -21,6 +22,8 @@ import {
   unparkQueuedPrompts,
   updateQueuedPrompt
 } from '@/store/composer-queue'
+import { $pendingConnectionId } from '@/store/connections'
+import { $gatewaySwitching } from '@/store/gateway-switch'
 import { notify } from '@/store/notifications'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
@@ -69,6 +72,9 @@ export function useComposerQueue({
 }: UseComposerQueueArgs) {
   const { t } = useI18n()
   const scope = useComposerScope()
+  const pendingConnectionId = useStore($pendingConnectionId)
+  const gatewaySwitching = useStore($gatewaySwitching)
+  const sessionsSwitching = isSessionsSwitchInFlight({ gatewaySwitching, pendingConnectionId })
 
   // Per-session slice (edge): re-renders only when THIS session's queue changes,
   // not on cross-session queue churn (the plain atom's map ref changes on every
@@ -199,7 +205,9 @@ export function useComposerQueue({
   // All queue drain paths share one lock + send-then-remove sequence.
   // `pickEntry` lets each caller choose head, by-id, or skip-edited.
   const runDrain = useCallback(
-    async (pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined): Promise<boolean> => {
+    async (
+      pickEntry: (entries: QueuedPromptEntry[]) => QueuedPromptEntry | undefined
+    ): Promise<boolean | 'deferred'> => {
       if (drainingQueueRef.current || !activeQueueSessionKey) {
         return false
       }
@@ -225,7 +233,11 @@ export function useComposerQueue({
           })
         )
 
-        if (accepted === false) {
+        if (isSubmitDeferred(accepted)) {
+          return 'deferred'
+        }
+
+        if (!isSubmitAccepted(accepted)) {
           return false
         }
 
@@ -331,7 +343,7 @@ export function useComposerQueue({
   // a stale-session 404) can't strand the entry permanently nor spin-loop. The
   // drain lock serializes sends; a remount/reconnect resets the failure counts.
   const autoDrainNext = useCallback(() => {
-    if (busy || queueParked || drainingQueueRef.current || !activeQueueSessionKey) {
+    if (busy || queueParked || drainingQueueRef.current || !activeQueueSessionKey || sessionsSwitching) {
       return
     }
 
@@ -342,6 +354,15 @@ export function useComposerQueue({
     }
 
     const onFail = () => {
+      if (
+        isSessionsSwitchInFlight({
+          gatewaySwitching: $gatewaySwitching.get(),
+          pendingConnectionId: $pendingConnectionId.get()
+        })
+      ) {
+        return
+      }
+
       const fails = (drainFailuresRef.current.get(entry.id) ?? 0) + 1
       drainFailuresRef.current.set(entry.id, fails)
 
@@ -357,12 +378,12 @@ export function useComposerQueue({
 
     void runDrain(() => entry)
       .then(sent => {
-        if (!sent) {
+        if (sent === false) {
           onFail()
         }
       })
       .catch(onFail)
-  }, [activeQueueSessionKey, busy, pickDrainHead, queueParked, queuedPrompts, runDrain, t])
+  }, [activeQueueSessionKey, busy, pickDrainHead, queueParked, queuedPrompts, runDrain, sessionsSwitching, t])
 
   // Re-key on a runtime session-id change. A stable stored id (queueSessionKey)
   // never churns, so a change there is a real session switch and must NOT

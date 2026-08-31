@@ -6,6 +6,7 @@ import { chatMessageText, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
 import { markAssistantIdSpoken, resolveSpokenReply } from '@/lib/spoken-reply'
 import { clearWakeIndicator, syncWakeIndicatorWithVoice } from '@/lib/wake-indicator'
+import { isSubmitAccepted } from '@/lib/workspace-send-gate'
 import { $voiceConversationStartRequest, takeVoiceConversationStart } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import { $gateway } from '@/store/gateway'
@@ -117,14 +118,19 @@ export function useComposerVoice({
   }
 
   const submitVoiceTurn = async (text: string) => {
-    if (busy) {
+    if (busy || disabled) {
+      return
+    }
+
+    const accepted = await onSubmit(text)
+
+    if (!isSubmitAccepted(accepted)) {
       return
     }
 
     triggerHaptic('submit')
     resetBrowseState(sessionId)
     clearDraft()
-    await onSubmit(text)
   }
 
   const wakePausedRef = useRef(false)
@@ -156,6 +162,18 @@ export function useComposerVoice({
     // to finish releasing the capture device (see wakePauseBarrierRef).
     beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
   })
+
+  // A live hands-free loop belongs to the workspace where it started. End it
+  // as soon as a Sessions switch/readiness barrier closes so a later utterance
+  // cannot create a fresh chat on the destination gateway.
+  useEffect(() => {
+    if (!disabled || !voiceConversationActive) {
+      return
+    }
+
+    setVoiceConversationActive(false)
+    void conversation.end()
+  }, [conversation, disabled, voiceConversationActive])
 
   // eslint-disable-next-line no-restricted-syntax -- ownership token used only by unmount cleanup
   useEffect(() => {
@@ -267,7 +285,13 @@ export function useComposerVoice({
 
   // Explicit start/end for the on-screen conversation controls (the hotkey uses
   // the gated toggle above).
-  const startConversation = useCallback(() => setVoiceConversationActive(true), [])
+  const startConversation = useCallback(() => {
+    if (disabled) {
+      return
+    }
+
+    setVoiceConversationActive(true)
+  }, [disabled])
 
   const endConversation = useCallback(() => {
     setVoiceConversationActive(false)
