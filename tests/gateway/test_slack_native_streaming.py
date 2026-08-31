@@ -18,11 +18,13 @@ Behaviour contract:
   * disconnect(): dangling streams sealed.
 """
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 from plugins.platforms.slack.adapter import SlackAdapter
 
 
@@ -228,3 +230,52 @@ class TestDisconnectCleanup:
         await adapter.disconnect()
         client.chat_stopStream.assert_awaited()
         assert not adapter._active_streams
+
+
+class TestStreamIsTheMessage:
+    """Slack's native stream IS the final message (unlike Telegram drafts).
+
+    Without this flag the stream consumer treats Slack like Telegram: it
+    bumps draft_id at every tool boundary (sealing one stream and opening
+    another) and later posts a real chat.postMessage. Users see the
+    streamed reply, then a second copy with mrkdwn auto-links.
+    """
+
+    def test_adapter_declares_draft_stream_is_message(self):
+        adapter, _ = _make_adapter()
+        assert SlackAdapter.draft_stream_is_message is True
+        assert adapter.draft_stream_is_message is True
+        consumer = GatewayStreamConsumer(
+            adapter, "D1", StreamConsumerConfig(chat_type="channel"),
+        )
+        assert consumer._stream_is_message() is True
+
+    @pytest.mark.asyncio
+    async def test_tool_boundary_does_not_post_duplicate_final(self):
+        adapter, client = _make_adapter()
+        cfg = StreamConsumerConfig(
+            transport="auto",
+            chat_type="channel",
+            edit_interval=0.01,
+            buffer_threshold=1,
+            cursor="",
+        )
+        consumer = GatewayStreamConsumer(
+            adapter, "C1", cfg, metadata=META,
+        )
+
+        task = asyncio.create_task(consumer.run())
+        consumer.on_delta("This looks like a briefing.")
+        await asyncio.sleep(0.05)
+        consumer.on_segment_break()
+        await asyncio.sleep(0.05)
+        consumer.on_delta(" Adam — use something.cdr.xyz")
+        await asyncio.sleep(0.05)
+        consumer.finish()
+        await asyncio.wait_for(task, timeout=5.0)
+
+        assert client.chat_startStream.await_count == 1
+        client.chat_stopStream.assert_awaited()
+        client.chat_postMessage.assert_not_awaited()
+        # Stream is sealed, so _active_streams is empty — one start, one stop.
+        assert "C1" not in adapter._active_streams
