@@ -985,11 +985,11 @@ DANGEROUS_PATTERNS = [
     # Each pattern requires the destructive flag/verb so benign usage
     # (`taskkill /IM app.exe` graceful kill, `reg query`, `icacls file`)
     # does NOT prompt.
-    # Bare PowerShell destructive delete: Remove-Item/ri with -Recurse or
-    # -Force. The cmd/powershell-prefixed forms are covered above; this
+    # Bare PowerShell destructive delete: Remove-Item and its built-in aliases
+    # with -Recurse or -Force. The cmd/powershell-prefixed forms are covered above; this
     # catches the bare form (ACP clients, pwsh-default SSH hosts, or
     # `powershell` invoked earlier in a compound command).
-    (r'\bremove-item\b[^\n;|&]*\s-(?:recurse|force)\b', "PowerShell destructive delete (Remove-Item)"),
+    (r'\b(?:remove-item|ri|rm|del|erase|rd|rmdir)\b[^\n;|&]*\s-(?:r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?|fo(?:r(?:c(?:e)?)?)?)\b', "PowerShell destructive delete (Remove-Item/alias)"),
     # cmd builtins with destructive switches, bare form: del/erase/rd/rmdir
     # with /s (recurse) or /q (quiet). Requires the switch so `del file.txt`
     # inside a cmd /c string stays covered by the prefixed rule only.
@@ -997,9 +997,14 @@ DANGEROUS_PATTERNS = [
     # Remote content piped to Invoke-Expression — PowerShell's `curl | sh`.
     (r'\b(?:iwr|invoke-webrequest|invoke-restmethod|irm|curl|wget)\b[^\n]*\|\s*(?:iex|invoke-expression)\b', "pipe remote content to PowerShell (iwr | iex)"),
     (r'\b(?:iex|invoke-expression)\s*\(\s*(?:iwr|invoke-webrequest|invoke-restmethod|irm)\b', "execute remote content via Invoke-Expression"),
+    # Self-termination via kill + command substitution (pgrep/pidof). Keep
+    # these structural rules ahead of the generic PowerShell `kill -Force`
+    # alias rule so POSIX commands retain their specific finding.
+    (r'\bkill\b.*\$\(\s*(pgrep|pidof)\b', "kill process via pgrep/pidof expansion (self-termination)"),
+    (r'\bkill\b.*`\s*(pgrep|pidof)\b', "kill process via backtick pgrep/pidof expansion (self-termination)"),
     # Force process kills — Windows analogue of pkill -9.
     (r'\btaskkill\b[^\n]*\s/f\b', "force kill processes (taskkill /F)"),
-    (r'\bstop-process\b[^\n]*\s-force\b', "force kill processes (Stop-Process -Force)"),
+    (r'\b(?:stop-pro(?:c(?:e(?:s(?:s)?)?)?)?|kill|spps)\b[^\n]*\s-f(?:o(?:r(?:c(?:e)?)?)?)?\b', "force kill processes (Stop-Process/alias -Force)"),
     # Volume/disk destruction — Windows analogue of mkfs / dd.
     (r'\bformat-volume\b', "format filesystem (Format-Volume)"),
     (r'\bclear-disk\b', "wipe disk (Clear-Disk)"),
@@ -1018,7 +1023,7 @@ DANGEROUS_PATTERNS = [
     (r'\breg(?:\.exe)?\s+delete\b', "registry delete (reg delete)"),
     (r'\bremove-itemproperty\b[^\n]*\s-force\b', "registry value delete (Remove-ItemProperty -Force)"),
     # Windows service/system stop — analogue of systemctl stop.
-    (r'\bstop-service\b[^\n]*\s-force\b', "force stop service (Stop-Service -Force)"),
+    (r'\bstop-ser(?:v(?:i(?:c(?:e)?)?)?)?\b[^\n]*\s-f(?:o(?:r(?:c(?:e)?)?)?)?\b', "force stop service (Stop-Service -Force)"),
     (r'\bsc(?:\.exe)?\s+(?:stop|delete)\b', "stop/delete service (sc)"),
     # Credential/key paths in Windows form — the POSIX ~/.ssh patterns never
     # match drive-letter or backslash spellings. Match both separators.
@@ -1137,14 +1142,6 @@ DANGEROUS_PATTERNS = [
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     # Self-termination protection: prevent agent from killing its own process
     (r'\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b', "kill hermes/gateway process (self-termination)"),
-    # Self-termination via kill + command substitution (pgrep/pidof).
-    # The name-based pattern above catches `pkill hermes` but not
-    # `kill -9 $(pgrep -f hermes)` because the substitution is opaque
-    # to regex at detection time. Catch the structural pattern instead.
-    # `pidof` is the BSD/Linux alternative to `pgrep` and is equally
-    # opaque, so include it in the same alternation.
-    (r'\bkill\b.*\$\(\s*(pgrep|pidof)\b', "kill process via pgrep/pidof expansion (self-termination)"),
-    (r'\bkill\b.*`\s*(pgrep|pidof)\b', "kill process via backtick pgrep/pidof expansion (self-termination)"),
     # launchctl-driven gateway stop/restart on macOS. The agent can bypass
     # the `hermes gateway stop|restart` pattern above by driving launchd
     # directly against the service label (commonly `ai.hermes.gateway`).
