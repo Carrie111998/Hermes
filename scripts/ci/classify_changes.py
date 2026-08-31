@@ -62,9 +62,9 @@ import sys
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
-_DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile") # docker setup
-_NIX_PATHS = ("nix/",) # nix files
-_NIX_FILES = {"flake.nix", "flake.lock"} # base nix files
+_DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile")  # docker setup
+_NIX_PATHS = ("nix/",)  # nix files
+_NIX_FILES = {"flake.nix", "flake.lock"}  # base nix files
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
 # Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
 _PY_SKIP = ("docs/", "website/") + _FRONTEND
@@ -97,6 +97,17 @@ _CI_REVIEW_FILES = {
 }
 _CI_REVIEW_PATHS = (".github/workflows/", ".github/actions/")
 
+# Flatpak/Snapcraft packaging: changes here trigger their dedicated build lanes.
+_FLATPAK_PATHS = (
+    "apps/desktop/flatpak/",
+    "apps/desktop/scripts/stage-flatpak.mjs",
+    "hermes_cli/flatpak_desktop.py",
+)
+_SNAPCRAFT_PATHS = (
+    "apps/desktop/snap/",
+    "apps/desktop/scripts/stage-snap.mjs",
+)
+
 # Supply-chain scan: files that can execute code at install/import time.
 _SCAN_EXTS = (".py", ".pth")
 _SCAN_FILES = {"setup.cfg", "pyproject.toml"}
@@ -117,10 +128,13 @@ _INSTALLER_FILES = {"scripts/install.ps1", "scripts/install.cmd"}
 _RUST_PATHS = ("apps/bootstrap-installer/src-tauri/",)
 _RUST_FILENAMES = {"Cargo.toml", "Cargo.lock"}
 
+
 def _is_docs(p: str) -> bool:
     if p.startswith(("skills/", "optional-skills/")):
         return False
-    return p.endswith((".md", ".mdx")) or p.startswith("docs/") or p.startswith("LICENSE")
+    return (
+        p.endswith((".md", ".mdx")) or p.startswith("docs/") or p.startswith("LICENSE")
+    )
 
 
 def _is_nix(p: str) -> bool:
@@ -193,7 +207,7 @@ def classify(files: list[str]) -> dict[str, bool]:
     deps = any(f == "pyproject.toml" for f in files)
     npm_lock = any(f.split("/")[-1] == "package-lock.json" for f in files)
     docker_meta = any(f.startswith(_DOCKER_META) for f in files)
-    
+
     ret = {
         "python": python,
         "python_prod": python_prod,
@@ -209,7 +223,9 @@ def classify(files: list[str]) -> dict[str, bool]:
         "rust": any(_is_rust(f) for f in files),
         "mcp_catalog": any(_is_mcp_catalog(f) for f in files),
         "ci_review": any(_is_ci_review(f) for f in files),
-        "nix": python_prod or frontend or any(_is_nix(f) for f in files)
+        "flatpak": any(f.startswith(_FLATPAK_PATHS) for f in files),
+        "snapcraft": any(f.startswith(_SNAPCRAFT_PATHS) for f in files),
+        "nix": python_prod or frontend or any(_is_nix(f) for f in files),
     }
     if not files or any(f.startswith(".github/") for f in files):
         ret["python"] = True
