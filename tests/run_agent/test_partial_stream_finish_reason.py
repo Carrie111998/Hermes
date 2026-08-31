@@ -269,6 +269,61 @@ class TestMixedToolCallsOneDroppedOneComplete:
         )
 
 
+# ── Merged finish_reason vs. the SSE passthrough guard (#94614) ────────────
+
+class TestMergedFinishReasonSurvivesSSEGuard:
+    """A provider may deliver ``finish_reason`` on the SAME chunk that carries
+    the last content, instead of in a separate ``"delta":{}`` marker chunk.
+    vLLM does this for most responses.
+
+    If that chunk also starts with ``:`` inside the final line — ordinary
+    prose such as ``"... In short: it turns raw logs into data"`` — the SSE
+    passthrough guard buffers it and ``continue``s, and the guard stays
+    engaged because the closing newline never arrives.  The harvest of
+    ``finish_reason`` must therefore not sit behind that ``continue``:
+    otherwise a COMPLETE turn ends with ``finish_reason=None`` and
+    ``_text_only_dropped_no_finish`` misclassifies it as a mid-stream drop.
+    The resulting continuation asks the model to finish an already-finished
+    text, so it restates its closing line and the answer ships duplicated.
+    """
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_merged_finish_reason_is_not_swallowed_by_sse_guard(
+        self, _mock_close, mock_create, monkeypatch,
+    ):
+        def _stream():
+            yield _make_stream_chunk(content="A log parser reads log files.")
+            yield _make_stream_chunk(content=" In short")
+            # ':' opens what the guard reads as an SSE comment. No newline
+            # follows, so the guard stays engaged until the stream ends.
+            yield _make_stream_chunk(content=": it")
+            yield _make_stream_chunk(
+                content=" turns raw logs into usable data.",
+                finish_reason="stop",
+            )
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = lambda *a, **kw: _stream()
+        mock_create.return_value = mock_client
+
+        agent = _make_agent()
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.id != PARTIAL_STREAM_STUB_ID, (
+            "A stream that DID deliver finish_reason must not be classified "
+            "as a mid-stream drop merely because the SSE guard buffered the "
+            "chunk carrying it (#94614)."
+        )
+        assert response.choices[0].finish_reason == "stop"
+        assert response.choices[0].message.content == (
+            "A log parser reads log files. In short"
+            ": it turns raw logs into usable data."
+        )
+        assert response.choices[0].message.tool_calls is None
+
+
 # ── Length-continuation prompt branching ──────────────────────────────────
 
 class TestLengthContinuationPromptBranching:

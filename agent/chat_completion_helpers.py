@@ -4252,6 +4252,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 continue
 
             delta = chunk.choices[0].delta
+
+            # Harvest the terminal metadata BEFORE any `continue` in this loop
+            # body.  It used to sit at the very end, which meant the SSE
+            # passthrough guard below (which buffers content that looks like an
+            # SSE frame and `continue`s) swallowed the finish_reason of the very
+            # chunk carrying it.  Providers that merge the marker into the last
+            # content chunk — vLLM does — then reached the end of the stream
+            # with finish_reason=None after delivering text, which
+            # `_text_only_dropped_no_finish` classifies as a mid-stream drop.
+            # The completed turn was retried as if the connection had died.
+            # Neither branch reads finish_reason, so harvesting early is
+            # order-independent.
+            chunk_finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+            if chunk_finish_reason:
+                finish_reason = chunk_finish_reason
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage_obj = chunk.usage
+
             if hasattr(chunk, "model") and chunk.model:
                 model_name = chunk.model
 
@@ -4389,14 +4407,6 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # at line ~6107 return `tool_calls=None`, silently
                         # discarding the attempted action.
                         result["partial_tool_names"].append(name)
-
-            chunk_finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-            if chunk_finish_reason:
-                finish_reason = chunk_finish_reason
-
-            # Usage in the final chunk
-            if hasattr(chunk, "usage") and chunk.usage:
-                usage_obj = chunk.usage
 
         _close_managed_stream()
 
