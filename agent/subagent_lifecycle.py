@@ -22,7 +22,11 @@ from concurrent.futures import Future, TimeoutError
 from typing import Any, Callable, Mapping, Optional
 
 from agent.interrupt_compat import request_hard_interrupt
-from agent.worker_contract import JobContract, WorkerConstitution
+from agent.worker_contract import (
+    JobContract,
+    WorkforceGovernance,
+    WorkerConstitution,
+)
 
 PUBLIC_CONTRACT_VERSION = 1
 _MAX_GOAL_CHARS = 16_000
@@ -70,6 +74,7 @@ class SubagentLaunchRequest:
     timeout_seconds: Optional[float] = None
     constitution: Optional[WorkerConstitution] = None
     job_contract: Optional[JobContract] = None
+    governance: Optional[WorkforceGovernance] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,6 +92,7 @@ class SubagentHandle:
     worker_profile: Optional[str] = None
     constitution: Optional[WorkerConstitution] = None
     job_contract: Optional[JobContract] = None
+    governance: Optional[WorkforceGovernance] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +113,9 @@ class SubagentHandle:
             "job_contract": (
                 self.job_contract.to_dict() if self.job_contract is not None else None
             ),
+            "governance": (
+                self.governance.to_dict() if self.governance is not None else None
+            ),
         }
 
     @classmethod
@@ -121,7 +130,9 @@ class SubagentHandle:
                     authority=constitution["authority"],
                     forbidden_actions=tuple(constitution.get("forbidden_actions", ())),
                     required_evidence=tuple(constitution.get("required_evidence", ())),
-                    escalation_path=constitution.get("escalation_path", "operator-review"),
+                    escalation_path=constitution.get(
+                        "escalation_path", "operator-review"
+                    ),
                 )
                 constitution.validate()
             job_contract = data.get("job_contract")
@@ -138,8 +149,12 @@ class SubagentHandle:
                     requires_review=job_contract.get("requires_review", True),
                 )
                 job_contract.validate()
+            governance = data.get("governance")
+            if governance is not None:
+                governance = WorkforceGovernance.from_dict(governance)
             data["constitution"] = constitution
             data["job_contract"] = job_contract
+            data["governance"] = governance
             return cls(**data)
         except (KeyError, TypeError, ValueError) as exc:
             raise SubagentLifecycleError("Malformed subagent handle.") from exc
@@ -299,6 +314,7 @@ class SubagentLifecycleService:
             raise SubagentLifecycleError("Hermes failed to assign a child identity.")
         child._worker_constitution = request.constitution
         child._job_contract = request.job_contract
+        child._workforce_governance = request.governance
         created = time.time()
         handle = SubagentHandle(
             PUBLIC_CONTRACT_VERSION,
@@ -320,6 +336,7 @@ class SubagentLifecycleService:
             ),
             request.constitution,
             request.job_contract,
+            request.governance,
         )
         record = _Record(handle, SubagentState.PENDING, created, agent=child)
         with _REGISTRY.lock:
@@ -332,7 +349,11 @@ class SubagentLifecycleService:
     @staticmethod
     def _workforce_context(request: SubagentLaunchRequest) -> Optional[str]:
         """Add validated assignment rules to the child-facing task context."""
-        if request.constitution is None and request.job_contract is None:
+        if (
+            request.constitution is None
+            and request.job_contract is None
+            and request.governance is None
+        ):
             return request.context
 
         assignment: dict[str, Any] = {}
@@ -340,6 +361,8 @@ class SubagentLifecycleService:
             assignment["constitution"] = request.constitution.to_dict()
         if request.job_contract is not None:
             assignment["job_contract"] = request.job_contract.to_dict()
+        if request.governance is not None:
+            assignment["governance"] = request.governance.to_dict()
         rendered = json.dumps(assignment, sort_keys=True)
         block = (
             "GOVERNED WORKFORCE ASSIGNMENT:\n"
@@ -612,7 +635,9 @@ class SubagentLifecycleService:
             )
         if request.constitution is not None:
             if not isinstance(request.constitution, WorkerConstitution):
-                raise SubagentLifecycleError("constitution must be a WorkerConstitution.")
+                raise SubagentLifecycleError(
+                    "constitution must be a WorkerConstitution."
+                )
             try:
                 request.constitution.validate()
             except ValueError as exc:
@@ -623,9 +648,20 @@ class SubagentLifecycleService:
             try:
                 request.job_contract.validate()
                 if not request.job_contract.is_active():
-                    raise SubagentLifecycleError("job_contract must be active at launch.")
+                    raise SubagentLifecycleError(
+                        "job_contract must be active at launch."
+                    )
             except SubagentLifecycleError:
                 raise
+            except ValueError as exc:
+                raise SubagentLifecycleError(str(exc)) from exc
+        if request.governance is not None:
+            if not isinstance(request.governance, WorkforceGovernance):
+                raise SubagentLifecycleError(
+                    "governance must be a WorkforceGovernance."
+                )
+            try:
+                request.governance.validate()
             except ValueError as exc:
                 raise SubagentLifecycleError(str(exc)) from exc
         if (
