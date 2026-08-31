@@ -453,7 +453,6 @@ status:
   auto_reconnect: ; automatikus újracsatlakozás {seconds} mp múlva
   waiting_no_response: '⏳ Várakozás: {model} — {seconds} mp, még nincs válasz (a szolgáltató lassú vagy túlterhelt lehet{recovery})'
   waiting_no_output: '⏳ Várakozás: {model} — {seconds} mp, még nincs kimenet (a szolgáltató lassú vagy túlterhelt lehet, vagy a modell gondolkodik{recovery})'
-  queued: ⏳ Sorban a következő körre{detail}. Válaszolok, amint az aktuális feladat befejeződik.
   draining_new_work: ⏳ A Gateway {action} alatt áll, és jelenleg nem fogad új munkát.
   draining_another_turn: ⏳ A Gateway {action} alatt áll, és jelenleg nem fogad újabb kört.
   queued_after_return: ⏳ Gateway {action} alatt — sorban a következő körre, amint visszatér.

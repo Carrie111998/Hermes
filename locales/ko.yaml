@@ -453,7 +453,6 @@ status:
   auto_reconnect: ; {seconds}초 후 자동 재연결
   waiting_no_response: ⏳ {model} 대기 중 — {seconds}초 동안 응답 없음 (프로바이더가 느리거나 과부하 상태일 수 있음{recovery})
   waiting_no_output: ⏳ {model} 대기 중 — {seconds}초 동안 출력 없음 (프로바이더가 느리거나 과부하이거나 모델이 생각 중일 수 있음{recovery})
-  queued: ⏳ 다음 턴에 대기열 등록됨{detail}. 현재 작업이 끝나면 응답하겠습니다.
   draining_new_work: ⏳ 게이트웨이가 {action} 중이라 지금은 새 작업을 받지 않습니다.
   draining_another_turn: ⏳ 게이트웨이가 {action} 중이라 지금은 추가 턴을 받지 않습니다.
   queued_after_return: ⏳ 게이트웨이 {action} — 복귀 후 다음 턴에 대기열 등록됨.

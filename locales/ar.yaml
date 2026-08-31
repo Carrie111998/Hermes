@@ -455,7 +455,6 @@ status:
   auto_reconnect: ؛ إعادة اتصال تلقائية عند {seconds} ث
   waiting_no_response: ⏳ في انتظار {model} — {seconds} ث دون رد حتى الآن (قد يكون المزوّد بطيئًا أو مثقلًا{recovery})
   waiting_no_output: ⏳ في انتظار {model} — {seconds} ث دون مخرجات حتى الآن (قد يكون المزوّد بطيئًا أو مثقلًا، أو ربما النموذج يفكر{recovery})
-  queued: ⏳ في قائمة الانتظار للدور التالي{detail}. سأرد بمجرد انتهاء المهمة الحالية.
   draining_new_work: ⏳ البوابة قيد {action} ولا تقبل عملًا جديدًا الآن.
   draining_another_turn: ⏳ البوابة قيد {action} ولا تقبل دورًا آخر الآن.
   queued_after_return: ⏳ البوابة قيد {action} — في قائمة الانتظار للدور التالي بعد عودتها.

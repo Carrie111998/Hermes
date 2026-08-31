@@ -453,7 +453,6 @@ status:
   auto_reconnect: ; automatische Wiederverbindung nach {seconds}s
   waiting_no_response: ⏳ warte auf {model} — seit {seconds}s keine Antwort (der Anbieter ist möglicherweise langsam oder überlastet{recovery})
   waiting_no_output: ⏳ warte auf {model} — seit {seconds}s keine Ausgabe (der Anbieter ist möglicherweise langsam oder überlastet, oder das Modell denkt nach{recovery})
-  queued: ⏳ Für die nächste Runde in der Warteschlange{detail}. Ich antworte, sobald die aktuelle Aufgabe abgeschlossen ist.
   draining_new_work: ⏳ Gateway wird {action} und nimmt derzeit keine neue Arbeit an.
   draining_another_turn: ⏳ Gateway wird {action} und nimmt derzeit keine weitere Runde an.
   queued_after_return: ⏳ Gateway wird {action} — in der Warteschlange für die nächste Runde, sobald es zurück ist.

@@ -453,7 +453,6 @@ status:
   auto_reconnect: ; 將於 {seconds} 秒後自動重新連線
   waiting_no_response: ⏳ 正在等待 {model} — {seconds} 秒尚無回應（提供者可能緩慢或過載{recovery}）
   waiting_no_output: ⏳ 正在等待 {model} — {seconds} 秒尚無輸出（提供者可能緩慢或過載，或模型正在思考{recovery}）
-  queued: ⏳ 已排入下一回合佇列{detail}。目前任務完成後會回覆。
   draining_new_work: ⏳ 閘道正在{action}，目前不接受新的工作。
   draining_another_turn: ⏳ 閘道正在{action}，目前不接受其他回合。
   queued_after_return: ⏳ 閘道正在{action} — 已排入其恢復後的下一回合。

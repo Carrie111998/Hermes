@@ -453,7 +453,6 @@ status:
   auto_reconnect: ; {seconds} sn sonra otomatik yeniden bağlan
   waiting_no_response: ⏳ {model} bekleniyor — {seconds} sn, henüz yanıt yok (sağlayıcı yavaş veya aşırı yüklü olabilir{recovery})
   waiting_no_output: ⏳ {model} bekleniyor — {seconds} sn, henüz çıktı yok (sağlayıcı yavaş veya aşırı yüklü olabilir ya da model düşünüyor{recovery})
-  queued: ⏳ Bir sonraki tur için kuyrukta{detail}. Geçerli görev bitince yanıtlayacağım.
   draining_new_work: ⏳ Gateway {action} ve şu anda yeni iş kabul etmiyor.
   draining_another_turn: ⏳ Gateway {action} ve şu anda başka bir tur kabul etmiyor.
   queued_after_return: ⏳ Gateway {action} — geri döndükten sonraki tur için kuyrukta.

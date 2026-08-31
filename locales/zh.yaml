@@ -6,7 +6,6 @@ status:
   auto_reconnect: "；将在{seconds}秒时自动重连"
   waiting_no_response: "⏳ 正在等待 {model} — 已等待{seconds}秒仍无响应（模型服务可能较慢或繁忙{recovery}）"
   waiting_no_output: "⏳ 正在等待 {model} — 已等待{seconds}秒仍无输出（模型服务可能较慢或繁忙，也可能仍在思考{recovery}）"
-  queued: "⏳ 已排队，下一轮处理{detail}。当前任务完成后我就回复你。"
   draining_new_work: "⏳ 网关{action}，暂时不接收新任务。"
   draining_another_turn: "⏳ 网关{action}，暂时不接收新回合。"
   queued_after_return: "⏳ 网关{action}——你的消息已排队，恢复后下一轮处理。"

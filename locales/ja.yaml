@@ -453,7 +453,6 @@ status:
   auto_reconnect: ; {seconds}秒後に自動再接続
   waiting_no_response: ⏳ {model} を待機中 — {seconds}秒間応答なし（プロバイダーが低速または過負荷の可能性{recovery}）
   waiting_no_output: ⏳ {model} を待機中 — {seconds}秒間出力なし（プロバイダーが低速または過負荷か、モデルが思考中の可能性{recovery}）
-  queued: ⏳ 次のターンにキューしました{detail}。現在のタスク終了後に返答します。
   draining_new_work: ⏳ ゲートウェイは{action}のため、現在新しい作業を受け付けていません。
   draining_another_turn: ⏳ ゲートウェイは{action}のため、現在これ以上のターンを受け付けていません。
   queued_after_return: ⏳ ゲートウェイは{action} — 復帰後の次のターンにキューしました。

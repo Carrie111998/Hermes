@@ -450,7 +450,6 @@ status:
   auto_reconnect: ; reconexión automática en {seconds}s
   waiting_no_response: ⏳ esperando a {model} — {seconds}s sin respuesta (el proveedor puede estar lento o sobrecargado{recovery})
   waiting_no_output: ⏳ esperando a {model} — {seconds}s sin salida (el proveedor puede estar lento o sobrecargado, o el modelo está pensando{recovery})
-  queued: ⏳ En cola para el siguiente turno{detail}. Responderé cuando termine la tarea actual.
   draining_new_work: ⏳ El Gateway se está {action} y no acepta trabajo nuevo en este momento.
   draining_another_turn: ⏳ El Gateway se está {action} y no acepta otro turno en este momento.
   queued_after_return: ⏳ Gateway {action} — en cola para el siguiente turno cuando vuelva.

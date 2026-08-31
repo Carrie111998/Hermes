@@ -457,7 +457,6 @@ status:
   auto_reconnect: ; athnasc uathoibríoch ag {seconds}s
   waiting_no_response: ⏳ ag fanacht le {model} — {seconds}s gan freagra fós (féadfaidh an soláthraí a bheith mall nó ró-luchtaithe{recovery})
   waiting_no_output: ⏳ ag fanacht le {model} — {seconds}s gan aschur fós (féadfaidh an soláthraí a bheith mall nó ró-luchtaithe, nó tá an tsamhail ag smaoineamh{recovery})
-  queued: ⏳ Sa scuaine don chéad bhabhta eile{detail}. Freagróidh mé nuair a chríochnaíonn an tasc reatha.
   draining_new_work: ⏳ Tá an Geata {action} agus níl sé ag glacadh obair nua faoi láthair.
   draining_another_turn: ⏳ Tá an Geata {action} agus níl sé ag glacadh babhta eile faoi láthair.
   queued_after_return: ⏳ Geata {action} — sa scuaine don chéad bhabhta eile nuair a thagann sé ar ais.

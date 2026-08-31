@@ -453,7 +453,6 @@ status:
   auto_reconnect: ; outo-herverbind by {seconds}s
   waiting_no_response: ⏳ wag op {model} — {seconds}s sonder antwoord nog (verskaffer kan stadig of oorlaai wees{recovery})
   waiting_no_output: ⏳ wag op {model} — {seconds}s sonder uitset nog (verskaffer kan stadig of oorlaai wees, of die model dink nog{recovery})
-  queued: ⏳ In die ry vir die volgende beurt{detail}. Ek antwoord sodra die huidige taak klaar is.
   draining_new_work: ⏳ Gateway is besig met {action} en aanvaar nou geen nuwe werk nie.
   draining_another_turn: ⏳ Gateway is besig met {action} en aanvaar nou geen verdere beurt nie.
   queued_after_return: ⏳ Gateway besig met {action} — in die ry vir die volgende beurt sodra dit terug is.
