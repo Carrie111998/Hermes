@@ -27,6 +27,7 @@ Configuration in config.yaml::
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
             reply_in_thread: true      # false = post replies flat to the channel timeline
             reaction_only_users: []    # acknowledge explicit tags without dispatching; allowed_users wins on overlap
+            reactions: true             # emoji reaction lifecycle (👀 received → 🧠 working → ✅/❌ done); false disables
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
