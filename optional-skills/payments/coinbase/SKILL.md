@@ -13,7 +13,7 @@ metadata:
 
 # Coinbase Skill
 
-Use the hosted Coinbase MCP server for brokerage, agentic trading, and payments. Prefer its typed `coinbase_*` tools over terminal commands. The server handles OAuth and requests on the user's behalf; it does not fund an account or replace confirmation for fund-affecting actions.
+Use the hosted Coinbase MCP server for brokerage, agentic trading, and payments. Prefer its typed `coinbase_*` tools over terminal commands. Tool availability may vary by region and release date. The server handles OAuth and requests on the user's behalf; it does not fund an account or replace confirmation for fund-affecting actions.
 
 ## When to Use
 
@@ -36,7 +36,7 @@ mcp_servers:
     connect_timeout: 60
 ```
 
-Reload MCP servers, complete the browser OAuth flow, and confirm Coinbase tools are available. If OAuth expires, run `hermes mcp reauth coinbase`. If OAuth cannot complete on a headless gateway, use the `mcp-oauth-remote-gateway` skill.
+Reload MCP servers, complete the browser OAuth flow, and confirm the Coinbase tools currently available in the user's region. If OAuth expires, run `hermes mcp reauth coinbase`. If OAuth cannot complete on a headless gateway, use the `mcp-oauth-remote-gateway` skill.
 
 ## How to Run
 
