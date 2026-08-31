@@ -254,6 +254,12 @@ def _set_process_title() -> None:
         return
     except ImportError:
         pass
+    except Exception:
+        # setproctitle 1.3.7 on Darwin with PS_USE_CLOBBER_ARGV raises
+        # UnicodeDecodeError when argv ends with a multibyte character
+        # (CJK, emoji).  The title is purely cosmetic — swallow any
+        # exception and fall through to the ctypes strategies (#98620).
+        pass
 
     # Strategy 2/3: platform-specific ctypes fallback
     import ctypes
