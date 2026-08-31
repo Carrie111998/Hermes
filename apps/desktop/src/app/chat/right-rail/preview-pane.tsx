@@ -154,10 +154,14 @@ const LOOPBACK_HOST_RE = /^(localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[?::1\]?)$
 /**
  * This window's zoom factor, guaranteed positive and finite.
  *
- * Two things in this file cross between host CSS pixels and the guest's, and
- * app zoom is the ratio for both — the emulated frame's size and the context
- * menu's click point. They read it through here so the fallback is one
- * decision rather than a `?? 1` in one place and a `|| 1` in the other.
+ * Two callers, and they are NOT the same conversion. The emulated frame's size
+ * genuinely crosses between host CSS pixels and the guest's, and app zoom is
+ * that ratio. The context menu's placement stays inside the host: Chromium
+ * reports the click in window device-independent pixels, and dividing gets back
+ * the host CSS pixels the menu is positioned in. Nothing here converts a point
+ * INTO the guest — see onGuestContextMenu for why that was the bug. One
+ * accessor so the fallback is one decision rather than a `?? 1` in one place
+ * and a `|| 1` in the other.
  */
 function hostZoomFactor(): number {
   const zoom = window.hermesDesktop?.zoom?.factor?.()
@@ -1033,8 +1037,23 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     // by the window zoom factor. Measured live (zoom 0.9): a click whose
     // true window CSS point was (901, 272) arrived as params (811, 246) =
     // (901*0.9, 272*0.9). Dividing by the zoom factor recovers CSS
-    // coordinates; adding the webview rect on top double-counted the offset
-    // and dropped the menu far right+below the click.
+    // coordinates for the MENU, which is placed in host CSS pixels; adding
+    // the webview rect on top double-counted the offset and dropped the menu
+    // far right+below the click.
+    //
+    // `inspectElement` wants that same WINDOW pixel, not a point inside the
+    // page — Chromium hit-tests down from the embedder's root view and
+    // subtracts the widget's own origin itself. Measured in a real <webview>
+    // sitting at (137, 89): inspectElement(200, 300) selected the element at
+    // guest CSS (63, 211). So params goes in untouched. Subtracting the rect
+    // put the inspector a whole pane-offset up and left of the click, and the
+    // zoom division moved it again — both at 100% zoom too, since neither
+    // term is the zoom.
+    //
+    // Device emulation needs no `scale` compensation here, unlike injected
+    // input (see preview-viewport.ts): that same root-view transform already
+    // carries it. Verified with Phone L at scale 0.5 AND zoom 134% — a click
+    // landing on guest CSS (200, 240) inspected exactly that element.
     const onGuestContextMenu = (event: Event) => {
       const detail = event as Event & { params?: GuestContextMenuParams }
       const params = detail.params
@@ -1047,11 +1066,8 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       // Window CSS point of the click (the menu anchors here).
       const windowX = params.x / zoom
       const windowY = params.y / zoom
-      // Guest CSS point (inspectElement wants coordinates INSIDE the page):
-      // subtract the webview's own offset from the window point.
-      const rect = webview.getBoundingClientRect()
-      const guestX = Math.max(0, Math.round(windowX - rect.left))
-      const guestY = Math.max(0, Math.round(windowY - rect.top))
+      const inspectX = Math.round(params.x)
+      const inspectY = Math.round(params.y)
 
       openGuestContextMenu(
         windowX,
@@ -1091,7 +1107,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             webview.focus()
             webview[command]?.()
           },
-          inspectElement: () => webview.inspectElement?.(guestX, guestY),
+          inspectElement: () => webview.inspectElement?.(inspectX, inspectY),
           replaceMisspelling: (word: string) => webview.replaceMisspelling?.(word)
         }
       )

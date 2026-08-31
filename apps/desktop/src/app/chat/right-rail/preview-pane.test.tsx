@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $contextMenu, closeContextMenu } from '@/app/context-menu/store'
 import { $connection } from '@/store/session'
 
 import { forgetPreviewConsole, previewConsoleState } from './preview-console-store'
@@ -33,6 +34,7 @@ describe('PreviewPane console state', () => {
 
   afterEach(() => {
     cleanup()
+    closeContextMenu()
     $connection.set(null)
     vi.unstubAllGlobals()
   })
@@ -369,6 +371,59 @@ describe('PreviewPane console state', () => {
     // the zoom it would be a flat 430x932 — which is exactly the bug.
     expect(webview.style.width).toBe('320px')
     expect(webview.style.height).toBe('693px')
+  })
+
+  // Two units in one gesture: the MENU is placed in host CSS pixels (params
+  // divided by zoom), while `inspectElement` takes the untouched window pixel
+  // — Chromium subtracts the widget's own origin itself. Measured in a real
+  // <webview>; the arithmetic that looked right (window point minus the
+  // element's rect) inspected a node a whole pane-offset away, at every zoom.
+  it('inspects the window point of the click, and anchors the menu in host pixels', async () => {
+    const zoomFactor = 1.3445671961657126 // 134%, this machine's saved level
+
+    vi.stubGlobal('window', {
+      ...window,
+      hermesDesktop: { zoom: { factor: () => zoomFactor, onChanged: () => () => {} } }
+    })
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          target={{ kind: 'url', label: 'example', source: 'https://example.com', url: 'https://example.com' }}
+        />
+      )
+    })
+
+    const webview = rendered.container.querySelector('webview') as HTMLElement & Record<string, unknown>
+    const inspectElement = vi.fn()
+
+    Object.assign(webview, { inspectElement })
+    // A pane in the right rail sits far from the window's left edge, which is
+    // exactly the offset the old formula subtracted twice over.
+    webview.getBoundingClientRect = () => ({ height: 700, left: 412, top: 96, width: 500 }) as DOMRect
+
+    act(() => {
+      webview.dispatchEvent(
+        Object.assign(new Event('context-menu'), {
+          params: { editFlags: {}, x: 901, y: 272 }
+        })
+      )
+    })
+
+    const open = $contextMenu.get()
+
+    expect(open?.kind).toBe('guest')
+
+    if (open?.kind !== 'guest') {
+      throw new Error('expected a guest menu')
+    }
+
+    open.guest.inspectElement()
+
+    expect(inspectElement).toHaveBeenCalledWith(901, 272)
+    expect(open.x).toBeCloseTo(901 / zoomFactor, 5)
+    expect(open.y).toBeCloseTo(272 / zoomFactor, 5)
   })
 
   it('renders authenticated remote HTML safely and honors source mode', async () => {
