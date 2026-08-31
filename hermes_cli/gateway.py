@@ -5507,12 +5507,20 @@ def wait_for_launchd_gateway_supervision(
 
 
 def _pid_is_descendant(pid: int | None, ancestor_pid: int | None, max_depth: int = 32) -> bool:
-    """Return True if *pid* is *ancestor_pid* or a descendant of it.
+    """Return True if *pid* is *ancestor_pid* OR a descendant of it.
+
+    Equality-inclusive: callers depend on a direct PID match counting as
+    "related" without a separate check (the name says descendant; the
+    contract is ancestor-or-self).
 
     launchd supervises ``hermes_cli.stderr_timestamp`` which in turn spawns
     the gateway (``hermes_cli.main gateway run``). The PID in the launchd
     plist therefore differs from the gateway PID, so an equality check never
     fires. Walking the parent chain covers the wrapper case (#94050).
+
+    Without psutil the walk is impossible and the helper degrades to
+    equality-only — observable via a one-time debug log so
+    ``launchd_status --deep`` output can explain the weaker dedupe.
     """
     if pid is None or ancestor_pid is None:
         return False
@@ -5521,15 +5529,22 @@ def _pid_is_descendant(pid: int | None, ancestor_pid: int | None, max_depth: int
     try:
         import psutil
     except ImportError:
+        logger.debug(
+            "psutil unavailable; launchd fallback dedupe limited to PID "
+            "equality (ancestry walk impossible)",
+        )
         return False
     try:
         proc = psutil.Process(pid)
-    except Exception:
+    except psutil.Error:
+        # Race: the process can exit between read and Process() (includes
+        # psutil.NoSuchProcess). Callers treat False as "not related" —
+        # the same answer as before the walk began.
         return False
     for _ in range(max_depth):
         try:
             parent = proc.parent()
-        except Exception:
+        except psutil.Error:
             return False
         if parent is None:
             return False
