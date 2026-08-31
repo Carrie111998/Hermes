@@ -42,7 +42,7 @@ import subprocess
 import sys
 import time
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 try:
     from aiohttp import web
@@ -385,15 +385,7 @@ class WebhookAdapter(BasePlatformAdapter):
             return await self._deliver_github_comment(content, delivery)
 
         # Cross-platform delivery — any platform with a gateway adapter.
-        # Check both built-in names and plugin-registered platforms.
-        _is_known_platform = deliver_type in _BUILTIN_DELIVER_PLATFORMS
-        if not _is_known_platform:
-            try:
-                from gateway.platform_registry import platform_registry
-                _is_known_platform = platform_registry.is_registered(deliver_type)
-            except Exception:
-                pass
-        if self.gateway_runner and _is_known_platform:
+        if self.gateway_runner and self._known_cross_platform(deliver_type):
             return await self._deliver_cross_platform(
                 deliver_type, content, delivery
             )
@@ -401,6 +393,223 @@ class WebhookAdapter(BasePlatformAdapter):
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
         return SendResult(
             success=False, error=f"Unknown deliver type: {deliver_type}"
+        )
+
+    def _known_cross_platform(self, deliver_type: str) -> bool:
+        """True if *deliver_type* names a platform with a live gateway adapter.
+
+        Checks both built-in platform names and plugin-registered ones.
+        Shared by ``send()`` and the media-send overrides below so a
+        route's ``deliver:`` target is recognized identically for text and
+        attachments.
+        """
+        if deliver_type in _BUILTIN_DELIVER_PLATFORMS:
+            return True
+        try:
+            from gateway.platform_registry import platform_registry
+            return platform_registry.is_registered(deliver_type)
+        except Exception:
+            return False
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Forward a local image file to the route's cross-platform ``deliver:`` target.
+
+        Webhook itself has no native photo transport. Without this override,
+        MEDIA: attachments extracted by ``_process_message_background`` would
+        hit ``BasePlatformAdapter``'s fallback (a "couldn't deliver" text
+        notice) even when the route is configured to forward everything else
+        to a real platform via ``deliver:``. Mirrors ``send()``'s resolution
+        of the deliver target and falls back to the base behaviour for any
+        deliver type ``send()`` itself would fall back for (log,
+        github_comment, unknown, or no gateway_runner).
+        """
+        delivery = self._delivery_info.get(chat_id, {})
+        deliver_type = delivery.get("deliver", "log")
+        if self.gateway_runner and self._known_cross_platform(deliver_type):
+            resolved = self._resolve_cross_platform_target(deliver_type, delivery)
+            if isinstance(resolved, SendResult):
+                return resolved
+            adapter, target_chat_id, cp_metadata = resolved
+            target_method = getattr(adapter, "send_image_file", None)
+            if target_method is not None:
+                return await target_method(
+                    chat_id=target_chat_id,
+                    image_path=image_path,
+                    caption=caption,
+                    reply_to=reply_to,
+                    metadata=cp_metadata,
+                    **kwargs,
+                )
+            # Target adapter has no native image-file sender — fall through
+            # to the base "couldn't deliver" notice rather than raising.
+
+        return await super().send_image_file(
+            chat_id=chat_id, image_path=image_path, caption=caption,
+            reply_to=reply_to, metadata=metadata, **kwargs,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Forward a local file to the route's cross-platform ``deliver:`` target.
+
+        See ``send_image_file`` for why webhook must forward rather than use
+        the base fallback notice.
+        """
+        delivery = self._delivery_info.get(chat_id, {})
+        deliver_type = delivery.get("deliver", "log")
+        if self.gateway_runner and self._known_cross_platform(deliver_type):
+            resolved = self._resolve_cross_platform_target(deliver_type, delivery)
+            if isinstance(resolved, SendResult):
+                return resolved
+            adapter, target_chat_id, cp_metadata = resolved
+            target_method = getattr(adapter, "send_document", None)
+            if target_method is not None:
+                return await target_method(
+                    chat_id=target_chat_id,
+                    file_path=file_path,
+                    caption=caption,
+                    file_name=file_name,
+                    reply_to=reply_to,
+                    metadata=cp_metadata,
+                    **kwargs,
+                )
+            # Target adapter has no native document sender — fall through
+            # to the base "couldn't deliver" notice rather than raising.
+
+        return await super().send_document(
+            chat_id=chat_id, file_path=file_path, caption=caption,
+            file_name=file_name, reply_to=reply_to, metadata=metadata, **kwargs,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Forward a local video file to the route's cross-platform ``deliver:`` target.
+
+        See ``send_image_file`` for why webhook must forward rather than use
+        the base fallback notice.
+        """
+        delivery = self._delivery_info.get(chat_id, {})
+        deliver_type = delivery.get("deliver", "log")
+        if self.gateway_runner and self._known_cross_platform(deliver_type):
+            resolved = self._resolve_cross_platform_target(deliver_type, delivery)
+            if isinstance(resolved, SendResult):
+                return resolved
+            adapter, target_chat_id, cp_metadata = resolved
+            target_method = getattr(adapter, "send_video", None)
+            if target_method is not None:
+                return await target_method(
+                    chat_id=target_chat_id,
+                    video_path=video_path,
+                    caption=caption,
+                    reply_to=reply_to,
+                    metadata=cp_metadata,
+                    **kwargs,
+                )
+            # Target adapter has no native video sender — fall through to
+            # the base "couldn't deliver" notice rather than raising.
+
+        return await super().send_video(
+            chat_id=chat_id, video_path=video_path, caption=caption,
+            reply_to=reply_to, metadata=metadata, **kwargs,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Forward a local audio file to the route's cross-platform ``deliver:`` target.
+
+        See ``send_image_file`` for why webhook must forward rather than use
+        the base fallback notice.
+        """
+        delivery = self._delivery_info.get(chat_id, {})
+        deliver_type = delivery.get("deliver", "log")
+        if self.gateway_runner and self._known_cross_platform(deliver_type):
+            resolved = self._resolve_cross_platform_target(deliver_type, delivery)
+            if isinstance(resolved, SendResult):
+                return resolved
+            adapter, target_chat_id, cp_metadata = resolved
+            target_method = getattr(adapter, "send_voice", None)
+            if target_method is not None:
+                return await target_method(
+                    chat_id=target_chat_id,
+                    audio_path=audio_path,
+                    caption=caption,
+                    reply_to=reply_to,
+                    metadata=cp_metadata,
+                    **kwargs,
+                )
+            # Target adapter has no native voice sender — fall through to
+            # the base "couldn't deliver" notice rather than raising.
+
+        return await super().send_voice(
+            chat_id=chat_id, audio_path=audio_path, caption=caption,
+            reply_to=reply_to, metadata=metadata, **kwargs,
+        )
+
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: List[Tuple[str, str]],
+        metadata: Optional[Dict[str, Any]] = None,
+        human_delay: float = 0.0,
+    ) -> None:
+        """Forward a batch of images to the route's cross-platform ``deliver:`` target.
+
+        Base signature returns ``None`` (it sends each image individually
+        and only logs failures), so this override does the same — unlike
+        the other media overrides there is no ``SendResult`` to hand back.
+        See ``send_image_file`` for why webhook must forward at all.
+        """
+        delivery = self._delivery_info.get(chat_id, {})
+        deliver_type = delivery.get("deliver", "log")
+        if self.gateway_runner and self._known_cross_platform(deliver_type):
+            resolved = self._resolve_cross_platform_target(deliver_type, delivery)
+            if isinstance(resolved, SendResult):
+                return
+            adapter, target_chat_id, cp_metadata = resolved
+            target_method = getattr(adapter, "send_multiple_images", None)
+            if target_method is not None:
+                await target_method(
+                    chat_id=target_chat_id,
+                    images=images,
+                    metadata=cp_metadata,
+                    human_delay=human_delay,
+                )
+                return
+            # Target adapter has no native batch-image sender — fall
+            # through to the base per-image loop rather than raising.
+
+        await super().send_multiple_images(
+            chat_id=chat_id, images=images, metadata=metadata, human_delay=human_delay,
         )
 
     def _prune_delivery_info(self, now: float) -> None:
@@ -1426,16 +1635,19 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.error("[webhook] github_comment delivery error: %s", e)
             return SendResult(success=False, error=str(e))
 
-    async def _deliver_cross_platform(
-        self, platform_name: str, content: str, delivery: dict
-    ) -> SendResult:
-        """Route response to another platform (telegram, discord, etc.)."""
-        if not self.gateway_runner:
-            return SendResult(
-                success=False,
-                error="No gateway runner for cross-platform delivery",
-            )
+    def _resolve_cross_platform_target(
+        self, platform_name: str, delivery: dict
+    ):
+        """Resolve the adapter/chat_id/metadata for a ``deliver:`` target.
 
+        Extracted from ``_deliver_cross_platform`` so the media-send
+        overrides (``send_image_file`` etc.) resolve the target identically
+        to text responses instead of duplicating adapter-lookup logic.
+
+        Returns a ``(adapter, chat_id, metadata)`` tuple on success, or a
+        ``SendResult(success=False, ...)`` describing why resolution failed
+        — callers distinguish the two with ``isinstance(x, SendResult)``.
+        """
         try:
             target_platform = Platform(platform_name)
         except ValueError:
@@ -1479,5 +1691,22 @@ class WebhookAdapter(BasePlatformAdapter):
         thread_id = extra.get("message_thread_id") or extra.get("thread_id")
         if thread_id:
             metadata = {"thread_id": thread_id}
+
+        return adapter, chat_id, metadata
+
+    async def _deliver_cross_platform(
+        self, platform_name: str, content: str, delivery: dict
+    ) -> SendResult:
+        """Route response to another platform (telegram, discord, etc.)."""
+        if not self.gateway_runner:
+            return SendResult(
+                success=False,
+                error="No gateway runner for cross-platform delivery",
+            )
+
+        resolved = self._resolve_cross_platform_target(platform_name, delivery)
+        if isinstance(resolved, SendResult):
+            return resolved
+        adapter, chat_id, metadata = resolved
 
         return await adapter.send(chat_id, content, metadata=metadata)
