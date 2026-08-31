@@ -394,7 +394,13 @@ class TestTelegramApprovalCallback:
             kind="wisdom.candidate",
             skill_id=skill_id,
             content_hash="sha256:source",
-            payload={"skill_name": "telegram-skill", "local_reasons": {}},
+            payload={
+                "skill_name": "telegram-skill",
+                "local_reasons": {
+                    "consecutive_business_days": 7,
+                    "business_day_timezone": "Australia/Brisbane",
+                },
+            },
             session_id="telegram-session",
             task_id="task-1",
             qualification="high_usage",
@@ -420,6 +426,10 @@ class TestTelegramApprovalCallback:
         assert raw_call.args == ("sendRichMessage",)
         html = raw_call.kwargs["api_kwargs"]["rich_message"]["html"]
         assert "telegram-skill" in html
+        assert "Why suggested:" in html
+        assert "consistently across consecutive business days" in html
+        assert "consecutive_business_days" not in html
+        assert "Australia/Brisbane" not in html
         assert "Draft in Collective" in html
         assert "Approve &amp; publish" in html
         assert f"wi:draft:{event_id}" in html
@@ -433,6 +443,15 @@ class TestTelegramApprovalCallback:
                 kind="wisdom.candidate", session_id="telegram-session"
             )
         ] == [event_id]
+
+    def test_wisdom_candidate_reason_explains_refinement_without_raw_evidence(self):
+        reason = TelegramAdapter._wisdom_candidate_qualification_reason("refinement")
+
+        assert "refined this skill repeatedly" in reason
+        assert "used it recently" in reason
+        assert "remained stable" in reason
+        assert "3" not in reason
+        assert "7" not in reason
 
     @pytest.mark.asyncio
     async def test_wisdom_candidate_draft_callback_adds_portal_and_publish_actions(

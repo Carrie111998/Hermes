@@ -7752,6 +7752,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._edit_wisdom_candidate_card(
                     query,
                     skill_name="Local skill",
+                    qualification_reason=(
+                        "This skill met your local Collective Wisdom "
+                        "qualification rules."
+                    ),
                     status=(
                         "This action could not continue. Open Collective in Hermes "
                         "to review the current state and try again."
@@ -7761,6 +7765,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
 
             skill_name = str(result.get("skill_name") or "Local skill")
+            qualification_reason = self._wisdom_candidate_qualification_reason(
+                str(result.get("qualification") or "")
+            )
             portal_url = result.get("portal_url")
             if action == "draft":
                 actions = [
@@ -7805,6 +7812,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._edit_wisdom_candidate_card(
                 query,
                 skill_name=skill_name,
+                qualification_reason=qualification_reason,
                 status=status,
                 actions=actions,
             )
@@ -8007,6 +8015,7 @@ class TelegramAdapter(BasePlatformAdapter):
     def _wisdom_candidate_html(
         *,
         skill_name: str,
+        qualification_reason: str,
         status: str,
         actions: List[Dict[str, Any]],
     ) -> str:
@@ -8031,8 +8040,21 @@ class TelegramAdapter(BasePlatformAdapter):
             "<h3>Hermes Collective Wisdom</h3>"
             "<p><b>Reusable skill ready to review</b><br/>"
             f"<code>{_html.escape(skill_name)}</code><br/>"
+            f"<b>Why suggested:</b> {_html.escape(qualification_reason)}<br/>"
             f"{_html.escape(status)}{control_html}</p>"
         )
+
+    @staticmethod
+    def _wisdom_candidate_qualification_reason(qualification: str) -> str:
+        """Explain the local threshold without exposing its evidence ledger."""
+        if qualification == "high_usage":
+            return "You used this skill consistently across consecutive business days."
+        if qualification == "refinement":
+            return (
+                "You refined this skill repeatedly, used it recently, and it "
+                "remained stable."
+            )
+        return "This skill met your local Collective Wisdom qualification rules."
 
     @staticmethod
     def _wisdom_candidate_keyboard(
@@ -8061,12 +8083,16 @@ class TelegramAdapter(BasePlatformAdapter):
         query,
         *,
         skill_name: str,
+        qualification_reason: str,
         status: str,
         actions: List[Dict[str, Any]],
     ) -> None:
         """Replace a candidate card in place while preserving its context."""
         html = self._wisdom_candidate_html(
-            skill_name=skill_name, status=status, actions=actions
+            skill_name=skill_name,
+            qualification_reason=qualification_reason,
+            status=status,
+            actions=actions,
         )
         message = getattr(query, "message", None)
         raw_request = getattr(getattr(self, "_bot", None), "do_api_request", None)
@@ -8093,6 +8119,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 text=(
                     "<b>Hermes Collective Wisdom</b>\n"
                     f"<b>{_html.escape(skill_name)}</b>\n{_html.escape(status)}"
+                    "\n<b>Why suggested:</b> "
+                    f"{_html.escape(qualification_reason)}"
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=self._wisdom_candidate_keyboard(actions),
@@ -8121,6 +8149,9 @@ class TelegramAdapter(BasePlatformAdapter):
             payload = event.get("payload")
             payload = payload if isinstance(payload, dict) else {}
             skill_name = str(payload.get("skill_name") or "Local skill")
+            qualification_reason = self._wisdom_candidate_qualification_reason(
+                str(event.get("qualification") or payload.get("qualification") or "")
+            )
             actions: List[Dict[str, Any]] = [
                 {
                     "label": "Draft in Collective",
@@ -8138,6 +8169,7 @@ class TelegramAdapter(BasePlatformAdapter):
             ]
             html = self._wisdom_candidate_html(
                 skill_name=skill_name,
+                qualification_reason=qualification_reason,
                 status=(
                     "Hermes found a reusable skill after this task. Nothing is shared "
                     "until you choose an action."
@@ -8181,6 +8213,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         "<b>Hermes Collective Wisdom</b>\n"
                         "<b>Reusable skill ready to review</b>\n"
                         f"<code>{_html.escape(skill_name)}</code>\n"
+                        "<b>Why suggested:</b> "
+                        f"{_html.escape(qualification_reason)}\n"
                         "Nothing is shared until you choose an action."
                     ),
                     "parse_mode": ParseMode.HTML,

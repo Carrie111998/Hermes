@@ -906,9 +906,10 @@ class WisdomService:
     def draft_candidate(self, event_id: str) -> dict[str, Any]:
         """Create or resume an owner-private draft for one exact candidate."""
         self.require_setup()
-        _event, local_skill_id, content_hash, skill_name = (
+        event, local_skill_id, content_hash, skill_name = (
             self._candidate_event_context(event_id)
         )
+        qualification = str(event.get("qualification") or "")
         existing = self.store.latest_draft_for_source(local_skill_id, content_hash)
         if existing is not None and not str(existing["id"]).startswith("local:"):
             state = str(existing["state"])
@@ -917,6 +918,7 @@ class WisdomService:
                 return {
                     "draft_id": draft_id,
                     "skill_name": skill_name,
+                    "qualification": qualification,
                     "state": state,
                     "portal_url": self.portal_review_url(draft_id),
                     "created": False,
@@ -941,6 +943,7 @@ class WisdomService:
         return {
             "draft_id": draft_id,
             "skill_name": skill_name,
+            "qualification": qualification,
             "state": str(draft.get("state") or "ready"),
             "portal_url": self.portal_review_url(draft_id),
             "created": True,
@@ -970,11 +973,16 @@ class WisdomService:
 
     def decline_candidate(self, event_id: str) -> dict[str, Any]:
         """Suppress this exact local package version without a network write."""
-        _event, local_skill_id, content_hash, skill_name = (
+        event, local_skill_id, content_hash, skill_name = (
             self._candidate_event_context(event_id)
         )
         result = self.dismiss_local_candidate(local_skill_id, content_hash)
-        return {**result, "skill_name": skill_name, "state": "declined"}
+        return {
+            **result,
+            "skill_name": skill_name,
+            "qualification": str(event.get("qualification") or ""),
+            "state": "declined",
+        }
 
     def review(
         self, draft_id: str, *, acknowledge: bool, portal: bool = False

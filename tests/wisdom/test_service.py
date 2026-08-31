@@ -475,6 +475,7 @@ def test_telegram_candidate_creates_an_owner_private_draft_and_portal_link(
     assert result == {
         "draft_id": "draft-1",
         "skill_name": "telegram-skill",
+        "qualification": "high_usage",
         "state": "ready",
         "portal_url": (
             "https://portal.test/orgs/wisdom-local/wisdom/review/draft-1"
