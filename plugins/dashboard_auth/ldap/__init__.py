@@ -348,8 +348,19 @@ class LdapAuthProvider(DashboardAuthProvider):
             auto_bind=False,
         )
         if self._start_tls:
-            conn.open()
-            conn.start_tls()
+            # open() connects the socket; if the StartTLS upgrade then
+            # fails, ldap3 leaves that socket open (strategy/base.py
+            # raises without closing). Close it ourselves or every failed
+            # login against a TLS-broken directory leaks an fd.
+            try:
+                conn.open()
+                conn.start_tls()
+            except Exception:
+                try:
+                    conn.unbind()
+                except Exception:  # noqa: BLE001 — cleanup must not mask
+                    pass
+                raise
         return conn
 
     def _bind(
@@ -360,10 +371,21 @@ class LdapAuthProvider(DashboardAuthProvider):
         failure (unreachable, TLS failure, timeout)."""
         from ldap3.core.exceptions import LDAPException
 
+        conn = None
         try:
             conn = self._factory(user=user, password=password)
             ok = conn.bind()
         except LDAPException as exc:
+            # The connection may already own a connected (or half-open)
+            # socket: ldap3 2.9.1 raises LDAPSocketOpenError from a failed
+            # connect() / TLS wrap without closing it. Close it here, or a
+            # down directory leaks one fd per hit on this unauthenticated
+            # endpoint.
+            if conn is not None:
+                try:
+                    conn.unbind()
+                except Exception:  # noqa: BLE001 — cleanup must not mask
+                    pass
             raise ProviderError(f"LDAP server unreachable: {exc}") from exc
         if not ok:
             try:

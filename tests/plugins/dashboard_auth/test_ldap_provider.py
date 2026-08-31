@@ -283,3 +283,129 @@ class TestDirectBindLogin:
         )
         with pytest.raises(ProviderError):
             p.complete_password_login(username="alice", password="s3cret")
+
+    def test_transport_failure_closes_the_connection(self):
+        # ldap3 raises LDAPSocketOpenError from a failed connect()/TLS wrap
+        # WITHOUT closing the socket it already opened. If the provider
+        # doesn't close it, a down directory leaks one fd per hit on this
+        # unauthenticated endpoint.
+        from ldap3.core.exceptions import LDAPSocketOpenError
+
+        conn = MagicMock()
+        conn.bind.side_effect = LDAPSocketOpenError("connection refused")
+
+        p = make_provider(
+            user_dn_template="uid={username},ou=people," + BASE_DN,
+            connection_factory=lambda *, user, password: conn,
+        )
+        with pytest.raises(ProviderError):
+            p.complete_password_login(username="alice", password="s3cret")
+        conn.unbind.assert_called_once_with()
+
+
+class TestDefaultFactory:
+    """Cover the REAL connection factory's TLS policy and timeouts.
+
+    Every other test injects a fake ``connection_factory``, so nothing
+    else exercises ``_default_factory`` — the highest-consequence
+    security code in the plugin. Without these assertions an edit
+    flipping ``CERT_REQUIRED`` to ``CERT_NONE`` would keep the suite
+    green while silently disabling certificate validation.
+    """
+
+    @pytest.fixture
+    def patched(self, monkeypatch):
+        """Patch ldap3's Tls/Server/Connection and record their kwargs."""
+        calls: dict = {}
+
+        def fake_tls(**kwargs):
+            calls["tls"] = kwargs
+            return "TLS_OBJ"
+
+        def fake_server(url, **kwargs):
+            calls["server"] = dict(kwargs, url=url)
+            return "SERVER_OBJ"
+
+        def fake_connection(server, **kwargs):
+            calls["conn"] = dict(kwargs, server=server)
+            return calls.setdefault("conn_obj", MagicMock())
+
+        monkeypatch.setattr(ldap3, "Tls", fake_tls)
+        monkeypatch.setattr(ldap3, "Server", fake_server)
+        monkeypatch.setattr(ldap3, "Connection", fake_connection)
+        return calls
+
+    def test_ldaps_validates_certificates(self, patched):
+        import ssl
+
+        p = make_provider(
+            server_url="ldaps://ldap.example.com",
+            ca_certs_file="/etc/ssl/private-ca.pem",
+            timeout_seconds=7.0,
+        )
+        conn = p._default_factory(user="uid=alice", password="s3cret")
+
+        assert patched["tls"] == {
+            "validate": ssl.CERT_REQUIRED,
+            "ca_certs_file": "/etc/ssl/private-ca.pem",
+        }
+        assert patched["server"]["tls"] == "TLS_OBJ"
+        assert patched["server"]["connect_timeout"] == 7.0
+        assert patched["server"]["get_info"] is ldap3.NONE
+        assert patched["conn"]["client_strategy"] is ldap3.SYNC
+        assert patched["conn"]["receive_timeout"] == 7.0
+        assert patched["conn"]["raise_exceptions"] is False
+        assert patched["conn"]["auto_bind"] is False
+        assert patched["conn"]["user"] == "uid=alice"
+        # ldaps:// is TLS from the first byte — no StartTLS upgrade.
+        conn.open.assert_not_called()
+        conn.start_tls.assert_not_called()
+
+    def test_unset_ca_certs_file_becomes_none(self, patched):
+        p = make_provider(server_url="ldaps://ldap.example.com")
+        p._default_factory(user=None, password=None)
+        # "" would make ldap3 try to load a file named "" — must be None
+        # so it falls back to the system trust store.
+        assert patched["tls"]["ca_certs_file"] is None
+
+    def test_start_tls_over_plain_ldap_attaches_tls_and_upgrades(
+        self, patched
+    ):
+        import ssl
+
+        p = make_provider(
+            server_url="ldap://ldap.example.com", start_tls=True
+        )
+        conn = p._default_factory(user=None, password=None)
+
+        assert patched["tls"]["validate"] == ssl.CERT_REQUIRED
+        assert patched["server"]["tls"] == "TLS_OBJ"
+        conn.open.assert_called_once_with()
+        conn.start_tls.assert_called_once_with()
+
+    def test_allow_insecure_plain_ldap_has_no_tls(self, patched):
+        p = make_provider(
+            server_url="ldap://ldap.example.com", allow_insecure=True
+        )
+        conn = p._default_factory(user=None, password=None)
+
+        assert "tls" not in patched  # ldap3.Tls never constructed
+        assert patched["server"]["tls"] is None
+        conn.open.assert_not_called()
+        conn.start_tls.assert_not_called()
+
+    def test_start_tls_failure_closes_the_socket(self, patched, monkeypatch):
+        # open() connects the socket; if start_tls() then fails, ldap3
+        # leaves it open. The factory must close it before propagating.
+        from ldap3.core.exceptions import LDAPStartTLSError
+
+        conn = MagicMock()
+        conn.start_tls.side_effect = LDAPStartTLSError("handshake failed")
+        monkeypatch.setattr(ldap3, "Connection", lambda *a, **k: conn)
+
+        p = make_provider(
+            server_url="ldap://ldap.example.com", start_tls=True
+        )
+        with pytest.raises(LDAPStartTLSError):
+            p._default_factory(user=None, password=None)
+        conn.unbind.assert_called_once_with()
