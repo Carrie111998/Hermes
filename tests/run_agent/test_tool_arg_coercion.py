@@ -246,3 +246,59 @@ class TestCoerceToolArgsNested:
         args = {"todos": [_json.dumps({"id": "1", "content": "x", "status": "pending"})]}
         result = coerce_tool_args("todo", args)
         assert result["todos"][0] == {"id": "1", "content": "x", "status": "pending"}
+
+
+# ── Scalar-array single-key dict unwrapping (#99270) ──────────────────────
+
+
+class TestCoerceToolArgsSingleKeyDictArray:
+    """Models sometimes emit a scalar-array argument as a single-key dict
+    (``{"ids": {"item": 14}}``). With a scalar ``items`` schema the sole
+    value is unwrapped; every other shape keeps the legacy wrap behavior."""
+
+    def _schema(self, items_schema):
+        return {
+            "name": "test_tool",
+            "description": "test",
+            "parameters": {
+                "type": "object",
+                "properties": {"ids": {"type": "array", "items": items_schema}},
+            },
+        }
+
+    def test_integer_items_unwrapped(self):
+        with patch("model_tools.registry.get_schema", return_value=self._schema({"type": "integer"})):
+            result = coerce_tool_args("test_tool", {"ids": {"item": 14}})
+            assert result["ids"] == [14]
+
+    def test_string_items_unwrapped(self):
+        with patch("model_tools.registry.get_schema", return_value=self._schema({"type": "string"})):
+            result = coerce_tool_args("test_tool", {"ids": {"item": "https://a.com"}})
+            assert result["ids"] == ["https://a.com"]
+
+    def test_inner_list_not_double_wrapped(self):
+        with patch("model_tools.registry.get_schema", return_value=self._schema({"type": "integer"})):
+            result = coerce_tool_args("test_tool", {"ids": {"item": [1, 2]}})
+            assert result["ids"] == [1, 2]
+
+    def test_object_items_schema_left_alone(self):
+        """``array<object>`` legitimately accepts single-key dict elements."""
+        schema = self._schema({"type": "object", "properties": {"item": {"type": "integer"}}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            result = coerce_tool_args("test_tool", {"ids": {"item": 1}})
+            assert result["ids"] == [{"item": 1}]
+
+    def test_multi_key_dict_left_alone(self):
+        with patch("model_tools.registry.get_schema", return_value=self._schema({"type": "integer"})):
+            result = coerce_tool_args("test_tool", {"ids": {"a": 1, "b": 2}})
+            assert result["ids"] == [{"a": 1, "b": 2}]
+
+    def test_missing_items_schema_left_alone(self):
+        schema = {
+            "name": "test_tool",
+            "description": "test",
+            "parameters": {"type": "object", "properties": {"ids": {"type": "array"}}},
+        }
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            result = coerce_tool_args("test_tool", {"ids": {"item": 14}})
+            assert result["ids"] == [{"item": 14}]

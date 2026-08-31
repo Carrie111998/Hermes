@@ -842,6 +842,19 @@ def _sanitize_tool_error(error_msg: str) -> str:
 # Tool argument type coercion
 # =========================================================================
 
+def _array_items_type(prop_schema: Any) -> Optional[str]:
+    """Return the declared ``items.type`` of an array property schema.
+
+    ``None`` when the schema has no ``items`` or a non-scalar-announced
+    ``items`` (missing/union types) — callers treat that as "unknown, do
+    not unwrap".
+    """
+    items = prop_schema.get("items") if isinstance(prop_schema, dict) else None
+    if isinstance(items, dict) and isinstance(items.get("type"), str):
+        return items["type"]
+    return None
+
+
 def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Coerce tool call arguments to match their JSON Schema types.
 
@@ -859,6 +872,13 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     sometimes emit ``{"urls": "https://a.com"}`` when the tool expects
     ``{"urls": ["https://a.com"]}``; wrapping here avoids a confusing tool
     failure on what is otherwise a well-formed call.
+
+    Some models go one step further and emit a scalar-array argument as a
+    single-key dict (``{"ids": {"item": 14}}``) — their serialization of the
+    array's inner slot.  When the declared ``items`` type is scalar, the sole
+    value is unwrapped before wrapping so the tool receives ``[14]`` instead
+    of ``[{"item": 14}]``; object-item schemas are untouched because
+    single-key dicts are legitimate elements there.
     """
     if not args or not isinstance(args, dict):
         return args
@@ -915,6 +935,22 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 args[key] = [value]
                 logger.info(
                     "coerce_tool_args: wrapped bare string in list for %s.%s",
+                    tool_name, key,
+                )
+                continue
+            # Single-key dict for a scalar-items array (e.g. ``{"item": 14}``
+            # for ``array<integer>``): unwrap the sole value instead of
+            # wrapping the whole dict. Sending ``[{"item": 14}]`` makes strict
+            # servers reject the call — or silently coerce it to ``[]``.
+            if (
+                isinstance(value, dict)
+                and len(value) == 1
+                and _array_items_type(prop_schema) in ("integer", "number", "string", "boolean")
+            ):
+                inner = next(iter(value.values()))
+                args[key] = list(inner) if isinstance(inner, (list, tuple)) else [inner]
+                logger.info(
+                    "coerce_tool_args: unwrapped single-key dict into list for %s.%s",
                     tool_name, key,
                 )
                 continue
