@@ -265,7 +265,11 @@ class GeminiImageGenProvider(ImageGenProvider):
             },
         }
         timeout = kwargs.get("timeout", 120)
+        timeout = kwargs.get("timeout", 180)
         try:
+            timeout = max(1.0, float(timeout))
+        except (TypeError, ValueError):
+            timeout = 180
             timeout = max(1.0, float(timeout))
         except (TypeError, ValueError):
             timeout = 120
