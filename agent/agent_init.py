@@ -905,6 +905,13 @@ def init_agent(
     agent._interrupt_thread_signal_pending = False
     agent._client_lock = threading.RLock()
     agent._model_request_active = threading.Event()
+    # #94248: close() from a timeout/interrupt thread must not release TLS FDs
+    # or the owned SessionDB handle while run_conversation is still on-stack
+    # (typically blocked in OpenSSL read). Starts idle (Event set).
+    agent._run_conversation_active = False
+    agent._run_conversation_idle = threading.Event()
+    agent._run_conversation_idle.set()
+    agent._deferred_close_scheduled = False
     agent._supports_active_turn_redirect = True
 
     # /steer mechanism — inject a user note into the next tool result

@@ -4629,6 +4629,80 @@ class AIAgent:
         except Exception:
             pass
 
+    def _mark_run_conversation_started(self) -> None:
+        """Fence close() until this turn's ``run_conversation`` fully unwinds.
+
+        Delegate timeout (#94248) and stranger-thread interrupts call
+        ``close()`` while the worker is still inside OpenSSL ``read``. Hard
+        ``client.close()`` / ``SessionDB.close()`` from that other thread is
+        the TLS-FD → SQLite SIGSEGV family (#29507 / #67142 / #70773).
+        """
+        self._run_conversation_active = True
+        idle = getattr(self, "_run_conversation_idle", None)
+        if idle is None:
+            idle = threading.Event()
+            self._run_conversation_idle = idle
+        idle.clear()
+
+    def _mark_run_conversation_finished(self) -> None:
+        """Release the close() fence after SessionDB-touching turn cleanup."""
+        self._run_conversation_active = False
+        idle = getattr(self, "_run_conversation_idle", None)
+        if idle is not None:
+            idle.set()
+
+    def _should_defer_hard_close(self) -> bool:
+        """True when this thread must not release TLS FDs or SessionDB.
+
+        The owning ``run_conversation`` thread may close on its own unwind.
+        A timeout / interrupt / parent-finally thread must not.
+        """
+        tid = getattr(self, "_execution_thread_id", None)
+        if isinstance(tid, int) and tid == threading.current_thread().ident:
+            return False
+        if getattr(self, "_run_conversation_active", False):
+            return True
+        model_active = getattr(self, "_model_request_active", None)
+        return bool(model_active is not None and model_active.is_set())
+
+    def _wait_until_safe_to_hard_close(self) -> None:
+        """Block until the worker turn has left SessionDB and SSL."""
+        idle = getattr(self, "_run_conversation_idle", None)
+        if idle is not None:
+            idle.wait()
+        model_active = getattr(self, "_model_request_active", None)
+        while model_active is not None and model_active.is_set():
+            time.sleep(0.05)
+        while getattr(self, "_run_conversation_active", False):
+            time.sleep(0.05)
+
+    def _schedule_deferred_close(self) -> None:
+        """Finish close() on a daemon thread after the in-flight worker unwinds."""
+        if getattr(self, "_deferred_close_scheduled", False):
+            return
+        self._deferred_close_scheduled = True
+
+        def _finish() -> None:
+            try:
+                self._wait_until_safe_to_hard_close()
+            finally:
+                self._deferred_close_scheduled = False
+                try:
+                    self.close()
+                except Exception:
+                    logger.debug(
+                        "Deferred agent close after in-flight worker failed",
+                        exc_info=True,
+                    )
+
+        thread = threading.Thread(
+            target=_finish,
+            name="agent-deferred-close",
+            daemon=True,
+        )
+        self._deferred_close_thread = thread
+        thread.start()
+
     def close(self) -> None:
         """Release all resources held by this agent instance.
 
@@ -4642,17 +4716,26 @@ class AIAgent:
 
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
+
+        When a worker thread is still inside ``run_conversation`` (delegate
+        deadline, interrupt), this thread only shuts sockets down and skips
+        SQLite / httpx FD release — see ``_should_defer_hard_close`` (#94248).
         """
+        in_flight = self._should_defer_hard_close()
+
         # AIAgent.close() is the hard owner boundary. Gateway cleanup may
         # call shutdown_memory_provider() first; its idempotence prevents
         # duplicate extraction while direct callers cannot skip provider close.
-        try:
-            session_messages = getattr(self, "_session_messages", None)
-            self.shutdown_memory_provider(
-                session_messages if isinstance(session_messages, list) else None
-            )
-        except Exception:
-            pass
+        # Skip it while a worker still owns the turn — memory providers may
+        # touch the same SQLite file the worker is flushing.
+        if not in_flight:
+            try:
+                session_messages = getattr(self, "_session_messages", None)
+                self.shutdown_memory_provider(
+                    session_messages if isinstance(session_messages, list) else None
+                )
+            except Exception:
+                pass
 
         task_id = getattr(self, "session_id", None) or ""
 
@@ -4700,17 +4783,27 @@ class AIAgent:
         except Exception:
             pass
 
-        # 6. Close the OpenAI/httpx client
+        # 6. Shared OpenAI/httpx client. #94248 / #70773: a stranger thread
+        # must only shutdown() sockets. client.close() releases FDs under a
+        # still-live SSL BIO (KERN_INVALID_ADDRESS in pysqlite 17-72ms later).
         try:
             client = getattr(self, "client", None)
             if client is not None:
-                self._close_openai_client(client, reason="agent_close", shared=True)
+                if in_flight:
+                    self._retire_shared_openai_client(
+                        client, reason="agent_close_in_flight"
+                    )
+                else:
+                    self._close_openai_client(
+                        client, reason="agent_close", shared=True
+                    )
                 self.client = None
         except Exception:
             pass
 
         # 6b. Close the cached per-request wire client (reused across
         # sequential LLM calls; see _create_request_openai_client).
+        # Already aborts without FD release when in_use.
         try:
             self._close_cached_request_openai_client(reason="agent_close")
         except Exception:
@@ -4719,6 +4812,10 @@ class AIAgent:
             self._close_cached_request_anthropic_client(reason="agent_close")
         except Exception:
             pass
+
+        if in_flight:
+            self._schedule_deferred_close()
+            return
 
         # 6c. Close the Codex app-server session. The runtime already drops
         # it on turn crash / retirement (agent/codex_runtime.py), but hard
@@ -8775,6 +8872,11 @@ class AIAgent:
                     _clear_if_owned()
 
         try:
+            # getattr: test doubles / third-party agents bind this method
+            # onto a stub that has no fence helpers (#94248 CI).
+            _mark_started = getattr(self, "_mark_run_conversation_started", None)
+            if callable(_mark_started):
+                _mark_started()
             # Serialize the full load -> run -> flush region across Hermes
             # processes. Gateway's asyncio lease closes alias routing inside one
             # process; this durable lease covers Desktop, CLI resume, gateway,
@@ -9104,57 +9206,65 @@ class AIAgent:
             raise
         finally:
             try:
-                if relay_turn is not None:
-                    relay_runtime.SESSION_COORDINATOR.end_turn(
-                        relay_turn,
-                        outcome=relay_outcome,
-                    )
-            finally:
                 try:
-                    if relay_lease is not None:
-                        relay_runtime.SESSION_COORDINATOR.release_conversation(
-                            relay_lease
+                    if relay_turn is not None:
+                        relay_runtime.SESSION_COORDINATOR.end_turn(
+                            relay_turn,
+                            outcome=relay_outcome,
                         )
                 finally:
-                    _stop_durable_turn_lease_refresher()
-                    if (
-                        durable_turn_lease_thread is not None
-                        and durable_turn_lease_thread.is_alive()
-                    ):
-                        durable_turn_lease_thread.join(timeout=1.0)
-                    # Clear any interrupt the refresher may have fired between
-                    # the inner stop and this join. Must run AFTER join so a
-                    # late interrupt does not survive into the next turn.
-                    _clear_durable_turn_lease_interrupt()
-                    if durable_turn_lease is not None:
-                        try:
-                            _turn_db.release_session_turn_lease(
-                                session_id, durable_turn_lease
-                            )
-                        except Exception:
-                            logger.error(
-                                "Failed to release session turn lease: %s",
-                                session_id,
-                                exc_info=True,
-                            )
-                        if (
-                            getattr(self, "_active_session_turn_lease_holder", None)
-                            == durable_turn_lease
-                        ):
-                            self._active_session_turn_lease_holder = None
-                            self._active_session_turn_lease_ttl_seconds = None
-                    # Always clear mid-turn labels when the turn exits — including
-                    # interrupted early returns that skip finalize_turn. Keep ts.
                     try:
-                        self._reset_activity_labels_after_turn()
-                    except Exception:
-                        pass
-                    if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
-                        self._relay_pending_turn_id = None
-                    if acct_token is not None:
-                        reset_accounting_context(acct_token)
-                    if token is not None:
-                        reset_conversation_context(token)
+                        if relay_lease is not None:
+                            relay_runtime.SESSION_COORDINATOR.release_conversation(
+                                relay_lease
+                            )
+                    finally:
+                        _stop_durable_turn_lease_refresher()
+                        if (
+                            durable_turn_lease_thread is not None
+                            and durable_turn_lease_thread.is_alive()
+                        ):
+                            durable_turn_lease_thread.join(timeout=1.0)
+                        # Clear any interrupt the refresher may have fired between
+                        # the inner stop and this join. Must run AFTER join so a
+                        # late interrupt does not survive into the next turn.
+                        _clear_durable_turn_lease_interrupt()
+                        if durable_turn_lease is not None:
+                            try:
+                                _turn_db.release_session_turn_lease(
+                                    session_id, durable_turn_lease
+                                )
+                            except Exception:
+                                logger.error(
+                                    "Failed to release session turn lease: %s",
+                                    session_id,
+                                    exc_info=True,
+                                )
+                            if (
+                                getattr(self, "_active_session_turn_lease_holder", None)
+                                == durable_turn_lease
+                            ):
+                                self._active_session_turn_lease_holder = None
+                                self._active_session_turn_lease_ttl_seconds = None
+                        # Always clear mid-turn labels when the turn exits — including
+                        # interrupted early returns that skip finalize_turn. Keep ts.
+                        try:
+                            self._reset_activity_labels_after_turn()
+                        except Exception:
+                            pass
+                        if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
+                            self._relay_pending_turn_id = None
+                        if acct_token is not None:
+                            reset_accounting_context(acct_token)
+                        if token is not None:
+                            reset_conversation_context(token)
+            finally:
+                # After SessionDB-touching turn cleanup above. Deferred close()
+                # waiters must not hard-close the handle while this finally
+                # still holds it (#94248).
+                _mark_finished = getattr(self, "_mark_run_conversation_finished", None)
+                if callable(_mark_finished):
+                    _mark_finished()
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

@@ -3553,6 +3553,9 @@ def _run_single_child(
         # Close tool resources (terminal sandboxes, browser daemons,
         # background processes, httpx clients) so subagent subprocesses
         # don't outlive the delegation.
+        # #94248: a timed-out worker may still be inside SSL read.
+        # AIAgent.close() retires sockets only and defers SessionDB /
+        # httpx FD release until that worker unwinds.
         try:
             if hasattr(child, "close"):
                 child.close()
