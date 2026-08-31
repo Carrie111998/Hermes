@@ -220,7 +220,11 @@ export function ChatBar({
 
   const { t } = useI18n()
   const gatewayState = useStore($gatewayState)
-  const reconnecting = gatewayState === 'closed' || gatewayState === 'error'
+  const reconnecting =
+    gatewayState === 'closed' ||
+    gatewayState === 'error' ||
+    gatewayState === 'connecting' ||
+    gatewayState === 'idle'
   const inputDisabled = disabled && !reconnecting
 
   // The draft engine — detached source of truth (DOM + draftRef + edge
