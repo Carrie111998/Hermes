@@ -413,8 +413,10 @@ export const ja = defineLocale({
         'iMessage風の絵文字タップバック — メッセージにリアクションでき、Hermesもあなたのメッセージにリアクションします。',
       tipsTitle: 'アプリ内ヒント',
       tipsDesc:
-        'アプリが待機中のとき、まだ見つけていない機能をときどき案内します。閉じたヒントは二度と表示されません。',
+        'アプリの一部を指す小さな吹き出し。待機中にときどき、また役に立つときは Hermes からも表示します。閉じたヒントは二度と表示されません。',
       tipsReset: (count: number) => `閉じた${count}件のヒントを元に戻す`,
+      toursTitle: 'ガイドツアー',
+      toursDesc: '画面を暗くして各ステップを強調しながら、Hermes がアプリを案内します。',
       composerPopoutTitle: 'フローティング入力欄',
       composerPopoutDesc: '入力欄をドックからドラッグして外せるようにします。オフにすると画面下部に固定されます。',
       vibeHeartsTitle: 'バイブハート',
@@ -1138,6 +1140,16 @@ export const ja = defineLocale({
         selectedMessage: backend => `ターミナルコマンドは ${backend} で実行されます。新しいセッションに適用されます。`,
         failedSelect: backend => `${backend} の選択に失敗しました`,
         needsSetupHint: 'このバックエンドは今すぐ選択できますが、セットアップが完了するまでコマンドは失敗します。'
+      },
+      browserRealProfile: {
+        label: '実際のブラウザプロファイルを使用',
+        description:
+          '既定ブラウザのログイン情報と Cookie を管理されたスナップショットにコピーし、エージェントはそれを使ってブラウジングします。実際のプロファイルが直接開かれることはありません。新しいセッションに適用されます。',
+        enabledTitle: '実プロファイルブラウジング：オン',
+        enabledMessage: '新しいセッションは既定ブラウザプロファイルのスナップショットでブラウジングします。',
+        disabledTitle: '実プロファイルブラウジング：オフ',
+        disabledMessage: 'プロファイルのスナップショットは削除され、新しいセッションはクリーンなブラウザを使用します。',
+        failedSave: '実プロファイル設定を保存できませんでした'
       }
     }
   },
@@ -1589,6 +1601,7 @@ export const ja = defineLocale({
     defaultBadge: 'デフォルト',
     rename: '名前を変更',
     renameMenu: '名前を変更…',
+    exportMenu: 'エクスポート…',
     editSoul: 'SOUL.md を編集…',
     copySetup: 'セットアップをコピー',
     copying: 'コピー中...',
@@ -1893,7 +1906,7 @@ export const ja = defineLocale({
       removeFolder: '削除',
       create: '作成',
       menu: 'アクション',
-      menuRename: '名前を変更',
+      menuRename: '名前を変更…',
       menuAppearance: '外観',
       noColor: '色なし',
       menuAddFolder: 'フォルダを追加',
@@ -1956,7 +1969,7 @@ export const ja = defineLocale({
       copyId: 'ID をコピー',
       export: 'エクスポート',
       branchFrom: '分岐',
-      rename: '名前を変更',
+      rename: '名前を変更…',
       archive: 'アーカイブ',
       newWindow: '新しいウィンドウ',
       openInTerminal: 'ターミナルで開く',

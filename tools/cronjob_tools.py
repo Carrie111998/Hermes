@@ -828,16 +828,20 @@ def _relay_fronted_delivery_platforms(job: Dict[str, Any]) -> set:
     return theirs & fronted
 
 
-def _forward_relay_fronted_run(job: Dict[str, Any]) -> Optional[str]:
+def _forward_relay_fronted_run(
+    job: Dict[str, Any], extra_prompt: Optional[str] = None
+) -> Optional[str]:
     """Forward a manual run to the gateway when it targets a relay-fronted
     platform and this process has no live relay adapter.
 
     Relay-fronted delivery has no standalone sender: the connector owns the
     credential and the gateway's live relay adapter is the only path. The
     gateway api_server's ``POST /api/jobs/{id}/run`` marks the job due for its
-    own ticker, which fires it with the live adapter. Returns a JSON result
-    string when forwarding engages (dispatch or the accurate error), else
-    None to fall through to the normal in-process run.
+    own ticker, which fires it with the live adapter. ``extra_prompt``
+    (transient per-run context) rides in the request body so the forwarded
+    fire keeps it. Returns a JSON result string when forwarding engages
+    (dispatch or the accurate error), else None to fall through to the normal
+    in-process run.
     """
     if not _relay_fronted_delivery_platforms(job):
         return None
@@ -882,7 +886,10 @@ def _forward_relay_fronted_run(job: Dict[str, Any]) -> Optional[str]:
         import httpx
 
         resp = httpx.post(
-            url, headers={"Authorization": f"Bearer {key}"}, timeout=10.0
+            url,
+            headers={"Authorization": f"Bearer {key}"},
+            json=({"prompt": extra_prompt} if extra_prompt else {}),
+            timeout=10.0,
         )
     except Exception:
         resp = None
@@ -1751,7 +1758,7 @@ def cronjob(
                 # Relay-fronted manual run: a standalone process has no live
                 # relay adapter and no standalone sender, so forward to the
                 # running gateway (its live adapter owns that delivery).
-                forwarded = _forward_relay_fronted_run(job)
+                forwarded = _forward_relay_fronted_run(job, extra_prompt=extra_prompt)
                 if forwarded is not None:
                     return forwarded
                 exec_result = _execute_job_now(job, extra_prompt=extra_prompt)
@@ -1910,8 +1917,12 @@ def cronjob(
                         )
                 updates["no_agent"] = target_no_agent
             if repeat is not None:
-                # Normalize: treat 0 or negative as None (infinite)
-                normalized_repeat = None if repeat <= 0 else repeat
+                # Coerce string forms ('forever'/'once'/'3') and 0/negative
+                # via the shared chokepoint — a bare `repeat <= 0` here
+                # raised TypeError for string repeats on the UPDATE path
+                # (create was fixed first; same class).
+                from cron.jobs import normalize_repeat_value
+                normalized_repeat = normalize_repeat_value(repeat)
                 repeat_state = dict(job.get("repeat") or {})
                 repeat_state["times"] = normalized_repeat
                 updates["repeat"] = repeat_state
@@ -1963,7 +1974,8 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "schedule": {
                 "type": "string",
-                "description": "REQUIRED for create. '30m' (every 30 minutes), 'every 2h', cron syntax '0 9 * * *' (daily 9am), or an ISO timestamp for one-shot ('2026-06-01T09:00:00')."
+                "type": "string",
+                "description": "REQUIRED for create. Schedule forms: (1) recurring interval — '30m', 'every 2h', 'every hour' (EVERY 30 minutes / 2 hours / hour, forever by default); (2) explicit one-shot by duration — 'in 30m', 'in 2h' (fires ONCE that far from now; use this for 'remind me in N minutes' — do NOT hand-compute an absolute timestamp); (3) natural day/time — 'every monday 9am', 'weekdays at 9am', 'every day at 9am' (recurring weekly/daily); (4) cron syntax — '0 9 * * *' (daily 9am); (5) absolute one-shot — ISO timestamp '2026-06-01T09:00:00'."
             },
             "name": {
                 "type": "string",

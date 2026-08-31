@@ -401,8 +401,10 @@ export const zhHant = defineLocale({
       reactionsTitle: '訊息回應',
       reactionsDesc: 'iMessage 風格的表情回應 — 你可以對訊息做出回應，Hermes 也能回應你的訊息。',
       tipsTitle: '應用程式內提示',
-      tipsDesc: '應用程式閒置時，偶爾指出你可能還沒發現的功能。關掉一則就不再出現。',
+      tipsDesc: '指向應用程式某處的小氣泡：閒置時偶爾出現，需要時 Hermes 也會給你一則。關掉一則就不再出現。',
       tipsReset: (count: number) => `復原 ${count} 則已關閉的提示`,
+      toursTitle: '導覽',
+      toursDesc: '讓 Hermes 帶你認識應用程式：調暗畫面並逐步標示每個位置。',
       composerPopoutTitle: '懸浮輸入框',
       composerPopoutDesc: '允許將輸入框拖出底部停靠區。關閉後，輸入框會鎖定在底部。',
       vibeHeartsTitle: '心情愛心',
@@ -1097,6 +1099,16 @@ export const zhHant = defineLocale({
         selectedMessage: backend => `終端命令現在透過 ${backend} 執行。將套用於新工作階段。`,
         failedSelect: backend => `選擇 ${backend} 失敗`,
         needsSetupHint: '現在即可選擇此後端——但在完成設定前命令將會失敗。'
+      },
+      browserRealProfile: {
+        label: '使用我的真實瀏覽器設定檔',
+        description:
+          '將預設瀏覽器的登入資訊與 Cookie 複製到受管理的快照中，代理使用該快照進行瀏覽。絕不會直接開啟你的真實設定檔。將套用於新工作階段。',
+        enabledTitle: '真實設定檔瀏覽：已開啟',
+        enabledMessage: '新工作階段將使用預設瀏覽器設定檔的快照進行瀏覽。',
+        disabledTitle: '真實設定檔瀏覽：已關閉',
+        disabledMessage: '設定檔快照將被刪除；新工作階段使用乾淨的瀏覽器。',
+        failedSave: '無法儲存真實設定檔設定'
       }
     }
   },
@@ -1528,6 +1540,7 @@ export const zhHant = defineLocale({
     defaultBadge: '預設',
     rename: '重新命名',
     renameMenu: '重新命名…',
+    exportMenu: '匯出…',
     editSoul: '編輯 SOUL.md…',
     copySetup: '複製安裝指令',
     copying: '複製中…',
@@ -1829,7 +1842,7 @@ export const zhHant = defineLocale({
       removeFolder: '移除',
       create: '建立',
       menu: '動作',
-      menuRename: '重新命名',
+      menuRename: '重新命名…',
       menuAppearance: '外觀',
       noColor: '無顏色',
       menuAddFolder: '新增資料夾',
@@ -1888,7 +1901,7 @@ export const zhHant = defineLocale({
       copyId: '複製 ID',
       export: '匯出',
       branchFrom: '分支',
-      rename: '重新命名',
+      rename: '重新命名…',
       archive: '封存',
       newWindow: '新視窗',
       openInTerminal: '在終端機中開啟',
