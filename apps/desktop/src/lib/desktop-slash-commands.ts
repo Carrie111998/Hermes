@@ -55,6 +55,7 @@ export interface DesktopThemeCommandOption {
 export type DesktopActionId =
   | 'branch'
   | 'browser'
+  | 'btw'
   | 'compress'
   | 'handoff'
   | 'hatch'
@@ -238,6 +239,17 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     description: 'Compress this conversation context',
     aliases: ['/compact'],
     surface: action('compress'),
+    argumentMode: 'text'
+  },
+  // /btw must be an action wired to the prompt.btw RPC, not exec: the slash
+  // worker runs the CLI's console variant, which prints the answer to the
+  // worker's stdout — the desktop never sees it, so the acknowledgement is
+  // the last thing the user gets (#99065). The answer arrives as a
+  // btw.complete gateway event rendered by the event dispatcher.
+  {
+    name: '/btw',
+    description: 'Ask a side question about this conversation without interrupting it',
+    surface: action('btw'),
     argumentMode: 'text'
   },
   {

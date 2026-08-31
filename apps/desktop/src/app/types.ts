@@ -53,6 +53,13 @@ export interface BrowserManageResponse {
   messages?: string[]
 }
 
+/** Response from the `prompt.btw` RPC: the backend starts answering against a
+ *  snapshot of the live conversation and the answer itself arrives later as a
+ *  `btw.complete` gateway event. */
+export interface PromptBtwResponse {
+  task_id?: string
+}
+
 /** Response from the `session.compress` RPC. `messages` is the post-compress
  *  history (same shape `session.resume` returns via `_history_to_messages`),
  *  so the desktop can replace its transcript from it rather than leaving stale

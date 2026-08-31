@@ -78,6 +78,37 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
     return true
   }
 
+  if (event.type === 'btw.complete') {
+    // Answer to a /btw side question (prompt.btw RPC): the backend finished
+    // the one-shot auxiliary call against the conversation snapshot. The CLI
+    // prints it as a panel and the Ink TUI as a system line; without this
+    // handler the desktop showed only the acknowledgement and the answer
+    // vanished (#99065). Persistent system message, not a toast — the whole
+    // point of the question is to read the answer.
+    const text = coerceGatewayText(payload?.text).trim()
+
+    if (text && sessionId) {
+      const question = coerceGatewayText((payload as { question?: string } | undefined)?.question).trim()
+      const header = question ? `💬 btw "${question}"` : '💬 btw'
+
+      flushQueuedDeltas(sessionId)
+      updateSessionState(sessionId, state => ({
+        ...state,
+        messages: [
+          ...state.messages,
+          {
+            id: `btw-complete-${Date.now()}`,
+            role: 'system',
+            parts: [textPart([header, text].join('\n'), occurredAt)],
+            timestamp: occurredAt
+          }
+        ]
+      }))
+    }
+
+    return true
+  }
+
   if (event.type === 'notification.show') {
     // Driver-agnostic agent notice (credits usage/grant/depleted/restored
     // from `agent/credits_tracker.py`). The Ink TUI renders these in its

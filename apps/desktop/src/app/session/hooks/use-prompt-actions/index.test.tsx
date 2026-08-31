@@ -616,6 +616,103 @@ describe('usePromptActions /wake', () => {
   })
 })
 
+describe('usePromptActions /btw', () => {
+  beforeEach(() => {
+    setSessions(() => [sessionInfo()])
+  })
+
+  afterEach(() => {
+    cleanup()
+    clearNotifications()
+    setMessages([])
+    vi.restoreAllMocks()
+  })
+
+  it('routes through prompt.btw (not the slash worker) and acknowledges', async () => {
+    const seeds: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.btw') {
+        return { task_id: 'btw_abc123' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => seeds.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/btw which file did that error come from?')
+
+    expect(requestGateway).toHaveBeenCalledWith('prompt.btw', {
+      session_id: RUNTIME_SESSION_ID,
+      text: 'which file did that error come from?'
+    })
+    expect(requestGateway).not.toHaveBeenCalledWith('slash.exec', expect.anything())
+    expect(requestGateway).not.toHaveBeenCalledWith('command.dispatch', expect.anything())
+    expect(
+      renderedSeedTexts(seeds).some(text => text.includes('answering from a conversation snapshot'))
+    ).toBe(true)
+  })
+
+  it('prints usage for a bare /btw without calling the gateway', async () => {
+    const requestGateway = vi.fn(async () => ({}) as never)
+    const seeds: Record<string, unknown>[] = []
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => seeds.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/btw')
+
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.btw', expect.anything())
+    expect(renderedSeedTexts(seeds).some(text => text.includes('usage: /btw'))).toBe(true)
+  })
+
+  it('falls back to the slash worker when an older gateway lacks prompt.btw', async () => {
+    const seeds: Record<string, unknown>[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.btw') {
+        throw new Error('method not found: prompt.btw')
+      }
+
+      if (method === 'slash.exec') {
+        return { output: '💬 Side question: "legacy"' } as never
+      }
+
+      throw new Error(`unexpected method: ${method}`)
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => seeds.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/btw why did it fail?')
+
+    expect(requestGateway).toHaveBeenCalledWith('slash.exec', expect.objectContaining({ command: 'btw why did it fail?' }))
+  })
+})
+
 describe('usePromptActions /compress', () => {
   beforeEach(() => {
     setSessions(() => [sessionInfo()])

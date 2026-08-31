@@ -99,6 +99,9 @@ describe('desktop slash command curation', () => {
     expect(desktopSlashCommandArgumentMode('/bg')).toBe('text')
     expect(isDesktopSlashCommand('/btw')).toBe(true)
     expect(desktopSlashCommandArgumentMode('/btw')).toBe('text')
+    // /btw owns a dedicated prompt.btw action — the slash worker's CLI variant
+    // prints the answer to stdout where the desktop can't see it (#99065).
+    expect(resolveDesktopCommand('/btw')?.surface).toEqual({ kind: 'action', action: 'btw' })
     expect(resolveDesktopCommand('/lcm')?.surface).toEqual({ kind: 'exec' })
     expect(desktopSlashCommandArgumentMode('/lcm')).toBe('text')
   })
@@ -234,7 +237,6 @@ describe('desktop slash command curation', () => {
   it('still routes commands without dedicated RPCs through exec()', () => {
     const execNames = [
       '/bg',
-      '/btw',
       '/debug',
       '/goal',
       '/personality',

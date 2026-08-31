@@ -56,6 +56,7 @@ import {
 import type {
   BrowserManageResponse,
   ClientSessionState,
+  PromptBtwResponse,
   SessionCompressResponse,
   SessionTitleResponse,
   SlashExecResponse
@@ -661,6 +662,50 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           } finally {
             compressInFlightRef.current.delete(sessionId)
+          }
+        },
+        // /btw runs against the live session agent via prompt.btw (the TUI's
+        // path). The RPC returns immediately with a task id; the answer is
+        // emitted asynchronously as a btw.complete event that the gateway-event
+        // dispatcher renders into the transcript. Routing through slash.exec
+        // instead would run the CLI's console variant inside the slash worker,
+        // where the answer only ever reaches the worker's stdout (#99065).
+        btw: async ctx => {
+          const question = ctx.arg.trim()
+
+          if (!question) {
+            const resolved = await withSlashOutput(ctx)
+
+            resolved?.render('usage: /btw <question> — answers without interrupting the current work')
+
+            return
+          }
+
+          const resolved = await withSlashOutput(ctx)
+
+          if (!resolved) {
+            return
+          }
+
+          const { render: renderSlashOutput, sessionId } = resolved
+
+          try {
+            await requestGateway<PromptBtwResponse>('prompt.btw', {
+              session_id: sessionId,
+              text: question
+            })
+
+            renderSlashOutput(`💬 answering from a conversation snapshot: "${question}"`)
+          } catch (err) {
+            // Older gateway without the RPC — keep the once-working worker
+            // path instead of a hard "method not found".
+            if (isMissingRpcMethod(err)) {
+              await runExec(ctx)
+
+              return
+            }
+
+            renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           }
         },
         // /yolo maps to the status-bar YOLO control — a per-session approval
