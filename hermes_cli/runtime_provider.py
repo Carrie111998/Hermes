@@ -804,11 +804,17 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 # Found match by provider key
                 base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
                 if base_url:
+                    # Read both model and default_model: the CLI setup flow
+                    # writes default_model (model_setup_flows.py:1769) while
+                    # the Desktop custom-endpoint panel writes model
+                    # (web_server.py:8475).  Prefer model if present, fall
+                    # back to default_model (#96855).
+                    _resolved_model = entry.get("model") or entry.get("default_model", "")
                     result = {
                         "name": entry.get("name", ep_name),
                         "base_url": base_url.strip(),
                         "api_key": resolved_api_key,
-                        "model": entry.get("default_model", ""),
+                        "model": _resolved_model,
                     }
                     extra_body = entry.get("extra_body")
                     if isinstance(extra_body, dict):
