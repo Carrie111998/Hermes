@@ -1296,7 +1296,12 @@ class BuzzAdapter(BasePlatformAdapter):
         cache[pubkey] = (time.monotonic(), name)
         return name
 
-    async def _mention_pubkeys_for(self, chat_id: str, content: str) -> List[str]:
+    async def _mention_pubkeys_for(
+        self,
+        chat_id: str,
+        content: str,
+        excluded_names: Optional[set[str]] = None,
+    ) -> List[str]:
         """Resolve ``@Name`` references in *content* to member pubkeys.
 
         The CLI hard-fails a publish when any @token fails to resolve to a
@@ -1323,12 +1328,15 @@ class BuzzAdapter(BasePlatformAdapter):
             return []
         by_name: Dict[str, List[str]] = {}
         display: Dict[str, str] = {}
+        exclusions = excluded_names or set()
         self_pk = getattr(self, "_self_pubkey", None)
         for pk in await self._channel_member_pubkeys(chat_id):
             if pk == self_pk:
                 continue
             name = await self._profile_display_name(pk)
             if not name:
+                continue
+            if unicodedata.normalize("NFKC", name).casefold() in exclusions:
                 continue
             key = name.lower()
             by_name.setdefault(key, [])
@@ -1460,7 +1468,11 @@ class BuzzAdapter(BasePlatformAdapter):
             if _has_complete_mention(content, name):
                 protected_names.add(key)
                 protected_pubkeys.append(pubkey)
-        mention_pubkeys = await self._mention_pubkeys_for(chat_id, content)
+        mention_pubkeys = await self._mention_pubkeys_for(
+            chat_id,
+            content,
+            protected_names,
+        )
         code, out, err = await self._run_message_send(
             args,
             content,
