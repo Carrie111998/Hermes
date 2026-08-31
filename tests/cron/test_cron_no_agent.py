@@ -255,6 +255,63 @@ def test_run_job_script_path_traversal_still_blocked(hermes_env):
     assert "Blocked" in output or "outside" in output
 
 
+def test_bash_script_argument_renders_windows_paths_without_backslashes(hermes_env):
+    """Regression (#99303): MSYS2/Git Bash re-parses the Windows command line
+    with POSIX shell quoting rules, where an unquoted backslash is an escape
+    character. A native Windows path handed to bash as argv therefore arrives
+    with every separator stripped (``C:\\Users\\...\\watch.sh`` ->
+    ``C:UsersUser...watch.sh``) and the script fails with exit 127. Python's
+    ``list2cmdline`` only quotes arguments containing spaces, so the path
+    cannot rely on quoting. The argument must be rendered in POSIX form."""
+    from cron.scheduler import _bash_script_argument
+
+    win = pathlib.PureWindowsPath(
+        "C:/Users/User/AppData/Local/hermes/profiles/jose/scripts/watch.sh"
+    )
+    native = str(win)
+    # Pin the premise: pathlib's native Windows rendering is backslash-form,
+    # i.e. exactly the value a bare ``str(path)`` used to hand to bash.
+    assert "\\" in native
+    arg = _bash_script_argument(win)
+    assert "\\" not in arg
+    assert arg == "C:/Users/User/AppData/Local/hermes/profiles/jose/scripts/watch.sh"
+
+
+def test_run_job_script_hands_bash_a_posix_script_path(hermes_env, monkeypatch):
+    """End-to-end guard for the #99303 fix: whatever the host platform, the
+    script path in the bash argv must never contain a backslash. On POSIX
+    this pins the contract; on the Windows CI runners it exercises the real
+    backslash path that bash previously mangled."""
+    import cron.scheduler as scheduler_module
+    from unittest.mock import MagicMock
+
+    script_path = hermes_env / "scripts" / "watch.sh"
+    script_path.write_text("#!/bin/bash\necho ok\n")
+
+    monkeypatch.setattr(
+        scheduler_module.shutil, "which", lambda name: "/bin/bash" if name == "bash" else None
+    )
+
+    captured: dict = {}
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = list(argv)
+        proc = MagicMock()
+        proc.communicate.return_value = ("ok", "")
+        proc.returncode = 0
+        return proc
+
+    monkeypatch.setattr(scheduler_module.subprocess, "Popen", fake_popen)
+
+    ok, output = scheduler_module._run_job_script("watch.sh")
+    assert ok is True, output
+
+    argv = captured["argv"]
+    assert argv[0] == "/bin/bash"
+    assert "\\" not in argv[1], f"bash argv carries a native Windows path: {argv[1]!r}"
+    assert argv[1] == script_path.as_posix()
+
+
 def test_run_job_script_nul_path_fails_cleanly(hermes_env):
     """Sibling of the lifecycle-guard ingestion fix: a NUL-bearing script
     value can survive to fire time (the creation-time guard treats it as

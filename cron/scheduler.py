@@ -4269,6 +4269,21 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _bash_script_argument(path: Path) -> str:
+    """Render a script path as the argument handed to bash.
+
+    MSYS2/Git Bash re-parses the Windows command line with POSIX shell
+    quoting rules, where an unquoted backslash is an escape character:
+    a native ``str(path)`` like ``C:\\Users\\...\\watch.sh`` arrives at
+    bash with every separator stripped (``C:UsersUser...watch.sh``) and
+    fails with exit 127 (#99303). Python's ``list2cmdline`` only quotes
+    arguments containing spaces, so the path cannot rely on quoting
+    either. Forward slashes are accepted by MSYS2 and native Windows
+    APIs alike, and are a no-op on POSIX.
+    """
+    return path.as_posix()
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -4378,7 +4393,7 @@ def _run_job_script(
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        argv = [_bash, _bash_script_argument(path)]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
