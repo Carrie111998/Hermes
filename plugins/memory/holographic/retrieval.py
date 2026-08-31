@@ -616,7 +616,11 @@ class FactRetriever:
         # accidentally creating a malformed query.
         _FTS_SPECIAL = '"()*^:-+'
         tokens: list[str] = []
-        for raw in query.lower().split():
+        # FTS5's unicode61 tokenizer treats -, /, _ as separators, so
+        # "llama-swap" is indexed as ("llama", "swap"). Deleting the
+        # hyphen here would query "llamaswap" — a token that can never
+        # exist in the index. Split on the same separators instead.
+        for raw in query.lower().translate(str.maketrans("-/_", "   ")).split():
             cleaned = raw.strip(".,;:!?\"'()[]{}#@<>") .translate(
                 str.maketrans("", "", _FTS_SPECIAL)
             )
