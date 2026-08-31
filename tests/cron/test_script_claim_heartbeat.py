@@ -425,6 +425,7 @@ def test_initially_lost_fire_claim_finishes_execution_without_running(monkeypatc
         "stale-execution",
         success=False,
         error="Fire claim ownership lost before execution started.",
+        api_calls=0,
     )
 
 
@@ -476,6 +477,7 @@ def test_initial_heartbeat_exception_does_not_start_execution(monkeypatch):
         "validation-execution",
         success=False,
         error="Fire claim ownership could not be validated before execution started.",
+        api_calls=0,
     )
 
 
@@ -506,6 +508,7 @@ def test_heartbeat_thread_start_failure_does_not_start_execution(monkeypatch):
         "thread-execution",
         success=False,
         error="Fire claim heartbeat could not be started; execution was not run.",
+        api_calls=0,
     )
 
 
@@ -577,4 +580,5 @@ def test_terminal_owner_cas_failure_marks_ledger_ownership_lost(monkeypatch):
         "execution-cas",
         success=False,
         error="Fire claim ownership lost before terminal completion.",
+        api_calls=0,
     )

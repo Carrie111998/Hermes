@@ -90,13 +90,21 @@ class TestBackgroundDispatch:
         the job outcome onto process_registry.completion_queue."""
         import time
 
+        from cron import scheduler as sched
         from tools.process_registry import process_registry
+
+        def measured_run(_job, **_kw):
+            sched._cron_execution_usage.get()["api_calls"] = 6
+            return True
 
         # The runner executes on a daemon thread — the patches must stay
         # active until the completion event lands, so poll INSIDE the blocks.
         with _bound_session_key("agent:main:telegram:dm:777"):
             with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
-                 patch("cron.scheduler.run_one_job", return_value=True), \
+                 patch(
+                     "cron.scheduler.run_one_job",
+                     side_effect=measured_run,
+                 ), \
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None,
                                      "next_run_at": "2026-08-07T09:00:00"}):
@@ -119,6 +127,7 @@ class TestBackgroundDispatch:
         assert found is not None, "completion event never reached the queue"
         assert found["session_key"] == "agent:main:telegram:dm:777"
         assert found["status"] == "completed"
+        assert found["api_calls"] == 6
         assert "bg run" in (found.get("summary") or "")
         assert "Next scheduled run" in found["summary"]
 
@@ -212,6 +221,7 @@ class TestInFlightDedupe:
                 res = _run_claimed_job(_job('job-bg-08'))
             assert res["success"] is False
             assert "already running" in res["error"]
+            assert res["api_calls"] == 0
             m_run.assert_not_called()
         finally:
             sched.release_running_job("job-bg-08")
@@ -226,6 +236,7 @@ class TestInFlightDedupe:
 
         def probe_run(job, **kw):
             seen_during_run["registered"] = "job-bg-09" in sched.get_running_job_ids()
+            sched._cron_execution_usage.get()["api_calls"] = 2
             return True
 
         with patch("cron.scheduler.run_one_job", side_effect=probe_run), \
@@ -234,8 +245,29 @@ class TestInFlightDedupe:
             res = _run_claimed_job(_job('job-bg-09'))
 
         assert res["success"] is True
+        assert res["api_calls"] == 2
         assert seen_during_run["registered"] is True
         assert "job-bg-09" not in sched.get_running_job_ids()   # released after
+
+    def test_run_claimed_job_preserves_usage_when_refresh_fails(self):
+        from cron import scheduler as sched
+        from tools.cronjob_tools import _run_claimed_job
+
+        def measured_run(_job, **_kw):
+            sched._cron_execution_usage.get()["api_calls"] = 5
+            return True
+
+        with patch("cron.scheduler.run_one_job", side_effect=measured_run), \
+             patch(
+                 "tools.cronjob_tools.get_job",
+                 side_effect=OSError("refresh unavailable"),
+             ):
+            res = _run_claimed_job(_job("job-bg-refresh-error"))
+
+        assert res["success"] is False
+        assert res["api_calls"] == 5
+        assert "refresh unavailable" in res["error"]
+        assert "job-bg-refresh-error" not in sched.get_running_job_ids()
 
     def test_background_dispatch_reports_running_job_immediately(self):
         """The dispatch path pre-checks the running set so a mid-run job
@@ -250,6 +282,7 @@ class TestInFlightDedupe:
                     res = _try_dispatch_background_run(_job('job-bg-10'))
             assert res["claimed"] is False
             assert "already running" in res["error"]
+            assert res["api_calls"] == 0
             m_claim.assert_not_called()   # no claim consumed for a skipped run
             m_disp.assert_not_called()
         finally:
@@ -294,15 +327,25 @@ class TestCronjobRunToolIntegration:
     def test_run_action_sync_path_unchanged_without_session(self):
         """No session context → the legacy synchronous behavior (executed +
         execution_success populated from the completed run)."""
+        from cron import scheduler as sched
+
+        def measured_run(_job, **_kw):
+            sched._cron_execution_usage.get()["api_calls"] = 3
+            return True
+
         ran = {"job": "after-run", "last_status": "ok", "last_error": None}
         with patch("tools.cronjob_tools.resolve_job_ref", return_value=_job('job-bg-13')), \
              patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}) as m_claim, \
-             patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
+             patch(
+                 "cron.scheduler.run_one_job",
+                 side_effect=measured_run,
+             ) as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=ran):
             out = json.loads(cronjob(action="run", job_id="job-bg-13"))
 
         assert out["success"] is True
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
+        assert out["job"]["execution_api_calls"] == 3
         m_claim.assert_called_once_with("job-bg-13", return_job=True)
         m_run.assert_called_once()

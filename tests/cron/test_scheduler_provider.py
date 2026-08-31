@@ -20,6 +20,8 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
     """Block until ``predicate()`` is truthy or ``timeout`` elapses.
@@ -443,11 +445,23 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
 def test_fire_due_lost_claim_does_not_run(monkeypatch):
     """If the CAS claim is lost (another machine/retry won), fire_due returns
     False and never runs the job."""
+    import cron.executions as executions
     import cron.jobs as jobs
     import cron.scheduler as sched
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
+    finished = []
+    monkeypatch.setattr(
+        executions,
+        "create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-lost-claim"},
+    )
+    monkeypatch.setattr(
+        executions,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
     monkeypatch.setattr(
         jobs,
         "claim_job_for_fire",
@@ -458,6 +472,53 @@ def test_fire_due_lost_claim_does_not_run(monkeypatch):
 
     assert InProcessCronScheduler().fire_due("j1") is False
     assert ran == []
+    assert finished == [
+        (
+            "exec-lost-claim",
+            {
+                "success": False,
+                "error": "Fire claim was not acquired",
+                "api_calls": 0,
+            },
+        )
+    ]
+
+
+def test_fire_due_claim_exception_finishes_zero_usage(monkeypatch):
+    import cron.executions as executions
+    import cron.jobs as jobs
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    finished = []
+    monkeypatch.setattr(
+        executions,
+        "create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-claim-error"},
+    )
+    monkeypatch.setattr(
+        executions,
+        "finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+    monkeypatch.setattr(
+        jobs,
+        "claim_job_for_fire",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("store unavailable")),
+    )
+
+    with pytest.raises(OSError, match="store unavailable"):
+        InProcessCronScheduler().fire_due("j1")
+
+    assert finished == [
+        (
+            "exec-claim-error",
+            {
+                "success": False,
+                "error": "Fire claim failed before dispatch: OSError: store unavailable",
+                "api_calls": 0,
+            },
+        )
+    ]
 
 
 def test_fire_due_missing_job_does_not_run(monkeypatch):

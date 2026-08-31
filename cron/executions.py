@@ -55,9 +55,19 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              claimed_at TEXT NOT NULL,
              started_at TEXT,
              finished_at TEXT,
-             error TEXT
+             error TEXT,
+             api_calls INTEGER
            )"""
     )
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(executions)")
+    }
+    if "api_calls" not in columns:
+        from hermes_cli.sqlite_util import add_column_if_missing
+
+        add_column_if_missing(
+            conn, "executions", "api_calls", "api_calls INTEGER"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -181,6 +191,7 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
+    api_calls: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
     now = _hermes_now().isoformat()
@@ -188,9 +199,9 @@ def finish_execution(
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
         cur = conn.execute(
-            """UPDATE executions SET status=?, finished_at=?, error=?
+            """UPDATE executions SET status=?, finished_at=?, error=?, api_calls=?
                WHERE id=? AND status IN ('claimed','running')""",
-            (status, now, detail, execution_id),
+            (status, now, detail, api_calls, execution_id),
         )
         if cur.rowcount != 1:
             return None

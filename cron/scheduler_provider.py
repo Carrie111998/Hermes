@@ -219,6 +219,7 @@ class CronScheduler(ABC):
                 execution["id"],
                 success=False,
                 error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
+                api_calls=0,
             )
             raise
         if not isinstance(claimed_job, dict):
@@ -226,6 +227,7 @@ class CronScheduler(ABC):
                 execution["id"],
                 success=False,
                 error="Fire claim was not acquired",
+                api_calls=0,
             )
             return None
         claimed_job["execution_id"] = execution["id"]
