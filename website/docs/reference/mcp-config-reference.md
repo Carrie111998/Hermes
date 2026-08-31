@@ -64,7 +64,7 @@ mcp_servers:
 | `idle_timeout_seconds` | number | stdio | Optional stdio server recycle after idle time (`0` disables). May also live under a `lifecycle:` mapping |
 | `max_lifetime_seconds` | number | stdio | Optional stdio server recycle after age (`0` disables). May also live under a `lifecycle:` mapping |
 | `tools` | mapping | both | Filtering and utility-tool policy |
-| `auth` | string | HTTP | Authentication method. `oauth` = OAuth 2.1 PKCE (browser login). `service_account` = M2M client-credentials exchange (see below). |
+| `auth` | string | HTTP | Authentication method. `oauth` = OAuth 2.1 PKCE (browser login). `service_account` = machine-to-machine token exchange, strategy chosen by `service_account.grant_type` (see below). |
 | `service_account` | mapping | HTTP | Service-account config block (required when `auth: service_account`). See `service_account` sub-keys below. |
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 | `elicitation` | mapping | both | Server-initiated user-input requests. `enabled` (default `true`) and `timeout` in seconds (default `300`). Form-mode requests route through the approval surface; URL-mode is declined (see MCP guide) |
@@ -384,7 +384,15 @@ mcp_servers:
 
 For HTTP MCP servers that authenticate machine identities rather than human users, use `auth: service_account`. This is distinct from `auth: oauth` (which opens a browser window for user login) — no browser interaction is needed. Hermes exchanges a long-lived service-account credential for a short-lived Bearer access token and renews it automatically.
 
-This is a generic OAuth 2.0 `client_credentials`-style exchange. Any identity provider that accepts the grant type works — the example below uses Authentik, but the same config works with any compatible IdP.
+The grant strategy is selected explicitly by `service_account.grant_type` and is never inferred from which fields you happen to set. One strategy is implemented today:
+
+| `grant_type` | What it does |
+|---|---|
+| `authentik_app_password` | Authentik's service-account extension: posts `grant_type=client_credentials` **plus** a resource-owner `username`/`password` pair. |
+
+:::caution Not a generic client-credentials client
+`authentik_app_password` is a provider extension that reuses the `client_credentials` wire name. It is **not** the RFC 6749 §4.4.2 client-credentials request, which carries no username or password. Identity providers whose M2M flow is plain client authentication — Keycloak service accounts, Auth0 M2M — do not work with this strategy. Support for a standards-conforming `client_credentials` strategy would be an additive change; for those providers today, use a static token via `headers:` instead.
+:::
 
 ```yaml
 mcp_servers:
@@ -392,6 +400,7 @@ mcp_servers:
     url: https://mcp.example.com/mcp
     auth: service_account
     service_account:
+      grant_type: authentik_app_password         # required — no default
       token_url: https://idp.example.com/application/o/toolhive/token/
       client_id: toolhive
       username: zug
@@ -411,10 +420,11 @@ AUTHENTIK_ZUG_APP_PASSWORD=your-app-password-here
 
 | Key | Required | Meaning |
 |---|---|---|
-| `token_url` | yes | OAuth token endpoint URL (`https://` required) |
+| `grant_type` | yes | Grant strategy. Only `authentik_app_password` is supported; there is no default |
+| `token_url` | yes | OAuth token endpoint URL. **`https://` is required** and enforced — an `http://` value is rejected at config validation and again immediately before every token request |
 | `client_id` | yes | Client ID registered at the IdP |
-| `username` | yes | Service-account username |
-| `password_env` | yes | Name of the environment variable holding the password |
+| `username` | yes | Service-account username (`authentik_app_password` only) |
+| `password_env` | yes | Name of the environment variable holding the password (`authentik_app_password` only) |
 | `scope` | no | Space-separated OAuth scopes to request |
 | `client_secret_env` | no | Name of the environment variable holding the optional client secret |
 
@@ -427,6 +437,11 @@ AUTHENTIK_ZUG_APP_PASSWORD=your-app-password-here
 - Concurrent requests share a single in-process lock so only one token exchange fires at a time.
 - Passwords and access tokens are never logged or written to `config.yaml`.
 - TLS verification is always on; there is no option to disable it for service-account auth.
+- **Token-endpoint redirects are not followed.** A `307`/`308` preserves the method and body, so following one would replay the password — and the client secret — at an origin your config never authorised. Any `3xx` from `token_url` is reported as an error; point `token_url` at the authorization server's final token endpoint.
+
+### Credential rotation
+
+The password is read from the environment on every token exchange, but editing `$HERMES_HOME/.env` does **not** change an already-running process's environment. Rotating a service-account password therefore requires restarting Hermes (or the gateway); automatic token renewal renews the *access token*, not the source credential. Until the restart, renewal and reconnect keep presenting the old password.
 
 ### Setting up via CLI
 
@@ -448,7 +463,7 @@ Because the password is read from an environment variable, `hermes mcp add` will
 | Mode | When to use |
 |---|---|
 | `auth: oauth` | Human user login via browser (PKCE). IdP manages sessions. |
-| `auth: service_account` | Machine identity (M2M). Long-lived app password exchanged for short-lived Bearer token. No browser. |
+| `auth: service_account` | Machine identity (M2M) against Authentik. Long-lived app password exchanged for short-lived Bearer token. No browser. |
 | `headers:` with `${VAR}` | Static API key injected directly (no exchange, no expiry). |
 
 ## Add to Hermes link

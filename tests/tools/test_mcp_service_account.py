@@ -26,7 +26,9 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
+import types
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -41,6 +43,7 @@ import pytest
 
 def _make_sa_config(
     *,
+    grant_type: str | None = "authentik_app_password",
     token_url: str = "https://idp.example/token/",
     client_id: str = "toolhive",
     username: str = "zug",
@@ -55,6 +58,10 @@ def _make_sa_config(
         "password_env": password_env,
         "scope": scope,
     }
+    # ``grant_type=None`` builds a config that omits the discriminator, so
+    # tests can assert it is required rather than defaulted.
+    if grant_type is not None:
+        cfg["grant_type"] = grant_type
     if client_secret_env:
         cfg["client_secret_env"] = client_secret_env
     return cfg
@@ -115,11 +122,25 @@ class TestValidateServiceAccountConfig:
         assert validate_service_account_config("srv", cfg) == []
 
     def test_missing_required_fields(self):
+        """An empty config reports the discriminator and the common fields.
+
+        Per-strategy fields (username/password_env) are deliberately *not*
+        reported here: without a grant_type there is no strategy yet, so the
+        validator cannot know which extra fields apply. Naming them anyway
+        would re-introduce the inference this schema exists to remove.
+        """
         from tools.mcp_service_account import validate_service_account_config
 
         errors = validate_service_account_config("srv", {})
+        assert any("grant_type" in e for e in errors)
         assert any("token_url" in e for e in errors)
         assert any("client_id" in e for e in errors)
+
+    def test_missing_grant_type_specific_fields(self):
+        from tools.mcp_service_account import validate_service_account_config
+
+        cfg = {"grant_type": "authentik_app_password"}
+        errors = validate_service_account_config("srv", cfg)
         assert any("username" in e for e in errors)
         assert any("password_env" in e for e in errors)
 
@@ -149,6 +170,220 @@ class TestValidateServiceAccountConfig:
 
         errors = validate_service_account_config("srv", "string")  # type: ignore
         assert errors
+
+
+# ---------------------------------------------------------------------------
+# Credential-egress boundary: the token endpoint is the ONLY secret sink
+# ---------------------------------------------------------------------------
+
+
+class TestTokenEndpointIsTheCredentialBoundary:
+    """The token request carries the service-account password.
+
+    Two properties keep that credential pinned to exactly the sink the config
+    proves: the endpoint must be https://, and a redirect away from it is
+    never followed.
+    """
+
+    def test_plaintext_http_token_url_rejected_at_validation(self):
+        from tools.mcp_service_account import validate_service_account_config
+
+        cfg = _make_sa_config(token_url="http://idp.example/token/")
+        errors = validate_service_account_config("srv", cfg)
+        assert any("token_url" in e for e in errors), (
+            "http:// token_url must be rejected — it would put the "
+            "service-account password on the wire in the clear"
+        )
+
+    def test_build_refuses_plaintext_http_token_url(self):
+        from tools.mcp_service_account import build_service_account_auth
+
+        cfg = _make_sa_config(token_url="http://idp.example/token/")
+        with pytest.raises(ValueError, match="token_url"):
+            build_service_account_auth("srv", cfg)
+
+    @pytest.mark.asyncio
+    async def test_post_refuses_plaintext_http_even_if_validation_bypassed(self):
+        """Consumption-time guard, not just a validation-time one.
+
+        A caller can construct ServiceAccountAuth directly, or mutate the
+        config after validation. The last check before the credential leaves
+        the process must stand on its own.
+        """
+        from tools.mcp_service_account import _post_token_request
+
+        client = _FakeHttpxClient([_FakeResponse(200, _fake_token_response())])
+        with pytest.raises(ValueError, match="non-https"):
+            await _post_token_request(
+                client,
+                "http://idp.example/token/",
+                {"password": "hunter2"},
+                "srv",
+            )
+        assert client.calls == [], "No request may be issued to a plaintext endpoint"
+
+    @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+    @pytest.mark.asyncio
+    async def test_redirect_from_token_endpoint_is_not_followed(self, status):
+        """307/308 preserve method and body — following one replays the password.
+
+        The fake client returns the redirect rather than transparently
+        chasing it, mirroring follow_redirects=False. Exactly one request must
+        have been made, to the configured origin only.
+        """
+        from tools.mcp_service_account import _post_token_request
+
+        client = _FakeHttpxClient([_FakeResponse(status, {})])
+        with pytest.raises(ValueError, match="redirect"):
+            await _post_token_request(
+                client,
+                "https://idp.example/token/",
+                {"grant_type": "client_credentials", "password": "hunter2"},
+                "srv",
+            )
+
+        assert len(client.calls) == 1, "The form must not be replayed after a 3xx"
+        assert client.calls[0]["url"] == "https://idp.example/token/"
+
+    @pytest.mark.asyncio
+    async def test_redirect_error_does_not_leak_the_location_or_password(self):
+        from tools.mcp_service_account import _post_token_request
+
+        client = _FakeHttpxClient([_FakeResponse(307, {})])
+        with pytest.raises(ValueError) as exc:
+            await _post_token_request(
+                client,
+                "https://idp.example/token/",
+                {"password": "hunter2"},
+                "srv",
+            )
+        assert "hunter2" not in str(exc.value)
+        assert "evil.example" not in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_token_client_is_built_with_redirects_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        """The live auth flow must construct its client with follow_redirects=False.
+
+        Asserted at the construction site because the fake client in the other
+        tests cannot itself prove which flag the real one was given.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("TEST_SA_PASSWORD", "hunter2")
+
+        from tools.mcp_service_account import (
+            ServiceAccountAuth,
+            _clear_refresh_locks_for_tests,
+        )
+
+        _clear_refresh_locks_for_tests()
+        auth = ServiceAccountAuth("srv", _make_sa_config(), hermes_home=tmp_path)
+
+        captured_kwargs: list[dict] = []
+
+        def _fake_async_client(**kwargs):
+            captured_kwargs.append(kwargs)
+            return _FakeHttpxClient([])
+
+        fake_httpx = types.SimpleNamespace(AsyncClient=_fake_async_client)
+
+        async def _ok_post(http_client, token_url, form, server_name):
+            return _fake_token_response("TOK")
+
+        with patch.dict(sys.modules, {"httpx2": fake_httpx}):
+            with patch("tools.mcp_service_account._post_token_request", _ok_post):
+                with patch(
+                    "mcp.client.streamable_http.httpx2", fake_httpx, create=True
+                ):
+                    request = MagicMock()
+                    request.headers = {}
+                    gen = auth.async_auth_flow(request)
+                    await gen.__anext__()
+                    resp = MagicMock()
+                    resp.status_code = 200
+                    try:
+                        await gen.asend(resp)
+                    except StopAsyncIteration:
+                        pass
+
+        assert captured_kwargs, "No AsyncClient was constructed"
+        assert captured_kwargs[0].get("follow_redirects") is False
+
+
+# ---------------------------------------------------------------------------
+# Grant strategy is explicit, never inferred
+# ---------------------------------------------------------------------------
+
+
+class TestGrantStrategyIsExplicit:
+    def test_grant_type_is_required(self):
+        from tools.mcp_service_account import validate_service_account_config
+
+        cfg = _make_sa_config(grant_type=None)
+        errors = validate_service_account_config("srv", cfg)
+        assert any("grant_type" in e for e in errors), (
+            "grant_type must not be inferred from the presence of "
+            "username/password_env"
+        )
+
+    def test_unknown_grant_type_rejected(self):
+        from tools.mcp_service_account import validate_service_account_config
+
+        cfg = _make_sa_config(grant_type="client_credentials")
+        errors = validate_service_account_config("srv", cfg)
+        assert any("grant_type" in e for e in errors), (
+            "The standards-conforming client_credentials strategy is not "
+            "implemented; it must be rejected rather than silently treated "
+            "as the Authentik app-password extension"
+        )
+
+    def test_build_rejects_unknown_grant_type(self):
+        from tools.mcp_service_account import build_service_account_auth
+
+        cfg = _make_sa_config(grant_type="totally_made_up")
+        with pytest.raises(ValueError, match="grant_type"):
+            build_service_account_auth("srv", cfg)
+
+    @pytest.mark.asyncio
+    async def test_authentik_app_password_wire_witness(self, tmp_path, monkeypatch):
+        """Pin the exact form Authentik's service-account extension expects.
+
+        Authentik reuses the ``client_credentials`` wire grant name while
+        adding a resource-owner username/password pair, so the config-level
+        strategy name and the wire value deliberately differ.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("TEST_SA_PASSWORD", "hunter2")
+        monkeypatch.setenv("TEST_SA_CLIENT_SECRET", "cs3cr3t")
+
+        from tools.mcp_service_account import (
+            ServiceAccountAuth,
+            _clear_refresh_locks_for_tests,
+        )
+
+        _clear_refresh_locks_for_tests()
+        cfg = _make_sa_config(client_secret_env="TEST_SA_CLIENT_SECRET")
+        auth = ServiceAccountAuth("srv", cfg, hermes_home=tmp_path)
+
+        form = auth._build_exchange_form("hunter2", "cs3cr3t")
+
+        assert form == {
+            "grant_type": "client_credentials",
+            "client_id": "toolhive",
+            "username": "zug",
+            "password": "hunter2",
+            "scope": "openid profile",
+            "client_secret": "cs3cr3t",
+        }
+
+    def test_exchange_form_rejects_unsupported_strategy_at_runtime(self, tmp_path):
+        from tools.mcp_service_account import ServiceAccountAuth
+
+        cfg = _make_sa_config(grant_type="client_credentials")
+        auth = ServiceAccountAuth("srv", cfg, hermes_home=tmp_path)
+        with pytest.raises(ValueError, match="grant_type"):
+            auth._build_exchange_form("hunter2", None)
 
 
 # ---------------------------------------------------------------------------
