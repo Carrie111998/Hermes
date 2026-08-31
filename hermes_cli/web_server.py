@@ -792,6 +792,42 @@ def should_require_dashboard_auth(
     )
 
 
+def _is_private_desktop_backend(
+    *,
+    host: str,
+    port: int,
+    open_browser: bool,
+    ssh_session_token: Optional[str] = None,
+    ssh_owner_nonce: Optional[str] = None,
+) -> bool:
+    """Return whether this process is a Desktop-private token backend.
+
+    ``dashboard.public_url`` describes a browser-facing deployment and must
+    gate a normal loopback server behind a reverse proxy. Desktop instead owns
+    a separate no-browser server on an OS-assigned loopback port and gives it a
+    per-launch token. Applying the browser deployment's ticket-only auth mode
+    to that child rejects the Desktop token before ``/api/ws`` can start. The
+    no-browser marker covers both modern ``serve`` and the legacy
+    ``dashboard --no-open`` compatibility fallback.
+
+    Keep the exception tied to the complete private-server shape. Clearing the
+    configured public hosts for this process also keeps its Host/Origin guard
+    loopback-only, so the browser-facing proxy cannot route through this seam.
+    """
+    if (
+        open_browser
+        or port != 0
+        or host not in _LOOPBACK_HOST_VALUES
+        or os.environ.get("HERMES_DESKTOP") != "1"
+    ):
+        return False
+
+    local_token = (os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or "").strip()
+    ssh_token = (ssh_session_token or "").strip()
+    ssh_nonce = (ssh_owner_nonce or "").strip()
+    return bool(local_token or (ssh_token and ssh_nonce))
+
+
 def _host_header_hostname(host_header: str) -> str:
     """Return a normalized hostname from a valid HTTP Host authority.
 
@@ -19447,7 +19483,26 @@ def start_server(
     # request middleware never reloads config. Any non-loopback public hostname
     # engages the auth gate even when the backend itself remains on loopback;
     # otherwise the SPA's local session token would become remotely reachable.
-    app.state.trusted_public_hosts = _dashboard_public_hosts()
+    configured_public_hosts = _dashboard_public_hosts()
+    private_desktop_backend = _is_private_desktop_backend(
+        host=host,
+        port=port,
+        open_browser=open_browser,
+        ssh_session_token=ssh_session_token,
+        ssh_owner_nonce=ssh_owner_nonce,
+    )
+    if private_desktop_backend and configured_public_hosts:
+        # This ephemeral server is reachable only through its loopback
+        # authority and per-launch token. The configured public URL belongs to
+        # a separate fixed-port dashboard/serve process, which still resolves
+        # the public host below and remains gated.
+        app.state.trusted_public_hosts = frozenset()
+        _log.info(
+            "Desktop-private loopback backend: ignoring dashboard.public_url "
+            "for this ephemeral process; public dashboard auth is unchanged."
+        )
+    else:
+        app.state.trusted_public_hosts = configured_public_hosts
     # Stash the auth-gate flag on app.state so middleware / SPA-token injection /
     # WS-auth paths can branch on it consistently. It also decides whether to
     # refuse startup, log the gate-on banner, and enable uvicorn proxy_headers.

@@ -5,6 +5,7 @@ later phases can prove they didn't break loopback mode.
 """
 import asyncio
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -161,7 +162,7 @@ def test_start_server_loopback_sets_auth_required_false(monkeypatch):
     # Force a fresh state to detect that start_server actually set it.
     web_server.app.state.auth_required = None
     web_server.start_server(
-        host="127.0.0.1", port=9119,
+        host="127.0.0.1", port=0,
         open_browser=False, allow_public=False,
     )
     assert web_server.app.state.auth_required is False
@@ -371,7 +372,7 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
     )
     try:
         web_server.start_server(
-            host="127.0.0.1", port=9119,
+            host="127.0.0.1", port=0,
             open_browser=False, allow_public=False,
         )
         assert web_server.app.state.auth_required is True
@@ -379,6 +380,162 @@ def test_start_server_loopback_public_url_enables_gate(monkeypatch):
             {"dashboard.example.test"}
         )
         assert captured["kwargs"].get("host") == "127.0.0.1"
+        assert captured["kwargs"].get("proxy_headers") is True
+    finally:
+        clear_providers()
+
+
+def _desktop_private_backend_env(monkeypatch):
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "desktop-minted-token")
+
+
+def test_private_desktop_backend_keeps_token_auth_with_public_url(monkeypatch):
+    """The Desktop's ephemeral loopback child is not the public dashboard."""
+    _desktop_private_backend_env(monkeypatch)
+
+    assert web_server._is_private_desktop_backend(
+        host="127.0.0.1",
+        port=0,
+        open_browser=False,
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "host,port,open_browser",
+    [
+        ("0.0.0.0", 0, False),
+        ("127.0.0.1", 42421, False),
+        ("127.0.0.1", 0, True),
+    ],
+)
+def test_private_desktop_backend_requires_private_server_shape(
+    monkeypatch, host, port, open_browser
+):
+    """Dropping any network/lifecycle marker preserves the public auth gate."""
+    _desktop_private_backend_env(monkeypatch)
+
+    assert web_server._is_private_desktop_backend(
+        host=host,
+        port=port,
+        open_browser=open_browser,
+    ) is False
+
+
+def test_private_desktop_backend_requires_desktop_marker_and_credential(monkeypatch):
+    """An ambient Desktop marker or a credential alone is insufficient."""
+    monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "desktop-minted-token")
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    assert web_server._is_private_desktop_backend(
+        host="127.0.0.1", port=0, open_browser=False
+    ) is False
+
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+    assert web_server._is_private_desktop_backend(
+        host="127.0.0.1", port=0, open_browser=False
+    ) is False
+
+
+def test_private_desktop_ssh_backend_requires_token_and_owner_nonce(monkeypatch):
+    """The SSH variant is private only when both one-shot markers are present."""
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+
+    assert web_server._is_private_desktop_backend(
+        host="127.0.0.1",
+        port=0,
+        open_browser=False,
+        ssh_session_token="ssh-token",
+        ssh_owner_nonce="ssh-owner",
+    ) is True
+    assert web_server._is_private_desktop_backend(
+        host="127.0.0.1",
+        port=0,
+        open_browser=False,
+        ssh_session_token="ssh-token",
+    ) is False
+    assert web_server._is_private_desktop_backend(
+        host="127.0.0.1",
+        port=0,
+        open_browser=False,
+        ssh_owner_nonce="ssh-owner",
+    ) is False
+
+
+@pytest.mark.parametrize("headless", [True, False], ids=["serve", "legacy-dashboard"])
+def test_start_server_isolates_private_desktop_from_public_dashboard(
+    monkeypatch, caplog, headless
+):
+    """A public URL cannot gate modern or legacy Desktop-private children."""
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    _desktop_private_backend_env(monkeypatch)
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", "desktop-minted-token")
+    captured = _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+
+    with caplog.at_level(logging.INFO, logger=web_server._log.name):
+        web_server.start_server(
+            host="127.0.0.1",
+            port=0,
+            open_browser=False,
+            allow_public=False,
+            headless=headless,
+        )
+
+    assert web_server.app.state.auth_required is False
+    assert web_server.app.state.trusted_public_hosts == frozenset()
+    assert captured["kwargs"].get("proxy_headers") is False
+    assert "Desktop-private loopback backend" in caplog.text
+
+    query = SimpleNamespace(
+        get=lambda key, default="": {"token": "desktop-minted-token"}.get(key, default)
+    )
+    ws = SimpleNamespace(query_params=query)
+    assert web_server._ws_auth_reason(ws) == (None, "token")
+
+
+def test_fixed_port_desktop_marked_server_stays_public_url_gated(monkeypatch):
+    """Only port-zero children qualify; a proxyable fixed port stays gated."""
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+    monkeypatch.setenv(
+        "HERMES_DASHBOARD_PUBLIC_URL",
+        "https://dashboard.example.test:9443",
+    )
+    _desktop_private_backend_env(monkeypatch)
+    clear_providers()
+    register_provider(StubAuthProvider())
+    captured = _stub_uvicorn_run(monkeypatch)
+    _restore_app_state_after_test(
+        monkeypatch,
+        "auth_required",
+        "bound_host",
+        "bound_port",
+        "trusted_public_hosts",
+    )
+    try:
+        web_server.start_server(
+            host="127.0.0.1",
+            port=42421,
+            open_browser=False,
+            allow_public=False,
+            headless=True,
+        )
+        assert web_server.app.state.auth_required is True
+        assert web_server.app.state.trusted_public_hosts == frozenset({
+            "dashboard.example.test"
+        })
         assert captured["kwargs"].get("proxy_headers") is True
     finally:
         clear_providers()

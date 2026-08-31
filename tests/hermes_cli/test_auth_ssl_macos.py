@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-
+from agent.ssl_verify import CA_BUNDLE_ENV_VARS
 from hermes_cli.auth import _default_verify, _resolve_verify
 
 
@@ -73,7 +73,7 @@ class TestResolveVerifyIntegration:
 
     @pytest.mark.linux_only
     def test_no_ca_uses_default_verify_on_linux(self, monkeypatch):
-        for var in ("HERMES_CA_BUNDLE", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"):
+        for var in CA_BUNDLE_ENV_VARS:
             monkeypatch.delenv(var, raising=False)
         assert _resolve_verify() is True
 
@@ -84,3 +84,33 @@ class TestResolveVerifyIntegration:
         bundle.write_text("stub")
         monkeypatch.setenv("HERMES_CA_BUNDLE", str(bundle))
         assert _resolve_verify(insecure=True) is False
+
+    def test_env_bundle_precedence_matches_canonical_order(self, monkeypatch, tmp_path):
+        paths = {}
+        for env_var in CA_BUNDLE_ENV_VARS:
+            path = tmp_path / f"{env_var.lower()}.pem"
+            path.write_text("stub")
+            paths[env_var] = str(path)
+            monkeypatch.setenv(env_var, str(path))
+
+        seen = {}
+        sentinel = object()
+
+        def fake_context(*, cafile):
+            seen["cafile"] = cafile
+            return sentinel
+
+        monkeypatch.setattr(ssl, "create_default_context", fake_context)
+        assert _resolve_verify() is sentinel
+        assert seen["cafile"] == paths[CA_BUNDLE_ENV_VARS[0]]
+
+    def test_curl_ca_bundle_is_honoured(self, monkeypatch, tmp_path):
+        for env_var in CA_BUNDLE_ENV_VARS:
+            monkeypatch.delenv(env_var, raising=False)
+        bundle = tmp_path / "curl.pem"
+        bundle.write_text("stub")
+        monkeypatch.setenv("CURL_CA_BUNDLE", str(bundle))
+
+        sentinel = object()
+        monkeypatch.setattr(ssl, "create_default_context", lambda **kwargs: sentinel)
+        assert _resolve_verify() is sentinel

@@ -880,7 +880,8 @@ def check_certificates(should_fix: bool = False, issues: "list | None" = None) -
         if issues is not None:
             issues.append(
                 "certifi reinstall did not restore the CA bundle — check for a "
-                "custom CA env var (SSL_CERT_FILE/REQUESTS_CA_BUNDLE) pointing "
+                "custom CA env var (HERMES_CA_BUNDLE/SSL_CERT_FILE/"
+                "REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE) pointing "
                 "at a missing file, or recreate the venv."
             )
 

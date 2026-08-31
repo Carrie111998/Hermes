@@ -5,14 +5,14 @@ parent provider). Reads one JSON request from stdin, writes one JSON envelope
 to stdout, then exits.
 
 Request::
-    {"query": str, "safe_limit": int}
+    {"query": str, "safe_limit": int, "backends": str | null}
 
 Envelope::
     {"ok": true, "results": [...]}
     {"ok": false, "error": str}
 
 Optional test hooks (only when ``HERMES_DDGS_ALLOW_TEST_HOOKS=1``)::
-    {"query": ..., "safe_limit": ..., "test_hook": "sleep"|"gil"|"success"|"error"|"empty"}
+    {"query": ..., "safe_limit": ..., "test_hook": "sleep"|"gil"|"success"|"error"|"empty"|"backends"}
 """
 
 from __future__ import annotations
@@ -46,7 +46,7 @@ def _hold_gil(secs: int) -> None:
     sleep(int(secs))
 
 
-def _run_test_hook(hook: str) -> dict:
+def _run_test_hook(hook: str, request: dict) -> dict:
     if hook == "sleep":
         time.sleep(30)
         return {"ok": False, "error": "sleep hook returned unexpectedly"}
@@ -67,6 +67,18 @@ def _run_test_hook(hook: str) -> dict:
         }
     if hook == "empty":
         return {"ok": True, "results": []}
+    if hook == "backends":
+        return {
+            "ok": True,
+            "results": [
+                {
+                    "title": "Configured backends",
+                    "url": "https://example.com",
+                    "description": str(request.get("backends") or ""),
+                    "position": 1,
+                }
+            ],
+        }
     if hook == "error":
         return {"ok": False, "error": "RuntimeError: boom"}
     return {"ok": False, "error": f"unknown test_hook: {hook!r}"}
@@ -91,17 +103,21 @@ def main() -> int:
                 {"ok": False, "error": "test_hook refused (hooks not enabled)"}
             )
             return 3
-        envelope = _run_test_hook(str(hook))
+        envelope = _run_test_hook(str(hook), request)
         _write_envelope(envelope)
         return 0 if envelope.get("ok") else 1
 
     query = str(request.get("query") or "")
     safe_limit = max(1, int(request.get("safe_limit") or 1))
+    raw_backends = request.get("backends")
+    if raw_backends is not None and not isinstance(raw_backends, str):
+        _write_envelope({"ok": False, "error": "backends must be a string"})
+        return 2
     try:
         # Import inside main so script startup stays light / patchable.
         from plugins.web.ddgs.provider import _run_ddgs_search
 
-        results = _run_ddgs_search(query, safe_limit)
+        results = _run_ddgs_search(query, safe_limit, backends=raw_backends)
         _write_envelope({"ok": True, "results": results})
         return 0
     except Exception as exc:  # noqa: BLE001
