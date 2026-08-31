@@ -466,17 +466,16 @@ def test_soak_violation_scenario_5_t_e78930fe(home: Path) -> None:
         )
 
 
+# Guard anchor: circuit-breaker blocks remain parked
 # -----------------------------------------------------------------------
-# Guard anchor: circuit-breaker blocks SHOULD still auto-recover
-# -----------------------------------------------------------------------
-def test_circuit_breaker_blocks_still_auto_recover(home: Path) -> None:
+def test_circuit_breaker_blocks_remain_parked(home: Path) -> None:
     """Circuit-breaker blocks (only ``gave_up`` event, NO ``blocked``
-    event) must auto-recover when parents finish.  This preserves the
-    original intent of #40c1decb3.
+    event) must remain blocked when the row status is already ``blocked``.
 
-    Key distinction: ``_has_sticky_block`` returns False when there's no
-    ``blocked`` event at all — only ``gave_up``.  So the task should
-    flow through recompute_ready normally.
+    The current recompute_ready contract treats a blocked status without a
+    sticky worker block as a blind-spot hold: it does not silently promote a
+    direct status write. This preserves the fail-closed behavior while the
+    claim primitive's independent event gate protects ready-row races.
     """
     with kb.connect_closing() as conn:
         # Parent completes first.
@@ -491,15 +490,13 @@ def test_circuit_breaker_blocks_still_auto_recover(home: Path) -> None:
         kb.link_tasks(conn, parent_id=pid, child_id=child_tid)
 
         # Set status to blocked manually. Only give_up event — no blocked
-        # event. Not sticky.
+        # event. This is the blind-spot state and remains parked.
         _set(conn, child_tid, "blocked")
         _insert_raw_event(conn, child_tid, "gave_up", {"failures": 3})
 
-        # With parent done AND no sticky block, recompute_ready must promote.
         promoted = kb.recompute_ready(conn)
-        assert promoted >= 1, (
-            "CB REGRESSION: circuit-breaker block must auto-recover"
+        assert promoted == 0, (
+            "CB REGRESSION: a blocked row must not auto-promote without "
+            "an explicit unblock/promote event"
         )
-        assert kb.get_task(conn, child_tid).status == "ready", (
-            "CB REGRESSION: child should be ready after parent done"
-        )
+        assert kb.get_task(conn, child_tid).status == "blocked"
