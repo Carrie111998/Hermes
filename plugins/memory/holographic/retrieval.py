@@ -93,7 +93,10 @@ class FactRetriever:
             if self.hrr_weight > 0 and fact.get("hrr_vector"):
                 fact_vec = hrr.bytes_to_phases(fact["hrr_vector"], dim=self.hrr_dim)
                 if query_vec is None:
-                    query_vec = hrr.encode_text(query, self.hrr_dim)
+                    # facts are stored as bind(encode_text(content), ROLE_CONTENT); bind the query the same way
+                    query_vec = hrr.bind(
+                        hrr.encode_text(query, self.hrr_dim),
+                        hrr.encode_atom("__hrr_role_content__", self.hrr_dim))
                 hrr_sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0  # shift to [0,1]
             else:
                 hrr_sim = 0.5  # neutral
