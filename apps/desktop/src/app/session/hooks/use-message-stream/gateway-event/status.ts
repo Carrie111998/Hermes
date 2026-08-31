@@ -1,3 +1,4 @@
+import { formatBtwCompleteNotice, slashStatusText } from '@/app/session/hooks/use-prompt-actions/utils'
 import { translateNow } from '@/i18n'
 import { textPart } from '@/lib/chat-messages'
 import { coerceGatewayText } from '@/lib/chat-runtime'
@@ -69,6 +70,35 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
             id: `review-summary-${Date.now()}`,
             role: 'system',
             parts: [textPart(`review:${text}`, occurredAt)],
+            timestamp: occurredAt
+          }
+        ]
+      }))
+    }
+
+    return true
+  }
+
+  if (event.type === 'btw.complete') {
+    // prompt.btw answers on a background thread and emits btw.complete with
+    // the originating session_id. The TUI renders that as a system line;
+    // without this handler Desktop showed the "started" ack from /btw and
+    // then went silent. Append onto the event's session so a chat switch
+    // before the answer arrives still lands it on the right transcript.
+    const question = coerceGatewayText(payload?.question)
+    const answer = coerceGatewayText(payload?.text)
+    const notice = formatBtwCompleteNotice(question, answer)
+
+    if (notice.trim() && sessionId) {
+      flushQueuedDeltas(sessionId)
+      updateSessionState(sessionId, state => ({
+        ...state,
+        messages: [
+          ...state.messages,
+          {
+            id: `btw-complete-${Date.now()}`,
+            role: 'system',
+            parts: [textPart(slashStatusText('/btw', notice), occurredAt)],
             timestamp: occurredAt
           }
         ]

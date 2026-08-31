@@ -63,6 +63,8 @@ import type {
 
 import { resolveTargetSessionId } from './resolve-target-session'
 import {
+  BTW_USAGE,
+  formatBtwStartedNotice,
   type GatewayRequest,
   isSessionIdCandidate,
   isTargetSessionBusy,
@@ -661,6 +663,49 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           } finally {
             compressInFlightRef.current.delete(sessionId)
+          }
+        },
+        // /btw must use prompt.btw (the TUI path). slash.exec runs the CLI
+        // handler, which prints a "started" ack and answers on a daemon
+        // thread — the worker returns before that answer exists, so Desktop
+        // showed only the ack and then went silent.
+        btw: async ctx => {
+          const resolved = await withSlashOutput(ctx)
+
+          if (!resolved) {
+            return
+          }
+
+          const { render: renderSlashOutput, sessionId } = resolved
+          const question = ctx.arg.trim()
+
+          if (!question) {
+            renderSlashOutput(BTW_USAGE)
+
+            return
+          }
+
+          try {
+            const result = await requestGateway<{ task_id?: string }>('prompt.btw', {
+              session_id: sessionId,
+              text: question
+            })
+
+            if (!result?.task_id) {
+              renderSlashOutput('/btw: no output')
+
+              return
+            }
+
+            renderSlashOutput(formatBtwStartedNotice(question))
+          } catch (err) {
+            if (isMissingRpcMethod(err)) {
+              await runExec(ctx)
+
+              return
+            }
+
+            renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
           }
         },
         // /yolo maps to the status-bar YOLO control — a per-session approval

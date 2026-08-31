@@ -55,6 +55,7 @@ export interface DesktopThemeCommandOption {
 export type DesktopActionId =
   | 'branch'
   | 'browser'
+  | 'btw'
   | 'compress'
   | 'handoff'
   | 'hatch'
@@ -238,6 +239,16 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     description: 'Compress this conversation context',
     aliases: ['/compact'],
     surface: action('compress'),
+    argumentMode: 'text'
+  },
+  // /btw must be an action (prompt.btw RPC), not exec. The slash-worker CLI
+  // handler prints a "started" line and answers on a daemon thread; slash.exec
+  // returns after that line, so Desktop never sees the answer, and switching
+  // sessions drops the ephemeral slash output.
+  {
+    name: '/btw',
+    description: 'Ask a side question about this conversation without interrupting it',
+    surface: action('btw'),
     argumentMode: 'text'
   },
   {

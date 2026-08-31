@@ -499,6 +499,36 @@ export function slashStatusText(command: string, output: string): string {
   return [`slash:${command}`, output.trim()].filter(Boolean).join('\n')
 }
 
+export const BTW_USAGE =
+  'Usage: /btw <question>\nExample: /btw which file was that error in?\n\nAnswers a quick side question about this conversation without interrupting it. For an independent background task, use /bg <prompt>.'
+
+function btwPreview(question: string): string {
+  const trimmed = question.trim()
+
+  return trimmed.length > 60 ? `${trimmed.slice(0, 60)}...` : trimmed
+}
+
+/** Immediate /btw ack — the answer arrives later as a `btw.complete` event. */
+export function formatBtwStartedNotice(question: string): string {
+  return `Side question: "${btwPreview(question)}"\nAnswering from a snapshot of this conversation — the current work continues.`
+}
+
+/** Final /btw answer (or failure) painted as a system line. */
+export function formatBtwCompleteNotice(question: string, answer: string): string {
+  const trimmedQuestion = question.trim()
+  const trimmedAnswer = answer.trim()
+  const preview = btwPreview(trimmedQuestion)
+  const failed = /^error:\s*/i.test(trimmedAnswer)
+
+  if (failed) {
+    const detail = trimmedAnswer.replace(/^error:\s*/i, '')
+
+    return trimmedQuestion ? `/btw failed: "${preview}"\n${detail}` : `/btw failed\n${detail}`
+  }
+
+  return trimmedQuestion ? `/btw: "${preview}"\n\n${trimmedAnswer}` : `/btw\n\n${trimmedAnswer}`
+}
+
 /**
  * Format the JSON reply from a gateway RPC surfaced as `kind: 'rpc'` in
  * desktop-slash-commands.ts. Kept here (instead of slash.ts) so it has no

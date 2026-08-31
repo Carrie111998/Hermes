@@ -190,7 +190,7 @@ describe('desktop slash command curation', () => {
     expect(desktopSlashCommandArgumentMode('/browser')).toBe('options')
   })
 
-  it('routes /compress through the session-compression action', () => {
+    it('routes /compress through the session-compression action', () => {
     // /compress must be an action (session.compress RPC), not exec: the slash
     // worker route times out on large sessions (#44456).
     expect(resolveDesktopCommand('/compress')?.surface).toEqual({ kind: 'action', action: 'compress' })
@@ -202,6 +202,17 @@ describe('desktop slash command curation', () => {
     expect(resolveDesktopCommand('/compact')?.surface).toEqual({ kind: 'action', action: 'compress' })
     expect(isDesktopSlashCommand('/compact')).toBe(true)
     expect(isDesktopSlashSuggestion('/compact')).toBe(false)
+  })
+
+  it('routes /btw through prompt.btw instead of the slash worker', () => {
+    // slash.exec only captures the CLI "started" line; the answer runs on a
+    // daemon thread and never reaches Desktop. prompt.btw + btw.complete is
+    // the TUI path.
+    expect(resolveDesktopCommand('/btw')?.surface).toEqual({ kind: 'action', action: 'btw' })
+    expect(desktopSlashCommandArgumentMode('/btw')).toBe('text')
+    expect(isDesktopSlashCommand('/btw')).toBe(true)
+    expect(isDesktopSlashSuggestion('/btw')).toBe(true)
+    expect(desktopSlashUnavailableMessage('/btw')).toBeNull()
   })
 
   it('routes only stateless session commands through dedicated gateway RPCs', () => {
@@ -234,7 +245,6 @@ describe('desktop slash command curation', () => {
   it('still routes commands without dedicated RPCs through exec()', () => {
     const execNames = [
       '/bg',
-      '/btw',
       '/debug',
       '/goal',
       '/personality',
