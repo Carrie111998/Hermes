@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import pytest
 from pathlib import Path
@@ -159,6 +160,33 @@ class TestTakeCheckpoint:
         # Never snapshot the filesystem root or the user's home.
         assert mgr.ensure_checkpoint("/", "root") is False
         assert mgr.ensure_checkpoint(str(Path.home()), "home") is False
+
+    @pytest.mark.macos_only
+    def test_shared_tmp_root_is_refused_without_checkpointing(self, mgr, monkeypatch):
+        attempts = []
+
+        def record_take(working_dir, reason):
+            attempts.append((working_dir, reason))
+            return True
+
+        monkeypatch.setattr(mgr, "_take", record_take)
+        shared_tmp = str(Path("/tmp").resolve())
+
+        assert mgr.ensure_checkpoint("/tmp", "symlink spelling") is False
+        mgr.new_turn()
+        assert mgr.ensure_checkpoint(shared_tmp, "canonical spelling") is False
+        assert attempts == []
+
+    @pytest.mark.macos_only
+    def test_workspace_under_shared_tmp_root_stays_checkpointable(self, mgr):
+        workspace = Path(tempfile.mkdtemp(prefix="hermes-checkpoint-test-", dir="/tmp"))
+        try:
+            assert workspace.resolve().parent == Path("/tmp").resolve()
+            (workspace / "payload.txt").write_text("owned by this test\n")
+
+            assert mgr.ensure_checkpoint(str(workspace), "nested workspace") is True
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
 
     def test_new_turn_resets_dedup_but_needs_changes(self, mgr, work_dir):
         assert mgr.ensure_checkpoint(str(work_dir), "turn 1") is True
