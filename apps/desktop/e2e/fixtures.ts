@@ -280,26 +280,33 @@ function assertDistBuilt(): void {
 }
 
 /**
- * Find the Electron binary. In the nix devshell, `electron` is on PATH.
- * As a fallback, use the node_modules/.bin/electron from the desktop package.
+ * Find the Electron binary. Prefer the desktop workspace package binary;
+ * fall back to PATH for development shells that provide Electron externally.
  */
 export function findElectron(): string {
   // In dev mode, we use the `electron` binary directly (not the packaged app).
   // The dev:electron script in package.json does exactly this: `electron .`
   // after building. We replicate that here.
-  const localElectron = path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron')
+  const localElectron = path.join(
+    DESKTOP_ROOT,
+    'node_modules',
+    'electron',
+    'dist',
+    process.platform === 'win32' ? 'electron.exe' : 'electron',
+  )
 
   if (fs.existsSync(localElectron)) {
     return localElectron
   }
 
-  // Fall back to PATH
-  const result = spawnSync('which', ['electron'], {
+  // Fall back to PATH, using a native Windows resolver so the returned path
+  // is spawnable by Playwright rather than an MSYS /c/... shim path.
+  const result = spawnSync(process.platform === 'win32' ? 'where.exe' : 'which', ['electron'], {
     encoding: 'utf8',
   })
 
   if (result.status === 0 && result.stdout.trim()) {
-    return result.stdout.trim()
+    return result.stdout.split(/\r?\n/).find(line => line.trim())!.trim()
   }
 
   throw new Error(

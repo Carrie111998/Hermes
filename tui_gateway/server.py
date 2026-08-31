@@ -8121,6 +8121,9 @@ def _agent_cbs(sid: str) -> dict:
             sid,
             {"text": text, **({"verbose": True} if _session_verbose(sid) else {})},
         ),
+        "reasoning_event_callback": lambda phase, item_id, text="": _emit(
+            f"reasoning.{phase}", sid, {"reasoning_id": item_id, "text": text}
+        ),
         "status_callback": lambda kind, text=None: _status_update(
             sid, str(kind), None if text is None else str(text)
         ),
@@ -9488,6 +9491,8 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         if m.get("display_kind") == "hidden":
             continue
         content_text = _coerce_message_text(m.get("content"))
+        from agent.codex_display_projection import project_codex_display_items
+        codex_display_items = project_codex_display_items(m) if role == "assistant" else None
         if _is_display_hidden_marker(role, content_text):
             continue
         if role == "assistant" and m.get("tool_calls"):
@@ -9500,8 +9505,6 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                     except (json.JSONDecodeError, TypeError):
                         args = {}
                     tool_call_args[tc_id] = (fn["name"], args)
-            if not content_text.strip():
-                continue
         if role == "tool":
             tc_id = m.get("tool_call_id", "")
             tc_info = tool_call_args.get(tc_id) if tc_id else None
@@ -9533,7 +9536,7 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         has_reasoning = role == "assistant" and any(
             m.get(key) for key in reasoning_keys
         )
-        if not content_text.strip() and not has_reasoning:
+        if not content_text.strip() and not has_reasoning and not codex_display_items:
             continue
         msg = {"role": role, "text": content_text}
         # Persisted authoring time (Unix seconds) for display.timestamps
@@ -9557,9 +9560,11 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
                 msg["text"] = invocation
                 msg["display_kind"] = "skill_invocation"
         if role == "assistant":
-            for key in reasoning_keys:
+            for key in ("reasoning", "reasoning_content", "reasoning_details"):
                 if key in m and m.get(key) is not None:
                     msg[key] = m.get(key)
+            if codex_display_items:
+                msg["codex_display_items"] = codex_display_items
         # Forward display-only timeline metadata so the TUI can render
         # model switches and delegation completions as events instead of
         # opaque user messages, and hide compaction handoffs entirely.
