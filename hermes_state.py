@@ -14069,11 +14069,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         self._apply_prune_age_filter(older_than_days, filters)
         where, params = self._prune_filter_where(source=source, **filters)
+        where = self._split_ended_guard(where).removeprefix(" AND ") or "1 = 1"
+        return self._list_filtered_session_rows(where, params)
+
+    @staticmethod
+    def _split_ended_guard(where: str) -> str:
+        """Return ``where`` with the leading mandatory ended-session guard
+        removed. Raises if :meth:`_prune_filter_where` ever stops emitting
+        the guard as its first clause, so guard-relaxing callers fail loud
+        instead of silently widening their selection.
+        """
         ended_guard = "s.ended_at IS NOT NULL"
         if not where.startswith(ended_guard):
             raise RuntimeError("prune filter lost its ended-session safety guard")
-        where = where[len(ended_guard):].removeprefix(" AND ") or "1 = 1"
-        return self._list_filtered_session_rows(where, params)
+        return where[len(ended_guard):]
 
     def _list_filtered_session_rows(
         self, where: str, params: list
@@ -14128,10 +14137,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
         self._apply_prune_age_filter(older_than_days, filters)
         where, params = self._prune_filter_where(source=source, **filters)
-        ended_guard = "s.ended_at IS NOT NULL"
-        if not where.startswith(ended_guard):
-            raise RuntimeError("prune filter lost its ended-session safety guard")
-        open_where = f"s.ended_at IS NULL{where[len(ended_guard):]}"
+        open_where = f"s.ended_at IS NULL{self._split_ended_guard(where)}"
         with self._read_ctx() as conn:
             cursor = conn.execute(
                 f"SELECT COUNT(*) FROM sessions s WHERE {open_where}", params

@@ -65,6 +65,47 @@ def test_sessions_export_md_writes_single_session(monkeypatch, tmp_path, capsys)
     assert str(files[0]) in output
 
 
+def test_sessions_export_filtered_includes_pinned_and_archived(
+    monkeypatch, tmp_path, capsys
+):
+    """Filtered export is non-destructive: it must select archived and
+    pinned sessions, which bulk prune/archive exclude by default."""
+    import hermes_cli.main as main_mod
+    import hermes_state
+
+    captured = {}
+
+    class FakeDB:
+        def list_export_candidates(self, **filters):
+            captured["filters"] = filters
+            return [
+                {"id": "s-plain", "source": "cli"},
+                {"id": "s-pinned", "source": "cli"},
+            ]
+
+        def close(self):
+            captured["closed"] = True
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda: FakeDB())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes", "sessions", "export", "--format", "md",
+            "--source", "cli", "--dry-run", str(tmp_path),
+        ],
+    )
+
+    main_mod.main()
+
+    out = capsys.readouterr().out
+    assert "Would export 2 session(s)" in out
+    assert captured["filters"]["source"] == "cli"
+    assert captured["filters"]["archived"] is None
+    assert captured["filters"]["include_pinned"] is True
+    assert captured["closed"] is True
+
+
 def test_sessions_export_redact_scrubs_secrets(monkeypatch, tmp_path):
     """--redact runs exported content through force-mode secret redaction."""
     import hermes_cli.main as main_mod

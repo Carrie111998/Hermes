@@ -424,8 +424,10 @@ def cmd_sessions(args, sessions_parser=None):
             except ValueError as e:
                 print(f"Error: {e}")
                 return
-            # Unlike prune/archive, export includes archived sessions.
+            # Unlike prune/archive, export includes archived and pinned
+            # sessions (pin means "keep", not "hide from backups").
             filters["archived"] = None
+            filters["include_pinned"] = True
 
         def _redact(data):
             if not args.redact or data is None:
@@ -988,7 +990,7 @@ def cmd_sessions(args, sessions_parser=None):
                     f"flag). {_optin}"
                 )
 
-        candidates = db.list_export_candidates(**filters)
+        candidates = db.list_prune_candidates(**filters)
         # Archive expands each selected row to its compression lineage, which
         # can include open continuations; a direct-open count would therefore
         # describe the eventual archive effect inaccurately.
