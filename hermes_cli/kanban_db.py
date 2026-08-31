@@ -3175,7 +3175,7 @@ def _require_dir_workspace_path(
     normalized = str(workspace_path).strip() if workspace_path is not None else ""
     if not normalized:
         raise ValueError("workspace_path is required for dir workspaces")
-    return normalized
+    return workspace_path
 
 
 def create_task(
