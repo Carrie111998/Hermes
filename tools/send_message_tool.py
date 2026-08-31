@@ -355,7 +355,11 @@ def send_telegram_notification_pane(
             if rich_item_parts:
                 item_count = len(rich_item_parts)
                 rich_parts = [
-                    "<h3>Collective Wisdom</h3>",
+                    # Telegram owns rich-message bubble sizing and exposes no
+                    # width/min-width control. Keep a stable, naturally wider
+                    # product heading so short skill names and one-word actions
+                    # do not collapse these notifications into narrow cards.
+                    "<h3>Hermes Collective Wisdom</h3>",
                     (
                         f"<p>{item_count} new "
                         f"{'update' if item_count == 1 else 'updates'}</p>"

@@ -385,7 +385,7 @@ class TestSendMessageTool:
         assert result == {"success": True}
         rich_html = send_mock.await_args.kwargs["rich_message_html"]
         assert rich_html == (
-            "<h3>Collective Wisdom</h3><p>1 new update</p>"
+            "<h3>Hermes Collective Wisdom</h3><p>1 new update</p>"
             "<p><b>⬆️ Update &lt;available&gt;</b><br/>"
             "gateway-pull-canary · v3<br/>"
             '<tg-button type="callback_data" style="primary" '
