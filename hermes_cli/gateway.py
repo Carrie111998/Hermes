@@ -2703,7 +2703,16 @@ def get_systemd_unit_path(system: bool = False) -> Path:
     name = get_service_name()
     if system:
         return Path("/etc/systemd/system") / f"{name}.service"
-    return Path.home() / ".config" / "systemd" / "user" / f"{name}.service"
+    # Use get_default_hermes_root().parent instead of Path.home() so that
+    # non-default profiles (whose $HOME may point to the profile's sandboxed
+    # home directory) write the .service file to the REAL user's
+    # ~/.config/systemd/user, not to the profile home's .config (#98699).
+    try:
+        from hermes_constants import get_default_hermes_root as _get_default_root
+        real_home = _get_default_root().parent
+    except Exception:
+        real_home = Path.home()
+    return real_home / ".config" / "systemd" / "user" / f"{name}.service"
 
 
 class UserSystemdUnavailableError(RuntimeError):
