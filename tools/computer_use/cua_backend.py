@@ -353,6 +353,20 @@ def _computer_use_max_image_dimension() -> Optional[int]:
     return dim if dim > 0 else None
 
 
+def _driver_cmd_is_windows_exe(cmd: str) -> bool:
+    """True when *cmd* points at a Windows PE executable.
+
+    Used by _EmbeddedCuaDaemon to detect the WSL2 cross-OS case: the Hermes
+    host is Linux (sys.platform == 'linux') but the configured cua-driver is a
+    Windows .exe.  Windows processes cannot create a Unix-domain socket — they
+    need a named-pipe path (#80227).
+    """
+    if not cmd:
+        return False
+    lower = cmd.lower()
+    return lower.endswith(".exe") or "\\\\wsl$" in lower or "/mnt/" in lower.replace("\\", "/")
+
+
 def cua_driver_child_env(base_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     """Return the environment dict for spawning cua-driver.
 
@@ -733,6 +747,13 @@ class _EmbeddedCuaDaemon:
         self._stderr_thread: Optional[threading.Thread] = None
         token = uuid.uuid4().hex[:12]
         if sys.platform == "win32":
+            self.socket_path = rf"\\.\pipe\hermes-cua-{token}"
+        elif _driver_cmd_is_windows_exe(driver_cmd):
+            # WSL2: the Python host is Linux (sys.platform == "linux") but the
+            # driver is a Windows .exe.  Windows processes cannot create a
+            # Unix-domain socket under /tmp — they need a named pipe path.
+            # Generating a Unix socket path here caused OS error 123
+            # (ERROR_INVALID_NAME) on every embedded-daemon launch (#80227).
             self.socket_path = rf"\\.\pipe\hermes-cua-{token}"
         else:
             self.socket_path = os.path.join(
