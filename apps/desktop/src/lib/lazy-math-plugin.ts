@@ -151,7 +151,7 @@ export function useLazyMathPluginState(
 
   return {
     failed: eligible && failed,
-    loading: eligible && loading,
+    loading: eligible && (loading || (!plugin && !failed)),
     plugin: eligible ? plugin : undefined
   }
 }

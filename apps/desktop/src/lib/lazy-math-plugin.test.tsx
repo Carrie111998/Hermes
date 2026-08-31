@@ -94,6 +94,36 @@ describe('useLazyMathPlugin', () => {
     expect(result.current.plugin).toBeUndefined()
   })
 
+  it('does not render raw delimiters during a prose-to-math transition', () => {
+    const renders: Array<{
+      failed: boolean
+      loading: boolean
+      plugin: MathPlugin | undefined
+      renderedText: string
+    }> = []
+
+    const loader = {
+      load: vi.fn(() => new Promise<MathPlugin>(() => undefined)),
+      peek: () => undefined
+    }
+
+    const { rerender } = renderHook(
+      ({ text }) => {
+        const state = useLazyMathPluginState(text, loader)
+        renders.push({ ...state, renderedText: state.loading ? 'loading' : text })
+
+        return state
+      },
+      { initialProps: { text: 'ordinary prose' } }
+    )
+
+    const rendersBeforeMath = renders.length
+    rerender({ text: 'Now $x$ appears' })
+
+    expect(renders[rendersBeforeMath]).toMatchObject({ failed: false, loading: true, plugin: undefined })
+    expect(renders[rendersBeforeMath].renderedText).not.toContain('$x$')
+  })
+
   it('publishes the plugin after eligible markdown loads it', async () => {
     const importer = vi.fn(async () => ({ createMemoizedMathPlugin: () => plugin }))
     const loader = createLazyMathPluginLoader(importer)
