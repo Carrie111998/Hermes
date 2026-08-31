@@ -26,6 +26,7 @@ import time
 import traceback
 from collections import defaultdict
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
 
@@ -156,11 +157,13 @@ from gateway.platforms.helpers import (
 )
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
+    AudioFormat,
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
     SendResult,
+    StreamingTTSHandle,
     cache_image_from_url,
     cache_image_from_bytes,
     cache_audio_from_url,
@@ -1029,6 +1032,18 @@ def _read_discord_prompt_timeout() -> int:
     if seconds > _DISCORD_PROMPT_TIMEOUT_MAX:
         return _DISCORD_PROMPT_TIMEOUT_MAX
     return seconds
+
+
+@dataclass
+class _DiscordStreamingTTSHandle(StreamingTTSHandle):
+    """Discord-specific state for one bounded mixer speech child."""
+
+    guild_id: int = 0
+    mixer: Any = None
+    child: Any = None
+    carry: bytes = b""
+    drain_task: Optional[asyncio.Task] = None
+    timeout_rearmed: bool = False
 
 
 class DiscordAdapter(BasePlatformAdapter):
@@ -4180,6 +4195,165 @@ class DiscordAdapter(BasePlatformAdapter):
                 success = await self.play_in_voice_channel(gid, audio_path)
                 return SendResult(success=success)
         return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
+
+    def _resolve_streaming_voice_mixer(self, chat_id: str) -> Optional[Tuple[int, Any]]:
+        """Return the connected, currently-installed mixer bound to *chat_id*."""
+        for guild_id, text_channel_id in getattr(self, "_voice_text_channels", {}).items():
+            if str(text_channel_id) != str(chat_id):
+                continue
+            voice_client = getattr(self, "_voice_clients", {}).get(guild_id)
+            mixer = getattr(self, "_voice_mixers", {}).get(guild_id)
+            try:
+                connected = voice_client is not None and voice_client.is_connected()
+            except Exception:
+                connected = False
+            if connected and mixer is not None and hasattr(mixer, "begin_streaming_speech"):
+                return guild_id, mixer
+        return None
+
+    @staticmethod
+    def _supports_discord_streaming_format(audio_format: AudioFormat) -> bool:
+        return (audio_format.sample_width == 2 and (
+            (audio_format.sample_rate == 24000 and audio_format.channels == 1)
+            or (audio_format.sample_rate == 48000 and audio_format.channels == 2)
+        ))
+
+    @staticmethod
+    def _discord_streaming_numpy_available() -> bool:
+        try:
+            import numpy  # noqa: F401, PLC0415 - optional voice dependency
+        except ImportError:
+            return False
+        return True
+
+    def supports_streaming_tts(self, chat_id: str, audio_format: AudioFormat) -> bool:
+        return (
+            self._resolve_streaming_voice_mixer(chat_id) is not None
+            and self._discord_streaming_numpy_available()
+            and self._supports_discord_streaming_format(audio_format)
+        )
+
+    async def begin_streaming_tts(
+        self,
+        chat_id: str,
+        audio_format: AudioFormat,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[StreamingTTSHandle]:
+        del metadata
+        resolved = self._resolve_streaming_voice_mixer(chat_id)
+        if (
+            resolved is None
+            or not self._discord_streaming_numpy_available()
+            or not self._supports_discord_streaming_format(audio_format)
+        ):
+            return None
+        guild_id, mixer = resolved
+        try:
+            child = mixer.begin_streaming_speech()
+        except Exception:
+            logger.debug("Failed to begin Discord streaming speech", exc_info=True)
+            return None
+        if child is None:
+            return None
+        current = self._resolve_streaming_voice_mixer(chat_id)
+        if current is None or current[0] != guild_id or current[1] is not mixer:
+            child.abort()
+            return None
+        self._cancel_voice_timeout(guild_id)
+        return _DiscordStreamingTTSHandle(
+            chat_id=str(chat_id), audio_format=audio_format, guild_id=guild_id,
+            mixer=mixer, child=child,
+        )
+
+    @staticmethod
+    def _discord_streaming_pcm(handle: _DiscordStreamingTTSHandle, chunk: bytes) -> bytes:
+        data = handle.carry + chunk
+        handle.carry = data[-1:] if len(data) % 2 else b""
+        data = data[:len(data) - len(handle.carry)]
+        if not data:
+            return b""
+        if handle.audio_format.sample_rate == 48000:
+            return data
+        import numpy as np  # noqa: PLC0415 - optional voice dependency
+        samples = np.frombuffer(data, dtype="<i2")
+        return np.repeat(samples, 4).astype("<i2", copy=False).tobytes()
+
+    async def write_streaming_tts(self, handle: StreamingTTSHandle, chunk: bytes) -> None:
+        if not isinstance(handle, _DiscordStreamingTTSHandle) or handle.aborted or not chunk:
+            return
+        current = self._resolve_streaming_voice_mixer(handle.chat_id)
+        if current is None or current[0] != handle.guild_id or current[1] is not handle.mixer:
+            return
+        pcm = self._discord_streaming_pcm(handle, chunk)
+        if not pcm:
+            return
+        await asyncio.to_thread(handle.child.write, pcm)
+        if not handle.aborted:
+            handle.audible = True
+
+    async def finish_streaming_tts(
+        self, handle: StreamingTTSHandle, *, interrupted: bool = False,
+    ) -> None:
+        if not isinstance(handle, _DiscordStreamingTTSHandle) or handle.aborted:
+            return
+        if interrupted:
+            await self.abort_streaming_tts(handle)
+            return
+        handle.child.finish()
+        if handle.drain_task is None or handle.drain_task.done():
+            handle.drain_task = asyncio.create_task(
+                self._rearm_voice_timeout_after_stream(handle)
+            )
+
+    async def _rearm_voice_timeout_after_stream(
+        self, handle: _DiscordStreamingTTSHandle,
+    ) -> None:
+        """Re-arm only once this child has drained without a mixer replacement."""
+        deadline = asyncio.get_running_loop().time() + 30.0
+        try:
+            while asyncio.get_running_loop().time() < deadline:
+                if handle.aborted:
+                    return
+                current = self._resolve_streaming_voice_mixer(handle.chat_id)
+                if current is None or current[0] != handle.guild_id or current[1] is not handle.mixer:
+                    return
+                if handle.child.drained and not handle.mixer.speech_active:
+                    # Resolve again immediately before resetting the timer so a
+                    # concurrent leave/rejoin cannot reset a new mixer.
+                    current = self._resolve_streaming_voice_mixer(handle.chat_id)
+                    if (
+                        current is not None
+                        and current[0] == handle.guild_id
+                        and current[1] is handle.mixer
+                        and not handle.mixer.speech_active
+                    ):
+                        self._reset_voice_timeout(handle.guild_id)
+                        handle.timeout_rearmed = True
+                    return
+                await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            return
+
+    async def abort_streaming_tts(
+        self, handle: StreamingTTSHandle, error: Optional[str] = None,
+    ) -> None:
+        del error
+        if not isinstance(handle, _DiscordStreamingTTSHandle) or handle.aborted:
+            return
+        handle.aborted = True
+        if handle.drain_task is not None:
+            handle.drain_task.cancel()
+        handle.child.abort()
+        current = self._resolve_streaming_voice_mixer(handle.chat_id)
+        if (
+            not handle.timeout_rearmed
+            and current is not None
+            and current[0] == handle.guild_id
+            and current[1] is handle.mixer
+            and not handle.mixer.speech_active
+        ):
+            self._reset_voice_timeout(handle.guild_id)
+            handle.timeout_rearmed = True
 
     async def send_voice(
         self,

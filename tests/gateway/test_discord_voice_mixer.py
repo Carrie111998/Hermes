@@ -7,7 +7,9 @@ integration (install on join, play routing, ack) is tested with the standard
 ``object.__new__(DiscordAdapter)`` helper used elsewhere in the voice suite.
 """
 
+import asyncio
 import os
+import struct
 import sys
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -175,6 +177,139 @@ def _make_adapter(fx_cfg=None):
         "ack_enabled": True, "ack_phrases": ["One moment."],
     }
     return adapter
+
+
+class TestDiscordStreamingTTS:
+    @pytest.mark.asyncio
+    async def test_connected_bound_mixer_supports_and_begins_stream(self):
+        from gateway.platforms.base import AudioFormat
+
+        adapter = _make_adapter()
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        mixer = vm.VoiceMixer()
+        adapter._voice_clients[111] = vc
+        adapter._voice_text_channels[111] = 222
+        adapter._voice_mixers[111] = mixer
+        adapter._cancel_voice_timeout = MagicMock()
+
+        audio_format = AudioFormat(24000, 1, 2)
+        assert adapter.supports_streaming_tts("222", audio_format) is True
+
+        handle = await adapter.begin_streaming_tts("222", audio_format)
+
+        assert handle is not None
+        assert handle.guild_id == 111
+        assert handle.mixer is mixer
+        assert handle.child in mixer._streaming_speech
+        adapter._cancel_voice_timeout.assert_called_once_with(111)
+
+    @pytest.mark.asyncio
+    async def test_split_24k_mono_pcm_writes_as_fifo_discord_pcm(self):
+        from gateway.platforms.base import AudioFormat
+
+        adapter = _make_adapter()
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        mixer = vm.VoiceMixer()
+        adapter._voice_clients[111] = vc
+        adapter._voice_text_channels[111] = 222
+        adapter._voice_mixers[111] = mixer
+        adapter._cancel_voice_timeout = MagicMock()
+
+        handle = await adapter.begin_streaming_tts("222", AudioFormat(24000, 1, 2))
+        source = b"\x01\x00\xfe\xff\x03\x00"
+        for chunk in (source[:1], source[1:3], source[3:]):
+            await adapter.write_streaming_tts(handle, chunk)
+        await adapter.finish_streaming_tts(handle)
+
+        handle.child.fade_frames = 0
+        frame = handle.child.read_frame()
+        expected = b"".join(struct.pack("<hhhh", sample, sample, sample, sample)
+                            for sample in (1, -2, 3))
+        assert frame is not None
+        np.testing.assert_array_equal(
+            frame[:12], np.frombuffer(expected, dtype=np.int16).astype(np.float32),
+        )
+
+    @pytest.mark.asyncio
+    async def test_unavailable_or_stale_voice_state_declines_streaming(self):
+        from gateway.platforms.base import AudioFormat
+
+        audio_format = AudioFormat(24000, 1, 2)
+        adapter = _make_adapter()
+        assert adapter.supports_streaming_tts("222", audio_format) is False
+        assert await adapter.begin_streaming_tts("222", audio_format) is None
+
+        vc = MagicMock()
+        vc.is_connected.return_value = False
+        adapter._voice_clients[111] = vc
+        adapter._voice_text_channels[111] = 222
+        assert adapter.supports_streaming_tts("222", audio_format) is False
+        assert await adapter.begin_streaming_tts("222", audio_format) is None
+
+        vc.is_connected.return_value = True
+        with patch.object(adapter, "_discord_streaming_numpy_available", return_value=False):
+            assert adapter.supports_streaming_tts("222", audio_format) is False
+            assert await adapter.begin_streaming_tts("222", audio_format) is None
+
+        child = MagicMock()
+
+        class StaleMixer:
+            def begin_streaming_speech(self):
+                adapter._voice_mixers.pop(111)
+                return child
+
+        adapter._voice_mixers[111] = StaleMixer()
+        assert await adapter.begin_streaming_tts("222", audio_format) is None
+        child.abort.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_finish_waits_for_drain_and_abort_drops_late_writes(self):
+        from gateway.platforms.base import AudioFormat
+
+        class Child:
+            def __init__(self):
+                self.drained = False
+                self.finish = MagicMock()
+                self.abort = MagicMock()
+                self.write = MagicMock()
+
+        class Mixer:
+            def __init__(self):
+                self.child = Child()
+                self.speech_active = True
+
+            def begin_streaming_speech(self):
+                return self.child
+
+        adapter = _make_adapter()
+        vc = MagicMock()
+        vc.is_connected.return_value = True
+        mixer = Mixer()
+        adapter._voice_clients[111] = vc
+        adapter._voice_text_channels[111] = 222
+        adapter._voice_mixers[111] = mixer
+        adapter._cancel_voice_timeout = MagicMock()
+        adapter._reset_voice_timeout = MagicMock()
+        handle = await adapter.begin_streaming_tts("222", AudioFormat(24000, 1, 2))
+
+        await adapter.finish_streaming_tts(handle)
+
+        mixer.child.finish.assert_called_once_with()
+        assert adapter._reset_voice_timeout.call_count == 0
+        assert handle.drain_task is not None
+
+        mixer.child.drained = True
+        mixer.speech_active = False
+        await asyncio.wait_for(handle.drain_task, timeout=0.5)
+        adapter._reset_voice_timeout.assert_called_once_with(111)
+
+        await adapter.abort_streaming_tts(handle)
+        await adapter.abort_streaming_tts(handle)
+        await adapter.write_streaming_tts(handle, b"\x01\x00")
+        mixer.child.abort.assert_called_once_with()
+        mixer.child.write.assert_not_called()
 
 
 class TestVoiceMixerActive:
