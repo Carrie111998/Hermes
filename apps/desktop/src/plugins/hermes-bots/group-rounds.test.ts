@@ -651,7 +651,8 @@ describe('member holds (#93129)', () => {
         { docs: { at: 2 }, impl: { at: 1 } },
         { everyone: true, mentioned: [] },
         '@all resume',
-        {}
+        {},
+        ['impl', 'docs']
       )
     ).toEqual({})
 
@@ -663,6 +664,131 @@ describe('member holds (#93129)', () => {
     expect(held.impl).toBeTruthy()
     expect(held.docs).toBeTruthy()
     expect(held.impl.at).toBe(5)
+  })
+
+  it.each(['@all', '@all!', '@all...'])(
+    'keeps sticky holds for a non-actionable room mention: %s',
+    async text => {
+      const { rounds } = await loadRoom()
+      const held = { impl: { at: 1 } }
+
+      expect(rounds.applyGroupHoldDirective(held, { everyone: true, mentioned: [] }, text, {}, ['impl'])).toBe(held)
+    }
+  )
+
+  it('releases current roster holds but preserves unavailable durable holds for @all task', async () => {
+    const { rounds } = await loadRoom()
+
+    expect(
+      rounds.applyGroupHoldDirective(
+        { 'laptop::builder': { at: 1 }, 'offline::reviewer': { at: 2 } },
+        { everyone: true, mentioned: [] },
+        '@all review this task',
+        {},
+        ['laptop::builder']
+      )
+    ).toEqual({ 'offline::reviewer': { at: 2 } })
+  })
+
+  it.each([
+    {
+      member: { name: 'ops', title: 'The Ops' },
+      text: '@all @theops!',
+      heldKey: 'ops'
+    },
+    {
+      member: {
+        connectionId: 'default',
+        handle: 'default-vera',
+        name: 'vera',
+        remoteSource: true,
+        title: ''
+      },
+      text: '@all @default-vera!',
+      heldKey: 'default::vera'
+    }
+  ])('keeps room engagement scoped to a directly mentioned alias: $text', async ({ member, text, heldKey }) => {
+    const { rounds } = await loadRoom()
+    const mentions = rounds.parseGroupChatMentions(text, [member as GroupMember])
+
+    expect(
+      rounds.applyGroupHoldDirective(
+        { docs: { at: 2 }, [heldKey]: { at: 1 } },
+        mentions,
+        text,
+        {},
+        [heldKey, 'docs']
+      )
+    ).toEqual({ docs: { at: 2 } })
+  })
+
+  it.each(['@all 分析这个故障', '@everyone 复核 42'])('accepts Unicode task payload: %s', async text => {
+    const { rounds } = await loadRoom()
+
+    expect(
+      rounds.applyGroupHoldDirective(
+        { impl: { at: 1 } },
+        { everyone: true, mentioned: [] },
+        text,
+        {},
+        ['impl']
+      )
+    ).toEqual({})
+  })
+
+  it('treats @all plus an attachment as actionable room engagement', async () => {
+    const { rounds } = await loadRoom()
+
+    expect(
+      rounds.applyGroupHoldDirective(
+        { impl: { at: 1 } },
+        { everyone: true, mentioned: [] },
+        '@all',
+        {},
+        ['impl'],
+        true
+      )
+    ).toEqual({})
+  })
+
+  it('keeps stop precedence when @all stop also contains task text', async () => {
+    const { rounds } = await loadRoom()
+
+    const held = rounds.applyGroupHoldDirective({}, { everyone: true, mentioned: [] }, '@all stop then review', {}, [
+      'impl',
+      'docs'
+    ])
+
+    expect(Object.keys(held).sort()).toEqual(['docs', 'impl'])
+  })
+
+  it('re-engages a stopped room when @all carries a task without a resume token (#97740)', async () => {
+    const room = await loadRoom()
+
+    const members: GroupMember[] = [
+      { name: 'research', title: '' },
+      { name: 'builder', title: '' }
+    ]
+
+    room.chat.$groupChats.set({
+      Room: {
+        epoch: 3,
+        holds: {},
+        log: [],
+        members,
+        running: true,
+        sessions: {},
+        turn: null,
+        watermarks: {}
+      }
+    } as unknown as Record<string, GroupChat>)
+
+    await room.rounds.stopGroupThread('Room', 'stopped-thread', members)
+    room.rounds.sendToGroupChat('Room', members, '@all review this task')
+    await settle(room, 'Room')
+
+    expect(room.gateway.calls.map(call => call.profile)).toEqual(expect.arrayContaining(['research', 'builder']))
+    expect(room.chat.$groupChats.get().Room.holds).toEqual({})
   })
 
   it('leaves holds untouched on an unrelated room message', async () => {

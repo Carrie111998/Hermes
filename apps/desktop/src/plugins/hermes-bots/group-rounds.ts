@@ -45,6 +45,7 @@ import type { Attachment, GroupMember, GroupMessage } from './types'
 export function parseGroupChatMentions(text: unknown, members: GroupMember[]) {
   const source = String(text || '')
   const mentioned = new Set<string>()
+  const mentionedTokens = new Set<string>()
   let everyone = false
   const handles = new Map<string, string>()
 
@@ -97,12 +98,14 @@ export function parseGroupChatMentions(text: unknown, members: GroupMember[]) {
 
     if (resolved) {
       mentioned.add(resolved)
+      mentionedTokens.add(handle)
     }
   }
 
   return {
     everyone,
-    mentioned
+    mentioned,
+    mentionedTokens
   }
 }
 
@@ -230,40 +233,103 @@ export function buildGroupChatTurnPrompt({ groupName, members, viewer, deltaLine
  *  one keeps doing work it was told to stop). A non-stop direct mention
  *  releases the mentioned members — the user addressing a bot directly
  *  overrides its hold. */
-export function classifyGroupHoldDirective(
+export type GroupHoldIntent =
+  | { kind: 'hold-all' }
+  | { kind: 'hold-members'; memberKeys: readonly string[] }
+  | { kind: 'release-all-explicit' }
+  | { kind: 'engage-room'; memberKeys: readonly string[] }
+  | { kind: 'release-members'; memberKeys: readonly string[] }
+  | { kind: 'none' }
+
+/** Whether a room-wide mention carries work rather than being a bare signal.
+ * This is intentionally mechanical, not an NLP classifier: after removing
+ * @all/@everyone, text needs a Unicode letter/number, or the send needs an
+ * attachment. Punctuation-only mentions must not wake every held member. */
+export function hasActionableGroupPayload(
+  text: string,
+  mentionedKeys: Iterable<string> | null | undefined = [],
+  hasAttachments = false,
+  mentionedTokens: Iterable<string> | null | undefined = []
+) {
+  if (hasAttachments) {
+    return true
+  }
+
+  let residual = String(text || '').replace(/@(all|everyone)\b/gi, ' ')
+
+  for (const token of mentionedTokens || []) {
+    const escaped = String(token || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+    if (escaped) {
+      residual = residual.replace(new RegExp(`@${escaped}\\b`, 'gi'), ' ')
+    }
+  }
+
+  // Compatibility fallback for callers that only have canonical member keys.
+  for (const memberKey of mentionedKeys || []) {
+    const bareName = String(memberKey || '').split('::').pop() || ''
+
+    if (bareName) {
+      const escaped = bareName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      residual = residual.replace(new RegExp(`@${escaped}\\b`, 'gi'), ' ')
+    }
+  }
+
+  return /[\p{L}\p{N}]/u.test(residual)
+}
+
+/** Classify one USER send into a typed room-hold transition. Stop has highest
+ * priority; explicit resume preserves the historical full-clear contract;
+ * implicit room engagement is roster-scoped so a stale roster cannot erase a
+ * durable hold for an unavailable remote member. */
+export function classifyGroupHoldIntent(
   text: string,
   mentionedKeys: Iterable<string> | null | undefined,
-  everyone: boolean
-) {
+  everyone: boolean,
+  allMemberKeys: readonly string[] = [],
+  hasAttachments = false,
+  mentionedTokens: Iterable<string> | null | undefined = []
+): GroupHoldIntent {
   const value = String(text || '')
   const mentioned = [...(mentionedKeys || [])]
   const stop = /\b(stop|halt|pause)\b/i.test(value)
   const resume = /\b(resume|continue|go|proceed)\b/i.test(value)
 
   if (stop) {
-    // "@all stop" holds every member — symmetric with "@all resume".
-    return {
-      hold: mentioned,
-      holdAll: Boolean(everyone),
-      release: [],
-      releaseAll: false
-    }
+    return everyone ? { kind: 'hold-all' } : { kind: 'hold-members', memberKeys: mentioned }
   }
 
   if (resume) {
-    return {
-      hold: [],
-      holdAll: false,
-      release: mentioned,
-      releaseAll: Boolean(everyone)
-    }
+    return everyone ? { kind: 'release-all-explicit' } : { kind: 'release-members', memberKeys: mentioned }
   }
 
+  if (everyone && hasActionableGroupPayload(value, mentioned, hasAttachments, mentionedTokens)) {
+    return { kind: 'engage-room', memberKeys: [...allMemberKeys] }
+  }
+
+  if (mentioned.length) {
+    return { kind: 'release-members', memberKeys: mentioned }
+  }
+
+  return { kind: 'none' }
+}
+
+/** Compatibility projection for tests and callers that inspect the original
+ * transition shape. Durable mutation below consumes the typed intent directly. */
+export function classifyGroupHoldDirective(
+  text: string,
+  mentionedKeys: Iterable<string> | null | undefined,
+  everyone: boolean,
+  allMemberKeys: readonly string[] = [],
+  hasAttachments = false
+) {
+  const intent = classifyGroupHoldIntent(text, mentionedKeys, everyone, allMemberKeys, hasAttachments)
+
   return {
-    hold: [],
-    holdAll: false,
-    release: mentioned,
-    releaseAll: false
+    hold: intent.kind === 'hold-members' ? intent.memberKeys : [],
+    holdAll: intent.kind === 'hold-all',
+    release: intent.kind === 'release-members' || intent.kind === 'engage-room' ? intent.memberKeys : [],
+    releaseAll: intent.kind === 'release-all-explicit'
   }
 }
 
@@ -271,6 +337,7 @@ export function classifyGroupHoldDirective(
 interface GroupMentionParse {
   everyone?: boolean
   mentioned?: Iterable<string>
+  mentionedTokens?: Iterable<string>
 }
 
 /** #93129: next holds map after one user message. Holds are keyed by
@@ -283,17 +350,29 @@ export function applyGroupHoldDirective(
   mentions: GroupMentionParse | null | undefined,
   text: string,
   stamp: GroupHoldStamp | null | undefined,
-  allMemberKeys: string[] = []
+  allMemberKeys: string[] = [],
+  hasAttachments = false
 ): Record<string, GroupHoldStamp> {
   const prior: Record<string, GroupHoldStamp> = holds && typeof holds === 'object' ? holds : {}
-  const action = classifyGroupHoldDirective(text, mentions?.mentioned || [], Boolean(mentions?.everyone))
 
-  if (action.releaseAll) {
+  const intent = classifyGroupHoldIntent(
+    text,
+    mentions?.mentioned || [],
+    Boolean(mentions?.everyone),
+    allMemberKeys,
+    hasAttachments,
+    mentions?.mentionedTokens || []
+  )
+
+  if (intent.kind === 'release-all-explicit') {
     return Object.keys(prior).length ? {} : prior
   }
 
-  // "@all stop": expand to every member key the caller knows about.
-  const toHold = action.holdAll ? [...allMemberKeys] : action.hold
+  const toHold = intent.kind === 'hold-all' ? [...allMemberKeys] : intent.kind === 'hold-members' ? intent.memberKeys : []
+
+  const toRelease =
+    intent.kind === 'release-members' || intent.kind === 'engage-room' ? intent.memberKeys : []
+
   let next = prior
 
   for (const key of toHold) {
@@ -310,7 +389,7 @@ export function applyGroupHoldDirective(
     }
   }
 
-  for (const key of action.release) {
+  for (const key of toRelease) {
     if (Object.prototype.hasOwnProperty.call(next, key)) {
       if (next === prior) {
         next = {
@@ -1015,7 +1094,8 @@ export function sendToGroupChat(
         byMessageId: sent?.id,
         thread: target
       },
-      members.map((member: GroupMember) => groupMemberKey(member))
+      members.map((member: GroupMember) => groupMemberKey(member)),
+      attached.length > 0
     )
 
     return room
