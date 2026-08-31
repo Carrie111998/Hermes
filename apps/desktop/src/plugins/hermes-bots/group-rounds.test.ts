@@ -690,16 +690,34 @@ describe('member holds (#93129)', () => {
     ).toEqual({ 'offline::reviewer': { at: 2 } })
   })
 
-  it('keeps @all plus a direct mention scoped when there is no independent task payload', async () => {
+  it.each([
+    {
+      member: { name: 'ops', title: 'The Ops' },
+      text: '@all @theops!',
+      heldKey: 'ops'
+    },
+    {
+      member: {
+        connectionId: 'default',
+        handle: 'default-vera',
+        name: 'vera',
+        remoteSource: true,
+        title: ''
+      },
+      text: '@all @default-vera!',
+      heldKey: 'default::vera'
+    }
+  ])('keeps room engagement scoped to a directly mentioned alias: $text', async ({ member, text, heldKey }) => {
     const { rounds } = await loadRoom()
+    const mentions = rounds.parseGroupChatMentions(text, [member as GroupMember])
 
     expect(
       rounds.applyGroupHoldDirective(
-        { docs: { at: 2 }, impl: { at: 1 } },
-        { everyone: true, mentioned: ['impl'] },
-        '@all @impl!',
+        { docs: { at: 2 }, [heldKey]: { at: 1 } },
+        mentions,
+        text,
         {},
-        ['impl', 'docs']
+        [heldKey, 'docs']
       )
     ).toEqual({ docs: { at: 2 } })
   })

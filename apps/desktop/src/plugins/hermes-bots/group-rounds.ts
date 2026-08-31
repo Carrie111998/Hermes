@@ -45,6 +45,7 @@ import type { Attachment, GroupMember, GroupMessage } from './types'
 export function parseGroupChatMentions(text: unknown, members: GroupMember[]) {
   const source = String(text || '')
   const mentioned = new Set<string>()
+  const mentionedTokens = new Set<string>()
   let everyone = false
   const handles = new Map<string, string>()
 
@@ -97,12 +98,14 @@ export function parseGroupChatMentions(text: unknown, members: GroupMember[]) {
 
     if (resolved) {
       mentioned.add(resolved)
+      mentionedTokens.add(handle)
     }
   }
 
   return {
     everyone,
-    mentioned
+    mentioned,
+    mentionedTokens
   }
 }
 
@@ -245,7 +248,8 @@ export type GroupHoldIntent =
 export function hasActionableGroupPayload(
   text: string,
   mentionedKeys: Iterable<string> | null | undefined = [],
-  hasAttachments = false
+  hasAttachments = false,
+  mentionedTokens: Iterable<string> | null | undefined = []
 ) {
   if (hasAttachments) {
     return true
@@ -253,6 +257,15 @@ export function hasActionableGroupPayload(
 
   let residual = String(text || '').replace(/@(all|everyone)\b/gi, ' ')
 
+  for (const token of mentionedTokens || []) {
+    const escaped = String(token || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+    if (escaped) {
+      residual = residual.replace(new RegExp(`@${escaped}\\b`, 'gi'), ' ')
+    }
+  }
+
+  // Compatibility fallback for callers that only have canonical member keys.
   for (const memberKey of mentionedKeys || []) {
     const bareName = String(memberKey || '').split('::').pop() || ''
 
@@ -274,7 +287,8 @@ export function classifyGroupHoldIntent(
   mentionedKeys: Iterable<string> | null | undefined,
   everyone: boolean,
   allMemberKeys: readonly string[] = [],
-  hasAttachments = false
+  hasAttachments = false,
+  mentionedTokens: Iterable<string> | null | undefined = []
 ): GroupHoldIntent {
   const value = String(text || '')
   const mentioned = [...(mentionedKeys || [])]
@@ -289,7 +303,7 @@ export function classifyGroupHoldIntent(
     return everyone ? { kind: 'release-all-explicit' } : { kind: 'release-members', memberKeys: mentioned }
   }
 
-  if (everyone && hasActionableGroupPayload(value, mentioned, hasAttachments)) {
+  if (everyone && hasActionableGroupPayload(value, mentioned, hasAttachments, mentionedTokens)) {
     return { kind: 'engage-room', memberKeys: [...allMemberKeys] }
   }
 
@@ -323,6 +337,7 @@ export function classifyGroupHoldDirective(
 interface GroupMentionParse {
   everyone?: boolean
   mentioned?: Iterable<string>
+  mentionedTokens?: Iterable<string>
 }
 
 /** #93129: next holds map after one user message. Holds are keyed by
@@ -345,7 +360,8 @@ export function applyGroupHoldDirective(
     mentions?.mentioned || [],
     Boolean(mentions?.everyone),
     allMemberKeys,
-    hasAttachments
+    hasAttachments,
+    mentions?.mentionedTokens || []
   )
 
   if (intent.kind === 'release-all-explicit') {
