@@ -43,6 +43,17 @@ def _isolate_tool_registry():
     process collects another module first, ``A2AAdapter._advertised_skills()``
     takes its dynamic path and Agent Card tests advertise leaked tools
     instead of the configured static capabilities.
+
+    Scope notes: only ``_tools``/``_scoped_tools`` are snapshot/cleared —
+    the registry's other state (``_toolset_aliases``, ``_toolset_checks``,
+    ``_plugin_override_policy``) is configuration/ownership bookkeeping,
+    not tool leakage, and is deliberately left untouched.  This is a
+    process-local fixture: it isolates each test within its pytest worker
+    only.  Under pytest-xdist each worker has its own registry singleton,
+    so cross-worker contamination is impossible and no shared state needs
+    guarding.  Touching the private attributes is intentional — a test
+    fixture may couple to registry internals rather than grow a public
+    reset API for it.
     """
     from tools.registry import registry
 
@@ -59,6 +70,49 @@ def _isolate_tool_registry():
             registry._tools.update(saved_tools)
             registry._scoped_tools.clear()
             registry._scoped_tools.update(saved_scoped)
+
+
+def test_registry_fixture_restores_state_when_test_body_raises():
+    """Failure path: a test that raises must still get its registrations
+    restored by the autouse fixture — snapshot in, snapshot out."""
+    import pytest as _pytest
+
+    from tools.registry import ToolEntry, registry
+
+    entry = ToolEntry(
+        name="_sentinel_tool_",
+        toolset="_sentinel_ts_",
+        schema={},
+        handler=lambda **kw: {"ok": True},
+        check_fn=None,
+        requires_env=[],
+        is_async=False,
+        description="sentinel for fixture teardown test",
+        emoji="🧪",
+    )
+
+    # Drive the generator-based fixture the way pytest does: prime it,
+    # run a body that registers a tool and raises, then close the
+    # generator (teardown must run on the failure path too).  The fixture
+    # is wrapped by @pytest.fixture, so reach the raw generator through
+    # ``__wrapped__`` instead of calling the fixture directly (deprecated).
+    fixture_gen = _isolate_tool_registry.__wrapped__()
+    next(fixture_gen)
+    try:
+        with registry._lock:
+            registry._tools["_sentinel_tool_"] = entry
+        with _pytest.raises(AssertionError, match="boom"):
+            raise AssertionError("boom")
+    finally:
+        # close() runs the fixture's finally-block (restoring the registry)
+        # even though the body raised; it returns normally once teardown
+        # completes.
+        fixture_gen.close()
+
+    with registry._lock:
+        assert "_sentinel_tool_" not in registry._tools, (
+            "registration leaked past fixture teardown after a raising body"
+        )
 
 
 # --------------------------------------------------------------------------
