@@ -3,11 +3,11 @@ from unittest.mock import patch
 import pytest
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_find_install_script_from_checkout(tmp_path):
     """_find_install_script finds scripts/install.sh in a git checkout.
 
-    ``linux_only``: the POSIX arm picks ``install.sh`` + ``bash``, which is
+    ``platforms("linux")``: the POSIX arm picks ``install.sh`` + ``bash``, which is
     already what ``_IS_WINDOWS`` reports here — nothing needs faking.
     """
     from hermes_cli.dep_ensure import _find_install_script
@@ -98,9 +98,9 @@ def test_find_agent_browser_lazy_install_cycle_terminates(monkeypatch):
     assert validate_calls == [True, False]
 
 
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_ensure_dependency_uses_powershell_on_windows(tmp_path):
-    """``windows_only``: the assertion is that we shell out to a real
+    """``platforms("windows")``: the assertion is that we shell out to a real
     PowerShell. Faking ``_IS_WINDOWS`` on Linux also required faking
     ``shutil.which`` into inventing a powershell.exe that isn't there."""
     from hermes_cli.dep_ensure import ensure_dependency

@@ -69,6 +69,7 @@ def test_resolve_workspace_for_file_uses_cwd_first(tmp_path: Path, monkeypatch):
 
 
 
+@pytest.mark.platforms("linux")
 def test_normalize_path_expands_tilde(monkeypatch):
     monkeypatch.setenv("HOME", "/home/user")
     p = normalize_path("~/x.py")

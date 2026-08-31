@@ -89,6 +89,7 @@ def test_absolute_terminal_cwd_used_verbatim(_isolated_cwd, monkeypatch):
     assert resolved == (workspace / "target.py")
 
 
+@pytest.mark.require_symlinks
 def test_container_absolute_input_path_does_not_follow_host_symlink(tmp_path, monkeypatch):
     """Docker paths are sandbox-local and must not be host-dereferenced.
 
@@ -118,6 +119,7 @@ def test_container_path_normalization_uses_posix_path_syntax():
     assert str(resolved) == "/workspace/projects/bar"
 
 
+@pytest.mark.require_symlinks
 def test_container_relative_path_keeps_container_cwd_symlink(tmp_path, monkeypatch):
     """Relative Docker paths should stay under the container cwd textually."""
     host_project = tmp_path / "host-project"
@@ -166,8 +168,11 @@ def test_warning_fires_when_relative_path_escapes_workspace(_isolated_cwd, monke
 
     assert warn is not None
     assert "OUTSIDE the active workspace" in warn
-    assert str(decoy) in warn
-    assert str(workspace) in warn
+    # Paths are repr-embedded in the message, so backslashes arrive doubled
+    # on Windows; un-escape before the containment check (host-aware).
+    warn_flat = warn.replace("\\\\", "\\")
+    assert str(decoy) in warn_flat
+    assert str(workspace) in warn_flat
 
 
 # ── Fix C: sentinel TERMINAL_CWD + empty-registry worktree anchoring ─────────
@@ -199,7 +204,7 @@ def test_warning_fires_from_terminal_cwd_when_registry_empty(_isolated_cwd, monk
 
     assert warn is not None
     assert "OUTSIDE the active workspace" in warn
-    assert str(workspace) in warn
+    assert str(workspace) in warn.replace("\\\\", "\\")
 
 
 # ── Fix A: write_file / patch report the resolved ABSOLUTE path ──────────────

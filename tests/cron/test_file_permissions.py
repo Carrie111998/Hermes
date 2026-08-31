@@ -7,6 +7,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
+pytestmark = pytest.mark.platforms("linux")
+
 
 class TestCronFilePermissions(unittest.TestCase):
     """Verify cron files get secure permissions."""

@@ -381,8 +381,10 @@ def _build_skill_message(
             if subdir_path.exists():
                 for f in sorted(subdir_path.rglob("*")):
                     if f.is_file() and not f.is_symlink():
-                        rel = str(f.relative_to(skill_dir))
-                        supporting.append(rel)
+                        # as_posix so the listed path matches the footer's
+                        # examples (scripts/foo.js) on every OS —
+                        # str(relative_to) emits backslashes on Windows.
+                        supporting.append(f.relative_to(skill_dir).as_posix())
 
     if supporting and skill_dir:
         try:

@@ -115,20 +115,19 @@ os.environ["HERMES_TEST_ISOLATION"] = os.environ.get("HERMES_HOME", "") or "1"
 HERMES_HOME_AT_CONFTEST_IMPORT = os.environ.get("HERMES_HOME", "")
 
 
-# ── Per-file process isolation ──────────────────────────────────────────────
-# Tests run via ``scripts/run_tests_parallel.py``, which spawns a fresh
-# ``python -m pytest <file>`` subprocess per test file. Cross-file state
-# leakage (module-level dicts, ContextVars, caches) is impossible: each
-# file gets a clean Python interpreter. Intra-file ordering is the test
-# author's responsibility — if test A in foo.py mutates state that test B
-# in foo.py reads, that's a real bug to fix in the file (it would also
-# bite anyone running ``pytest tests/foo.py`` directly).
+# ── File-level scheduling isolation ──────────────────────────────────────────
+# Tests run via ``scripts/run_tests.sh``, which dispatches on host. POSIX:
+# every file in its own freshly-spawned ``python -m pytest <file>`` subprocess
+# (``scripts/run_tests_parallel.py``) — cross-file state leakage is
+# impossible. Windows: pytest-xdist with ``--dist loadfile``, which pins every
+# test of a FILE to ONE worker — leakage is bounded to co-scheduled files, and
+# any such leak is a stateful-test bug to fix at the tests. Intra-file
+# ordering is the test author's responsibility on every host — if test A in
+# foo.py mutates state that test B in foo.py reads, that's a real bug to fix
+# in the file (it would also bite anyone running ``pytest tests/foo.py``
+# directly).
 #
-# This replaces the historic _reset_module_state autouse fixture (manual
-# state clearing) and the brief experiment with subprocess-per-test
-# isolation (too slow at ~17k tests).
-#
-# See ``scripts/run_tests_parallel.py`` for the runner.
+# See ``scripts/run_tests.sh`` for the runner.
 
 
 # ── Credential env-var filter ──────────────────────────────────────────────
@@ -783,16 +782,14 @@ def _state_db_write_guard(request, monkeypatch):
     yield
 
 
-# ── Module-level state reset — replaced by per-file process isolation ──────
+# ── Module-level state reset — replaced by file-pinned xdist workers ────────
 #
-# Each test FILE runs in a freshly-spawned ``python -m pytest <file>``
-# subprocess via ``scripts/run_tests_parallel.py``, so module-level dicts /
-# sets / ContextVars from tests in one file cannot leak into tests in
-# another file. No manual per-module clearing needed.
-#
-# Within a single file, ordering is the author's responsibility. If your
-# tests in the same file share mutable state, either reset it explicitly
-# in a fixture or split them across files.
+# ``--dist loadfile`` pins each test FILE to ONE worker, so heavy
+# co-scheduling pollution (module-level dicts / sets / ContextVars shared
+# by many files) is bounded to files that land on the same worker. Within
+# a single file, ordering is the author's responsibility. If your tests
+# in the same file share mutable state, either reset it explicitly in a
+# fixture or split them across files.
 #
 # The skill ``test-suite-cascade-diagnosis`` documents the cascade patterns
 # this replaces; the running example was ``test_command_guards`` failing
@@ -1107,12 +1104,12 @@ _ALLOW_MACOS_KEYCHAIN_MARK = "allow_macos_keychain"
 # So: a test whose subject is genuinely OS-specific declares the OS it
 # belongs to and runs there for real —
 #
-#   @pytest.mark.windows_only   → only on native Windows (``sys.platform == "win32"``)
-#   @pytest.mark.macos_only     → only on macOS (``sys.platform == "darwin"``)
-#   @pytest.mark.linux_only     → only on Linux (``sys.platform.startswith("linux")``)
+#   @pytest.mark.platforms("windows")   → only on native Windows (``sys.platform == "win32"``)
+#   @pytest.mark.platforms("macos")     → only on macOS (``sys.platform == "darwin"``)
+#   @pytest.mark.platforms("linux")     → only on Linux (``sys.platform.startswith("linux")``)
 #
 # Elsewhere the test is skipped, not faked. CI runs a dedicated macOS job
-# (``-m macos_only``) and a dedicated Windows job (``-m windows_only``) so
+# (``-m platforms("macos")``) and a dedicated Windows job (``-m platforms("windows")``) so
 # those markers are actually exercised on their own host rather than
 # quietly skipped everywhere.
 #
@@ -1132,20 +1129,78 @@ _ALLOW_MACOS_KEYCHAIN_MARK = "allow_macos_keychain"
 # another OS in order to pass, it belongs on that OS.
 # ---------------------------------------------------------------------------
 
-_OS_MARKS = {
-    "linux_only": (
-        lambda: sys.platform.startswith("linux"),
-        "Linux",
-    ),
-    "macos_only": (
-        lambda: sys.platform == "darwin",
-        "macOS",
-    ),
-    "windows_only": (
-        lambda: sys.platform == "win32",
-        "native Windows",
-    ),
+_PLATFORM_ALIASES = {
+    "linux": ("linux",),
+    "macos": ("darwin", "macos"),
+    "windows": ("win32", "windows"),
+    "posix": ("linux", "darwin"),
+    "any": (),
 }
+
+
+def _platform_machine() -> str:
+    import platform as _platform
+
+    machine = (_platform.machine() or "").lower()
+    return {"amd64": "x86_64", "x86": "x86_64", "aarch64": "arm64"}.get(machine, machine)
+
+
+def _host_matches_platforms(conditions, arch=None, arch_negate=False):
+    """Evaluate a platforms() marker payload against the running host.
+
+    Returns ``(ok, skip_reason)``.
+    """
+    host = sys.platform.lower()
+    machine = _platform_machine()
+    specs = [str(c).strip().lower() for c in conditions if str(c).strip()]
+    if not specs:
+        return True, "platforms() with no specs matches every host"
+    for spec in specs:
+        negate = spec.startswith("not ")
+        leaf = spec[4:].strip() if negate else spec
+        if leaf not in _PLATFORM_ALIASES:
+            return False, f"platforms(): unknown spec {spec!r}"
+        wanted = _PLATFORM_ALIASES[leaf]
+        matched = (not wanted) or host in wanted
+        if negate:
+            matched = not matched
+        if matched:
+            break
+    else:
+        return False, f"platforms({', '.join(specs)}); host is {sys.platform}"
+    if arch is not None:
+        arch_l = str(arch).lower()
+        arch_hit = machine == arch_l or (
+            arch_l in {"arm64", "aarch64"} and machine == "arm64"
+        )
+        if arch_negate:
+            arch_hit = not arch_hit
+        if not arch_hit:
+            return False, (
+                f"platforms(arch={'not ' if arch_negate else ''}{arch}); "
+                f"host machine is {machine or 'unknown'}"
+            )
+    return True, ""
+
+
+def _platforms_gate_reason(item):
+    """Skip reason when the item's platforms() gating excludes this host."""
+    for mark in item.iter_markers("platforms"):
+        kwargs = dict(mark.kwargs)
+        conds = list(mark.args)
+        ok, reason = _host_matches_platforms(
+            conds,
+            arch=kwargs.pop("arch", None),
+            arch_negate=kwargs.pop("arch_negate", False),
+        )
+        if kwargs:
+            raise pytest.UsageError(
+                f"{item.nodeid}: platforms() got unexpected keyword(s) "
+                f"{sorted(kwargs)} — valid: arch, arch_negate"
+            )
+        if not ok:
+            return reason
+    return None
 
 
 def pytest_configure(config):  # noqa: D401 — pytest hook
@@ -1170,6 +1225,18 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     )
     config.addinivalue_line(
         "markers",
+        "platforms(*specs, arch=None, arch_negate=False): run only on hosts "
+        "matching at least one spec — linux/macos/windows/posix/any, "
+        "'not X' negation, optional arch filter (e.g. arch='arm64')",
+    )
+    config.addinivalue_line(
+        "markers",
+        "platforms(*specs, arch=None, arch_negate=False): run only on hosts "
+        "matching at least one spec — linux/macos/windows/posix/any, "
+        "'not X' negation, optional arch filter (e.g. arch='arm64')",
+    )
+    config.addinivalue_line(
+        "markers",
         f"{_ALLOW_MACOS_KEYCHAIN_MARK}: allow a test to exercise the macOS "
         "Keychain credential reader with its own subprocess/platform mocks.",
     )
@@ -1185,7 +1252,7 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         "dispatcher's memory guard to 'no data' — only for tests that "
         "exercise the guard itself with their own patched samples.",
     )
-    # NOTE: linux_only / macos_only / windows_only are declared in
+    # NOTE: platforms("linux") / platforms("macos") / platforms("windows") are declared in
     # pyproject.toml's ``markers`` list, not here — they are part of the
     # project's public marker vocabulary (``pytest --markers``, and the CI
     # lanes select on them), whereas the marks above are conftest-internal
@@ -1231,52 +1298,51 @@ def pytest_runtest_setup(item):
             )
 
 
-def _reject_multiple_os_marks(items):
-    """Fail collection when one test carries two host-OS markers.
+def _reject_contradictory_platform_marks(items):
+    """Fail collection when one test carries two platforms() markers.
 
-    Every marker in ``_OS_MARKS`` skips on all but one host, so two of them
-    on the same item means it is skipped on *every* host — a test that never
-    runs anywhere, reported as green by both the Linux suite and the
-    tests-os lanes. That is the exact silent-coverage-loss the markers were
-    introduced to remove, so it is a hard collection error rather than a
-    warning nobody reads.
+    Two markers are ANDed by the gate, so a stacked pair is not always wrong
+    in principle — but the historic failure this guard exists for (a
+    module-level gate stacking with a per-test gate so the test is skipped
+    on every host while both lanes report green) is only diagnosable at
+    collection time. A test that needs a compound condition writes ONE
+    marker: platforms("linux", arch="arm64").
     """
     offenders = []
     for item in items:
-        marks = sorted({m.name for m in item.iter_markers() if m.name in _OS_MARKS})
+        marks = list(item.iter_markers("platforms"))
         if len(marks) > 1:
-            offenders.append(f"  {item.nodeid}: {', '.join(marks)}")
+            offenders.append(f"  {item.nodeid}: {len(marks)} platforms() marks")
     if offenders:
         raise pytest.UsageError(
-            "a test may carry at most one host-OS marker "
-            f"({', '.join(_OS_MARKS)}); these carry several and would be "
-            "skipped on every host:\n" + "\n".join(offenders)
+            "a test may carry at most one platforms() marker — combine the "
+            'specs into one call (platforms("linux", arch="arm64") instead '
+            "of stacking two markers); these carry several:\n"
+            + "\n".join(offenders)
         )
 
 
 def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
     """Apply host-OS gating, then skip ``requires_wal`` where WAL is unusable.
 
-    OS gating: a test marked ``linux_only`` / ``macos_only`` /
-    ``windows_only`` runs only on that host. See the ``_OS_MARKS`` block
-    comment above for why these tests are skipped rather than run against a
-    patched ``sys.platform``.
+    OS gating: a test marked ``platforms(...)`` runs only on hosts its
+    specs match. See the platform-gating block comment above for why these
+    tests are skipped rather than run against a patched ``sys.platform``.
 
     WAL gating is cheaper and more honest than each test hand-rolling a
     version check: the reason string names the actual linked version so the
     skip is diagnosable rather than mysterious.
     """
-    _reject_multiple_os_marks(items)
+    _reject_contradictory_platform_marks(items)
 
-    for mark_name, (is_host, label) in _OS_MARKS.items():
-        if is_host():
-            continue
-        skip_os = pytest.mark.skip(
-            reason=f"{label}-only test (marked {mark_name}); host is {sys.platform}"
-        )
-        for item in items:
-            if item.get_closest_marker(mark_name) is not None:
-                item.add_marker(skip_os)
+    # platforms() gating: skip items whose specs exclude this host. The skip
+    # markers (not -m expressions) are the authoritative host filter on
+    # every lane, so a lane selects with plain ``-m platforms`` and lets the
+    # specs decide per-test.
+    for item in items:
+        reason = _platforms_gate_reason(item)
+        if reason is not None:
+            item.add_marker(pytest.mark.skip(reason=reason))
 
     if _wal_is_usable():
         return

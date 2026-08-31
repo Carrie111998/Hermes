@@ -3474,7 +3474,15 @@ def run_slash(rest: str) -> str:
     import io
     import contextlib
 
-    tokens = shlex.split(rest) if rest and rest.strip() else []
+    # Non-posix split (Windows) keeps backslashes as path separators but
+    # leaves quote characters in the tokens — strip a fully wrapping pair
+    # so `"my task"` reaches argparse as `my task`, not `"my task"`.
+    tokens = []
+    if rest and rest.strip():
+        for tok in shlex.split(rest, posix=os.name == "posix"):
+            if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in ("'", '"'):
+                tok = tok[1:-1]
+            tokens.append(tok)
 
     # Bare ``/kanban`` or ``/kanban help`` / ``--help`` / ``-h`` / ``?``:
     # show the curated short-help block instead of dumping argparse's full

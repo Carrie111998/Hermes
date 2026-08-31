@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+@pytest.mark.platforms("linux")
 def test_cancel_event_terminates_script_process_tree(tmp_path, monkeypatch):
     """Losing a fire claim must stop both the script and its descendants."""
     import cron.scheduler as scheduler
@@ -540,8 +541,10 @@ def test_repeated_heartbeat_errors_cancel_after_bounded_grace(monkeypatch):
     }
     monkeypatch.setattr(scheduler, "heartbeat_fire_claim", heartbeat)
     monkeypatch.setattr(scheduler, "_run_one_job_body", run_body)
-    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
-    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.03)
+    # Intervals well above Windows' ~15ms timer resolution so the grace window
+    # reliably spans 3+ heartbeat ticks (10ms/30ms left only ~2 on win32).
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.05)
+    monkeypatch.setattr(scheduler, "_FIRE_CLAIM_HEARTBEAT_GRACE_SECONDS", 0.3)
 
     assert scheduler.run_one_job(job) is True
     assert calls >= 3

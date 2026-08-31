@@ -33,7 +33,7 @@ import threading
 from typing import Dict, List, Optional
 
 from agent.tts_provider import TTSProvider
-from hermes_constants import hermes_home_key
+from hermes_constants import hermes_home_key, normalize_scope
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +97,7 @@ def register_provider(provider: TTSProvider, *, scope: Optional[str] = None) -> 
         )
         return
     with _lock:
+        scope = normalize_scope(scope)
         target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
         existing = target.get(key)
         target[key] = provider
@@ -116,7 +117,7 @@ def list_providers(*, scope: Optional[str] = None) -> List[TTSProvider]:
     """Return all registered providers, sorted by name."""
     with _lock:
         merged = dict(_providers)
-        merged.update(_scoped_providers.get(scope or hermes_home_key(), {}))
+        merged.update(_scoped_providers.get(hermes_home_key(scope), {}))
         items = list(merged.values())
     return sorted(items, key=lambda p: p.name)
 
@@ -132,7 +133,7 @@ def get_provider(name: str, *, scope: Optional[str] = None) -> Optional[TTSProvi
         return None
     key = name.strip().lower()
     with _lock:
-        return _scoped_providers.get(scope or hermes_home_key(), {}).get(key) or _providers.get(key)
+        return _scoped_providers.get(hermes_home_key(scope), {}).get(key) or _providers.get(key)
 
 
 def snapshot_registration(
@@ -140,6 +141,7 @@ def snapshot_registration(
 ) -> Optional[TTSProvider]:
     key = name.strip().lower()
     with _lock:
+        scope = normalize_scope(scope)
         target = _providers if scope is None else _scoped_providers.get(scope, {})
         return target.get(key)
 
@@ -154,6 +156,7 @@ def restore_registration(
     """Restore a plugin registration only when *current* is still installed."""
     key = name.strip().lower()
     with _lock:
+        scope = normalize_scope(scope)
         target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
         if target.get(key) is not current:
             return False

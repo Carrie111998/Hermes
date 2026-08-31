@@ -144,7 +144,7 @@ def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool
     return False
 
 
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_write_stdin_uses_str_for_windows_pty(registry):
     """pywinpty expects str input; bytes raises a PyString conversion error.
 
@@ -168,7 +168,7 @@ def test_write_stdin_uses_str_for_windows_pty(registry):
     assert isinstance(written[0], str)
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_write_stdin_uses_bytes_for_posix_pty(registry):
     """The POSIX counterpart: ptyprocess expects bytes, not str."""
     written = []
@@ -187,7 +187,7 @@ def test_write_stdin_uses_bytes_for_posix_pty(registry):
     assert written == [b"hello\n"]
 
 
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_submit_stdin_uses_crlf_for_windows_pty(registry):
     """Enter on a Windows PTY is a carriage return, not a bare LF.
 
@@ -213,7 +213,7 @@ def test_submit_stdin_uses_crlf_for_windows_pty(registry):
     assert written == ["Y\r\n"]
 
 
-@pytest.mark.windows_only
+@pytest.mark.platforms("windows")
 def test_submit_stdin_keeps_lf_for_windows_pipe(registry):
     """Non-PTY (Popen pipe) sessions keep the plain LF on Windows."""
     session = _make_session(sid="pipe-win-submit")
@@ -570,6 +570,7 @@ class TestStdinHelpers:
         proc.stdin.close.assert_called_once()
         assert result["status"] == "ok"
 
+    @pytest.mark.platforms("linux")
     def test_close_stdin_allows_eof_driven_process_to_finish(self, registry, tmp_path):
         """PTY mode: writing data + sending EOF lets an EOF-driven child finish.
 
@@ -707,6 +708,7 @@ class TestPruning:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
+    @pytest.mark.platforms("linux")
     def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
         captured = {}
 
@@ -814,6 +816,7 @@ class TestSpawnEnvSanitization:
 class TestPopenLeakOnSetupFailure:
     """Regression for issue #2749: subprocess orphaned when post-Popen setup raises."""
 
+    @pytest.mark.platforms("linux")
     def test_popen_killed_when_thread_creation_fails(self, registry):
         """If Thread() raises after Popen, proc must be killed — not orphaned."""
         killed = []
@@ -915,6 +918,7 @@ class TestSpawnRewriteCompoundBackground:
         # Simple background must remain as-is
         assert "sleep 5 &" in shell_cmd
 
+    @pytest.mark.platforms("linux")
     def test_pty_path_uses_rewritten_command(self, registry):
         """PTY spawn path must also use the rewritten command (issue #68915)."""
         mock_pty_proc = MagicMock()
@@ -1061,6 +1065,7 @@ class TestKillProcess:
         assert result["status"] == "already_exited"
 
 
+    @pytest.mark.platforms("linux")
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
@@ -1256,7 +1261,7 @@ class TestTerminateHostPidWindows:
     target handle only, not the tree.
     """
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_windows_invokes_taskkill_with_tree_and_force_flags(self, monkeypatch):
         """The Windows branch must shell out to ``taskkill /PID N /T /F``.
 
@@ -1286,6 +1291,7 @@ class TestTerminateHostPidWindows:
 class TestTerminateHostPidPosix:
     """POSIX branch walks the tree via psutil and SIGTERMs children first."""
 
+    @pytest.mark.platforms("linux")
     def test_posix_walks_tree_and_terminates_children_then_parent(self, monkeypatch):
         from tools import process_registry as pr
         import psutil
@@ -1323,6 +1329,7 @@ class TestTerminateHostPidPosix:
             "Children must be terminated before the parent"
         )
 
+    @pytest.mark.platforms("linux")
     def test_posix_oserror_falls_back_to_os_kill(self, monkeypatch):
         from tools import process_registry as pr
         import psutil

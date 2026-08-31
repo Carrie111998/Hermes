@@ -142,13 +142,34 @@ def get_hermes_home() -> Path:
 def hermes_home_key(path: str | Path | None = None) -> str:
     """Return a stable key for a Hermes home/profile directory.
 
+    A falsy path (``None`` or empty) resolves to the active default home.
     Runtime registries use this key to isolate plugin-owned entries while
     keeping built-in registrations process-global.  ``strict=False`` preserves
     useful behavior for profiles whose directories have not been created yet.
     """
-    candidate = Path(path) if path is not None else get_hermes_home()
+    candidate = Path(path) if path else get_hermes_home()
     resolved = candidate.expanduser().resolve(strict=False)
     return os.path.normcase(str(resolved))
+
+
+def normalize_scope(scope: str | Path | None) -> str | None:
+    """Normalize a WRITE-side registry scope key, preserving ``None``.
+
+    Two different contracts live on the same registries — do not unify them:
+
+    * **Write / slot paths** (``register_*``, ``snapshot_registration``,
+      ``restore_registration``, tool-registry slot lookup): ``None`` means
+      the process-global layer and must stay ``None``. Use this function.
+    * **Read paths** (``list_providers``, ``get_provider``): ``None`` means
+      "the active home's scope" and must go through :func:`hermes_home_key`
+      (falsy input resolves to the active default home). Using this
+      function there hides every scoped registration — the exact bug
+      fixed after e66a627aa5.
+
+    Both normalize non-None values identically (resolved absolute path,
+    normcase on Windows) so writes and reads agree on the key.
+    """
+    return hermes_home_key(scope) if scope is not None else None
 
 
 def get_process_hermes_home() -> Path:

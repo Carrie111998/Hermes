@@ -37,7 +37,7 @@ import threading
 from typing import Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
-from hermes_constants import hermes_home_key
+from hermes_constants import hermes_home_key, normalize_scope
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,7 @@ def register_provider(provider: WebSearchProvider, *, scope: Optional[str] = Non
         raise ValueError("Web provider .name must be a non-empty string")
     name = raw_name.strip()
     with _lock:
+        scope = normalize_scope(scope)
         target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
         existing = target.get(name)
         target[name] = provider
@@ -83,7 +84,7 @@ def list_providers(*, scope: Optional[str] = None) -> List[WebSearchProvider]:
     """Return all registered providers, sorted by name."""
     with _lock:
         merged = dict(_providers)
-        merged.update(_scoped_providers.get(scope or hermes_home_key(), {}))
+        merged.update(_scoped_providers.get(hermes_home_key(scope), {}))
         items = list(merged.values())
     return sorted(items, key=lambda p: p.name)
 
@@ -94,13 +95,14 @@ def get_provider(name: str, *, scope: Optional[str] = None) -> Optional[WebSearc
         return None
     with _lock:
         key = name.strip()
-        return _scoped_providers.get(scope or hermes_home_key(), {}).get(key) or _providers.get(key)
+        return _scoped_providers.get(hermes_home_key(scope), {}).get(key) or _providers.get(key)
 
 
 def snapshot_registration(
     name: str, *, scope: Optional[str] = None
 ) -> Optional[WebSearchProvider]:
     with _lock:
+        scope = normalize_scope(scope)
         target = _providers if scope is None else _scoped_providers.get(scope, {})
         return target.get(name.strip())
 
@@ -115,6 +117,7 @@ def restore_registration(
     """Restore a plugin registration only when *current* is still installed."""
     key = name.strip()
     with _lock:
+        scope = normalize_scope(scope)
         target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
         if target.get(key) is not current:
             return False

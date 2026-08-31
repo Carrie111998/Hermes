@@ -28,6 +28,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import noninteractive_git_env
 from hermes_cli.config import cfg_get
 from hermes_cli.secret_prompt import masked_secret_prompt
+from hermes_cli.fs_utils import rmtree_force as _rmtree_force
 from utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
@@ -867,7 +868,7 @@ def _install_plugin_core(
             _write_install_metadata(new_metadata)
         except Exception:
             if target.exists():
-                shutil.rmtree(target)
+                _rmtree_force(target)
             if replaced_existing and backup.exists():
                 os.replace(backup, target)
             if old_metadata:
@@ -1208,7 +1209,7 @@ def _remove_plugin_core(target: Path) -> None:
     """Remove one plugin and its metadata without splitting their state."""
     metadata = _read_install_metadata()
     if target.name not in metadata:
-        shutil.rmtree(target)
+        _rmtree_force(target)
         return
 
     updated = dict(metadata)
@@ -1230,7 +1231,7 @@ def _remove_plugin_core(target: Path) -> None:
             ) from restore_exc
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    shutil.rmtree(staging)
+    _rmtree_force(staging)
 
 
 def cmd_remove(name: str) -> None:

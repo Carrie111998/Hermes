@@ -2168,6 +2168,21 @@ def _replace_simple_shell_expansions(word: str) -> str:
     return _PARAM_DEFAULT_RE.sub(lambda match: match.group("default"), word)
 
 
+def _is_windows_drive_relative_backslash(word: str, i: int) -> bool:
+    """True when ``word[i] == '\\'`` is a path separator, not a shell escape.
+
+    On Windows drive-relative paths (``C:\\Users\\x``, ``C:Users`` forms), a
+    backslash between word characters is a separator the shell leaves alone.
+    The codebase's Windows shell is still bash, so ``r\\m`` spells ``rm``
+    exactly as on POSIX — the escape must keep being stripped everywhere
+    EXCEPT inside a drive-anchored path, where stripping would corrupt the
+    path (``C:\\Users`` → ``C:Users``) and open false-positive approvals.
+    """
+    if i <= 0 or not word[i - 1].isalnum():
+        return False
+    return bool(re.match(r"^[A-Za-z]:", word))
+
+
 def _strip_shell_word_syntax(word: str) -> str:
     chars: list[str] = []
     quote: str | None = None
@@ -2175,7 +2190,12 @@ def _strip_shell_word_syntax(word: str) -> str:
     while i < len(word):
         ch = word[i]
         if quote:
-            if ch == "\\" and quote == '"' and i + 1 < len(word):
+            if (
+                ch == "\\"
+                and quote == '"'
+                and i + 1 < len(word)
+                and not _is_windows_drive_relative_backslash(word, i)
+            ):
                 chars.append(word[i + 1])
                 i += 2
                 continue
@@ -2190,7 +2210,11 @@ def _strip_shell_word_syntax(word: str) -> str:
             quote = ch
             i += 1
             continue
-        if ch == "\\" and i + 1 < len(word):
+        if (
+            ch == "\\"
+            and i + 1 < len(word)
+            and not _is_windows_drive_relative_backslash(word, i)
+        ):
             chars.append(word[i + 1])
             i += 2
             continue
@@ -3517,9 +3541,11 @@ def _get_approval_timeout() -> int:
         safe_cap = int(MAX_SAFE_TIMEOUT_S)
     except Exception:
         # Fail CLOSED: returning the raw value here would re-open the exact
-        # time_t overflow this clamp exists to prevent. ~1 year, matching
-        # agent.deadline.MAX_SAFE_TIMEOUT_S.
-        safe_cap = 365 * 24 * 3600
+        # time_t overflow this clamp exists to prevent. Mirror the per-host
+        # ceiling of agent.deadline.MAX_SAFE_TIMEOUT_S — 1 year on POSIX,
+        # but the DWORD-millisecond ceiling on Windows (WaitForSingleObject
+        # caps at ~49.7 days; a year overflows it).
+        safe_cap = 4_294_907 if sys.platform == "win32" else 365 * 24 * 3600
     if raw > safe_cap:
         logger.warning(
             "approvals.timeout=%s exceeds the platform-safe maximum; "

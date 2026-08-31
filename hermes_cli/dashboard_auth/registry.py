@@ -10,7 +10,7 @@ import logging
 import threading
 from typing import List, Optional
 
-from hermes_constants import hermes_home_key
+from hermes_constants import hermes_home_key, normalize_scope
 from hermes_cli.dashboard_auth.base import (
     DashboardAuthProvider,
     assert_protocol_compliance,
@@ -24,7 +24,7 @@ _scoped_providers: dict[str, dict[str, DashboardAuthProvider]] = {}
 
 def _merged(scope: Optional[str] = None) -> dict[str, DashboardAuthProvider]:
     providers = dict(_providers)
-    providers.update(_scoped_providers.get(scope or hermes_home_key(), {}))
+    providers.update(_scoped_providers.get(hermes_home_key(scope), {}))
     return providers
 
 
@@ -41,6 +41,7 @@ def register_provider(
     """
     assert_protocol_compliance(type(provider))
     with _lock:
+        scope = normalize_scope(scope)
         target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
         effective = target if scope is None else _merged(scope)
         if provider.name in effective:
@@ -70,6 +71,7 @@ def snapshot_registration(
     scope: Optional[str] = None,
 ) -> Optional[DashboardAuthProvider]:
     with _lock:
+        scope = normalize_scope(scope)
         target = _providers if scope is None else _scoped_providers.get(scope, {})
         return target.get(name)
 
@@ -83,6 +85,7 @@ def restore_registration(
 ) -> bool:
     """Restore a host-owned provider registration if it is still current."""
     with _lock:
+        scope = normalize_scope(scope)
         target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
         if target.get(name) is not current:
             return False

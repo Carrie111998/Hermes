@@ -18,6 +18,7 @@ from tools.environments.local import _find_bash, _find_shell
 class TestFindShellPrefersUserShell:
     """_find_shell should prefer $SHELL over bash on POSIX."""
 
+    @pytest.mark.platforms("linux")
     def test_returns_shell_env_when_set_and_exists(self, tmp_path):
         """When $SHELL points to an existing allowlisted executable, _find_shell returns it."""
         fake_zsh = tmp_path / "zsh"
@@ -46,6 +47,7 @@ class TestFindShellPrefersUserShell:
             assert _find_shell() == _find_bash()
 
 
+    @pytest.mark.platforms("linux")
     def test_honours_allowlisted_bash_and_dash(self, tmp_path):
         """Every allowlisted POSIX-sh-family shell is honoured."""
         for name in ("bash", "dash", "sh", "ksh"):
@@ -65,7 +67,7 @@ class TestFindShellPrefersUserShell:
 class TestFindShellWindowsBehavior:
     """On Windows, _find_shell always delegates to _find_bash."""
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_windows_ignores_shell_env(self):
         """On Windows, $SHELL is ignored — _find_shell delegates to _find_bash.
 
@@ -105,7 +107,7 @@ class TestFindBashUnchanged:
 class TestFindBashSkipsBrokenCustomPath:
     """Stale HERMES_GIT_BASH_PATH must not brick Windows terminal startup."""
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_falls_through_to_portable_when_custom_fails_probe(self, tmp_path, monkeypatch):
         """Windows-only: the candidate ladder (HERMES_GIT_BASH_PATH →
         %LOCALAPPDATA%\\hermes\\git → Program Files) only exists in
@@ -154,7 +156,7 @@ class TestGitBashExternalProgramProbe:
         assert local_mod._bash_starts(r"C:\Git\bin\bash.exe") is True
         assert calls[0][0][-1] == "/usr/bin/true; /usr/bin/cat --version >/dev/null"
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_aslr_failure_surfaces_targeted_windows_command(
         self, tmp_path, monkeypatch
     ):
@@ -193,7 +195,7 @@ class TestGitBashExternalProgramProbe:
         assert str(tmp_path / "hermes" / "git") in message
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 @pytest.mark.skipif(
     not os.path.isfile("/bin/bash"),
     reason="reproduces the macOS system-bash-3.2 login-shell swallow",

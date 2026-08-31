@@ -332,7 +332,7 @@ def test_make_tui_argv_skips_build_only_on_termux_when_fresh(
 
     argv, cwd = main_mod._make_tui_argv(tmp_path, tui_dev=False)
 
-    assert argv == ["/bin/node", "--expose-gc", str(tmp_path / "dist" / "entry.js")]
+    assert argv[1:] == ["--expose-gc", str(tmp_path / "dist" / "entry.js")]
     assert cwd == tmp_path
 
 
@@ -352,7 +352,7 @@ def test_make_tui_argv_skips_install_on_termux_when_bundle_fresh(
 
     argv, cwd = main_mod._make_tui_argv(tmp_path, tui_dev=False)
 
-    assert argv == ["/bin/node", "--expose-gc", str(tmp_path / "dist" / "entry.js")]
+    assert argv[1:] == ["--expose-gc", str(tmp_path / "dist" / "entry.js")]
     assert cwd == tmp_path
 
 
@@ -382,8 +382,7 @@ def test_make_tui_argv_scopes_npm_install_on_termux_workspace(
     main_mod._make_tui_argv(tui_dir, tui_dev=False)
 
     install_cmd = calls[0][0][0]
-    assert install_cmd[:7] == [
-        "/bin/npm",
+    assert install_cmd[1:7] == [
         "install",
         "--workspace",
         "ui-tui",
@@ -418,8 +417,7 @@ def test_make_tui_argv_keeps_desktop_workspace_install_behaviour(
 
     main_mod._make_tui_argv(tui_dir, tui_dev=False)
 
-    assert calls[0][0][0] == [
-        "/bin/npm",
+    assert calls[0][0][0][1:] == [
         "install",
         "--workspace",
         "ui-tui",
@@ -463,7 +461,7 @@ def test_make_tui_argv_npm_install_forces_include_dev(
     main_mod._make_tui_argv(tui_dir, tui_dev=False)
 
     install_cmd = calls[0][0][0]
-    assert install_cmd[:2] == ["/bin/npm", "install"]
+    assert install_cmd[1] == "install"
     assert "--include=dev" in install_cmd
 
 
@@ -487,7 +485,7 @@ def test_make_tui_argv_keeps_desktop_always_build_behaviour(
     main_mod._make_tui_argv(tmp_path, tui_dev=False)
 
     assert calls
-    assert calls[0][0][0] == ["/bin/npm", "run", "build"]
+    assert calls[0][0][0][-2:] == ["run", "build"]
     _assert_utf8_replace_capture(calls[0][1])
 
 
@@ -514,7 +512,7 @@ def test_make_tui_argv_decodes_dev_prebuild_with_utf8_replace(
 
     assert argv == [str(tsx), "src/entry.tsx"]
     assert cwd == tmp_path
-    assert calls[0][0][0] == ["/bin/npm", "run", "build"]
+    assert calls[0][0][0][-2:] == ["run", "build"]
     assert calls[0][1]["cwd"] == str(ink_dir)
     _assert_utf8_replace_capture(calls[0][1])
 
@@ -550,7 +548,7 @@ def test_make_tui_argv_exits_with_recovery_hint_when_workspace_unrecoverable(
 
     argv, cwd = main_mod._make_tui_argv(tui_dir, tui_dev=False)
 
-    assert argv == ["/usr/bin/node", "--expose-gc", str(bundled_entry)]
+    assert argv[1:] == ["--expose-gc", str(bundled_entry)]
     assert cwd == bundled_entry.parent
 
 

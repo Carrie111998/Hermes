@@ -157,6 +157,7 @@ class TestMacOSManagedPythonSigning:
 
 class TestResolveUv:
 
+    @pytest.mark.platforms("linux")
     def test_existing_executable(self, tmp_path):
         _make_executable(tmp_path / "bin" / "uv")
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path):
@@ -181,6 +182,7 @@ class TestResolveUv:
 
 class TestEnsureUv:
 
+    @pytest.mark.platforms("linux")
     def test_installs_if_missing(self, tmp_path):
         with patch("hermes_cli.managed_uv.get_hermes_home", return_value=tmp_path), \
              patch("hermes_cli.managed_uv.repair_vulnerable_runtime", return_value=_RRR("not-applicable")), \
@@ -195,6 +197,7 @@ class TestEnsureUv:
             assert path == str(tmp_path / "bin" / "uv")
             mock_install.assert_called_once()
 
+    @pytest.mark.platforms("linux")
     def test_install_reports_runtime_repair_to_observer(self, tmp_path):
         from hermes_cli.managed_uv import (
             RuntimeRepairResult,
@@ -302,9 +305,9 @@ class TestEnsureUvWindowsSafe:
         with pytest.raises(TypeError):
             subprocess.list2cmdline([_UvResult("C:\\hermes\\uv.exe"), "pip"])
 
-    @pytest.mark.windows_only
+    @pytest.mark.platforms("windows")
     def test_windows_returns_plain_str_safe_for_subprocess(self, tmp_path):
-        """``windows_only``: the subject is the real Windows opt-out branch and
+        """``platforms("windows")``: the subject is the real Windows opt-out branch and
         ``subprocess.list2cmdline`` — the faked ``platform.system`` only ever
         proved the branch existed, not that the field crash was fixed on the
         host that reported it."""
@@ -329,6 +332,7 @@ class TestUpdateManagedUv:
 
 
 
+    @pytest.mark.platforms("linux")
     def test_fresh_stamp_skips_network_self_update_but_not_repair(self, tmp_path, monkeypatch):
         """A recent success stamp must skip `uv self update` entirely while the
         vulnerable-runtime repair probe still runs (CVE repair is never gated)."""
@@ -355,6 +359,7 @@ class TestUpdateManagedUv:
         mock_repair.assert_called_once_with(str(uv))
 
 
+    @pytest.mark.platforms("linux")
     def test_stale_stamp_runs_self_update_and_refreshes_stamp(self, tmp_path):
         import os as _os
         import time as _time
@@ -674,6 +679,7 @@ class TestRuntimeCutover:
 # ---------------------------------------------------------------------------
 
 class TestInstallUvInternals:
+    @pytest.mark.platforms("linux")
     def test_posix_sets_uv_unmanaged_install(self, tmp_path):
         target = tmp_path / "bin" / "uv"
         with patch("hermes_cli.managed_uv._install_uv_posix") as mock_posix:
@@ -1258,6 +1264,7 @@ class TestDefaultLiveVenv:
             (bin_dir / "python").write_text("py", encoding="utf-8")
         return root
 
+    @pytest.mark.platforms("linux")
     def test_dot_venv_only_is_targeted(self, tmp_path):
         from hermes_cli.managed_uv import _default_live_venv
 

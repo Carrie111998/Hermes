@@ -51,7 +51,7 @@ import tempfile
 import threading
 import time
 import uuid
-from pathlib import PureWindowsPath
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -538,7 +538,10 @@ def _wsl_windows_path_to_posix(path: str) -> str:
     drive = (win.drive or "").rstrip(":").lower()
     if not drive:
         return path
-    return os.path.join("/mnt", drive, *(str(part) for part in win.parts[1:]))
+    # PurePosixPath (not os.path.join) so the result always uses forward
+    # slashes — os.path.join would emit backslashes on a native Windows host,
+    # producing the invalid ``/mnt\c\...`` the WSL side cannot read.
+    return str(PurePosixPath("/mnt", drive, *(str(part) for part in win.parts[1:])))
 
 
 def _resolve_cua_driver_app_path(driver_cmd: str) -> Optional[str]:

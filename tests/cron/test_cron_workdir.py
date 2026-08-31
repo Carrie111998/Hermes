@@ -45,6 +45,7 @@ class TestNormalizeWorkdir:
         result = _normalize_workdir(str(tmp_path))
         assert result == str(tmp_path.resolve())
 
+    @pytest.mark.platforms("linux")
     def test_tilde_expands(self, tmp_path, monkeypatch):
         from cron.jobs import _normalize_workdir
         monkeypatch.setenv("HOME", str(tmp_path))

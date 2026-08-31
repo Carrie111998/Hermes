@@ -77,7 +77,10 @@ class TestApprovalTimeoutOverflowClamp:
         monkeypatch.setattr(builtins, "__import__", _blocked)
         with _with_configured_timeout(10**18):
             value = _get_approval_timeout()
-        assert value == 365 * 24 * 3600
+        # The fallback mirrors the per-host MAX_SAFE_TIMEOUT_S ceiling
+        # (imported BEFORE the block — the check itself must not depend on
+        # the patched-away import).
+        assert value == int(MAX_SAFE_TIMEOUT_S)
         # Still platform-safe for the crashing primitive.
         lock = threading.Lock()
         assert lock.acquire(timeout=value)

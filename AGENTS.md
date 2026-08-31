@@ -1579,30 +1579,34 @@ def profile_env(tmp_path, monkeypatch):
 ### Python
 **ALWAYS use `scripts/run_tests.sh`** — do not call `pytest` directly. The script enforces
 hermetic environment parity with CI (unset credential vars, TZ=UTC, LANG=C.UTF-8,
-per-file subprocess isolation via `scripts/run_tests_parallel.py` — no xdist,
-worker count auto-scaled from CPU count). Direct `pytest`
+and a host-dispatched runner: per-file subprocess isolation on POSIX — spawn is
+~15ms there, so each file gets a clean interpreter and is collected exactly
+once — and pytest-xdist `--dist loadfile` on Windows, where per-file spawn
+costs 0.5-1.5s and persistent workers amortize it). Direct `pytest`
 on a 16+ core developer machine with API keys set diverges from CI in ways
 that have caused multiple "works locally, fails in CI" incidents (and the reverse).
 
 ```bash
 scripts/run_tests.sh                                  # full suite, CI-parity
 scripts/run_tests.sh tests/gateway/                   # one directory
-scripts/run_tests.sh tests/agent/test_foo.py -k test_x  # one test (file + -k; the runner is file-granular)
+scripts/run_tests.sh tests/agent/test_foo.py -k test_x  # one test (file + -k)
 scripts/run_tests.sh -v --tb=long                     # pass-through pytest flags
 ```
 
-**Flake policy:** the runner auto-retries a failing test FILE once in a fresh
-subprocess (`--file-retries`, default 1; `HERMES_TEST_FILE_RETRIES=0` to
-disable). Pass-on-retry counts as green but is printed in a `⚠ FLAKY` summary
-section with both attempts' output. A FLAKY report is a bug to fix, not noise
-to ignore — timing-sensitive tests must not assume a quiet runner (loose
-wall-clock bounds ≥ 2s, event-based sync, no `assert not _wait_until(...)`
-negative-timing races).
+**Flake policy:** on POSIX every file runs in its own subprocess (a failure
+is the file's own bug). On Windows, xdist `loadfile` co-schedules files on
+workers — an order-dependent failure there is a stateful-test bug to fix, not
+noise; fix it at the test, don't reach for runner changes. Timing-sensitive
+tests must not assume a quiet runner (loose wall-clock bounds ≥ 2s,
+event-based sync, no `assert not _wait_until(...)` negative-timing races).
 
-#### Subprocess-per-test-file isolation
+#### Host-dispatched isolation
 
-Every test file runs in a freshly-spawned Python subprocess via `run_tests_parallel.py`. This means module-level dicts/sets and
-ContextVars from one test file cannot leak into the next.
+On POSIX, each test file runs in a freshly-spawned `python -m pytest <file>`
+subprocess (via `scripts/run_tests_parallel.py`), so module-level state cannot
+leak between files at all. On Windows, `--dist loadfile` pins each file to ONE
+xdist worker, bounding pollution to co-scheduled files — state shared across
+files is a bug to fix at the tests.
 
 #### Why the wrapper
 
@@ -1632,10 +1636,23 @@ genuinely differs per host. Those differences are tested by running on the
 host, not by patching `sys.platform`.
 
 ```python
-@pytest.mark.linux_only
-@pytest.mark.macos_only
-@pytest.mark.windows_only
+@pytest.mark.platforms("linux")
+@pytest.mark.platforms("macos")
+@pytest.mark.platforms("windows")
 ```
+
+The `platforms` marker takes any number of spec strings (any-of semantics)
+plus optional arch filters, so it can express more than the legacy trio:
+
+```python
+@pytest.mark.platforms("not macos")              # anywhere except macOS
+@pytest.mark.platforms("windows", arch="arm64")  # native Windows on arm64
+@pytest.mark.platforms("posix")                  # linux or macOS
+```
+
+Specs: `linux`, `macos`, `windows`, `posix`, `any`, and `not <spec>`.
+The historic `linux_only` / `macos_only` / `windows_only` markers have been
+fully replaced — `platforms` is the only host-gating marker in the tree.
 
 Things that are host-independent can stay unmarked:
 
@@ -1668,13 +1685,15 @@ argv, not the direct parent (the venv shim makes every spawn a
 launcher/worker chain).
 
 **Use the marker, never a bare `skipif`.** `scripts/ci/list_os_marked_tests.py`
-decides which files the macOS/Windows lanes import by grepping for the marker
-*name*, and the lane then filters with `-m <marker>`. A test gated with
-`@pytest.mark.skipif(sys.platform != "win32")` therefore skips on Linux AND is
-never imported on the Windows lane — it runs on no host at all, silently. The
-same trap catches a file-local alias (`windows_only = pytest.mark.skipif(...)`):
-the grep matches the name, so the file *is* listed, but `-m windows_only`
-deselects every test in it and the lane reports green over zero coverage.
+decides which files the macOS lane imports by grepping for the quoted spec
+inside `platforms(...)`, and the lane then selects with `-m platforms` while
+the conftest's per-test host skips do the actual gating. A test gated with
+`@pytest.mark.skipif(sys.platform != "win32")` therefore runs on no host at
+all, silently — it is never imported by the lane that would run it, and the
+full-suite lanes skip it. Don't stack a module-level `pytestmark =
+platforms(...)` on a file whose tests carry their own host marker — the
+conftest hard-rejects tests carrying two `platforms()` markers (a test
+skipped on every host, reported green everywhere).
 Equally, don't `pytest.skip()` the non-host rows of a `@parametrize` over
 platforms — split it into one marked test per OS, or only the host's row ever
 executes.

@@ -30,7 +30,7 @@ import threading
 from typing import Dict, List, Optional
 
 from agent.terminal_env_provider import TerminalEnvironmentProvider
-from hermes_constants import hermes_home_key
+from hermes_constants import hermes_home_key, normalize_scope
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,7 @@ def register_provider(
         )
     global _generation
     with _lock:
+        scope = normalize_scope(scope)
         target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
         existing = target.get(name)
         target[name] = provider
@@ -101,7 +102,7 @@ def list_providers(*, scope: Optional[str] = None) -> List[TerminalEnvironmentPr
     """Return all registered providers, sorted by name."""
     with _lock:
         merged = dict(_providers)
-        merged.update(_scoped_providers.get(scope or hermes_home_key(), {}))
+        merged.update(_scoped_providers.get(hermes_home_key(scope), {}))
         items = list(merged.values())
     return sorted(items, key=lambda p: p.name)
 
@@ -115,7 +116,7 @@ def get_provider(
     key = name.strip().lower()
     with _lock:
         return (
-            _scoped_providers.get(scope or hermes_home_key(), {}).get(key)
+            _scoped_providers.get(hermes_home_key(scope), {}).get(key)
             or _providers.get(key)
         )
 
@@ -173,13 +174,14 @@ def snapshot_registration(
     name: str, *, scope: Optional[str] = None
 ) -> Optional[TerminalEnvironmentProvider]:
     with _lock:
+        scope = normalize_scope(scope)
         target = _providers if scope is None else _scoped_providers.get(scope, {})
         return target.get(name.strip().lower())
 
 
 def registry_generation(*, scope: Optional[str] = None) -> tuple:
     """Return a cache fingerprint for the global base and one profile."""
-    active_scope = scope or hermes_home_key()
+    active_scope = hermes_home_key(scope)
     with _lock:
         return _generation, _scoped_generations.get(active_scope, 0)
 
@@ -195,6 +197,7 @@ def restore_registration(
     key = name.strip().lower()
     global _generation
     with _lock:
+        scope = normalize_scope(scope)
         target = _providers if scope is None else _scoped_providers.setdefault(scope, {})
         if target.get(key) is not current:
             return False

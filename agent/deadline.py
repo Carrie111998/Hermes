@@ -90,12 +90,22 @@ __all__ = [
 # Upper bound for any timeout handed to platform wait primitives.
 #
 # CPython converts ``threading.Lock.acquire(timeout=...)`` /
-# ``Thread.join(timeout=...)`` deadlines to an absolute timestamp; very large
-# relative timeouts overflow ``time_t`` on macOS and raise
-# ``OverflowError: timestamp out of range for platform time_t`` (#83220).
-# One year is semantically "unbounded" for every wait in this codebase while
-# staying far below any platform conversion limit.
-MAX_SAFE_TIMEOUT_S = 31_536_000.0  # 365 days
+# ``Thread.join(timeout=...)`` deadlines through the platform wait primitive;
+# a value too large for that primitive's conversion limit raises
+# ``OverflowError``. The ceilings differ per host:
+#
+#   * POSIX — ``time_t`` on macOS (32-bit in #83220) overflows on absurd
+#     relative timeouts. One year is semantically "unbounded" for every wait
+#     in this codebase while staying far below ``time_t``.
+#   * Windows — ``WaitForSingleObject`` takes a DWORD of milliseconds
+#     (2**32 - 1 ms ≈ 49.7 days), so 365 days would overflow it.
+if sys.platform == "win32":
+    # Leave headroom for consumers that add a small margin on top (e.g. the
+    # 60s human-wait margin): MAX + margin must stay under the DWORD-millisecond
+    # ceiling (4294967.295s), so 4_294_907 + 60 rounds to exactly 4_294_967s.
+    MAX_SAFE_TIMEOUT_S = 4_294_907.0
+else:
+    MAX_SAFE_TIMEOUT_S = 31_536_000.0  # 365 days
 
 # Grace period after a deadline fires before concluding the event loop thread
 # is blocked in a synchronous call and dumping stacks (family A diagnostics).
