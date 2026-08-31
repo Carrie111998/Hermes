@@ -142,6 +142,11 @@ class MemoryProvider(ABC):
           - hermes_home (str): The active HERMES_HOME directory path. Use this
             for profile-scoped storage instead of hardcoding ``~/.hermes``.
           - platform (str): "cli", "telegram", "discord", "cron", etc.
+          - cwd (str): The resolved agent working directory (session contextvar
+            → TERMINAL_CWD → process cwd, per ``agent.runtime_cwd``). Use this
+            instead of ``os.getcwd()``, which does not reflect the agent's
+            project directory on Desktop and gateway launches. Providers that
+            scope state per project should key on this value.
 
         kwargs may also include:
           - agent_context (str): "primary", "subagent", "cron", or "flush".

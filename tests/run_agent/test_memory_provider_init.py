@@ -170,3 +170,41 @@ def test_core_tool_names_rejected_from_memory_routing_table():
     assert "honcho_search" in schema_names
 
 
+
+def test_aiagent_forwards_cwd_to_memory_provider(tmp_path, monkeypatch):
+    """AIAgent passes the resolved agent cwd to the provider's initialize kwargs.
+
+    The Desktop backend inherits the Electron launch cwd (the home directory
+    when no default project is configured), so providers must not rely on
+    os.getcwd(). TERMINAL_CWD is the controlled resolver input here: setting
+    it proves the value traveled resolve_agent_cwd() -> _init_kwargs ->
+    provider.initialize(), not an accidental os.getcwd() fallback.
+    """
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+
+    provider = RecordingMemoryProvider()
+    cfg = {"memory": {"provider": "recording"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="sess-cwd",
+            platform="feishu",
+        )
+
+    assert agent._memory_manager is not None
+    assert provider.init_session_id == "sess-cwd"
+    assert provider.init_kwargs["cwd"] == str(tmp_path)

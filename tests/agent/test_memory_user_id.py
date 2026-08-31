@@ -100,6 +100,34 @@ class TestMemoryManagerUserIdThreading:
         assert p2._init_kwargs.get("platform") == "slack"
 
 
+class TestMemoryManagerCwdThreading:
+    """Verify the resolved agent cwd reaches providers via initialize_all."""
+
+    def test_initialize_all_forwards_cwd_kwarg(self):
+        """cwd passes through initialize_all to every provider."""
+        mgr = MemoryManager()
+        p = RecordingProvider()
+        mgr.add_provider(p)
+
+        mgr.initialize_all(
+            session_id="sess-cwd",
+            platform="cli",
+            cwd="/tmp/project-a",
+        )
+
+        assert p._init_kwargs.get("cwd") == "/tmp/project-a"
+
+    def test_initialize_all_omits_cwd_when_absent(self):
+        """No cwd kwarg means providers receive no cwd key (no silent fallback)."""
+        mgr = MemoryManager()
+        p = RecordingProvider()
+        mgr.add_provider(p)
+
+        mgr.initialize_all(session_id="sess-nocwd", platform="cli")
+
+        assert "cwd" not in p._init_kwargs
+
+
 # ---------------------------------------------------------------------------
 # Mem0 provider user_id tests
 # ---------------------------------------------------------------------------
