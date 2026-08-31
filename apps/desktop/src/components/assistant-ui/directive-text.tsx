@@ -454,15 +454,26 @@ const DirectiveImage: FC<{ id: string; label: string }> = ({ id, label }) => {
  *  from under the chat you're reading). Lazy-imports so the composer's rich
  *  editor can pull this module in without booting the profile/REST stack. */
 export function openSessionRef(value: string) {
-  const { sessionId } = parseSessionRefValue(value)
+  const { profile, sessionId } = parseSessionRefValue(value)
 
   if (!sessionId) {
     return
   }
 
   triggerHaptic('selection')
-  // navigate is unused for the `tab` intent (focus-or-tile only).
-  void import('@/app/open-session').then(({ openSession }) => openSession(sessionId, () => undefined, 'tab'))
+  // navigate is unused for the `tab` intent (focus-or-tile only). A
+  // `@session:<profile>/<id>` ref names the owning profile — activate that
+  // gateway before open, otherwise a NULL-profile or cross-profile row
+  // resolves against the live backend and the click does nothing (#99222).
+  void import('@/app/open-session').then(async ({ openSession }) => {
+    if (profile) {
+      const { ensureGatewayProfile } = await import('@/store/profile')
+
+      await ensureGatewayProfile(profile)
+    }
+
+    openSession(sessionId, () => undefined, 'tab')
+  })
 }
 
 /** What activating a directive of a given kind does. The single source of truth

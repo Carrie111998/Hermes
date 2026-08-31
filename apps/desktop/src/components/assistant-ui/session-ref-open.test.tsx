@@ -3,14 +3,20 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { __resetSessionLinkTitleCache } from '@/lib/session-link-title'
 import { $previewTabs, closeRightRail } from '@/store/preview'
+import type * as ProfileModule from '@/store/profile'
 
 import { DirectiveContent } from './directive-text'
 import { MarkdownTextContent } from './markdown-text'
 
 const openSession = vi.fn()
+const ensureGatewayProfile = vi.fn().mockResolvedValue(undefined)
 
 vi.mock('@/app/open-session', () => ({
   openSession: (...args: unknown[]) => openSession(...args)
+}))
+vi.mock('@/store/profile', async importActual => ({
+  ...(await importActual<typeof ProfileModule>()),
+  ensureGatewayProfile: (...args: unknown[]) => ensureGatewayProfile(...args)
 }))
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
@@ -19,6 +25,7 @@ afterEach(() => {
   cleanup()
   closeRightRail()
   openSession.mockClear()
+  ensureGatewayProfile.mockClear()
   delete desktopWindow.hermesDesktop
   __resetSessionLinkTitleCache()
 })
@@ -33,6 +40,7 @@ describe('session refs open the session', () => {
     fireEvent.click(await screen.findByTitle('work/20260101_abc123'))
 
     await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab'))
+    expect(ensureGatewayProfile).toHaveBeenCalledWith('work')
   })
 
   it('opens the session from a chip in the user transcript', async () => {
@@ -44,6 +52,7 @@ describe('session refs open the session', () => {
     fireEvent.click(chip)
 
     await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab'))
+    expect(ensureGatewayProfile).toHaveBeenCalledWith('work')
   })
 })
 

@@ -3788,6 +3788,23 @@ def _register_session_cwd(session: dict | None) -> None:
         pass
 
 
+def _session_persist_profile_name(session: dict) -> str:
+    """Durable owner written on the session row at first persist.
+
+    Launch-profile creates used to store NULL (``profile_home`` is omitted so
+    the row lands in the process DB). Desktop then filters the sidebar by
+    ``profile_name``, so those rows vanish after a profile switch and
+    ``@session:`` links cannot resolve them (#99222). Always stamp a concrete
+    name: the profile home's leaf, or this backend's launch profile.
+    """
+    profile_home = session.get("profile_home")
+    if profile_home:
+        name = Path(profile_home).name.strip()
+        if name:
+            return name
+    return _current_profile_name()
+
+
 def _ensure_session_db_row(session: dict) -> None:
     """Idempotently persist the session's DB row on first real activity.
 
@@ -3916,9 +3933,10 @@ def _ensure_session_db_row(session: dict) -> None:
             parent_session_id=parent_session_id,
             cwd=_persisted_session_cwd(session),
             # Self-describing rows: aggregators that merge multiple profile DBs
-            # into one list can't rely on which file a row came from alone. NULL
-            # means the launch/default profile (matches run_agent's convention).
-            profile_name=Path(profile_home).name if profile_home else None,
+            # into one list can't rely on which file a row came from alone.
+            # Always write a concrete name — NULL used to mean "launch profile"
+            # but Desktop filters by profile_name and drops those rows (#99222).
+            profile_name=_session_persist_profile_name(session),
         )
         # A session can be born hidden (session.create hidden=true, or a
         # session.set_hidden that arrived before the row existed): apply the
