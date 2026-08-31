@@ -13,7 +13,7 @@ Deliver one bounded broker batch as native local Codex tasks. Preserve the broke
 
 | Situation | Required action |
 |---|---|
-| No actionable pending or retry jobs | End with no user-facing message. |
+| `session_status` counts show no pending, leased, or retry work | Not a stop condition. Still run the full preflight and both persisted-heartbeat pending calls (`session_sidebar_hydration_pending`, then `session_sidebar_pending`); these advance the broker heartbeat. End with no user-facing message only after registration pending returns no job. |
 | Bridge or native project preflight is unhealthy | End without leasing; no job attempt is consumed. |
 | Hydration and registration are both actionable | Claim one hydration job; do not call registration pending unless hydration returned no job. |
 | Hydration targets an existing exact task | Read and authenticate that exact task before any send; never create or replace it. |
@@ -51,7 +51,7 @@ Each fallback invocation counts as the exact single bridge call required by the 
 
 ## Queue Selection
 
-Call `session_status` exactly once. Validate scanner health and the configured broker/inbox identity. Then call `read_thread({"threadId":"019f9b71-7109-7ed0-943a-d7291190245c","turnLimit":10,"includeOutputs":false})` exactly once and require its local host, title `Fix Claude session translation`, and cwd `C:\Users\diego\Developer\session-sidebar-broker`. Then call the native tool `list_projects({})` exactly once. Require exactly one local saved project whose canonical path equals `C:\Users\diego\Developer\session-sidebar-broker`, whose returned ID equals configured `broker_project_id`, and whose production ID is `local-453ac85f86839c6d001817cb8480b8ca`. Separately require exactly one local saved project whose canonical path equals `C:\Users\diego\.hermes`; retain its returned ID separately as `inbox_project_id`, whose production value is `local-e59c279a6cdda9313cf111e46a80b027`. If either ID differs, preflight stops before lease. Preflight failure ends before leasing and no job attempt is consumed.
+Call `session_status` exactly once. Validate scanner health and the configured broker/inbox identity. Read the configured broker thread ID from that same `session_status` response at `sidebar.broker.thread_id`; require an exact non-empty string and never substitute, infer, default, or carry over a previously seen value. A missing, empty, or non-string value stops preflight before lease. Then call `read_thread({"threadId":"<exact sidebar.broker.thread_id>","turnLimit":10,"includeOutputs":false})` exactly once and require its local host, title `Fix Claude session translation`, and cwd `C:\Users\diego\Developer\session-sidebar-broker`. Then call the native tool `list_projects({})` exactly once. Require exactly one local saved project whose canonical path equals `C:\Users\diego\Developer\session-sidebar-broker`, whose returned ID equals configured `broker_project_id`, and whose production ID is `local-453ac85f86839c6d001817cb8480b8ca`. Separately require exactly one local saved project whose canonical path equals `C:\Users\diego\.hermes`; retain its returned ID separately as `inbox_project_id`, whose production value is `local-e59c279a6cdda9313cf111e46a80b027`. If either ID differs, preflight stops before lease. Preflight failure ends before leasing and no job attempt is consumed.
 
 One provider's non-null `degraded_reason` must not globally block healthy queued delivery from another provider.
 
