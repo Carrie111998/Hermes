@@ -183,15 +183,41 @@ class TestStructuredServeAuthority:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture()
+def never_spawns(monkeypatch):
+    """A refusal must be decided BEFORE anything is launched.
+
+    Asserting only on the ``None`` return is not enough: ``_respawn_recorded_runtime``
+    also returns ``None`` when ``Popen`` raises ``OSError`` because the recorded
+    executable does not resolve on ``PATH``. On a box without ``hermes`` on
+    ``PATH`` that makes an accepted-but-wrong record look refused, which is how
+    a genuinely broken round-trip check ran green. Fail on the spawn itself so
+    these tests answer the same way in both environments.
+    """
+
+    def _boom(parts, *args, **kwargs):
+        raise AssertionError(f"a record that must be refused was spawned: {parts!r}")
+
+    monkeypatch.setattr(update_cmd.subprocess, "Popen", _boom)
+
+
 class TestAmbiguousLegacyRecordsAreRefused:
-    def test_a_truncated_legacy_argv_is_refused(self):
+    def test_a_truncated_legacy_argv_is_refused(self, never_spawns):
         """Ten tokens is exactly the old cap — the eleventh may be missing."""
         argv = " ".join(["hermes", "serve"] + [f"--o{i}" for i in range(8)])
         assert update_cmd._respawn_recorded_runtime(argv, _record({"argv": argv})) is None
 
-    def test_a_quoted_legacy_argv_is_refused(self):
+    def test_a_quoted_legacy_argv_is_refused(self, never_spawns):
         """Quoting in the string proves the join was not a plain join."""
         argv = "hermes serve --config '/my dir/c.toml'"
+        assert (
+            update_cmd._respawn_recorded_runtime(argv, _record({"argv": argv}, kind="gateway"))
+            is None
+        )
+
+    def test_repeated_whitespace_in_a_legacy_argv_is_refused(self, never_spawns):
+        """A plain join emits exactly one space — more means it was not one."""
+        argv = "hermes  serve --port 9119"
         assert (
             update_cmd._respawn_recorded_runtime(argv, _record({"argv": argv}, kind="gateway"))
             is None
@@ -207,7 +233,7 @@ class TestAmbiguousLegacyRecordsAreRefused:
         assert isinstance(pid, int)
         assert _await_json(out)["argv"] == []
 
-    def test_an_empty_record_is_refused(self):
+    def test_an_empty_record_is_refused(self, never_spawns):
         assert update_cmd._respawn_recorded_runtime("", _record({})) is None
 
 

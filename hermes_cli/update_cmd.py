@@ -3781,7 +3781,13 @@ def _legacy_argv_parts(argv: str):
     if len(parts) >= _LEGACY_ARGV_TOKEN_CAP:
         logger.debug("Refusing a possibly-truncated legacy argv: %r", argv)
         return None
-    if shlex.join(parts) != argv.strip():
+    # The round trip is checked against a PLAIN join, because a plain join is
+    # what produced the string. ``shlex.join`` re-quotes whatever it is given,
+    # so it reproduces a quoted string exactly and accepts the very records
+    # this check exists to refuse — the whole "quoting is the tell" argument
+    # only holds against ``" ".join``. Anything a plain join cannot
+    # regenerate (quotes, runs of whitespace) is not a faithful rendering.
+    if " ".join(parts) != argv.strip():
         logger.debug("Refusing a legacy argv that does not round-trip: %r", argv)
         return None
     return parts
