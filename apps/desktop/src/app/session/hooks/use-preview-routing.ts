@@ -87,6 +87,14 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
         const target = typeof url === 'string' ? url.trim() : ''
 
         if (target && (!event.session_id || sessionIsOnScreen(event.session_id))) {
+          // Stamp the ORIGIN of this open — the session that produced the
+          // `preview.open` event — onto the tab as its immutable owner. The
+          // pane registers its reader under this identity, never under the
+          // ambient `$activeSessionId`, so a background bot session's preview
+          // is attributed to that session and can't be re-bound to the
+          // foreground chat by a later focus switch (#95459).
+          const ownerSessionId = event.session_id
+
           void normalizeOrLocalPreviewTarget(target, $currentCwd.get() || currentCwd || undefined).then(
             async resolved => {
               if (!resolved) {
@@ -100,7 +108,7 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
               const url = resolved.kind === 'url' ? await reachablePreviewUrl(resolved.url) : resolved.url
               const reached = url === resolved.url ? resolved : { ...resolved, label: resolved.label || target, url }
 
-              openPreview(trimmedLabel ? { ...reached, label: trimmedLabel } : reached, 'tool-result')
+              openPreview(trimmedLabel ? { ...reached, label: trimmedLabel } : reached, 'tool-result', ownerSessionId)
             }
           )
         }

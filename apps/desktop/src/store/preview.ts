@@ -60,6 +60,14 @@ export type PreviewRecordSource = 'explicit-link' | 'file-browser' | 'manual' | 
 export interface PreviewTab {
   id: RightRailTabId
   target: PreviewTarget
+  /** The session that created/owns this tab, when it was opened by a routed
+   *  gateway event (the `session_id` of the `preview.open` event). Stamped
+   *  once at open and carried immutably into the pane, so a background bot
+   *  session's preview is registered to ITS identity — never to whichever
+   *  chat happens to be ambient-active at registration (#95459). Tabs opened
+   *  by the user directly (file browser, explicit link, artifact) carry no
+   *  owner and fall back to the active session at registration time. */
+  ownerSessionId?: string
 }
 
 const TABS_STORAGE_KEY = 'hermes.desktop.previewTabs.v2'
@@ -91,7 +99,12 @@ function isPreviewTab(value: unknown): value is PreviewTab {
 
   const r = value as Record<string, unknown>
 
-  return typeof r.id === 'string' && (r.id.startsWith('file:') || r.id.startsWith('url:')) && isPreviewTarget(r.target)
+  return (
+    typeof r.id === 'string' &&
+    (r.id.startsWith('file:') || r.id.startsWith('url:')) &&
+    isPreviewTarget(r.target) &&
+    (r.ownerSessionId === undefined || typeof r.ownerSessionId === 'string')
+  )
 }
 
 function isPdfFileTarget(target: PreviewTarget): boolean {
@@ -381,13 +394,26 @@ function previewTargetForSource(target: PreviewTarget, source: PreviewRecordSour
 
 /** Open (or re-front) the tab for `target`. Re-opening an existing tab refreshes
  *  its target so a stale label/path can't outlive the thing it points at. The
- *  only way anything reaches a preview. */
-export function openPreview(target: PreviewTarget, source: PreviewRecordSource = 'manual') {
+ *  only way anything reaches a preview.
+ *
+ *  `ownerSessionId` stamps the session that created this tab (the routed
+ *  `preview.open` event's `session_id`). It is immutable once set: re-fronting
+ *  an already-open tab never overwrites an existing owner, so a preview a
+ *  background session opened stays owned by that session even if a different
+ *  session later hands the same target in (#95459). */
+export function openPreview(
+  target: PreviewTarget,
+  source: PreviewRecordSource = 'manual',
+  ownerSessionId?: string
+) {
   const resolved = previewTargetForSource(target, source)
   const current = $previewTabs.get()
   const id = resolved.kind === 'url' ? browserTabId(current) : previewTabId(resolved)
   const index = current.findIndex(tab => tab.id === id)
-  const tab: PreviewTab = { id, target: resolved }
+
+  const existingOwner = index !== -1 ? current[index].ownerSessionId : undefined
+  const owner = existingOwner ?? ownerSessionId
+  const tab: PreviewTab = { id, target: resolved, ...(owner ? { ownerSessionId: owner } : {}) }
 
   $previewTabs.set(index === -1 ? [...current, tab] : current.map((item, i) => (i === index ? tab : item)))
   selectRightRailTab(id)
