@@ -535,6 +535,7 @@ class AIAgent:
         pass_session_id: bool = False,
         default_headers: Dict[str, str] = None,
         requested_provider: str = None,
+        capabilities: Dict[str, bool] | None = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -551,6 +552,7 @@ class AIAgent:
             api_key=api_key,
             provider=provider,
             requested_provider=requested_provider,
+            capabilities=capabilities,
             api_mode=api_mode,
             acp_command=acp_command,
             acp_args=acp_args,
@@ -912,12 +914,22 @@ class AIAgent:
             return_load_result=True,
         )
 
-    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode='', default_headers=None):
+    def switch_model(
+        self,
+        new_model,
+        new_provider,
+        api_key='',
+        base_url='',
+        api_mode='',
+        default_headers=None,
+        capabilities=None,
+    ):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
         from agent.agent_runtime_helpers import switch_model
-        if default_headers is None:
-            return switch_model(self, new_model, new_provider, api_key, base_url, api_mode)
-        return switch_model(self, new_model, new_provider, api_key, base_url, api_mode, default_headers)
+        kwargs = {"capabilities": capabilities}
+        if default_headers is not None:
+            kwargs["default_headers"] = default_headers
+        return switch_model(self, new_model, new_provider, api_key, base_url, api_mode, **kwargs)
 
     def _safe_print(self, *args, **kwargs):
         """Print that silently handles broken pipes / closed stdout.
@@ -8196,15 +8208,35 @@ class AIAgent:
                         )
                         return system_message or ""
 
+                timeout_cause = {
+                    "total_exhausted": False,
+                    "progress_observed": False,
+                }
+
+                def _on_timeout_cause(total_exhausted, progress_observed):
+                    timeout_cause["total_exhausted"] = total_exhausted
+                    timeout_cause["progress_observed"] = progress_observed
+
                 def _on_timeout(idle, waited, since_progress):
-                    logger.warning(
-                        "Context compression made no progress for %.1fs "
-                        "(total wait %.1fs, ceiling %.1fs); continuing without "
-                        "compression",
-                        since_progress,
-                        waited,
-                        total_ceiling,
-                    )
+                    total_exhausted = timeout_cause["total_exhausted"]
+                    progress_observed = timeout_cause["progress_observed"]
+                    if total_exhausted:
+                        logger.warning(
+                            "Context compression reached its total ceiling "
+                            "after %.1fs (progress observed=%s); continuing "
+                            "without compression",
+                            waited,
+                            progress_observed,
+                        )
+                    else:
+                        logger.warning(
+                            "Context compression made no progress for %.1fs "
+                            "(total wait %.1fs, ceiling %.1fs); continuing "
+                            "without compression",
+                            since_progress,
+                            waited,
+                            total_ceiling,
+                        )
                     touch = getattr(self, "_touch_activity", None)
                     if callable(touch):
                         try:
@@ -8224,9 +8256,20 @@ class AIAgent:
                         record = getattr(compressor, "record_timeout_failure", None)
                         if callable(record):
                             try:
-                                record(
-                                    "host compress_context timeout "
+                                reason = (
+                                    "host compress_context total ceiling "
+                                    "exhausted"
+                                    if total_exhausted
+                                    else "host compress_context timeout "
                                     "(no summary progress)"
+                                )
+                                record(
+                                    reason,
+                                    failure_kind=(
+                                        "ceiling_exhausted"
+                                        if total_exhausted
+                                        else "stalled"
+                                    ),
                                 )
                             except Exception:
                                 logger.debug(
@@ -8236,13 +8279,27 @@ class AIAgent:
                                 )
                     emit = getattr(self, "_emit_warning", None)
                     if callable(emit):
-                        emit(
-                            "⚠ Context compression timed out "
-                            f"after {idle:.1f}s with no output from the summary "
-                            "model. No messages were dropped — continuing without "
-                            "compression. Run /compress to retry, /new for a clean "
-                            "session, or check auxiliary.compression."
-                        )
+                        if total_exhausted:
+                            progress = (
+                                " after summary output was observed"
+                                if progress_observed
+                                else ""
+                            )
+                            emit(
+                                "⚠ Context compression reached its total ceiling "
+                                f"after {waited:.1f}s{progress}. No messages were "
+                                "dropped — continuing without compression. Run "
+                                "/compress to retry or /new for a clean session."
+                            )
+                        else:
+                            emit(
+                                "⚠ Context compression timed out "
+                                f"after {idle:.1f}s with no output from the summary "
+                                "model. No messages were dropped — continuing "
+                                "without compression. Run /compress to retry, /new "
+                                "for a clean session, or check "
+                                "auxiliary.compression."
+                            )
 
                 def _on_commit_overrun(waited, ceiling):
                     # Commit-phase ceiling breach: the SessionDB mutation is in
@@ -8276,6 +8333,7 @@ class AIAgent:
                     idle_timeout_seconds=idle_timeout,
                     total_ceiling_seconds=total_ceiling,
                     on_timeout=_on_timeout,
+                    on_timeout_cause=_on_timeout_cause,
                     on_commit_overrun=_on_commit_overrun,
                     fence=active_fence,
                     telemetry_agent=self,
