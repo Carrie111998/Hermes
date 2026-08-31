@@ -7,14 +7,24 @@ export interface IncrementalMarkdownPreprocessor {
   clear: () => void
 }
 
+type MarkdownPreprocessor = (text: string) => string
+
+export function selectMarkdownPreprocessor(
+  isStreaming: boolean,
+  incremental: MarkdownPreprocessor,
+  completed: MarkdownPreprocessor
+): MarkdownPreprocessor {
+  return isStreaming ? incremental : completed
+}
+
 interface AppendEntry {
   output: string
   refreshAt: number
   text: string
 }
 
-const APPEND_CACHE_MAX = 4
-const APPEND_LINEAGE_MAX = 4
+const APPEND_CACHE_MAX = 8
+const APPEND_LINEAGE_MAX = 8
 const APPEND_CACHE_MIN_LENGTH = 2048
 const APPEND_CACHE_REFRESH_CHARS = 1024
 const MAX_RETAINED_MARKDOWN_CHARS = 200_000

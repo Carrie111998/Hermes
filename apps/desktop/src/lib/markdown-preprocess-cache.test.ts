@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import { preprocessMarkdown } from './markdown-preprocess'
-import { createIncrementalMarkdownPreprocessor } from './markdown-preprocess-cache'
+import {
+  createIncrementalMarkdownPreprocessor,
+  selectMarkdownPreprocessor
+} from './markdown-preprocess-cache'
+import { createIncrementalPreprocessWithTailRepair } from './markdown-preprocess-wrapper'
 
 const LONG_SETTLED_PROSE = Array.from(
   { length: 48 },
@@ -24,6 +28,29 @@ const STATEFUL_TAILS = [
 ] as const
 
 describe('createIncrementalMarkdownPreprocessor', () => {
+  it('uses one normal pass for completed text instead of priming incremental state', () => {
+    let completedPasses = 0
+    let incrementalPasses = 0
+
+    const completed = (text: string) => {
+      completedPasses += 1
+
+      return preprocessMarkdown(text)
+    }
+
+    const incremental = (text: string) => {
+      incrementalPasses += 1
+
+      return preprocessMarkdown(text)
+    }
+
+    const source = `${LONG_SETTLED_PROSE}A completed answer.`
+
+    expect(selectMarkdownPreprocessor(false, incremental, completed)(source)).toBe(preprocessMarkdown(source))
+    expect(completedPasses).toBe(1)
+    expect(incrementalPasses).toBe(0)
+  })
+
   it('does not preprocess a cacheable first value twice', () => {
     const processedLengths: number[] = []
 
@@ -80,6 +107,84 @@ describe('createIncrementalMarkdownPreprocessor', () => {
 
     expect(incremental(appendedFirst)).toBe(preprocessMarkdown(appendedFirst))
     expect(processedCharacters - workBeforeFirstAppend).toBeLessThan(appendedFirst.length / 4)
+  })
+
+  it('keeps five interleaved append lineages hot', () => {
+    let processedCharacters = 0
+
+    const incremental = createIncrementalMarkdownPreprocessor(text => {
+      processedCharacters += text.length
+
+      return preprocessMarkdown(text)
+    })
+
+    const lineages = Array.from({ length: 5 }, (_, index) => {
+      const prefix = LONG_SETTLED_PROSE.replaceAll('Paragraph', `Lineage ${index} paragraph`)
+
+      return `${prefix}Live tail ${index}`
+    })
+
+    for (const text of lineages) {
+      expect(incremental(text)).toBe(preprocessMarkdown(text))
+    }
+
+    let appendedCharacters = 0
+
+    for (let round = 0; round < 2; round += 1) {
+      const workBeforeRound = processedCharacters
+
+      for (let index = 0; index < lineages.length; index += 1) {
+        const text = lineages[index]!
+        const appended = `${text} plus another token ${round}`
+        lineages[index] = appended
+        appendedCharacters += appended.length - text.length
+
+        expect(incremental(appended)).toBe(preprocessMarkdown(appended))
+      }
+
+      if (round === 1) {
+        expect(processedCharacters - workBeforeRound).toBeLessThan(appendedCharacters * 5)
+      }
+    }
+  })
+
+  it('accounts for wrapper scans across representative streaming updates', () => {
+    let wrapperScannedCharacters = 0
+    let preprocessedCharacters = 0
+
+    const incremental = createIncrementalPreprocessWithTailRepair(
+      text => {
+        preprocessedCharacters += text.length
+
+        return preprocessMarkdown(text)
+      },
+      text => {
+        wrapperScannedCharacters += text.length
+
+        return text
+      }
+    )
+
+    const paragraphs = Array.from(
+      { length: 120 },
+      (_, index) => `Transcript paragraph ${index}: a completed answer remains stable while the final sentence grows.\n\n`
+    )
+
+    let text = paragraphs.join('')
+    let fullPreprocessCharacters = text.length
+
+    expect(incremental(text)).toBe(preprocessMarkdown(text))
+
+    for (let update = 0; update < 40; update += 1) {
+      const suffix = `Update ${update} adds another sentence to the live answer. `
+      text += suffix
+      fullPreprocessCharacters += text.length
+
+      expect(incremental(text)).toBe(preprocessMarkdown(text))
+    }
+
+    expect(preprocessedCharacters).toBeLessThan(fullPreprocessCharacters / 8)
+    expect(wrapperScannedCharacters).toBeLessThanOrEqual(fullPreprocessCharacters)
   })
 
   it('reuses a settled prefix discovered inside the first observed value', () => {
