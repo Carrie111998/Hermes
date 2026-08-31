@@ -20,7 +20,7 @@ import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
 from tools.environments.local import hermes_subprocess_env
@@ -85,37 +85,49 @@ def _default_registry_path() -> Path:
     return get_hermes_home() / "state" / _REGISTRY_NAME
 
 
-def _pid_alive(pid: int) -> bool:
-    # Never call os.kill(pid, 0) directly: on Windows CPython maps sig=0 to
-    # CTRL_C_EVENT (they collide at the C level) and routes it through
-    # GenerateConsoleCtrlEvent(0, pid), broadcasting Ctrl+C to the entire
-    # console process group containing the target PID. A read-only status
-    # check would then kill the process it inspects — and sibling processes
-    # sharing its console. See bpo-14484 and CONTRIBUTING.md rule 1.
-    # gateway.status._pid_exists is the canonical psutil-backed probe (with
-    # a ctypes OpenProcess/WaitForSingleObject fallback on Windows) and also
-    # handles zombie processes (issue #42126).
+_pid_probe_unavailable_logged = False
+
+
+def _pid_alive(pid: int) -> Optional[bool]:
+    """Return True if ``pid`` is alive, False if definitely dead, None if unknown.
+
+    Callers must treat ``None`` as "probe unavailable" and fail toward the
+    safer choice for their context — e.g. ``reconcile_startup_orphan`` must
+    not remove the registry on ``None`` or it can spawn a duplicate compute
+    host next to the live one.
+
+    Never call ``os.kill(pid, 0)`` directly: on Windows CPython maps sig=0 to
+    CTRL_C_EVENT (they collide at the C level) and routes it through
+    ``GenerateConsoleCtrlEvent(0, pid)``, broadcasting Ctrl+C to the entire
+    console process group containing the target PID. A read-only status
+    check would then kill the process it inspects — and sibling processes
+    sharing its console. See bpo-14484 and CONTRIBUTING.md rule 1.
+    ``gateway.status._pid_exists`` is the canonical psutil-backed probe
+    (with a ctypes ``OpenProcess``/``WaitForSingleObject`` fallback on
+    Windows) and also handles zombie processes (issue #42126).
+    """
+    global _pid_probe_unavailable_logged
     if pid <= 0:
         return False
     try:
         from gateway.status import _pid_exists
     except Exception:
-        # Log louder than debug so a missing probe (import-time failure of a
-        # transitive dep) is not silently indistinguishable from "process
-        # dead" — otherwise reconcile_startup_orphan concludes the old host
-        # died, removes the registry, and can spawn a second compute host
-        # alongside the live one.
-        logger.warning(
-            "gateway.status._pid_exists unavailable — treating pid=%s as gone",
-            pid,
-            exc_info=True,
-        )
-        return False
+        # Log once (not per-call): _pid_alive is invoked in a 50ms polling
+        # loop inside _terminate_pid, so a per-call warning with exc_info
+        # would emit a stack trace every 50ms if the import stays broken.
+        if not _pid_probe_unavailable_logged:
+            _pid_probe_unavailable_logged = True
+            logger.warning(
+                "gateway.status._pid_exists unavailable — pid liveness probe "
+                "will return unknown; callers must not treat as dead",
+                exc_info=True,
+            )
+        return None
     try:
         return bool(_pid_exists(int(pid)))
     except Exception:
         logger.debug("pid liveness probe failed for pid=%s", pid, exc_info=True)
-        return False
+        return None
 
 
 def _pid_command(pid: int) -> str:
@@ -242,9 +254,17 @@ class HostSupervisor:
             pid = int(data.get("host_pid") or 0)
         except Exception:
             pid = 0
-        if pid <= 0 or not _pid_alive(pid):
+        if pid <= 0:
             self._remove_registry()
             return "not-running"
+        alive = _pid_alive(pid)
+        if alive is False:
+            self._remove_registry()
+            return "not-running"
+        if alive is None:
+            # Probe unavailable: do NOT remove the registry, or we could
+            # spawn a second compute host alongside the still-live one.
+            return "probe-unavailable"
         if not self._pid_matches_compute_host(pid):
             # PID was reused by another process. Never signal it.
             self._remove_registry()
@@ -572,7 +592,7 @@ class HostSupervisor:
                 return
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
-                if not _pid_alive(pid):
+                if _pid_alive(pid) is False:
                     return
                 time.sleep(0.05)
             try:
@@ -583,6 +603,16 @@ class HostSupervisor:
                 logger.debug("failed to force-kill compute host pid=%s", pid, exc_info=True)
             return
         # Fallback path (should not fire in practice): use os.kill directly.
+        # On Windows this degrades — signal.SIGKILL does not exist so the
+        # "force" escalation becomes another SIGTERM that will not cascade
+        # to child processes. Surface that loudly so a missing gateway.status
+        # dependency does not silently break shutdown on Windows.
+        if sys.platform == "win32":
+            logger.warning(
+                "gateway.status.terminate_pid unavailable on Windows — "
+                "force-kill will not cascade to child processes for pid=%s",
+                pid,
+            )
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -592,7 +622,7 @@ class HostSupervisor:
             return
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            if not _pid_alive(pid):
+            if _pid_alive(pid) is False:
                 return
             time.sleep(0.05)
         sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
