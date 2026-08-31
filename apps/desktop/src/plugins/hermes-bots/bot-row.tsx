@@ -60,7 +60,7 @@ import { displayName, stripPreviewMarkdown } from './labels'
 import { duplicateBot } from './profile-ops'
 import { openRosterBot } from './roster-actions'
 import { botRosterMeta, botWorkspaceOwnerKey, setBotsWorkspaceOwner } from './routing'
-import { A2A_PREFIX_RE, botCanonicalSessionId, botRowOwnsWorkspace, previewKind, workerActiveAt } from './row-helpers'
+import { A2A_PREFIX_RE, botCanonicalSessionId, botRowOwnsWorkspace, botTurnInFlight, previewKind, workerActiveAt } from './row-helpers'
 import type { GroupMember, RosterRow, SidebarRowLabels } from './types'
 
 // ── bot row ──────────────────────────────────────────────────────────────────
@@ -141,7 +141,7 @@ export function BotRow({ bot, onDelete, onEdit, onGroup, showHandle }: BotRowPro
     ? Math.max(activitySession?.last_active || 0, bot.worker_session?.last_active || 0)
     : activitySession?.last_active || 0
 
-  const botMood = workerActive || (isGatewayHome && gatewayState === 'busy') ? 'work' : 'idle'
+  const botMood = workerActive || botTurnInFlight(bot) || (isGatewayHome && gatewayState === 'busy') ? 'work' : 'idle'
   // Status keys off the canonical Bot Chat — the very session this row opens,
   // so the dot and the click can never describe different conversations.
   const canonicalSessionId = botCanonicalSessionId(bot)
