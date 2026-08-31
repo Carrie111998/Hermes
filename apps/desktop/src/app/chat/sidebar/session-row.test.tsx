@@ -71,4 +71,37 @@ describe('SidebarSessionRow bridge badges', () => {
     expect(badge.getAttribute('title')).toBe(`Codex sidebar: ${label}`)
     expect(badge.className).toContain(tone)
   })
+
+  it('tints Claude, Codex and Hermes provider badges with distinct hues', () => {
+    const classes = (['claude', 'codex', 'hermes'] as const).map(provider => {
+      const { unmount } = renderRow(makeSession({ bridge_provider: provider, source: provider }))
+      const badge = screen.getByText(provider === 'claude' ? 'Claude' : provider === 'codex' ? 'Codex' : 'Hermes')
+      const className = badge.className
+
+      unmount()
+
+      return className
+    })
+
+    expect(new Set(classes).size).toBe(3)
+
+    for (const className of classes) {
+      expect(className).not.toContain('text-(--ui-text-tertiary)')
+    }
+  })
+
+  it('keeps an unrecognized provider badge on the neutral tint', () => {
+    // The union type forbids this today, but the row renders whatever an older
+    // or newer backend sends — the neutral fallback is the defensive contract.
+    renderRow(makeSession({ bridge_provider: 'mystery' as SessionInfo['bridge_provider'], source: 'cli' }))
+
+    expect(screen.getByText('Mystery').className).toContain('text-(--ui-text-tertiary)')
+  })
+
+  it('tints the driver badge with the same per-harness hue', () => {
+    renderRow(makeSession({ driver: 'claude' }))
+
+    const badge = screen.getByText('Claude')
+    expect(badge.className).not.toContain('text-(--ui-text-tertiary)')
+  })
 })

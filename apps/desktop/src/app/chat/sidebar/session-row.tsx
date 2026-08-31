@@ -15,6 +15,7 @@ import {
   bridgeProviderLabel,
   bridgeSidebarStateLabel,
   handoffOriginSource,
+  normalizeSessionSource,
   sessionDriverLabel,
   sessionSourceLabel
 } from '@/lib/session-source'
@@ -30,6 +31,22 @@ import { SidebarRowBody, SidebarRowGrab, SidebarRowLabel, SidebarRowLead, Sideba
 import { SessionActionsMenu, SessionContextMenu } from './session-actions-menu'
 import { type SessionDotState, sessionDotState, sessionShowsRunningArc } from './session-row-state'
 import { useProfilePrewarm } from './use-profile-prewarm'
+
+// Per-harness tints so Claude / Codex / Hermes badges scan apart at a glance.
+// Hues stay brand-adjacent (Anthropic coral, OpenAI teal, Hermes violet) with
+// translucent fills so they sit quietly on both themes; anything outside the
+// three harnesses keeps the neutral tertiary tone.
+const HARNESS_BADGE_CLASSES: Record<string, string> = {
+  claude: 'border-[#d97757]/45 bg-[#d97757]/10 text-[#b35a3e] dark:text-[#e59a80]',
+  codex: 'border-[#10a37f]/45 bg-[#10a37f]/10 text-[#0d7a60] dark:text-[#34c79f]',
+  hermes: 'border-[#8b5cf6]/45 bg-[#8b5cf6]/10 text-[#7048c8] dark:text-[#a78bfa]'
+}
+
+const NEUTRAL_BADGE_CLASSES = 'border-(--ui-border) text-(--ui-text-tertiary)'
+
+function harnessBadgeClasses(id: null | string | undefined): string {
+  return (id && HARNESS_BADGE_CLASSES[id]) || NEUTRAL_BADGE_CLASSES
+}
 
 interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   session: SessionInfo
@@ -288,7 +305,10 @@ export function SidebarSessionRow({
           {bridgeProvider ? (
             <span
               aria-label={bridgeProviderDescription ?? undefined}
-              className="shrink-0 rounded-[3px] border border-(--ui-border) px-1 py-px text-[0.5625rem] font-medium leading-none text-(--ui-text-tertiary)"
+              className={cn(
+                'shrink-0 rounded-[3px] border px-1 py-px text-[0.5625rem] font-medium leading-none',
+                harnessBadgeClasses(normalizeSessionSource(session.bridge_provider))
+              )}
               title={bridgeProviderDescription ?? undefined}
             >
               {bridgeProvider}
@@ -297,7 +317,10 @@ export function SidebarSessionRow({
           {driverBadge ? (
             <span
               aria-label={driverDescription ?? undefined}
-              className="shrink-0 rounded-[3px] border border-(--ui-border) px-1 py-px text-[0.5625rem] font-medium leading-none text-(--ui-text-tertiary)"
+              className={cn(
+                'shrink-0 rounded-[3px] border px-1 py-px text-[0.5625rem] font-medium leading-none',
+                harnessBadgeClasses(normalizeSessionSource(driverBadge))
+              )}
               title={driverDescription ?? undefined}
             >
               {driverBadge}
