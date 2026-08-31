@@ -1575,6 +1575,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # transient empty model resolution (#35314) instead of building an
         # agent with model="" that 400s every call until manual retry.
         self._last_resolved_model: Dict[str, str] = {}
+        self._last_resolved_provider: Dict[str, str] = {}
         self._session_db_lock: Optional[asyncio.Lock] = None  # Single-flight for lazy init
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
@@ -3074,16 +3075,28 @@ class APIServerAdapter(BasePlatformAdapter):
         # stateless request, growing unbounded for the life of the process.
         _resolved_key = gateway_session_key or ""
         if not model:
-            _recovered = (self._last_resolved_model.get(_resolved_key)
-                          or self._last_resolved_model.get("*"))
+            _recovery_key = (
+                _resolved_key
+                if self._last_resolved_model.get(_resolved_key)
+                else "*"
+            )
+            _recovered = self._last_resolved_model.get(_recovery_key)
+            _recovered_provider = self._last_resolved_provider.get(
+                _recovery_key, ""
+            )
+            _policy_provider = _recovered_provider or str(
+                runtime_kwargs.get("provider") or ""
+            )
             if _recovered:
-                from hermes_cli.model_catalog import is_automatic_model_excluded
+                from hermes_cli.model_catalog import resolve_automatic_model_recovery
 
-                if is_automatic_model_excluded(
-                    runtime_kwargs.get("provider", ""), _recovered
-                ):
-                    _recovered = ""
+                _recovered = resolve_automatic_model_recovery(
+                    _policy_provider,
+                    _recovered,
+                )
             if _recovered and _recovered != self._model_name:
+                if _policy_provider and not runtime_kwargs.get("provider"):
+                    runtime_kwargs["provider"] = _policy_provider
                 logger.warning(
                     "Empty model resolved for session=%s — recovering "
                     "last-known-good model %s (config read likely returned "
@@ -3091,11 +3104,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     _resolved_key, _recovered,
                 )
                 model = _recovered
-        elif model:
-            if model != self._model_name:
                 if _resolved_key:
                     self._last_resolved_model[_resolved_key] = model
+                    self._last_resolved_provider[_resolved_key] = _policy_provider
                 self._last_resolved_model["*"] = model
+                self._last_resolved_provider["*"] = _policy_provider
+        elif model:
+            if model != self._model_name:
+                _provider = str(runtime_kwargs.get("provider") or "")
+                if _resolved_key:
+                    self._last_resolved_model[_resolved_key] = model
+                    self._last_resolved_provider[_resolved_key] = _provider
+                self._last_resolved_model["*"] = model
+                self._last_resolved_provider["*"] = _provider
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))

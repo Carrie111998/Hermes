@@ -3996,6 +3996,10 @@ def list_picker_providers(
     The typed ``/model <name>`` path is unaffected -- only the interactive
     picker payload is narrowed.
     """
+    from hermes_cli.model_catalog import (
+        filter_model_catalog_rows,
+        get_model_catalog_exclusions,
+    )
     from hermes_cli.models import fetch_openrouter_models
 
     providers = list_authenticated_providers(
@@ -4011,6 +4015,7 @@ def list_picker_providers(
     if include_moa:
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
 
+    excluded_models = get_model_catalog_exclusions()
     filtered: List[dict] = []
     for p in providers:
         slug = str(p.get("slug", "")).lower()
@@ -4024,6 +4029,7 @@ def list_picker_providers(
             p["models"] = live_ids[:max_models] if max_models is not None else live_ids
             p["total_models"] = len(live_ids)
 
+        p = filter_model_catalog_rows([p], excluded_models)[0]
         has_models = bool(p.get("models"))
         is_custom_endpoint = bool(p.get("is_user_defined")) and bool(p.get("api_url"))
         if not has_models and not is_custom_endpoint:

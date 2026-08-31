@@ -2888,6 +2888,7 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     "_session_service_tier_overrides",
     "_pending_model_notes",
     "_last_resolved_model",
+    "_last_resolved_provider",
     "_queued_events",
     # Stall-watchdog "already notified" latch (#72016). Cleared on /new so a
     # fresh conversation can warn again if it later stalls with pending inbound.
@@ -7052,6 +7053,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "_session_service_tier_overrides"
     )
     _last_resolved_model = legacy_dict_property("_last_resolved_model")
+    _last_resolved_provider = legacy_dict_property("_last_resolved_provider")
     _queued_events = legacy_dict_property("_queued_events")
     _pending_turn_sidecar_notes = legacy_dict_property("_pending_turn_sidecar_notes")
     _pending_messages = legacy_dict_property("_pending_messages")
@@ -8471,20 +8473,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else None
             )
             _lr_star = self._peek_session_state("*")
+            _recovery_state = (
+                _lr_state
+                if _lr_state and _lr_state.conversation.last_resolved_model
+                else _lr_star
+            )
             _recovered = (
-                (_lr_state.conversation.last_resolved_model if _lr_state else "")
-                or (_lr_star.conversation.last_resolved_model if _lr_star else "")
+                _recovery_state.conversation.last_resolved_model
+                if _recovery_state
+                else ""
+            )
+            _recovered_provider = (
+                _recovery_state.conversation.last_resolved_provider
+                if _recovery_state
+                else ""
+            )
+            _policy_provider = _recovered_provider or str(
+                runtime_kwargs.get("provider") or ""
             )
             if _recovered:
-                from hermes_cli.model_catalog import is_automatic_model_excluded
+                from hermes_cli.model_catalog import resolve_automatic_model_recovery
 
-                if is_automatic_model_excluded(
-                    runtime_kwargs.get("provider", ""),
+                _recovered = resolve_automatic_model_recovery(
+                    _policy_provider,
                     _recovered,
                     user_config,
-                ):
-                    _recovered = ""
+                )
             if _recovered:
+                if _policy_provider and not runtime_kwargs.get("provider"):
+                    runtime_kwargs["provider"] = _policy_provider
                 logger.warning(
                     "Empty model resolved for session=%s — recovering "
                     "last-known-good model %s (config read likely returned "
@@ -8492,13 +8509,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     resolved_session_key or "", _recovered,
                 )
                 model = _recovered
+                if resolved_session_key:
+                    _state = self._session_state(resolved_session_key).conversation
+                    _state.last_resolved_model = model
+                    _state.last_resolved_provider = _policy_provider
+                _star = self._session_state("*").conversation
+                _star.last_resolved_model = model
+                _star.last_resolved_provider = _policy_provider
         elif model:
             # Cache the good resolution for future recovery turns.
             if resolved_session_key:
-                self._session_state(
-                    resolved_session_key
-                ).conversation.last_resolved_model = model
-            self._session_state("*").conversation.last_resolved_model = model
+                _state = self._session_state(resolved_session_key).conversation
+                _state.last_resolved_model = model
+                _state.last_resolved_provider = str(
+                    runtime_kwargs.get("provider") or ""
+                )
+            _star = self._session_state("*").conversation
+            _star.last_resolved_model = model
+            _star.last_resolved_provider = str(
+                runtime_kwargs.get("provider") or ""
+            )
 
         return model, runtime_kwargs
 

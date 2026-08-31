@@ -58,7 +58,7 @@ def test_empty_model_recovers_session_last_good(monkeypatch):
     assert model == "deepseek/deepseek-v4-flash", "recovery turn must reuse last-known-good, not build model=''"
 
 
-def test_empty_model_does_not_recover_locally_excluded_model(monkeypatch):
+def test_empty_model_replaces_locally_excluded_cached_pair(monkeypatch):
     runner = _make_runner()
     sk = "agent:main:discord:dm:retired"
     config = {
@@ -72,13 +72,43 @@ def test_empty_model_does_not_recover_locally_excluded_model(monkeypatch):
     )
     runner._resolve_session_agent_runtime(session_key=sk, user_config=config)
 
+    monkeypatch.setattr(
+        "hermes_cli.models.get_default_model_for_provider",
+        lambda provider: "glm-5.3-flash" if provider == "zai" else "",
+    )
+    _patch_resolution(monkeypatch, model_from_config="", provider="")
+    model, runtime = runner._resolve_session_agent_runtime(
+        session_key=sk,
+        user_config=config,
+    )
+
+    assert model == "glm-5.3-flash"
+    assert runtime["provider"] == "zai"
+    assert runner._last_resolved_provider[sk] == "zai"
+
+
+def test_providerless_recovery_preserves_cached_provider_scope(monkeypatch):
+    runner = _make_runner()
+    sk = "agent:main:discord:dm:provider-scope"
+    config = {
+        "model_catalog": {"excluded_models": {"zai": ["shared-name"]}}
+    }
+
+    _patch_resolution(
+        monkeypatch,
+        model_from_config="shared-name",
+        provider="openrouter",
+    )
+    runner._resolve_session_agent_runtime(session_key=sk, user_config=config)
+
     _patch_resolution(monkeypatch, model_from_config="", provider="")
     model, _ = runner._resolve_session_agent_runtime(
         session_key=sk,
         user_config=config,
     )
 
-    assert model == ""
+    assert model == "shared-name"
+    assert runner._last_resolved_provider[sk] == "openrouter"
 
 
 def test_bare_runner_without_cache_attr_does_not_crash(monkeypatch):
@@ -111,4 +141,3 @@ def test_has_pending_fallback_empty_chain():
     agent._fallback_chain = []
     agent._fallback_index = 0
     assert agent._has_pending_fallback() is False
-

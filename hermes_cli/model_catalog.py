@@ -171,16 +171,47 @@ def is_automatic_model_excluded(
     )
     policy = get_model_catalog_exclusions(policy_config)
     provider_id = str(provider or "").strip()
-    if provider_id:
-        return not filter_model_catalog_exclusions(
-            provider_id, [model_id], policy
+    if not provider_id:
+        return False
+    return not filter_model_catalog_exclusions(provider_id, [model_id], policy)
+
+
+def resolve_automatic_model_recovery(
+    provider: str,
+    model_id: str,
+    config: dict[str, Any] | None = None,
+) -> str:
+    """Keep an allowed recovery model or select the next allowed local route."""
+    provider_id = str(provider or "").strip()
+    model = str(model_id or "").strip()
+    if not model or not is_automatic_model_excluded(provider_id, model, config):
+        return model
+
+    candidates: list[str] = []
+    try:
+        from hermes_cli.models import get_default_model_for_provider
+
+        candidates.append(get_default_model_for_provider(provider_id))
+    except Exception:
+        pass
+    try:
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        candidates.extend(
+            str(entry.get("model") or "")
+            for entry in get_fallback_chain(config)
+            if str(entry.get("provider") or "").strip().lower()
+            == provider_id.lower()
         )
-    return any(
-        not filter_model_catalog_exclusions(
-            str(candidate), [model_id], policy
-        )
-        for candidate in policy
-    )
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if candidate and not is_automatic_model_excluded(
+            provider_id, candidate, config
+        ):
+            return candidate
+    return ""
 
 
 def filter_model_catalog_rows(

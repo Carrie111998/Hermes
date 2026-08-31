@@ -9,7 +9,10 @@ POLICY = {"zai": [RETIRED]}
 
 
 def test_filter_is_exact_provider_scoped_and_fail_open():
-    from hermes_cli.model_catalog import filter_model_catalog_exclusions
+    from hermes_cli.model_catalog import (
+        filter_model_catalog_exclusions,
+        is_automatic_model_excluded,
+    )
 
     assert filter_model_catalog_exclusions(
         "ZAI", [RETIRED.upper(), CURRENT], POLICY
@@ -20,6 +23,38 @@ def test_filter_is_exact_provider_scoped_and_fail_open():
     assert filter_model_catalog_exclusions(
         "zai", [RETIRED, CURRENT], {"zai": RETIRED}
     ) == [RETIRED, CURRENT]
+    assert not is_automatic_model_excluded(
+        "",
+        RETIRED,
+        {"model_catalog": {"excluded_models": POLICY}},
+    )
+
+
+def test_messaging_picker_applies_shared_exclusion_policy(monkeypatch):
+    from hermes_cli.model_switch import list_picker_providers
+
+    source_rows = [
+        {
+            "slug": "zai",
+            "name": "Z.AI",
+            "models": [RETIRED, CURRENT],
+            "total_models": 2,
+        }
+    ]
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_authenticated_providers",
+        lambda **_kwargs: source_rows,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"model_catalog": {"excluded_models": POLICY}},
+    )
+
+    rows = list_picker_providers()
+
+    assert rows[0]["models"] == [CURRENT]
+    assert rows[0]["total_models"] == 1
+    assert source_rows[0]["models"] == [RETIRED, CURRENT]
 
 
 def test_merged_inventory_hides_retired_model_without_mutating_source():
@@ -57,6 +92,20 @@ def test_merged_inventory_hides_retired_model_without_mutating_source():
     assert source_rows[0]["models"] == [RETIRED, CURRENT]
 
 
+def test_picker_context_loads_profile_scoped_exclusions(monkeypatch):
+    from hermes_cli.inventory import load_picker_context
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {"provider": "zai", "default": CURRENT},
+            "model_catalog": {"excluded_models": POLICY},
+        },
+    )
+
+    assert load_picker_context().excluded_models == POLICY
+
+
 def test_automatic_default_and_fallback_skip_retired_model(monkeypatch):
     from hermes_cli import models as models_module
     from hermes_cli.fallback_config import get_fallback_chain
@@ -77,6 +126,17 @@ def test_automatic_default_and_fallback_skip_retired_model(monkeypatch):
         == CURRENT
     )
     assert get_fallback_chain(config) == [{"provider": "zai", "model": CURRENT}]
+
+    legacy = {
+        "model_catalog": {"excluded_models": POLICY},
+        "fallback_model": [
+            {"provider": "zai", "model": RETIRED},
+            {"provider": "zai", "model": CURRENT},
+        ],
+    }
+    assert get_fallback_chain(legacy) == [
+        {"provider": "zai", "model": CURRENT}
+    ]
 
 
 def test_classic_setup_picker_hides_retired_but_keeps_manual_entry():

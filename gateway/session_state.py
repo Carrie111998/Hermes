@@ -101,6 +101,8 @@ class ConversationState:
     service_tier_override: Any = _UNSET_TIER
     # Last successfully-resolved non-empty model (#35314 recovery).
     last_resolved_model: str = ""
+    # Provider paired with last_resolved_model for provider-scoped policy.
+    last_resolved_provider: str = ""
     # /queue overflow FIFO (adapter slot holds the head).
     queued_events: List[Any] = field(default_factory=list)
     # Per-turn must-deliver sidecar notes (one-shot).
@@ -122,6 +124,7 @@ class ConversationState:
         self.reasoning_override = None
         self.service_tier_override = _UNSET_TIER
         self.last_resolved_model = ""
+        self.last_resolved_provider = ""
         self.queued_events = []
         self.sidecar_notes = []
         self.ephemeral_pin = None
@@ -386,6 +389,9 @@ LEGACY_FIELD_SPECS: Dict[str, _FieldSpec] = {
     ),
     "_last_resolved_model": _FieldSpec(
         "conversation", "last_resolved_model", str, _present_nonzero
+    ),
+    "_last_resolved_provider": _FieldSpec(
+        "conversation", "last_resolved_provider", str, _present_nonzero
     ),
     "_queued_events": _FieldSpec("conversation", "queued_events", list, _present_nonzero),
     "_pending_turn_sidecar_notes": _FieldSpec(

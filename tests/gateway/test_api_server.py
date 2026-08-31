@@ -2974,7 +2974,7 @@ class TestCreateAgentModelRecovery:
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
 
-    def test_create_agent_does_not_recover_locally_excluded_model(
+    def test_create_agent_replaces_locally_excluded_cached_pair(
         self, monkeypatch,
     ):
         captured = []
@@ -2997,20 +2997,23 @@ class TestCreateAgentModelRecovery:
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
         monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
         adapter._last_resolved_model["ch"] = "glm-4.5-air"
+        adapter._last_resolved_provider["ch"] = "zai"
 
         monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "")
         monkeypatch.setattr(
             "gateway.run._resolve_runtime_agent_kwargs",
-            lambda: {"provider": "zai", "base_url": None, "api_mode": None},
+            lambda: {"provider": None, "base_url": None, "api_mode": None},
         )
         monkeypatch.setattr(
             "hermes_cli.models.get_default_model_for_provider",
-            lambda _provider: "",
+            lambda provider: "glm-5.3-flash" if provider == "zai" else "",
         )
 
         adapter._create_agent(session_id="s1", gateway_session_key="ch")
 
-        assert captured[0]["model"] == ""
+        assert captured[0]["model"] == "glm-5.3-flash"
+        assert captured[0]["provider"] == "zai"
+        assert adapter._last_resolved_provider["ch"] == "zai"
 
     # ── Recovery-net alias guards (PR for #79101) ──────────────────────
 
