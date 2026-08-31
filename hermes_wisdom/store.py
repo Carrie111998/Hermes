@@ -15,7 +15,7 @@ from typing import Any, Iterator
 from hermes_constants import get_hermes_home
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def utc_now() -> str:
@@ -177,6 +177,7 @@ class WisdomStore:
                   qualification TEXT NOT NULL,
                   payload_json TEXT NOT NULL,
                   state TEXT NOT NULL,
+                  telegram_delivered_at TEXT,
                   created_at TEXT NOT NULL,
                   UNIQUE(kind, skill_id, content_hash, qualification),
                   FOREIGN KEY(skill_id) REFERENCES local_skill(id) ON DELETE CASCADE
@@ -295,6 +296,7 @@ class WisdomStore:
                       qualification TEXT NOT NULL,
                       payload_json TEXT NOT NULL,
                       state TEXT NOT NULL,
+                      telegram_delivered_at TEXT,
                       created_at TEXT NOT NULL,
                       UNIQUE(kind, skill_id, content_hash, qualification),
                       FOREIGN KEY(skill_id) REFERENCES local_skill(id) ON DELETE CASCADE
@@ -302,10 +304,15 @@ class WisdomStore:
                     INSERT INTO local_event
                       SELECT id,kind,session_id,task_id,skill_id,content_hash,
                         COALESCE(json_extract(payload_json,'$.qualification'),'legacy'),
-                        payload_json,state,created_at
+                        payload_json,state,NULL,created_at
                       FROM local_event_v2;
                     DROP TABLE local_event_v2;
                     """
+                )
+                event_columns.add("telegram_delivered_at")
+            if "telegram_delivered_at" not in event_columns:
+                db.execute(
+                    "ALTER TABLE local_event ADD COLUMN telegram_delivered_at TEXT"
                 )
             journal_sql = str(
                 db.execute(
@@ -578,7 +585,10 @@ class WisdomStore:
                 if row and row["state"] == "dismissed":
                     return None
             cursor = db.execute(
-                "INSERT OR IGNORE INTO local_event VALUES(?,?,?,?,?,?,?,?,'unread',?)",
+                "INSERT OR IGNORE INTO local_event("
+                "id,kind,session_id,task_id,skill_id,content_hash,qualification,"
+                "payload_json,state,telegram_delivered_at,created_at"
+                ") VALUES(?,?,?,?,?,?,?,?,'unread',NULL,?)",
                 (
                     event_id,
                     kind,
@@ -617,6 +627,52 @@ class WisdomStore:
         for row in rows:
             row["payload"] = json.loads(row.pop("payload_json"))
         return rows
+
+    def local_event(self, event_id: str) -> dict[str, Any] | None:
+        """Return one local event without changing its delivery or consent state."""
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT * FROM local_event WHERE id=?", (event_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        value = dict(row)
+        value["payload"] = json.loads(value.pop("payload_json"))
+        return value
+
+    def pending_telegram_events(
+        self, *, kind: str, session_id: str
+    ) -> list[dict[str, Any]]:
+        """Return unread session events not yet surfaced in Telegram.
+
+        Telegram delivery is deliberately independent from ``state``. The same
+        candidate must remain available to Desktop and Dashboard until the
+        owner dismisses it or advances its exact bytes into publication.
+        """
+        with self.transaction() as db:
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT * FROM local_event WHERE kind=? AND session_id=? "
+                    "AND state='unread' AND telegram_delivered_at IS NULL "
+                    "ORDER BY created_at",
+                    (kind, session_id),
+                ).fetchall()
+            ]
+        for row in rows:
+            row["payload"] = json.loads(row.pop("payload_json"))
+        return rows
+
+    def mark_telegram_delivered(self, event_ids: list[str]) -> None:
+        if not event_ids:
+            return
+        placeholders = ",".join("?" for _ in event_ids)
+        with self.transaction() as db:
+            db.execute(
+                f"UPDATE local_event SET telegram_delivered_at=? "
+                f"WHERE id IN ({placeholders}) AND telegram_delivered_at IS NULL",
+                (utc_now(), *event_ids),
+            )
 
     def dismiss_candidate(self, skill_id: str, content_hash: str) -> None:
         now = utc_now()

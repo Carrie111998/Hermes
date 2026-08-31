@@ -7721,6 +7721,94 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             return
+        if len(parts) == 3 and parts[1] in {"draft", "publish", "decline"}:
+            action, event_id = parts[1], parts[2]
+            await query.answer(
+                text={
+                    "draft": "Creating private draft…",
+                    "publish": "Reviewing and publishing…",
+                    "decline": "Declining…",
+                }[action]
+            )
+
+            def candidate_action():
+                from hermes_wisdom.service import WisdomService
+
+                service = WisdomService()
+                if action == "draft":
+                    return service.draft_candidate(event_id)
+                if action == "publish":
+                    return service.approve_candidate(event_id)
+                return service.decline_candidate(event_id)
+
+            try:
+                result = await self._run_wisdom_profile_operation(candidate_action)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Collective Wisdom candidate action failed: %s",
+                    self.name,
+                    _redact_telegram_error_text(exc),
+                )
+                await self._edit_wisdom_candidate_card(
+                    query,
+                    skill_name="Local skill",
+                    status=(
+                        "This action could not continue. Open Collective in Hermes "
+                        "to review the current state and try again."
+                    ),
+                    actions=[],
+                )
+                return
+
+            skill_name = str(result.get("skill_name") or "Local skill")
+            portal_url = result.get("portal_url")
+            if action == "draft":
+                actions = [
+                    {
+                        "label": "Approve & publish",
+                        "callback_data": f"wi:publish:{event_id}",
+                        "primary": True,
+                    },
+                    *(
+                        [{"label": "View ↗", "url": str(portal_url)}]
+                        if isinstance(portal_url, str)
+                        else []
+                    ),
+                    {
+                        "label": "Decline",
+                        "callback_data": f"wi:decline:{event_id}",
+                    },
+                ]
+                status = (
+                    "Private draft created. Nothing is shared until you approve it."
+                )
+            elif action == "publish":
+                state = str(
+                    result.get("publication_state") or result.get("state") or ""
+                )
+                status = (
+                    "Sent to your collective administrator for approval."
+                    if state == "pending_moderation"
+                    else "Published to your collective."
+                )
+                actions = (
+                    [{"label": "View ↗", "url": str(portal_url)}]
+                    if isinstance(portal_url, str)
+                    else []
+                )
+            else:
+                status = (
+                    "Declined on this device. These exact bytes will not be "
+                    "suggested again."
+                )
+                actions = []
+            await self._edit_wisdom_candidate_card(
+                query,
+                skill_name=skill_name,
+                status=status,
+                actions=actions,
+            )
+            return
         if (
             len(parts) != 4
             or parts[1] not in {"plan", "confirm"}
@@ -7731,20 +7819,6 @@ class TelegramAdapter(BasePlatformAdapter):
 
         phase, action, value = parts[1], parts[2], parts[3]
         await query.answer(text="Verifying…" if phase == "plan" else "Applying…")
-
-        async def run_scoped(operation):
-            owner_profile = getattr(self, "_owner_profile", None)
-            if not isinstance(owner_profile, str) or not owner_profile.strip():
-                return await asyncio.to_thread(operation)
-
-            # Secondary multiplexed bots must operate on the profile that owns
-            # their Telegram credential, not whichever profile happens to be
-            # active in the shared gateway process.
-            from gateway.run import _profile_runtime_scope
-            from hermes_cli.profiles import get_profile_dir
-
-            with _profile_runtime_scope(get_profile_dir(owner_profile)):
-                return await asyncio.to_thread(operation)
 
         def apply_receipt(receipt: str):
             from hermes_wisdom.service import WisdomService
@@ -7778,7 +7852,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     else service.update_plan(value)
                 )
 
-            result = await run_scoped(
+            result = await self._run_wisdom_profile_operation(
                 plan_action if phase == "plan" else lambda: apply_receipt(value)
             )
         except Exception as exc:
@@ -7869,7 +7943,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # stopped above and remains available in the full Collective UI.
         receipt = str(result["receipt"])
         try:
-            applied = await run_scoped(lambda: apply_receipt(receipt))
+            applied = await self._run_wisdom_profile_operation(
+                lambda: apply_receipt(receipt)
+            )
         except Exception as exc:
             logger.warning(
                 "[%s] Collective Wisdom Telegram apply failed: %s",
@@ -7908,6 +7984,226 @@ class TelegramAdapter(BasePlatformAdapter):
             )
         except Exception:
             pass
+
+    async def _run_wisdom_profile_operation(self, operation):
+        """Run local Wisdom state access inside this Telegram bot's profile."""
+        owner_profile = getattr(self, "_owner_profile", None)
+        if not isinstance(owner_profile, str) or not owner_profile.strip():
+            return await asyncio.to_thread(operation)
+
+        # Secondary multiplexed bots must operate on the profile that owns
+        # their Telegram credential, not whichever profile happens to be
+        # active in the shared gateway process.
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.profiles import get_profile_dir
+
+        def scoped():
+            with _profile_runtime_scope(get_profile_dir(owner_profile)):
+                return operation()
+
+        return await asyncio.to_thread(scoped)
+
+    @staticmethod
+    def _wisdom_candidate_html(
+        *,
+        skill_name: str,
+        status: str,
+        actions: List[Dict[str, Any]],
+    ) -> str:
+        controls: list[str] = []
+        for action in actions:
+            label = _html.escape(str(action["label"]))
+            url = action.get("url")
+            if isinstance(url, str):
+                controls.append(
+                    '<tg-button type="url" url="'
+                    f'{_html.escape(url, quote=True)}">{label}</tg-button>'
+                )
+                continue
+            callback_data = str(action.get("callback_data") or "")
+            style = ' style="primary"' if action.get("primary") else ""
+            controls.append(
+                f'<tg-button type="callback_data"{style} data="'
+                f'{_html.escape(callback_data, quote=True)}">{label}</tg-button>'
+            )
+        control_html = f"<br/>{' '.join(controls)}" if controls else ""
+        return (
+            "<h3>Hermes Collective Wisdom</h3>"
+            "<p><b>Reusable skill ready to review</b><br/>"
+            f"<code>{_html.escape(skill_name)}</code><br/>"
+            f"{_html.escape(status)}{control_html}</p>"
+        )
+
+    @staticmethod
+    def _wisdom_candidate_keyboard(
+        actions: List[Dict[str, Any]],
+    ) -> Optional["InlineKeyboardMarkup"]:
+        buttons = []
+        for action in actions:
+            label = str(action["label"])
+            if isinstance(action.get("url"), str):
+                buttons.append(InlineKeyboardButton(label, url=str(action["url"])))
+            else:
+                buttons.append(
+                    InlineKeyboardButton(
+                        label, callback_data=str(action.get("callback_data") or "")
+                    )
+                )
+        if not buttons:
+            return None
+        rows = [buttons[:2]]
+        if len(buttons) > 2:
+            rows.append(buttons[2:])
+        return InlineKeyboardMarkup(rows)
+
+    async def _edit_wisdom_candidate_card(
+        self,
+        query,
+        *,
+        skill_name: str,
+        status: str,
+        actions: List[Dict[str, Any]],
+    ) -> None:
+        """Replace a candidate card in place while preserving its context."""
+        html = self._wisdom_candidate_html(
+            skill_name=skill_name, status=status, actions=actions
+        )
+        message = getattr(query, "message", None)
+        raw_request = getattr(getattr(self, "_bot", None), "do_api_request", None)
+        if message is not None and callable(raw_request):
+            try:
+                await raw_request(
+                    "editMessageText",
+                    api_kwargs={
+                        "chat_id": normalize_telegram_chat_id(message.chat_id),
+                        "message_id": int(message.message_id),
+                        "rich_message": {"html": html},
+                        "link_preview_options": {"is_disabled": True},
+                    },
+                )
+                return
+            except Exception as exc:
+                logger.debug(
+                    "[%s] Candidate rich-card edit failed: %s",
+                    self.name,
+                    _redact_telegram_error_text(exc),
+                )
+        try:
+            await query.edit_message_text(
+                text=(
+                    "<b>Hermes Collective Wisdom</b>\n"
+                    f"<b>{_html.escape(skill_name)}</b>\n{_html.escape(status)}"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._wisdom_candidate_keyboard(actions),
+            )
+        except Exception:
+            pass
+
+    async def send_wisdom_candidate_notifications(
+        self,
+        chat_id: str,
+        session_id: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Surface newly qualified local skills in their exact Telegram session."""
+        from hermes_wisdom.store import WisdomStore
+
+        events = await self._run_wisdom_profile_operation(
+            lambda: WisdomStore().pending_telegram_events(
+                kind="wisdom.candidate", session_id=session_id
+            )
+        )
+        sent = 0
+        for event in events:
+            event_id = str(event["id"])
+            payload = event.get("payload")
+            payload = payload if isinstance(payload, dict) else {}
+            skill_name = str(payload.get("skill_name") or "Local skill")
+            actions: List[Dict[str, Any]] = [
+                {
+                    "label": "Draft in Collective",
+                    "callback_data": f"wi:draft:{event_id}",
+                },
+                {
+                    "label": "Approve & publish",
+                    "callback_data": f"wi:publish:{event_id}",
+                    "primary": True,
+                },
+                {
+                    "label": "Decline",
+                    "callback_data": f"wi:decline:{event_id}",
+                },
+            ]
+            html = self._wisdom_candidate_html(
+                skill_name=skill_name,
+                status=(
+                    "Hermes found a reusable skill after this task. Nothing is shared "
+                    "until you choose an action."
+                ),
+                actions=actions,
+            )
+            delivered = False
+            raw_request = getattr(getattr(self, "_bot", None), "do_api_request", None)
+            if callable(raw_request):
+                rich_payload: Dict[str, Any] = {
+                    "chat_id": normalize_telegram_chat_id(chat_id),
+                    "rich_message": {"html": html},
+                    "link_preview_options": {"is_disabled": True},
+                }
+                thread_id = self._metadata_thread_id(metadata)
+                rich_payload.update(
+                    {
+                        key: value
+                        for key, value in self._thread_kwargs_for_send(
+                            chat_id,
+                            thread_id,
+                            metadata,
+                            reply_to_mode=self._reply_to_mode,
+                        ).items()
+                        if value is not None
+                    }
+                )
+                try:
+                    await raw_request("sendRichMessage", api_kwargs=rich_payload)
+                    delivered = True
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] Candidate rich-card send failed: %s",
+                        self.name,
+                        _redact_telegram_error_text(exc),
+                    )
+            if not delivered and self._bot is not None:
+                kwargs: Dict[str, Any] = {
+                    "chat_id": normalize_telegram_chat_id(chat_id),
+                    "text": (
+                        "<b>Hermes Collective Wisdom</b>\n"
+                        "<b>Reusable skill ready to review</b>\n"
+                        f"<code>{_html.escape(skill_name)}</code>\n"
+                        "Nothing is shared until you choose an action."
+                    ),
+                    "parse_mode": ParseMode.HTML,
+                    "reply_markup": self._wisdom_candidate_keyboard(actions),
+                    **self._link_preview_kwargs(),
+                }
+                try:
+                    await self._send_message_with_thread_fallback(**kwargs)
+                    delivered = True
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Candidate notification failed: %s",
+                        self.name,
+                        _redact_telegram_error_text(exc),
+                    )
+            if delivered:
+                await self._run_wisdom_profile_operation(
+                    lambda event_id=event_id: WisdomStore().mark_telegram_delivered(
+                        [event_id]
+                    )
+                )
+                sent += 1
+        return sent
 
     @staticmethod
     def _wisdom_api_mapping(value: object) -> Optional[Dict[str, Any]]:

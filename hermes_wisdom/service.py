@@ -14,7 +14,7 @@ import webbrowser
 from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from hermes_constants import get_hermes_home, get_skills_dir
 from tools.skill_usage import is_bundled, is_hub_installed
@@ -858,6 +858,124 @@ class WisdomService:
             self.store.set_draft_state(str(prepared["id"]), "declined")
         return {"dismissed": True}
 
+    def portal_review_url(self, draft_id: str) -> str:
+        """Return the authenticated Portal review URL for this profile's team."""
+        org_id = self.store.active_org_id()
+        if not org_id:
+            raise PackagePolicyError(
+                "Collective Wisdom is not set up for this profile"
+            )
+        org_slug = org_id.split(":", 1)[-1]
+        return (
+            f"{portal_base_url()}/orgs/{quote(org_slug, safe='')}/wisdom/review/"
+            f"{quote(draft_id, safe='')}"
+        )
+
+    def _candidate_event_context(
+        self, event_id: str
+    ) -> tuple[dict[str, Any], str, str, str]:
+        event = self.store.local_event(event_id)
+        if event is None or event.get("kind") != "wisdom.candidate":
+            raise WisdomNotFound("local candidate not found")
+        if event.get("state") != "unread":
+            raise WisdomConflict(
+                "this local candidate has already been handled",
+                code="candidate_already_handled",
+            )
+
+        local_skill_id = str(event["skill_id"])
+        content_hash = str(event["content_hash"])
+        local = self.store.local_skill(local_skill_id)
+        if local is None or str(local.get("current_hash")) != content_hash:
+            raise WisdomConflict(
+                "this local skill changed after qualification; use its current version instead",
+                code="candidate_source_changed",
+            )
+        source = Path(str(local["canonical_path"]))
+        if not source.is_dir() or _source_fingerprint(source) != content_hash:
+            raise WisdomConflict(
+                "this local skill changed after qualification; scan local skills and try again",
+                code="candidate_source_changed",
+            )
+        skill_name = source.name
+        # Re-run the normal eligibility boundary so a callback cannot turn a
+        # stale or excluded local path into an upload authority.
+        self._candidate_source(skill_name, local_skill_id)
+        return event, local_skill_id, content_hash, skill_name
+
+    def draft_candidate(self, event_id: str) -> dict[str, Any]:
+        """Create or resume an owner-private draft for one exact candidate."""
+        self.require_setup()
+        _event, local_skill_id, content_hash, skill_name = (
+            self._candidate_event_context(event_id)
+        )
+        existing = self.store.latest_draft_for_source(local_skill_id, content_hash)
+        if existing is not None and not str(existing["id"]).startswith("local:"):
+            state = str(existing["state"])
+            if state not in {"declined", "invalidated"}:
+                draft_id = str(existing["id"])
+                return {
+                    "draft_id": draft_id,
+                    "skill_name": skill_name,
+                    "state": state,
+                    "portal_url": self.portal_review_url(draft_id),
+                    "created": False,
+                }
+
+        prepared = self.store.prepared_draft(local_skill_id, content_hash)
+        prepared_result = (
+            self._prepared_result(prepared)
+            if prepared is not None
+            else self.suggest(skill_name, local_skill_id=local_skill_id)
+        )
+        submitted = self.suggest(
+            skill_name,
+            description=str(prepared_result["drafted_description"]),
+            system_specification=dict(prepared_result["system_specification"]),
+            local_skill_id=local_skill_id,
+        )
+        draft = submitted.get("draft")
+        if not isinstance(draft, dict) or not isinstance(draft.get("id"), str):
+            raise WisdomValidationError("Gateway did not return an owner-private draft")
+        draft_id = str(draft["id"])
+        return {
+            "draft_id": draft_id,
+            "skill_name": skill_name,
+            "state": str(draft.get("state") or "ready"),
+            "portal_url": self.portal_review_url(draft_id),
+            "created": True,
+        }
+
+    def approve_candidate(self, event_id: str) -> dict[str, Any]:
+        """Use an explicit Telegram action as exact-package owner consent."""
+        drafted = self.draft_candidate(event_id)
+        state = str(drafted["state"])
+        if state in {"pending_moderation", "published"}:
+            return {**drafted, "publication_state": state}
+
+        draft_id = str(drafted["draft_id"])
+        # Approval still passes through the ordinary authoritative re-fetch and
+        # three-hash receipt. The button is consent, not a bypass around review.
+        self.review(draft_id, acknowledge=True)
+        result = self.approve(draft_id)
+        publication = result.get("publication")
+        publication = publication if isinstance(publication, dict) else {}
+        publication_state = str(publication.get("state") or "")
+        return {
+            **drafted,
+            "state": publication_state,
+            "publication_state": publication_state,
+            "approval": result,
+        }
+
+    def decline_candidate(self, event_id: str) -> dict[str, Any]:
+        """Suppress this exact local package version without a network write."""
+        _event, local_skill_id, content_hash, skill_name = (
+            self._candidate_event_context(event_id)
+        )
+        result = self.dismiss_local_candidate(local_skill_id, content_hash)
+        return {**result, "skill_name": skill_name, "state": "declined"}
+
     def review(
         self, draft_id: str, *, acknowledge: bool, portal: bool = False
     ) -> dict[str, Any]:
@@ -898,7 +1016,7 @@ class WisdomService:
             "receipt": None,
         }
         if portal:
-            url = f"{portal_base_url()}/wisdom/review/{draft_id}"
+            url = self.portal_review_url(draft_id)
             webbrowser.open(url)
             result["portal_url"] = url
         if acknowledge:

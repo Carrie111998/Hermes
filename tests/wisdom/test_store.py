@@ -154,7 +154,7 @@ def test_identity_rotation_is_atomic_with_org_activation(tmp_path: Path):
     assert store.active_org_id() == "org-2"
 
 
-def test_schema_v5_tracks_profile_local_usage_days(tmp_path: Path):
+def test_schema_v6_tracks_profile_local_usage_and_telegram_delivery(tmp_path: Path):
     store = WisdomStore(tmp_path / "wisdom")
     with store.transaction() as db:
         snapshot_columns = {
@@ -166,6 +166,9 @@ def test_schema_v5_tracks_profile_local_usage_days(tmp_path: Path):
         usage_columns = {
             row[1] for row in db.execute("PRAGMA table_info(usage_day)").fetchall()
         }
+        event_columns = {
+            row[1] for row in db.execute("PRAGMA table_info(local_event)").fetchall()
+        }
         version = db.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
         ).fetchone()[0]
@@ -173,10 +176,11 @@ def test_schema_v5_tracks_profile_local_usage_days(tmp_path: Path):
     assert {"session_id", "task_id"} <= stability_columns
     assert {"day_local", "timezone_name"} <= usage_columns
     assert "day_utc" not in usage_columns
-    assert version == "5"
+    assert "telegram_delivered_at" in event_columns
+    assert version == "6"
 
 
-def test_schema_v5_preserves_v4_usage_in_an_explicit_utc_bucket(tmp_path: Path):
+def test_schema_v6_preserves_v4_usage_in_an_explicit_utc_bucket(tmp_path: Path):
     root = tmp_path / "wisdom"
     root.mkdir()
     with sqlite3.connect(root / "wisdom.db") as db:
@@ -213,3 +217,43 @@ def test_schema_v5_preserves_v4_usage_in_an_explicit_utc_bucket(tmp_path: Path):
             "SELECT day_local,timezone_name,use_count FROM usage_day"
         ).fetchone()
     assert tuple(row) == ("2026-08-03", "UTC", 2)
+
+
+def test_telegram_delivery_is_session_scoped_without_consuming_candidate(tmp_path: Path):
+    store = WisdomStore(tmp_path / "wisdom")
+    skill_path = tmp_path / "skill"
+    skill_path.mkdir()
+    (skill_path / "SKILL.md").write_text("hello", encoding="utf-8")
+    skill_id = store.register_skill(
+        skill_path, content_hash="sha256:source", source_kind="local"
+    )
+    event_id = store.emit_local_event(
+        kind="wisdom.candidate",
+        skill_id=skill_id,
+        content_hash="sha256:source",
+        payload={"skill_name": "skill"},
+        session_id="telegram-session",
+        task_id="task-1",
+        qualification="high_usage",
+    )
+    assert event_id is not None
+
+    assert store.pending_telegram_events(
+        kind="wisdom.candidate", session_id="other-session"
+    ) == []
+    pending = store.pending_telegram_events(
+        kind="wisdom.candidate", session_id="telegram-session"
+    )
+    assert [item["id"] for item in pending] == [event_id]
+
+    store.mark_telegram_delivered([event_id])
+
+    assert store.pending_telegram_events(
+        kind="wisdom.candidate", session_id="telegram-session"
+    ) == []
+    assert [
+        item["id"]
+        for item in store.local_events(
+            kind="wisdom.candidate", session_id="telegram-session"
+        )
+    ] == [event_id]

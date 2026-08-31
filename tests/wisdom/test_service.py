@@ -416,6 +416,151 @@ def test_suggest_uses_candidate_identity_and_rejects_a_stale_duplicate_action(
         )
 
 
+def _qualified_candidate_event(service: WisdomService, skill: Path) -> str:
+    candidate = service.scan_candidates()[0]
+    event_id = service.store.emit_local_event(
+        kind="wisdom.candidate",
+        skill_id=candidate["local_skill_id"],
+        content_hash=candidate["content_hash"],
+        payload={
+            "skill_name": skill.name,
+            "local_reasons": {"high_usage": True},
+        },
+        session_id="telegram-session",
+        task_id="task-1",
+        qualification="high_usage",
+    )
+    assert event_id is not None
+    return event_id
+
+
+def test_telegram_candidate_creates_an_owner_private_draft_and_portal_link(
+    monkeypatch, tmp_path: Path
+):
+    skills = tmp_path / "skills"
+    skill = skills / "telegram-skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: telegram-skill\ndescription: Share a safe runbook.\n---\n"
+        "# Telegram skill\n",
+        encoding="utf-8",
+    )
+    fake = FakeClient()
+    store = WisdomStore(tmp_path / "state")
+    store.installation_identity()
+    store.verify_installation_identity("nas_organisation:wisdom-local")
+    service = WisdomService(store=store, client=fake)
+    monkeypatch.setattr(service, "_eligible_paths", lambda: [skill])
+    monkeypatch.setattr(
+        "hermes_wisdom.service._config",
+        lambda: {
+            "enabled": True,
+            "disclosure_acknowledged_at": "2026-08-31T00:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_wisdom.service.portal_base_url", lambda: "https://portal.test"
+    )
+    monkeypatch.setattr(
+        "hermes_wisdom.service._scan_summary",
+        lambda _path: {
+            "guard": {"allowed": True, "findings": [], "reason": None},
+            "skill_evaluator": {"status": "disabled", "findings": []},
+        },
+    )
+    event_id = _qualified_candidate_event(service, skill)
+
+    result = service.draft_candidate(event_id)
+
+    assert result == {
+        "draft_id": "draft-1",
+        "skill_name": "telegram-skill",
+        "state": "ready",
+        "portal_url": (
+            "https://portal.test/orgs/wisdom-local/wisdom/review/draft-1"
+        ),
+        "created": True,
+    }
+    assert fake.uploaded > 0
+    assert fake.submissions[0]["description"] == "Share a safe runbook."
+    assert "local_reasons" not in json.dumps(fake.submissions)
+
+    resumed = service.draft_candidate(event_id)
+    assert resumed["created"] is False
+    assert len(fake.submissions) == 1
+
+
+def test_telegram_candidate_publish_uses_normal_review_and_approval(
+    monkeypatch, tmp_path: Path
+):
+    service = WisdomService(store=WisdomStore(tmp_path / "state"), client=FakeClient())
+    monkeypatch.setattr(
+        service,
+        "draft_candidate",
+        lambda _event_id: {
+            "draft_id": "draft-1",
+            "skill_name": "telegram-skill",
+            "state": "ready",
+            "portal_url": "https://portal.test/review/draft-1",
+            "created": True,
+        },
+    )
+    reviewed: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        service,
+        "review",
+        lambda draft_id, *, acknowledge, portal=False: reviewed.append(
+            (draft_id, acknowledge)
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "approve",
+        lambda _draft_id: {"publication": {"state": "pending_moderation"}},
+    )
+
+    result = service.approve_candidate("event-1")
+
+    assert reviewed == [("draft-1", True)]
+    assert result["publication_state"] == "pending_moderation"
+
+
+def test_telegram_candidate_rejects_changed_source_before_any_upload(
+    monkeypatch, tmp_path: Path
+):
+    skill = tmp_path / "skills" / "changing-skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# First\n", encoding="utf-8")
+    fake = FakeClient()
+    service = WisdomService(store=WisdomStore(tmp_path / "state"), client=fake)
+    monkeypatch.setattr(service, "_eligible_paths", lambda: [skill])
+    monkeypatch.setattr(service, "require_setup", lambda: None)
+    event_id = _qualified_candidate_event(service, skill)
+    (skill / "SKILL.md").write_text("# Changed\n", encoding="utf-8")
+
+    with pytest.raises(WisdomConflict, match="changed after qualification"):
+        service.draft_candidate(event_id)
+
+    assert fake.uploaded == 0
+
+
+def test_telegram_candidate_decline_suppresses_only_the_qualified_bytes(
+    monkeypatch, tmp_path: Path
+):
+    skill = tmp_path / "skills" / "decline-from-telegram"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# Decline\n", encoding="utf-8")
+    service = WisdomService(store=WisdomStore(tmp_path / "state"), client=FakeClient())
+    monkeypatch.setattr(service, "_eligible_paths", lambda: [skill])
+    event_id = _qualified_candidate_event(service, skill)
+
+    result = service.decline_candidate(event_id)
+
+    assert result["state"] == "declined"
+    assert result["skill_name"] == "decline-from-telegram"
+    assert service.store.local_event(event_id)["state"] == "dismissed"
+
+
 def test_setup_persists_explicit_disclosure_and_enables_the_profile(
     monkeypatch, tmp_path: Path
 ):

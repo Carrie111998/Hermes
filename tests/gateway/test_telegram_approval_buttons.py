@@ -378,6 +378,153 @@ class TestTelegramApprovalCallback:
         )
 
     @pytest.mark.asyncio
+    async def test_wisdom_candidate_notification_is_exact_session_and_non_consuming(
+        self, tmp_path
+    ):
+        from hermes_wisdom.store import WisdomStore
+
+        store = WisdomStore(tmp_path / "wisdom")
+        skill = tmp_path / "telegram-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text("# Telegram skill\n", encoding="utf-8")
+        skill_id = store.register_skill(
+            skill, content_hash="sha256:source", source_kind="local"
+        )
+        event_id = store.emit_local_event(
+            kind="wisdom.candidate",
+            skill_id=skill_id,
+            content_hash="sha256:source",
+            payload={"skill_name": "telegram-skill", "local_reasons": {}},
+            session_id="telegram-session",
+            task_id="task-1",
+            qualification="high_usage",
+        )
+        assert event_id is not None
+        adapter = _make_adapter()
+
+        with patch("hermes_wisdom.store.WisdomStore", return_value=store):
+            assert (
+                await adapter.send_wisdom_candidate_notifications(
+                    "12345", "other-session"
+                )
+                == 0
+            )
+            assert (
+                await adapter.send_wisdom_candidate_notifications(
+                    "12345", "telegram-session"
+                )
+                == 1
+            )
+
+        raw_call = adapter._bot.do_api_request.await_args
+        assert raw_call.args == ("sendRichMessage",)
+        html = raw_call.kwargs["api_kwargs"]["rich_message"]["html"]
+        assert "telegram-skill" in html
+        assert "Draft in Collective" in html
+        assert "Approve &amp; publish" in html
+        assert f"wi:draft:{event_id}" in html
+        assert f"wi:publish:{event_id}" in html
+        assert store.pending_telegram_events(
+            kind="wisdom.candidate", session_id="telegram-session"
+        ) == []
+        assert [
+            item["id"]
+            for item in store.local_events(
+                kind="wisdom.candidate", session_id="telegram-session"
+            )
+        ] == [event_id]
+
+    @pytest.mark.asyncio
+    async def test_wisdom_candidate_draft_callback_adds_portal_and_publish_actions(
+        self,
+    ):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "wi:draft:event-1"
+        query.message = MagicMock(chat_id=12345, message_id=77)
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        service = MagicMock()
+        service.draft_candidate.return_value = {
+            "draft_id": "draft-1",
+            "skill_name": "telegram-skill",
+            "state": "ready",
+            "portal_url": "https://portal.test/review/draft-1",
+        }
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(
+                    MagicMock(callback_query=query), MagicMock()
+                )
+
+        service.draft_candidate.assert_called_once_with("event-1")
+        html = adapter._bot.do_api_request.await_args.kwargs["api_kwargs"][
+            "rich_message"
+        ]["html"]
+        assert "Private draft created" in html
+        assert "Approve &amp; publish" in html
+        assert "https://portal.test/review/draft-1" in html
+        assert "wi:decline:event-1" in html
+
+    @pytest.mark.asyncio
+    async def test_wisdom_candidate_publish_callback_reports_moderation_state(self):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "wi:publish:event-1"
+        query.message = MagicMock(chat_id=12345, message_id=78)
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        service = MagicMock()
+        service.approve_candidate.return_value = {
+            "skill_name": "telegram-skill",
+            "publication_state": "pending_moderation",
+            "portal_url": "https://portal.test/review/draft-1",
+        }
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(
+                    MagicMock(callback_query=query), MagicMock()
+                )
+
+        service.approve_candidate.assert_called_once_with("event-1")
+        html = adapter._bot.do_api_request.await_args.kwargs["api_kwargs"][
+            "rich_message"
+        ]["html"]
+        assert "collective administrator" in html
+        assert "https://portal.test/review/draft-1" in html
+
+    @pytest.mark.asyncio
+    async def test_wisdom_candidate_decline_callback_suppresses_exact_bytes(self):
+        adapter = _make_adapter()
+        query = AsyncMock()
+        query.data = "wi:decline:event-1"
+        query.message = MagicMock(chat_id=12345, message_id=79)
+        query.from_user = MagicMock(id="12345", first_name="Shannon")
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+        service = MagicMock()
+        service.decline_candidate.return_value = {
+            "skill_name": "telegram-skill",
+            "state": "declined",
+        }
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("hermes_wisdom.service.WisdomService", return_value=service):
+                await adapter._handle_callback_query(
+                    MagicMock(callback_query=query), MagicMock()
+                )
+
+        service.decline_candidate.assert_called_once_with("event-1")
+        html = adapter._bot.do_api_request.await_args.kwargs["api_kwargs"][
+            "rich_message"
+        ]["html"]
+        assert "exact bytes will not be suggested again" in html
+
+    @pytest.mark.asyncio
     async def test_wisdom_install_preserves_rich_notification_and_disables_action(
         self,
     ):

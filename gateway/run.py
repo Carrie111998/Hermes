@@ -22674,6 +22674,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await _deliver()
 
+    async def _defer_wisdom_candidate_notice_after_delivery(
+        self, source: Any, session_id: str
+    ) -> None:
+        """Surface local qualification after the originating Telegram reply."""
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return
+        adapter = self._adapter_for_source(source)
+        sender = getattr(adapter, "send_wisdom_candidate_notifications", None)
+        if adapter is None or not callable(sender):
+            return
+
+        try:
+            metadata = self._thread_metadata_for_source(source)
+        except Exception:
+            metadata = None
+
+        async def _deliver() -> None:
+            try:
+                await sender(
+                    source.chat_id,
+                    session_id,
+                    metadata=metadata,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Wisdom candidate Telegram delivery failed: %s", exc, exc_info=True
+                )
+
+        try:
+            session_key = self._session_key_for_source(source)
+        except Exception:
+            session_key = None
+        if session_key and hasattr(adapter, "register_post_delivery_callback"):
+            try:
+                generation = None
+                active = getattr(adapter, "_active_sessions", {}).get(session_key)
+                if active is not None:
+                    generation = getattr(active, "_hermes_run_generation", None)
+                adapter.register_post_delivery_callback(
+                    session_key,
+                    _deliver,
+                    generation=generation,
+                )
+                return
+            except Exception as exc:
+                logger.debug(
+                    "Wisdom candidate post-delivery callback registration failed: %s",
+                    exc,
+                )
+        await _deliver()
+
     async def _post_turn_goal_continuation(
         self,
         *,
@@ -22809,6 +22860,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception as exc:
             logger.debug("loop completion hook failed: %s", exc)
+        try:
+            await self._defer_wisdom_candidate_notice_after_delivery(
+                source, str(session_entry.session_id)
+            )
+        except Exception as exc:
+            logger.debug("Wisdom candidate notification hook failed: %s", exc)
 
     @staticmethod
     def _final_text_for_post_turn_hooks(agent_result, event=None) -> str:
