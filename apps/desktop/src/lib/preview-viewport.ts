@@ -131,11 +131,10 @@ export function fitScale(viewport: { height: number; width: number }, available:
 /**
  * The element size that makes the emulated page fill it exactly.
  *
- * `zoom` is the HOST window's zoom factor, and it is not optional in practice —
- * leaving it at 1 while the user has zoomed the app is the bug this parameter
- * exists to kill. The pane measures itself in host CSS pixels, but Chromium
- * paints the emulated page in the GUEST's CSS pixels, and app zoom is exactly
- * the ratio between the two: at 134% the guest widget came out 1.34x larger
+ * `zoom` is the HOST window's zoom factor. The pane measures itself in host CSS
+ * pixels, but Chromium paints the emulated page in the GUEST's CSS pixels, and
+ * app zoom is exactly the ratio between the two: at 134% the guest widget came
+ * out 1.34x larger
  * than the page painted into it, so a quarter of the frame stayed unpainted —
  * a white band down the right and along the bottom. Measured in a real guest:
  * a 430x932 phone reported a 563x1219 widget for a 419x907 paint.

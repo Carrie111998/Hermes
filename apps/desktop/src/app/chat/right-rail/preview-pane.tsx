@@ -151,6 +151,20 @@ const LOOPBACK_HOST_RE = /^(localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|\[?::1\]?)$
  * — where that port is usually nothing, or worse, somebody else's service. The
  * URL isn't wrong, it's just addressed to a different computer.
  */
+/**
+ * This window's zoom factor, guaranteed positive and finite.
+ *
+ * Two things in this file cross between host CSS pixels and the guest's, and
+ * app zoom is the ratio for both — the emulated frame's size and the context
+ * menu's click point. They read it through here so the fallback is one
+ * decision rather than a `?? 1` in one place and a `|| 1` in the other.
+ */
+function hostZoomFactor(): number {
+  const zoom = window.hermesDesktop?.zoom?.factor?.()
+
+  return Number.isFinite(zoom) && (zoom ?? 0) > 0 ? (zoom as number) : 1
+}
+
 function isRemoteLoopbackUrl(url: string): boolean {
   if (!isRemoteGateway()) {
     return false
@@ -312,6 +326,13 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       return
     }
 
+    // What the guest was last told. `apply` runs on three triggers now — pane
+    // resize, navigation, and zoom — and the emulate call is a synchronous
+    // main-process hop, so held Ctrl+ would fire one per key repeat with a
+    // byte-identical payload. Cleared on navigation, which resets the override
+    // in the guest and is the one time re-sending the same metrics is the point.
+    let emulated: null | string = null
+
     const apply = () => {
       const webview = webviewRef.current
 
@@ -335,7 +356,8 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
         webview.className = 'flex h-full w-full flex-1 bg-transparent'
         setViewportScale(1)
 
-        if (typeof webContentsId === 'number') {
+        if (typeof webContentsId === 'number' && emulated !== 'off') {
+          emulated = 'off'
           void window.hermesDesktop?.previewEmulateDevice?.({ metrics: null, webContentsId })
         }
 
@@ -343,31 +365,43 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       }
 
       const box = host.getBoundingClientRect()
+
       // The pane measures in host CSS pixels; the guest paints in its own. App
       // zoom is the ratio, so a zoomed window needs it divided back out or the
       // frame is bigger than the page painted into it — see preview-viewport.ts.
-      const zoom = window.hermesDesktop?.zoom?.factor?.() ?? 1
-      const { frame, scale } = viewportFit(viewport, { height: box.height, width: box.width }, zoom)
+      const { frame, scale } = viewportFit(
+        viewport,
+        { height: box.height, width: box.width },
+        hostZoomFactor()
+      )
+
       webview.className = 'bg-transparent'
       webview.style.width = `${frame.width}px`
       webview.style.height = `${frame.height}px`
       setViewportScale(scale)
 
-      if (typeof webContentsId === 'number') {
-        void window.hermesDesktop?.previewEmulateDevice?.({
-          metrics: { height: viewport.height, mobile: viewport.mobile, scale, width: viewport.width },
-          webContentsId
-        })
+      const metrics = { height: viewport.height, mobile: viewport.mobile, scale, width: viewport.width }
+      const sent = `${webContentsId}:${metrics.width}x${metrics.height}:${metrics.mobile}:${scale}`
+
+      if (typeof webContentsId === 'number' && sent !== emulated) {
+        emulated = sent
+        void window.hermesDesktop?.previewEmulateDevice?.({ metrics, webContentsId })
       }
     }
 
     apply()
 
     // A guest that was not attached yet on the first pass, and any navigation
-    // that might have reset the override, both get another go.
+    // that might have reset the override, both get another go — from scratch,
+    // because the guest has forgotten what it was told.
+    const reapply = () => {
+      emulated = null
+      apply()
+    }
+
     const webview = webviewRef.current
-    webview?.addEventListener('dom-ready', apply)
-    webview?.addEventListener('did-navigate', apply)
+    webview?.addEventListener('dom-ready', reapply)
+    webview?.addEventListener('did-navigate', reapply)
     // Guarded rather than assumed: this test file unstubs globals between
     // cases, and jsdom has no ResizeObserver of its own. Same shape as
     // find-bar.tsx.
@@ -375,13 +409,13 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     observer?.observe(host)
     // Ctrl +/-/0 changes the host's CSS pixel without resizing the pane, so the
     // ResizeObserver never fires — the frame would keep the old zoom's size.
-    const stopZoom = window.hermesDesktop?.zoom?.onChanged?.(() => apply())
+    const stopZoom = window.hermesDesktop?.zoom?.onChanged?.(apply)
 
     return () => {
       observer?.disconnect()
       stopZoom?.()
-      webview?.removeEventListener('dom-ready', apply)
-      webview?.removeEventListener('did-navigate', apply)
+      webview?.removeEventListener('dom-ready', reapply)
+      webview?.removeEventListener('did-navigate', reapply)
     }
   }, [isRemoteHtml, isWebPreview, viewport])
 
@@ -1009,7 +1043,7 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
         return
       }
 
-      const zoom = window.hermesDesktop?.zoom?.factor?.() || 1
+      const zoom = hostZoomFactor()
       // Window CSS point of the click (the menu anchors here).
       const windowX = params.x / zoom
       const windowY = params.y / zoom

@@ -12,9 +12,11 @@
  * webContents does not reach a guest (electron/electron#20333), which is why
  * this is a per-pane registry rather than something main could do.
  *
- * Coordinates are relative to the webview, and the webview IS the guest
- * viewport — so a rect the act engine measured inside the page needs no
- * conversion on the way back out.
+ * Coordinates are relative to the webview and are the GUEST's own pixels, so a
+ * rect the act engine measured inside the page needs no conversion for app
+ * zoom on the way back out. It does need one for device emulation: Chromium
+ * divides injected coordinates by the emulation scale, which is what
+ * `toWidgetPoint` puts back (see lib/preview-viewport.ts).
  */
 
 import { $rightRailActiveTabId } from '@/store/layout'

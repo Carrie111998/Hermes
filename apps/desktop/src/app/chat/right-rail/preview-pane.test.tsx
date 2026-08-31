@@ -336,20 +336,11 @@ describe('PreviewPane console state', () => {
   // the argument here would leave every lib test green while shipping the white
   // band back — this is the test that notices.
   it('sizes an emulated frame with the window zoom, not without it', async () => {
-    const emulate = vi.fn(async () => true)
     const zoomFactor = 1.3445671961657126 // 134%, this machine's saved level
 
-    vi.stubGlobal('ResizeObserver', class {
-      disconnect() {}
-      observe() {}
-      unobserve() {}
-    })
     vi.stubGlobal('window', {
       ...window,
-      hermesDesktop: {
-        previewEmulateDevice: emulate,
-        zoom: { factor: () => zoomFactor, onChanged: () => () => {} }
-      }
+      hermesDesktop: { zoom: { factor: () => zoomFactor, onChanged: () => () => {} } }
     })
 
     const target = {
@@ -361,7 +352,7 @@ describe('PreviewPane console state', () => {
 
     let rendered!: ReturnType<typeof render>
     await act(async () => {
-      rendered = render(<PreviewPane target={target as never} />)
+      rendered = render(<PreviewPane target={target} />)
     })
 
     await act(async () => {
@@ -378,7 +369,6 @@ describe('PreviewPane console state', () => {
     // the zoom it would be a flat 430x932 — which is exactly the bug.
     expect(webview.style.width).toBe('320px')
     expect(webview.style.height).toBe('693px')
-    expect(webview.style.width).not.toBe('430px')
   })
 
   it('renders authenticated remote HTML safely and honors source mode', async () => {

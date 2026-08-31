@@ -64,6 +64,9 @@ describe('fitScale', () => {
 })
 
 describe('viewportFit', () => {
+  /** 1.2^1.6239 — the level found in this machine's zoom-state.json, i.e. 134%. */
+  const ZOOM = 1.3445671961657126
+
   it('sizes the element so the emulated page fills it exactly', () => {
     // Verified in Electron: element = device × scale, with the same scale
     // passed to enableDeviceEmulation, leaves no letterboxing.
@@ -73,20 +76,26 @@ describe('viewportFit', () => {
     expect(frame.width).toBeLessThanOrEqual(500)
   })
 
-  it('never overflows the pane it was asked to fit', () => {
+  it('never overflows the pane it was asked to fit, at any zoom', () => {
     // Rounding the scale up put a 820x1180 tablet at 390x561 inside a 500x560
     // pane — one pixel of overflow is a scrollbar. Found in a real guest, so
     // check every preset against a few awkward pane sizes rather than one.
-    for (const preset of VIEWPORT_PRESETS) {
-      for (const pane of [
-        { height: 560, width: 500 },
-        { height: 337, width: 1201 },
-        { height: 999, width: 333 },
-        { height: 2000, width: 2000 }
-      ]) {
-        const { frame } = viewportFit(preset, pane)
-        expect(frame.width, `${preset.id} in ${pane.width}x${pane.height}`).toBeLessThanOrEqual(pane.width)
-        expect(frame.height, `${preset.id} in ${pane.width}x${pane.height}`).toBeLessThanOrEqual(pane.height)
+    // Zoomed too: dividing the frame by the zoom must not round its way back
+    // over the edge.
+    for (const zoom of [undefined, ZOOM]) {
+      for (const preset of VIEWPORT_PRESETS) {
+        for (const pane of [
+          { height: 560, width: 500 },
+          { height: 337, width: 1201 },
+          { height: 999, width: 333 },
+          { height: 2000, width: 2000 }
+        ]) {
+          const { frame } = viewportFit(preset, pane, zoom)
+          const where = `${preset.id} in ${pane.width}x${pane.height} @${zoom ?? 1}`
+
+          expect(frame.width, where).toBeLessThanOrEqual(pane.width)
+          expect(frame.height, where).toBeLessThanOrEqual(pane.height)
+        }
       }
     }
   })
@@ -101,8 +110,6 @@ describe('viewportFit', () => {
   // who had pressed Ctrl+ — measured in a real guest at 134%: a 430x932 phone
   // got a 563x1219 widget for a 419x907 paint, exactly 1/1.3446 of it painted.
   describe('under app zoom', () => {
-    const ZOOM = 1.3445671961657126 // 1.2^1.6239, the level found in zoom-state.json
-
     it('shrinks the frame by the zoom, so the painted page fills it', () => {
       const pane = { height: 1000, width: 800 }
       const { frame, scale } = viewportFit(PHONE, pane, ZOOM)
@@ -120,23 +127,7 @@ describe('viewportFit', () => {
       const pane = { height: 500, width: 400 }
       const zoomed = viewportFit(DESKTOP, pane, ZOOM)
 
-      expect(zoomed.frame.width).not.toBe(Math.round(DESKTOP.width * zoomed.scale))
       expect(zoomed.frame.width).toBeLessThan(Math.round(DESKTOP.width * zoomed.scale))
-    })
-
-    it('still never overflows the pane it was asked to fit', () => {
-      for (const preset of VIEWPORT_PRESETS) {
-        for (const pane of [
-          { height: 560, width: 500 },
-          { height: 337, width: 1201 },
-          { height: 999, width: 333 }
-        ]) {
-          const { frame } = viewportFit(preset, pane, ZOOM)
-
-          expect(frame.width, `${preset.id} in ${pane.width}x${pane.height}`).toBeLessThanOrEqual(pane.width)
-          expect(frame.height, `${preset.id} in ${pane.width}x${pane.height}`).toBeLessThanOrEqual(pane.height)
-        }
-      }
     })
 
     it('uses the zoom to fit MORE page, not less', () => {
