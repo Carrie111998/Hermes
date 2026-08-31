@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import time
 from types import SimpleNamespace
 from unittest import mock
 
@@ -9,6 +10,7 @@ import httpx
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import SendResult
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +439,207 @@ class TestWaitForReconnection:
         result = await adapter.send("test_openid", "Hello, world!")
         assert result.success
         assert result.message_id == "msg_123"
+
+
+# ---------------------------------------------------------------------------
+# C2C passive-reply quota exhaustion
+# ---------------------------------------------------------------------------
+
+class TestQQC2CPassiveReplyQuota:
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+
+        adapter = QQAdapter(
+            _make_config(app_id="a", client_secret="b", markdown_support=False, **extra)
+        )
+        adapter._running = True
+        adapter._ws = SimpleNamespace(closed=False)
+        return adapter
+
+    def test_passive_quota_error_is_bounded_and_permanent(self):
+        """One final C2C delivery makes one passive request and no fallback send."""
+        adapter = self._make_adapter()
+        calls = []
+
+        async def fake_api_request(method, path, body):
+            calls.append((method, path, dict(body)))
+            raise RuntimeError(
+                "QQ Bot API error [400] /v2/users/u/messages: "
+                "40034128 被动回复时间或次数超限"
+            )
+
+        adapter._api_request = fake_api_request
+
+        result = asyncio.run(
+            adapter._send_with_retry(
+                "u", "final answer", reply_to="inbound-1", max_retries=2, base_delay=0
+            )
+        )
+
+        assert not result.success
+        assert result.retryable is False
+        assert len(calls) == 1
+        assert calls[0][2]["msg_id"] == "inbound-1"
+        assert calls[0][2]["message_reference"] == {"message_id": "inbound-1"}
+        assert "40034128" in (result.error or "")
+
+    def test_wakeup_quota_error_is_permanent_without_inner_retries(self):
+        adapter = self._make_adapter()
+        calls = []
+
+        async def fake_c2c(*args, **kwargs):
+            calls.append((args, kwargs))
+            raise RuntimeError(
+                "QQ Bot API error [400] /v2/users/u/messages: "
+                "40034122 召回消息已达区间上限"
+            )
+
+        adapter._send_c2c_text = fake_c2c
+
+        result = asyncio.run(adapter._send_chunk("u", "final answer", "inbound-1"))
+
+        assert not result.success
+        assert result.retryable is False
+        assert len(calls) == 1
+        assert "40034122" in (result.error or "")
+
+    def test_success_path_still_sends_once(self):
+        adapter = self._make_adapter()
+        calls = []
+
+        async def fake_api_request(method, path, body):
+            calls.append((method, path, dict(body)))
+            return {"id": "sent-1"}
+
+        adapter._api_request = fake_api_request
+
+        result = asyncio.run(
+            adapter._send_with_retry("u", "final answer", reply_to="inbound-1")
+        )
+
+        assert result.success
+        assert result.message_id == "sent-1"
+        assert len(calls) == 1
+
+    def test_quota_codes_are_classified_without_localized_message(self):
+        adapter = self._make_adapter()
+
+        assert adapter._is_c2c_quota_error("QQ error code=40034128")
+        assert adapter._is_c2c_quota_error("QQ error code=40034122")
+
+    def test_dropped_answer_is_carried_forward_to_next_deliverable_send(self):
+        """A final answer permanently dropped by quota exhaustion (#agentic-rl-jd-
+        20260825 incident: 13 retries against an exhausted wakeup channel, then
+        silent loss) must not vanish — it rides along on the next message this
+        adapter actually manages to deliver to the same chat."""
+        adapter = self._make_adapter()
+        outcomes = [
+            RuntimeError(
+                "QQ Bot API error [400] /v2/users/u/messages: "
+                "40034128 被动回复时间或次数超限"
+            ),
+            {"id": "sent-2"},
+        ]
+        sent_bodies = []
+
+        async def fake_api_request(method, path, body):
+            sent_bodies.append(dict(body))
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+        adapter._api_request = fake_api_request
+
+        dropped = asyncio.run(adapter.send("u", "final answer that got dropped"))
+        assert not dropped.success
+        assert dropped.error_kind == "rate_limited"
+        assert "u" in adapter._quota_undelivered
+
+        delivered = asyncio.run(adapter.send("u", "next turn's reply"))
+        assert delivered.success
+        merged_content = sent_bodies[-1]["content"]
+        assert "final answer that got dropped" in merged_content
+        assert "next turn's reply" in merged_content
+        # Consumed — a third, unrelated send must not repeat stale content.
+        assert "u" not in adapter._quota_undelivered
+
+    def test_stale_carried_content_is_discarded_not_reattached(self):
+        """Content dropped hours ago should not get glued onto a reply in an
+        unrelated, much later conversation turn."""
+        adapter = self._make_adapter()
+        adapter._quota_undelivered["u"] = (
+            "ancient dropped answer",
+            time.time() - (adapter._UNDELIVERED_CARRY_SECONDS + 60),
+        )
+
+        merged = adapter._prepend_undelivered("u", "fresh reply")
+
+        assert merged == "fresh reply"
+        assert "ancient dropped answer" not in merged
+
+    def test_repeated_quota_failure_keeps_carrying_merged_content(self):
+        """If the carried-forward retry also gets quota-rejected, the merged
+        text must be re-stashed rather than dropped a second time."""
+        adapter = self._make_adapter()
+        adapter._quota_undelivered["u"] = ("first dropped answer", time.time())
+
+        async def always_quota_exhausted(method, path, body):
+            raise RuntimeError(
+                "QQ Bot API error [400] /v2/users/u/messages: "
+                "40034122 召回消息已达区间上限"
+            )
+
+        adapter._api_request = always_quota_exhausted
+
+        result = asyncio.run(adapter.send("u", "second answer"))
+
+        assert not result.success
+        assert result.error_kind == "rate_limited"
+        carried_content, _ = adapter._quota_undelivered["u"]
+        assert "first dropped answer" in carried_content
+        assert "second answer" in carried_content
+
+    def test_non_quota_failure_does_not_consume_carried_content(self):
+        adapter = self._make_adapter()
+        adapter._quota_undelivered["u"] = ("first dropped answer", time.time())
+
+        async def transient_failure(*args, **kwargs):
+            return SendResult(success=False, error="connection reset", retryable=True)
+
+        adapter._send_chunk = transient_failure
+
+        result = asyncio.run(adapter.send("u", "second answer"))
+
+        assert not result.success
+        carried_content, _ = adapter._quota_undelivered["u"]
+        assert carried_content == "first dropped answer"
+
+    def test_partial_multi_chunk_send_stashes_only_undelivered_tail(self):
+        adapter = self._make_adapter()
+        adapter.MAX_MESSAGE_LENGTH = 80
+        sent_chunks = []
+
+        async def fail_second_chunk(chat_id, chunk, reply_to=None):
+            sent_chunks.append(chunk)
+            if len(sent_chunks) == 1:
+                return SendResult(success=True, message_id="sent-1")
+            return SendResult(
+                success=False,
+                error="40034128 passive reply quota exceeded",
+                retryable=False,
+                error_kind="rate_limited",
+            )
+
+        adapter._send_chunk = fail_second_chunk
+        content = "FIRST-PART " + ("x" * 80) + " UNDELIVERED-TAIL"
+
+        result = asyncio.run(adapter.send("u", content))
+
+        assert not result.success
+        carried_content, _ = adapter._quota_undelivered["u"]
+        assert "UNDELIVERED-TAIL" in carried_content
+        assert "FIRST-PART" not in carried_content
 
 
 # ---------------------------------------------------------------------------
