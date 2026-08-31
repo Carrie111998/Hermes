@@ -497,6 +497,59 @@ export function useSlashCommand(deps: SlashCommandDeps) {
         branch: async () => {
           await branchCurrentSession()
         },
+        // /btw answers a side question from a snapshot of the LIVE
+        // conversation via the gateway's prompt.btw RPC — the TUI's path
+        // (ui-tui/src/app/slash/commands/session.ts). It must NOT go through
+        // runExec: the slash worker's HermesCLI prints the answer from a
+        // fire-and-forget thread after process_command already returned,
+        // past the worker's stdout capture window, so the answer never
+        // reached the desktop conversation (#99065) — only the synchronous
+        // "Side question: …" acknowledgement rendered. The RPC replies
+        // immediately with the task id; the answer itself arrives later as a
+        // btw.complete gateway event, which the gateway-event dispatcher
+        // appends to this session.
+        btw: async ctx => {
+          const question = ctx.arg.trim()
+
+          const resolved = await withSlashOutput(ctx)
+
+          if (!resolved) {
+            return
+          }
+
+          const { render: renderSlashOutput, sessionId } = resolved
+
+          if (!question) {
+            renderSlashOutput(
+              'Usage: /btw <question> — answered from a snapshot of this conversation without interrupting it.'
+            )
+
+            return
+          }
+
+          try {
+            const result = await requestGateway<{ task_id?: string }>('prompt.btw', {
+              session_id: sessionId,
+              text: question
+            })
+
+            renderSlashOutput(
+              result.task_id
+                ? `💬 Side question (${result.task_id}) — answering from a conversation snapshot; the answer will appear here.`
+                : '💬 Side question — answering from a conversation snapshot; the answer will appear here.'
+            )
+          } catch (err) {
+            // Older gateways without the dedicated RPC still have the
+            // slash-worker route — same compatibility fallback as runRpc.
+            if (isMissingRpcMethod(err)) {
+              await runExec(ctx)
+
+              return
+            }
+
+            renderSlashOutput(`error: ${err instanceof Error ? err.message : String(err)}`)
+          }
+        },
         // /compress (alias /compact) runs the gateway's dedicated
         // session.compress RPC — the TUI's path
         // (ui-tui/src/app/slash/commands/session.ts). It must NOT go through

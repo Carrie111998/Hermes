@@ -55,6 +55,7 @@ export interface DesktopThemeCommandOption {
 export type DesktopActionId =
   | 'branch'
   | 'browser'
+  | 'btw'
   | 'compress'
   | 'handoff'
   | 'hatch'
@@ -238,6 +239,19 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     description: 'Compress this conversation context',
     aliases: ['/compact'],
     surface: action('compress'),
+    argumentMode: 'text'
+  },
+  // /btw must be an action (prompt.btw RPC — the TUI's path), not exec: the
+  // slash worker's HermesCLI prints the side-question answer from a
+  // fire-and-forget thread after process_command already returned, past the
+  // worker's stdout capture window, so Desktop only ever saw the
+  // acknowledgement (#99065). The RPC replies immediately with a task id;
+  // the answer arrives later as a btw.complete gateway event, which the
+  // gateway-event dispatcher appends to this session.
+  {
+    name: '/btw',
+    description: 'Ask a side question about this conversation without interrupting it',
+    surface: action('btw'),
     argumentMode: 'text'
   },
   {

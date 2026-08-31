@@ -41,6 +41,40 @@ export function handleStatusEvent(ctx: GatewayEventContext): boolean {
     return true
   }
 
+  if (event.type === 'btw.complete') {
+    // prompt.btw RPC (the TUI's /btw path) answers a side question from a
+    // snapshot of the live conversation and reports it here; the event
+    // carries the originating session id, so the answer lands in the
+    // conversation that asked. Persistent transcript line (not a toast),
+    // mirroring the TUI's `[btw "question"]` system line — without it the
+    // answer was indistinguishable from a lost command: the slash-worker
+    // route printed it from a fire-and-forget thread after the stdout
+    // capture window closed (#99065).
+    const text = coerceGatewayText(payload?.text).trim()
+
+    if (text && sessionId) {
+      const taskId = String(payload?.task_id ?? '').trim()
+      const question = coerceGatewayText(payload?.question).trim()
+      const header = `[btw${question ? ` "${question}"` : ''}${taskId ? ` (${taskId})` : ''}]`
+
+      flushQueuedDeltas(sessionId)
+      updateSessionState(sessionId, state => ({
+        ...state,
+        messages: [
+          ...state.messages,
+          {
+            id: `btw-complete-${taskId || Date.now()}`,
+            role: 'system',
+            parts: [textPart(`${header}\n${text}`, occurredAt)],
+            timestamp: occurredAt
+          }
+        ]
+      }))
+    }
+
+    return true
+  }
+
   if (event.type === 'review.summary') {
     // Self-improvement background review saved something to memory/skills
     // and emitted a persistent summary (Python formats it as

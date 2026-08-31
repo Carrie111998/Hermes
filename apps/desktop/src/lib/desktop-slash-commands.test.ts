@@ -232,9 +232,11 @@ describe('desktop slash command curation', () => {
   })
 
   it('still routes commands without dedicated RPCs through exec()', () => {
+    // /btw deliberately NOT here — it has the dedicated prompt.btw RPC since
+    // #99065 (the slash worker's side-question answer print lands after the
+    // capture window closes, so the answer never reached the desktop).
     const execNames = [
       '/bg',
-      '/btw',
       '/debug',
       '/goal',
       '/personality',
@@ -249,6 +251,13 @@ describe('desktop slash command curation', () => {
     for (const name of execNames) {
       expect(resolveDesktopCommand(name)?.surface).toEqual({ kind: 'exec' })
     }
+  })
+
+  it('routes /btw to the prompt.btw side-question action', () => {
+    expect(resolveDesktopCommand('/btw')?.surface).toEqual({ kind: 'action', action: 'btw' })
+    expect(isDesktopSlashCommand('/btw')).toBe(true)
+    expect(isDesktopSlashSuggestion('/btw')).toBe(true)
+    expect(desktopSlashUnavailableMessage('/btw')).toBeNull()
   })
 
   it('distinguishes free prose from finite slash option lists', () => {
