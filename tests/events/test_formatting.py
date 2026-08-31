@@ -365,6 +365,16 @@ def test_format_whatsapp_message_has_no_separator():
     assert "You have an offer from Acme" in msg
 
 
+def test_format_whatsapp_header_for_followup_due_uses_plain_title():
+    event = _make_event(EventType.FOLLOWUP_DUE, source="tracker")
+    route = classify(event)
+
+    header = format_whatsapp_header(event, verdict=route.verdict)
+
+    assert "FOLLOW-UP DUE" in header
+    assert "FOLLOWUP_DUE" not in header
+
+
 def test_watchdog_burst_renders_with_burst_icon():
     """WATCHDOG_BURST gets a distinct icon (🌊) so operators can scan for it."""
     e = Event.create(
