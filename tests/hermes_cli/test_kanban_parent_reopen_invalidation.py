@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_containment as kc
 
 
 @pytest.fixture
@@ -132,6 +133,74 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     assert run is not None and run.outcome == "reclaimed"
 
 
+def test_contained_descendants_are_all_reserved_and_certified_before_invalidation(
+    conn, monkeypatch,
+):
+    parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
+    assert kb.complete_task(conn, parent_id)
+    children = []
+    for index in range(2):
+        child_id = kb.create_task(
+            conn,
+            title=f"contained child {index}",
+            assignee="builder",
+            parents=[parent_id],
+        )
+        claimed = kb.claim_task(conn, child_id, claimer=f"host:owner:{index}")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert claimed.claim_lock is not None
+        run_id = int(claimed.current_run_id)
+        kb._register_worker_containment(
+            conn,
+            child_id,
+            run_id=run_id,
+            claim_lock=claimed.claim_lock,
+            worker_pid=700000 + index,
+            cgroup_path=f"/sys/fs/cgroup/descendant-{index}",
+            cgroup_inode=800000 + index,
+        )
+        children.append((child_id, run_id))
+
+    legacy_kills = []
+
+    def fake_kill(path, inode):
+        reserved = conn.execute(
+            "SELECT COUNT(*) AS n FROM worker_containments "
+            "WHERE task_id IN (?, ?) AND retirement_reason = 'ancestor_reopened'",
+            (children[0][0], children[1][0]),
+        ).fetchone()
+        assert reserved["n"] == 2
+        assert path.startswith("/sys/fs/cgroup/descendant-")
+        assert inode in {800000, 800001}
+        return {"containment_certified": True, "terminated": True}
+
+    monkeypatch.setattr(kc, "kill_cgroup", fake_kill)
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *args, **kwargs: legacy_kills.append(args),
+    )
+
+    _reopen_parent_directly(conn, parent_id)
+    result = kb.invalidate_descendants_for_parent_reopen(
+        conn, parent_id, author="operator",
+    )
+
+    assert {entry["id"] for entry in result["invalidated"]} == {
+        child_id for child_id, _ in children
+    }
+    assert legacy_kills == []
+    for child_id, run_id in children:
+        child = kb.get_task(conn, child_id)
+        assert child is not None and child.status == "todo"
+        row = conn.execute(
+            "SELECT termination_certified_at FROM worker_containments "
+            "WHERE task_id = ? AND run_id = ?",
+            (child_id, run_id),
+        ).fetchone()
+        assert row["termination_certified_at"] is not None
+
+
 def test_counter_reset_on_invalidated_descendants(conn):
     parent_id, child_id = _done_parent_with_done_child(conn)
     with kb.write_txn(conn):
@@ -228,3 +297,78 @@ def test_dashboard_and_db_paths_produce_identical_outcomes(tmp_path, monkeypatch
         assert failures == 0
         assert "descendant_invalidated" in kinds
         assert n_comments >= 1
+
+
+def test_partial_descendant_retirement_converges_without_reopening_parent(
+    monkeypatch,
+    tmp_path,
+):
+    conn = kb.connect(tmp_path / "kanban.db")
+    try:
+        parent = kb.create_task(conn, title="parent", assignee="planner")
+        assert kb.complete_task(conn, parent)
+        children = []
+        for index in range(2):
+            child = kb.create_task(
+                conn,
+                title=f"child {index}",
+                assignee="builder",
+                parents=[parent],
+            )
+            claimed = kb.claim_task(conn, child, claimer=f"host:child-{index}")
+            assert claimed is not None and claimed.current_run_id is not None
+            assert claimed.claim_lock is not None
+            kb._register_worker_containment(
+                conn,
+                child,
+                run_id=claimed.current_run_id,
+                claim_lock=claimed.claim_lock,
+                worker_pid=7200 + index,
+                cgroup_path=f"/sys/fs/cgroup/hermes-child-partial-{index}",
+                cgroup_inode=9200 + index,
+            )
+            children.append((child, int(claimed.current_run_id)))
+
+        calls = 0
+
+        def partial_kill(_path, _inode):
+            nonlocal calls
+            calls += 1
+            return {
+                "terminated": calls == 1,
+                "containment_certified": calls == 1,
+            }
+
+        monkeypatch.setattr(kc, "kill_cgroup", partial_kill)
+        with pytest.raises(kc.ContainmentError):
+            kb.invalidate_descendants_for_parent_reopen(conn, parent, author="op")
+
+        parent_task = kb.get_task(conn, parent)
+        assert parent_task is not None and parent_task.status == "done"
+        rows = conn.execute(
+            "SELECT retirement_started_at FROM worker_containments ORDER BY run_id"
+        ).fetchall()
+        assert len(rows) == 2
+        assert all(row["retirement_started_at"] is not None for row in rows)
+
+        monkeypatch.setattr(
+            kc,
+            "kill_cgroup",
+            lambda *_args: {"terminated": True, "containment_certified": True},
+        )
+        monkeypatch.setattr(kc, "cgroup_absent", lambda _path: False)
+        monkeypatch.setattr(kc, "cleanup_cgroup", lambda *_args: True)
+        assert kb.cleanup_inactive_worker_containments(conn) == 2
+        parent_task = kb.get_task(conn, parent)
+        assert parent_task is not None and parent_task.status == "done"
+        for child, run_id in children:
+            current = kb.get_task(conn, child)
+            assert current is not None and current.status == "ready"
+            run = conn.execute(
+                "SELECT ended_at, outcome FROM task_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            assert run["ended_at"] is not None
+            assert run["outcome"] == "reclaimed"
+    finally:
+        conn.close()

@@ -29,6 +29,7 @@ if str(_WORKTREE) not in sys.path:
     sys.path.insert(0, str(_WORKTREE))
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_containment as kc
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +286,59 @@ class TestWorkerSpawnEnv:
         assert env["HERMES_KANBAN_DB"] == str(expected_db)
         expected_ws = fresh_home / "kanban" / "boards" / "spawntest" / "workspaces"
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
+
+    def test_default_spawn_uses_durable_cgroup_gate_when_enabled(
+        self, fresh_home, monkeypatch
+    ):
+        captured = {}
+
+        class FakeHandle:
+            pid = 515151
+            cgroup_path = "/run/a3d/docker.scope/hermes-kanban-r73-deadbeefdeadbeefdeadbeef"
+            cgroup_inode = 7373
+
+        def fake_spawn_gated(
+            command, *, task_id, run_id, claim_lock, popen_kwargs
+        ):
+            captured["command"] = command
+            captured["task_id"] = task_id
+            captured["run_id"] = run_id
+            captured["claim_lock"] = claim_lock
+            captured["kwargs"] = popen_kwargs
+            return FakeHandle()
+
+        monkeypatch.setattr(kc, "enabled", lambda: True)
+        monkeypatch.setattr(kc, "spawn_gated", fake_spawn_gated)
+        kb.create_board("contained")
+        task = kb.Task(
+            id="t_contained",
+            title="contained worker",
+            body=None,
+            assignee="teknium",
+            status="running",
+            priority=0,
+            created_by="user",
+            created_at=0,
+            started_at=1,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock="host:claim",
+            claim_expires=999,
+            tenant=None,
+            current_run_id=73,
+        )
+
+        result = kb._default_spawn(
+            task, str(fresh_home / "ws"), board="contained"
+        )
+
+        assert result.__class__ is FakeHandle
+        assert captured["task_id"] == "t_contained"
+        assert captured["run_id"] == 73
+        assert captured["claim_lock"] == "host:claim"
+        assert captured["kwargs"]["env"]["HERMES_KANBAN_RUN_ID"] == "73"
+        assert captured["command"][-3:] == ["chat", "-q", "work kanban task t_contained"]
 
 
 # ---------------------------------------------------------------------------

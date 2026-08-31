@@ -51,6 +51,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_containment import ContainmentError
 
 log = logging.getLogger(__name__)
 
@@ -896,6 +897,12 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         # --- status -------------------------------------------------------
         if payload.status is not None:
             s = payload.status
+            if s != "running":
+                _ensure_contained_worker_retired(
+                    conn,
+                    task_id,
+                    reason=f"dashboard_status_{s}",
+                )
             ok = True
             if s == "done":
                 ok = kanban_db.complete_task(
@@ -1057,6 +1064,97 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
 
 # ---------------------------------------------------------------------------
+# Durable dashboard lifecycle custody
+# ---------------------------------------------------------------------------
+
+def _ensure_contained_worker_retired(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    require_cleanup: bool = False,
+) -> None:
+    """Retire an exact contained run before a dashboard lifecycle mutation.
+
+    Legacy tasks have no containment row and retain their existing dashboard
+    behavior.  Once a durable containment exists, however, PID/claim hints are
+    no longer authority: delegate the reserve -> kill -> certify -> semantic
+    reclaim protocol to :func:`kanban_db.reclaim_task`.  A failed certificate
+    leaves the task/run ownership untouched and fails the request closed.
+
+    Hard deletion additionally requires physical cleanup and durable
+    ``cleaned_at`` readback because the task row is the containment's audit
+    owner and must not disappear while cgroup retirement is incomplete.
+    """
+    task = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        return
+
+    rows = conn.execute(
+        "SELECT * FROM worker_containments "
+        "WHERE task_id = ? AND cleaned_at IS NULL ORDER BY run_id",
+        (task_id,),
+    ).fetchall()
+    if not rows:
+        return
+
+    current_run_id = (
+        int(task["current_run_id"])
+        if task["current_run_id"] is not None
+        else None
+    )
+    active = next(
+        (row for row in rows if int(row["run_id"]) == current_run_id),
+        None,
+    )
+    if active is not None and active["termination_certified_at"] is None:
+        if task["status"] != "running" or not kanban_db.reclaim_task(
+            conn, task_id, reason=reason,
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="worker containment retirement could not be certified",
+            )
+
+    rows = conn.execute(
+        "SELECT * FROM worker_containments "
+        "WHERE task_id = ? AND cleaned_at IS NULL ORDER BY run_id",
+        (task_id,),
+    ).fetchall()
+    if any(row["termination_certified_at"] is None for row in rows):
+        # An older, already-inactive containment cannot be reclaimed through
+        # the active-task primitive.  Let the durable sweeper certify/clean it
+        # and verify the exact task-scoped evidence before proceeding.
+        kanban_db.cleanup_inactive_worker_containments(conn)
+        rows = conn.execute(
+            "SELECT * FROM worker_containments "
+            "WHERE task_id = ? AND cleaned_at IS NULL ORDER BY run_id",
+            (task_id,),
+        ).fetchall()
+        if any(row["termination_certified_at"] is None for row in rows):
+            raise HTTPException(
+                status_code=409,
+                detail="worker containment retirement could not be certified",
+            )
+
+    if require_cleanup and rows:
+        kanban_db.cleanup_inactive_worker_containments(conn)
+        pending = conn.execute(
+            "SELECT 1 FROM worker_containments "
+            "WHERE task_id = ? AND cleaned_at IS NULL LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if pending is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="worker containment cleanup is not durable",
+            )
+
+
+# ---------------------------------------------------------------------------
 # DELETE /tasks/:id
 # ---------------------------------------------------------------------------
 
@@ -1065,6 +1163,12 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        _ensure_contained_worker_retired(
+            conn,
+            task_id,
+            reason="dashboard_delete",
+            require_cleanup=True,
+        )
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1131,6 +1235,26 @@ def _set_status_direct(
     orphaned. ``running -> ready`` via drag-drop is the common case
     (user yanking a stuck worker back to the queue).
     """
+    preflight = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if (
+        preflight is not None
+        and preflight["status"] in {"done", "archived"}
+        and new_status not in {"done", "archived"}
+    ):
+        try:
+            kanban_db.prepare_descendant_containment_retirement(conn, task_id)
+        except ContainmentError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="descendant containment retirement could not be certified",
+            ) from exc
+    _ensure_contained_worker_retired(
+        conn,
+        task_id,
+        reason=f"dashboard_status_{new_status}",
+    )
     terminations: list[tuple[Optional[int], Optional[str]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
@@ -1337,10 +1461,23 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     results.append(entry)
                     continue
                 if payload.archive:
+                    _ensure_contained_worker_retired(
+                        conn,
+                        tid,
+                        reason="dashboard_bulk_archive",
+                    )
                     if not kanban_db.archive_task(conn, tid):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status
+                    if s in {
+                        "done", "blocked", "review", "ready", "scheduled", "todo", "triage"
+                    }:
+                        _ensure_contained_worker_retired(
+                            conn,
+                            tid,
+                            reason=f"dashboard_bulk_status_{s}",
+                        )
                     if s == "done":
                         ok = kanban_db.complete_task(
                             conn, tid,
@@ -1738,7 +1875,13 @@ def terminate_run_endpoint(
                 status_code=409,
                 detail=f"run {run_id} already ended",
             )
-        ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        ok = kanban_db.reclaim_task(
+            conn,
+            r.task_id,
+            reason=payload.reason,
+            expected_run_id=r.id,
+            expected_claim_lock=r.claim_lock,
+        )
         if not ok:
             raise HTTPException(
                 status_code=409,

@@ -96,6 +96,55 @@ def test_dispatch_spawn_fires_worker_spawned(
     assert "board" in kw
     assert pid_at_fire_time == [4242]
 
+
+def test_dispatch_preserves_contained_handle_until_durable_registration(
+    kanban_home, all_assignees_spawnable, captured_hooks,
+):
+    handles = []
+
+    class FakeSpawn:
+        cgroup_path = "/sys/fs/cgroup/hermes-worker-dispatch"
+        cgroup_inode = 15151
+        pid = 939393
+        released = False
+        aborted = False
+
+        def __init__(self, task):
+            self.task_id = task.id
+            self.run_id = task.current_run_id
+            self.claim_lock = task.claim_lock
+
+        def release(self):
+            self.released = True
+
+        def abort(self):
+            self.aborted = True
+
+    def _spawn(task, *_args, **_kwargs):
+        handle = FakeSpawn(task)
+        handles.append(handle)
+        return handle
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="contained dispatch", assignee="alice")
+        result = kb.dispatch_once(conn, spawn_fn=_spawn)
+        assert any(row[0] == task_id for row in result.spawned)
+        row = conn.execute(
+            "SELECT worker_pid, run_id FROM worker_containments WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        assert row is not None and row["worker_pid"] == FakeSpawn.pid
+    finally:
+        conn.close()
+
+    assert len(handles) == 1
+    assert handles[0].released is True
+    assert handles[0].aborted is False
+    fired = [e for e in captured_hooks if e[0] == "on_kanban_worker_spawned"]
+    assert len(fired) == 1
+    assert fired[0][1]["worker_pid"] == FakeSpawn.pid
+
 def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypatch):
     """A dead-PID reclaim fires the exit observer with the exit facts."""
     conn = kb.connect()
