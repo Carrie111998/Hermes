@@ -234,67 +234,73 @@ class _ComponentFilter(logging.Filter):
 
 
 class _SecretRedactionFilter(logging.Filter):
-    """Global secret redaction — 100× stronger than 97217-era formatter-only.
+    """Global secret redaction — truly global (handler-level + factory).
 
-    97217 had no global Filter; redaction was via RedactingFormatter on
-    specific handlers. This Filter is installed on the root logger so *every*
-    record (agent, gateway, gui, cron, tools, third-party) is redacted at
-    record-creation time, not just at format time. It:
+    Why handler-level: a Filter installed only on the root *logger* is
+    NEVER checked for child logger records that propagate to root handlers
+    (Logger.callHandlers traverses ancestor *handlers*, not ancestor logger
+    filters — verified against stdlib). Installing on each *handler* makes
+    the check run for every record via Handler.filter → Handler.handle.
 
-    - Redacts msg, args, exc_info, stack_info via redact_sensitive_text
-    - Handles both %-style and {}-style args, and pre-formatted messages
-    - Uses entropy + known-prefix detection (via redact.py, which covers
-      sk-, Bearer, _SESSION_TOKEN, postgres URLs, query params, etc.)
-    - Is fail-closed: if redaction throws, the record is replaced with
-      [REDACTION_ERROR] rather than leaking raw secrets
-    - Maintains an audit counter (log_secret_redacted_total) for SOC
-    - Respects security.redact_secrets / HERMES_REDACT_SECRETS (default true)
+    Factory covers queue-bypass / early logs / future handlers; handler
+    filter covers propagation, extra, assembled, and makeLogRecord paths.
     """
 
     # Audit counter — not content, just count (for SOC, not for exfil)
     _redacted_total = 0
     _lock = threading.Lock()
 
+    # Standard LogRecord attributes — anything else is caller-supplied `extra`
+    _STANDARD_ATTRS = frozenset(
+        logging.LogRecord("", 0, "", 0, "", (), None).__dict__.keys()
+    ) | {"message", "asctime"}
+
+    @staticmethod
+    def _redact_text(text: str) -> str:
+        from agent.redact import redact_sensitive_text
+
+        return redact_sensitive_text(text)
+
     def filter(self, record: logging.LogRecord) -> bool:
-        # Respect the same toggle as redact.py (import-time snapshot)
         try:
-            from agent.redact import _REDACT_ENABLED, redact_sensitive_text
+            from agent.redact import _REDACT_ENABLED
 
             if not _REDACT_ENABLED:
                 return True
         except Exception:
-            # If redact module fails to load, be fail-closed: drop record
-            # rather than leak — but still allow WARNING+ for triage
             return record.levelno >= logging.WARNING
 
         try:
-            # Quick pre-check: does the record contain anything that *might*
-            # be a secret? Avoids calling the regex engine on every debug line.
-            # redact_sensitive_text is cheap when no pattern matches, but this
-            # saves even that cost for the common case.
-            text_to_check = ""
-            if isinstance(record.msg, str):
-                text_to_check = record.msg
-            elif record.msg:
-                text_to_check = str(record.msg)
-            # Also check args if they are strings
-            if record.args:
-                if isinstance(record.args, dict):
-                    text_to_check += " " + " ".join(str(v) for v in record.args.values())
-                elif isinstance(record.args, tuple):
-                    text_to_check += " " + " ".join(str(v) for v in record.args if isinstance(v, str))
-                else:
-                    text_to_check += " " + str(record.args)
+            from agent.redact import redact_sensitive_text
 
-            # Redact msg
-            orig_msg = record.msg
-            if isinstance(record.msg, str):
-                redacted = redact_sensitive_text(record.msg)
-                if redacted != record.msg:
-                    with self._lock:
-                        type(self)._redacted_total += 1
-                    record.msg = redacted
-            # Redact args (may be tuple of strings for %-formatting)
+            redacted_any = False
+
+            def _bump():
+                with self._lock:
+                    type(self)._redacted_total += 1
+
+            # 1) msg — including non-string/custom objects
+            if record.msg is not None:
+                if isinstance(record.msg, str):
+                    red = redact_sensitive_text(record.msg)
+                    if red != record.msg:
+                        record.msg = red
+                        _bump()
+                        redacted_any = True
+                else:
+                    # Custom objects control their own __str__; redact that
+                    # rendering without assuming it is safe.
+                    try:
+                        s = str(record.msg)
+                        red = redact_sensitive_text(s)
+                        if red != s:
+                            record.msg = red
+                            _bump()
+                            redacted_any = True
+                    except Exception:
+                        pass
+
+            # 2) args — tuple / dict, string values only (preserve types)
             if record.args:
                 if isinstance(record.args, tuple):
                     new_args = []
@@ -303,16 +309,28 @@ class _SecretRedactionFilter(logging.Filter):
                         if isinstance(arg, str):
                             red = redact_sensitive_text(arg)
                             if red != arg:
-                                with self._lock:
-                                    type(self)._redacted_total += 1
+                                _bump()
                                 changed = True
                                 new_args.append(red)
                             else:
                                 new_args.append(arg)
                         else:
-                            new_args.append(arg)
+                            # Nested structures inside args (e.g. dataclass) — stringify
+                            # only if the string rendering contains a secret
+                            try:
+                                s = str(arg)
+                                if redact_sensitive_text(s) != s:
+                                    _bump()
+                                    changed = True
+                                    # keep original type but ensure logging won't leak via %s
+                                    new_args.append(redact_sensitive_text(s))
+                                else:
+                                    new_args.append(arg)
+                            except Exception:
+                                new_args.append(arg)
                     if changed:
                         record.args = tuple(new_args)
+                        redacted_any = True
                 elif isinstance(record.args, dict):
                     new_args = {}
                     changed = False
@@ -320,44 +338,104 @@ class _SecretRedactionFilter(logging.Filter):
                         if isinstance(v, str):
                             red = redact_sensitive_text(v)
                             if red != v:
-                                with self._lock:
-                                    type(self)._redacted_total += 1
+                                _bump()
                                 changed = True
                                 new_args[k] = red
                             else:
                                 new_args[k] = v
                         else:
-                            new_args[k] = v
+                            try:
+                                s = str(v)
+                                if redact_sensitive_text(s) != s:
+                                    _bump()
+                                    changed = True
+                                    new_args[k] = redact_sensitive_text(s)
+                                else:
+                                    new_args[k] = v
+                            except Exception:
+                                new_args[k] = v
                     if changed:
                         record.args = new_args
+                        redacted_any = True
 
-            # Redact exc_info if present (exception text may contain secrets)
+            # 3) assembled message — catches token formed only after % formatting
+            # e.g. msg="token sk-%s" args=("a"*32,) → assembled "token sk-aaa..."
+            try:
+                assembled = record.getMessage()
+                red_assembled = redact_sensitive_text(assembled)
+                if red_assembled != assembled:
+                    # Replace components with redacted assembled to avoid re-leak via formatter
+                    record.msg = red_assembled
+                    record.args = ()
+                    _bump()
+                    redacted_any = True
+            except Exception:
+                pass
+
+            # 4) exc_info — value, traceback text, and chained causes
             if record.exc_info and record.exc_info[1] is not None:
                 try:
-                    exc_str = str(record.exc_info[1])
+                    exc_val = record.exc_info[1]
+                    exc_str = str(exc_val)
                     red_exc = redact_sensitive_text(exc_str)
                     if red_exc != exc_str:
-                        with self._lock:
-                            type(self)._redacted_total += 1
-                        # Replace the exception instance's args if possible
+                        _bump()
                         try:
-                            record.exc_info[1].args = (red_exc,)  # type: ignore
+                            # mutate args if possible
+                            if hasattr(exc_val, "args") and exc_val.args:
+                                # keep exc type, redact first arg string
+                                if isinstance(exc_val.args[0], str):
+                                    exc_val.args = (red_exc,) + exc_val.args[1:]  # type: ignore
                         except Exception:
                             pass
+                    # Also redact the formatted traceback skeleton (file lines don't leak, but exc message does)
+                    # Store redacted exc_text for formatters that use it
+                    try:
+                        import traceback as _tb
+
+                        exc_text = "".join(_tb.format_exception(*record.exc_info))
+                        red_exc_text = redact_sensitive_text(exc_text)
+                        if red_exc_text != exc_text:
+                            record.exc_text = red_exc_text  # type: ignore[attr-defined]
+                            _bump()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
-            # Redact stack_info if present
+            # 5) stack_info
             if record.stack_info and isinstance(record.stack_info, str):
                 red_stack = redact_sensitive_text(record.stack_info)
                 if red_stack != record.stack_info:
-                    with self._lock:
-                        type(self)._redacted_total += 1
                     record.stack_info = red_stack
+                    _bump()
+
+            # 6) extra fields — merged into record.__dict__ after factory by Logger.makeRecord
+            # Any caller-supplied `extra={'token': 'sk-...'}` ends up here
+            for k, v in list(record.__dict__.items()):
+                if k in self._STANDARD_ATTRS:
+                    continue
+                if isinstance(v, str):
+                    red = redact_sensitive_text(v)
+                    if red != v:
+                        setattr(record, k, red)
+                        _bump()
+                        redacted_any = True
+                elif isinstance(v, (dict, list, tuple)):
+                    # shallow redact string members of extra structures
+                    try:
+                        s = str(v)
+                        if redact_sensitive_text(s) != s:
+                            setattr(record, k, redact_sensitive_text(s))
+                            _bump()
+                            redacted_any = True
+                    except Exception:
+                        pass
+
+            # 7) logging.makeLogRecord path — dict already redacted via wrapped
+            # function (see below), but handler filter is still the last gate
 
         except Exception:
-            # Fail-closed: if redaction itself errors, do not leak raw record
-            # Replace msg with safe placeholder, keep level for triage
             record.msg = "[REDACTION_ERROR] log record suppressed due to redaction failure"
             record.args = ()
             record.exc_info = None
@@ -457,77 +535,48 @@ def setup_logging(
 
     root = logging.getLogger()
 
-    # 98833 100× stronger: global secret redaction Filter on root logger
-    # (installed before handlers so every record is redacted at creation,
-    # not just at format time — covers gateway, gui, cron, tools, third-party).
-    # Replaces any existing instance on force re-init to avoid duplicates.
+    # 98833 100× stronger: truly global redaction — handler-level Filter +
+    # factory + Formatter defense in depth. Root logger Filter alone is NOT
+    # global (Logger.callHandlers does not re-check ancestor logger filters for
+    # child logger records). Installing on each *handler* via
+    # Handler.filter → handle() makes it fire for gateway/agent/gui/console
+    # regardless of propagation. Factory covers early logs / future handlers /
+    # queue-bypass; Formatter covers final assembled string.
+    #
+    # Ensure any queued handlers that already exist also carry the secret
+    # redaction filter (idempotent).
+    def _ensure_handler_redaction_filter(h: logging.Handler) -> None:
+        for f in list(h.filters):
+            if isinstance(f, _SecretRedactionFilter):
+                return
+        h.addFilter(_SecretRedactionFilter())
+
+    for _h in list(_queued_file_handlers):
+        _ensure_handler_redaction_filter(_h)
+    # Also remove any stale root Filter that previous head installed — it was
+    # ineffective for child loggers and now superseded by handler filters.
     for f in list(root.filters):
         if isinstance(f, _SecretRedactionFilter):
             root.removeFilter(f)
-    root.addFilter(_SecretRedactionFilter())
 
-    # 98833 100× stronger: install redacting LogRecord factory for queue-bypass
-    # coverage. _SecretRedactionFilter on root is checked in Logger.callHandlers,
-    # but _NonFormattingQueueHandler enqueues before handler filters — the factory
-    # guarantees redaction even for early logs before setup_logging, console
-    # handlers without RedactingFormatter, and any future handler.
+    # 98833 100× stronger: install redacting LogRecord factory + makeLogRecord
+    # wrap. Factory covers queue-bypass, early logs, and any handler without
+    # RedactingFormatter. makeLogRecord wrap covers dict-reconstructed records
+    # (logging.makeLogRecord) where Logger.makeRecord's extra-merge happens after
+    # the factory.
     global _redacting_factory_installed, _original_log_record_factory
+    _original_make_log_record = getattr(logging, "makeLogRecord", None)
     try:
         if not _redacting_factory_installed:
             _original_log_record_factory = logging.getLogRecordFactory()
 
             def _redacting_log_record_factory(*args, **kwargs):
                 record = _original_log_record_factory(*args, **kwargs)
+                # Reuse handler filter's redaction logic so factory and handler
+                # stay in sync — instantiate a temporary filter and run it.
                 try:
-                    from agent.redact import _REDACT_ENABLED, redact_sensitive_text
-
-                    if not _REDACT_ENABLED:
-                        return record
-                    # Redact msg
-                    if isinstance(record.msg, str):
-                        red = redact_sensitive_text(record.msg)
-                        if red != record.msg:
-                            with _SecretRedactionFilter._lock:
-                                _SecretRedactionFilter._redacted_total += 1
-                            record.msg = red
-                    # Redact args
-                    if record.args:
-                        if isinstance(record.args, tuple):
-                            new_args = []
-                            changed = False
-                            for a in record.args:
-                                if isinstance(a, str):
-                                    red = redact_sensitive_text(a)
-                                    if red != a:
-                                        with _SecretRedactionFilter._lock:
-                                            _SecretRedactionFilter._redacted_total += 1
-                                        changed = True
-                                        new_args.append(red)
-                                    else:
-                                        new_args.append(a)
-                                else:
-                                    new_args.append(a)
-                            if changed:
-                                record.args = tuple(new_args)
-                        elif isinstance(record.args, dict):
-                            new_args = {}
-                            changed = False
-                            for k, v in record.args.items():
-                                if isinstance(v, str):
-                                    red = redact_sensitive_text(v)
-                                    if red != v:
-                                        with _SecretRedactionFilter._lock:
-                                            _SecretRedactionFilter._redacted_total += 1
-                                        changed = True
-                                        new_args[k] = red
-                                    else:
-                                        new_args[k] = v
-                                else:
-                                    new_args[k] = v
-                            if changed:
-                                record.args = new_args
+                    _SecretRedactionFilter().filter(record)
                 except Exception:
-                    # Fail-closed: suppress record content on factory error
                     try:
                         record.msg = "[REDACTION_ERROR]"
                         record.args = ()
@@ -538,6 +587,24 @@ def setup_logging(
                 return record
 
             logging.setLogRecordFactory(_redacting_log_record_factory)
+
+            # Wrap makeLogRecord (dict → LogRecord) to also redact extra etc.
+            if _original_make_log_record is not None and not getattr(
+                _original_make_log_record, "_hermes_redacting_wrapped", False
+            ):
+                _orig = _original_make_log_record
+
+                def _redacting_make_log_record(dict):  # type: ignore
+                    rec = _orig(dict)
+                    try:
+                        _SecretRedactionFilter().filter(rec)
+                    except Exception:
+                        pass
+                    return rec
+
+                _redacting_make_log_record._hermes_redacting_wrapped = True  # type: ignore
+                logging.makeLogRecord = _redacting_make_log_record  # type: ignore
+
             _redacting_factory_installed = True
     except Exception:
         pass
@@ -619,6 +686,7 @@ def setup_verbose_logging() -> None:
     handler = logging.StreamHandler(_safe_stderr())
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(RedactingFormatter(_LOG_FORMAT_VERBOSE, datefmt="%H:%M:%S"))
+    handler.addFilter(_SecretRedactionFilter())
     handler._hermes_verbose = True  # type: ignore[attr-defined]
     root.addHandler(handler)
 
@@ -978,6 +1046,9 @@ def _add_rotating_handler(
     )
     handler.setLevel(level)
     handler.setFormatter(formatter)
+    # Truly global secret redaction — must be on handler, not root logger
+    # (root logger Filter is never checked for child logger records).
+    handler.addFilter(_SecretRedactionFilter())
     if log_filter is not None:
         handler.addFilter(log_filter)
     # Route through the async queue instead of ``logger.addHandler(handler)`` so
