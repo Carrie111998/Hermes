@@ -255,6 +255,104 @@ def test_cmd_update_captures_and_propagates_pre_rebuild_snapshot(
     ]
 
 
+def test_cmd_update_restores_snapshots_after_healthy_runtime_repair(
+    tmp_path, monkeypatch
+):
+    """A healthy replacement venv still needs its optional deps restored."""
+    from hermes_cli import managed_uv, update_cmd
+
+    (tmp_path / ".git").mkdir()
+    snapshot = ["platform.telegram"]
+    tool_snapshot = ["langfuse"]
+    refresh_calls = []
+    restore_calls = []
+
+    class RestoreReached(Exception):
+        pass
+
+    def fake_run(cmd, **kwargs):
+        if "rev-parse" in cmd:
+            return SimpleNamespace(returncode=0, stdout="main\n", stderr="")
+        if "rev-list" in cmd:
+            return SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_refresh(prefix, *, env=None, features=None):
+        refresh_calls.append((prefix, env, features))
+        return True
+
+    def fake_restore(dependencies, prefix, *, env=None):
+        restore_calls.append((dependencies, prefix, env))
+        raise RestoreReached
+
+    def fake_update_managed_uv(*, repair_observer=None, **kwargs):
+        if repair_observer is not None:
+            repair_observer(managed_uv.RuntimeRepairResult("repaired"))
+        return "uv"
+
+    monkeypatch.setattr(m, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(m, "_capture_active_lazy_features", lambda: snapshot.copy())
+    monkeypatch.setattr(
+        m, "_capture_active_tool_dependencies", lambda: tool_snapshot.copy()
+    )
+    monkeypatch.setattr(m, "_is_windows", lambda: False)
+    monkeypatch.setattr(m, "_run_pre_update_backup", lambda args: None)
+    monkeypatch.setattr(m, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(m, "_resume_windows_gateways_after_update", lambda state: None)
+    monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *args: None)
+    monkeypatch.setattr(
+        m,
+        "_get_origin_url",
+        lambda *args: "https://github.com/NousResearch/hermes-agent.git",
+    )
+    monkeypatch.setattr(m, "_resolve_update_branch", lambda args: "main")
+    monkeypatch.setattr(m, "_stash_local_changes_if_needed", lambda *args: None)
+    monkeypatch.setattr(update_cmd, "_invalidate_update_cache", lambda: None)
+    monkeypatch.setattr(
+        update_cmd, "_venv_core_imports_healthy", lambda: (True, "")
+    )
+    monkeypatch.setattr(update_cmd, "_write_update_incomplete_marker", lambda: None)
+    monkeypatch.setattr(
+        m,
+        "_abort_dependency_sync_if_self_locked",
+        lambda *args, **kwargs: pytest.fail(
+            "runtime-only restoration must not hand off after venv cutover"
+        ),
+    )
+    monkeypatch.setattr(
+        m,
+        "_install_python_dependencies_with_optional_fallback",
+        lambda *args, **kwargs: pytest.fail(
+            "a healthy replacement must not reinstall core dependencies"
+        ),
+    )
+    monkeypatch.setattr(m, "_refresh_active_lazy_features", fake_refresh)
+    monkeypatch.setattr(m, "_restore_active_tool_dependencies", fake_restore)
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(managed_uv, "update_managed_uv", fake_update_managed_uv)
+    monkeypatch.setattr(managed_uv, "ensure_uv", lambda **kwargs: "uv")
+
+    args = SimpleNamespace(
+        yes=True,
+        force=False,
+        force_venv=False,
+        no_backup=True,
+        backup=False,
+        branch=None,
+    )
+    with pytest.raises(RestoreReached):
+        m._cmd_update_impl(args, gateway_mode=False)
+
+    from hermes_cli.managed_uv import managed_python_env
+
+    expected_env = managed_python_env()
+    expected_env["VIRTUAL_ENV"] = str(tmp_path / "venv")
+    assert refresh_calls == [(["uv", "pip"], expected_env, snapshot)]
+    assert restore_calls == [
+        (tool_snapshot, ["uv", "pip"], expected_env)
+    ]
+
+
 
 
 
