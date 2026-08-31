@@ -9,6 +9,7 @@ import { desktopDefaultCwd } from '@/lib/desktop-fs'
 import { decideLivenessForceClose, LIVENESS_REPROBE_DELAY_MS } from '@/lib/gateway-liveness-policy'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { BACKEND_BOOT_WAIT_TIMEOUT_MS, RECONNECT_ATTEMPT_TIMEOUT_MS, withTimeout } from '@/lib/with-timeout'
+import { collectKeptProfileKeys } from '@/store/backend-usage'
 import {
   $desktopBoot,
   applyDesktopBootProgress,
@@ -27,6 +28,7 @@ import {
   disposeSecondariesForConnection,
   ensureGatewayForProfile,
   gatewayActivationEpoch,
+  getPrimaryProfileKey,
   isActivePrimary,
   liveSecondaryConnectionIds,
   pruneSecondaryGateways,
@@ -298,7 +300,7 @@ export function useGatewayBoot({
     }
 
     const attemptReconnect = async () => {
-      if (cancelled || reconnecting || gatewayOpen() || $gatewaySwitching.get()) {
+      if (cancelled || reconnecting || gatewayOpen() || $gatewaySwitching.get() || !isActivePrimary()) {
         return
       }
 
@@ -318,6 +320,10 @@ export function useGatewayBoot({
           'Timed out revalidating the gateway connection'
         ).catch(() => undefined)
 
+        if (cancelled || !isActivePrimary()) {
+          return
+        }
+
         // Primary sleep/wake reconnect must dial the WINDOW-owned primary backend
         // (same as boot/softSwitch). Passing $activeGatewayProfile would retarget
         // this primary socket at a secondary profile's backend after a live swap.
@@ -330,7 +336,7 @@ export function useGatewayBoot({
 
         setPrimaryGatewayConnection(conn)
 
-        if (cancelled) {
+        if (cancelled || !isActivePrimary()) {
           return
         }
 
@@ -357,7 +363,7 @@ export function useGatewayBoot({
 
         await gateway.connect(wsUrl)
 
-        if (cancelled) {
+        if (cancelled || !isActivePrimary()) {
           return
         }
 
@@ -391,7 +397,7 @@ export function useGatewayBoot({
         // against a ticket that can never succeed. Transport failures fall
         // through to the backoff in the finally block below — they must NOT
         // take the full-screen "couldn't start" path (locks reading/drafting).
-        if (!cancelled && isGatewayReauthRequired(err) && !reauthNotified) {
+        if (!cancelled && isActivePrimary() && isGatewayReauthRequired(err) && !reauthNotified) {
           reauthNotified = true
           const message = err instanceof Error ? err.message : String(err)
           failDesktopBoot(message)
@@ -400,7 +406,7 @@ export function useGatewayBoot({
       } finally {
         reconnecting = false
 
-        if (!cancelled && !gatewayOpen() && !$gatewaySwitching.get()) {
+        if (!cancelled && !gatewayOpen() && !$gatewaySwitching.get() && isActivePrimary()) {
           if (reconnectFailingSince === null) {
             reconnectFailingSince = Date.now()
           }
@@ -423,7 +429,14 @@ export function useGatewayBoot({
     }
 
     function scheduleReconnect() {
-      if (cancelled || reconnecting || reconnectTimer !== null || gatewayOpen() || $gatewaySwitching.get()) {
+      if (
+        cancelled ||
+        reconnecting ||
+        reconnectTimer !== null ||
+        gatewayOpen() ||
+        $gatewaySwitching.get() ||
+        !isActivePrimary()
+      ) {
         return
       }
 
@@ -820,9 +833,16 @@ export function useGatewayBoot({
         if (bootCompleted) {
           completeDesktopBoot()
         }
-      } else if (bootCompleted && !$gatewaySwitching.get() && (st === 'closed' || st === 'error')) {
+      } else if (
+        bootCompleted &&
+        !$gatewaySwitching.get() &&
+        isActivePrimary() &&
+        (st === 'closed' || st === 'error')
+      ) {
         // The socket dropped after a healthy boot (typically sleep/wake). Try
         // to bring it back instead of leaving the composer stuck disabled.
+        // Idle-stop closes primary while the user is on a named profile —
+        // reconnecting here would respawn it onto the wrong backend.
         scheduleReconnect()
       }
     })
@@ -893,13 +913,6 @@ export function useGatewayBoot({
     // this a socket dropped during sleep sits closed until the user clicks.
     window.addEventListener('focus', onFocus)
 
-    // Keep live pool backends alive while this window is open (the main process
-    // can't observe the direct renderer↔backend WS). No-op for the primary.
-    const keepaliveTimer = setInterval(() => {
-      touchActiveGatewayBackend()
-      touchSecondaryGateways()
-    }, 60_000)
-
     // Bound concurrency cost to consumers: keep a background socket while its
     // profile has a running (working) or blocked (needs-input) session, OR an
     // open owner-routed tile (Bot chats stay on a secondary while chrome stays
@@ -907,6 +920,8 @@ export function useGatewayBoot({
     // and its backend is free to idle-reap. The active profile is always spared.
     // Do not key this off `entry.retained` — that flag only skips dispose-after-
     // RPC; idle prune is what reclaims hover-warmed sockets after you leave.
+    // Also reports keep set + active profile to main so idle-stop can spare/stop
+    // the primary.
     const recomputeKeptGateways = () => {
       const live = new Set([...$workingSessionIds.get(), ...$attentionSessionIds.get()])
       // Registry-scoped (connectionId, profile) scopes with live work. Two
@@ -931,13 +946,55 @@ export function useGatewayBoot({
       // releases agree with this pruner. This recompute only has to RUN when
       // they change — see the tile / selected session / hold subscriptions.
       pruneSecondaryGateways(keep)
+
+      const idleKeep = new Set(
+        collectKeptProfileKeys(
+          $sessions.get(),
+          $workingSessionIds.get(),
+          $attentionSessionIds.get(),
+          getPrimaryProfileKey()
+        )
+      )
+      const primaryKey = getPrimaryProfileKey()
+
+      for (const scope of keep) {
+        const value = String(scope)
+
+        if (value === primaryKey || value.endsWith(`::${primaryKey}`)) {
+          idleKeep.add(primaryKey)
+        }
+      }
+
+      void window.hermesDesktop
+        ?.reportBackendUsage?.({
+          activeProfile: normalizeProfileKey($activeGatewayProfile.get()),
+          keepProfiles: [...idleKeep]
+        })
+        ?.catch(() => undefined)
     }
+
+    // Keep live pool backends alive while this window is open (the main process
+    // can't observe the direct renderer↔backend WS). No-op for the primary.
+    // Also refresh keep + report so main's idle-stop sees current usage.
+    const keepaliveTimer = setInterval(() => {
+      touchActiveGatewayBackend()
+      touchSecondaryGateways()
+      recomputeKeptGateways()
+    }, 60_000)
 
     const offWorking = $workingSessionIds.subscribe(() => recomputeKeptGateways())
     const offAttention = $attentionSessionIds.subscribe(() => recomputeKeptGateways())
     const offActiveSession = $activeSessionId.subscribe(() => recomputeKeptGateways())
     const offSessionTiles = $sessionTiles.subscribe(() => recomputeKeptGateways())
-    const offActiveProfile = $activeGatewayProfile.subscribe(() => recomputeKeptGateways())
+    const offActiveProfile = $activeGatewayProfile.subscribe(() => {
+      recomputeKeptGateways()
+      // Switching back to the launch profile: ensureGatewayForProfile is a
+      // no-op for primary, so a socket idle-stopped while we were on a named
+      // profile stays closed unless we reconnect here.
+      if (bootCompleted && isActivePrimary() && !gatewayOpen()) {
+        void attemptReconnect()
+      }
+    })
     const offTiles = $sessionTiles.subscribe(() => recomputeKeptGateways())
     const offSelectedSession = $selectedStoredSessionId.subscribe(() => recomputeKeptGateways())
     const offSessionOwnerHolds = $sessionOwnerHoldRevision.subscribe(() => recomputeKeptGateways())
@@ -950,8 +1007,8 @@ export function useGatewayBoot({
       }
     })
 
-    const offExit = desktop.onBackendExit(() => {
-      if ($gatewaySwitching.get()) {
+    const offExit = desktop.onBackendExit(payload => {
+      if (payload?.reason === 'idle-stop' || $gatewaySwitching.get()) {
         return
       }
 

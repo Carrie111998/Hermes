@@ -46,6 +46,13 @@ declare global {
       // Keepalive: mark a pool profile backend as recently used so the idle
       // reaper spares it while its chat is active.
       touchBackend: (profile?: string | null) => Promise<{ ok: boolean }>
+      // Renderer reports which profile is active in the UI and which profiles
+      // have live work (working ∪ attention). Main uses this to idle-stop the
+      // primary local child when it is not needed (#91050).
+      reportBackendUsage: (payload: {
+        activeProfile?: string | null
+        keepProfiles?: string[]
+      }) => Promise<{ ok: boolean; idleStopScheduled?: boolean }>
       getGatewayWsUrl: (profile?: null | string) => Promise<GatewayWsUrlResult>
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
@@ -1416,4 +1423,6 @@ export interface HermesSelectPathsOptions {
 export interface BackendExit {
   code: number | null
   signal: string | null
+  /** Present when main intentionally stopped the primary (idle-stop). */
+  reason?: string
 }

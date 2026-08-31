@@ -300,6 +300,10 @@ export function isActivePrimary(): boolean {
   return g.activeKey === g.primaryProfile
 }
 
+export function getPrimaryProfileKey(): string {
+  return g.primaryProfile
+}
+
 /** Changes on every active route selection, including same-profile source swaps. */
 export function gatewayActivationEpoch(): number {
   return Number.isFinite(g.activationEpoch) ? g.activationEpoch : 0

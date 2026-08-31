@@ -84,6 +84,27 @@ describe('Hermes REST helpers', () => {
     )
   })
 
+  it('forwards the active profile on multiplex session list reads', async () => {
+    setApiRequestProfile('coder')
+
+    await listAllProfileSessions(50, 1)
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        profile: 'coder'
+      })
+    )
+  })
+
+  it('omits profile on multiplex session list reads when none is active', async () => {
+    setApiRequestProfile(null)
+
+    await listAllProfileSessions(50, 1)
+
+    const call = api.mock.calls[0]?.[0] as { profile?: string }
+    expect(call.profile).toBeUndefined()
+  })
+
   it('batches the sidebar slices into a single request with per-slice limits + excludes', async () => {
     api.mockResolvedValue({ recents: { sessions: [] }, cron: { sessions: [] }, messaging: { sessions: [] } })
 

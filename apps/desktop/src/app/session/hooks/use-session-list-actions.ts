@@ -36,7 +36,7 @@ import {
   setSessions,
   setSessionsLoading
 } from '@/store/session'
-import { $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
+import { $attentionSessionIds, $workingSessionIds, getRecentlySettledSessionIds } from '@/store/session-states'
 
 import { refreshCronJobs as refreshCronJobsStore } from '../../cron/cron-actions'
 
@@ -76,6 +76,7 @@ function dropTombstoned(sessions: SessionInfo[]): SessionInfo[] {
 function sessionsToKeep(scope?: string): Set<string> {
   const keep = new Set<string>([
     ...$workingSessionIds.get(),
+    ...$attentionSessionIds.get(),
     ...$pinnedSessionIds.get(),
     ...getRecentlySettledSessionIds()
   ])
