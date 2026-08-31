@@ -1481,7 +1481,8 @@ export interface McpServer {
   command: string | null;
   args: string[];
   env: Record<string, string>;
-  auth: "header" | "oauth" | null;
+  auth: "header" | "oauth" | "service_account" | null;
+  service_account?: McpServiceAccountConfig;
   enabled: boolean;
   tools: string[] | null;
 }
@@ -1516,7 +1517,19 @@ export interface McpCatalogDiagnostic {
 }
 
 
-export type McpHttpAuth = "none" | "header" | "oauth";
+export type McpHttpAuth = "none" | "header" | "oauth" | "service_account";
+
+/** Non-secret service-account fields. Secrets stay in the profile's .env. */
+export interface McpServiceAccountConfig {
+  token_url: string;
+  client_id: string;
+  username: string;
+  /** Name of the env var that holds the password — not the password itself. */
+  password_env: string;
+  scope?: string;
+  /** Name of the env var that holds the client secret (optional). */
+  client_secret_env?: string;
+}
 
 export interface McpServerCreate {
   name: string;
@@ -1526,6 +1539,7 @@ export interface McpServerCreate {
   env?: Record<string, string>;
   auth?: McpHttpAuth;
   bearer_token?: string;
+  service_account?: McpServiceAccountConfig;
 }
 
 export interface McpTestResult {
