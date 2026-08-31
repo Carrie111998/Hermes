@@ -17811,6 +17811,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "egress": self._busy_egress_command,
                 "goal": self._busy_goal_command,
                 "loop": self._busy_loop_command,
+                "reasoning": self._busy_reasoning_command,
             }.get(handler_key)
             if special is not None:
                 return await special(event, quick_key, source)
@@ -18030,6 +18031,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not _loop_arg or _loop_arg in {"status", "pause", "resume", "stop", "clear", "cancel", "help", "--help", "-h"}:
             return await self._handle_loop_command(event)
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
+
+    async def _busy_reasoning_command(
+        self, event: MessageEvent, quick_key: str, source,
+    ):
+        """Report the active turn's reasoning without changing its effort."""
+        return await self._handle_reasoning_command(
+            event,
+            running_agent=self._running_agents.get(quick_key),
+            session_key=quick_key,
+        )
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
