@@ -23688,6 +23688,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            reply_anchor = self._reply_anchor_for_event(event)
+            media_reply_kwargs = (
+                {"reply_to": reply_anchor}
+                if event.source.platform == Platform.QQBOT and reply_anchor
+                else {}
+            )
             # Do NOT deduplicate explicit MEDIA tags against prior turns here
             # (#73771). This rescan is already EXPLICIT-ONLY (see docstring):
             # a MEDIA: directive in the final streamed reply is the model
@@ -23708,7 +23714,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if thread_metadata is not None
                 else self._thread_metadata_for_source(
                     event.source,
-                    self._reply_anchor_for_event(event),
+                    reply_anchor,
                 )
             )
 
@@ -23733,11 +23739,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(
-                        chat_id=event.source.chat_id,
-                        images=images,
-                        metadata=_thread_meta,
-                    )
+                    if media_reply_kwargs:
+                        await adapter._send_multiple_images_with_reply_anchor(
+                            chat_id=event.source.chat_id,
+                            images=images,
+                            **media_reply_kwargs,
+                            metadata=_thread_meta,
+                        )
+                    else:
+                        await adapter.send_multiple_images(
+                            chat_id=event.source.chat_id,
+                            images=images,
+                            metadata=_thread_meta,
+                        )
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
 
@@ -23748,6 +23762,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await adapter.send_voice(
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
+                            **media_reply_kwargs,
                             metadata=_thread_meta,
                             is_voice=is_voice,
                         )
@@ -23755,12 +23770,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
+                            **media_reply_kwargs,
                             metadata=_thread_meta,
                         )
                     else:
                         await adapter.send_document(
                             chat_id=event.source.chat_id,
                             file_path=media_path,
+                            **media_reply_kwargs,
                             metadata=_thread_meta,
                         )
                 except Exception as e:
@@ -24038,6 +24055,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from gateway.platforms.base import BasePlatformAdapter
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
+                media_reply_kwargs = (
+                    {"reply_to": event_message_id}
+                    if source.platform == Platform.QQBOT and event_message_id
+                    else {}
+                )
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
@@ -24062,6 +24084,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             chat_id=source.chat_id,
                             image_url=image_url,
                             caption=alt_text,
+                            **media_reply_kwargs,
                             metadata=_thread_metadata,
                         )
                     except Exception:
@@ -24082,6 +24105,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await adapter.send_voice(
                                 chat_id=source.chat_id,
                                 audio_path=media_path,
+                                **media_reply_kwargs,
                                 metadata=_thread_metadata,
                                 is_voice=_is_voice,
                             )
@@ -24089,18 +24113,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await adapter.send_video(
                                 chat_id=source.chat_id,
                                 video_path=media_path,
+                                **media_reply_kwargs,
                                 metadata=_thread_metadata,
                             )
                         elif _ext in _IMAGE_EXTS:
                             await adapter.send_image_file(
                                 chat_id=source.chat_id,
                                 image_path=media_path,
+                                **media_reply_kwargs,
                                 metadata=_thread_metadata,
                             )
                         else:
                             await adapter.send_document(
                                 chat_id=source.chat_id,
                                 file_path=media_path,
+                                **media_reply_kwargs,
                                 metadata=_thread_metadata,
                             )
                     except Exception:
