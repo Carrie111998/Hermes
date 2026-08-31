@@ -24,7 +24,6 @@ permissions:
   pull-requests: write # needed by lint (PR comment) + supply-chain review_status
   actions: read # needed by osv-scanner (SARIF upload)
   security-events: write # needed by osv-scanner (SARIF upload)
-  packages: write # needed by docker build
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -75,6 +74,16 @@ jobs:
     needs: detect
     if: needs.detect.outputs.python == 'true'
     uses: ./.github/workflows/tests.yml
+
+  # macOS + Windows lanes. The main `tests` lane above is Linux-only, and
+  # the OS-marked tests it collects are skipped there by design (see the
+  # `_OS_MARKS` comment in tests/conftest.py) — this is where they run.
+  # Same `python` lane gate: if no Python changed, neither runs.
+  tests-os:
+    name: OS-specific tests
+    needs: detect
+    if: needs.detect.outputs.python == 'true'
+    uses: ./.github/workflows/tests-os.yml
 
   lint:
     name: Python lints
@@ -169,17 +178,6 @@ jobs:
     if: needs.detect.outputs.docker_meta == 'true'
     uses: ./.github/workflows/docker-lint.yml
 
-  docker:
-    name: Build&Test Docker image
-    needs: detect
-    # Trusted main pushes run docker.yml directly so its container-publish
-    # environment secrets never cross this reusable-workflow call. PR runs
-    # remain build/test-only and secret-free. Gated on python_prod (not
-    # python): the image copies installed code, never tests/ — tests-only
-    # PRs skip the build.
-    if: needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' || needs.detect.outputs.docker_meta == 'true')
-    uses: ./.github/workflows/docker.yml
-
   supply-chain:
     name: Supply-chain scan
     needs: detect
@@ -260,6 +258,7 @@ jobs:
     needs:
       - detect
       - tests
+      - tests-os
       - lint
       - js-tests
       - installer-tests
@@ -319,7 +318,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   ci-timings:
     name: CI timing report
-    needs: [all-checks-pass, docker]
+    needs: [all-checks-pass]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
