@@ -5831,6 +5831,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 session_id=self.session_id,
                 surface=surface,
                 config=self.config,
+                # Record presence even with no cap set, so `hermes status` and
+                # other sessions in this checkout can see this one (#46303).
+                record_presence=True,
             )
         except Exception as exc:
             logger.warning("Failed to claim active session slot: %s", exc)
