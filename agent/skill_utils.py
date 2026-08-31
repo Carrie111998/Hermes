@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -511,6 +512,53 @@ def parse_config_string_list(value) -> List[str]:
 
 def _normalize_string_set(values) -> Set[str]:
     return {name.strip() for name in parse_config_string_list(values) if name.strip()}
+
+
+@dataclass(frozen=True)
+class SkillPolicy:
+    """Normalized profile skill access and prompt-index policy."""
+
+    allowed: Optional[frozenset[str]]
+    index_described: Optional[frozenset[str]]
+
+    def permits(self, name: str) -> bool:
+        return self.allowed is None or name in self.allowed
+
+    def describes(self, name: str) -> bool:
+        return self.index_described is None or name in self.index_described
+
+
+def get_skill_policy() -> SkillPolicy:
+    """Read one normalized policy shared by prompt and tool surfaces."""
+    parsed = _load_raw_config()
+    skills_cfg = parsed.get("skills") if isinstance(parsed, dict) else None
+    if not isinstance(skills_cfg, dict):
+        return SkillPolicy(None, None)
+
+    raw_allowed = skills_cfg.get("allowed")
+    raw_described = skills_cfg.get("index_described")
+    allowed = (
+        None
+        if raw_allowed is None
+        else frozenset(_normalize_string_set(raw_allowed))
+    )
+    described = (
+        None
+        if raw_described is None
+        else frozenset(_normalize_string_set(raw_described))
+    )
+    if allowed is not None and described is not None:
+        outside = described - allowed
+        if outside:
+            raise ValueError(
+                "skills.index_described contains names outside skills.allowed: "
+                + ", ".join(sorted(outside))
+            )
+    return SkillPolicy(allowed, described)
+
+
+def skill_allowed(name: str, policy: Optional[SkillPolicy] = None) -> bool:
+    return (policy or get_skill_policy()).permits(str(name or "").strip())
 
 
 # ── External skills directories ──────────────────────────────────────────

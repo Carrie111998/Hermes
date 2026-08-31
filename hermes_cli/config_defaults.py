@@ -165,6 +165,13 @@ DEFAULT_CONFIG = {
         # qwen/glm/minimax/mimo/mistral models), true/false (force on/off for
         # all models), or a list of model-name substrings to match.
         "execution_guidance": "auto",
+        # Prompt assembly compatibility mode. ``compact`` replaces the
+        # overlapping completion, parallel-call, tool-enforcement, and
+        # model-family execution blocks with one model-neutral contract.
+        "execution_guidance_mode": "legacy",
+        # Include the Hermes self-support pointer in the system prompt.
+        # Domain specialists can disable it without suppressing their SOUL.
+        "hermes_help": True,
         # Intent-ack continuation: when the model opens a turn by narrating an
         # action it will take ("I'll go check the logs...") but emits no tool
         # call, intercept the turn-end, inject a "continue now, execute the
@@ -232,6 +239,10 @@ DEFAULT_CONFIG = {
         #   "on"             — force the prompt posture everywhere.
         #   "off"            — disable entirely.
         "coding_context": "auto",
+        # Repository context authority, resolved independently of tool cwd.
+        # ``assigned`` requires an explicit task/job workdir; ambient cwd and
+        # terminal.cwd cannot activate it.
+        "project_context": "auto",
         # Standing operator instructions for the coding posture. A string (or
         # list of strings) appended to the coding brief as an extra stable
         # system block — pin project-wide workflow rules here instead of editing
@@ -2229,6 +2240,11 @@ DEFAULT_CONFIG = {
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.
     "skills": {
+        # Access allowlist. null = every installed skill; [] = none.
+        "allowed": None,
+        # Which allowed skills retain descriptions in the prompt index.
+        # null = all; [] = names only.
+        "index_described": None,
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
         # Project-local skill discovery: when a session starts inside a git
         # checkout, ``<root>/.hermes/skills/`` and ``<root>/.agents/skills/``

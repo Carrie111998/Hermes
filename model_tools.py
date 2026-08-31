@@ -74,11 +74,11 @@ def _is_dispatcher_owned_worker() -> bool:
     """False when HERMES_KANBAN_* is present but this execution does not own it
     (delegate_task child, or a cron job fired in-process from a worker)."""
     try:
-        from agent.delegation_context import is_dispatcher_owned_worker_context
+        from agent.delegation_context import has_dispatcher_owned_worker_task
 
-        return is_dispatcher_owned_worker_context()
+        return has_dispatcher_owned_worker_task()
     except Exception:
-        return True
+        return False
 
 
 # =============================================================================
@@ -424,20 +424,10 @@ def _compute_tool_definitions(
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
+    dispatcher_worker = _is_dispatcher_owned_worker()
+
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
-        if (
-            os.environ.get("HERMES_KANBAN_TASK")
-            and not _is_delegated_child_context()
-            and _is_dispatcher_owned_worker()
-            and "kanban" not in effective_enabled_toolsets
-        ):
-            # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
-            # must always receive the lifecycle handoff tools. Assignee
-            # profiles may intentionally restrict their normal chat toolsets
-            # (for token/cost reasons), but that should not strip the kanban
-            # worker's completion/block/heartbeat surface.
-            effective_enabled_toolsets.append("kanban")
         for toolset_name in effective_enabled_toolsets:
             if validate_toolset(toolset_name):
                 resolved = resolve_toolset(toolset_name)
@@ -499,6 +489,16 @@ def _compute_tool_definitions(
                     print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
             elif not quiet_mode:
                 print(f"⚠️  Unknown toolset: {toolset_name}")
+
+    # A dispatcher-owned worker gets exactly the task lifecycle subset, even
+    # when a platform bundle or the profile's normal surface includes full
+    # Kanban. Apply this after profile allow/deny resolution so inherited core
+    # tools cannot widen the worker, and remove clarify because the run is
+    # headless. The handlers remain the existing kanban registrations.
+    if dispatcher_worker:
+        tools_to_include.difference_update(resolve_toolset("kanban"))
+        tools_to_include.update(resolve_toolset("kanban_worker"))
+        tools_to_include.discard("clarify")
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()

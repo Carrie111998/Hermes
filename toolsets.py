@@ -178,6 +178,12 @@ TOOLSETS = {
         "tools": ["skills_list", "skill_view", "skill_manage"],
         "includes": []
     },
+
+    "skills_read": {
+        "description": "Load a named skill without listing or modifying skills",
+        "tools": ["skill_view"],
+        "includes": [],
+    },
     
     "browser": {
         "description": "Browser automation for web interaction (navigate, click, type, scroll, iframes, hold-click) with web search for finding URLs",
@@ -189,6 +195,12 @@ TOOLSETS = {
             "browser_dialog", "browser_exec", "web_search"
         ],
         "includes": []
+    },
+
+    "browser_exec_only": {
+        "description": "Run bounded browser automation through browser_exec only",
+        "tools": ["browser_exec"],
+        "includes": [],
     },
     
     "cronjob": {
@@ -306,6 +318,16 @@ TOOLSETS = {
             "kanban_create", "kanban_link",
             "kanban_unblock",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
+        ],
+        "includes": [],
+    },
+
+    "kanban_worker": {
+        "description": "Kanban lifecycle tools for a dispatcher-owned worker task",
+        "tools": [
+            "kanban_show", "kanban_complete", "kanban_block",
+            "kanban_request_review", "kanban_request_changes",
+            "kanban_heartbeat", "kanban_comment",
         ],
         "includes": [],
     },

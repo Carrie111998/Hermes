@@ -447,6 +447,28 @@ Project skills are the **highest-precedence tier**: `project → local (~/.herme
 
 Like external dirs, project skill directories are treated as repo-owned: autonomous skill maintenance (the curator) never modifies them, and new agent-created skills always go to `~/.hermes/skills/`.
 
+### Profile allowlists and compact indexes
+
+A narrow profile can fail closed on skill access while keeping broad profiles'
+full inventory available:
+
+```yaml
+skills:
+  allowed: [deploy-k8s, incident-triage]   # null = all; [] = none
+  index_described: [incident-triage]      # null = describe all; [] = names only
+  project_discovery: false
+```
+
+`allowed` gates the prompt index, `skills_list`, `skill_view`, and
+`skill_manage` across profile, external, organization, plugin, and trusted
+project sources. Unknown or ambiguous configured names fail agent startup.
+`skills.disabled` is applied afterward for backward compatibility.
+
+Allowed skills omitted from `index_described` remain visible as names-only
+entries and remain loadable. For a provenance-sensitive profile, also disable
+project discovery so a same-named repository skill cannot shadow the intended
+profile or external source.
+
 ### Scan-time quarantine
 
 Trust is a repo-level decision, but a repo's skill content changes with every `git pull`. To close that gap, every project skill is scanned with the same security scanner used for Skills Hub installs before it enters the index. A skill whose scan verdict is **dangerous** (prompt-injection directives, credential-exfiltration commands, hidden-text tricks) is quarantined: it does not appear in the skill index, `skills_list`, slash commands, and refuses to load by name with an explanatory error. Scans are content-hash cached under `~/.hermes/cache/project_skill_scans/` (never inside your repo) and re-run automatically when the skill's content changes.

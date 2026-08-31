@@ -597,6 +597,7 @@ def init_agent(
     chat_type: str = None,
     thread_id: str = None,
     gateway_session_key: str = None,
+    assigned_workdir: str = None,
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
@@ -685,6 +686,7 @@ def init_agent(
     agent._chat_type = chat_type
     agent._thread_id = thread_id
     agent._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+    agent.assigned_workdir = assigned_workdir
     # Pluggable print function — CLI replaces this with _cprint so that
     # raw ANSI status lines are routed through prompt_toolkit's renderer
     # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1637,10 +1639,27 @@ def init_agent(
     # Resolving the ~835-token block once here avoids re-running the
     # membership test + reference on every system-prompt rebuild
     # (init + each context compression).
-    from agent.prompt_builder import KANBAN_GUIDANCE
-    agent._kanban_worker_guidance = (
-        KANBAN_GUIDANCE if "kanban_show" in agent.valid_tool_names else ""
-    )
+    from agent.prompt_builder import KANBAN_GUIDANCE, KANBAN_WORKER_GUIDANCE
+    try:
+        from agent.delegation_context import has_dispatcher_owned_worker_task
+        _dispatcher_worker = has_dispatcher_owned_worker_task()
+    except Exception:
+        _dispatcher_worker = False
+    if _dispatcher_worker:
+        agent._kanban_worker_guidance = KANBAN_WORKER_GUIDANCE
+    elif "kanban" in (enabled_toolsets or ()) and "kanban_show" in agent.valid_tool_names:
+        agent._kanban_worker_guidance = KANBAN_GUIDANCE
+    else:
+        agent._kanban_worker_guidance = ""
+
+    # Preserve the selected aliases for skill eligibility. A narrow composite
+    # must not imply its full canonical parent merely because they share one
+    # registered handler.
+    agent.effective_toolsets = set(enabled_toolsets or ())
+    if _dispatcher_worker:
+        agent.effective_toolsets.discard("kanban")
+        agent.effective_toolsets.discard("clarify")
+        agent.effective_toolsets.add("kanban_worker")
 
     # Check tool requirements
     if agent.tools and not agent.quiet_mode:
@@ -1805,6 +1824,32 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+
+    _agent_section = _agent_cfg.get("agent", {})
+    if not isinstance(_agent_section, dict):
+        _agent_section = {}
+    from agent.runtime_cwd import resolve_project_context
+
+    _project_context = resolve_project_context(
+        _agent_section.get("project_context", "auto"),
+        assigned_workdir=assigned_workdir,
+        entrypoint_skip=bool(skip_context_files),
+        entrypoint_load_soul=bool(load_soul_identity),
+        platform=platform,
+    )
+    agent.project_context_mode = _project_context.mode
+    agent.repository_context_root = _project_context.root
+    agent.repository_context_active = _project_context.repository_context_active
+    agent.skip_context_files = _project_context.skip_context_files
+    agent.load_soul_identity = _project_context.load_soul_identity
+
+    from agent.skill_utils import get_skill_policy
+    _skill_policy = get_skill_policy()
+    agent.skill_policy = _skill_policy
+    agent.skill_policy_sources = {}
+    if _skill_policy.allowed is not None or _skill_policy.index_described is not None:
+        from tools.skills_tool import validate_configured_skill_policy
+        agent.skill_policy_sources = validate_configured_skill_policy()
 
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
@@ -1994,9 +2039,6 @@ def init_agent(
 
     # Tool-use enforcement config: "auto" (default — matches hardcoded
     # model list), true (always), false (never), or list of substrings.
-    _agent_section = _agent_cfg.get("agent", {})
-    if not isinstance(_agent_section, dict):
-        _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
     # Execution-discipline guidance gate: "auto" (default — matches
@@ -2004,6 +2046,13 @@ def init_agent(
     # model-name substrings.  Independent of tool_use_enforcement — see
     # agent/system_prompt.py for the injection gate.
     agent._execution_guidance = _agent_section.get("execution_guidance", "auto")
+    _execution_mode = str(
+        _agent_section.get("execution_guidance_mode", "legacy") or "legacy"
+    ).strip().lower()
+    agent._execution_guidance_mode = (
+        _execution_mode if _execution_mode in {"compact", "legacy"} else "legacy"
+    )
+    agent._hermes_help = bool(_agent_section.get("hermes_help", True))
 
     # Wall-clock run budget from config (agent.run_budget_seconds) — only
     # consulted when the constructor arg was not given. Absent/None/invalid

@@ -1752,6 +1752,37 @@ The injected block covers:
 
 The gate is independent of `tool_use_enforcement` — either can be on without the other. The guidance is chosen once at session start keyed on the model name, so the system prompt stays byte-stable (and prompt-cache-friendly) for the life of the conversation. Gemini/Gemma are excluded from the auto list because they receive the more specific Google operational guidance; Claude is excluded because it doesn't exhibit these failure modes — opt any model in with `true` or a substring list.
 
+## Compact Execution and Project Context
+
+Profiles can replace the overlapping legacy execution blocks with one compact,
+model-neutral contract and independently control repository-context discovery:
+
+```yaml
+agent:
+  execution_guidance_mode: compact  # compact | legacy (default)
+  hermes_help: false                 # default true
+  project_context: assigned          # off | assigned | auto (default)
+```
+
+- `compact` replaces task-completion, parallel-call, tool-enforcement and
+  model-family execution guidance; it never injects both modes.
+- `hermes_help: false` removes only the global Hermes-support pointer. It does
+  not suppress the profile SOUL.
+- `project_context: off` keeps SOUL but omits repository instructions, coding
+  posture and workspace snapshots.
+- `assigned` activates repository context only for an explicit task or cron
+  workdir. Ambient process cwd and `TERMINAL_CWD` cannot widen it.
+- `auto` preserves repository discovery for ordinary CLI/project work.
+
+Repository-context resolution never changes the terminal or file-tool working
+directory. Existing `agent.coding_context` still controls the coding posture
+when repository context is active.
+
+Three narrow toolsets reuse existing tool handlers without duplicating them:
+`skills_read` exposes only `skill_view`, `browser_exec_only` only
+`browser_exec`, and dispatcher-owned Kanban workers receive the seven
+`kanban_worker` lifecycle tools instead of full board orchestration.
+
 ## Tool-Loop Guardrails
 
 Hermes detects when the agent is stuck in an unproductive tool-calling loop — the same tool call failing repeatedly, the same tool failing over and over, or an idempotent call returning the same result with no progress. By default it injects a **warning** into the tool result so the model self-corrects; it does not hard-stop, since a person watching the CLI/TUI can intervene.

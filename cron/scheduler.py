@@ -6435,6 +6435,7 @@ def run_job(
             skip_memory=False,
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
+            assigned_workdir=_job_workdir,
             session_id=_cron_session_id,
             session_db=_session_db,
         )
