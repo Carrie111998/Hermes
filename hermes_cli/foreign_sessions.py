@@ -366,11 +366,22 @@ def import_foreign_session(source: str, path, db=None) -> str:
                 "foreign_session_id": parsed.get("session_id"),
             }
         }
+        model_config = None
+        if source == "codex" and parsed.get("session_id"):
+            # Keep the existing portable transcript import, but also retain
+            # the native thread identity. When codex_app_server is active,
+            # resuming this Hermes session reconnects to Codex's authoritative
+            # task instead of starting a duplicate thread.
+            model_config = {
+                "codex_thread_id": parsed["session_id"],
+                "codex_thread_resume_strict": True,
+            }
         db.create_session(
             session_id,
             source=_SOURCE_DB_NAMES[source],
             cwd=parsed.get("cwd"),
             origin_json=json.dumps(origin),
+            model_config=model_config,
         )
         for turn in turns:
             db.append_message(session_id, turn["role"], turn["content"])

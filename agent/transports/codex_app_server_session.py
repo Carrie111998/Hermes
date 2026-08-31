@@ -8,7 +8,7 @@ into its `messages` list.
 
 Lifecycle:
     session = CodexAppServerSession(cwd="/home/x/proj")
-    session.ensure_started()                              # spawns + handshake + thread/start
+    session.ensure_started()                     # handshake + thread/start or thread/resume
     result = session.run_turn(user_input="hello")         # blocks until turn/completed
     # result.final_text          → assistant text returned to caller
     # result.projected_messages  → list of {role, content, ...} for messages list
@@ -275,6 +275,8 @@ class CodexAppServerSession:
         self,
         *,
         cwd: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        resume_fallback_to_start: bool = True,
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
@@ -284,6 +286,8 @@ class CodexAppServerSession:
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
+        self._requested_thread_id = str(thread_id or "").strip() or None
+        self._resume_fallback_to_start = bool(resume_fallback_to_start)
         self._codex_bin = codex_bin
         self._codex_home = codex_home
         self._permission_profile = (
@@ -313,9 +317,11 @@ class CodexAppServerSession:
     # ---------- lifecycle ----------
 
     def ensure_started(self) -> str:
-        """Spawn the subprocess, do the initialize handshake, and start a
-        thread. Returns the codex thread id. Idempotent — repeated calls
-        return the same thread id."""
+        """Spawn, initialize, then start or resume a Codex thread.
+
+        Returns the Codex thread id. Idempotent — repeated calls return the
+        same thread id.
+        """
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
@@ -326,13 +332,14 @@ class CodexAppServerSession:
             client_name="hermes",
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
+            capabilities={
+                "experimentalApi": True,
+                "requestAttestation": False,
+            },
         )
-        # Permission selection is intentionally NOT sent on thread/start.
-        # Two reasons (live-tested against codex 0.130.0):
-        #   1. `thread/start.permissions` is gated behind the experimentalApi
-        #      capability on this codex version — we'd have to opt in during
-        #      initialize and accept the unstable surface.
-        #   2. Even with experimentalApi declared and the correct shape
+        # Permission selection is intentionally NOT sent on thread/start or
+        # thread/resume. Even with experimentalApi declared (required for the
+        # resume path) and the correct shape
         #      (`{"type": "profile", "id": "..."}`, not `{"profileId": ...}`),
         #      codex requires a matching `[permissions]` table in
         #      ~/.codex/config.toml or it fails the request with
@@ -342,8 +349,37 @@ class CodexAppServerSession:
         # codex CLI workflow and avoids fighting codex's own validation.
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
-        params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        result: dict[str, Any] = {}
+        method = "thread/start"
+        if self._requested_thread_id:
+            method = "thread/resume"
+            try:
+                result = self._client.request(
+                    method,
+                    {
+                        "cwd": self._cwd,
+                        "threadId": self._requested_thread_id,
+                        # The Hermes SessionDB is a display/search mirror. Codex
+                        # remains authoritative for the native thread transcript,
+                        # so there is no need to hydrate all turns over JSON-RPC.
+                        "excludeTurns": True,
+                    },
+                    timeout=15,
+                )
+            except (CodexAppServerError, TimeoutError) as exc:
+                if not self._resume_fallback_to_start:
+                    raise
+                logger.warning(
+                    "codex thread/resume failed for id=%s (%s) — starting "
+                    "a fresh thread",
+                    self._requested_thread_id[:8],
+                    exc,
+                )
+                method = "thread/start"
+        if method == "thread/start":
+            result = self._client.request(
+                method, {"cwd": self._cwd}, timeout=15
+            )
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -355,17 +391,33 @@ class CodexAppServerSession:
             or result.get("sessionId")
             or result.get("threadId")
         )
+        if not thread_id and method == "thread/resume" and self._resume_fallback_to_start:
+            logger.warning(
+                "codex thread/resume returned no thread id "
+                "(payload keys: %s) — starting a fresh thread",
+                sorted(result.keys()),
+            )
+            method = "thread/start"
+            result = self._client.request(method, {"cwd": self._cwd}, timeout=15)
+            thread_obj = result.get("thread") or {}
+            thread_id = (
+                thread_obj.get("id")
+                or thread_obj.get("sessionId")
+                or result.get("sessionId")
+                or result.get("threadId")
+            )
         if not thread_id:
             raise CodexAppServerError(
                 code=-32603,
                 message=(
-                    "codex thread/start returned no thread id "
+                    f"codex {method} returned no thread id "
                     f"(payload keys: {sorted(result.keys())})"
                 ),
             )
         self._thread_id = thread_id
         logger.info(
-            "codex app-server thread started: id=%s profile=%s cwd=%s",
+            "codex app-server thread %s: id=%s profile=%s cwd=%s",
+            "resumed" if method == "thread/resume" else "started",
             self._thread_id[:8],
             self._permission_profile,
             self._cwd,

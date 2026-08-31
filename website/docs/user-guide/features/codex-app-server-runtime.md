@@ -197,6 +197,42 @@ model:
   openai_runtime: codex_app_server   # default is "auto" (= Hermes runtime)
 ```
 
+## Continue an existing Codex task from a gateway
+
+When this runtime is enabled, an explicitly configured gateway admin can
+browse the same native task catalog used by Codex CLI and Codex Desktop:
+
+```
+/sessions codex
+/sessions codex search login refresh
+```
+
+Continue one of the displayed tasks in the current Telegram, Discord,
+Feishu, or other gateway conversation:
+
+```
+/resume codex 2
+/resume codex <thread-id-or-unique-prefix>
+/resume codex "task name"
+```
+
+Hermes creates a lightweight route session and stores the native Codex thread
+ID, then reconnects with `thread/resume` on the next message. Codex remains the
+source of truth for the task's context; the Hermes session transcript is only
+a searchable/display mirror of turns sent through Hermes. A gateway restart,
+agent-cache eviction, or later Hermes `/resume` therefore reconnects to the
+same Codex task instead of creating a duplicate.
+
+Native Codex tasks are host-wide and may contain previews from unrelated
+workspaces, so this picker requires an explicit gateway admin even when slash
+command access control is otherwise disabled. Configure the gateway's admin
+user list before using it from a messenger.
+
+Codex permits only one active writer per task. If Codex Desktop or another
+client is currently running a turn on the selected task, Hermes preserves that
+lock and reports the app-server error; finish or stop the other turn, then
+retry from the gateway.
+
 ## Self-improvement loop (memory + skill nudges)
 
 Hermes' background self-improvement fires on counter thresholds:

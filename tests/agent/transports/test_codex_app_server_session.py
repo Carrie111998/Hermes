@@ -34,6 +34,7 @@ class FakeClient:
         self.responses: list[tuple[Any, dict]] = []
         self.error_responses: list[tuple[Any, int, str]] = []
         self._initialized = False
+        self.initialize_kwargs: dict[str, Any] = {}
         self._closed = False
         self._notifications: list[dict] = []
         self._server_requests: list[dict] = []
@@ -42,6 +43,7 @@ class FakeClient:
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
         self._initialized = True
+        self.initialize_kwargs = dict(kwargs)
         return {"userAgent": "fake/0.0.0", "codexHome": "/tmp",
                 "platformOs": "linux", "platformFamily": "unix"}
 
@@ -52,6 +54,9 @@ class FakeClient:
         # Sensible defaults for protocol methods used by the session
         if method == "thread/start":
             return {"thread": {"id": "thread-fake-001"},
+                    "activePermissionProfile": {"id": "workspace-write"}}
+        if method == "thread/resume":
+            return {"thread": {"id": (params or {}).get("threadId")},
                     "activePermissionProfile": {"id": "workspace-write"}}
         if method == "turn/start":
             return {"turn": {"id": "turn-fake-001"}}
@@ -173,6 +178,67 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+
+    def test_requested_thread_is_resumed_instead_of_started(self):
+        client = FakeClient()
+        s = make_session(client, thread_id="thread-existing-123")
+
+        assert s.ensure_started() == "thread-existing-123"
+        assert ("thread/start", {"cwd": "/tmp"}) not in client.requests
+        assert (
+            "thread/resume",
+            {
+                "cwd": "/tmp",
+                "threadId": "thread-existing-123",
+                "excludeTurns": True,
+            },
+        ) in client.requests
+        assert client.initialize_kwargs["capabilities"] == {
+            "experimentalApi": True,
+            "requestAttestation": False,
+        }
+
+    def test_resume_failure_falls_back_for_automatic_binding(self):
+        client = FakeClient()
+
+        def handle_request(method, params):
+            if method == "thread/resume":
+                raise session_mod.CodexAppServerError(
+                    code=-32600, message="rollout not found"
+                )
+            if method == "thread/start":
+                return {"thread": {"id": "thread-replacement"}}
+            return {}
+
+        client._request_handler = handle_request
+        s = make_session(client, thread_id="thread-deleted")
+
+        assert s.ensure_started() == "thread-replacement"
+        assert [method for method, _ in client.requests] == [
+            "thread/resume",
+            "thread/start",
+        ]
+
+    def test_resume_failure_is_strict_for_explicit_native_task(self):
+        client = FakeClient()
+
+        def handle_request(method, params):
+            if method == "thread/resume":
+                raise session_mod.CodexAppServerError(
+                    code=-32600, message="thread already has an active writer"
+                )
+            raise AssertionError(f"unexpected request: {method}")
+
+        client._request_handler = handle_request
+        s = make_session(
+            client,
+            thread_id="thread-desktop-active",
+            resume_fallback_to_start=False,
+        )
+
+        with pytest.raises(session_mod.CodexAppServerError, match="active writer"):
+            s.ensure_started()
+        assert [method for method, _ in client.requests] == ["thread/resume"]
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -895,4 +961,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

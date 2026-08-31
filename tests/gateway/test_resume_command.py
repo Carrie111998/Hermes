@@ -80,6 +80,125 @@ class TestHandleResumeCommand:
         assert "not available" in result.lower()
 
     @pytest.mark.asyncio
+    async def test_resume_codex_binds_native_thread(self, tmp_path, monkeypatch):
+        import gateway.run as gateway_run
+        from agent.transports.codex_thread_catalog import CodexThreadSummary
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(text="/resume codex 1")
+        lane_key = _session_key_for_event(event)
+        db.create_session(
+            "current_session_001",
+            "telegram",
+            session_key=lane_key,
+            user_id="12345",
+            chat_id="67890",
+        )
+        runner = _make_runner(
+            session_db=db,
+            current_session_id="current_session_001",
+            event=event,
+        )
+        runner._resume_caller_is_admin = lambda _source: True
+        runner._release_running_agent_state = MagicMock()
+        runner._clear_conversation_scope = MagicMock()
+        runner._evict_cached_agent = MagicMock()
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {
+                "model": {
+                    "default": "openai/gpt-5",
+                    "openai_runtime": "codex_app_server",
+                }
+            },
+        )
+        monkeypatch.setattr(
+            "agent.transports.codex_thread_catalog.list_codex_threads",
+            lambda **kwargs: (
+                [
+                    CodexThreadSummary(
+                        thread_id="native-thread-123",
+                        cwd="/repo/project",
+                        preview="Fix login refresh",
+                        source="vscode",
+                    )
+                ],
+                None,
+            ),
+        )
+
+        result = await runner._handle_resume_command(event)
+
+        assert "Resumed native Codex task" in result
+        switched_id = runner.session_store.switch_session.call_args[0][1]
+        assert switched_id != "current_session_001"
+        assert db.get_session_model_config_value(
+            switched_id, "codex_thread_id"
+        ) == "native-thread-123"
+        assert db.get_session_model_config_value(
+            switched_id, "codex_thread_resume_strict"
+        ) is True
+        assert db.get_session(switched_id)["cwd"] == "/repo/project"
+        runner._clear_conversation_scope.assert_called_once_with(
+            lane_key, reason="resume_codex"
+        )
+        runner._evict_cached_agent.assert_called_once_with(lane_key)
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_resume_codex_does_not_duplicate_current_binding(
+        self, tmp_path, monkeypatch
+    ):
+        import gateway.run as gateway_run
+        from agent.transports.codex_thread_catalog import CodexThreadSummary
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(text="/resume codex native-thread-123")
+        lane_key = _session_key_for_event(event)
+        db.create_session(
+            "current_session_001",
+            "telegram",
+            session_key=lane_key,
+            user_id="12345",
+            chat_id="67890",
+            model_config={"codex_thread_id": "native-thread-123"},
+        )
+        runner = _make_runner(
+            session_db=db,
+            current_session_id="current_session_001",
+            event=event,
+        )
+        runner._resume_caller_is_admin = lambda _source: True
+        monkeypatch.setattr(
+            gateway_run,
+            "_load_gateway_config",
+            lambda: {"model": {"openai_runtime": "codex_app_server"}},
+        )
+        monkeypatch.setattr(
+            "agent.transports.codex_thread_catalog.list_codex_threads",
+            lambda **kwargs: (
+                [
+                    CodexThreadSummary(
+                        thread_id="native-thread-123",
+                        cwd="/repo/project",
+                        preview="Fix login refresh",
+                    )
+                ],
+                None,
+            ),
+        )
+
+        result = await runner._handle_resume_command(event)
+
+        assert "Already using native Codex task" in result
+        runner.session_store.switch_session.assert_not_called()
+        assert len(db.list_sessions_rich(limit=10)) == 1
+        db.close()
+
+    @pytest.mark.asyncio
     async def test_list_named_sessions_when_no_arg(self, tmp_path):
         """With no argument, lists recently titled sessions."""
         from hermes_state import SessionDB
@@ -374,6 +493,56 @@ class TestHandleResumeCommand:
 
 class TestHandleSessionsCommand:
     """Tests for GatewayRunner._handle_sessions_command."""
+
+    @pytest.mark.asyncio
+    async def test_sessions_codex_lists_native_tasks_for_admin(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.transports.codex_thread_catalog import CodexThreadSummary
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(text="/sessions codex")
+        runner = _make_runner(session_db=db, event=event)
+        runner._resume_caller_is_admin = lambda _source: True
+        monkeypatch.setattr(
+            "agent.transports.codex_thread_catalog.list_codex_threads",
+            lambda **kwargs: (
+                [
+                    CodexThreadSummary(
+                        thread_id="native-thread-123",
+                        cwd="/repo/project",
+                        preview="Fix login refresh",
+                        name="Login task",
+                        source="vscode",
+                        is_pinned=True,
+                    )
+                ],
+                None,
+            ),
+        )
+
+        result = await runner._handle_sessions_command(event)
+
+        assert "Codex Tasks" in result
+        assert "Login task" in result
+        assert "native-threa" in result
+        assert "/resume codex" in result
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_sessions_codex_requires_explicit_admin(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(text="/sessions codex")
+        runner = _make_runner(session_db=db, event=event)
+        runner._resume_caller_is_admin = lambda _source: False
+
+        result = await runner._handle_sessions_command(event)
+
+        assert "explicitly configured gateway admin" in result
+        db.close()
 
     @pytest.mark.asyncio
     async def test_sessions_full_keeps_legacy_reset_child_after_parent_resume(

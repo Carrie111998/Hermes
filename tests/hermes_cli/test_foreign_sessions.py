@@ -223,6 +223,12 @@ def test_import_codex_session(tmp_path, session_db):
     assert title.startswith("Imported from Codex CLI: ")
     messages = session_db.get_messages(session_id)
     _assert_alternating(messages)
+    assert session_db.get_session_model_config_value(
+        session_id, "codex_thread_id"
+    ) == "0000-1111"
+    assert session_db.get_session_model_config_value(
+        session_id, "codex_thread_resume_strict"
+    ) is True
     # resumable: resolve_session_id round-trips
     assert session_db.resolve_session_id(session_id) == session_id
 
