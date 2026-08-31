@@ -162,3 +162,26 @@ def test_qq_observed_rows_are_context_only_for_addressed_turn():
     )
 
 
+def test_observed_rows_are_omitted_when_observe_mode_is_disabled():
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {"role": "assistant", "content": "previous explicit reply"},
+        {
+            "role": "user",
+            "content": "[Alice] passive chatter from an earlier configuration",
+            "observed": True,
+        },
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt=None,
+    )
+
+    assert agent_history == [
+        {"role": "assistant", "content": "previous explicit reply"}
+    ]
+    assert observed_context is None
+
+

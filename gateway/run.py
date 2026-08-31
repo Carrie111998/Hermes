@@ -1870,6 +1870,12 @@ def _build_gateway_agent_history(
         if separate_observed_context and msg.get("observed") and role == "user" and content:
             observed_group_context.append(str(content).strip())
             continue
+        if msg.get("observed") and role == "user":
+            # Passive group chatter must never become a normal actionable user
+            # turn. If observation was later disabled (or the prompt marker is
+            # unavailable), drop the row entirely rather than replaying it as a
+            # request to the current addressed turn.
+            continue
 
         # Rich agent messages (tool_calls, tool results) must be passed through
         # intact so the API sees valid assistant→tool sequences.
