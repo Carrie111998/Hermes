@@ -569,9 +569,17 @@ async def loop_heartbeat_forever(
                 logger.debug(
                     "stale loop-tick socket sweep failed", exc_info=True
                 )
-        tick_server = await asyncio.start_unix_server(
-            _tick_socket_handler, path=str(tick_socket_path)
-        )
+        # windows-footgun: asyncio.start_unix_server is POSIX-only. On
+        # Windows it raises AttributeError which the except below turned into
+        # a warning + traceback spammed into gateway.log on every startup.
+        # Guard with hasattr so POSIX keeps the socket and Windows skips it
+        # cleanly (loop_tick_socket=False payload already documents this).
+        if hasattr(asyncio, "start_unix_server"):
+            tick_server = await asyncio.start_unix_server(
+                _tick_socket_handler, path=str(tick_socket_path)
+            )
+        else:
+            tick_server = None
     except Exception:
         tick_server = None
         logger.warning(
