@@ -78,7 +78,18 @@ def resolve_exec_command() -> str:
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
             # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            #
+            # Exception: if sys.executable is a uv-managed interpreter
+            # (path contains "uv/python/cpython-"), it lives outside the venv
+            # and also lacks hermes dependencies when launched by a DE (#92923).
+            # In that case look for the shell wrapper in ~/.local/bin first.
+            exe = Path(sys.executable).resolve()
+            if "uv/python/cpython-" in str(exe) or "uv/python/pypy-" in str(exe):
+                # Prefer the user-local shell wrapper which sources the venv
+                local_bin = Path.home() / ".local" / "bin" / "hermes"
+                if local_bin.is_file():
+                    return " ".join(_quote_exec_arg(a) for a in [str(local_bin), "desktop"])
+            argv = [str(exe), str(resolved), "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
