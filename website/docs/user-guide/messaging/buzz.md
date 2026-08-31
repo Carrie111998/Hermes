@@ -107,6 +107,12 @@ By default the allow-list is empty, which means every community member who menti
 
 Cron jobs and notifications (`deliver=buzz`) are delivered to the **home channel** — `BUZZ_HOME_CHANNEL` if set, otherwise the first watched channel — and work even when cron runs outside the gateway process.
 
+## Reading canonical message links
+
+When a user supplies a canonical `buzz://message` link, Hermes can call the bundled `buzz_read_message_link` tool to retrieve that exact signed Buzz event with the configured identity. The link must contain a channel UUID and 64-character hexadecimal event id; an optional thread id is validated against the event's thread root.
+
+The lookup uses Buzz's exact event-ID thread query and then validates the returned event's channel and optional thread root. CLI failures and malformed responses return safe errors without exposing credential-bearing stderr. The private key remains in the subprocess environment and is never placed in command arguments or tool output.
+
 ## Run the gateway
 
 ```bash
@@ -117,7 +123,7 @@ Check status with `hermes gateway status` — Buzz connection state is reported 
 
 ## Notes and limitations
 
-- **Inbound is polled, not streamed.** The `buzz` CLI is request/response, so the adapter polls `buzz messages get` per watched channel every `poll_interval` seconds (default 4). Expect up to one interval of latency on inbound messages. A future optimization is a websocket transport (the Buzz repo ships `buzz-ws-client` for true streaming).
+- **Inbound uses WebSocket by default.** In `auto` mode, the adapter falls back to CLI polling only when the WebSocket cannot be established at startup. Use `websocket` to require streaming or `poll` to force polling; `poll_interval` controls only polling mode.
 - On (re)connect the adapter seeds its high-water mark from the newest events, so channel history is never replayed into the agent.
 - New DM conversations are discovered automatically (every few poll sweeps).
 - The private key is passed to the CLI via the subprocess environment — it never appears in argv or logs.
