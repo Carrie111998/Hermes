@@ -2162,16 +2162,39 @@ def _mark_verification_stale(
     resolved_paths: list[str],
     session_id: str | None = None,
 ) -> None:
-    """Best-effort note that successful edits made prior verification stale."""
+    """Mark verification stale only for files inside detected code workspaces.
+
+    Runtime state written outside a project (for example ``~/.hermes/cron/state``)
+    must not inherit the task's authoritative code workspace. Otherwise a cron
+    checkpoint makes unrelated repository verification stale and can provoke an
+    ad-hoc ``hermes-verify-*`` script at turn end.
+    """
     paths = [p for p in resolved_paths if p]
     if not paths:
         return
     try:
         from agent.coding_context import project_facts_for
         from agent.verification_evidence import mark_workspace_edited
+        from hermes_constants import get_hermes_home
 
-        cwd = None
+        runtime_state_root = (get_hermes_home() / "cron" / "state").resolve()
+        code_paths: list[str] = []
         for path in paths:
+            try:
+                resolved = Path(path).expanduser().resolve()
+            except Exception:
+                continue
+            if resolved == runtime_state_root or runtime_state_root in resolved.parents:
+                continue
+            code_paths.append(str(resolved))
+
+        if not code_paths:
+            return
+
+        # Preserve the existing fallback for remote/container workspaces whose
+        # backend paths cannot be inspected as host-side Git roots.
+        cwd = None
+        for path in code_paths:
             try:
                 candidate = str(Path(path).parent)
             except Exception:
@@ -2183,10 +2206,14 @@ def _mark_verification_stale(
             cwd = _authoritative_workspace_root(task_id)
         if cwd is None:
             try:
-                cwd = str(Path(paths[0]).parent)
+                cwd = str(Path(code_paths[0]).parent)
             except Exception:
                 cwd = None
-        mark_workspace_edited(session_id=session_id or task_id, cwd=cwd, paths=paths)
+        mark_workspace_edited(
+            session_id=session_id or task_id,
+            cwd=cwd,
+            paths=code_paths,
+        )
     except Exception:
         logger.debug("verification stale marker failed", exc_info=True)
 
