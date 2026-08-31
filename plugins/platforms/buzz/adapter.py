@@ -173,6 +173,7 @@ from gateway.platforms.base import (
     SendResult,
     MessageEvent,
     MessageType,
+    ProcessingOutcome,
     cache_media_bytes,
 )
 from gateway.config import Platform
@@ -937,6 +938,33 @@ class BuzzAdapter(BasePlatformAdapter):
         # instead of opening a new thread under every reply (see _thread_root).
         self._thread_roots: "OrderedDict[str, Optional[str]]" = OrderedDict()
 
+        # ── Reaction lifecycle (👀 received → 🧠 working → ✅/❌) ──────────
+        # Best-effort visible progress: Buzz has no typing-indicator API, so
+        # reactions are the only pre-reply surface. Config gate:
+        #   gateway.platforms.buzz.extra.reactions (default true)
+        # Deliberately NOT an env var — behavioral config belongs in
+        # config.yaml (profile-scoped, so multiplex profiles stay isolated).
+        reactions_raw = extra.get("reactions", True)
+        if isinstance(reactions_raw, bool):
+            self._reactions_enabled_flag = reactions_raw
+        else:
+            _text = str(reactions_raw).strip().lower()
+            if _text in ("true", "1", "yes", "on"):
+                self._reactions_enabled_flag = True
+            elif _text in ("false", "0", "no", "off"):
+                self._reactions_enabled_flag = False
+            else:
+                logger.warning(
+                    "Buzz: invalid reactions value %r in platforms.buzz.extra; "
+                    "using default true",
+                    reactions_raw,
+                )
+                self._reactions_enabled_flag = True
+        # (chat_id, message_id) -> {"emoji": str|None, "terminal": bool,
+        # "tail_task": asyncio.Task|None}
+        self._reaction_lifecycle: Dict[tuple, dict] = {}
+        self._reaction_tasks: set = set()
+
     @property
     def name(self) -> str:
         return "Buzz"
@@ -1125,8 +1153,197 @@ class BuzzAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._poll_task = None
+        # Reaction lifecycle: cancel any in-flight transition tasks so
+        # shutdown never leaks "task pending" warnings or hangs on a wedged
+        # buzz-cli call.
+        pending = [t for t in self._reaction_tasks if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._reaction_tasks.clear()
+        self._reaction_lifecycle = {}
         self._channel_state = {}
         self._poll_count = 0
+
+    async def remove_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        """Remove our emoji reaction from a message via buzz-cli.
+
+        Mirrors :meth:`send_reaction`: best-effort, returns True/False, never
+        raises into the message flow. Requires the exact emoji because the
+        CLI contract is ``reactions remove --event <id> --emoji <e>``.
+        """
+        if not self.cli_path or not emoji or not message_id:
+            return False
+        args = [
+            "reactions", "remove",
+            "--event", str(message_id),
+            "--emoji", emoji,
+        ]
+        try:
+            code, _out, err = await self._run_cli(args)
+        except Exception as exc:
+            logger.debug(
+                "Buzz: reaction remove failed for message %s in %s — %s",
+                message_id[:12], chat_id, exc,
+            )
+            return False
+        if code != 0:
+            logger.debug(
+                "Buzz: reaction remove failed for message %s in %s — %s",
+                message_id[:12], chat_id, _cli_error_message(err, code),
+            )
+            return False
+        return True
+
+    # ── Reaction lifecycle coordinator ────────────────────────────────────
+    #
+    # Buzz has no typing-indicator API, so reactions are the only visible
+    # pre-reply progress. State machine per inbound message, keyed
+    # (chat_id, message_id): 👀 queued at dispatch → 🧠 when background
+    # processing starts → ✅/❌ on the real outcome (CANCELLED removes the
+    # working reaction and adds nothing). Transitions are serialized per
+    # message behind a tail task so hooks can fire out of order / early
+    # without stacking or racing reactions on the relay, and every buzz-cli
+    # call happens in a background task — never awaited by message
+    # processing or response delivery. Best-effort throughout: any failure
+    # only means the user sees a stale emoji, never a broken reply.
+
+    _RECEIVED_EMOJI = "\N{EYES}"
+    _WORKING_EMOJI = "\N{BRAIN}"
+    _OK_EMOJI = "\N{WHITE HEAVY CHECK MARK}"
+    _FAIL_EMOJI = "\N{CROSS MARK}"
+
+    def _reactions_enabled(self) -> bool:
+        """Config gate: platforms.buzz.extra.reactions (default true)."""
+        return self._reactions_enabled_flag
+
+    def _reaction_begin(self, chat_id: str, message_id: str) -> None:
+        """Create lifecycle state and queue the 👀 transition (non-blocking)."""
+        key = (chat_id, message_id)
+        if key in self._reaction_lifecycle:
+            return
+        self._reaction_lifecycle[key] = {
+            "emoji": None, "terminal": False, "tail_task": None,
+        }
+        self._reaction_transition_enqueue(key, self._RECEIVED_EMOJI)
+
+    def _reaction_transition_enqueue(
+        self, key: tuple, desired: Optional[str], *, terminal: bool = False
+    ) -> None:
+        """Queue a transition behind the current tail; returns immediately.
+
+        ``terminal=True`` marks the lifecycle finished. The transition still
+        runs (chained behind its predecessors), but no further transitions
+        may be enqueued and the terminal task drops the lifecycle state when
+        it completes.
+        """
+        state = self._reaction_lifecycle.get(key)
+        if state is None or state["terminal"]:
+            return
+        if terminal:
+            state["terminal"] = True
+        task = asyncio.create_task(
+            self._reaction_transition_run(
+                key, desired, state.get("tail_task"), terminal
+            )
+        )
+        state["tail_task"] = task
+        self._reaction_tasks.add(task)
+        task.add_done_callback(self._reaction_tasks.discard)
+
+    async def _reaction_transition_run(
+        self,
+        key: tuple,
+        desired: Optional[str],
+        prev: Optional[asyncio.Task],
+        terminal: bool,
+    ) -> None:
+        """Serialized remove-gated replacement; see block comment above."""
+        try:
+            if prev is not None:
+                try:
+                    await prev
+                except asyncio.CancelledError:
+                    # Shutdown cancelled the chain ahead of us — stop here.
+                    raise
+                except Exception:
+                    pass  # predecessor failed; best-effort chain continues
+            state = self._reaction_lifecycle.get(key)
+            if state is None:
+                return
+            chat_id, message_id = key
+            current = state["emoji"]
+            if desired != current:
+                if current is not None:
+                    if not await self.remove_reaction(chat_id, message_id, current):
+                        # Keep the old reaction authoritative; skip the add
+                        # so two lifecycle reactions never stack on the relay.
+                        return
+                    state["emoji"] = None
+                if desired is not None and await self.send_reaction(
+                    chat_id, message_id, desired
+                ):
+                    state["emoji"] = desired
+        finally:
+            if terminal:
+                # The terminal task is the chain's last link (later enqueues
+                # are rejected), so dropping the state here cannot orphan a
+                # queued transition. Best-effort end regardless of I/O result.
+                self._reaction_lifecycle.pop(key, None)
+
+    def _reaction_eligible(self, event: MessageEvent) -> bool:
+        """True when this turn should carry lifecycle reactions.
+
+        Requires message ids, an enabled gate, a conversational (non-command)
+        message, and — when a gateway authorization callback is installed —
+        a positive authorization for the sender. ``on_processing_start`` runs
+        before the runner's central authorization check, so without this
+        gate unauthorized senders would earn a 👀 they can see.
+        """
+        if not getattr(event, "message_id", None):
+            return False
+        if not self._reactions_enabled():
+            return False
+        if not isinstance(getattr(event, "text", None), str) or event.is_command():
+            return False
+        user_id = getattr(event.source, "user_id", None)
+        if user_id and self._authorization_check is not None:
+            decision = self._is_sender_authorized(
+                user_id,
+                chat_type=getattr(event.source, "chat_type", None),
+                chat_id=getattr(event.source, "chat_id", None),
+            )
+            if decision is False:
+                return False
+        return True
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """👀 → 🧠 when background processing of the message begins."""
+        key = (
+            getattr(event.source, "chat_id", None),
+            getattr(event, "message_id", None),
+        )
+        if key in self._reaction_lifecycle:
+            self._reaction_transition_enqueue(key, self._WORKING_EMOJI)
+
+    async def on_processing_complete(
+        self, event: MessageEvent, outcome: ProcessingOutcome
+    ) -> None:
+        """🧠 → ✅/❌ on the real outcome; CANCELLED removes and adds nothing."""
+        key = (
+            getattr(event.source, "chat_id", None),
+            getattr(event, "message_id", None),
+        )
+        if key not in self._reaction_lifecycle:
+            return
+        if outcome == ProcessingOutcome.SUCCESS:
+            desired = self._OK_EMOJI
+        elif outcome == ProcessingOutcome.FAILURE:
+            desired = self._FAIL_EMOJI
+        else:
+            desired = None  # CANCELLED: remove current, add no terminal.
+        self._reaction_transition_enqueue(key, desired, terminal=True)
 
     # ── Sending ───────────────────────────────────────────────────────────
 
@@ -1401,7 +1618,14 @@ class BuzzAdapter(BasePlatformAdapter):
             "--event", str(message_id),
             "--emoji", emoji,
         ]
-        code, _out, err = await self._run_cli(args)
+        try:
+            code, _out, err = await self._run_cli(args)
+        except Exception as exc:
+            logger.debug(
+                "Buzz: reaction add failed for message %s in %s — %s",
+                message_id[:12], chat_id, exc,
+            )
+            return False
         if code != 0:
             logger.debug(
                 "Buzz: reaction add failed for message %s in %s — %s",
@@ -2997,6 +3221,11 @@ class BuzzAdapter(BasePlatformAdapter):
             thread_id=thread_id,
         )
 
+        # Reaction lifecycle: create state and queue 👀 as a tracked
+        # transition BEFORE handle_message (which spawns the background task
+        # that fires on_processing_start) so the states stay ordered.
+        # Skipped for commands / disabled gate / unauthorized senders / bad
+        # ids — see _reaction_eligible.
         event = MessageEvent(
             text=text,
             message_type=message_type,
@@ -3013,14 +3242,10 @@ class BuzzAdapter(BasePlatformAdapter):
             reply_to_is_own_message=reply_to_is_own_message,
         )
 
-        await self.handle_message(event)
+        if self._reaction_eligible(event):
+            self._reaction_begin(chat_id, message_id)
 
-        # Add a "seen" reaction after dispatching — signals to the user that
-        # their message was received and is being processed.
-        try:
-            await self.send_reaction(chat_id, message_id, "👀")
-        except Exception:
-            logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
+        await self.handle_message(event)
 
 
 # ---------------------------------------------------------------------------

@@ -83,7 +83,10 @@ def _event(event_id, pubkey=OTHER_PUBKEY, content="hello", created_at=1000, kind
 def _make_adapter(extra=None):
     from gateway.config import PlatformConfig
 
-    cfg = PlatformConfig(enabled=True, extra={"relay_url": "https://test.relay", **(extra or {})})
+    cfg = PlatformConfig(
+        enabled=True,
+        extra={"relay_url": "https://test.relay", "reactions": False, **(extra or {})},
+    )
     adapter = BuzzAdapter(cfg)
     adapter._self_pubkey = SELF_PUBKEY
     adapter._self_npub = SELF_NPUB

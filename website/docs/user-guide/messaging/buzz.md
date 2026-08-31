@@ -85,6 +85,7 @@ gateway:
         allowed_users: []                 # empty = allow all if allow_all_users is true; otherwise restrict to listed npubs/hex pubkeys
         require_mention: true             # in channels: only respond when addressed (@name, npub, or hex pubkey); DMs always dispatch regardless
         allow_all_users: false            # set true for community mode (everyone can chat, only owner is admin); false for private mode (only allowed_users)
+        reactions: true                   # 👀 received → 🧠 working → ✅/❌ done reactions on each conversational turn
 ```
 
 **Why these defaults:**
@@ -121,6 +122,17 @@ gateway:
 ```
 
 The opt-out applies to **all** send paths — final answers, streamed updates, interim commentary, tool-progress bubbles, and out-of-process cron delivery (`deliver=buzz`).
+
+## Reaction lifecycle
+
+Buzz has no typing indicator, so the agent marks each conversational turn with emoji reactions on your message:
+
+- 👀 — received
+- 🧠 — working on it
+- ✅ — replied successfully
+- ❌ — failed (the error follows as a regular message)
+
+Only one reaction is shown at a time — each replaces the previous one. Commands (`/status`, `/stop`, …) don't get reactions, and senders who aren't authorized to talk to the agent never see any. Reactions are best-effort: if a reaction fails to update, the reply is unaffected. Set `reactions: false` in the `buzz` `extra` block to turn them off.
 
 ## Access control
 
