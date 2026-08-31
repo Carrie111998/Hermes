@@ -36,6 +36,7 @@ import { normalize } from '@/lib/text'
 import { fmtDayTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $connection } from '@/store/session'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
@@ -125,6 +126,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
   const a = t.artifacts
   const navigate = useNavigate()
   const connection = useStore($connection)
+  const activeProfile = useStore($activeGatewayProfile)
   const [artifacts, setArtifacts] = useState<ArtifactRecord[] | null>(null)
   const [query, setQuery] = useState('')
 
@@ -163,7 +165,7 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
             await getAllSessionMessages(session.id, {
               connectionId: session.connection_id,
               profile: session.profile
-            })
+            }, { signal: controller.signal })
           ).messages,
         {
           cache: artifactSessionCache,
@@ -171,7 +173,8 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
             connection?.connectionId || '',
             connection?.mode || 'local',
             connection?.baseUrl || '',
-            connection?.remoteIdentity || ''
+            connection?.remoteIdentity || '',
+            connection?.profile || activeProfile || ''
           ].join(':'),
           signal: controller.signal,
           yieldToMainThread
@@ -231,7 +234,9 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
     connection?.baseUrl,
     connection?.connectionId,
     connection?.mode,
-    connection?.remoteIdentity
+    connection?.profile,
+    connection?.remoteIdentity,
+    activeProfile
   ])
 
   useRefreshHotkey(refreshArtifacts)

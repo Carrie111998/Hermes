@@ -451,7 +451,7 @@ export function collectArtifactsForSession(session: SessionInfo, messages: Sessi
 
 export async function loadArtifactsForSessions(
   sessions: SessionInfo[],
-  loadMessages: (session: SessionInfo) => Promise<SessionMessage[]>,
+  loadMessages: (session: SessionInfo, signal?: AbortSignal) => Promise<SessionMessage[]>,
   options: ArtifactLoadOptions = {}
 ): Promise<ArtifactLoadResult> {
   const artifacts: ArtifactRecord[] = []
@@ -471,13 +471,7 @@ export async function loadArtifactsForSessions(
 
     const cacheKey = `${options.scope || ''}:${session.connection_id || ''}:${session.profile || ''}:${session.id}`
 
-    const fingerprint = JSON.stringify([
-      session.last_active,
-      session.message_count,
-      session.tool_call_count,
-      session.title,
-      session.preview
-    ])
+    const fingerprint = JSON.stringify(session)
 
     const cached = options.cache?.get(cacheKey)
 
@@ -490,7 +484,7 @@ export async function loadArtifactsForSessions(
     }
 
     try {
-      const messages = await loadMessages(session)
+      const messages = await loadMessages(session, options.signal)
       throwIfAborted()
 
       const sessionArtifacts = collectArtifactsForSession(session, messages)
@@ -500,10 +494,7 @@ export async function loadArtifactsForSessions(
         options.cache.delete(cacheKey)
 
         if (!session.is_active) {
-          const characters = sessionArtifacts.reduce(
-            (total, artifact) => total + artifact.value.length + artifact.label.length + artifact.sessionTitle.length,
-            0
-          )
+          const characters = JSON.stringify(sessionArtifacts).length
 
           if (characters <= MAX_ARTIFACT_CACHE_CHARACTERS && sessionArtifacts.length <= MAX_ARTIFACT_CACHE_ARTIFACTS) {
             options.cache.set(cacheKey, {
@@ -546,7 +537,7 @@ export async function loadArtifactsForSessions(
       throwIfAborted()
     } catch (error) {
       if (options.signal?.aborted) {
-        throw error
+        throwIfAborted()
       }
 
       failures.push({ error, session })

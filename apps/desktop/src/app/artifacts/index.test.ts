@@ -443,6 +443,21 @@ describe('loadArtifactsForSessions', () => {
     expect(loadMessages).toHaveBeenCalledTimes(2)
   })
 
+  it('passes the abort signal to transcript loads', async () => {
+    const controller = new AbortController()
+    let received: AbortSignal | undefined
+
+    const loadMessages = vi.fn(async (_session: SessionInfo, signal?: AbortSignal) => {
+      received = signal
+
+      return []
+    })
+
+    await loadArtifactsForSessions([makeSession()], loadMessages, { signal: controller.signal })
+
+    expect(received).toBe(controller.signal)
+  })
+
   it('stops before the next transcript when the load is aborted', async () => {
     const controller = new AbortController()
 
@@ -467,6 +482,19 @@ describe('loadArtifactsForSessions', () => {
     ).rejects.toMatchObject({ name: 'AbortError' })
 
     expect(loadMessages).toHaveBeenCalledOnce()
+  })
+
+  it('does not publish a late non-abort failure after cancellation', async () => {
+    const controller = new AbortController()
+
+    const loadMessages = vi.fn(async () => {
+      controller.abort()
+      throw new Error('late transcript failure')
+    })
+
+    await expect(loadArtifactsForSessions([makeSession()], loadMessages, { signal: controller.signal })).rejects.toMatchObject({
+      name: 'AbortError'
+    })
   })
 
   it('loads transcripts serially and continues after a session fails', async () => {

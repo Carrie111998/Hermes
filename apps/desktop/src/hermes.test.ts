@@ -590,6 +590,23 @@ describe('Hermes REST helpers', () => {
     })
   })
 
+  it('rejects an in-flight complete transcript request when aborted', async () => {
+    let resolveRequest!: (value: unknown) => void
+
+    const pending = new Promise(resolve => {
+      resolveRequest = resolve
+    })
+
+    const controller = new AbortController()
+    api.mockReturnValue(pending)
+
+    const result = getAllSessionMessages('session-1', null, { signal: controller.signal })
+    controller.abort()
+
+    await expect(result).rejects.toMatchObject({ name: 'AbortError' })
+    resolveRequest({ messages: [], session_id: 'session-1' })
+  })
+
   it('stops complete transcript loads before Desktop memory becomes unbounded', async () => {
     api.mockResolvedValueOnce({
       messages: [{ id: 1, content: 'large transcript page' }],

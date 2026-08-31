@@ -351,6 +351,41 @@ export function getSession(id: string, profile?: ProfileScope): Promise<SessionI
   })
 }
 
+function abortError(): DOMException {
+  return new DOMException('Session transcript loading was aborted', 'AbortError')
+}
+
+function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) {
+    return promise
+  }
+
+  if (signal.aborted) {
+    return Promise.reject(abortError())
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener('abort', onAbort)
+
+    const onAbort = () => {
+      cleanup()
+      reject(abortError())
+    }
+
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      value => {
+        cleanup()
+        resolve(value)
+      },
+      error => {
+        cleanup()
+        reject(error)
+      }
+    )
+  })
+}
+
 // Reads another profile's transcript. For a remote profile Electron reroutes
 // this GET to the remote backend (which serves its own state.db); for a local
 // profile the primary opens that profile's state.db via ?profile=. Omit for
@@ -486,7 +521,7 @@ export function getOlderSessionMessages(
 export async function getAllSessionMessages(
   id: string,
   profile?: ProfileScope,
-  options: { maxJsonChars?: number } = {}
+  options: { maxJsonChars?: number; signal?: AbortSignal } = {}
 ): Promise<SessionMessagesResponse> {
   const messages: SessionMessage[] = []
   const pageSize = 500
@@ -496,12 +531,23 @@ export async function getAllSessionMessages(
   let resolvedSessionId = id
 
   while (true) {
-    const page = await getSessionMessages(id, profile, {
-      limit: pageSize,
-      offset,
-      order: 'oldest',
-      includeCompacted: true
-    })
+    if (options.signal?.aborted) {
+      throw abortError()
+    }
+
+    const page = await abortable(
+      getSessionMessages(id, profile, {
+        limit: pageSize,
+        offset,
+        order: 'oldest',
+        includeCompacted: true
+      }),
+      options.signal
+    )
+
+    if (options.signal?.aborted) {
+      throw abortError()
+    }
 
     resolvedSessionId = page.session_id
     jsonChars += (JSON.stringify(page.messages) ?? '').length
