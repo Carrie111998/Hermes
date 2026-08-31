@@ -2495,9 +2495,17 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    temp_dir_input = os.path.abspath(tempfile.gettempdir())
+    temp_dir = os.path.realpath(temp_dir_input)
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    # Require the exact one-level spelling. Normalizing first would turn
+    # ``/tmp/nested/../hermes-verify-x.py`` into an apparently safe path and
+    # would also exempt a path reached through an arbitrary symlink. The one
+    # platform spelling exception is macOS's conventional /tmp alias.
+    allowed_operands = {os.path.join(temp_dir, basename)}
+    if temp_dir_input == "/tmp":
+        allowed_operands.add(os.path.join("/tmp", basename))
+    if operand not in allowed_operands:
         return False
 
     target = os.path.realpath(operand)

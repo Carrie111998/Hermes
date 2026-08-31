@@ -485,6 +485,8 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.federation import build_federation_parser
+from hermes_cli.federation import cmd_federation
 
 
 def _require_tty(command_name: str) -> None:
@@ -12415,7 +12417,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
+        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update", "federation",
         "webhook", "whatsapp", "whatsapp-cloud", "worktree", "chat", "secrets", "security",
         "browser",
         "verify",
@@ -14637,6 +14639,11 @@ def main():
     # profile command  (parser built in hermes_cli/subcommands/profile.py)
     # =========================================================================
     build_profile_parser(subparsers, cmd_profile=cmd_profile)
+
+    # =========================================================================
+    # federation command (parser built in hermes_cli/subcommands/federation.py)
+    # =========================================================================
+    build_federation_parser(subparsers, cmd_federation=cmd_federation)
 
     # =========================================================================
     # completion command

@@ -82,6 +82,36 @@ def _(rid, params: dict) -> dict:
         except Exception:
             return None
 
+    def _federation_role(profile_path):
+        """Read optional role identity metadata for Bot Mode roster clients."""
+        try:
+            from pathlib import Path
+            import json
+
+            path = Path(profile_path) / "federation_role.json"
+            if not path.is_file():
+                return None
+            with path.open("r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if not isinstance(raw, dict) or raw.get("schema_name") != "hermes_federation_role_v1":
+                return None
+            return {
+                key: raw[key]
+                for key in (
+                    "role_id",
+                    "display_name",
+                    "department",
+                    "authority",
+                    "schedule",
+                    "skills",
+                    "toolsets",
+                    "handoffs",
+                )
+                if key in raw
+            }
+        except Exception:
+            return None
+
     def _canonical_session_row(db, profile_path):
         """Summary of the profile's canonical "Bot Chat" registry row, or None.
 
@@ -267,6 +297,12 @@ def _(rid, params: dict) -> dict:
                 "display_name": getattr(p, "display_name", "") or "",
                 "skill_count": getattr(p, "skill_count", 0) or 0,
             }
+            federation_role = _federation_role(p.path)
+            if federation_role:
+                # Optional and additive: older clients ignore it, while Bot
+                # Mode and future federation surfaces can group/filter the
+                # roster without parsing profile files themselves.
+                row["federation_role"] = federation_role
             if include_sessions:
                 db = _open_profile_session_db(p.path)
                 try:
