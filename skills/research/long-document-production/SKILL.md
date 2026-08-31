@@ -8,7 +8,7 @@ platforms: [windows, linux, macos]
 metadata:
   hermes:
     tags: [publication, long-form, latex, visual-qa, source-fusion, hermes, security]
-    related_skills: [arxiv-paper-production, axl-voice-and-public-writing, source-of-truth-or-silence, axl-public-artifact-quality, hermes-agent-skill-authoring, feature-parity-alignment-campaigns, godfile-decomposition-campaigns, campaign-operations-kill-locks]
+    related_skills: [hermes-agent-skill-authoring]
 ---
 
 # Long Document Production
