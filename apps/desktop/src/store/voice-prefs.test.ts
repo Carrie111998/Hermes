@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 
 import {
   $autoSpeakReplies,
@@ -37,14 +37,34 @@ describe('desktop-local auto-speak preference', () => {
   })
 
   it('a failed local write reverts the atom', async () => {
-    const failing = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
-      throw new DOMException('quota exceeded', 'QuotaExceededError')
-    })
+    // Swap the whole `localStorage` property rather than mocking
+    // `Storage.prototype`: under Node 26 the setup file installs a
+    // plain-object storage fallback whose methods are own properties (no
+    // Storage prototype), while jsdom's Storage wrapper silently drops
+    // own-property overrides. Replacing the property works under both.
+    const real = window.localStorage
 
-    await expect(setAutoSpeakReplies(true)).rejects.toThrow()
-    expect($autoSpeakReplies.get()).toBe(false)
+    const failing: Storage = {
+      get length() {
+        return real.length
+      },
+      key: index => real.key(index),
+      getItem: key => real.getItem(key),
+      setItem: () => {
+        throw new DOMException('quota exceeded', 'QuotaExceededError')
+      },
+      removeItem: key => real.removeItem(key),
+      clear: () => real.clear()
+    }
 
-    failing.mockRestore()
+    Object.defineProperty(window, 'localStorage', { value: failing, configurable: true })
+
+    try {
+      await expect(setAutoSpeakReplies(true)).rejects.toThrow()
+      expect($autoSpeakReplies.get()).toBe(false)
+    } finally {
+      Object.defineProperty(window, 'localStorage', { value: real, configurable: true })
+    }
   })
 })
 
