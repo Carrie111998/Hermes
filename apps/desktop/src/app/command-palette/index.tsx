@@ -17,7 +17,7 @@ import { codiconIcon } from '@/components/ui/codicon'
 import { Command, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
 import { HighlightMatches } from '@/components/ui/highlight-matches'
 import { KbdCombo } from '@/components/ui/kbd'
-import { getHermesConfigRecord, listAllProfileSessions } from '@/hermes'
+import { getHermesConfigRecord } from '@/hermes'
 import { useMediaQuery } from '@/hooks/use-media-query'
 import { useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
@@ -87,6 +87,7 @@ import { canOpenNewWindow, openNewWindow } from '@/store/windows'
 import { luminance } from '@/themes/color'
 import { type ThemeMode, useTheme } from '@/themes/context'
 import { isUserTheme, resolveTheme } from '@/themes/user-themes'
+import type { SessionInfo } from '@/types/hermes'
 
 import { openSession, openSessionIntentFromModifiers } from '../open-session'
 import {
@@ -113,6 +114,7 @@ import { PetInlineToggle, PetPalettePage } from './pet-palette-page'
 import { commandPaletteQueryKey } from './query-scope'
 import { rankPaletteGroups } from './rank-groups'
 import { resolvePaletteSearchStatus } from './search-status'
+import { commandPaletteSessionsQueryFn } from './session-query'
 
 interface PaletteItem {
   /** Keybind action id — its live combo renders as a hotkey hint. */
@@ -310,7 +312,7 @@ const SESSION_ID_RE = /^\d{8}_\d{6}_[a-f0-9]{6}$/
 // home path would always miss and double-create.
 const FOLDER_PATH_RE = /^(\/|[A-Za-z]:[/\\]).+/
 
-type SessionRow = Awaited<ReturnType<typeof listAllProfileSessions>>['sessions'][number]
+type SessionRow = SessionInfo
 
 const toSessionEntry = (session: SessionRow): SessionEntry => ({
   git_branch: session.git_branch ?? null,
@@ -582,13 +584,13 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const sessionsQuery = useQuery({
     enabled: hasRootSearch,
     queryKey: commandPaletteQueryKey('sessions', connection, activeGatewayProfile),
-    queryFn: () => listAllProfileSessions(200, 1, 'exclude')
+    queryFn: context => commandPaletteSessionsQueryFn(context, false)
   })
 
   const archivedQuery = useQuery({
     enabled: hasRootSearch,
     queryKey: commandPaletteQueryKey('archived', connection, activeGatewayProfile),
-    queryFn: () => listAllProfileSessions(200, 0, 'only')
+    queryFn: context => commandPaletteSessionsQueryFn(context, true)
   })
 
   // getServers is the shared choke point that also drops malformed (null/
