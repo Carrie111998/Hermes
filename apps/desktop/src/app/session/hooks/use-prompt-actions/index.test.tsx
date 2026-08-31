@@ -9,7 +9,7 @@ import { textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
-import { requestGatewayForAgent } from '@/store/gateway'
+import { requestGatewayForAgent, retainGatewayForSessionTurn } from '@/store/gateway'
 import { $goalsBySession, setSessionGoal } from '@/store/goals'
 import { $hudMode } from '@/store/hud'
 import { $notifications, clearNotifications } from '@/store/notifications'
@@ -22,8 +22,10 @@ import {
   $sessions,
   $terminalBackend,
   $turnStartedAt,
+  _resetSessionOwnerHintsForTests,
   setCurrentUsage,
   setMessages,
+  setSessionOwnerHint,
   setSessions
 } from '@/store/session'
 import { dropSessionState, publishSessionState } from '@/store/session-states'
@@ -40,6 +42,11 @@ import { uploadComposerAttachment, usePromptActions } from '.'
 // never-settling in-flight promise from one test into the next.
 beforeEach(() => {
   clearSingleFlightSessionResumeState()
+  vi.mocked(retainGatewayForSessionTurn).mockImplementation(async () => {
+    const release: () => void = vi.fn()
+
+    return release
+  })
 })
 
 vi.mock('@/hermes', () => ({
@@ -52,7 +59,8 @@ vi.mock('@/hermes', () => ({
 
 vi.mock('@/store/gateway', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
-  requestGatewayForAgent: vi.fn()
+  requestGatewayForAgent: vi.fn(),
+  retainGatewayForSessionTurn: vi.fn(async () => vi.fn())
 }))
 
 // The active id the desktop holds is the *runtime* session id from
@@ -1775,6 +1783,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     cleanup()
     $connection.set(null)
     vi.mocked(requestGatewayForAgent).mockReset()
+    vi.mocked(retainGatewayForSessionTurn).mockReset()
     vi.restoreAllMocks()
   })
 
@@ -1783,7 +1792,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     setSessions([sessionInfo({ id: 'stored-remote', profile: 'default' })])
 
     const ambientRequest = vi.fn(async () => ({}) as never)
-    vi.mocked(requestGatewayForAgent).mockResolvedValue({} as never)
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({ status: 'streaming' } as never)
 
     let handle: HarnessHandle | null = null
     await actRender(
@@ -1803,8 +1812,10 @@ describe('usePromptActions submit / queue drain semantics', () => {
       'default',
       'prompt.submit',
       { session_id: 'runtime-remote', text: 'continue remotely' },
-      1_800_000
+      1_800_000,
+      undefined
     )
+    expect(retainGatewayForSessionTurn).toHaveBeenCalledWith('hermes01', 'default', 'runtime-remote')
     expect(ambientRequest).not.toHaveBeenCalled()
   })
 
@@ -4393,6 +4404,9 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
     vi.restoreAllMocks()
     $connection.set(null)
     $composerAttachments.set([])
+    _resetSessionOwnerHintsForTests({ storage: true })
+    vi.mocked(requestGatewayForAgent).mockReset()
+    vi.mocked(retainGatewayForSessionTurn).mockReset()
   })
 
   it('delivers the first message of a new chat through the intentional route transition (#62562)', async () => {
@@ -4409,18 +4423,16 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
       expect(preview).toBe('first message of a new chat')
       activeSessionIdRef.current = NEW_RUNTIME_ID
       selectedStoredSessionIdRef.current = NEW_STORED_ID
+      setSessionOwnerHint(NEW_STORED_ID, { connectionId: 'local', profile: 'sec' })
       routeToken = `/${NEW_STORED_ID}::`
 
       return NEW_RUNTIME_ID
     })
 
-    const calls: { method: string; params?: Record<string, unknown> }[] = []
-
-    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
-      calls.push({ method, params })
-
-      return {} as never
-    })
+    const requestGateway = vi.fn(async () => ({}) as never)
+    const releaseTurnLease = vi.fn()
+    vi.mocked(retainGatewayForSessionTurn).mockResolvedValue(releaseTurnLease)
+    vi.mocked(requestGatewayForAgent).mockResolvedValue({ status: 'streaming' } as never)
 
     let handle: HarnessHandle | null = null
     render(
@@ -4440,15 +4452,17 @@ describe('usePromptActions new-chat first-send delivery (#63078)', () => {
 
     expect(await handle!.submitText('first message of a new chat')).toBe(true)
     expect(createBackendSessionForSend).toHaveBeenCalledTimes(1)
-    // The FULL RPC transcript: exactly one prompt.submit, addressed to the
-    // created runtime session, carrying the user's text — no session.resume
-    // detour and, critically, no silent drop before the submit.
-    expect(calls).toEqual([
-      {
-        method: 'prompt.submit',
-        params: { session_id: NEW_RUNTIME_ID, text: 'first message of a new chat' }
-      }
-    ])
+    expect(retainGatewayForSessionTurn).toHaveBeenCalledWith('local', 'sec', NEW_RUNTIME_ID)
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      'local',
+      'sec',
+      'prompt.submit',
+      { session_id: NEW_RUNTIME_ID, text: 'first message of a new chat' },
+      1_800_000,
+      undefined
+    )
+    expect(releaseTurnLease).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
   })
 
   it('delivers the first prompt when React Router commits the created-session route late (#62990)', async () => {
