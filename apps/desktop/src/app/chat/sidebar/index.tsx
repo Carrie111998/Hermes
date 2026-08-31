@@ -1396,6 +1396,9 @@ export function ChatSidebar({
                   // virtualized long list, which must keep its own scroller.
                   !recentsVirtualizes && COMPACT_FLAT
                 )}
+                // Date rhythm only makes sense over the recency sort — a manual
+                // drag-order would make "Today"/"Yesterday" dividers lie.
+                dateSections={!showAllProfiles && !agentOrderManual}
                 dndSensors={dndSensors}
                 emptyState={
                   showSessionSkeletons ? (

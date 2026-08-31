@@ -4,10 +4,11 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { type FC, useCallback, useRef } from 'react'
 
 import type { SessionInfo } from '@/hermes'
-import { type SidebarSessionEntry } from '@/lib/session-branch-tree'
 import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
 
+import { SidebarDateSectionHeader } from './date-section-header'
+import type { SidebarSessionListItem } from './session-date-sections'
 import { SidebarSessionRow } from './session-row'
 
 interface SessionRowCommonProps {
@@ -27,7 +28,7 @@ interface SessionRowCommonProps {
 interface VirtualSessionListProps {
   activeSessionId: null | string
   className?: string
-  entries: SidebarSessionEntry[]
+  items: SidebarSessionListItem[]
   onArchiveSession: (sessionId: string) => void
   onBranchSession?: (sessionId: string, profile?: string) => void
   onDeleteSession: (sessionId: string) => void
@@ -40,12 +41,13 @@ interface VirtualSessionListProps {
 }
 
 const ROW_ESTIMATE_PX = 28
+const HEADER_ESTIMATE_PX = 24
 const OVERSCAN_ROWS = 12
 
 export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   activeSessionId,
   className,
-  entries,
+  items,
   onArchiveSession,
   onBranchSession,
   onDeleteSession,
@@ -59,9 +61,13 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   const scrollerRef = useRef<HTMLDivElement | null>(null)
 
   const virtualizer = useVirtualizer({
-    count: entries.length,
-    estimateSize: () => ROW_ESTIMATE_PX,
-    getItemKey: index => entries[index]?.session.id ?? index,
+    count: items.length,
+    estimateSize: index => (items[index]?.kind === 'header' ? HEADER_ESTIMATE_PX : ROW_ESTIMATE_PX),
+    getItemKey: index => {
+      const item = items[index]
+
+      return (item?.kind === 'header' ? item.id : item?.entry.session.id) ?? index
+    },
     getScrollElement: () => scrollerRef.current,
     // jsdom-friendly default; the real rect takes over on first observe.
     initialRect: { height: 600, width: 240 },
@@ -74,13 +80,24 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   const paddingBottom = Math.max(0, totalSize - (virtualItems[virtualItems.length - 1]?.end ?? 0))
 
   const rows = virtualItems.map(virtualItem => {
-    const entry = entries[virtualItem.index]
+    const item = items[virtualItem.index]
 
-    if (!entry) {
+    if (!item) {
       return null
     }
 
-    const { branchStem, session } = entry
+    if (item.kind === 'header') {
+      return (
+        <SidebarDateSectionHeader
+          bucket={item.bucket}
+          data-index={virtualItem.index}
+          key={item.id}
+          ref={virtualizer.measureElement}
+        />
+      )
+    }
+
+    const { branchStem, session } = item.entry
     const reorderable = sortable && !branchStem
 
     const commonProps: SessionRowCommonProps = {

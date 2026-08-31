@@ -1795,6 +1795,12 @@ export const zh: Translations = {
     groupTitleGrouped: '取消分组',
     groupTitleUngrouped: '按工作区分组',
     allPinned: '这里的全部已置顶。取消置顶某个对话即可在最近中显示。',
+    dateSections: {
+      today: '今天',
+      yesterday: '昨天',
+      thisWeek: '本周',
+      thisMonth: '本月'
+    },
     shiftClickHint: 'Shift+ 单击对话以置顶 · 拖动以重新排序',
     noWorkspace: '无工作区',
     noProject: '无项目',

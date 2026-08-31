@@ -12,6 +12,7 @@ import { cn } from '@/lib/utils'
 import { sessionPinId } from '@/store/session'
 
 import { SidebarCount } from './chrome'
+import { SidebarDateSectionHeader } from './date-section-header'
 import {
   EnteredProjectContent,
   ProjectOverviewRow,
@@ -22,6 +23,7 @@ import {
 } from './projects'
 import { ReorderableList, useSortableBindings } from './reorderable-list'
 import { SidebarSessionSkeletons } from './section-states'
+import { type SidebarSessionListItem, withDateSections } from './session-date-sections'
 import { SidebarSessionRow } from './session-row'
 import { VirtualSessionList } from './virtual-session-list'
 
@@ -139,6 +141,10 @@ interface SidebarSessionsSectionProps {
   // lists (Pinned / search results) in the All-profiles view, where no group
   // header communicates ownership (#66003).
   showProfileTags?: boolean
+  // Interleave date dividers (Today / Yesterday / …) into the flat list. Only
+  // meaningful over the recency sort — callers must leave this off while the
+  // user's manual drag-order is active, where date rhythm would lie.
+  dateSections?: boolean
 }
 
 export function SidebarSessionsSection({
@@ -179,7 +185,8 @@ export function SidebarSessionsSection({
   onReorderProjects,
   projectBackRow,
   dndSensors,
-  showProfileTags = false
+  showProfileTags = false,
+  dateSections = false
 }: SidebarSessionsSectionProps) {
   const sectionOpen = collapsible ? open : true
   const hasGroupedSessions = Boolean(groups?.some(group => group.sessions.length > 0))
@@ -195,6 +202,14 @@ export function SidebarSessionsSection({
   // grouped/tree views always sort by creation date and never drag.
   const sessionsDraggable = sortable && !!onReorderSessions
   const displayEntries = useMemo(() => flattenSessionsWithBranches(sessions), [sessions])
+
+  const displayItems = useMemo<SidebarSessionListItem[]>(
+    () =>
+      dateSections
+        ? withDateSections(displayEntries)
+        : displayEntries.map(entry => ({ entry, kind: 'entry' as const })),
+    [dateSections, displayEntries]
+  )
 
   const renderRow = (session: SessionInfo, draggable: boolean, branchStem?: string) => {
     const rowProps = {
@@ -310,7 +325,7 @@ export function SidebarSessionsSection({
       <VirtualSessionList
         activeSessionId={activeSessionId}
         className={contentClassName}
-        entries={displayEntries}
+        items={displayItems}
         onArchiveSession={onArchiveSession}
         onBranchSession={onBranchSession}
         onDeleteSession={onDeleteSession}
@@ -334,11 +349,23 @@ export function SidebarSessionsSection({
   } else if (sessionsDraggable && onReorderSessions) {
     inner = (
       <ReorderableList ids={sessions.map(s => s.id)} onReorder={onReorderSessions} sensors={dndSensors}>
-        {displayEntries.map(({ branchStem, session }) => renderRow(session, true, branchStem))}
+        {displayItems.map(item =>
+          item.kind === 'header' ? (
+            <SidebarDateSectionHeader bucket={item.bucket} key={item.id} />
+          ) : (
+            renderRow(item.entry.session, true, item.entry.branchStem)
+          )
+        )}
       </ReorderableList>
     )
   } else {
-    inner = displayEntries.map(({ branchStem, session }) => renderRow(session, false, branchStem))
+    inner = displayItems.map(item =>
+      item.kind === 'header' ? (
+        <SidebarDateSectionHeader bucket={item.bucket} key={item.id} />
+      ) : (
+        renderRow(item.entry.session, false, item.entry.branchStem)
+      )
+    )
   }
 
   // The virtualizer owns its own scroller, so suppress the wrapper's overflow

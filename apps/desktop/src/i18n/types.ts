@@ -1337,6 +1337,12 @@ export interface Translations {
     groupTitleGrouped: string
     groupTitleUngrouped: string
     allPinned: string
+    dateSections: {
+      today: string
+      yesterday: string
+      thisWeek: string
+      thisMonth: string
+    }
     shiftClickHint: string
     noWorkspace: string
     noProject: string

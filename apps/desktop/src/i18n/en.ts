@@ -1612,6 +1612,12 @@ export const en: Translations = {
     groupTitleGrouped: 'Ungroup sessions',
     groupTitleUngrouped: 'Group by workspace',
     allPinned: 'Everything here is pinned. Unpin a chat to show it in recents.',
+    dateSections: {
+      today: 'Today',
+      yesterday: 'Yesterday',
+      thisWeek: 'This week',
+      thisMonth: 'This month'
+    },
     shiftClickHint: 'Shift-click a chat to pin',
     noWorkspace: 'No workspace',
     noProject: 'No project',
