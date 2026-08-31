@@ -637,14 +637,22 @@ def load_cli_config() -> Dict[str, Any]:
     
     # CWD resolution for CLI/TUI. The gateway has its own config bridge in
     # gateway/run.py but may lazily import cli.py (triggering this code).
-    # Local backend: always os.getcwd(). Use `cd /dir && hermes` to control it.
+    # Local backend: use the dispatcher-owned workspace for Kanban workers;
+    # otherwise use os.getcwd(). Use `cd /dir && hermes` to control a normal
+    # interactive CLI. The worker pin must win over both the profile's default
+    # cwd and the launcher's cwd or the worker can inspect/edit the wrong repo.
     # Non-local with placeholder: pop so terminal_tool uses its per-backend default.
     # Non-local with explicit path: keep as-is.
     _CWD_PLACEHOLDERS = (".", "auto", "cwd")
     effective_backend = terminal_config.get("env_type", "local")
 
     if effective_backend == "local":
-        terminal_config["cwd"] = os.getcwd()
+        from agent.runtime_cwd import resolve_kanban_worker_cwd
+
+        terminal_config["cwd"] = (
+            resolve_kanban_worker_cwd(os.environ.get("TERMINAL_CWD"))
+            or os.getcwd()
+        )
         defaults["terminal"]["cwd"] = terminal_config["cwd"]
     elif terminal_config.get("cwd") in _CWD_PLACEHOLDERS:
         terminal_config.pop("cwd", None)
