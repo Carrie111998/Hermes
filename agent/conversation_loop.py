@@ -2005,6 +2005,7 @@ def run_conversation(
     current_turn_user_idx = _ctx.current_turn_user_idx
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
+    _runtime_time_context = _ctx.runtime_time_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
     # Commentary deduplication spans all provider continuations and tool calls
@@ -2083,8 +2084,15 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        # codex_app_server owns its thread and receives only the current user
+        # input here. Add the volatile clock block to that API copy while the
+        # Hermes transcript keeps the clean user message. The subprocess
+        # retains the exact input it received for later turns.
+        _codex_user_message = compose_user_api_content(
+            user_message, "", _runtime_time_context
+        )
         return agent._run_codex_app_server_turn(
-            user_message=user_message,
+            user_message=_codex_user_message or user_message,
             original_user_message=original_user_message,
             messages=messages,
             effective_task_id=effective_task_id,

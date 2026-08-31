@@ -525,6 +525,9 @@ class TurnContext:
     should_review_memory: bool = False
     # Context contributed by ``pre_llm_call`` plugins (appended to user message).
     plugin_user_context: str = ""
+    # Volatile wall-clock context for this inference turn. Kept separate for
+    # runtimes such as codex_app_server that bypass the standard sidecar path.
+    runtime_time_context: str = ""
     # External-memory prefetch result, reused across loop iterations.
     ext_prefetch_cache: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
@@ -1436,6 +1439,27 @@ def build_turn_context(
                 else _gateway_notes
             )
 
+    # Per-turn current-time context (volatile). Composed into the API copy of
+    # the current turn's user message — never the cached system prompt — so
+    # every inference turn sees fresh wall-clock time while the cached prompt
+    # prefix stays byte-stable (see AGENTS.md "prompt caching is sacred").
+    # Runs for every entrypoint (CLI, gateway platforms, cron) because this is
+    # the single shared turn prologue. Fail-open: a formatting problem must
+    # never block a turn.
+    runtime_time_context = ""
+    try:
+        from hermes_time import format_current_time_context
+
+        runtime_time_context = format_current_time_context()
+        if runtime_time_context:
+            plugin_user_context = (
+                runtime_time_context + "\n\n" + plugin_user_context
+                if plugin_user_context
+                else runtime_time_context
+            )
+    except Exception:
+        logger.debug("per-turn time context unavailable", exc_info=True)
+
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
     agent._turn_file_mutation_paths = set()
@@ -1599,6 +1623,7 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx,
         should_review_memory=should_review_memory,
         plugin_user_context=plugin_user_context,
+        runtime_time_context=runtime_time_context,
         ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=_preflight_compression_blocked,
     )

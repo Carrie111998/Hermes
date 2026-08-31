@@ -3278,7 +3278,21 @@ class TestRunConversation:
         ]
         assert all("message_count" in c and isinstance(c.get("request_messages"), list) for c in pre_request_calls)
         assert all("request" in c and "messages" in c["request"]["body"] for c in pre_request_calls)
-        assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
+        # Contract: the user's text remains fully intact AND the volatile
+        # per-turn runtime context (current time) is appended to the API
+        # copy after it. A bare prefix check would let arbitrary trailing
+        # content pass; require the exact two-part shape.
+        _user_msgs = [
+            msg.get("content")
+            for msg in pre_request_calls[0]["request_messages"]
+            if msg.get("role") == "user"
+            and isinstance(msg.get("content"), str)
+        ]
+        assert any(
+            m.startswith("search something\n\n[Runtime Context]")
+            and "\nCurrent datetime: " in m
+            for m in _user_msgs
+        )
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
 
@@ -4966,7 +4980,13 @@ class TestRunConversation:
         # output-cap retry would call the compressor but re-transmit the same
         # oversized request forever.
         second_messages = second_call.get("messages", [])
-        assert second_messages[-1].get("content") == "hello"
+        # The compressed history is re-sent; the single user message carries
+        # the full user text plus the volatile per-turn runtime context
+        # appended after it (exact shape, not a loose prefix).
+        _retry_content = second_messages[-1].get("content")
+        assert isinstance(_retry_content, str)
+        assert _retry_content.startswith("hello\n\n[Runtime Context]")
+        assert "\nCurrent datetime: " in _retry_content
         assert len(second_messages) == 2
         assert second_messages[0]["role"] == "system"
         # context_length was NOT mutated by an output-cap error.

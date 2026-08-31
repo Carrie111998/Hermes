@@ -2995,7 +2995,21 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
 
     summary_request = MAX_ITERATIONS_SUMMARY_REQUEST
-    append_message(messages, {"role": "user", "content": summary_request})
+    summary_request_message = append_message(
+        messages, {"role": "user", "content": summary_request}
+    )
+    # Persist the exact API-bound summary bytes beside the stable synthetic
+    # marker.  The next turn can therefore replay the same prefix instead of
+    # replacing this timestamp with clean marker content and invalidating the
+    # cache at the largest request of the turn.
+    try:
+        from hermes_time import prepend_current_time_context
+
+        summary_api_content = prepend_current_time_context(summary_request)
+        if summary_api_content != summary_request:
+            summary_request_message["api_content"] = summary_api_content
+    except Exception:
+        logger.debug("max-iterations time context unavailable", exc_info=True)
 
     try:
         # Build API messages, stripping internal-only fields
