@@ -1012,14 +1012,13 @@ def redact_sensitive_text(
 
 
 # ---------------------------------------------------------------------------
-# Mandatory tool-result / exception boundary
+# Mandatory dispatch-time tool-result / exception pre-projection
 # ---------------------------------------------------------------------------
 #
-# Tool results are persisted and replayed into model context.  Unlike ordinary
-# display/log redaction, this boundary is therefore not optional and never
-# preserves a credential prefix or suffix.  The ordinary redactor above keeps
-# that diagnostic context by design; tool-result persistence has the stricter
-# contract below.
+# Dispatch results can flow to observers and later sinks.  This pre-projection
+# is therefore not optional and never preserves a credential prefix or suffix.
+# It complements, rather than replaces, the canonical durable/model-facing sink
+# sanitizer selected by the maintainers.
 
 TOOL_SECRET_PLACEHOLDER = "[REDACTED_SECRET]"
 _MIN_RUNTIME_SECRET_CHARS = 6
@@ -1037,28 +1036,30 @@ _TOOL_DISCORD_WEBHOOK_RE = re.compile(
 def _runtime_loaded_secret_values() -> tuple[str, ...]:
     """Return in-scope runtime secret values without exposing metadata.
 
-    A multiplexed turn already carries an authoritative profile secret scope;
-    use every non-trivial value in that scope.  Single-profile processes keep
-    credentials in the process environment, where only credential-named keys
-    are considered.  Values are sorted longest-first so overlapping values are
-    replaced deterministically.
+    Mirror ``agent.secret_scope.get_secret`` authority: an active multiplexed
+    scope is authoritative, while a non-multiplexed scope is an overlay over
+    credential-named process environment values.  Values are sorted
+    longest-first so overlapping values are replaced deterministically.
     """
     values: set[str] = set()
     try:
-        from agent.secret_scope import current_secret_scope
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
 
         scope = current_secret_scope()
+        multiplex_active = is_multiplex_active()
     except Exception:
         scope = None
+        # Failing to establish the multiplexing authority must not widen the
+        # proof scope into process-global credentials.
+        multiplex_active = True
 
-    if scope is not None:
-        candidates = list(scope.values())
-    else:
-        candidates = [
+    candidates = list(scope.values()) if scope is not None else []
+    if not multiplex_active:
+        candidates.extend(
             value
             for key, value in os.environ.items()
             if key != "HERMES_REDACT_SECRETS" and _key_has_secret_keyword(key)
-        ]
+        )
 
     # During an active turn, the resolved provider credential is held in the
     # context-local main runtime.  It may originate from auth.json or OAuth
@@ -1097,12 +1098,13 @@ def _redact_tool_url_credentials(text: str) -> str:
 
 
 def redact_tool_boundary_text(text: Any) -> str:
-    """Redact one text value before logging, persistence, or model replay.
+    """Redact one text value at the dispatch-time pre-projection.
 
-    This is a mandatory egress boundary: it ignores the operator-facing
+    This pre-projection ignores the operator-facing
     ``security.redact_secrets`` preference and always emits the single fixed
-    sentinel.  Runtime-loaded values are removed first, then recognizable
-    credential forms provide defense in depth.
+    sentinel. Runtime-loaded values are removed first, then recognizable
+    credential forms provide defense in depth. Canonical durable-sink
+    ownership remains outside this helper.
     """
     if text is None:
         return ""

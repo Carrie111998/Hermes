@@ -55,6 +55,27 @@ def synthetic_secret_scope():
         reset_secret_scope(token)
 
 
+@pytest.fixture()
+def configure_secret_authority():
+    """Configure one authority matrix cell and restore global/context state."""
+    from agent.secret_scope import is_multiplex_active, set_multiplex_active
+
+    previous_multiplex = is_multiplex_active()
+    tokens = []
+
+    def configure(scope, *, multiplex_active):
+        set_multiplex_active(multiplex_active)
+        token = set_secret_scope(scope)
+        tokens.append(token)
+
+    try:
+        yield configure
+    finally:
+        for token in reversed(tokens):
+            reset_secret_scope(token)
+        set_multiplex_active(previous_multiplex)
+
+
 def _generic_registry_target():
     excluded = {
         "todo",
@@ -129,6 +150,99 @@ class TestEnvelope:
 
 
 class TestMandatorySecretRedaction:
+    def test_scope_miss_uses_credential_env_when_multiplex_off(
+        self, monkeypatch, configure_secret_authority
+    ):
+        scoped_secret = "opaque-scope-" + ("A7mQ" * 8)
+        environment_secret = "opaque-environment-" + ("B8nR" * 8)
+        monkeypatch.setenv("STAGE1B_RUNTIME_PASSWORD", environment_secret)
+        configure_secret_authority(
+            {"STAGE1B_SCOPED_TOKEN": scoped_secret},
+            multiplex_active=False,
+        )
+
+        out = redact_tool_boundary_text(environment_secret)
+
+        assert out == TOOL_SECRET_PLACEHOLDER
+
+    def test_scope_is_authoritative_and_env_is_excluded_when_multiplex_on(
+        self, monkeypatch, configure_secret_authority
+    ):
+        scoped_secret = "opaque-scope-" + ("C9pS" * 8)
+        other_profile_secret = "opaque-other-profile-" + ("D2qT" * 8)
+        monkeypatch.setenv("STAGE1B_RUNTIME_PASSWORD", other_profile_secret)
+        configure_secret_authority(
+            {"STAGE1B_SCOPED_TOKEN": scoped_secret},
+            multiplex_active=True,
+        )
+
+        out = redact_tool_boundary_text(
+            scoped_secret + " | " + other_profile_secret
+        )
+
+        assert out == TOOL_SECRET_PLACEHOLDER + " | " + other_profile_secret
+
+    def test_no_scope_uses_credential_env_when_multiplex_off(
+        self, monkeypatch, configure_secret_authority
+    ):
+        environment_secret = "opaque-environment-" + ("E3rU" * 8)
+        monkeypatch.setenv("STAGE1B_RUNTIME_PASSWORD", environment_secret)
+        configure_secret_authority(None, multiplex_active=False)
+
+        out = redact_tool_boundary_text(environment_secret)
+
+        assert out == TOOL_SECRET_PLACEHOLDER
+
+    def test_no_scope_does_not_widen_to_env_when_multiplex_on(
+        self, monkeypatch, configure_secret_authority
+    ):
+        other_profile_secret = "opaque-other-profile-" + ("F4sV" * 8)
+        monkeypatch.setenv("STAGE1B_RUNTIME_PASSWORD", other_profile_secret)
+        configure_secret_authority(None, multiplex_active=True)
+
+        out = redact_tool_boundary_text(other_profile_secret)
+
+        assert out == other_profile_secret
+
+    @pytest.mark.parametrize(
+        ("scope", "multiplex_active"),
+        [
+            ({"STAGE1B_SCOPED_TOKEN": "opaque-scope-one"}, True),
+            ({"STAGE1B_SCOPED_TOKEN": "opaque-scope-two"}, False),
+            (None, True),
+            (None, False),
+        ],
+    )
+    def test_runtime_main_credential_is_redacted_in_every_authority_cell(
+        self, configure_secret_authority, scope, multiplex_active
+    ):
+        from agent.auxiliary_client import reset_runtime_main, set_runtime_main
+
+        provider_secret = "opaque-provider-runtime-" + ("G5tW" * 8)
+        configure_secret_authority(scope, multiplex_active=multiplex_active)
+        runtime_token = set_runtime_main(
+            "synthetic-provider",
+            "synthetic-model",
+            api_key=provider_secret,
+        )
+        try:
+            out = redact_tool_boundary_text(provider_secret)
+        finally:
+            reset_runtime_main(runtime_token)
+
+        assert out == TOOL_SECRET_PLACEHOLDER
+
+    def test_ordinary_environment_value_is_not_collected(
+        self, monkeypatch, configure_secret_authority
+    ):
+        ordinary_value = "ordinary-runtime-setting-" + ("H6uX" * 8)
+        monkeypatch.setenv("STAGE1B_ORDINARY_SETTING", ordinary_value)
+        configure_secret_authority(None, multiplex_active=False)
+
+        out = redact_tool_boundary_text(ordinary_value)
+
+        assert out == ordinary_value
+
     def test_runtime_secret_and_all_pattern_classes_are_fully_redacted(
         self, synthetic_secret_scope
     ):

@@ -843,7 +843,7 @@ def _sanitize_tool_error(error_msg: str) -> str:
 
 
 def _redact_tool_result(value: Any) -> Any:
-    """Apply the mandatory recursive boundary after every dispatch/hook."""
+    """Apply dispatch-time pre-projection after every dispatch/hook."""
     from agent.redact import redact_tool_boundary_value
 
     return redact_tool_boundary_value(value)

@@ -38,7 +38,7 @@ _MAX_LOGGED_ERROR_CHARS = 8192
 
 
 def _redact_tool_boundary(value):
-    """Project a value through the mandatory tool-result secret boundary."""
+    """Apply the mandatory dispatch-time secret pre-projection."""
     from agent.redact import redact_tool_boundary_value
 
     return redact_tool_boundary_value(value)
