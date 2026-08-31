@@ -45,6 +45,9 @@ DISCORD_API_BASE = "https://discord.com/api/v10"
 _DISCORD_RESPONSE_BODY_MAX_BYTES = 4 * 1024 * 1024
 _DISCORD_ERROR_BODY_MAX_BYTES = 64 * 1024
 
+# Discord's hard cap on a message's `content` field.
+DISCORD_MESSAGE_CONTENT_MAX_LENGTH = 2000
+
 # Application flag bits (from GET /applications/@me → "flags").
 # Source: https://discord.com/developers/docs/resources/application#application-object-application-flags
 _FLAG_GATEWAY_GUILD_MEMBERS = 1 << 14
@@ -583,6 +586,26 @@ def _delete_message(token: str, channel_id: str, message_id: str, **_kwargs: Any
     return json.dumps({"success": True, "message": f"Message {message_id} deleted."})
 
 
+def _send_message(token: str, channel_id: str, content: str, **_kwargs: Any) -> str:
+    """Post a text message to a channel or thread.
+
+    Discord thread IDs are channel IDs — POST /channels/{id}/messages works
+    identically whether {id} names a text channel or a thread. Mentions are
+    suppressed by default (``allowed_mentions.parse: []``) so agent-authored
+    content can never ping @everyone/@here, a role, or a user unexpectedly.
+    """
+    body = {
+        "content": content,
+        "allowed_mentions": {"parse": []},
+    }
+    msg = _discord_request("POST", f"/channels/{channel_id}/messages", token, body=body)
+    return json.dumps({
+        "success": True,
+        "channel_id": channel_id,
+        "message_id": msg["id"],
+    })
+
+
 def _create_thread(
     token: str, channel_id: str, name: str,
     message_id: Optional[str] = None,
@@ -643,11 +666,12 @@ _ACTIONS = {
     "unpin_message": _unpin_message,
     "delete_message": _delete_message,
     "create_thread": _create_thread,
+    "send_message": _send_message,
     "add_role": _add_role,
     "remove_role": _remove_role,
 }
 
-_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
+_CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread", "send_message"})
 _ADMIN_ACTION_NAMES = frozenset(_ACTIONS.keys()) - _CORE_ACTION_NAMES
 
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
@@ -670,6 +694,7 @@ _ACTION_MANIFEST: List[Tuple[str, str, str]] = [
     ("unpin_message", "(channel_id, message_id)", "unpin a message"),
     ("delete_message", "(channel_id, message_id)", "delete a message"),
     ("create_thread", "(channel_id, name)", "create a public thread; optional message_id anchor"),
+    ("send_message", "(channel_id, content)", "post a text message to a channel or thread (max 2000 chars; mentions suppressed)"),
     ("add_role", "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", "(guild_id, user_id, role_id)", "remove a role"),
 ]
@@ -691,6 +716,7 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
     "unpin_message": ["channel_id", "message_id"],
     "delete_message": ["channel_id", "message_id"],
     "create_thread": ["channel_id", "name"],
+    "send_message": ["channel_id", "content"],
     "add_role": ["guild_id", "user_id", "role_id"],
     "remove_role": ["guild_id", "user_id", "role_id"],
 }
@@ -852,6 +878,15 @@ def _build_schema(
             "type": "string",
             "description": "New thread name (create_thread).",
         },
+        "content": {
+            "type": "string",
+            "maxLength": DISCORD_MESSAGE_CONTENT_MAX_LENGTH,
+            "description": (
+                "Message text to send (send_message). "
+                f"Max {DISCORD_MESSAGE_CONTENT_MAX_LENGTH} characters. "
+                "Mentions (@everyone, @here, roles, users) are always suppressed."
+            ),
+        },
         "limit": {
             "type": "integer",
             "minimum": 1,
@@ -994,6 +1029,7 @@ def _run_discord_action(
     message_id: str = "",
     query: str = "",
     name: str = "",
+    content: str = "",
     limit: int = 50,
     before: str = "",
     after: str = "",
@@ -1029,12 +1065,19 @@ def _run_discord_action(
         "message_id": message_id,
         "query": query,
         "name": name,
+        "content": content,
     }
 
     missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not local_vars.get(p)]
     if missing:
         return tool_error(
             f"Missing required parameters for '{action}': {', '.join(missing)}"
+        )
+
+    if action == "send_message" and len(content) > DISCORD_MESSAGE_CONTENT_MAX_LENGTH:
+        return tool_error(
+            f"content exceeds Discord's {DISCORD_MESSAGE_CONTENT_MAX_LENGTH}-character "
+            f"limit ({len(content)} characters)."
         )
 
     try:
@@ -1047,6 +1090,7 @@ def _run_discord_action(
             message_id=message_id,
             query=query,
             name=name,
+            content=content,
             limit=limit,
             before=before,
             after=after,
@@ -1063,7 +1107,11 @@ def _run_discord_action(
 
 
 def discord_core(action: str, **kwargs) -> str:
-    """Execute a core Discord action (fetch_messages, search_members, create_thread)."""
+    """Execute a core Discord action.
+
+    Core actions fetch messages, search members, create threads, and post text
+    messages to channels or threads.
+    """
     return _run_discord_action(action, _CORE_ACTIONS, "discord", **kwargs)
 
 
@@ -1078,7 +1126,7 @@ def discord_admin_handler(action: str, **kwargs) -> str:
 
 _HANDLER_DEFAULTS = {
     "action": "", "guild_id": "", "channel_id": "", "user_id": "",
-    "role_id": "", "message_id": "", "query": "", "name": "",
+    "role_id": "", "message_id": "", "query": "", "name": "", "content": "",
     "limit": 50, "before": "", "after": "", "auto_archive_duration": 1440,
 }
 
