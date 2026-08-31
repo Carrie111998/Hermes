@@ -202,6 +202,95 @@ def test_rich_reinjection_block_is_self_contained():
         assert needle in text, f"missing {needle!r}"
 
 
+def test_completion_without_runtime_reporting_is_explicit_not_question_mark():
+    evt = _make_async_evt(model=None)
+
+    text = format_process_notification(evt)
+
+    assert text is not None
+    assert "Model: ?" not in text
+    assert "Actual: not-reported/not-reported" in text
+
+
+def test_dispatch_persists_sanitized_model_evidence():
+    evidence = [{
+        "selection_source": "task",
+        "requested": {"provider": "openrouter", "model": "requested/model"},
+        "resolved": {"provider": "openrouter", "model": "resolved/model"},
+        "actual": {"provider": "not-reported", "model": "not-reported"},
+    }]
+    res = ad.dispatch_async_delegation_batch(
+        goals=["persist evidence"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="resolved/model",
+        model_evidence=evidence,
+        session_key="owner-session",
+        runner=lambda: {
+            "results": [{
+                "task_index": 0,
+                "status": "completed",
+                "summary": "done",
+                "model_evidence": evidence[0],
+            }],
+        },
+    )
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    assert evt["model_evidence"] == evidence
+
+    with ad._connect() as conn:
+        task_json, event_json = conn.execute(
+            "SELECT task_json, event_json FROM async_delegations WHERE delegation_id=?",
+            (res["delegation_id"],),
+        ).fetchone()
+    assert json.loads(task_json)["model_evidence"] == evidence
+    assert json.loads(event_json)["model_evidence"] == evidence
+
+
+def test_credential_shaped_model_never_reaches_durable_or_delivered_payloads():
+    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    raw_evidence = [{
+        "selection_source": "task",
+        "requested": {"provider": secret, "model": secret},
+        "resolved": {"provider": secret, "model": secret},
+        "actual": {"provider": secret, "model": secret},
+    }]
+    res = ad.dispatch_async_delegation_batch(
+        goals=["withhold configured secret"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=secret,
+        model_evidence=raw_evidence,
+        session_key="owner-session",
+        runner=lambda: {
+            "results": [{
+                "task_index": 0,
+                "status": "error",
+                "summary": None,
+                "model": secret,
+                "model_evidence": raw_evidence[0],
+                "error": (secret + " rejected ") * 200,
+            }],
+        },
+    )
+    evt = _drain_for(res["delegation_id"])
+    assert evt is not None
+    rendered = format_process_notification(evt)
+
+    with ad._connect() as conn:
+        task_json, event_json, result_json = conn.execute(
+            "SELECT task_json, event_json, result_json FROM async_delegations "
+            "WHERE delegation_id=?",
+            (res["delegation_id"],),
+        ).fetchone()
+    for payload in (task_json, event_json, result_json, rendered):
+        assert secret not in payload
+    assert len(evt["results"][0]["error"]) <= 1000
+
+
 def test_dispatch_rejected_at_capacity():
     ev = threading.Event()
 

@@ -3540,6 +3540,24 @@ def run_conversation(
 
                 agent._turn_received_provider_response = True
 
+                # Keep provider-reported identity separate from the configured
+                # route. A response model alone is not provider evidence.
+                _delegation_evidence = getattr(
+                    agent, "_delegation_model_evidence", None
+                )
+                if isinstance(_delegation_evidence, dict):
+                    try:
+                        from tools.delegation_model_evidence import (
+                            record_actual_response,
+                        )
+
+                        record_actual_response(_delegation_evidence, response)
+                    except Exception:
+                        logging.debug(
+                            "Failed to record delegated runtime model evidence",
+                            exc_info=True,
+                        )
+
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
                     status = getattr(response, "status", None)

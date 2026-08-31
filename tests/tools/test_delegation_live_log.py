@@ -274,8 +274,8 @@ def test_manifest_includes_model_and_provider():
     assert len(manifest["tasks"]) == 2
 
 
-def test_manifest_model_provider_are_optional_and_default_none():
-    """When not provided, model and provider should be null in the manifest."""
+def test_manifest_model_provider_are_explicit_when_not_reported():
+    """Missing route evidence is explicit rather than an ambiguous null."""
     delegation_id, _writers, _paths = create_live_transcripts(
         [{"goal": "task without model"}]
     )
@@ -285,8 +285,8 @@ def test_manifest_model_provider_are_optional_and_default_none():
             encoding="utf-8"
         )
     )
-    assert manifest["model"] is None
-    assert manifest["provider"] is None
+    assert manifest["model"] == "not-reported"
+    assert manifest["provider"] == "not-reported"
 
 
 def test_no_file_in_the_dispatch_directory_carries_the_raw_key():
