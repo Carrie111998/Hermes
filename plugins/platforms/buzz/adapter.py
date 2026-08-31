@@ -37,6 +37,7 @@ environment and is never logged.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -106,6 +107,43 @@ _WS_AUTH_TIMEOUT = 20.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
+
+# Presence & typing (kind:20001 / kind:20002 ephemeral events). The native
+# Buzz agent harness (buzz-acp) publishes presence "online" at startup plus a
+# 60s heartbeat (relay Redis TTL is 180s) and a kind:20002 typing indicator
+# every 3s while drafting — the desktop renders "online" and the animated
+# "speaking" emoji from those live events. Typing auto-clears 8s after the
+# last indicator; the reply landing also suppresses it client-side.
+_PRESENCE_KIND = 20001
+_TYPING_KIND = 20002
+_PRESENCE_HEARTBEAT_SECS = 60.0
+_TYPING_MIN_INTERVAL_SECS = 3.0
+# Observer frames (kind 24200): NIP-44-encrypted agent telemetry that the
+# Desktop renders as the "thinking" popup / activity headlines. Routed to the
+# owner's pubkey, gated by the relay's agent-owner mapping. The owner is
+# resolved per-frame from BUZZ_OWNER_PUBKEY or the NIP-OA auth tag
+# (BUZZ_AUTH_TAG = ["auth", <owner-hex>, conditions, sig]); telemetry
+# silently no-ops when neither is set.
+_OBSERVER_KIND = 24200
+
+
+def _resolve_owner_pubkey() -> Optional[str]:
+    """Owner pubkey from BUZZ_OWNER_PUBKEY, else the NIP-OA auth tag."""
+    direct = (os.getenv("BUZZ_OWNER_PUBKEY") or "").strip()
+    if direct:
+        return direct if len(direct) == 64 else None
+    tag_raw = (os.getenv("BUZZ_AUTH_TAG") or "").strip()
+    if not tag_raw:
+        return None
+    try:
+        tag = json.loads(tag_raw)
+        if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "auth" and isinstance(tag[1], str) and len(tag[1]) == 64:
+            return tag[1]
+    except ValueError:
+        pass
+    return None
+# Long-turn typing keepalive cadence (Desktop TTL is 8s).
+_TYPING_KEEPALIVE_SECS = 5.0
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
@@ -436,6 +474,21 @@ class BuzzAdapter(BasePlatformAdapter):
         self._channel_meta: Dict[str, dict] = {}
         self._user_names: Dict[str, str] = {}
         self._poll_count = 0
+        # Presence heartbeat task (kind:20001 "online" every 60s).
+        self._presence_task: Optional[asyncio.Task] = None
+        # chat_id -> monotonic time of last kind:20002 typing indicator send.
+        self._typing_last: Dict[str, float] = {}
+        # chat_id -> event_id of the 👀 reaction placed on receipt of the
+        # latest inbound message; removed once the agent's reply lands.
+        self._pending_eyes: Dict[str, str] = {}
+        # Observer telemetry: monotonic seq + per-agent identity for
+        # kind:24200 frames.
+        self._observer_seq = 0
+        # chat_id -> turn_id currently in flight (scopes observer frames).
+        self._observer_turn: Dict[str, str] = {}
+        # Live status phrase per chat (set_status_text) — mirrored into
+        # observer frames while a turn runs.
+        self._status_text: Dict[str, str] = {}
 
     @property
     def name(self) -> str:
@@ -556,6 +609,10 @@ class BuzzAdapter(BasePlatformAdapter):
                 return False
         if transport_used == "poll":
             self._poll_task = asyncio.create_task(self._poll_loop())
+        # Presence: announce online and keep the relay's 180s TTL alive with a
+        # 60s heartbeat (mirrors the native buzz-acp harness).
+        await self._publish_presence("online")
+        self._presence_task = asyncio.create_task(self._presence_loop())
         self._mark_connected()
         logger.info(
             "Buzz: connected to %s as %s, watching %d channel(s) via %s%s",
@@ -565,13 +622,24 @@ class BuzzAdapter(BasePlatformAdapter):
             transport_used,
             "" if transport_used == "websocket" else f", poll interval {self.poll_interval:.1f}s",
         )
-        # Plugin-registered native handlers (ctx.register_platform_handler).
-        self._wire_plugin_handlers(None)
         return True
 
     async def disconnect(self) -> None:
         """Stop the inbound transport and drop runtime state."""
         self._mark_disconnected()
+        if self._presence_task and not self._presence_task.done():
+            self._presence_task.cancel()
+            try:
+                await self._presence_task
+            except asyncio.CancelledError:
+                pass
+        self._presence_task = None
+        keepalive = getattr(self, "_typing_keepalive", None)
+        if keepalive and not keepalive.done():
+            keepalive.cancel()
+        # Best-effort "offline" so the relay clears our presence entry
+        # immediately instead of waiting out the 180s TTL.
+        await self._publish_presence("offline")
         lock_key = getattr(self, "_lock_key", None)
         if lock_key:
             try:
@@ -601,6 +669,230 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── Sending ───────────────────────────────────────────────────────────
 
+    async def _publish_presence(self, status: str) -> None:
+        """Publish a kind:20001 presence event ("online"/"away"/"offline").
+
+        Ephemeral kinds are only accepted over an authenticated WebSocket
+        connection, so this signs the event with the same helpers the WS
+        transport uses and sends it over the active WS when present, falling
+        back to a short-lived dedicated WS (same approach as buzz-cli's
+        ``users set-presence``). Never raises — presence is best-effort.
+        """
+        if not self._private_key:
+            return
+        try:
+            event = self._build_ephemeral_event(_PRESENCE_KIND, "online" if status == "online" else status, [])
+            await self._send_ephemeral(event)
+        except Exception:
+            logger.debug("Buzz: presence publish (%s) failed", status, exc_info=True)
+
+    async def _presence_loop(self) -> None:
+        """60s presence heartbeat; relay expires the entry after 180s."""
+        try:
+            while True:
+                await asyncio.sleep(_PRESENCE_HEARTBEAT_SECS)
+                await self._publish_presence("online")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Buzz: presence heartbeat loop crashed", exc_info=True)
+
+    def _build_ephemeral_event(self, kind: int, content: str, tags: List[List[str]]) -> dict:
+        """Sign a kind:2000x ephemeral event with the identity key."""
+        na = _load_nostr_auth()
+        pubkey = na.public_key_hex(self._private_key)
+        timestamp = int(time.time())
+        serialized = json.dumps(
+            [0, pubkey, timestamp, kind, tags, content],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode()
+        event_id = hashlib.sha256(serialized).digest()
+        return {
+            "id": event_id.hex(),
+            "pubkey": pubkey,
+            "created_at": timestamp,
+            "kind": kind,
+            "tags": tags,
+            "content": content,
+            "sig": na.schnorr_sign(event_id, self._private_key).hex(),
+        }
+
+    async def _send_ephemeral(self, event: dict) -> None:
+        """Publish an ephemeral event over WebSocket (the only accepted path).
+
+        Reuses the adapter's persistent inbound WS when it is healthy; opens a
+        short-lived authenticated connection otherwise.
+        """
+        if self._ws_active and self._ws_task and not self._ws_task.done():
+            # The inbound WS loop owns the socket; there is no direct handle
+            # here, so fall through to a dedicated connection (publishing on
+            # the shared socket would need cross-task coordination).
+            pass
+        import websockets
+
+        url = self._websocket_url()
+        async with websockets.connect(url, open_timeout=_WS_AUTH_TIMEOUT, close_timeout=5) as ws:
+            raw = await asyncio.wait_for(ws.recv(), timeout=_WS_AUTH_TIMEOUT)
+            message = json.loads(raw)
+            if not isinstance(message, list) or message[0] != "AUTH":
+                raise ConnectionError("Buzz relay did not send a NIP-42 AUTH challenge")
+            auth_event = _load_nostr_auth().build_auth_event(
+                private_key=self._private_key,
+                challenge=str(message[1]),
+                relay_url=url,
+                auth_tag_json=os.getenv("BUZZ_AUTH_TAG", ""),
+            )
+            await ws.send(json.dumps(["AUTH", auth_event], separators=(",", ":")))
+            await ws.send(json.dumps(["EVENT", event], separators=(",", ":")))
+            while True:
+                raw = await asyncio.wait_for(ws.recv(), timeout=_WS_AUTH_TIMEOUT)
+                response = json.loads(raw)
+                if isinstance(response, list) and response[0] == "OK" and response[1] == event["id"]:
+                    if response[2] is not True:
+                        raise ConnectionError(f"ephemeral publish rejected: {response[3] if len(response) > 3 else '?'}")
+                    return
+                if isinstance(response, list) and response[0] in ("NOTICE", "CLOSED"):
+                    raise ConnectionError(f"ephemeral publish failed: {response[-1]}")
+
+    async def _publish_typing(
+        self, chat_id: str, metadata: Optional[dict] = None, force: bool = False
+    ) -> None:
+        """Publish a kind:20002 typing indicator ("speaking" emoji in Desktop).
+
+        Throttled to one event per channel per 3s — the desktop clears the
+        indicator 8s after the last one, and the reply event itself suppresses
+        the indicator client-side, so cadence mirrors the native harness.
+        ``force`` bypasses the throttle for the keepalive loop.
+        """
+        if not self._private_key or not chat_id:
+            return
+        now = time.monotonic()
+        last = self._typing_last.get(str(chat_id), 0.0)
+        if not force and now - last < _TYPING_MIN_INTERVAL_SECS:
+            return
+        self._typing_last[str(chat_id)] = now
+        tags: List[List[str]] = [["h", str(chat_id)]]
+        thread = (metadata or {}).get("thread_id")
+        if thread:
+            tags.append(["e", str(thread), "", "reply"])
+        try:
+            event = self._build_ephemeral_event(_TYPING_KIND, "", tags)
+            await self._send_ephemeral(event)
+        except Exception:
+            logger.debug("Buzz: typing indicator failed for %s", chat_id, exc_info=True)
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """Publish a typing indicator and start the long-turn keepalive loop."""
+        await self._publish_typing(chat_id, metadata)
+        # Exactly one keepalive loop per chat: replace any previous one.
+        prev = getattr(self, "_typing_keepalive", None)
+        if prev and not prev.done():
+            prev.cancel()
+        self._typing_keepalive = asyncio.create_task(
+            self._typing_keepalive_loop(chat_id, metadata)
+        )
+
+    # ── Observer telemetry (kind 24200, the Desktop "thinking" popup) ──────
+
+    # Textless typing indicator normally; the live per-tool status phrase is
+    # mirrored into observer frames so the Desktop activity bar can show what
+    # we're doing ("running pytest…") instead of a bare spinner.
+    supports_status_text = True
+
+    def _observer_emit(self, chat_id: str, kind: str, payload: dict) -> None:
+        """Queue an observer telemetry frame (fire-and-forget task)."""
+        if not self._private_key:
+            return
+        asyncio.get_running_loop().create_task(self._observer_send(chat_id, kind, payload))
+
+    async def _observer_send(self, chat_id: str, kind: str, payload: dict) -> None:
+        """Sign + publish one observer frame. Never raises."""
+        try:
+            owner_hex = _resolve_owner_pubkey()
+            if not owner_hex:
+                return
+            from plugins.platforms.buzz.nip44 import nip44_encrypt
+
+            self._observer_seq += 1
+            event_payload = {
+                "seq": self._observer_seq,
+                "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "kind": kind,
+                "channelId": str(chat_id) if chat_id else None,
+                "payload": payload,
+            }
+            plaintext = json.dumps(event_payload, separators=(",", ":"))
+            ciphertext = nip44_encrypt(self._private_key, owner_hex, plaintext)
+            na = _load_nostr_auth()
+            pubkey = na.public_key_hex(self._private_key)
+            tags = [
+                ["p", owner_hex],
+                ["agent", pubkey],
+                ["frame", "telemetry"],
+            ]
+            timestamp = int(time.time())
+            serialized = json.dumps(
+                [0, pubkey, timestamp, _OBSERVER_KIND, tags, ciphertext],
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode()
+            event_id = hashlib.sha256(serialized).digest()
+            event = {
+                "id": event_id.hex(),
+                "pubkey": pubkey,
+                "created_at": timestamp,
+                "kind": _OBSERVER_KIND,
+                "tags": tags,
+                "content": ciphertext,
+                "sig": na.schnorr_sign(event_id, self._private_key).hex(),
+            }
+            await self._send_ephemeral(event)
+        except Exception:
+            logger.debug("Buzz: observer frame publish failed", exc_info=True)
+
+    def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
+        """Store the live tool phrase; the typing keepalive mirrors it into
+        observer frames so the Desktop activity bar shows real work."""
+        if text:
+            self._status_text[str(chat_id)] = text
+        else:
+            self._status_text.pop(str(chat_id), None)
+
+    async def _typing_keepalive_loop(self, chat_id: str, metadata: Optional[dict]) -> None:
+        """Re-publish typing + observer status every 5s for long turns.
+
+        The Desktop expires the indicator 8s after the last event; the native
+        harness re-sends every 3s. We mirror that cadence (throttled slightly
+        higher to stay under the relay's ephemeral rate limits).
+        """
+        try:
+            while True:
+                await asyncio.sleep(_TYPING_KEEPALIVE_SECS)
+                # Stop once no status phrase AND no in-flight turn marker.
+                phrase = self._status_text.get(str(chat_id))
+                if phrase is None and str(chat_id) not in self._observer_turn:
+                    return
+                await self._publish_typing(chat_id, metadata, force=True)
+                if phrase:
+                    self._observer_emit(
+                        chat_id,
+                        "acp_read",
+                        {
+                            "method": "session/update",
+                            "params": {
+                                "update": {
+                                    "sessionUpdate": "agent_thought_chunk",
+                                    "content": {"type": "text", "text": phrase},
+                                }
+                            },
+                        },
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Buzz: typing keepalive crashed", exc_info=True)
+
     async def send(
         self,
         chat_id: str,
@@ -613,7 +905,15 @@ class BuzzAdapter(BasePlatformAdapter):
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
         reply_target = reply_to or (metadata or {}).get("thread_id")
         if reply_target:
-            args += ["--reply-to", str(reply_target)]
+            # Native agents reply WITH --broadcast: the e-tag keeps the reply
+            # linked for notification/thread purposes but the message SURFACES
+            # at channel level instead of nesting into a sub-thread.
+            args += ["--reply-to", str(reply_target), "--broadcast"]
+        # The reply landing stops the typing keepalive for this chat.
+        keepalive = getattr(self, "_typing_keepalive", None)
+        if keepalive and not keepalive.done():
+            keepalive.cancel()
+        self._status_text.pop(str(chat_id), None)
         code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
             return SendResult(
@@ -630,15 +930,16 @@ class BuzzAdapter(BasePlatformAdapter):
             # Belt-and-braces echo suppression: the poll loop already skips
             # our own pubkey, but marking the id seen makes de-dupe explicit.
             self._mark_seen(str(chat_id), str(event_id))
+            # The agent has spoken — clear any 👀 reaction left on the message
+            # we're answering so "seen" doesn't linger after the reply lands.
+            eyes_target = self._pending_eyes.pop(str(chat_id), None)
+            if eyes_target:
+                asyncio.create_task(self._remove_eyes_reaction(str(chat_id), eyes_target))
         return SendResult(
             success=bool(data.get("accepted", True)),
             message_id=str(event_id) if event_id else None,
             raw_response=data,
         )
-
-    async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Buzz has no typing indicator API — no-op."""
-        pass
 
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Add a reaction to a message via buzz-cli.
@@ -684,7 +985,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 "--content", "-",
             ]
             if reply_to:
-                args += ["--reply-to", str(reply_to)]
+                args += ["--reply-to", str(reply_to), "--broadcast"]
             code, out, err = await self._run_cli(args, input_text=caption or "")
             if code != 0:
                 return SendResult(success=False, error=_cli_error_message(err, code), retryable=code == 2)
@@ -1245,11 +1546,26 @@ class BuzzAdapter(BasePlatformAdapter):
         await self.handle_message(event)
         
         # Add a "seen" reaction after dispatching — signals to the user that
-        # their message was received and is being processed.
+        # their message was received and is being processed. Removed again
+        # once the agent's reply lands (see send()).
         try:
-            await self.send_reaction(chat_id, message_id, "👀")
+            if await self.send_reaction(chat_id, message_id, "👀"):
+                self._pending_eyes[str(chat_id)] = str(message_id)
         except Exception:
             logger.debug("Buzz: reaction failed for message %s", message_id[:12], exc_info=True)
+
+    async def _remove_eyes_reaction(self, chat_id: str, message_id: str) -> None:
+        """Best-effort removal of the 👀 "seen" reaction after replying."""
+        try:
+            code, _out, _err = await self._run_cli(
+                ["reactions", "remove", "--event", message_id, "--emoji", "👀"]
+            )
+            if code != 0:
+                logger.debug(
+                    "Buzz: eyes-reaction remove failed for %s in %s", message_id[:12], chat_id
+                )
+        except Exception:
+            logger.debug("Buzz: eyes-reaction remove errored for %s", message_id[:12], exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1389,7 +1705,7 @@ async def _standalone_send(
 
     args = ["messages", "send", "--channel", target, "--content", "-"]
     if thread_id:
-        args += ["--reply-to", str(thread_id)]
+        args += ["--reply-to", str(thread_id), "--broadcast"]
     for path in media_files or []:
         args += ["--file", str(path)]
     try:
