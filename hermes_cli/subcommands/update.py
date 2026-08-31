@@ -73,7 +73,8 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "never silently ride along across updates."
         ),
     )
-    update_parser.add_argument(
+    target_group = update_parser.add_mutually_exclusive_group()
+    target_group.add_argument(
         "--branch",
         default=None,
         metavar="NAME",
@@ -83,6 +84,13 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "switch to the requested branch first (auto-stashing any "
             "uncommitted changes)."
         ),
+    )
+    target_group.add_argument(
+        "--version",
+        dest="update_version",
+        default=None,
+        metavar="RELEASE",
+        help="Update to this official release instead of the latest main branch.",
     )
     update_parser.add_argument(
         "--switch-branch",
