@@ -176,9 +176,11 @@ export interface GroupChat {
   /** Last contiguous hosted-room event sequence applied locally. */
   hostedSeq?: number
   hostedStatus?: null | {
+    canReconnect?: boolean
     canRetry?: boolean
     canStop?: boolean
     label: string
+    reconnectMemberId?: string
     state: string
     taskId?: string
   }

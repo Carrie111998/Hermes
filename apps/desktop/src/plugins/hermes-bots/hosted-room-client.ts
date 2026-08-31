@@ -36,10 +36,12 @@ export type HostedRoomCapabilityKind = 'driver-capable' | 'transient-failure' | 
 export interface HostedRoomCapability {
   authorityId: null | string
   connectionId: null | string
+  exactPeerGrantRevoke: boolean
   kind: HostedRoomCapabilityKind
   limits: typeof HOSTED_ROOM_CLIENT_LIMITATIONS
   maxLogLimit?: number
   persistentProcess: boolean | null
+  routeGrantFingerprint: boolean
   reason: null | string
   roomLink: null | RoomLinkCapability
 }
@@ -305,8 +307,10 @@ export function classifyHostedRoomCapability(
       kind: unsupported ? 'unsupported' : 'transient-failure',
       reason: unsupported ? 'old-gateway' : 'probe-failed',
       connectionId: localConnectionId,
+      exactPeerGrantRevoke: false,
       authorityId: null,
       persistentProcess: null,
+      routeGrantFingerprint: false,
       roomLink: null,
       limits: HOSTED_ROOM_CLIENT_LIMITATIONS
     }
@@ -319,8 +323,10 @@ export function classifyHostedRoomCapability(
       kind: 'transient-failure',
       reason: 'invalid-response',
       connectionId: localConnectionId,
+      exactPeerGrantRevoke: false,
       authorityId: null,
       persistentProcess: null,
+      routeGrantFingerprint: false,
       roomLink: null,
       limits: HOSTED_ROOM_CLIENT_LIMITATIONS
     }
@@ -331,8 +337,10 @@ export function classifyHostedRoomCapability(
       kind: 'unsupported',
       reason: capabilities.driver === false ? 'driver-disabled' : 'incomplete-contract',
       connectionId: localConnectionId,
+      exactPeerGrantRevoke: false,
       authorityId: null,
       persistentProcess: capabilities.persistent_process === true,
+      routeGrantFingerprint: false,
       roomLink: roomLinkCapability(capabilities.room_link),
       limits: HOSTED_ROOM_CLIENT_LIMITATIONS
     }
@@ -345,8 +353,10 @@ export function classifyHostedRoomCapability(
       kind: 'unsupported',
       reason: 'incomplete-contract',
       connectionId: localConnectionId,
+      exactPeerGrantRevoke: false,
       authorityId: null,
       persistentProcess: capabilities.persistent_process === true,
+      routeGrantFingerprint: false,
       roomLink: roomLinkCapability(capabilities.room_link),
       limits: HOSTED_ROOM_CLIENT_LIMITATIONS
     }
@@ -356,8 +366,12 @@ export function classifyHostedRoomCapability(
     kind: 'driver-capable',
     reason: null,
     connectionId: localConnectionId,
+    exactPeerGrantRevoke:
+      Array.isArray(capabilities.methods) && capabilities.methods.includes('groups.peer.revoke_exact'),
     authorityId,
     persistentProcess: capabilities.persistent_process === true,
+    routeGrantFingerprint:
+      Array.isArray(capabilities.features) && capabilities.features.includes('peer_route_grant_fingerprint'),
     roomLink: roomLinkCapability(capabilities.room_link),
     maxLogLimit: positiveInteger(capabilities.max_log_limit, 100) || 100,
     limits: HOSTED_ROOM_CLIENT_LIMITATIONS

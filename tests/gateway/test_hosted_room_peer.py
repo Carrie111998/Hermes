@@ -19,6 +19,7 @@ from gateway.hosted_room_peer import (
     PROTOCOL_VERSION,
     RoomLinkProbe,
     catalog_mapping,
+    decode_room_grant,
     derive_room_grant_secret,
     gateway_room_grant_secret,
     issue_room_grant,
@@ -290,6 +291,25 @@ def test_room_grant_fails_closed_for_tamper_expiry_and_permission():
         )
     with pytest.raises(HostedRoomGrantError, match="signature"):
         verify_room_grant(SECRET, token[:-1] + "A", dispatch, now=105)
+
+    assert (
+        decode_room_grant(
+            SECRET,
+            token,
+            permission="status",
+            now=100 + 30 * 24 * 60 * 60,
+            allow_expired_for_revocation=True,
+        )["grant_id"]
+        == "grant-1"
+    )
+    with pytest.raises(HostedRoomGrantError, match="only.*revocation"):
+        decode_room_grant(
+            SECRET,
+            token,
+            permission="dispatch",
+            now=100 + 30 * 24 * 60 * 60,
+            allow_expired_for_revocation=True,
+        )
 
 
 def test_link_selection_prefers_safe_direct_then_overlay_then_relay_then_pull():

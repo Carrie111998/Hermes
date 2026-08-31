@@ -27,6 +27,7 @@ LONG_HANDLERS = frozenset({
     "groups.retry",
     "groups.approve",
     "groups.peer.invite",
+    "groups.peer.revoke_exact",
     "groups.peer.revoke",
     "groups.peer.register",
 })
@@ -255,6 +256,7 @@ def _(rid, params: dict) -> dict:
                 "replayable_disband",
                 "typed_events",
                 "actor_identity",
+                "peer_route_grant_fingerprint",
             ],
             "methods": [
                 "groups.capabilities",
@@ -270,6 +272,7 @@ def _(rid, params: dict) -> dict:
                 "groups.retry",
                 "groups.approve",
                 "groups.peer.invite",
+                "groups.peer.revoke_exact",
                 "groups.peer.revoke",
                 "groups.peer.register",
             ],
@@ -355,6 +358,7 @@ def _(rid, params: dict) -> dict:
             gateway_room_grant_secret(),
             str(params.get("grant") or ""),
             permission="status",
+            allow_expired_for_revocation=True,
         )
         if (
             claims["target_profile"] != profile
@@ -363,6 +367,38 @@ def _(rid, params: dict) -> dict:
         ):
             raise ValueError("room grant target does not match this profile")
         hosted_rooms.revoke_room_grant_scope(
+            hosted_rooms.default_db_path(),
+            claims=claims,
+            expires_at=float(
+                claims.get("status_expires_at", claims["expires_at"])
+            ),
+        )
+        return _ok(rid, {"revoked": True})
+    except Exception as exc:
+        return _err(rid, 4122, str(exc))
+
+
+@method("groups.peer.revoke_exact")
+def _(rid, params: dict) -> dict:
+    """Revoke only this bearer grant, preserving concurrent replacements."""
+    try:
+        from gateway import hosted_rooms
+        from gateway.hosted_room_peer import decode_room_grant, gateway_room_grant_secret
+
+        profile = _requested_profile(params)
+        claims = decode_room_grant(
+            gateway_room_grant_secret(),
+            str(params.get("grant") or ""),
+            permission="status",
+            allow_expired_for_revocation=True,
+        )
+        if (
+            claims["target_profile"] != profile
+            or claims["target_install_id"]
+            != hosted_rooms.local_authority_gateway_id()
+        ):
+            raise ValueError("room grant target does not match this profile")
+        hosted_rooms.revoke_room_grant_id(
             hosted_rooms.default_db_path(),
             claims=claims,
             expires_at=float(
@@ -402,6 +438,14 @@ def _(rid, params: dict) -> dict:
             raise ValueError("target does not support a direct RoomLink")
         target_profile = str(params.get("target_profile") or "")
         grant = str(params.get("grant") or "")
+        expected_grant_sha256 = None
+        if "expected_grant_sha256" in params:
+            expected_grant_sha256 = str(params.get("expected_grant_sha256") or "")
+            if expected_grant_sha256 and (
+                len(expected_grant_sha256) != 64
+                or any(character not in "0123456789abcdef" for character in expected_grant_sha256)
+            ):
+                raise ValueError("expected_grant_sha256 must be a sha256 digest")
         client = PeerRunsHTTPClient(
             base_url=target_url,
             api_key="",
@@ -452,6 +496,11 @@ def _(rid, params: dict) -> dict:
             client=client,
             target_url=target_url,
             catalog=catalog,
+            **(
+                {"expected_grant_sha256": expected_grant_sha256}
+                if expected_grant_sha256 is not None
+                else {}
+            ),
         )
         return _ok(
             rid,
@@ -535,15 +584,16 @@ def _(rid, params: dict) -> dict:
             include_disbanded=params.get("include_disbanded") is True,
         )
         service = get_hosted_room_service()
+        driver_status = (
+            service.status_with_grant_fingerprints(str(room["room_id"]))
+            if service is not None and room.get("disbanded_at") is None
+            else None
+        )
         return _ok(
             rid,
             {
                 "room": room,
-                **(
-                    {"driver_status": service.status(str(room["room_id"]))}
-                    if service is not None and room.get("disbanded_at") is None
-                    else {}
-                ),
+                **({"driver_status": driver_status} if driver_status else {}),
             },
         )
     except HostedRoomError as exc:

@@ -201,10 +201,14 @@ type BotsMessages = {
     retryTitle: string
     retryDesc: string
     retryAction: string
+    reconnectAction: string
+    reconnectingAction: string
+    reconnectFailed: string
     botsNeedOneHost: string
     aBot: string
     memberUnavailable: (member: string) => string
     memberNeedsAttention: (member: string) => string
+    memberReconnectToContinue: (member: string) => string
     memberCouldNotRespond: (member: string) => string
     memberRetryWhenOnline: (member: string) => string
     desktopStorageUnavailable: string
@@ -451,10 +455,14 @@ const en: BotsMessages = {
     retryTitle: 'Retry uncertain work?',
     retryDesc: 'The earlier attempt may have finished. Retrying could repeat actions.',
     retryAction: 'Retry',
+    reconnectAction: 'Reconnect',
+    reconnectingAction: 'Connecting…',
+    reconnectFailed: 'Could not reconnect this Bot. Check its gateway and try again.',
     botsNeedOneHost: 'The selected Bots cannot continue when Desktop is closed.',
     aBot: 'A bot',
     memberUnavailable: member => `${member} is unavailable.`,
     memberNeedsAttention: member => `${member} needs your attention.`,
+    memberReconnectToContinue: member => `Reconnect ${member} to continue this Group Chat.`,
     memberCouldNotRespond: member => `${member} could not respond.`,
     memberRetryWhenOnline: member => `${member} will retry when online.`,
     desktopStorageUnavailable: 'Desktop could not save this action. Try again.',
@@ -694,10 +702,14 @@ const ja: BotsMessages = {
     retryTitle: '不確かな作業を再試行しますか？',
     retryDesc: '前の試行が完了している可能性があります。再試行すると操作が重複する場合があります。',
     retryAction: '再試行',
+    reconnectAction: '再接続',
+    reconnectingAction: '接続中…',
+    reconnectFailed: 'このボットを再接続できませんでした。ゲートウェイを確認して、もう一度お試しください。',
     botsNeedOneHost: '選択したボットはDesktopを閉じると継続できません。',
     aBot: 'ボット',
     memberUnavailable: member => `${member} は利用できません。`,
     memberNeedsAttention: member => `${member} に確認が必要です。`,
+    memberReconnectToContinue: member => `このグループチャットを続けるには ${member} を再接続してください。`,
     memberCouldNotRespond: member => `${member} は応答できませんでした。`,
     memberRetryWhenOnline: member => `${member} はオンラインになると再試行します。`,
     desktopStorageUnavailable: 'Desktopでこの操作を保存できませんでした。もう一度お試しください。',
@@ -935,10 +947,14 @@ const zh: BotsMessages = {
     retryTitle: '重试状态不确定的工作？',
     retryDesc: '之前的尝试可能已完成。重试可能会重复操作。',
     retryAction: '重试',
+    reconnectAction: '重新连接',
+    reconnectingAction: '正在连接…',
+    reconnectFailed: '无法重新连接此机器人。请检查其网关后重试。',
     botsNeedOneHost: '关闭 Desktop 后，所选机器人无法继续工作。',
     aBot: '一个机器人',
     memberUnavailable: member => `${member} 不可用。`,
     memberNeedsAttention: member => `${member} 需要你的处理。`,
+    memberReconnectToContinue: member => `请重新连接 ${member} 以继续此群聊。`,
     memberCouldNotRespond: member => `${member} 无法回复。`,
     memberRetryWhenOnline: member => `${member} 上线后将重试。`,
     desktopStorageUnavailable: 'Desktop 无法保存此操作。请重试。',
@@ -1176,10 +1192,14 @@ const zhHant: BotsMessages = {
     retryTitle: '重試狀態不確定的工作？',
     retryDesc: '先前的嘗試可能已完成。重試可能會重複操作。',
     retryAction: '重試',
+    reconnectAction: '重新連接',
+    reconnectingAction: '正在連接…',
+    reconnectFailed: '無法重新連接此機器人。請檢查其閘道後再試一次。',
     botsNeedOneHost: '關閉 Desktop 後，所選機器人無法繼續工作。',
     aBot: '一個機器人',
     memberUnavailable: member => `${member} 無法使用。`,
     memberNeedsAttention: member => `${member} 需要您的處理。`,
+    memberReconnectToContinue: member => `請重新連接 ${member} 以繼續此群組聊天。`,
     memberCouldNotRespond: member => `${member} 無法回覆。`,
     memberRetryWhenOnline: member => `${member} 上線後將重試。`,
     desktopStorageUnavailable: 'Desktop 無法儲存此操作。請再試一次。',

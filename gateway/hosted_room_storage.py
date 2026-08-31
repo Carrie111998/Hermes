@@ -39,6 +39,7 @@ from gateway.hosted_room_contract import (
     _REMOTE_RUN_SCHEMA_COLUMNS,
     _REPLICA_RESERVATION_COLUMNS,
     _RETIRED_ROOM_SCHEMA_COLUMNS,
+    _REVOKED_GRANT_ID_SCHEMA_COLUMNS,
     _REVOKED_GRANT_SCHEMA_COLUMNS,
     _ROOM_RESERVATION_SCHEMA_COLUMNS,
     _ROOM_SAFETY_TRIGGERS,
@@ -209,6 +210,14 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             scope_key TEXT PRIMARY KEY,
             expires_at REAL NOT NULL,
             revoked_before REAL NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS hosted_room_revoked_grant_ids (
+            scope_key TEXT NOT NULL,
+            grant_id TEXT NOT NULL,
+            expires_at REAL NOT NULL,
+            PRIMARY KEY (scope_key, grant_id)
         )"""
     )
     conn.execute(
@@ -449,6 +458,10 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
         row[1]
         for row in conn.execute("PRAGMA table_info(hosted_room_revoked_grants)")
     )
+    revoked_grant_id_columns = frozenset(
+        row[1]
+        for row in conn.execute("PRAGMA table_info(hosted_room_revoked_grant_ids)")
+    )
     peer_reservation_columns = frozenset(
         row[1]
         for row in conn.execute("PRAGMA table_info(hosted_room_peer_reservations)")
@@ -479,6 +492,13 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     ):
         return False
     if not _REVOKED_GRANT_SCHEMA_COLUMNS.issubset(revoked_grant_columns):
+        return False
+    if not _REVOKED_GRANT_ID_SCHEMA_COLUMNS.issubset(revoked_grant_id_columns):
+        return False
+    if _primary_key_columns(conn, "hosted_room_revoked_grant_ids") != (
+        "scope_key",
+        "grant_id",
+    ):
         return False
     if not _PEER_RESERVATION_SCHEMA_COLUMNS.issubset(peer_reservation_columns):
         return False
@@ -618,6 +638,39 @@ def _room_grant_scope_key(claims: Mapping[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
+
+
+def revoke_room_grant_id(
+    db_path: Path | str,
+    *,
+    claims: Mapping[str, Any],
+    expires_at: float,
+    now: float | None = None,
+) -> None:
+    """Revoke only one bearer grant without fencing concurrent replacements."""
+
+    timestamp = float(now if now is not None else time.time())
+    expiry = float(expires_at)
+    if expiry <= timestamp:
+        return
+    grant_id = _validate_identifier(
+        claims.get("grant_id"), label="grant_id", max_chars=256
+    )
+    scope_key = _room_grant_scope_key(claims)
+    with _transaction(db_path, immediate=True) as conn:
+        conn.execute(
+            "DELETE FROM hosted_room_revoked_grant_ids WHERE expires_at<=?",
+            (timestamp,),
+        )
+        conn.execute(
+            """INSERT INTO hosted_room_revoked_grant_ids(
+                   scope_key, grant_id, expires_at
+               ) VALUES (?, ?, ?)
+               ON CONFLICT(scope_key, grant_id) DO UPDATE SET
+                   expires_at=MAX(hosted_room_revoked_grant_ids.expires_at,
+                                  excluded.expires_at)""",
+            (scope_key, grant_id, expiry),
+        )
 
 
 def revoke_room_grant_scope(
@@ -846,7 +899,18 @@ def room_grant_is_revoked(
     timestamp = float(now if now is not None else time.time())
     scope_key = _room_grant_scope_key(claims)
     issued_at = float(claims.get("issued_at") or 0)
+    grant_id = _validate_identifier(
+        claims.get("grant_id"), label="grant_id", max_chars=256
+    )
+    scope_key = _room_grant_scope_key(claims)
     with _transaction(db_path) as conn:
+        exact = conn.execute(
+            """SELECT 1 FROM hosted_room_revoked_grant_ids
+                 WHERE scope_key=? AND grant_id=? AND expires_at>?""",
+            (scope_key, grant_id, timestamp),
+        ).fetchone()
+        if exact is not None:
+            return True
         row = conn.execute(
             """SELECT revoked_before FROM hosted_room_revoked_grants
                  WHERE scope_key=? AND expires_at>?""",

@@ -204,6 +204,7 @@ class HostedRoomService:
         client: HostedRoomPeerClient,
         target_url: str | None = None,
         catalog: GatewayRoomCatalog | None = None,
+        expected_grant_sha256: str | None = None,
     ) -> None:
         """Register one verified route and optionally persist its scoped grant."""
         bind_store = getattr(client, "bind_receipt_store", None)
@@ -223,23 +224,37 @@ class HostedRoomService:
                 != catalog.execution_policy.policy_digest
             ):
                 raise ValueError("peer route does not match its target catalog")
-        if target_url is not None and catalog is not None:
-            hosted_room_links.save_room_link(
-                self.db_path,
-                hosted_room_links.make_stored_link(
-                    room_id=room_id,
-                    member_id=member_id,
-                    target_url=target_url,
-                    target_profile=route.target_profile,
-                    grant=route.grant,
-                    catalog=catalog,
-                    cancellation_scope_id=route.cancellation_scope_id,
-                    trace_id=route.trace_id,
-                ),
-            )
         # Persistence is the publication boundary. A failed disk write must
-        # never leave a process-local route that disappears after restart.
+        # never leave a process-local route that disappears after restart. The
+        # same lock makes reconnect a compare-and-swap against grant rotation.
         with self._policy_lock:
+            current = self.peer_routes.get((room_id, member_id))
+            current_sha256 = (
+                hashlib.sha256(current.grant.encode("utf-8")).hexdigest()
+                if current is not None
+                else ""
+            )
+            incoming_sha256 = hashlib.sha256(route.grant.encode("utf-8")).hexdigest()
+            if (
+                current_sha256 != incoming_sha256
+                and expected_grant_sha256 is not None
+                and current_sha256 != expected_grant_sha256
+            ):
+                raise RuntimeError("peer route changed during reconnect")
+            if target_url is not None and catalog is not None:
+                hosted_room_links.save_room_link(
+                    self.db_path,
+                    hosted_room_links.make_stored_link(
+                        room_id=room_id,
+                        member_id=member_id,
+                        target_url=target_url,
+                        target_profile=route.target_profile,
+                        grant=route.grant,
+                        catalog=catalog,
+                        cancellation_scope_id=route.cancellation_scope_id,
+                        trace_id=route.trace_id,
+                    ),
+                )
             self.peer_routes[(room_id, member_id)] = route
             self.peer_clients[(room_id, member_id)] = client
             self._peer_route_status[(room_id, member_id)] = "ready"
@@ -421,62 +436,62 @@ class HostedRoomService:
         catalog: GatewayRoomCatalog | None = None,
     ) -> None:
         """Persist a target-refreshed scoped grant before publishing it live."""
-        key = (room_id, member_id)
-        route = self.peer_routes.get(key)
-        if route is None:
-            raise RuntimeError("peer room route is unavailable")
-        stored = next(
-            (
-                link
-                for link in hosted_room_links.load_room_links(self.db_path)
-                if (link.room_id, link.member_id) == key
-            ),
-            None,
-        )
-        if stored is None:
-            raise RuntimeError("peer room route cannot be renewed before persistence")
-        effective_catalog = catalog or stored.catalog
-        if catalog is not None and (
-            catalog.installation_id != route.target_install_id
-            or catalog.execution_policy.target_profile != route.target_profile
-            or PROTOCOL_VERSION not in catalog.protocol_versions
-            or "direct" not in catalog.link_modes
-            or not catalog.text
-            or catalog.execution_policy.policy_digest
-            != route.execution_policy_digest
-        ):
-            self._set_route_status(room_id, member_id, "needs_reauthorization")
-            raise RuntimeError(
-                "peer room execution policy changed; reauthorization is required"
-            )
-        rotated_route = replace(
-            route,
-            grant=grant,
-            capability_digest=(
-                catalog.catalog_digest
-                if catalog is not None
-                else route.capability_digest
-            ),
-            execution_policy_digest=(
-                catalog.execution_policy.policy_digest
-                if catalog is not None
-                else route.execution_policy_digest
-            ),
-        )
-        hosted_room_links.save_room_link(
-            self.db_path,
-            hosted_room_links.make_stored_link(
-                room_id=room_id,
-                member_id=member_id,
-                target_url=stored.target_url,
-                target_profile=stored.target_profile,
-                grant=grant,
-                catalog=effective_catalog,
-                cancellation_scope_id=stored.cancellation_scope_id,
-                trace_id=stored.trace_id,
-            ),
-        )
         with self._policy_lock:
+            key = (room_id, member_id)
+            route = self.peer_routes.get(key)
+            if route is None:
+                raise RuntimeError("peer room route is unavailable")
+            stored = next(
+                (
+                    link
+                    for link in hosted_room_links.load_room_links(self.db_path)
+                    if (link.room_id, link.member_id) == key
+                ),
+                None,
+            )
+            if stored is None:
+                raise RuntimeError("peer room route cannot be renewed before persistence")
+            effective_catalog = catalog or stored.catalog
+            if catalog is not None and (
+                catalog.installation_id != route.target_install_id
+                or catalog.execution_policy.target_profile != route.target_profile
+                or PROTOCOL_VERSION not in catalog.protocol_versions
+                or "direct" not in catalog.link_modes
+                or not catalog.text
+                or catalog.execution_policy.policy_digest
+                != route.execution_policy_digest
+            ):
+                self._set_route_status(room_id, member_id, "needs_reauthorization")
+                raise RuntimeError(
+                    "peer room execution policy changed; reauthorization is required"
+                )
+            rotated_route = replace(
+                route,
+                grant=grant,
+                capability_digest=(
+                    catalog.catalog_digest
+                    if catalog is not None
+                    else route.capability_digest
+                ),
+                execution_policy_digest=(
+                    catalog.execution_policy.policy_digest
+                    if catalog is not None
+                    else route.execution_policy_digest
+                ),
+            )
+            hosted_room_links.save_room_link(
+                self.db_path,
+                hosted_room_links.make_stored_link(
+                    room_id=room_id,
+                    member_id=member_id,
+                    target_url=stored.target_url,
+                    target_profile=stored.target_profile,
+                    grant=grant,
+                    catalog=effective_catalog,
+                    cancellation_scope_id=stored.cancellation_scope_id,
+                    trace_id=stored.trace_id,
+                ),
+            )
             self.peer_routes[key] = rotated_route
             self._peer_route_status[key] = "ready"
 
@@ -492,6 +507,33 @@ class HostedRoomService:
                 if room_id is None or key[0] == room_id
             ]
         return sorted(rows, key=lambda row: (row["room_id"], row["member_id"]))
+
+    def status_with_grant_fingerprints(self, room_id: str) -> dict[str, Any]:
+        """Snapshot reconnect status and non-secret grant identity atomically."""
+        with self._policy_lock:
+            status = self.status(room_id)
+            return {
+                **status,
+                "peer_routes": [
+                    {
+                        **row,
+                        **(
+                            {
+                                "grant_sha256": hashlib.sha256(
+                                    route.grant.encode("utf-8")
+                                ).hexdigest()
+                            }
+                            if (
+                                route := self.peer_routes.get(
+                                    (room_id, str(row.get("member_id") or ""))
+                                )
+                            )
+                            else {}
+                        ),
+                    }
+                    for row in status.get("peer_routes", [])
+                ],
+            }
 
     def _events(self, room_id: str) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []

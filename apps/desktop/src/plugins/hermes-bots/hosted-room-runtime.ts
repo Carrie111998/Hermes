@@ -20,6 +20,16 @@ import {
   updateGroupChat
 } from './group-chat'
 import {
+  addHostedRoomCleanup,
+  armHostedRoomCleanup,
+  dispatchHostedRoomCleanup,
+  hostedRoomCleanupPending,
+  releaseHostedRoomCleanup,
+  resetHostedRoomCleanupForTests,
+  startHostedRoomCleanup,
+  stopHostedRoomCleanup
+} from './hosted-room-cleanup'
+import {
   classifyHostedRoomCapability,
   createHostedRoomOutbox,
   createHostedRoomReplayState,
@@ -42,11 +52,10 @@ import { botsText } from './i18n'
 import { requestForBot } from './routing'
 import type { GroupChat, GroupMember, GroupMessage, ProfileRoute } from './types'
 
+export { $hostedRoomCleanup } from './hosted-room-cleanup'
 export { describeAutonomousRoomPlan, describeHostedRoomCreationError } from './hosted-room-client'
 
 const HOSTED_ROOM_OUTBOX_KEY = 'hosted-room-outbox-v1'
-const HOSTED_ROOM_CLEANUP_KEY = 'hosted-room-cleanup-v1'
-const HOSTED_ROOM_CLEANUP_LIMIT = 64
 const HOSTED_ROOM_LIST_PAGE_SIZE = 500
 const HOSTED_ROOM_LIST_MAX_PAGES = 4
 const HOSTED_ROOM_SYNC_INTERVAL_MS = 5000
@@ -54,21 +63,29 @@ const HOSTED_ROOM_UNSUPPORTED_REPROBE_MS = 30_000
 
 export const $hostedRoomCapabilities = atom<Record<string, HostedRoomCapability>>({})
 export const $hostedRoomOutbox = atom<HostedRoomOutbox>(createHostedRoomOutbox())
-export const $hostedRoomCleanup = atom<HostedRoomCleanup>({ version: 1, operations: [] })
 
 const hostedAuthorityRoutes = new Map<string, ProfileRoute>()
 const hostedRoomPollCache = new Map<string, string>()
+const hostedRoomPollGenerations = new Map<string, number>()
 const hostedRoomMutationGenerations = new Map<string, number>()
 const hostedRoomLocallyDeleted = new Set<string>()
 const hostedRoomInventoriedConnections = new Set<string>()
 let hostedRoomSyncTimer: ReturnType<typeof setTimeout> | null = null
 let hostedRoomSyncRunning = false
 let hostedRoomSyncDisposed = true
+let hostedRoomLifecycleGeneration = 0
 let hostedOutboxDispatching = false
-let hostedCleanupDispatching = false
 let hostedRoomStorage: null | PluginContext['storage'] = null
 let hostedRoomHooks: HostedRoomRuntimeHooks = {}
 const hostedUnsupportedUntil = new Map<string, number>()
+
+export function hostedRoomLifecycleToken() {
+  return hostedRoomLifecycleGeneration
+}
+
+export function hostedRoomLifecycleIsCurrent(token: number) {
+  return !hostedRoomSyncDisposed && token === hostedRoomLifecycleGeneration
+}
 
 function hostedRoomMutationGeneration(roomId: string) {
   return Math.max(0, Number(hostedRoomMutationGenerations.get(String(roomId || '')) || 0))
@@ -145,23 +162,6 @@ export interface HostedRoomProbe {
   routes: Record<string, ProfileRoute>
 }
 
-interface HostedRoomCleanupOperation {
-  cancelId?: null | string
-  connectionId: string
-  grant?: null | string
-  kind: 'home-disband' | 'peer-revoke'
-  operationId: string
-  ownerId: string
-  profile?: null | string
-  roomId?: null | string
-  setupId: string
-}
-
-interface HostedRoomCleanup {
-  operations: HostedRoomCleanupOperation[]
-  version: 1
-}
-
 interface HostedRoomCreateInput {
   members: Array<{
     display_name?: string
@@ -236,7 +236,7 @@ async function hostedDefaultRoutes(): Promise<ProfileRoute[]> {
   return [...byConnection.values()]
 }
 
-async function requestHostedConnection<T>(
+export async function requestHostedConnection<T>(
   route: ProfileRoute,
   method: string,
   params: Record<string, unknown> = {}
@@ -246,188 +246,6 @@ async function requestHostedConnection<T>(
   }
 
   return host.requestProfile(route, method, params) as Promise<T>
-}
-
-const hostedCleanupOwnerId =
-  globalThis.crypto?.randomUUID?.() || `desktop-${Date.now()}-${Math.random().toString(36).slice(2)}`
-
-function normalizeHostedRoomCleanup(value: unknown): HostedRoomCleanup {
-  const candidate = record(value)
-  const operations: HostedRoomCleanupOperation[] = []
-
-  for (const raw of Array.isArray(candidate?.operations) ? candidate.operations : []) {
-    const operation = record(raw)
-    const operationId = String(operation?.operationId || '')
-    const setupId = String(operation?.setupId || '')
-    const kind = String(operation?.kind || '')
-    const connectionId = String(operation?.connectionId || '')
-
-    if (!operationId || !setupId || !connectionId || !['home-disband', 'peer-revoke'].includes(kind)) {
-      continue
-    }
-
-    if (kind === 'home-disband' && !String(operation?.roomId || '')) {
-      continue
-    }
-
-    if (kind === 'peer-revoke' && (!String(operation?.grant || '') || !String(operation?.profile || ''))) {
-      continue
-    }
-
-    operations.push({
-      operationId,
-      setupId,
-      kind: kind as HostedRoomCleanupOperation['kind'],
-      connectionId,
-      ownerId: String(operation?.ownerId || ''),
-      roomId: kind === 'home-disband' ? String(operation?.roomId || '') : null,
-      cancelId:
-        kind === 'home-disband' ? String(operation?.cancelId || `rollback-${String(operation?.roomId || '')}`) : null,
-      profile: kind === 'peer-revoke' ? String(operation?.profile || '') : null,
-      grant: kind === 'peer-revoke' ? String(operation?.grant || '') : null
-    })
-  }
-
-  return {
-    version: 1,
-    operations: operations.slice(-HOSTED_ROOM_CLEANUP_LIMIT)
-  }
-}
-
-async function replaceHostedRoomCleanup(next: HostedRoomCleanup) {
-  if (!hostedRoomStorage?.set) {
-    throw new Error('Desktop storage is unavailable, so Group Chat setup cannot be secured.')
-  }
-
-  const previous = $hostedRoomCleanup.get()
-
-  $hostedRoomCleanup.set(next)
-
-  try {
-    await hostedRoomStorage.set(HOSTED_ROOM_CLEANUP_KEY, next)
-  } catch (error) {
-    $hostedRoomCleanup.set(previous)
-    throw error
-  }
-}
-
-async function addHostedRoomCleanup(operation: Omit<HostedRoomCleanupOperation, 'ownerId'>) {
-  const current = normalizeHostedRoomCleanup($hostedRoomCleanup.get())
-
-  const next = normalizeHostedRoomCleanup({
-    version: 1,
-    operations: [
-      ...current.operations.filter(entry => entry.operationId !== operation.operationId),
-      {
-        ...operation,
-        ownerId: hostedCleanupOwnerId
-      }
-    ]
-  })
-
-  if (next.operations.length >= HOSTED_ROOM_CLEANUP_LIMIT && current.operations.length >= HOSTED_ROOM_CLEANUP_LIMIT) {
-    throw new Error('Group Chat cleanup is pending. Reconnect the affected devices before creating another.')
-  }
-
-  await replaceHostedRoomCleanup(next)
-}
-
-async function releaseHostedRoomCleanup(setupId: string) {
-  const current = normalizeHostedRoomCleanup($hostedRoomCleanup.get())
-
-  await replaceHostedRoomCleanup({
-    version: 1,
-    operations: current.operations.filter(operation => operation.setupId !== setupId)
-  })
-}
-
-async function armHostedRoomCleanup(setupId: string) {
-  const current = normalizeHostedRoomCleanup($hostedRoomCleanup.get())
-
-  await replaceHostedRoomCleanup({
-    version: 1,
-    operations: current.operations.map(operation =>
-      operation.setupId === setupId
-        ? {
-            ...operation,
-            ownerId: ''
-          }
-        : operation
-    )
-  })
-}
-
-async function hostedRouteForReference(connectionId: string, profile = 'default') {
-  if (typeof host.profileRoutes !== 'function') {
-    return null
-  }
-
-  const routes = await host.profileRoutes()
-
-  return ((Array.isArray(routes) ? routes : []).find(route => {
-    const routeProfile = String(route?.targetProfile || route?.profile || '')
-
-    return String(route?.connectionId || '') === connectionId && routeProfile === profile
-  }) || null) as ProfileRoute | null
-}
-
-function hostedCleanupAlreadySettled(operation: HostedRoomCleanupOperation, error: unknown) {
-  const candidate = record(error)
-  const inner = record(candidate?.error)
-  const code = Number(candidate?.code ?? inner?.code)
-  const message = String(candidate?.message || inner?.message || error || '')
-
-  return operation.kind === 'home-disband' && code === 4113 && /hosted room not found|already disbanded/i.test(message)
-}
-
-async function dispatchHostedRoomCleanup() {
-  if (hostedCleanupDispatching || hostedRoomSyncDisposed) {
-    return
-  }
-
-  hostedCleanupDispatching = true
-
-  try {
-    for (const operation of normalizeHostedRoomCleanup($hostedRoomCleanup.get()).operations) {
-      if (operation.ownerId === hostedCleanupOwnerId) {
-        continue
-      }
-
-      const profile = operation.kind === 'peer-revoke' ? String(operation.profile || '') : 'default'
-      const route = await hostedRouteForReference(operation.connectionId, profile)
-
-      if (!route) {
-        continue
-      }
-
-      try {
-        if (operation.kind === 'home-disband') {
-          await requestHostedConnection(route, 'groups.disband', {
-            room_id: operation.roomId,
-            cancel_id: operation.cancelId
-          })
-        } else {
-          await requestHostedConnection(route, 'groups.peer.revoke', {
-            grant: operation.grant,
-            profile: operation.profile
-          })
-        }
-      } catch (error) {
-        if (!hostedCleanupAlreadySettled(operation, error)) {
-          continue
-        }
-      }
-
-      const latest = normalizeHostedRoomCleanup($hostedRoomCleanup.get())
-
-      await replaceHostedRoomCleanup({
-        version: 1,
-        operations: latest.operations.filter(entry => entry.operationId !== operation.operationId)
-      })
-    }
-  } finally {
-    hostedCleanupDispatching = false
-  }
 }
 
 async function withHostedRoomProbeTimeout<T>(task: Promise<T>, timeoutMs = 3000) {
@@ -465,8 +283,7 @@ function hostedMemberDescriptors(
     const handle = String(member.handle || member.profile || 'hermes')
     const target = record(member.target)
 
-    const targetAuthority =
-      target?.kind === 'peer' ? String(target.installation_id || target.peer_id || '') : ''
+    const targetAuthority = target?.kind === 'peer' ? String(target.installation_id || target.peer_id || '') : ''
 
     const prior = (existingMembers || []).find(
       candidate =>
@@ -480,9 +297,7 @@ function hostedMemberDescriptors(
 
     const connectionId = targetAuthority ? peerConnectionId || String(prior?.connectionId || '') : homeConnectionId
 
-    const connectionLabel = connectionId
-      ? sourceLabel(connectionId)
-      : String(prior?.connectionLabel || '')
+    const connectionLabel = connectionId ? sourceLabel(connectionId) : String(prior?.connectionLabel || '')
 
     const sourceReachable = connectionId
       ? capabilities[connectionId]
@@ -637,6 +452,40 @@ export function hostedRoomPollFingerprint(value: unknown) {
   return `${revision}:${latestSeq}`
 }
 
+function hostedRoomCapabilityFingerprint(capability: HostedRoomCapability | undefined) {
+  if (!capability) {
+    return ''
+  }
+
+  return JSON.stringify([
+    capability.kind,
+    capability.authorityId,
+    capability.persistentProcess,
+    capability.exactPeerGrantRevoke,
+    capability.routeGrantFingerprint
+  ])
+}
+
+function invalidateHostedRoomsForConnection(connectionId: string) {
+  for (const room of Object.values($groupChats.get())) {
+    if (
+      room.hostedConnectionId === connectionId ||
+      (room.members || []).some(
+        member => String(member.route?.connectionId || member.connectionId || '') === connectionId
+      )
+    ) {
+      hostedRoomPollCache.delete(String(room.roomId || ''))
+    }
+  }
+}
+
+export function invalidateHostedRoomPoll(roomId: string) {
+  const id = String(roomId || '')
+
+  hostedRoomPollCache.delete(id)
+  hostedRoomPollGenerations.set(id, Number(hostedRoomPollGenerations.get(id) || 0) + 1)
+}
+
 export function shouldRefreshHostedRoom(room: GroupChat | undefined, listed: unknown) {
   if (!room) {
     return true
@@ -662,6 +511,9 @@ export async function refreshHostedRooms() {
     return
   }
 
+  const lifecycleGeneration = hostedRoomLifecycleGeneration
+  const syncStale = () => hostedRoomSyncDisposed || lifecycleGeneration !== hostedRoomLifecycleGeneration
+
   hostedRoomSyncRunning = true
 
   try {
@@ -672,7 +524,7 @@ export async function refreshHostedRooms() {
     }
 
     for (const route of routes) {
-      if (hostedRoomSyncDisposed) {
+      if (syncStale()) {
         return
       }
 
@@ -707,11 +559,24 @@ export async function refreshHostedRooms() {
         }
       }
 
-      if (hostedRoomSyncDisposed) {
+      if (syncStale()) {
         return
       }
 
+      if (hostedRoomCapabilityFingerprint(cached) !== hostedRoomCapabilityFingerprint(capability)) {
+        invalidateHostedRoomsForConnection(connectionId)
+      }
+
       capabilities[connectionId] = capability
+    }
+
+    if (syncStale()) {
+      return
+    }
+
+    for (const route of routes) {
+      const connectionId = String(route.connectionId)
+      const capability = capabilities[connectionId]
 
       if (!isHostedRoomContinuityEligible(capability) || !capability.authorityId) {
         if (capability.kind === 'unsupported') {
@@ -751,12 +616,15 @@ export async function refreshHostedRooms() {
           listOffset = nextOffset
         }
       } catch {
+        if (syncStale()) {
+          return
+        }
         markHostedConnectionUnavailable(connectionId)
 
         continue
       }
 
-      if (hostedRoomSyncDisposed) {
+      if (syncStale()) {
         return
       }
 
@@ -793,8 +661,7 @@ export async function refreshHostedRooms() {
         if (!shouldRefreshHostedRoom(existingEntry?.[1], listedRoom)) {
           if (
             includeDisbanded &&
-            Math.max(0, Number(existingEntry?.[1]?.hostedSeq || 0)) >=
-              Math.max(0, Number(listedRoom.latest_seq || 0))
+            Math.max(0, Number(existingEntry?.[1]?.hostedSeq || 0)) >= Math.max(0, Number(listedRoom.latest_seq || 0))
           ) {
             caughtUpDisbandedIds.add(roomId)
           }
@@ -803,6 +670,7 @@ export async function refreshHostedRooms() {
         }
 
         const refreshGeneration = hostedRoomMutationGeneration(roomId)
+        const pollGeneration = Number(hostedRoomPollGenerations.get(roomId) || 0)
 
         let stateResponse: Record<string, unknown>
 
@@ -812,12 +680,15 @@ export async function refreshHostedRooms() {
             ...(includeDisbanded ? { include_disbanded: true } : {})
           })
         } catch {
+          if (syncStale()) {
+            return
+          }
           markHostedConnectionUnavailable(connectionId)
 
           continue
         }
 
-        if (hostedRoomSyncDisposed) {
+        if (syncStale()) {
           return
         }
 
@@ -866,7 +737,7 @@ export async function refreshHostedRooms() {
             existing = $groupChats.get()[renamed]
           }
 
-          if (hostedRoomSyncDisposed) {
+          if (syncStale()) {
             return
           }
 
@@ -895,7 +766,7 @@ export async function refreshHostedRooms() {
           pageSize: capability.maxLogLimit || 100
         })
 
-        if (hostedRoomSyncDisposed) {
+        if (syncStale()) {
           return
         }
 
@@ -905,6 +776,42 @@ export async function refreshHostedRooms() {
 
         const replayStatus = deriveFriendlyHostedRoomStatus(replay.state)
         const driver = record(stateResponse.driver_status)
+        const reconnectRoute = (Array.isArray(driver?.peer_routes) ? driver.peer_routes : [])
+          .map(record)
+          .find(route => route?.status === 'needs_reauthorization' && String(route?.member_id || ''))
+        const reconnectMemberId = String(reconnectRoute?.member_id || '')
+        const reconnectMember = (Array.isArray(serverRoom.members) ? serverRoom.members : [])
+          .map(record)
+          .find(member => String(member?.member_id || '') === reconnectMemberId)
+        const reconnectName = String(
+          reconnectMember?.display_name || reconnectMember?.handle || reconnectMember?.profile || botsText().group.aBot
+        )
+        const reconnectTarget = record(reconnectMember?.target)
+        const reconnectAuthority = String(reconnectTarget?.installation_id || reconnectTarget?.peer_id || '')
+        const reconnectPrior = (existing?.members || []).find(
+          member =>
+            String(member.handle || member.name || '') ===
+              String(reconnectMember?.handle || reconnectMember?.profile || '') &&
+            String(member.targetProfile || member.name || '') ===
+              String(reconnectMember?.profile || reconnectMember?.member_id || '')
+        )
+        const reconnectConnectionId =
+          Object.entries(capabilities).find(([, candidate]) => candidate.authorityId === reconnectAuthority)?.[0] ||
+          String(reconnectPrior?.route?.connectionId || reconnectPrior?.connectionId || '')
+        const reconnectCapability = reconnectConnectionId ? capabilities[reconnectConnectionId] : undefined
+        const reconnectCapabilityKnown = Boolean(reconnectCapability)
+        const reconnectSupported = Boolean(
+          capability.routeGrantFingerprint &&
+          reconnectConnectionId &&
+          reconnectCapability?.kind === 'driver-capable' &&
+          reconnectCapability.exactPeerGrantRevoke
+        )
+        const reconnectUpdateConnectionId = !capability.routeGrantFingerprint
+          ? connectionId
+          : reconnectCapability?.kind === 'unsupported' ||
+              (reconnectCapability?.kind === 'driver-capable' && !reconnectCapability.exactPeerGrantRevoke)
+            ? reconnectConnectionId
+            : ''
 
         const stopping = $hostedRoomOutbox
           .get()
@@ -913,7 +820,15 @@ export async function refreshHostedRooms() {
               command.roomId === roomId && ['disband', 'stop'].includes(command.kind) && command.status !== 'failed'
           )
 
-        const friendly = hostedRoomDriverDisplayStatus(replayStatus, driver, { stopping })
+        const friendly = reconnectMemberId
+          ? {
+              ...replayStatus,
+              kind: 'needs-attention' as const,
+              member: reconnectName,
+              canRetry: false,
+              canStop: false
+            }
+          : hostedRoomDriverDisplayStatus(replayStatus, driver, { stopping })
         const running = ['queued', 'stopping', 'working'].includes(friendly.kind)
 
         const retryAction = (Array.isArray(driver?.pending_actions) ? driver.pending_actions : [])
@@ -935,10 +850,26 @@ export async function refreshHostedRooms() {
               hostedStatus: {
                 ...hostedStatus(friendly, sourceLabel(connectionId)),
                 ...(retryAction ? { taskId: String(retryAction.task_id) } : {}),
-                ...(!replay.complete ? { canRetry: true } : {})
+                ...(reconnectMemberId && reconnectSupported
+                  ? {
+                      canReconnect: true,
+                      reconnectMemberId
+                    }
+                  : {}),
+                ...(!replay.complete && !reconnectMemberId ? { canRetry: true } : {})
               },
               continuityMode: hostedRoomContinuityMode(serverRoom),
-              continuityIssue: replay.complete ? null : botsText().group.hostedSyncing,
+              continuityIssue: reconnectMemberId
+                ? !reconnectCapabilityKnown || reconnectCapability?.kind === 'transient-failure'
+                  ? botsText().group.hostedSyncing
+                  : reconnectSupported
+                    ? botsText().group.memberReconnectToContinue(reconnectName)
+                    : botsText().group.hostUpdateNeeded(
+                        reconnectUpdateConnectionId ? sourceLabel(reconnectUpdateConnectionId) : reconnectName
+                      )
+                : replay.complete
+                  ? null
+                  : botsText().group.hostedSyncing,
               running
             }
           },
@@ -947,7 +878,11 @@ export async function refreshHostedRooms() {
           }
         )
 
-        if (replay.complete) {
+        if (
+          replay.complete &&
+          (!reconnectMemberId || Boolean(reconnectUpdateConnectionId)) &&
+          Number(hostedRoomPollGenerations.get(roomId) || 0) === pollGeneration
+        ) {
           hostedRoomPollCache.set(roomId, hostedRoomPollFingerprint(listedRoom))
 
           if (includeDisbanded) {
@@ -1008,6 +943,9 @@ export async function refreshHostedRooms() {
 
             continue
           } catch (error) {
+            if (syncStale()) {
+              return
+            }
             const message = String(record(error)?.message || record(record(error)?.error)?.message || error || '')
 
             if (!/history expired|permanently retired|hosted room not found/i.test(message)) {
@@ -1033,7 +971,7 @@ export async function refreshHostedRooms() {
       }
     }
 
-    if (!hostedRoomSyncDisposed) {
+    if (!syncStale()) {
       $hostedRoomCapabilities.set(capabilities)
     }
   } finally {
@@ -1479,9 +1417,7 @@ export async function createAutonomousHostedGroupChat({
     await armHostedRoomCleanup(roomId).catch(() => undefined)
     await dispatchHostedRoomCleanup().catch(() => undefined)
 
-    if (
-      normalizeHostedRoomCleanup($hostedRoomCleanup.get()).operations.some(operation => operation.setupId === roomId)
-    ) {
+    if (hostedRoomCleanupPending(roomId)) {
       throw Object.assign(
         new Error('Some selected Bots could not finish cleanup. Reconnect them before trying again.', {
           cause: error
@@ -1646,6 +1582,7 @@ export async function disbandHostedGroupChat(group: string) {
 }
 
 export async function startHostedRoomRuntime(storage: PluginContext['storage'], hooks: HostedRoomRuntimeHooks = {}) {
+  const lifecycleGeneration = ++hostedRoomLifecycleGeneration
   hostedRoomStorage = storage
   hostedRoomHooks = hooks
   hostedRoomSyncDisposed = false
@@ -1660,30 +1597,34 @@ export async function startHostedRoomRuntime(storage: PluginContext['storage'], 
     /* an empty outbox is the safe fallback */
   }
 
+  if (hostedRoomSyncDisposed || lifecycleGeneration !== hostedRoomLifecycleGeneration) {
+    return
+  }
+
   try {
     $hostedRoomOutbox.set(createHostedRoomOutbox(persisted))
   } catch {
     $hostedRoomOutbox.set(createHostedRoomOutbox())
   }
 
-  try {
-    $hostedRoomCleanup.set(normalizeHostedRoomCleanup(await storage?.get?.(HOSTED_ROOM_CLEANUP_KEY, null)))
-  } catch {
-    $hostedRoomCleanup.set({ version: 1, operations: [] })
+  await startHostedRoomCleanup(storage)
+  if (hostedRoomSyncDisposed || lifecycleGeneration !== hostedRoomLifecycleGeneration) {
+    return
   }
-
-  await dispatchHostedRoomCleanup().catch(() => undefined)
   await refreshHostedRooms().catch(() => undefined)
   await dispatchHostedRoomOutbox().catch(() => undefined)
   scheduleHostedRoomSync()
 }
 
 export function stopHostedRoomRuntime() {
+  hostedRoomLifecycleGeneration += 1
   hostedRoomSyncDisposed = true
+  stopHostedRoomCleanup()
   hostedRoomStorage = null
   hostedRoomHooks = {}
   hostedAuthorityRoutes.clear()
   hostedRoomPollCache.clear()
+  hostedRoomPollGenerations.clear()
   hostedRoomMutationGenerations.clear()
   hostedRoomLocallyDeleted.clear()
   hostedRoomInventoriedConnections.clear()
@@ -1701,8 +1642,7 @@ export function resetHostedRoomRuntimeForTests() {
   stopHostedRoomRuntime()
   hostedRoomSyncRunning = false
   hostedOutboxDispatching = false
-  hostedCleanupDispatching = false
+  resetHostedRoomCleanupForTests()
   $hostedRoomCapabilities.set({})
   $hostedRoomOutbox.set(createHostedRoomOutbox())
-  $hostedRoomCleanup.set({ version: 1, operations: [] })
 }

@@ -87,11 +87,13 @@ def test_capabilities_are_honest_about_the_driver_boundary(home):
 def test_capabilities_and_invitation_advertise_scoped_roomlink(home, monkeypatch):
     monkeypatch.setenv("API_SERVER_KEY", "gateway-api-key-1234567890")
     monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    (home / "profiles" / "reviewer").mkdir()
     result = _result(srv._methods["groups.capabilities"](1, {}))
     assert result["room_link"]["enabled"] is True
     assert result["room_link"]["profile"] == "reviewer"
     assert result["room_link"]["catalog"]["text"] is True
     assert "groups.peer.invite" in result["methods"]
+    assert "groups.peer.revoke_exact" in result["methods"]
     assert "groups.peer.register" in result["methods"]
 
     invitation = _result(
@@ -117,6 +119,17 @@ def test_capabilities_and_invitation_advertise_scoped_roomlink(home, monkeypatch
         room_id="room-1",
         target_profile="reviewer",
     )
+
+    exact = _result(
+        srv._methods["groups.peer.revoke_exact"](
+            3,
+            {
+                "grant": invitation["grant"],
+                "profile": "reviewer",
+            },
+        )
+    )
+    assert exact == {"revoked": True}
 
 
 def test_capabilities_disable_roomlink_when_run_replay_is_not_durable(
@@ -366,12 +379,14 @@ def test_register_peer_route_probes_scope_and_persists_via_service(home, monkeyp
                 "target_profile": "reviewer",
                 "grant": "signed.room.grant",
                 "catalog": catalog,
+                "expected_grant_sha256": "a" * 64,
             },
         )
     )
     assert result["registered"] is True
     assert captured["api_key"] == ""
     assert captured["registered"]["target_url"] == ("https://peer.example.test")
+    assert captured["registered"]["expected_grant_sha256"] == "a" * 64
 
 
 def test_register_rejects_plaintext_non_loopback(home, monkeypatch):

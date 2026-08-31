@@ -98,6 +98,7 @@ import {
 import type { GroupComposerDraft, GroupDraftSetter } from './group-panes'
 import { sendToGroupChat, stopGroupThread } from './group-rounds'
 import { clearGroupClarify } from './group-turns'
+import { reconnectHostedGroupChatPeer } from './hosted-room-reauthorization'
 import {
   beginHostedRoomMutation,
   disbandHostedGroupChat,
@@ -756,6 +757,7 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
   // Collapsible Activity view: collapsed by default — opening it is always an
   // explicit user action, it never steals focus, and it never auto-scrolls.
   const [activityOpen, setActivityOpen] = useState(false)
+  const [reconnecting, setReconnecting] = useState(false)
   // Subscribe: activity rows re-render as turn events land.
   useValue($groupActivity)
   // Pending member questions for THIS room (#90694), oldest first.
@@ -840,6 +842,25 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
   const latestActivity = activityEvents.length ? activityEvents[activityEvents.length - 1] : null
   const hostedActivity = groupChatHostedGateway(room) ? room.hostedStatus?.label : null
   const retryTaskId = String(room.hostedStatus?.taskId || '')
+  const reconnectMemberId = String(room.hostedStatus?.reconnectMemberId || '')
+
+  const reconnectRoomMember = async () => {
+    if (!reconnectMemberId || reconnecting) {
+      return
+    }
+
+    setReconnecting(true)
+    try {
+      await reconnectHostedGroupChatPeer(group, reconnectMemberId)
+    } catch {
+      host.notify({
+        kind: 'error',
+        message: b.group.reconnectFailed
+      })
+    } finally {
+      setReconnecting(false)
+    }
+  }
 
   // #94570 shell rewired onto the real primitive (#91868/#94569): the button
   // must stop the ROUND, not just spray per-member interrupts — without the
@@ -897,6 +918,17 @@ export function GroupChatWorkspace({ group, members, onBack, visible = true }: G
             variant="secondary"
           >
             {b.group.retryAction}
+          </Button>
+        ) : null}
+        {room.hostedStatus?.canReconnect && reconnectMemberId ? (
+          <Button
+            aria-busy={reconnecting}
+            disabled={reconnecting}
+            onClick={() => void reconnectRoomMember()}
+            size="xs"
+            variant="secondary"
+          >
+            {reconnecting ? b.group.reconnectingAction : b.group.reconnectAction}
           </Button>
         ) : null}
       </div>

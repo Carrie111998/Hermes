@@ -69,6 +69,7 @@ const eligibleProbe: HostedRoomProbe = {
   capability: {
     authorityId: 'install:studio',
     connectionId: 'host-a',
+    exactPeerGrantRevoke: false,
     kind: 'driver-capable',
     limits: {
       attachments: false,
@@ -76,6 +77,7 @@ const eligibleProbe: HostedRoomProbe = {
       crossGatewayMembers: true
     },
     persistentProcess: true,
+    routeGrantFingerprint: false,
     reason: null,
     roomLink: null
   },
@@ -167,11 +169,7 @@ describe('automatic Group Chat continuity', () => {
     const create = await renderSelectedGroup()
 
     expect(screen.getByText('New group chat')).toBeTruthy()
-    expect(
-      screen.getByText(
-        'Choose 2–6 Bots.'
-      )
-    ).toBeTruthy()
+    expect(screen.getByText('Choose 2–6 Bots.')).toBeTruthy()
     expect(screen.queryByRole('switch')).toBeNull()
     await waitFor(() => expect(create.disabled).toBe(false))
     await act(async () => {
@@ -276,9 +274,10 @@ describe('automatic Group Chat continuity', () => {
         member: expect.objectContaining({ connectionId: 'host-b', name: 'builder' })
       })
     ])
-    expect(
-      mocks.saveBotMeta.mock.calls.map(([owner]) => (owner as { connectionId?: string }).connectionId)
-    ).toEqual(['host-a', 'host-b'])
+    expect(mocks.saveBotMeta.mock.calls.map(([owner]) => (owner as { connectionId?: string }).connectionId)).toEqual([
+      'host-a',
+      'host-b'
+    ])
   })
 
   it('keeps Create disabled until the probe settles', async () => {

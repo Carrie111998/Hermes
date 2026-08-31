@@ -58,6 +58,8 @@ describe('hosted Group Chat capability negotiation', () => {
         driver: true,
         persistent_process: true,
         authority_gateway_id: 'install:home',
+        features: ['peer_route_grant_fingerprint'],
+        methods: ['groups.peer.revoke_exact'],
         max_log_limit: 250
       },
       {
@@ -74,10 +76,26 @@ describe('hosted Group Chat capability negotiation', () => {
     expect(capable).toMatchObject({
       kind: 'driver-capable',
       authorityId: 'install:home',
+      exactPeerGrantRevoke: true,
       persistentProcess: true,
+      routeGrantFingerprint: true,
       maxLogLimit: 250
     })
     expect(isHostedRoomContinuityEligible(capable)).toBe(true)
+    expect(
+      classifyHostedRoomCapability({
+        driver: true,
+        persistent_process: true,
+        authority_gateway_id: 'install:older'
+      }).exactPeerGrantRevoke
+    ).toBe(false)
+    expect(
+      classifyHostedRoomCapability({
+        driver: true,
+        persistent_process: true,
+        authority_gateway_id: 'install:older'
+      }).routeGrantFingerprint
+    ).toBe(false)
     expect(
       isHostedRoomContinuityEligible({
         driver: true,
