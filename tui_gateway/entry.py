@@ -395,12 +395,18 @@ def ensure_mcp_discovery_started() -> None:
     SELECTED profile's ``mcp_servers``, not the launch profile's (#67605).
 
     Delegating to the shared owner (instead of a hand-rolled thread) keeps
-    the process-wide start lock, the retry-after-zero-connected allowance,
-    and interactive-OAuth suppression.
+    the start lock, the retry-after-zero-connected allowance, and
+    interactive-OAuth suppression. That owner's coordinator state is keyed by
+    canonical profile home, so each profile gets its own discovery run: a
+    profile whose run is still in flight no longer denies every other profile
+    the discovery slot, and repeated builds for one profile still dedupe.
 
-    Known limitation: MCP tool registration is process-global, so in a
-    multi-profile process the FIRST profile that builds an agent wins the
-    discovery slot. Full per-profile MCP registries are tracked in #67605.
+    Known limitation: the model tool registry is process-global, so two
+    profiles exposing the same public ``mcp__<server>__<tool>`` name share one
+    registry entry. Dispatch itself is profile-scoped (each profile's
+    ``MCPServerTask`` lives in its own ``MCPProfileRegistry``), so a call made
+    under profile B cannot reach profile A's session -- but the tool's schema
+    and description come from whichever profile registered it. See #67605.
     """
     global _mcp_discovery_enabled
 
