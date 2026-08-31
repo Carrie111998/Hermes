@@ -7595,11 +7595,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         # (/v1/responses, /v1/runs) record one, so no other
                         # caller's rows change shape.
                         if bind_declared_conversation:
-                            if _declared_selected:
-                                self._bind_declared_conversation(
-                                    getattr(agent, "session_id", None) or session_id,
-                                    gateway_session_key,
-                                )
+                            self._bind_declared_conversation(
+                                getattr(agent, "session_id", None) or session_id,
+                                gateway_session_key,
+                            )
                     clear_session_vars(tokens)
 
         self._activate_admitted_request()
@@ -7997,11 +7996,14 @@ class APIServerAdapter(BasePlatformAdapter):
                             _clear_turn_process_ownership(agent)
                             # /v1/runs owns its agent lifecycle, so it records
                             # the declared conversation itself rather than
-                            # through _run_agent's bind_declared_conversation.
-                            self._bind_declared_conversation(
-                                getattr(agent, "session_id", None) or session_id,
-                                gateway_session_key,
-                            )
+                            # through _run_agent's bind_declared_conversation
+                            # -- carrying the same precedence gate, which an
+                            # explicit body session_id turns off.
+                            if _declared_selected:
+                                self._bind_declared_conversation(
+                                    getattr(agent, "session_id", None) or session_id,
+                                    gateway_session_key,
+                                )
                             try:
                                 unregister_gateway_notify(approval_session_key)
                             finally:
