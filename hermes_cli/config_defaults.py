@@ -2297,6 +2297,22 @@ DEFAULT_CONFIG = {
         # and single-mutation `hermes curator rollback <entry-id>`.
         # Telemetry, never a gate: ledger failures cannot block a mutation.
         "ledger": True,
+        # Opt-in three-stage routing for large catalogs. The system prompt shows
+        # only configured hot skills plus top-level family cards; each user turn
+        # gets a model-routed, precision-ranked shortlist in its persisted
+        # api_content sidecar. Disabled by default: enabling changes the stable
+        # system-prompt prefix and therefore requires a new process/session.
+        "staged_router": {
+            "enabled": False,
+            "hot_skills": [],
+            "max_families": 3,
+            "max_exact_lookups": 3,
+            "max_ranked": 5,
+            "timeout_seconds": 60,
+            # Empty provider/model means use the live main route.
+            "provider": "",
+            "model": "",
+        },
     },
 
     # Curator — background skill maintenance.

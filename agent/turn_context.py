@@ -849,6 +849,16 @@ def build_turn_context(
 
     active_system_prompt = agent._cached_system_prompt
 
+    # Bind the exact prompt-builder-visible catalog to structured session
+    # metadata. Resumed sessions restore that persisted state; old sessions
+    # without it remain disabled regardless of marker-like prompt text.
+    try:
+        from agent.skill_router import bind_staged_router_session_state
+
+        bind_staged_router_session_state(agent)
+    except Exception:
+        logger.warning("staged skill router session binding failed", exc_info=True)
+
     # Bot Mode DM tool — injected ONLY into a bot's canonical "Bot Chat"
     # session on Bot-Mode-managed installs (same gate as the protocol
     # section above). The gate is stable for a session's lifetime, so the
@@ -1413,28 +1423,135 @@ def build_turn_context(
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
+    # Multimodal turns cannot carry the string api_content sidecar. Avoid
+    # sending their image payload through auxiliary routing; append the exact
+    # session-catalog fallback as a durable text part instead.
+    _turn_user_content = (
+        messages[current_turn_user_idx].get("content")
+        if 0 <= current_turn_user_idx < len(messages)
+        and isinstance(messages[current_turn_user_idx], dict)
+        else None
+    )
+    if isinstance(_turn_user_content, list):
+        try:
+            from agent.skill_router import full_catalog_context_for_agent
+
+            _multimodal_skill_context = full_catalog_context_for_agent(agent)
+            if _multimodal_skill_context:
+                append_notes_to_multimodal_content(
+                    _turn_user_content, _multimodal_skill_context
+                )
+        except Exception:
+            logger.warning(
+                "multimodal staged skill router fallback unavailable", exc_info=True
+            )
+
     # Gateway must-deliver notes (auto-reset note, first-contact intro,
     # voice-channel change) ride the same user-message injection channel as
     # plugin context so the ephemeral system prompt can stay byte-stable.
-    # One-shot: staged by the gateway right before this turn, consumed here.
-    # Multimodal (list) content can't take the string sidecar — append a
-    # durable text part instead of dropping the fact.
     _gateway_notes = consume_gateway_turn_context_notes(agent)
     if _gateway_notes:
-        _gw_turn_content = (
-            messages[current_turn_user_idx].get("content")
-            if 0 <= current_turn_user_idx < len(messages)
-            and isinstance(messages[current_turn_user_idx], dict)
-            else None
-        )
-        if isinstance(_gw_turn_content, list):
-            append_notes_to_multimodal_content(_gw_turn_content, _gateway_notes)
+        if isinstance(_turn_user_content, list):
+            append_notes_to_multimodal_content(_turn_user_content, _gateway_notes)
         else:
             plugin_user_context = (
                 plugin_user_context + "\n\n" + _gateway_notes
                 if plugin_user_context
                 else _gateway_notes
             )
+
+    # Stamp deterministic pre-router context before the first persistence.
+    # This preserves the one-insert sidecar contract for plugin/gateway notes;
+    # only context learned after this point (router or memory prefetch) needs a
+    # guarded DB backfill.
+    _api_content_at_early_persist = None
+    if (
+        not moa_active
+        and getattr(agent, "api_mode", None) != "codex_app_server"
+        and isinstance(_turn_user_content, str)
+    ):
+        _api_content_at_early_persist = compose_user_api_content(
+            _turn_user_content, "", plugin_user_context
+        )
+        if (
+            _api_content_at_early_persist is not None
+            and _api_content_at_early_persist != _turn_user_content
+        ):
+            messages[current_turn_user_idx]["api_content"] = (
+                _api_content_at_early_persist
+            )
+
+    # Persist the inbound turn before staged routing makes any auxiliary model
+    # call. The exact string sidecar is backfilled below after routing/prefetch;
+    # a crash or timeout in routing still leaves the clean user turn durable.
+    def _ensure_and_persist() -> None:
+        agent._ensure_db_session()
+        agent._persist_session(messages, conversation_history)
+
+    _early_persist_succeeded = False
+    try:
+        if persist_lock is None:
+            _ensure_and_persist()
+        else:
+            with persist_lock:
+                _ensure_and_persist()
+        _early_persist_succeeded = True
+    except Exception:
+        logger.warning(
+            "Early turn-start session persistence failed for session=%s",
+            agent.session_id or "none",
+            exc_info=True,
+        )
+    finally:
+        # Keep an unmarked staged input available to a later close retry if the
+        # normal persistence attempt failed. Once the marker is present, the
+        # close path must no longer treat it as a pre-worker UI input.
+        if not isinstance(pending_cli_message, dict) or pending_cli_message.get(
+            "_db_persisted"
+        ):
+            agent._pending_cli_user_message = None
+
+    # Opt-in staged skill routing. The router runs once per user turn after the
+    # live provider/model binding is established. Its output rides the same
+    # persisted api_content sidecar as plugin context, so the system prompt and
+    # every historical request prefix remain byte-stable.
+    try:
+        from agent.skill_router import (
+            full_catalog_context_for_agent,
+            route_skills_for_turn,
+        )
+
+        _skill_route_context = (
+            route_skills_for_turn(agent, original_user_message)
+            if isinstance(original_user_message, str) and _early_persist_succeeded
+            else full_catalog_context_for_agent(agent)
+            if isinstance(original_user_message, str)
+            else ""
+        )
+        if _skill_route_context:
+            plugin_user_context = (
+                plugin_user_context + "\n\n" + _skill_route_context
+                if plugin_user_context
+                else _skill_route_context
+            )
+    except Exception as exc:
+        logger.warning("staged skill router unavailable: %s", exc)
+        try:
+            from agent.skill_router import full_catalog_context_for_agent
+
+            _skill_route_context = full_catalog_context_for_agent(agent)
+            if _skill_route_context:
+                plugin_user_context = (
+                    plugin_user_context + "\n\n" + _skill_route_context
+                    if plugin_user_context
+                    else _skill_route_context
+                )
+        except Exception:
+            logger.warning(
+                "staged skill router deterministic fallback unavailable",
+                exc_info=True,
+            )
+
 
     # Per-turn file-mutation verifier state.
     agent._turn_failed_file_mutations = {}
@@ -1529,54 +1646,42 @@ def build_turn_context(
             # Backfill it onto the freshly-inserted row directly. Rotation
             # mode needs nothing here: its compacted copies flush to the
             # child session after this stamp.
-            if _preflight_compressed and bool(
-                getattr(agent, "_last_compaction_in_place", False)
-            ):
-                _db = getattr(agent, "_session_db", None)
-                if _db is not None:
-                    try:
-                        _db.set_latest_user_api_content(
-                            agent.session_id,
-                            _turn_user_msg.get("content"),
-                            _api_content,
+            _db = getattr(agent, "_session_db", None)
+            _needs_backfill = (
+                _early_persist_succeeded
+                and (
+                    _api_content != _api_content_at_early_persist
+                    or (
+                        _preflight_compressed
+                        and bool(
+                            getattr(agent, "_last_compaction_in_place", False)
                         )
-                    except Exception:
-                        logger.warning(
-                            "in-place compaction api_content backfill failed "
-                            "for session=%s",
-                            agent.session_id or "none",
-                            exc_info=True,
-                        )
+                    )
+                )
+            )
+            if _db is not None and _needs_backfill:
+                try:
+                    _db.set_latest_user_api_content(
+                        agent.session_id,
+                        _turn_user_msg.get("content"),
+                        _api_content,
+                    )
+                except Exception:
+                    logger.warning(
+                        "turn-start api_content backfill failed for session=%s",
+                        agent.session_id or "none",
+                        exc_info=True,
+                    )
 
-    # Crash-resilience: persist the inbound user turn before the first LLM
-    # call. Runs after preflight compression (which rewrites history anyway)
-    # and after prefetch/pre_llm_call, so the user row is written once with
-    # its final api_content instead of being re-written mid-turn.
-    # Keep row creation and the marker-based append in the same per-agent
-    # critical section as CLI close persistence, and retry the row create if
-    # the pre-compression attempt above failed transiently.
-    def _ensure_and_persist() -> None:
-        agent._ensure_db_session()
-        agent._persist_session(messages, conversation_history)
-
-    try:
-        if persist_lock is None:
-            _ensure_and_persist()
-        else:
-            with persist_lock:
-                _ensure_and_persist()
-    except Exception:
-        logger.warning(
-            "Early turn-start session persistence failed for session=%s",
-            agent.session_id or "none",
-            exc_info=True,
+    # Codex app-server bypasses the api_messages sidecar substitution path, so
+    # pass the same composed context directly in its turn payload while keeping
+    # the persisted user content clean.
+    if getattr(agent, "api_mode", None) == "codex_app_server":
+        _codex_user_message = compose_user_api_content(
+            user_message, ext_prefetch_cache, plugin_user_context
         )
-    finally:
-        # Keep an unmarked staged input available to a later close retry if the
-        # normal persistence attempt failed. Once the marker is present, the
-        # close path must no longer treat it as a pre-worker UI input.
-        if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
-            agent._pending_cli_user_message = None
+        if _codex_user_message is not None:
+            user_message = _codex_user_message
 
     # Title the session from this user message, now — the row exists and the
     # turn has not called the model yet. Titling is derived from the user's
