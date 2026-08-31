@@ -12082,12 +12082,50 @@ class SessionBridgeStore:
     _DESKTOP_REGISTRY_BASELINE_BATCH = 5_000
 
     def load_desktop_registry_baselines(self) -> list[dict[str, Any]]:
-        with self.db._lock:
-            rows = self.db._conn.execute(
-                """SELECT filename, root_id, group_name, value_json, revision
-                   FROM desktop_registry_baselines"""
-            ).fetchall()
-        return [dict(row) for row in rows]
+        # Read in bounded batches, RELEASING db._lock between them.
+        #
+        # This used to hold the lock across one unbounded SELECT of the whole
+        # table. Measured 2026-08-31 against the production state.db: 448,800
+        # rows carrying 528.7 MB of value_json, and 1.52s for the statement
+        # alone on a warm, uncontended, read-only connection -- worse on the
+        # shared one under load. db._lock serialises EVERY store caller, so for
+        # that entire window the asyncio event loop sat blocked in
+        # coordinator.health() -> mirror_job_counts() -> `with self.db._lock`,
+        # /health stopped answering, and the supervisor's 5s smoke correctly
+        # read the service as not-serving and killed it. Three py-spy dumps 26s
+        # apart caught exactly that: MainThread parked on the lock at
+        # store.py:11130 while this function held it on an executor thread.
+        # DesktopRegistrySyncWorker runs every 300s, which matched the observed
+        # 5-12 minute restart cadence.
+        #
+        # Keyed pagination on rowid, not OFFSET, which would rescan the prefix
+        # on every batch. NOTE this trades a single-statement snapshot for a
+        # batched read, so an interleaving writer could yield a torn view. The
+        # only writer is upsert_desktop_registry_baselines, called by the same
+        # single-threaded worker AFTER this load returns, so no interleaving
+        # exists today. If a second writer is ever added, give this its own
+        # read-only connection instead: WAL permits concurrent readers, which
+        # restores atomicity AND keeps the lock free.
+        out: list[dict[str, Any]] = []
+        last_rowid = 0
+        while True:
+            with self.db._lock:
+                rows = self.db._conn.execute(
+                    """SELECT rowid AS batch_rowid, filename, root_id,
+                              group_name, value_json, revision
+                       FROM desktop_registry_baselines
+                       WHERE rowid > ?
+                       ORDER BY rowid
+                       LIMIT ?""",
+                    (last_rowid, self._DESKTOP_REGISTRY_BASELINE_BATCH),
+                ).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                record = dict(row)
+                last_rowid = int(record.pop("batch_rowid"))
+                out.append(record)
+        return out
 
     def upsert_desktop_registry_baselines(
         self, rows: Sequence[Mapping[str, Any]]
