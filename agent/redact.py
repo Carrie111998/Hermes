@@ -1055,11 +1055,32 @@ def _runtime_loaded_secret_values() -> tuple[str, ...]:
 
     candidates = list(scope.values()) if scope is not None else []
     if not multiplex_active:
-        candidates.extend(
-            value
-            for key, value in os.environ.items()
-            if key != "HERMES_REDACT_SECRETS" and _key_has_secret_keyword(key)
-        )
+        # Iterate names first and only resolve values for credential-shaped
+        # keys. ``os.environ.items()`` materializes every value, including the
+        # overwhelmingly common non-secret settings, on every boundary call.
+        # The cheap name prefilter contains every keyword accepted by
+        # ``_key_has_secret_keyword`` and therefore cannot exclude a key that
+        # the authoritative boundary check would accept.
+        for key in os.environ:
+            if key == "HERMES_REDACT_SECRETS":
+                continue
+            # A cheap, false-negative-free prefilter keeps ordinary runtime
+            # metadata (TERMINAL_*, PATH, HOME, and similar) away from the
+            # boundary-aware regex validator. Every keyword accepted by
+            # ``_KEY_KEYWORD_RE`` contains at least one token below.
+            upper_key = key.upper()
+            if not (
+                "KEY" in upper_key
+                or "TOKEN" in upper_key
+                or "SECRET" in upper_key
+                or "PASS" in upper_key
+                or "PW" in upper_key
+                or "CREDENTIAL" in upper_key
+                or "AUTH" in upper_key
+            ):
+                continue
+            if _key_has_secret_keyword(key):
+                candidates.append(os.environ.get(key))
 
     # During an active turn, the resolved provider credential is held in the
     # context-local main runtime.  It may originate from auth.json or OAuth
@@ -1097,7 +1118,33 @@ def _redact_tool_url_credentials(text: str) -> str:
     return _STRICT_URL_USERINFO_RE.sub(_redact_userinfo, text)
 
 
-def redact_tool_boundary_text(text: Any) -> str:
+def _has_tool_telegram_hint(text: str) -> bool:
+    """Return whether a colon is immediately preceded by at least 8 digits."""
+    offset = 0
+    while True:
+        colon = text.find(":", offset)
+        if colon < 0:
+            return False
+        cursor = colon - 1
+        digits = 0
+        while cursor >= 0 and text[cursor].isdigit():
+            digits += 1
+            if digits >= 8:
+                return True
+            cursor -= 1
+        offset = colon + 1
+
+
+def _tool_boundary_secret_snapshot() -> tuple[str, ...]:
+    """Capture one immutable, invocation-local boundary authority snapshot."""
+    return _runtime_loaded_secret_values()
+
+
+def redact_tool_boundary_text(
+    text: Any,
+    *,
+    _secret_snapshot: tuple[str, ...] | None = None,
+) -> str:
     """Redact one text value at the dispatch-time pre-projection.
 
     This pre-projection ignores the operator-facing
@@ -1113,7 +1160,10 @@ def redact_tool_boundary_text(text: Any) -> str:
     if not text:
         return text
 
-    for secret in _runtime_loaded_secret_values():
+    if _secret_snapshot is None:
+        _secret_snapshot = _tool_boundary_secret_snapshot()
+
+    for secret in _secret_snapshot:
         if secret in text:
             text = text.replace(secret, TOOL_SECRET_PLACEHOLDER)
 
@@ -1124,13 +1174,16 @@ def redact_tool_boundary_text(text: Any) -> str:
         )
         text = _PREFIX_RE.sub(TOOL_SECRET_PLACEHOLDER, text)
 
-    text = _TOOL_DISCORD_WEBHOOK_RE.sub(TOOL_SECRET_PLACEHOLDER, text)
-    text = _TOOL_BEARER_RE.sub(
-        lambda match: match.group(1) + TOOL_SECRET_PLACEHOLDER,
-        text,
-    )
+    folded_text = text.casefold()
+    if "discord" in folded_text and "/webhooks/" in folded_text:
+        text = _TOOL_DISCORD_WEBHOOK_RE.sub(TOOL_SECRET_PLACEHOLDER, text)
+    if "bearer " in folded_text:
+        text = _TOOL_BEARER_RE.sub(
+            lambda match: match.group(1) + TOOL_SECRET_PLACEHOLDER,
+            text,
+        )
 
-    if "uthorization" in text or "UTHORIZATION" in text:
+    if "authorization" in folded_text:
         text = _AUTH_HEADER_RE.sub(
             lambda match: (
                 match.group(1)
@@ -1139,7 +1192,18 @@ def redact_tool_boundary_text(text: Any) -> str:
             ),
             text,
         )
-    if ":" in text:
+    if ":" in text and any(
+        marker in folded_text
+        for marker in (
+            "x-api-key",
+            "x-goog-api-key",
+            "api-key",
+            "apikey",
+            "x-api-token",
+            "x-auth-token",
+            "x-access-token",
+        )
+    ):
         text = _SECRET_HEADER_RE.sub(
             lambda match: match.group(1) + TOOL_SECRET_PLACEHOLDER,
             text,
@@ -1159,14 +1223,35 @@ def redact_tool_boundary_text(text: Any) -> str:
                 text = _CFG_DOTTED_RE.sub(_redact_assignment, text)
                 text = _CFG_ANCHORED_RE.sub(_redact_assignment, text)
 
-    if ":" in text and '"' in text:
+    if (
+        ":" in text
+        and '"' in text
+        and any(
+            marker in folded_text
+            for marker in ("key", "token", "secret", "password", "bearer")
+        )
+    ):
         text = _JSON_FIELD_RE.sub(
             lambda match: (
                 f'{match.group(1)}: "{TOOL_SECRET_PLACEHOLDER}"'
             ),
             text,
         )
-    if ":" in text and "://" not in text:
+    if (
+        ":" in text
+        and "://" not in text
+        and any(
+            marker in folded_text
+            for marker in (
+                "key",
+                "token",
+                "secret",
+                "passwd",
+                "password",
+                "credential",
+            )
+        )
+    ):
         text = _YAML_ASSIGN_RE.sub(
             lambda match: (
                 f"{match.group(1)}{match.group(2)}{TOOL_SECRET_PLACEHOLDER}"
@@ -1176,7 +1261,7 @@ def redact_tool_boundary_text(text: Any) -> str:
 
     if "BEGIN" in text and "PRIVATE KEY" in text:
         text = _PRIVATE_KEY_RE.sub(TOOL_SECRET_PLACEHOLDER, text)
-    if ":" in text:
+    if ":" in text and _has_tool_telegram_hint(text):
         text = _TELEGRAM_RE.sub(
             lambda match: (match.group(1) or "")
             + match.group(2)
@@ -1200,10 +1285,16 @@ def redact_tool_boundary_text(text: Any) -> str:
     if "eyJ" in text:
         text = _JWT_RE.sub(TOOL_SECRET_PLACEHOLDER, text)
 
-    return _redact_tool_url_credentials(text)
+    if "=" in text or ("://" in text and "@" in text):
+        text = _redact_tool_url_credentials(text)
+    return text
 
 
-def redact_tool_boundary_value(value: Any) -> Any:
+def redact_tool_boundary_value(
+    value: Any,
+    *,
+    _secret_snapshot: tuple[str, ...] | None = None,
+) -> Any:
     """Recursively redact supported tool-result values without mutation.
 
     Strings and UTF-8-decodable bytes keep their type.  Mapping/list/tuple/set
@@ -1211,29 +1302,56 @@ def redact_tool_boundary_value(value: Any) -> Any:
     only their message redacted.  Unsupported objects pass through so this
     safety layer cannot silently change tool API contracts.
     """
+    if _secret_snapshot is None:
+        _secret_snapshot = _tool_boundary_secret_snapshot()
+
     if isinstance(value, str):
-        return redact_tool_boundary_text(value)
+        return redact_tool_boundary_text(value, _secret_snapshot=_secret_snapshot)
     if isinstance(value, bytes):
         try:
             decoded = value.decode("utf-8")
         except UnicodeDecodeError:
             return value
-        return redact_tool_boundary_text(decoded).encode("utf-8")
+        return redact_tool_boundary_text(
+            decoded,
+            _secret_snapshot=_secret_snapshot,
+        ).encode("utf-8")
     if isinstance(value, BaseException):
-        return redact_tool_boundary_text(str(value))
+        return redact_tool_boundary_text(
+            str(value),
+            _secret_snapshot=_secret_snapshot,
+        )
     if isinstance(value, Mapping):
         return {
-            redact_tool_boundary_value(key): redact_tool_boundary_value(item)
+            redact_tool_boundary_value(
+                key,
+                _secret_snapshot=_secret_snapshot,
+            ): redact_tool_boundary_value(
+                item,
+                _secret_snapshot=_secret_snapshot,
+            )
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [redact_tool_boundary_value(item) for item in value]
+        return [
+            redact_tool_boundary_value(item, _secret_snapshot=_secret_snapshot)
+            for item in value
+        ]
     if isinstance(value, tuple):
-        return tuple(redact_tool_boundary_value(item) for item in value)
+        return tuple(
+            redact_tool_boundary_value(item, _secret_snapshot=_secret_snapshot)
+            for item in value
+        )
     if isinstance(value, set):
-        return {redact_tool_boundary_value(item) for item in value}
+        return {
+            redact_tool_boundary_value(item, _secret_snapshot=_secret_snapshot)
+            for item in value
+        }
     if isinstance(value, frozenset):
-        return frozenset(redact_tool_boundary_value(item) for item in value)
+        return frozenset(
+            redact_tool_boundary_value(item, _secret_snapshot=_secret_snapshot)
+            for item in value
+        )
     return value
 
 
@@ -1480,6 +1598,11 @@ def _has_nested_unbounded_repeat(pattern: str) -> bool:
 _PREFIX_SUBSTRINGS = tuple(
     _extract_literal_prefix(p) for p in _PREFIX_PATTERNS
 )
+_PREFIX_PUNCTUATION_FREE_SUBSTRINGS = tuple(
+    prefix
+    for prefix in _PREFIX_SUBSTRINGS
+    if "-" not in prefix and "_" not in prefix
+)
 
 
 def _has_known_prefix_substring(text: str) -> bool:
@@ -1487,7 +1610,10 @@ def _has_known_prefix_substring(text: str) -> bool:
 
     Used as a cheap pre-check before invoking the expensive ``_PREFIX_RE``.
     """
-    return any(p in text for p in _PREFIX_SUBSTRINGS)
+    candidates = _PREFIX_SUBSTRINGS
+    if "-" not in text and "_" not in text:
+        candidates = _PREFIX_PUNCTUATION_FREE_SUBSTRINGS
+    return any(prefix in text for prefix in candidates)
 
 
 # ---------------------------------------------------------------------------
@@ -1523,12 +1649,17 @@ def _rebuild_prefix_matcher() -> None:
     globals up at call time, so swapping the module attributes (atomic
     under the GIL) propagates immediately to every caller.
     """
-    global _PREFIX_RE, _PREFIX_SUBSTRINGS
+    global _PREFIX_RE, _PREFIX_SUBSTRINGS, _PREFIX_PUNCTUATION_FREE_SUBSTRINGS
     combined = _PREFIX_PATTERNS + _plugin_patterns()
     _PREFIX_RE = re.compile(
         r"(?<![A-Za-z0-9_-])(" + "|".join(combined) + r")(?![A-Za-z0-9_-])"
     )
     _PREFIX_SUBSTRINGS = tuple(_extract_literal_prefix(p) for p in combined)
+    _PREFIX_PUNCTUATION_FREE_SUBSTRINGS = tuple(
+        prefix
+        for prefix in _PREFIX_SUBSTRINGS
+        if "-" not in prefix and "_" not in prefix
+    )
 
 
 def register_redaction_patterns(patterns, source: str = "plugin") -> int:

@@ -37,11 +37,18 @@ _TOOL_ERROR_TRUNCATION_MARKER = "… [truncated]"
 _MAX_LOGGED_ERROR_CHARS = 8192
 
 
-def _redact_tool_boundary(value):
+def _redact_tool_boundary(value, *, secret_snapshot=None):
     """Apply the mandatory dispatch-time secret pre-projection."""
     from agent.redact import redact_tool_boundary_value
 
-    return redact_tool_boundary_value(value)
+    return redact_tool_boundary_value(value, _secret_snapshot=secret_snapshot)
+
+
+def _capture_tool_boundary_secret_snapshot():
+    """Capture authority once for one immediate, hook-free projection."""
+    from agent.redact import _tool_boundary_secret_snapshot
+
+    return _tool_boundary_secret_snapshot()
 
 
 def _safe_exception_frames(exc: BaseException) -> str:
@@ -1336,9 +1343,16 @@ def tool_error(message, **extra) -> str:
     '{"error": "bad input", "success": false}'
     """
     # Bound the context-bound copy so a raw exception can't bloat history across retries.
-    result = {"error": _bound_error_text(_redact_tool_boundary(str(message)))}
+    secret_snapshot = _capture_tool_boundary_secret_snapshot()
+    result = {
+        "error": _bound_error_text(
+            _redact_tool_boundary(str(message), secret_snapshot=secret_snapshot)
+        )
+    }
     if extra:
-        result.update(_redact_tool_boundary(extra))
+        result.update(
+            _redact_tool_boundary(extra, secret_snapshot=secret_snapshot)
+        )
     return json.dumps(result, ensure_ascii=False)
 
 

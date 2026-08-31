@@ -254,6 +254,37 @@ class TestMandatorySecretRedaction:
         for canary in synthetic_secret_scope.values():
             assert canary not in out
 
+    @pytest.mark.parametrize(
+        "payload_factory",
+        [
+            lambda secret: "x-" + "api-key: " + secret,
+            lambda secret: json.dumps({"api_key": secret}),
+            lambda secret: "client_" + "secret: " + secret,
+            lambda secret: "12345678:" + secret,
+            lambda secret: (
+                "-----BEGIN "
+                + "PRIVATE KEY-----\n"
+                + secret
+                + "\n-----END "
+                + "PRIVATE KEY-----"
+            ),
+            lambda secret: "postgres" + "://user:" + secret + "@host/db",
+            lambda secret: "https" + "://" + secret + "@example.invalid/",
+            lambda secret: "eyJ" + secret,
+            lambda secret: "aUtHoRiZaTiOn: Basic " + secret,
+        ],
+    )
+    def test_pattern_fast_paths_preserve_every_gated_family(
+        self, payload_factory
+    ):
+        secret = "Q7mP" * 12
+        raw = payload_factory(secret)
+
+        out = redact_tool_boundary_text(raw)
+
+        assert secret not in out
+        assert TOOL_SECRET_PLACEHOLDER in out
+
     def test_exception_message_is_redacted(self, synthetic_secret_scope):
         exc = RuntimeError(synthetic_secret_scope["arbitrary"])
 
@@ -300,6 +331,57 @@ class TestMandatorySecretRedaction:
         assert any(TOOL_SECRET_PLACEHOLDER in str(key) for key in out)
         assert isinstance(out["stderr"], bytes)
         assert TOOL_SECRET_PLACEHOLDER.encode() in out["stderr"]
+
+    def test_nested_projection_captures_authority_once(
+        self, monkeypatch, synthetic_secret_scope
+    ):
+        import agent.redact as redact_module
+
+        calls = 0
+        original = redact_module._runtime_loaded_secret_values
+
+        def counted_snapshot():
+            nonlocal calls
+            calls += 1
+            return original()
+
+        monkeypatch.setattr(
+            redact_module,
+            "_runtime_loaded_secret_values",
+            counted_snapshot,
+        )
+        raw = {
+            "stdout": synthetic_secret_scope["arbitrary"],
+            "items": [
+                {"stderr": synthetic_secret_scope["authorization"]}
+                for _ in range(12)
+            ],
+        }
+
+        out = redact_tool_boundary_value(raw)
+
+        assert calls == 1
+        assert synthetic_secret_scope["arbitrary"] not in repr(out)
+        assert synthetic_secret_scope["authorization"] not in repr(out)
+
+    def test_snapshot_is_not_reused_across_top_level_invocations(
+        self, configure_secret_authority
+    ):
+        first = "opaque-first-authority-" + ("J7vZ" * 8)
+        second = "opaque-second-authority-" + ("K8wA" * 8)
+        configure_secret_authority(
+            {"STAGE1B_SCOPED_TOKEN": first},
+            multiplex_active=True,
+        )
+        assert redact_tool_boundary_value(first) == TOOL_SECRET_PLACEHOLDER
+
+        configure_secret_authority(
+            {"STAGE1B_SCOPED_TOKEN": second},
+            multiplex_active=True,
+        )
+        out = redact_tool_boundary_value(first + " | " + second)
+
+        assert out == first + " | " + TOOL_SECRET_PLACEHOLDER
 
     def test_non_utf8_bytes_are_preserved(self):
         raw = b"\xff\xfe\x00"
@@ -360,6 +442,36 @@ class TestMandatorySecretRedaction:
         assert payload["error"] == TOOL_SECRET_PLACEHOLDER
         assert synthetic_secret_scope["authorization"] not in payload["stderr"]
         assert TOOL_SECRET_PLACEHOLDER in payload["stderr"]
+
+    def test_tool_error_message_and_extra_share_one_immediate_snapshot(
+        self, monkeypatch, synthetic_secret_scope
+    ):
+        import agent.redact as redact_module
+
+        calls = 0
+        original = redact_module._runtime_loaded_secret_values
+
+        def counted_snapshot():
+            nonlocal calls
+            calls += 1
+            return original()
+
+        monkeypatch.setattr(
+            redact_module,
+            "_runtime_loaded_secret_values",
+            counted_snapshot,
+        )
+
+        payload = json.loads(
+            tool_error(
+                synthetic_secret_scope["arbitrary"],
+                stderr=synthetic_secret_scope["authorization"],
+            )
+        )
+
+        assert calls == 1
+        assert payload["error"] == TOOL_SECRET_PLACEHOLDER
+        assert payload["stderr"].endswith(TOOL_SECRET_PLACEHOLDER)
 
     def test_registry_exception_result_and_log_are_redacted(
         self, synthetic_secret_scope, caplog
