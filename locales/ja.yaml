@@ -456,3 +456,52 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "セッションデータベースが利用できません"
     session_not_found:           "データベースにセッションが見つかりません。"
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: プロバイダー
+  auto_reconnect: ; {seconds}秒後に自動再接続
+  waiting_no_response: ⏳ {model} を待機中 — {seconds}秒間応答なし（プロバイダーが低速または過負荷の可能性{recovery}）
+  waiting_no_output: ⏳ {model} を待機中 — {seconds}秒間出力なし（プロバイダーが低速または過負荷か、モデルが思考中の可能性{recovery}）
+  queued: ⏳ 次のターンにキューしました{detail}。現在のタスク終了後に返答します。
+  draining_new_work: ⏳ ゲートウェイは{action}のため、現在新しい作業を受け付けていません。
+  draining_another_turn: ⏳ ゲートウェイは{action}のため、現在これ以上のターンを受け付けていません。
+  queued_after_return: ⏳ ゲートウェイは{action} — 復帰後の次のターンにキューしました。
+  restarted_success: ♻ ゲートウェイが正常に再起動しました。セッションは継続します。
+  action_restarting: 再起動中
+  action_shutting_down: シャットダウン中
+  compression_timeout: ⚠️ コンテキスト圧縮が {sec}秒後にタイムアウトしました（要約モデルからの出力なし）。メッセージは破棄されていません — 圧縮なしで続行します。再試行は /compress、クリーンなセッションには /reset を実行するか、auxiliary.compression モデル設定を確認してください。
+  compression_timeout_new: ⚠ コンテキスト圧縮が {sec}秒後にタイムアウトしました（要約モデルからの出力なし）。メッセージは破棄されていません — 圧縮なしで続行します。再試行は /compress、クリーンなセッションには /new を実行するか、auxiliary.compression を確認してください。
+  compression_commit_overrun: ⚠ コンテキスト圧縮のコミットに異常に時間がかかっています（{waited}秒、上限 {ceiling}秒）。安全に完了するのを待機中 — 続く場合は SessionDB の状態（ディスク／ロック競合）を確認してください。
+  api_call_start: 'API 呼び出し #{n} を開始'
+  api_call_done: 'API 呼び出し #{n} が完了'
+  tool_results_continue: 'ツール結果を送信、イテレーション #{n} を継続'
+  retry_backoff: 再試行バックオフ ({c}/{m})、残り {s}秒
+  api_error_recovery: API エラーからの回復（試行 {c}/{m}）
+  error_retry_backoff: エラー再試行バックオフ ({c}/{m})、残り {s}秒
+  empty_retry_backoff: 空応答の再試行バックオフ ({c}/{m})、残り {s}秒
+  not_paused: Hermes は一時停止されていません。
+  usage_queue: '使用方法: /queue <prompt>'
+  queued_next: 次のターンにキューしました。
+  queued_next_depth: 次のターンにキューしました。（{depth} 件待機中）
+  usage_steer: '使用方法: /steer <prompt>'
+  usage_steer_no_agent: '使用方法: /steer <prompt>  （実行中のエージェントがありません。通常のメッセージとして送信します）'
+  steer_starting: エージェントはまだ起動中です — /steer は次のターンにキューしました。
+  steer_failed: '⚠️ ステアに失敗しました: {exc}'
+  steer_empty: ステアが拒否されました（空のペイロード）。
+  steer_no_agent: アクティブなエージェントがありません — /steer は次のターンにキューしました。
+  goal_running: エージェント実行中です — 実行中は /goal status / pause / clear / wait を使用するか、新しいゴールを設定する前に /stop してください。
+  loop_running: エージェント実行中です — 実行中は /loop status / pause / stop を使用するか、新しいループを設定する前に /stop してください。
+  moa_prepare_failed: MoA ターンの準備に失敗しました。
+  quickcmd_timeout: クイックコマンドがタイムアウトしました（30秒）。
+  quickcmd_error: 'クイックコマンドエラー: {e}'
+  quickcmd_no_command: クイックコマンド '/{command}' にコマンドが定義されていません。
+  quickcmd_no_target: クイックコマンド '/{command}' にターゲットが定義されていません。
+  quickcmd_bad_type: 'クイックコマンド ''/{command}'' のタイプはサポートされていません（サポート: ''exec''、''alias''）。'
+  stacked_skills_failed: /{command} のスタックスキルの読み込みに失敗しました。
+  hook_blocked: コマンド `/{command}` はフックによってブロックされました。
+  learn_start_failed: /learn を開始できませんでした — もう一度お試しください。
+  init_start_failed: /init を開始できませんでした — もう一度お試しください。
+  suggestions_failed: '候補コマンドに失敗しました: {e}'
+  hermes_working: 'Hermes 作業中
+
+    {lines}'

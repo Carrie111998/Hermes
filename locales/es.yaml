@@ -453,3 +453,55 @@ gateway:
     session_db_unavailable_prefix: "Base de datos de sesiones no disponible"
     session_not_found:           "Sesión no encontrada en la base de datos."
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: el proveedor
+  auto_reconnect: ; reconexión automática en {seconds}s
+  waiting_no_response: ⏳ esperando a {model} — {seconds}s sin respuesta (el proveedor puede estar lento o sobrecargado{recovery})
+  waiting_no_output: ⏳ esperando a {model} — {seconds}s sin salida (el proveedor puede estar lento o sobrecargado, o el modelo está pensando{recovery})
+  queued: ⏳ En cola para el siguiente turno{detail}. Responderé cuando termine la tarea actual.
+  draining_new_work: ⏳ El Gateway se está {action} y no acepta trabajo nuevo en este momento.
+  draining_another_turn: ⏳ El Gateway se está {action} y no acepta otro turno en este momento.
+  queued_after_return: ⏳ Gateway {action} — en cola para el siguiente turno cuando vuelva.
+  restarted_success: ♻ Gateway reiniciado correctamente. Tu sesión continúa.
+  action_restarting: reiniciando
+  action_shutting_down: apagando
+  compression_timeout: ⚠️ La compresión del contexto agotó el tiempo tras {sec}s sin salida del modelo de resumen. No se descartaron mensajes — se continúa sin compresión. Ejecuta /compress para reintentar,
+    /reset para una sesión limpia, o revisa la configuración del modelo auxiliary.compression.
+  compression_timeout_new: ⚠ La compresión del contexto agotó el tiempo tras {sec}s sin salida del modelo de resumen. No se descartaron mensajes — se continúa sin compresión. Ejecuta /compress para reintentar,
+    /new para una sesión limpia, o revisa auxiliary.compression.
+  compression_commit_overrun: ⚠ La confirmación de la compresión del contexto está tardando más de lo habitual ({waited}s, límite {ceiling}s). Esperando a que termine de forma segura — si persiste, revisa
+    el estado de la SessionDB (disco / contención de bloqueos).
+  api_call_start: iniciando llamada API n.º {n}
+  api_call_done: llamada API n.º {n} completada
+  tool_results_continue: resultados de herramientas publicados, continuando con la iteración n.º {n}
+  retry_backoff: espera de reintento ({c}/{m}), quedan {s}s
+  api_error_recovery: recuperación de error de API (intento {c}/{m})
+  error_retry_backoff: espera de reintento por error ({c}/{m}), quedan {s}s
+  empty_retry_backoff: espera de reintento por respuesta vacía ({c}/{m}), quedan {s}s
+  not_paused: Hermes no estaba en pausa.
+  usage_queue: 'Uso: /queue <prompt>'
+  queued_next: En cola para el siguiente turno.
+  queued_next_depth: En cola para el siguiente turno. ({depth} en cola)
+  usage_steer: 'Uso: /steer <prompt>'
+  usage_steer_no_agent: 'Uso: /steer <prompt>  (no hay ningún agente en ejecución; se envía como mensaje normal)'
+  steer_starting: El agente aún está arrancando — /steer en cola para el siguiente turno.
+  steer_failed: '⚠️ Error al dirigir: {exc}'
+  steer_empty: Steer rechazado (carga útil vacía).
+  steer_no_agent: No hay ningún agente activo — /steer en cola para el siguiente turno.
+  goal_running: El agente está en ejecución — usa /goal status / pause / clear / wait durante la ejecución, o /stop antes de establecer un nuevo objetivo.
+  loop_running: El agente está en ejecución — usa /loop status / pause / stop durante la ejecución, o /stop antes de establecer un nuevo bucle.
+  moa_prepare_failed: No se pudo preparar el turno MoA.
+  quickcmd_timeout: El comando rápido agotó el tiempo (30s).
+  quickcmd_error: 'Error del comando rápido: {e}'
+  quickcmd_no_command: El comando rápido '/{command}' no tiene ningún comando definido.
+  quickcmd_no_target: El comando rápido '/{command}' no tiene ningún destino definido.
+  quickcmd_bad_type: 'El comando rápido ''/{command}'' tiene un tipo no compatible (compatibles: ''exec'', ''alias'').'
+  stacked_skills_failed: No se pudieron cargar las skills apiladas para /{command}.
+  hook_blocked: El comando `/{command}` fue bloqueado por un hook.
+  learn_start_failed: No se pudo iniciar /learn — inténtalo de nuevo.
+  init_start_failed: No se pudo iniciar /init — inténtalo de nuevo.
+  suggestions_failed: 'Falló el comando de sugerencias: {e}'
+  hermes_working: 'Hermes está trabajando
+
+    {lines}'

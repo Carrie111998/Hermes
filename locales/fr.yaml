@@ -456,3 +456,55 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "Base de données de sessions indisponible"
     session_not_found:           "Session introuvable dans la base de données."
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: le fournisseur
+  auto_reconnect: ; reconnexion automatique dans {seconds}s
+  waiting_no_response: ⏳ en attente de {model} — aucune réponse depuis {seconds}s (le fournisseur est peut-être lent ou surchargé{recovery})
+  waiting_no_output: ⏳ en attente de {model} — aucune sortie depuis {seconds}s (le fournisseur est peut-être lent ou surchargé, ou le modèle réfléchit{recovery})
+  queued: ⏳ En file d'attente pour le prochain tour{detail}. Je répondrai une fois la tâche en cours terminée.
+  draining_new_work: ⏳ Le Gateway est en cours de {action} et n'accepte pas de nouveau travail pour le moment.
+  draining_another_turn: ⏳ Le Gateway est en cours de {action} et n'accepte pas d'autre tour pour le moment.
+  queued_after_return: ⏳ Gateway en cours de {action} — en file d'attente pour le prochain tour après son retour.
+  restarted_success: ♻ Gateway redémarré avec succès. Votre session continue.
+  action_restarting: redémarrage
+  action_shutting_down: arrêt
+  compression_timeout: ⚠️ La compression du contexte a expiré après {sec}s sans sortie du modèle de résumé. Aucun message n'a été perdu — poursuite sans compression. Exécutez /compress pour réessayer, /reset
+    pour une session propre, ou vérifiez la configuration de votre modèle auxiliary.compression.
+  compression_timeout_new: ⚠ La compression du contexte a expiré après {sec}s sans sortie du modèle de résumé. Aucun message n'a été perdu — poursuite sans compression. Exécutez /compress pour réessayer,
+    /new pour une session propre, ou vérifiez auxiliary.compression.
+  compression_commit_overrun: ⚠ La validation de la compression du contexte prend anormalement longtemps ({waited}s, plafond {ceiling}s). En attente d'une fin sûre — si cela persiste, vérifiez l'état de
+    la SessionDB (disque / contention de verrous).
+  api_call_start: démarrage de l'appel API n° {n}
+  api_call_done: appel API n° {n} terminé
+  tool_results_continue: résultats d'outil transmis, poursuite de l'itération n° {n}
+  retry_backoff: délai avant nouvelle tentative ({c}/{m}), {s}s restantes
+  api_error_recovery: récupération d'erreur API (tentative {c}/{m})
+  error_retry_backoff: délai de nouvelle tentative après erreur ({c}/{m}), {s}s restantes
+  empty_retry_backoff: délai de nouvelle tentative après réponse vide ({c}/{m}), {s}s restantes
+  not_paused: Hermes n'était pas en pause.
+  usage_queue: 'Utilisation : /queue <prompt>'
+  queued_next: En file d'attente pour le prochain tour.
+  queued_next_depth: En file d'attente pour le prochain tour. ({depth} en attente)
+  usage_steer: 'Utilisation : /steer <prompt>'
+  usage_steer_no_agent: 'Utilisation : /steer <prompt>  (aucun agent en cours ; envoyé comme message normal)'
+  steer_starting: L'agent démarre encore — /steer en file d'attente pour le prochain tour.
+  steer_failed: '⚠️ Échec de la redirection : {exc}'
+  steer_empty: Steer rejeté (charge utile vide).
+  steer_no_agent: Aucun agent actif — /steer en file d'attente pour le prochain tour.
+  goal_running: L'agent est en cours — utilisez /goal status / pause / clear / wait en cours d'exécution, ou /stop avant de définir un nouvel objectif.
+  loop_running: L'agent est en cours — utilisez /loop status / pause / stop en cours d'exécution, ou /stop avant de définir une nouvelle boucle.
+  moa_prepare_failed: Échec de la préparation du tour MoA.
+  quickcmd_timeout: La commande rapide a expiré (30s).
+  quickcmd_error: 'Erreur de la commande rapide : {e}'
+  quickcmd_no_command: La commande rapide '/{command}' n'a aucune commande définie.
+  quickcmd_no_target: La commande rapide '/{command}' n'a aucune cible définie.
+  quickcmd_bad_type: 'La commande rapide ''/{command}'' a un type non pris en charge (pris en charge : ''exec'', ''alias'').'
+  stacked_skills_failed: Échec du chargement des skills empilées pour /{command}.
+  hook_blocked: La commande `/{command}` a été bloquée par un hook.
+  learn_start_failed: Impossible de démarrer /learn — veuillez réessayer.
+  init_start_failed: Impossible de démarrer /init — veuillez réessayer.
+  suggestions_failed: 'Échec de la commande de suggestions : {e}'
+  hermes_working: 'Hermes travaille
+
+    {lines}'

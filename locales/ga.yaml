@@ -460,3 +460,55 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "Níl bunachar sonraí na seisiún ar fáil"
     session_not_found:           "Seisiún gan a aimsiú sa bhunachar sonraí."
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: an soláthraí
+  auto_reconnect: ; athnasc uathoibríoch ag {seconds}s
+  waiting_no_response: ⏳ ag fanacht le {model} — {seconds}s gan freagra fós (féadfaidh an soláthraí a bheith mall nó ró-luchtaithe{recovery})
+  waiting_no_output: ⏳ ag fanacht le {model} — {seconds}s gan aschur fós (féadfaidh an soláthraí a bheith mall nó ró-luchtaithe, nó tá an tsamhail ag smaoineamh{recovery})
+  queued: ⏳ Sa scuaine don chéad bhabhta eile{detail}. Freagróidh mé nuair a chríochnaíonn an tasc reatha.
+  draining_new_work: ⏳ Tá an Geata {action} agus níl sé ag glacadh obair nua faoi láthair.
+  draining_another_turn: ⏳ Tá an Geata {action} agus níl sé ag glacadh babhta eile faoi láthair.
+  queued_after_return: ⏳ Geata {action} — sa scuaine don chéad bhabhta eile nuair a thagann sé ar ais.
+  restarted_success: ♻ Atosaíodh an Geata go rathúil. Leanann do sheisiún ar aghaidh.
+  action_restarting: ag atosú
+  action_shutting_down: ag múchadh
+  compression_timeout: ⚠️ Chuaigh comhbhrú comhthéacs thar am tar éis {sec}s gan aschur ón tsamhail achoimrithe. Níor scaoileadh aon teachtaireachtaí — ag leanúint ar aghaidh gan comhbhrú. Rith /compress
+    chun triail eile a bhaint as, /reset le haghaidh seisiún glan, nó seiceáil cumraíocht do shamhla auxiliary.compression.
+  compression_timeout_new: ⚠ Chuaigh comhbhrú comhthéacs thar am tar éis {sec}s gan aschur ón tsamhail achoimrithe. Níor scaoileadh aon teachtaireachtaí — ag leanúint ar aghaidh gan comhbhrú. Rith /compress
+    chun triail eile a bhaint as, /new le haghaidh seisiún glan, nó seiceáil auxiliary.compression.
+  compression_commit_overrun: ⚠ Tá daingniú an chomhbhrúite comhthéacs ag tógáil níos faide ná mar is gnách ({waited}s, uasteorainn {ceiling}s). Ag fanacht go gcríochnaíonn sé go sábháilte — má leanann
+    sé ar aghaidh, seiceáil sláinte SessionDB (diosca / imreas glas).
+  api_call_start: 'ag tosú glao API #{n}'
+  api_call_done: 'glao API #{n} críochnaithe'
+  tool_results_continue: 'torthaí uirlisí postáilte, ag leanúint le hatriall #{n}'
+  retry_backoff: cúlú atrialach ({c}/{m}), {s}s fágtha
+  api_error_recovery: aisghabháil earráide API (iarracht {c}/{m})
+  error_retry_backoff: cúlú atrialach earráide ({c}/{m}), {s}s fágtha
+  empty_retry_backoff: cúlú atrialach freagra folamh ({c}/{m}), {s}s fágtha
+  not_paused: Ní raibh Hermes ar sos.
+  usage_queue: 'Úsáid: /queue <leid>'
+  queued_next: Sa scuaine don chéad bhabhta eile.
+  queued_next_depth: Sa scuaine don chéad bhabhta eile. ({depth} sa scuaine)
+  usage_steer: 'Úsáid: /steer <leid>'
+  usage_steer_no_agent: 'Úsáid: /steer <leid>  (níl aon ghníomhaire ag rith; seolfar mar ghnáththeachtaireacht é)'
+  steer_starting: Tá an gníomhaire fós ag tosú — /steer sa scuaine don chéad bhabhta eile.
+  steer_failed: '⚠️ Theip ar an stiúradh: {exc}'
+  steer_empty: Diúltaíodh an stiúradh (ualach folamh).
+  steer_no_agent: Gan ghníomhaire gníomhach — /steer sa scuaine don chéad bhabhta eile.
+  goal_running: Tá an gníomhaire ag rith — bain úsáid as /goal status / pause / clear / wait le linn an rith, nó /stop sula socraíonn tú sprioc nua.
+  loop_running: Tá an gníomhaire ag rith — bain úsáid as /loop status / pause / stop le linn an rith, nó /stop sula socraíonn tú lúb nua.
+  moa_prepare_failed: Theip ar ullmhú bhabhta MoA.
+  quickcmd_timeout: Chuaigh an t-ordú tapa thar am (30s).
+  quickcmd_error: 'Earráid ordaithe thapa: {e}'
+  quickcmd_no_command: Níl aon ordú sainithe ag an ordú tapa '/{command}'.
+  quickcmd_no_target: Níl aon sprioc sainithe ag an ordú tapa '/{command}'.
+  quickcmd_bad_type: 'Tá cineál nach dtacaítear leis ag an ordú tapa ''/{command}'' (tacaítear le: ''exec'', ''alias'').'
+  stacked_skills_failed: Theip ar lódáil scileanna cruacha le haghaidh /{command}.
+  hook_blocked: Chuir crúca bac ar an ordú `/{command}`.
+  learn_start_failed: Níorbh fhéidir /learn a thosú — bain triail eile as le do thoil.
+  init_start_failed: Níorbh fhéidir /init a thosú — bain triail eile as le do thoil.
+  suggestions_failed: 'Theip ar ordú na moltaí: {e}'
+  hermes_working: 'Tá Hermes ag obair
+
+    {lines}'

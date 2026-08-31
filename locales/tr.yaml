@@ -456,3 +456,55 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "Oturum veritabanı kullanılamıyor"
     session_not_found:           "Oturum veritabanında bulunamadı."
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: sağlayıcı
+  auto_reconnect: ; {seconds} sn sonra otomatik yeniden bağlan
+  waiting_no_response: ⏳ {model} bekleniyor — {seconds} sn, henüz yanıt yok (sağlayıcı yavaş veya aşırı yüklü olabilir{recovery})
+  waiting_no_output: ⏳ {model} bekleniyor — {seconds} sn, henüz çıktı yok (sağlayıcı yavaş veya aşırı yüklü olabilir ya da model düşünüyor{recovery})
+  queued: ⏳ Bir sonraki tur için kuyrukta{detail}. Geçerli görev bitince yanıtlayacağım.
+  draining_new_work: ⏳ Gateway {action} ve şu anda yeni iş kabul etmiyor.
+  draining_another_turn: ⏳ Gateway {action} ve şu anda başka bir tur kabul etmiyor.
+  queued_after_return: ⏳ Gateway {action} — geri döndükten sonraki tur için kuyrukta.
+  restarted_success: ♻ Gateway başarıyla yeniden başlatıldı. Oturumunuz devam ediyor.
+  action_restarting: yeniden başlatılıyor
+  action_shutting_down: kapatılıyor
+  compression_timeout: ⚠️ Bağlam sıkıştırma, özet modelinden çıktı gelmeden {sec} sn sonra zaman aşımına uğradı. Hiçbir mesaj kaybolmadı — sıkıştırma olmadan devam ediliyor. Yeniden denemek için /compress,
+    temiz oturum için /reset çalıştırın veya auxiliary.compression model yapılandırmanızı kontrol edin.
+  compression_timeout_new: ⚠ Bağlam sıkıştırma, özet modelinden çıktı gelmeden {sec} sn sonra zaman aşımına uğradı. Hiçbir mesaj kaybolmadı — sıkıştırma olmadan devam ediliyor. Yeniden denemek için /compress,
+    temiz oturum için /new çalıştırın veya auxiliary.compression yapılandırmasını kontrol edin.
+  compression_commit_overrun: ⚠ Bağlam sıkıştırma işlemi alışılmadık şekilde uzun sürüyor ({waited} sn, üst sınır {ceiling} sn). Güvenle bitmesi bekleniyor — sürerse SessionDB sağlığını kontrol edin (disk
+    / kilit çekişmesi).
+  api_call_start: 'API çağrısı başlatılıyor #{n}'
+  api_call_done: 'API çağrısı tamamlandı #{n}'
+  tool_results_continue: 'araç sonuçları gönderildi, yinelemeye devam: #{n}'
+  retry_backoff: yeniden deneme bekleme ({c}/{m}), kalan {s} sn
+  api_error_recovery: API hatası kurtarma (deneme {c}/{m})
+  error_retry_backoff: hata yeniden deneme bekleme ({c}/{m}), kalan {s} sn
+  empty_retry_backoff: boş yanıt yeniden deneme bekleme ({c}/{m}), kalan {s} sn
+  not_paused: Hermes duraklatılmamıştı.
+  usage_queue: 'Kullanım: /queue <istemi>'
+  queued_next: Bir sonraki tur için kuyrukta.
+  queued_next_depth: Bir sonraki tur için kuyrukta. ({depth} kuyrukta)
+  usage_steer: 'Kullanım: /steer <istemi>'
+  usage_steer_no_agent: 'Kullanım: /steer <istemi>  (çalışan aracı yok; normal mesaj olarak gönderilecek)'
+  steer_starting: Aracı hâlâ başlıyor — /steer bir sonraki tur için kuyruğa alındı.
+  steer_failed: '⚠️ Yönlendirme başarısız: {exc}'
+  steer_empty: Yönlendirme reddedildi (boş yük).
+  steer_no_agent: Aktif aracı yok — /steer bir sonraki tur için kuyruğa alındı.
+  goal_running: Aracı çalışıyor — çalışma sırasında /goal status / pause / clear / wait kullanın veya yeni bir hedef belirlemeden önce /stop kullanın.
+  loop_running: Aracı çalışıyor — çalışma sırasında /loop status / pause / stop kullanın veya yeni bir döngü belirlemeden önce /stop kullanın.
+  moa_prepare_failed: MoA turu hazırlanamadı.
+  quickcmd_timeout: Hızlı komut zaman aşımına uğradı (30 sn).
+  quickcmd_error: 'Hızlı komut hatası: {e}'
+  quickcmd_no_command: '''/{command}'' hızlı komutunda tanımlı komut yok.'
+  quickcmd_no_target: '''/{command}'' hızlı komutunda tanımlı hedef yok.'
+  quickcmd_bad_type: '''/{command}'' hızlı komutu desteklenmeyen türde (desteklenen: ''exec'', ''alias'').'
+  stacked_skills_failed: /{command} için yığılmış beceriler yüklenemedi.
+  hook_blocked: '`/{command}` komutu bir kanca tarafından engellendi.'
+  learn_start_failed: /learn başlatılamadı — lütfen tekrar deneyin.
+  init_start_failed: /init başlatılamadı — lütfen tekrar deneyin.
+  suggestions_failed: 'Öneriler komutu başarısız oldu: {e}'
+  hermes_working: 'Hermes çalışıyor
+
+    {lines}'

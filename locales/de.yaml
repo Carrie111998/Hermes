@@ -456,3 +456,55 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "Session-Datenbank nicht verfügbar"
     session_not_found:           "Session nicht in der Datenbank gefunden."
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: der Anbieter
+  auto_reconnect: ; automatische Wiederverbindung nach {seconds}s
+  waiting_no_response: ⏳ warte auf {model} — seit {seconds}s keine Antwort (der Anbieter ist möglicherweise langsam oder überlastet{recovery})
+  waiting_no_output: ⏳ warte auf {model} — seit {seconds}s keine Ausgabe (der Anbieter ist möglicherweise langsam oder überlastet, oder das Modell denkt nach{recovery})
+  queued: ⏳ Für die nächste Runde in der Warteschlange{detail}. Ich antworte, sobald die aktuelle Aufgabe abgeschlossen ist.
+  draining_new_work: ⏳ Gateway wird {action} und nimmt derzeit keine neue Arbeit an.
+  draining_another_turn: ⏳ Gateway wird {action} und nimmt derzeit keine weitere Runde an.
+  queued_after_return: ⏳ Gateway wird {action} — in der Warteschlange für die nächste Runde, sobald es zurück ist.
+  restarted_success: ♻ Gateway erfolgreich neu gestartet. Ihre Sitzung läuft weiter.
+  action_restarting: neu gestartet
+  action_shutting_down: heruntergefahren
+  compression_timeout: ⚠️ Die Kontextkomprimierung hat nach {sec}s ohne Ausgabe des Zusammenfassungsmodells das Zeitlimit überschritten. Es wurden keine Nachrichten verworfen — Fortsetzung ohne Komprimierung.
+    Führen Sie /compress zum Wiederholen, /reset für eine saubere Sitzung aus, oder prüfen Sie Ihre auxiliary.compression-Modellkonfiguration.
+  compression_timeout_new: ⚠ Die Kontextkomprimierung hat nach {sec}s ohne Ausgabe des Zusammenfassungsmodells das Zeitlimit überschritten. Es wurden keine Nachrichten verworfen — Fortsetzung ohne Komprimierung.
+    Führen Sie /compress zum Wiederholen, /new für eine saubere Sitzung aus, oder prüfen Sie auxiliary.compression.
+  compression_commit_overrun: ⚠ Das Festschreiben der Kontextkomprimierung dauert ungewöhnlich lange ({waited}s, Obergrenze {ceiling}s). Es wird auf einen sicheren Abschluss gewartet — falls dies anhält,
+    prüfen Sie den Zustand der SessionDB (Festplatte / Sperrkonflikte).
+  api_call_start: starte API-Aufruf Nr. {n}
+  api_call_done: API-Aufruf Nr. {n} abgeschlossen
+  tool_results_continue: Tool-Ergebnisse übermittelt, fahre mit Iteration Nr. {n} fort
+  retry_backoff: Wiederholungs-Backoff ({c}/{m}), noch {s}s
+  api_error_recovery: Wiederherstellung nach API-Fehler (Versuch {c}/{m})
+  error_retry_backoff: Fehler-Wiederholungs-Backoff ({c}/{m}), noch {s}s
+  empty_retry_backoff: Backoff bei leerer Antwort ({c}/{m}), noch {s}s
+  not_paused: Hermes war nicht pausiert.
+  usage_queue: 'Verwendung: /queue <prompt>'
+  queued_next: Für die nächste Runde in der Warteschlange.
+  queued_next_depth: Für die nächste Runde in der Warteschlange. ({depth} wartend)
+  usage_steer: 'Verwendung: /steer <prompt>'
+  usage_steer_no_agent: 'Verwendung: /steer <prompt>  (kein Agent aktiv; wird als normale Nachricht gesendet)'
+  steer_starting: Agent startet noch — /steer für die nächste Runde in der Warteschlange.
+  steer_failed: '⚠️ Steuern fehlgeschlagen: {exc}'
+  steer_empty: Steuern abgelehnt (leere Nutzlast).
+  steer_no_agent: Kein aktiver Agent — /steer für die nächste Runde in der Warteschlange.
+  goal_running: Der Agent läuft — verwenden Sie während des Laufs /goal status / pause / clear / wait oder /stop, bevor Sie ein neues Ziel setzen.
+  loop_running: Der Agent läuft — verwenden Sie während des Laufs /loop status / pause / stop oder /stop, bevor Sie eine neue Schleife starten.
+  moa_prepare_failed: MoA-Runde konnte nicht vorbereitet werden.
+  quickcmd_timeout: Zeitlimit für Schnellbefehl überschritten (30s).
+  quickcmd_error: 'Schnellbefehl-Fehler: {e}'
+  quickcmd_no_command: Schnellbefehl '/{command}' hat keinen Befehl definiert.
+  quickcmd_no_target: Schnellbefehl '/{command}' hat kein Ziel definiert.
+  quickcmd_bad_type: 'Schnellbefehl ''/{command}'' hat einen nicht unterstützten Typ (unterstützt: ''exec'', ''alias'').'
+  stacked_skills_failed: Gestapelte Skills für /{command} konnten nicht geladen werden.
+  hook_blocked: Befehl `/{command}` wurde von einem Hook blockiert.
+  learn_start_failed: /learn konnte nicht gestartet werden — bitte versuchen Sie es erneut.
+  init_start_failed: /init konnte nicht gestartet werden — bitte versuchen Sie es erneut.
+  suggestions_failed: 'Vorschlagsbefehl fehlgeschlagen: {e}'
+  hermes_working: 'Hermes arbeitet
+
+    {lines}'

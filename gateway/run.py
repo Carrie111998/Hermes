@@ -4753,7 +4753,7 @@ class TurnRunner:
                 f"- {task['title']} - {labels.get(task['status'], task['status'])}"
                 for task in _visible_tasks()
             ]
-            return "Hermes is working\n" + "\n".join(lines)
+            return t("status.hermes_working", lines="\n".join(lines))
 
         def _apply_native_event(raw: Any) -> bool:
             nonlocal anonymous_seq
@@ -9312,7 +9312,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "restart" if self._restart_requested else "shutdown"
 
     def _status_action_gerund(self) -> str:
-        return "restarting" if self._restart_requested else "shutting down"
+        if self._restart_requested:
+            return t("status.action_restarting")
+        return t("status.action_shutting_down")
 
     def _queue_during_drain_enabled(
         self, busy_input_mode: Optional[str] = None
@@ -10536,9 +10538,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
             if self._queue_during_drain_enabled(effective_mode):
                 self._queue_or_replace_pending_event(session_key, event)
-                message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                message = t("status.queued_after_return", action=self._status_action_gerund())
             else:
-                message = f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                message = t("status.draining_another_turn", action=self._status_action_gerund())
 
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -17322,7 +17324,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if args.lower() in {"off", "resume", "stop", "disengage"}:
             if estop.disengage():
                 return "▶️ Resumed — new work is accepted again."
-            return "Hermes wasn't paused."
+            return t("status.not_paused")
         state = estop.get_state()
         if state is not None and not args:
             reason = state.get("reason")
@@ -17396,7 +17398,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # fields silently lost the attachment when the queued turn ran.
         has_media = bool(getattr(event, "media_urls", None))
         if not queued_text and not has_media:
-            return "Usage: /queue <prompt>"
+            return t("status.usage_queue")
         adapter = self._adapter_for_source(source)
         if adapter:
             queued_event = MessageEvent(
@@ -17421,8 +17423,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._enqueue_fifo(quick_key, queued_event, adapter)
         depth = self._queue_depth(quick_key, adapter=self._adapter_for_source(source))
         if depth <= 1:
-            return "Queued for the next turn."
-        return f"Queued for the next turn. ({depth} queued)"
+            return t("status.queued_next")
+        return t("status.queued_next_depth", depth=depth)
 
     async def _busy_steer_command(self, event: MessageEvent, quick_key: str, source):
         # /steer <prompt> — inject mid-run after the next tool call.
@@ -17432,7 +17434,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # no role-alternation violation.
         steer_text = event.get_command_args().strip()
         if not steer_text:
-            return "Usage: /steer <prompt>"
+            return t("status.usage_steer")
         _steer_state = self._peek_session_state(quick_key)
         running_agent = _steer_state.turn.agent if _steer_state else None
         if running_agent is _AGENT_PENDING_SENTINEL:
@@ -17448,17 +17450,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_context=event.channel_context,
                 )
                 self._enqueue_fifo(quick_key, queued_event, adapter)
-            return "Agent still starting — /steer queued for the next turn."
+            return t("status.steer_starting")
         if running_agent and hasattr(running_agent, "steer"):
             try:
                 accepted = running_agent.steer(steer_text)
             except Exception as exc:
                 logger.warning("Steer failed for session %s: %s", quick_key, exc)
-                return f"⚠️ Steer failed: {exc}"
+                return t("status.steer_failed", exc=exc)
             if accepted:
                 preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                 return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
-            return "Steer rejected (empty payload)."
+            return t("status.steer_empty")
         # Running agent is missing or lacks steer() — fall back to queue.
         adapter = self._adapter_for_source(source)
         if adapter:
@@ -17471,7 +17473,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_context=event.channel_context,
             )
             self._enqueue_fifo(quick_key, queued_event, adapter)
-        return "No active agent — /steer queued for the next turn."
+        return t("status.steer_no_agent")
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
         # /goal is safe mid-run for status/pause/clear/wait (inspection
@@ -17492,7 +17494,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if _is_control:
             return await self._handle_goal_command(event)
-        return "Agent is running — use /goal status / pause / clear / wait mid-run, or /stop before setting a new goal."
+        return t("status.goal_running")
 
     async def _busy_loop_command(self, event: MessageEvent, quick_key: str, source):
         # /loop mirrors /goal: control verbs are safe mid-run (state
@@ -17501,7 +17503,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _loop_arg = (event.get_command_args() or "").strip().lower()
         if not _loop_arg or _loop_arg in {"status", "pause", "resume", "stop", "clear", "cancel", "help", "--help", "-h"}:
             return await self._handle_loop_command(event)
-        return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
+        return t("status.loop_running")
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -18161,9 +18163,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if queue_during_drain:
                     self._queue_or_replace_pending_event(_quick_key, event)
                 return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                    t("status.queued_after_return", action=self._status_action_gerund())
                     if queue_during_drain
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                    else t("status.draining_another_turn", action=self._status_action_gerund())
                 )
             if effective_busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
@@ -18379,7 +18381,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message = hook_result.get("message")
                     if isinstance(message, str) and message:
                         return message
-                    return f"Command `/{command}` was blocked by a hook."
+                    return t("status.hook_blocked", command=command)
                 if decision == "handled":
                     message = hook_result.get("message")
                     return message if isinstance(message, str) and message else None
@@ -18472,7 +18474,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event.text = build_learn_prompt(_learn_req)
                 # fall through to agent processing
             except Exception:
-                return "Could not start /learn — please try again."
+                return t("status.learn_start_failed")
 
         if canonical == "plan":
             # /plan: rewrite the turn to the plan-mode prompt and fall
@@ -18514,7 +18516,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 _init_prompt = build_init_prompt_for_cwd(extra=_init_notes)
             except Exception:
-                return "Could not start /init — please try again."
+                return t("status.init_start_failed")
             _ack = (
                 "Updating AGENTS.md from a project scan…"
                 if "UPDATE the existing AGENTS.md" in _init_prompt
@@ -18653,7 +18655,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "queue":
             queue_payload = event.get_command_args().strip()
             if not queue_payload:
-                return "Usage: /queue <prompt>"
+                return t("status.usage_queue")
             try:
                 event.text = queue_payload
             except Exception:
@@ -18665,7 +18667,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # message. If the payload is empty, surface the usage hint.
             steer_payload = event.get_command_args().strip()
             if not steer_payload:
-                return "Usage: /steer <prompt>  (no agent is running; sending as a normal message)"
+                return t("status.usage_steer_no_agent")
             try:
                 event.text = steer_payload
             except Exception:
@@ -18719,13 +18721,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._evict_cached_agent(_quick_key)
                 event._moa_disable_after_turn = True
             except Exception:
-                return "Failed to prepare MoA turn."
+                return t("status.moa_prepare_failed")
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
         if self._draining:
-            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+            return t("status.draining_new_work", action=self._status_action_gerund())
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -18770,11 +18772,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 output = redact_sensitive_text(output)
                             return output if output else "Command returned no output."
                         except asyncio.TimeoutError:
-                            return "Quick command timed out (30s)."
+                            return t("status.quickcmd_timeout")
                         except Exception as e:
-                            return f"Quick command error: {e}"
+                            return t("status.quickcmd_error", e=e)
                     else:
-                        return f"Quick command '/{command}' has no command defined."
+                        return t("status.quickcmd_no_command", command=command)
                 elif qcmd.get("type") == "alias":
                     target = (qcmd.get("target") or "").strip()
                     if target:
@@ -18785,9 +18787,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         command = target_command.split()[0] if target_command else target_command
                         # Fall through to normal command dispatch below
                     else:
-                        return f"Quick command '/{command}' has no target defined."
+                        return t("status.quickcmd_no_target", command=command)
                 else:
-                    return f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias')."
+                    return t("status.quickcmd_bad_type", command=command)
 
         # Plugin-registered slash commands
         if command:
@@ -18915,7 +18917,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             event.text = msg
                             # Fall through to normal message processing
                         else:
-                            return f"Failed to load stacked skills for /{command}."
+                            return t("status.stacked_skills_failed", command=command)
                     else:
                         msg = build_skill_invocation_message(
                             cmd_key, user_instruction, task_id=_quick_key
@@ -20860,14 +20862,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 time.monotonic() - _hyg_wait_started,
                                                 _hyg_total_ceiling_seconds,
                                             )
-                                            _timeout_msg = (
-                                                "⚠️ Context compression timed out "
-                                                f"after {_hyg_timeout_seconds:.1f}s "
-                                                "with no output from the summary model. "
-                                                "No messages were dropped — continuing without "
-                                                "compression. Run /compress to retry, /reset for "
-                                                "a clean session, or check your "
-                                                "auxiliary.compression model configuration."
+                                            _timeout_msg = t(
+                                                "status.compression_timeout",
+                                                sec=f"{_hyg_timeout_seconds:.1f}",
                                             )
                                             try:
                                                 _adapter = self._adapter_for_source(source)
@@ -22389,7 +22386,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return handle_suggestions_command(args, origin=origin, surface="gateway")
         except Exception as e:
             logger.debug("suggestions command failed: %s", e)
-            return f"Suggestions command failed: {e}"
+            return t("status.suggestions_failed", e=e)
 
     async def _handle_blueprint_command(self, event: MessageEvent):
         """Handle /blueprint in the gateway.
@@ -25430,7 +25427,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result = await transport.send(
                 platform,
                 str(chat_id),
-                "♻ Gateway restarted successfully. Your session continues.",
+                t("status.restarted_success"),
                 metadata=_non_conversational_metadata(metadata, platform=platform),
             )
             # adapter.send() catches provider errors (e.g. "Chat not found")

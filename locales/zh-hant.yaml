@@ -456,3 +456,52 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "工作階段資料庫無法使用"
     session_not_found:           "資料庫中找不到此工作階段。"
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: 提供者
+  auto_reconnect: ; 將於 {seconds} 秒後自動重新連線
+  waiting_no_response: ⏳ 正在等待 {model} — {seconds} 秒尚無回應（提供者可能緩慢或過載{recovery}）
+  waiting_no_output: ⏳ 正在等待 {model} — {seconds} 秒尚無輸出（提供者可能緩慢或過載，或模型正在思考{recovery}）
+  queued: ⏳ 已排入下一回合佇列{detail}。目前任務完成後會回覆。
+  draining_new_work: ⏳ 閘道正在{action}，目前不接受新的工作。
+  draining_another_turn: ⏳ 閘道正在{action}，目前不接受其他回合。
+  queued_after_return: ⏳ 閘道正在{action} — 已排入其恢復後的下一回合。
+  restarted_success: ♻ 閘道已成功重新啟動。您的工作階段將繼續。
+  action_restarting: 重新啟動中
+  action_shutting_down: 關閉中
+  compression_timeout: ⚠️ 上下文壓縮在 {sec} 秒後逾時，摘要模型無輸出。未捨棄任何訊息 — 將不壓縮繼續。執行 /compress 重試、/reset 開始全新工作階段，或檢查 auxiliary.compression 模型設定。
+  compression_timeout_new: ⚠ 上下文壓縮在 {sec} 秒後逾時，摘要模型無輸出。未捨棄任何訊息 — 將不壓縮繼續。執行 /compress 重試、/new 開始全新工作階段，或檢查 auxiliary.compression。
+  compression_commit_overrun: ⚠ 上下文壓縮提交耗時異常（{waited} 秒，上限 {ceiling} 秒）。正在等待其安全完成 — 若持續發生，請檢查 SessionDB 健康狀態（磁碟／鎖定競爭）。
+  api_call_start: '開始 API 呼叫 #{n}'
+  api_call_done: 'API 呼叫 #{n} 完成'
+  tool_results_continue: '工具結果已送出，繼續迭代 #{n}'
+  retry_backoff: 重試退避（{c}/{m}），剩餘 {s} 秒
+  api_error_recovery: API 錯誤復原（嘗試 {c}/{m}）
+  error_retry_backoff: 錯誤重試退避（{c}/{m}），剩餘 {s} 秒
+  empty_retry_backoff: 空回應重試退避（{c}/{m}），剩餘 {s} 秒
+  not_paused: Hermes 並未暫停。
+  usage_queue: 用法：/queue <prompt>
+  queued_next: 已排入下一回合佇列。
+  queued_next_depth: 已排入下一回合佇列。（{depth} 個排隊中）
+  usage_steer: 用法：/steer <prompt>
+  usage_steer_no_agent: 用法：/steer <prompt>（沒有執行中的代理；將以一般訊息傳送）
+  steer_starting: 代理仍在啟動中 — /steer 已排入下一回合。
+  steer_failed: ⚠️ 導向失敗：{exc}
+  steer_empty: 導向已被拒絕（內容為空）。
+  steer_no_agent: 沒有作用中的代理 — /steer 已排入下一回合。
+  goal_running: 代理正在執行 — 執行中請使用 /goal status / pause / clear / wait，或先 /stop 再設定新目標。
+  loop_running: 代理正在執行 — 執行中請使用 /loop status / pause / stop，或先 /stop 再設定新迴圈。
+  moa_prepare_failed: 準備 MoA 回合失敗。
+  quickcmd_timeout: 快速指令逾時（30 秒）。
+  quickcmd_error: 快速指令錯誤：{e}
+  quickcmd_no_command: 快速指令 '/{command}' 未定義指令。
+  quickcmd_no_target: 快速指令 '/{command}' 未定義目標。
+  quickcmd_bad_type: 快速指令 '/{command}' 的類型不受支援（支援：'exec'、'alias'）。
+  stacked_skills_failed: 載入 /{command} 的堆疊技能失敗。
+  hook_blocked: 指令 `/{command}` 已被掛鉤封鎖。
+  learn_start_failed: 無法啟動 /learn — 請重試。
+  init_start_failed: 無法啟動 /init — 請重試。
+  suggestions_failed: 建議指令失敗：{e}
+  hermes_working: 'Hermes 處理中
+
+    {lines}'

@@ -456,3 +456,55 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "A munkamenet-adatbázis nem érhető el"
     session_not_found:           "A munkamenet nem található az adatbázisban."
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: a szolgáltató
+  auto_reconnect: ; automatikus újracsatlakozás {seconds} mp múlva
+  waiting_no_response: '⏳ Várakozás: {model} — {seconds} mp, még nincs válasz (a szolgáltató lassú vagy túlterhelt lehet{recovery})'
+  waiting_no_output: '⏳ Várakozás: {model} — {seconds} mp, még nincs kimenet (a szolgáltató lassú vagy túlterhelt lehet, vagy a modell gondolkodik{recovery})'
+  queued: ⏳ Sorban a következő körre{detail}. Válaszolok, amint az aktuális feladat befejeződik.
+  draining_new_work: ⏳ A Gateway {action} alatt áll, és jelenleg nem fogad új munkát.
+  draining_another_turn: ⏳ A Gateway {action} alatt áll, és jelenleg nem fogad újabb kört.
+  queued_after_return: ⏳ Gateway {action} alatt — sorban a következő körre, amint visszatér.
+  restarted_success: ♻ A Gateway sikeresen újraindult. A munkameneted folytatódik.
+  action_restarting: újraindítás
+  action_shutting_down: leállítás
+  compression_timeout: ⚠️ A kontextustömörítés {sec} mp után időtúllépéssel leállt, az összefoglaló modell nem adott kimenetet. Egy üzenet sem veszett el — folytatás tömörítés nélkül. Futtasd a /compress
+    parancsot az újrapróbáláshoz, a /reset parancsot tiszta munkamenethez, vagy ellenőrizd az auxiliary.compression modell beállítását.
+  compression_timeout_new: ⚠ A kontextustömörítés {sec} mp után időtúllépéssel leállt, az összefoglaló modell nem adott kimenetet. Egy üzenet sem veszett el — folytatás tömörítés nélkül. Futtasd a /compress
+    parancsot az újrapróbáláshoz, a /new parancsot tiszta munkamenethez, vagy ellenőrizd az auxiliary.compression beállítást.
+  compression_commit_overrun: ⚠ A kontextustömörítés véglegesítése szokatlanul sokáig tart ({waited} mp, plafon {ceiling} mp). Várakozás a biztonságos befejezésre — ha így marad, ellenőrizd a SessionDB
+    állapotát (lemez / zárolási verseny).
+  api_call_start: 'API-hívás indítása: #{n}'
+  api_call_done: 'API-hívás kész: #{n}'
+  tool_results_continue: 'eszközeredmények elküldve, iteráció folytatása: #{n}'
+  retry_backoff: 'újrapróbálkozási várakozás ({c}/{m}), hátralévő idő: {s} mp'
+  api_error_recovery: API-hiba helyreállítása (kísérlet {c}/{m})
+  error_retry_backoff: 'hiba-újrapróbálkozási várakozás ({c}/{m}), hátralévő idő: {s} mp'
+  empty_retry_backoff: 'üres válasz újrapróbálkozási várakozás ({c}/{m}), hátralévő idő: {s} mp'
+  not_paused: A Hermes nem volt szüneteltetve.
+  usage_queue: 'Használat: /queue <prompt>'
+  queued_next: Sorban a következő körre.
+  queued_next_depth: Sorban a következő körre. ({depth} várakozik)
+  usage_steer: 'Használat: /steer <prompt>'
+  usage_steer_no_agent: 'Használat: /steer <prompt>  (nem fut ügynök; normál üzenetként lesz elküldve)'
+  steer_starting: Az ügynök még indul — a /steer sorban áll a következő körre.
+  steer_failed: '⚠️ Az irányítás sikertelen: {exc}'
+  steer_empty: Az irányítás elutasítva (üres tartalom).
+  steer_no_agent: Nincs aktív ügynök — a /steer sorban áll a következő körre.
+  goal_running: Az ügynök fut — használd a /goal status / pause / clear / wait parancsokat futás közben, vagy a /stop parancsot, mielőtt új célt állítasz be.
+  loop_running: Az ügynök fut — használd a /loop status / pause / stop parancsokat futás közben, vagy a /stop parancsot, mielőtt új ciklust állítasz be.
+  moa_prepare_failed: A MoA-kör előkészítése sikertelen.
+  quickcmd_timeout: A gyorsparancs időtúllépett (30 mp).
+  quickcmd_error: 'Gyorsparancs-hiba: {e}'
+  quickcmd_no_command: A '/{command}' gyorsparancshoz nincs parancs megadva.
+  quickcmd_no_target: A '/{command}' gyorsparancshoz nincs cél megadva.
+  quickcmd_bad_type: 'A ''/{command}'' gyorsparancs típusa nem támogatott (támogatott: ''exec'', ''alias'').'
+  stacked_skills_failed: Nem sikerült betölteni a /{command} halmozott készségeit.
+  hook_blocked: A `/{command}` parancsot egy hook blokkolt.
+  learn_start_failed: Nem sikerült elindítani a /learn parancsot — próbáld újra.
+  init_start_failed: Nem sikerült elindítani az /init parancsot — próbáld újra.
+  suggestions_failed: 'A javaslatok parancs sikertelen: {e}'
+  hermes_working: 'A Hermes dolgozik
+
+    {lines}'

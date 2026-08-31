@@ -152,6 +152,7 @@ from agent.memory_provider import is_trivial_prompt
 from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
 from agent.message_content import flatten_message_text
+from agent.i18n import t
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
@@ -8220,11 +8221,7 @@ class AIAgent:
                     emit = getattr(self, "_emit_warning", None)
                     if callable(emit):
                         emit(
-                            "⚠ Context compression timed out "
-                            f"after {idle:.1f}s with no output from the summary "
-                            "model. No messages were dropped — continuing without "
-                            "compression. Run /compress to retry, /new for a clean "
-                            "session, or check auxiliary.compression."
+                            t("status.compression_timeout_new", sec=f"{idle:.1f}")
                         )
 
                 def _on_commit_overrun(waited, ceiling):
@@ -8235,10 +8232,11 @@ class AIAgent:
                     emit = getattr(self, "_emit_warning", None)
                     if callable(emit):
                         emit(
-                            "⚠ Context compression commit is taking unusually "
-                            f"long ({waited:.0f}s, ceiling {ceiling:.0f}s). "
-                            "Waiting for it to finish safely — if this persists, "
-                            "check SessionDB health (disk / lock contention)."
+                            t(
+                                "status.compression_commit_overrun",
+                                waited=f"{waited:.0f}",
+                                ceiling=f"{ceiling:.0f}",
+                            )
                         )
 
                 def _publish_new_fence():

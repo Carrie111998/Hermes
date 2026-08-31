@@ -456,3 +456,55 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "База данных сеансов недоступна"
     session_not_found:           "Сеанс не найден в базе данных."
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: провайдер
+  auto_reconnect: ; автопереподключение через {seconds} с
+  waiting_no_response: ⏳ Ожидание {model} — нет ответа {seconds} с (провайдер может быть медленным или перегруженным{recovery})
+  waiting_no_output: ⏳ Ожидание {model} — нет вывода {seconds} с (провайдер может быть медленным или перегруженным, или модель думает{recovery})
+  queued: ⏳ Поставлено в очередь на следующий ход{detail}. Отвечу после завершения текущей задачи.
+  draining_new_work: ⏳ Шлюз {action} и сейчас не принимает новую работу.
+  draining_another_turn: ⏳ Шлюз {action} и сейчас не принимает ещё один ход.
+  queued_after_return: ⏳ Шлюз {action} — поставлено в очередь на следующий ход после его возврата.
+  restarted_success: ♻ Шлюз успешно перезапущен. Ваша сессия продолжается.
+  action_restarting: перезапускается
+  action_shutting_down: завершает работу
+  compression_timeout: ⚠️ Время ожидания сжатия контекста истекло через {sec} с без вывода от модели суммаризации. Сообщения не удалены — продолжаю без сжатия. Выполните /compress для повтора, /reset для
+    чистой сессии или проверьте настройку модели auxiliary.compression.
+  compression_timeout_new: ⚠ Время ожидания сжатия контекста истекло через {sec} с без вывода от модели суммаризации. Сообщения не удалены — продолжаю без сжатия. Выполните /compress для повтора, /new для
+    чистой сессии или проверьте auxiliary.compression.
+  compression_commit_overrun: ⚠ Фиксация сжатия контекста занимает необычно много времени ({waited} с, предел {ceiling} с). Жду безопасного завершения — если это продолжается, проверьте состояние SessionDB
+    (диск / конкуренция блокировок).
+  api_call_start: 'запуск вызова API #{n}'
+  api_call_done: 'вызов API #{n} завершён'
+  tool_results_continue: 'результаты инструментов отправлены, продолжаю итерацию #{n}'
+  retry_backoff: пауза перед повтором ({c}/{m}), осталось {s} с
+  api_error_recovery: восстановление после ошибки API (попытка {c}/{m})
+  error_retry_backoff: пауза перед повтором после ошибки ({c}/{m}), осталось {s} с
+  empty_retry_backoff: пауза перед повтором из-за пустого ответа ({c}/{m}), осталось {s} с
+  not_paused: Hermes не был приостановлен.
+  usage_queue: 'Использование: /queue <prompt>'
+  queued_next: Поставлено в очередь на следующий ход.
+  queued_next_depth: 'Поставлено в очередь на следующий ход. (в очереди: {depth})'
+  usage_steer: 'Использование: /steer <prompt>'
+  usage_steer_no_agent: 'Использование: /steer <prompt>  (агент не запущен; отправлю как обычное сообщение)'
+  steer_starting: Агент ещё запускается — /steer поставлен в очередь на следующий ход.
+  steer_failed: '⚠️ Ошибка корректировки: {exc}'
+  steer_empty: Корректировка отклонена (пустые данные).
+  steer_no_agent: Нет активного агента — /steer поставлен в очередь на следующий ход.
+  goal_running: Агент выполняется — во время выполнения используйте /goal status / pause / clear / wait или /stop перед установкой новой цели.
+  loop_running: Агент выполняется — во время выполнения используйте /loop status / pause / stop или /stop перед установкой нового цикла.
+  moa_prepare_failed: Не удалось подготовить ход MoA.
+  quickcmd_timeout: Быстрая команда превысила время ожидания (30 с).
+  quickcmd_error: 'Ошибка быстрой команды: {e}'
+  quickcmd_no_command: У быстрой команды '/{command}' не задана команда.
+  quickcmd_no_target: У быстрой команды '/{command}' не задана цель.
+  quickcmd_bad_type: 'У быстрой команды ''/{command}'' неподдерживаемый тип (поддерживаются: ''exec'', ''alias'').'
+  stacked_skills_failed: Не удалось загрузить стек навыков для /{command}.
+  hook_blocked: Команда `/{command}` заблокирована хуком.
+  learn_start_failed: Не удалось запустить /learn — попробуйте снова.
+  init_start_failed: Не удалось запустить /init — попробуйте снова.
+  suggestions_failed: 'Ошибка команды предложений: {e}'
+  hermes_working: 'Hermes работает
+
+    {lines}'

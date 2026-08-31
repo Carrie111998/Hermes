@@ -458,3 +458,54 @@ gateway:
     session_db_unavailable_prefix: "قاعدة بيانات الجلسات غير متاحة"
     session_not_found:           "لم يُعثر على الجلسة في قاعدة البيانات."
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: المزوّد
+  auto_reconnect: ؛ إعادة اتصال تلقائية عند {seconds} ث
+  waiting_no_response: ⏳ في انتظار {model} — {seconds} ث دون رد حتى الآن (قد يكون المزوّد بطيئًا أو مثقلًا{recovery})
+  waiting_no_output: ⏳ في انتظار {model} — {seconds} ث دون مخرجات حتى الآن (قد يكون المزوّد بطيئًا أو مثقلًا، أو ربما النموذج يفكر{recovery})
+  queued: ⏳ في قائمة الانتظار للدور التالي{detail}. سأرد بمجرد انتهاء المهمة الحالية.
+  draining_new_work: ⏳ البوابة قيد {action} ولا تقبل عملًا جديدًا الآن.
+  draining_another_turn: ⏳ البوابة قيد {action} ولا تقبل دورًا آخر الآن.
+  queued_after_return: ⏳ البوابة قيد {action} — في قائمة الانتظار للدور التالي بعد عودتها.
+  restarted_success: ♻ تمت إعادة تشغيل البوابة بنجاح. جلستك مستمرة.
+  action_restarting: إعادة التشغيل
+  action_shutting_down: إيقاف التشغيل
+  compression_timeout: ⚠️ انتهت مهلة ضغط السياق بعد {sec} ث دون مخرجات من نموذج التلخيص. لم تُسقط أي رسائل — المتابعة دون ضغط. نفّذ /compress لإعادة المحاولة، أو /reset لجلسة نظيفة، أو تحقق من إعداد نموذج
+    auxiliary.compression.
+  compression_timeout_new: ⚠ انتهت مهلة ضغط السياق بعد {sec} ث دون مخرجات من نموذج التلخيص. لم تُسقط أي رسائل — المتابعة دون ضغط. نفّذ /compress لإعادة المحاولة، أو /new لجلسة نظيفة، أو تحقق من auxiliary.compression.
+  compression_commit_overrun: ⚠ يستغرق تثبيت ضغط السياق وقتًا طويلاً بشكل غير معتاد ({waited} ث، الحد الأقصى {ceiling} ث). في انتظار اكتماله بأمان — إذا استمر ذلك، تحقق من سلامة SessionDB (القرص / تنافس
+    الأقفال).
+  api_call_start: بدء استدعاء API رقم {n}
+  api_call_done: اكتمل استدعاء API رقم {n}
+  tool_results_continue: تم نشر نتائج الأدوات، متابعة التكرار رقم {n}
+  retry_backoff: تراجع إعادة المحاولة ({c}/{m})، متبقٍ {s} ث
+  api_error_recovery: استرداد خطأ API (المحاولة {c}/{m})
+  error_retry_backoff: تراجع إعادة المحاولة بعد الخطأ ({c}/{m})، متبقٍ {s} ث
+  empty_retry_backoff: تراجع إعادة المحاولة بعد رد فارغ ({c}/{m})، متبقٍ {s} ث
+  not_paused: لم يكن Hermes متوقفًا مؤقتًا.
+  usage_queue: 'الاستخدام: /queue <موجّه>'
+  queued_next: في قائمة الانتظار للدور التالي.
+  queued_next_depth: في قائمة الانتظار للدور التالي. ({depth} في الانتظار)
+  usage_steer: 'الاستخدام: /steer <موجّه>'
+  usage_steer_no_agent: 'الاستخدام: /steer <موجّه>  (لا يوجد وكيل قيد التشغيل؛ سيُرسل كرسالة عادية)'
+  steer_starting: الوكيل لا يزال يبدأ — /steer في قائمة الانتظار للدور التالي.
+  steer_failed: '⚠️ فشل التوجيه: {exc}'
+  steer_empty: تم رفض التوجيه (حمولة فارغة).
+  steer_no_agent: لا يوجد وكيل نشط — /steer في قائمة الانتظار للدور التالي.
+  goal_running: الوكيل قيد التشغيل — استخدم /goal status / pause / clear / wait أثناء التشغيل، أو /stop قبل تعيين هدف جديد.
+  loop_running: الوكيل قيد التشغيل — استخدم /loop status / pause / stop أثناء التشغيل، أو /stop قبل تعيين حلقة جديدة.
+  moa_prepare_failed: فشل إعداد دور MoA.
+  quickcmd_timeout: انتهت مهلة الأمر السريع (30 ث).
+  quickcmd_error: 'خطأ في الأمر السريع: {e}'
+  quickcmd_no_command: الأمر السريع '/{command}' لا يحتوي على أمر معرّف.
+  quickcmd_no_target: الأمر السريع '/{command}' لا يحتوي على هدف معرّف.
+  quickcmd_bad_type: 'الأمر السريع ''/{command}'' له نوع غير مدعوم (المدعوم: ''exec''، ''alias'').'
+  stacked_skills_failed: فشل تحميل المهارات المكدسة لـ /{command}.
+  hook_blocked: تم حظر الأمر `/{command}` بواسطة خطاف.
+  learn_start_failed: تعذّر بدء /learn — حاول مرة أخرى.
+  init_start_failed: تعذّر بدء /init — حاول مرة أخرى.
+  suggestions_failed: 'فشل أمر الاقتراحات: {e}'
+  hermes_working: 'Hermes يعمل
+
+    {lines}'

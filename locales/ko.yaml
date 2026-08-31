@@ -456,3 +456,52 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "세션 데이터베이스를 사용할 수 없습니다"
     session_not_found:           "데이터베이스에서 세션을 찾을 수 없습니다."
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: 프로바이더
+  auto_reconnect: ; {seconds}초 후 자동 재연결
+  waiting_no_response: ⏳ {model} 대기 중 — {seconds}초 동안 응답 없음 (프로바이더가 느리거나 과부하 상태일 수 있음{recovery})
+  waiting_no_output: ⏳ {model} 대기 중 — {seconds}초 동안 출력 없음 (프로바이더가 느리거나 과부하이거나 모델이 생각 중일 수 있음{recovery})
+  queued: ⏳ 다음 턴에 대기열 등록됨{detail}. 현재 작업이 끝나면 응답하겠습니다.
+  draining_new_work: ⏳ 게이트웨이가 {action} 중이라 지금은 새 작업을 받지 않습니다.
+  draining_another_turn: ⏳ 게이트웨이가 {action} 중이라 지금은 추가 턴을 받지 않습니다.
+  queued_after_return: ⏳ 게이트웨이 {action} — 복귀 후 다음 턴에 대기열 등록됨.
+  restarted_success: ♻ 게이트웨이가 성공적으로 재시작되었습니다. 세션이 계속됩니다.
+  action_restarting: 재시작 중
+  action_shutting_down: 종료 중
+  compression_timeout: ⚠️ 컨텍스트 압축이 {sec}초 후 시간 초과되었습니다 (요약 모델의 출력 없음). 메시지는 삭제되지 않았습니다 — 압축 없이 계속합니다. /compress로 재시도하거나 /reset으로 새 세션을 시작하거나 auxiliary.compression 모델 설정을 확인하세요.
+  compression_timeout_new: ⚠ 컨텍스트 압축이 {sec}초 후 시간 초과되었습니다 (요약 모델의 출력 없음). 메시지는 삭제되지 않았습니다 — 압축 없이 계속합니다. /compress로 재시도하거나 /new로 새 세션을 시작하거나 auxiliary.compression을 확인하세요.
+  compression_commit_overrun: ⚠ 컨텍스트 압축 커밋이 비정상적으로 오래 걸립니다 ({waited}초, 상한 {ceiling}초). 안전하게 완료될 때까지 대기 중 — 계속되면 SessionDB 상태(디스크 / 잠금 경합)를 확인하세요.
+  api_call_start: 'API 호출 #{n} 시작'
+  api_call_done: 'API 호출 #{n} 완료'
+  tool_results_continue: '도구 결과 전송됨, 반복 #{n} 계속'
+  retry_backoff: 재시도 백오프 ({c}/{m}), {s}초 남음
+  api_error_recovery: API 오류 복구 (시도 {c}/{m})
+  error_retry_backoff: 오류 재시도 백오프 ({c}/{m}), {s}초 남음
+  empty_retry_backoff: 빈 응답 재시도 백오프 ({c}/{m}), {s}초 남음
+  not_paused: Hermes가 일시 중지되어 있지 않습니다.
+  usage_queue: '사용법: /queue <prompt>'
+  queued_next: 다음 턴에 대기열 등록됨.
+  queued_next_depth: 다음 턴에 대기열 등록됨. ({depth}개 대기 중)
+  usage_steer: '사용법: /steer <prompt>'
+  usage_steer_no_agent: '사용법: /steer <prompt>  (실행 중인 에이전트가 없습니다. 일반 메시지로 전송합니다)'
+  steer_starting: 에이전트가 아직 시작 중입니다 — /steer가 다음 턴에 대기열 등록되었습니다.
+  steer_failed: '⚠️ 스티어 실패: {exc}'
+  steer_empty: 스티어가 거부되었습니다 (빈 페이로드).
+  steer_no_agent: 활성 에이전트가 없습니다 — /steer가 다음 턴에 대기열 등록되었습니다.
+  goal_running: 에이전트 실행 중 — 실행 중에는 /goal status / pause / clear / wait를 사용하거나, 새 목표를 설정하기 전에 /stop 하세요.
+  loop_running: 에이전트 실행 중 — 실행 중에는 /loop status / pause / stop을 사용하거나, 새 루프를 설정하기 전에 /stop 하세요.
+  moa_prepare_failed: MoA 턴 준비에 실패했습니다.
+  quickcmd_timeout: 빠른 명령 시간 초과 (30초).
+  quickcmd_error: '빠른 명령 오류: {e}'
+  quickcmd_no_command: 빠른 명령 '/{command}'에 정의된 명령이 없습니다.
+  quickcmd_no_target: 빠른 명령 '/{command}'에 정의된 대상이 없습니다.
+  quickcmd_bad_type: '빠른 명령 ''/{command}''의 유형이 지원되지 않습니다 (지원: ''exec'', ''alias'').'
+  stacked_skills_failed: /{command}의 스택 스킬을 불러오지 못했습니다.
+  hook_blocked: 명령 `/{command}`이(가) 후크에 의해 차단되었습니다.
+  learn_start_failed: /learn을 시작할 수 없습니다 — 다시 시도하세요.
+  init_start_failed: /init을 시작할 수 없습니다 — 다시 시도하세요.
+  suggestions_failed: '제안 명령 실패: {e}'
+  hermes_working: 'Hermes 작업 중
+
+    {lines}'

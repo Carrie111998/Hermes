@@ -36,6 +36,7 @@ from agent.error_classifier import (
 from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
+from agent.i18n import t
 from agent.model_metadata import is_local_endpoint
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
@@ -1604,11 +1605,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
-    t = threading.Thread(target=_context_thread_target(_call), daemon=True)
-    t.start()
+    worker = threading.Thread(target=_context_thread_target(_call), daemon=True)
+    worker.start()
     _poll_count = 0
-    while t.is_alive():
-        t.join(timeout=0.3)
+    while worker.is_alive():
+        worker.join(timeout=0.3)
         _poll_count += 1
 
         # Every ~30s: touch activity for the gateway inactivity monitor AND
@@ -1632,9 +1633,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     elapsed=_elapsed,
                 )
                 agent._emit_wait_notice(
-                    f"⏳ waiting on {api_kwargs.get('model', 'the provider')} — "
-                    f"{int(_elapsed)}s with no response yet (provider may be slow "
-                    f"or overloaded{_recovery})"
+                    t(
+                        "status.waiting_no_response",
+                        model=api_kwargs.get("model", t("status.provider")),
+                        seconds=int(_elapsed),
+                        recovery=_recovery,
+                    )
                 )
             except Exception:
                 logger.debug("wait-notice construction failed", exc_info=True)
@@ -1689,7 +1693,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"codex stream killed after {int(_elapsed)}s with no first byte"
             )
             # Wait briefly for the worker to notice the closed connection.
-            t.join(timeout=2.0)
+            worker.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
@@ -1734,7 +1738,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             agent._touch_activity(
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
-            t.join(timeout=2.0)
+            worker.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
                 result["error"] = TimeoutError(
                     f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
@@ -1767,7 +1771,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _bump_stale_streak(agent)
             _touch_stale_kill_activity(agent, _elapsed)
             # Wait briefly for the thread to notice the closed connection.
-            t.join(timeout=2.0)
+            worker.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
@@ -5216,12 +5220,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
-    t = threading.Thread(target=_context_thread_target(_call), daemon=True)
-    t.start()
+    worker = threading.Thread(target=_context_thread_target(_call), daemon=True)
+    worker.start()
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
-    while t.is_alive():
-        t.join(timeout=0.3)
+    while worker.is_alive():
+        worker.join(timeout=0.3)
 
         # Periodic heartbeat: touch the agent's activity tracker so the
         # gateway's inactivity monitor knows we're alive while waiting
@@ -5244,13 +5248,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _stream_stale_timeout is not None
                     and _stream_stale_timeout != float("inf")
                 ):
-                    _recovery = f"; auto-reconnect at {int(_stream_stale_timeout)}s"
+                    _recovery = t("status.auto_reconnect", seconds=int(_stream_stale_timeout))
                 else:
                     _recovery = ""
                 agent._emit_wait_notice(
-                    f"⏳ waiting on {api_kwargs.get('model', 'the provider')} — "
-                    f"{_waiting_secs}s with no output yet (provider may be "
-                    f"slow or overloaded, or the model is thinking{_recovery})"
+                    t(
+                        "status.waiting_no_output",
+                        model=api_kwargs.get("model", t("status.provider")),
+                        seconds=_waiting_secs,
+                        recovery=_recovery,
+                    )
                 )
             else:
                 # Chunks are flowing — keep the activity tracker fresh but

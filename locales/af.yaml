@@ -456,3 +456,54 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "Sessie-databasis is nie beskikbaar"
     session_not_found:           "Sessie nie in databasis gevind nie."
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: die verskaffer
+  auto_reconnect: ; outo-herverbind by {seconds}s
+  waiting_no_response: ⏳ wag op {model} — {seconds}s sonder antwoord nog (verskaffer kan stadig of oorlaai wees{recovery})
+  waiting_no_output: ⏳ wag op {model} — {seconds}s sonder uitset nog (verskaffer kan stadig of oorlaai wees, of die model dink nog{recovery})
+  queued: ⏳ In die ry vir die volgende beurt{detail}. Ek antwoord sodra die huidige taak klaar is.
+  draining_new_work: ⏳ Gateway is besig met {action} en aanvaar nou geen nuwe werk nie.
+  draining_another_turn: ⏳ Gateway is besig met {action} en aanvaar nou geen verdere beurt nie.
+  queued_after_return: ⏳ Gateway besig met {action} — in die ry vir die volgende beurt sodra dit terug is.
+  restarted_success: ♻ Gateway suksesvol herbegin. Jou sessie gaan voort.
+  action_restarting: herbegin
+  action_shutting_down: afsluit
+  compression_timeout: ⚠️ Konteksdrukking het na {sec}s verstryk sonder uitset van die opsommingsmodel. Geen boodskappe is laat val nie — gaan voort sonder drukking. Voer /compress uit om weer te probeer,
+    /reset vir 'n skoon sessie, of kyk jou auxiliary.compression-modelkonfigurasie na.
+  compression_timeout_new: ⚠ Konteksdrukking het na {sec}s verstryk sonder uitset van die opsommingsmodel. Geen boodskappe is laat val nie — gaan voort sonder drukking. Voer /compress uit om weer te probeer,
+    /new vir 'n skoon sessie, of kyk auxiliary.compression na.
+  compression_commit_overrun: ⚠ Konteksdrukking-vashaking neem buitengewoon lank ({waited}s, perk {ceiling}s). Wag dat dit veilig klaarmaak — as dit voortduur, kyk SessionDB-gesondheid na (skyf / slot-twis).
+  api_call_start: 'begin API-oproep #{n}'
+  api_call_done: 'API-oproep #{n} voltooi'
+  tool_results_continue: 'nutsmiddelresultate geplaas, gaan voort met iterasie #{n}'
+  retry_backoff: herpoging-terugval ({c}/{m}), {s}s oor
+  api_error_recovery: API-foutherstel (poging {c}/{m})
+  error_retry_backoff: foutherpoging-terugval ({c}/{m}), {s}s oor
+  empty_retry_backoff: leë-antwoord-herpoging-terugval ({c}/{m}), {s}s oor
+  not_paused: Hermes was nie gepouseer nie.
+  usage_queue: 'Gebruik: /queue <opdrag>'
+  queued_next: In die ry vir die volgende beurt.
+  queued_next_depth: In die ry vir die volgende beurt. ({depth} in die ry)
+  usage_steer: 'Gebruik: /steer <opdrag>'
+  usage_steer_no_agent: 'Gebruik: /steer <opdrag>  (geen agent loop nie; word as ''n gewone boodskap gestuur)'
+  steer_starting: Agent begin nog — /steer in die ry vir die volgende beurt.
+  steer_failed: '⚠️ Stuur het misluk: {exc}'
+  steer_empty: Stuur verwerp (leë loonvrag).
+  steer_no_agent: Geen aktiewe agent — /steer in die ry vir die volgende beurt.
+  goal_running: Agent loop — gebruik /goal status / pause / clear / wait tydens die loop, of /stop voordat jy 'n nuwe doel stel.
+  loop_running: Agent loop — gebruik /loop status / pause / stop tydens die loop, of /stop voordat jy 'n nuwe lus stel.
+  moa_prepare_failed: Kon nie MoA-beurt voorberei nie.
+  quickcmd_timeout: Vinnige opdrag het verstryk (30s).
+  quickcmd_error: 'Vinnige opdrag-fout: {e}'
+  quickcmd_no_command: Vinnige opdrag '/{command}' het geen opdrag gedefinieer nie.
+  quickcmd_no_target: Vinnige opdrag '/{command}' het geen teiken gedefinieer nie.
+  quickcmd_bad_type: 'Vinnige opdrag ''/{command}'' het ''n nie-ondersteunde tipe (ondersteun: ''exec'', ''alias'').'
+  stacked_skills_failed: Kon nie gestapelde vaardighede vir /{command} laai nie.
+  hook_blocked: Opdrag `/{command}` is deur 'n haak geblokkeer.
+  learn_start_failed: Kon nie /learn begin nie — probeer asseblief weer.
+  init_start_failed: Kon nie /init begin nie — probeer asseblief weer.
+  suggestions_failed: 'Voorstelle-opdrag het misluk: {e}'
+  hermes_working: 'Hermes is besig
+
+    {lines}'

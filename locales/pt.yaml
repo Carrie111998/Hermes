@@ -456,3 +456,55 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "Base de dados de sessões indisponível"
     session_not_found:           "Sessão não encontrada na base de dados."
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: o fornecedor
+  auto_reconnect: ; reconexão automática em {seconds}s
+  waiting_no_response: ⏳ à espera de {model} — sem resposta há {seconds}s (o fornecedor pode estar lento ou sobrecarregado{recovery})
+  waiting_no_output: ⏳ à espera de {model} — sem saída há {seconds}s (o fornecedor pode estar lento ou sobrecarregado, ou o modelo está a pensar{recovery})
+  queued: ⏳ Em fila para o próximo turno{detail}. Responderei quando a tarefa atual terminar.
+  draining_new_work: ⏳ O Gateway está a {action} e não está a aceitar novo trabalho de momento.
+  draining_another_turn: ⏳ O Gateway está a {action} e não está a aceitar outro turno de momento.
+  queued_after_return: ⏳ Gateway a {action} — em fila para o próximo turno quando voltar.
+  restarted_success: ♻ Gateway reiniciado com sucesso. A sua sessão continua.
+  action_restarting: reiniciar
+  action_shutting_down: encerrar
+  compression_timeout: ⚠️ A compressão do contexto excedeu o tempo limite após {sec}s sem saída do modelo de resumo. Nenhuma mensagem foi descartada — a continuar sem compressão. Execute /compress para
+    tentar novamente, /reset para uma sessão limpa, ou verifique a configuração do modelo auxiliary.compression.
+  compression_timeout_new: ⚠ A compressão do contexto excedeu o tempo limite após {sec}s sem saída do modelo de resumo. Nenhuma mensagem foi descartada — a continuar sem compressão. Execute /compress para
+    tentar novamente, /new para uma sessão limpa, ou verifique auxiliary.compression.
+  compression_commit_overrun: ⚠ A confirmação da compressão do contexto está a demorar mais do que o habitual ({waited}s, limite {ceiling}s). A aguardar que termine em segurança — se persistir, verifique
+    o estado da SessionDB (disco / contenção de bloqueios).
+  api_call_start: a iniciar a chamada de API n.º {n}
+  api_call_done: chamada de API n.º {n} concluída
+  tool_results_continue: resultados das ferramentas publicados, a continuar a iteração n.º {n}
+  retry_backoff: espera antes de nova tentativa ({c}/{m}), restam {s}s
+  api_error_recovery: recuperação de erro de API (tentativa {c}/{m})
+  error_retry_backoff: espera de nova tentativa após erro ({c}/{m}), restam {s}s
+  empty_retry_backoff: espera de nova tentativa após resposta vazia ({c}/{m}), restam {s}s
+  not_paused: Hermes não estava em pausa.
+  usage_queue: 'Utilização: /queue <prompt>'
+  queued_next: Em fila para o próximo turno.
+  queued_next_depth: Em fila para o próximo turno. ({depth} em fila)
+  usage_steer: 'Utilização: /steer <prompt>'
+  usage_steer_no_agent: 'Utilização: /steer <prompt>  (nenhum agente em execução; enviado como mensagem normal)'
+  steer_starting: O agente ainda está a iniciar — /steer em fila para o próximo turno.
+  steer_failed: '⚠️ Falha ao direcionar: {exc}'
+  steer_empty: Steer rejeitado (conteúdo vazio).
+  steer_no_agent: Nenhum agente ativo — /steer em fila para o próximo turno.
+  goal_running: O agente está em execução — use /goal status / pause / clear / wait durante a execução, ou /stop antes de definir um novo objetivo.
+  loop_running: O agente está em execução — use /loop status / pause / stop durante a execução, ou /stop antes de definir um novo ciclo.
+  moa_prepare_failed: Falha ao preparar o turno MoA.
+  quickcmd_timeout: O comando rápido excedeu o tempo limite (30s).
+  quickcmd_error: 'Erro do comando rápido: {e}'
+  quickcmd_no_command: O comando rápido '/{command}' não tem nenhum comando definido.
+  quickcmd_no_target: O comando rápido '/{command}' não tem nenhum destino definido.
+  quickcmd_bad_type: 'O comando rápido ''/{command}'' tem um tipo não suportado (suportados: ''exec'', ''alias'').'
+  stacked_skills_failed: Falha ao carregar as skills empilhadas para /{command}.
+  hook_blocked: O comando `/{command}` foi bloqueado por um hook.
+  learn_start_failed: Não foi possível iniciar /learn — tente novamente.
+  init_start_failed: Não foi possível iniciar /init — tente novamente.
+  suggestions_failed: 'Falha no comando de sugestões: {e}'
+  hermes_working: 'Hermes está a trabalhar
+
+    {lines}'

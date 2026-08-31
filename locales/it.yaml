@@ -456,3 +456,55 @@ Future messages in this room will use that transcript until `/reset` or another 
     session_db_unavailable_prefix: "Database delle sessioni non disponibile"
     session_not_found:           "Sessione non trovata nel database."
     warn_passthrough:            "⚠️ {error}"
+
+status:
+  provider: il provider
+  auto_reconnect: ; riconnessione automatica tra {seconds}s
+  waiting_no_response: ⏳ in attesa di {model} — nessuna risposta da {seconds}s (il provider potrebbe essere lento o sovraccarico{recovery})
+  waiting_no_output: ⏳ in attesa di {model} — nessun output da {seconds}s (il provider potrebbe essere lento o sovraccarico, oppure il modello sta ragionando{recovery})
+  queued: ⏳ In coda per il prossimo turno{detail}. Risponderò una volta terminata l'attività corrente.
+  draining_new_work: ⏳ Il Gateway è in fase di {action} e non accetta nuovo lavoro al momento.
+  draining_another_turn: ⏳ Il Gateway è in fase di {action} e non accetta un altro turno al momento.
+  queued_after_return: ⏳ Gateway in fase di {action} — in coda per il prossimo turno al suo ritorno.
+  restarted_success: ♻ Gateway riavviato con successo. La tua sessione continua.
+  action_restarting: riavvio
+  action_shutting_down: arresto
+  compression_timeout: ⚠️ La compressione del contesto è scaduta dopo {sec}s senza output dal modello di riepilogo. Nessun messaggio è stato eliminato — si continua senza compressione. Esegui /compress
+    per riprovare, /reset per una sessione pulita, oppure controlla la configurazione del modello auxiliary.compression.
+  compression_timeout_new: ⚠ La compressione del contesto è scaduta dopo {sec}s senza output dal modello di riepilogo. Nessun messaggio è stato eliminato — si continua senza compressione. Esegui /compress
+    per riprovare, /new per una sessione pulita, oppure controlla auxiliary.compression.
+  compression_commit_overrun: ⚠ Il commit della compressione del contesto sta impiegando insolitamente a lungo ({waited}s, limite {ceiling}s). In attesa di una conclusione sicura — se persiste, controlla
+    lo stato della SessionDB (disco / contesa dei lock).
+  api_call_start: avvio della chiamata API n. {n}
+  api_call_done: chiamata API n. {n} completata
+  tool_results_continue: risultati degli strumenti inviati, prosegue l'iterazione n. {n}
+  retry_backoff: backoff di riprova ({c}/{m}), {s}s rimanenti
+  api_error_recovery: ripristino da errore API (tentativo {c}/{m})
+  error_retry_backoff: backoff di riprova dopo errore ({c}/{m}), {s}s rimanenti
+  empty_retry_backoff: backoff di riprova dopo risposta vuota ({c}/{m}), {s}s rimanenti
+  not_paused: Hermes non era in pausa.
+  usage_queue: 'Uso: /queue <prompt>'
+  queued_next: In coda per il prossimo turno.
+  queued_next_depth: In coda per il prossimo turno. ({depth} in coda)
+  usage_steer: 'Uso: /steer <prompt>'
+  usage_steer_no_agent: 'Uso: /steer <prompt>  (nessun agente in esecuzione; inviato come messaggio normale)'
+  steer_starting: L'agente è ancora in avvio — /steer in coda per il prossimo turno.
+  steer_failed: '⚠️ Steer non riuscito: {exc}'
+  steer_empty: Steer rifiutato (payload vuoto).
+  steer_no_agent: Nessun agente attivo — /steer in coda per il prossimo turno.
+  goal_running: L'agente è in esecuzione — usa /goal status / pause / clear / wait durante l'esecuzione, oppure /stop prima di impostare un nuovo obiettivo.
+  loop_running: L'agente è in esecuzione — usa /loop status / pause / stop durante l'esecuzione, oppure /stop prima di impostare un nuovo ciclo.
+  moa_prepare_failed: Impossibile preparare il turno MoA.
+  quickcmd_timeout: Comando rapido scaduto (30s).
+  quickcmd_error: 'Errore del comando rapido: {e}'
+  quickcmd_no_command: Il comando rapido '/{command}' non ha alcun comando definito.
+  quickcmd_no_target: Il comando rapido '/{command}' non ha alcuna destinazione definita.
+  quickcmd_bad_type: 'Il comando rapido ''/{command}'' ha un tipo non supportato (supportati: ''exec'', ''alias'').'
+  stacked_skills_failed: Impossibile caricare le skill impilate per /{command}.
+  hook_blocked: Il comando `/{command}` è stato bloccato da un hook.
+  learn_start_failed: Impossibile avviare /learn — riprova.
+  init_start_failed: Impossibile avviare /init — riprova.
+  suggestions_failed: 'Comando dei suggerimenti non riuscito: {e}'
+  hermes_working: 'Hermes sta lavorando
+
+    {lines}'
