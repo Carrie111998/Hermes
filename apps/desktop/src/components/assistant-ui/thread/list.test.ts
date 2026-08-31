@@ -10,6 +10,7 @@ import {
   type MessageGroup,
   resolveThreadScrollTarget,
   shouldClampTranscriptBudget,
+  shouldRePinOnTranscriptReload,
   subscribeToThreadForeground,
   transcriptBackfillFrameCount,
   transcriptPaneBudget
@@ -327,5 +328,25 @@ describe('liveTailStart', () => {
 describe('transcriptBackfillFrameCount', () => {
   it('settles a full pane in at most three prepend commits', () => {
     expect(transcriptBackfillFrameCount()).toBeLessThanOrEqual(3)
+  })
+})
+
+describe('shouldRePinOnTranscriptReload', () => {
+  it('pins on a session switch even before the transcript has settled', () => {
+    expect(shouldRePinOnTranscriptReload({ sessionSwitched: true, settledNonEmpty: false })).toBe(true)
+  })
+
+  it('pins on a session switch even when the prior session had settled', () => {
+    expect(shouldRePinOnTranscriptReload({ sessionSwitched: true, settledNonEmpty: true })).toBe(true)
+  })
+
+  it('preserves the reader position on a same-session refresh after settling', () => {
+    // The bug case: a transcript that briefly empties and repopulates under
+    // the SAME sessionKey must NOT re-pin a scrolled-up reader to the bottom.
+    expect(shouldRePinOnTranscriptReload({ sessionSwitched: false, settledNonEmpty: true })).toBe(false)
+  })
+
+  it('pins on a cold-load arrival (same session, never settled non-empty)', () => {
+    expect(shouldRePinOnTranscriptReload({ sessionSwitched: false, settledNonEmpty: false })).toBe(true)
   })
 })

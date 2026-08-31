@@ -138,6 +138,17 @@ export const resolveThreadScrollTarget: GetTargetScrollTop = (targetScrollTop, {
   return remaining >= 0 && remaining <= SCROLL_TARGET_EPSILON_PX ? currentScrollTop : targetScrollTop
 }
 
+// Returns true when the pin-to-bottom effect should re-arm (pin to bottom),
+// false when it should preserve the reader's position.
+export function shouldRePinOnTranscriptReload(opts: {
+  sessionSwitched: boolean
+  settledNonEmpty: boolean
+}): boolean {
+  if (opts.sessionSwitched) return true
+  if (opts.settledNonEmpty) return false
+  return true
+}
+
 export function subscribeToThreadForeground(shouldReanchor: () => boolean, onReanchor: () => void): () => void {
   let frameId: number | null = null
   let framePending = false
@@ -469,6 +480,11 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // Session the settle loop last armed for, so a re-arm within the same load
   // is distinguishable from a switch to a different transcript.
   const settleKeyRef = useRef(sessionKey)
+  // True once the CURRENT session has settled with a non-empty transcript.
+  // A same-session refresh (transcript briefly cleared and repopulated under
+  // the same key) must preserve the reader's scroll position rather than
+  // re-pin to the bottom; only a session switch or a cold-load arrival re-arms.
+  const settledNonEmptyRef = useRef(false)
 
   // Record where the view should land once a prepend has grown the content,
   // measured from the BOTTOM so the added height doesn't invalidate it. Only a
@@ -646,6 +662,20 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       return
     }
 
+    // A same-session refresh (transcript briefly cleared and repopulated under
+    // the same key) must preserve the reader's position, not re-pin to the
+    // bottom. Only a session switch or a cold-load arrival re-arms. This must
+    // run BEFORE stopScroll / scrollTop / loadSettledRef reset so a refresh
+    // neither yanks the view nor clears the settled flag.
+    if (
+      !shouldRePinOnTranscriptReload({
+        sessionSwitched: settleKeyRef.current !== sessionKey,
+        settledNonEmpty: settledNonEmptyRef.current
+      })
+    ) {
+      return
+    }
+
     stopScroll()
     el.scrollTop = el.scrollHeight
     loadSettledRef.current = false
@@ -680,6 +710,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       // frames to minimize the settle-loop racing markdown paint on every switch.
       if (stableFrames >= 2 || ++frame > 15) {
         void scrollToBottom('instant')
+        settledNonEmptyRef.current = hasGroups
         loadSettledRef.current = true
 
         return
