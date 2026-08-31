@@ -25,7 +25,7 @@ from typing import Any, Callable, Dict, List, Optional
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import TRIVIAL_PROMPT_RE, MemoryProvider, is_trivial_prompt
 from plugins.memory.honcho.client import spawn_context_thread
-from tools.registry import tool_error
+from tools.registry import tool_error, tool_result
 
 logger = logging.getLogger(__name__)
 
@@ -1556,11 +1556,11 @@ class HonchoMemoryProvider(MemoryProvider):
                     result = self._manager.set_peer_card(self._session_key, card_update, peer=peer)
                     if result is None:
                         return tool_error("Failed to update peer card.")
-                    return json.dumps({"result": f"Peer card updated ({len(result)} facts).", "card": result})
+                    return tool_result({"result": f"Peer card updated ({len(result)} facts).", "card": result})
                 card = self._manager.get_peer_card(self._session_key, peer=peer)
                 if not card:
-                    return json.dumps(self._empty_profile_hint(peer))
-                return json.dumps({"result": card})
+                    return tool_result(self._empty_profile_hint(peer))
+                return tool_result({"result": card})
 
             elif tool_name == "honcho_search":
                 query = (args.get("query") or "").strip()
@@ -1572,8 +1572,8 @@ class HonchoMemoryProvider(MemoryProvider):
                     self._session_key, query, max_tokens=max_tokens, peer=peer
                 )
                 if not result:
-                    return json.dumps({"result": "No relevant context found."})
-                return json.dumps({"result": result})
+                    return tool_result({"result": "No relevant context found."})
+                return tool_result({"result": result})
 
             elif tool_name == "honcho_reasoning":
                 query = (args.get("query") or "").strip()
@@ -1608,13 +1608,13 @@ class HonchoMemoryProvider(MemoryProvider):
                     )
                 # Update cadence tracker so auto-injection respects the gap after an explicit call
                 self._last_dialectic_turn = self._turn_count
-                return json.dumps({"result": result or "No result from Honcho."})
+                return tool_result({"result": result or "No result from Honcho."})
 
             elif tool_name == "honcho_context":
                 peer = args.get("peer", "user")
                 ctx = self._manager.get_session_context(self._session_key, peer=peer)
                 if not ctx:
-                    return json.dumps({"result": "No context available yet."})
+                    return tool_result({"result": "No context available yet."})
                 parts = []
                 if ctx.get("summary"):
                     parts.append(f"## Summary\n{ctx['summary']}")
@@ -1629,7 +1629,7 @@ class HonchoMemoryProvider(MemoryProvider):
                         for m in msgs[-5:]  # last 5 for brevity
                     )
                     parts.append(f"## Recent messages\n{msg_str}")
-                return json.dumps({"result": "\n\n".join(parts) or "No context available."})
+                return tool_result({"result": "\n\n".join(parts) or "No context available."})
 
             elif tool_name == "honcho_conclude":
                 delete_id = (args.get("delete_id") or "").strip()
@@ -1650,15 +1650,15 @@ class HonchoMemoryProvider(MemoryProvider):
                     conclusions = self._manager.list_conclusions(
                         self._session_key, query=query or None, peer=peer
                     )
-                    return json.dumps({"conclusions": conclusions})
+                    return tool_result({"conclusions": conclusions})
                 if has_delete_id:
                     ok = self._manager.delete_conclusion(self._session_key, delete_id, peer=peer)
                     if ok:
-                        return json.dumps({"result": f"Conclusion {delete_id} deleted."})
+                        return tool_result({"result": f"Conclusion {delete_id} deleted."})
                     return tool_error(f"Failed to delete conclusion {delete_id}.")
                 ok = self._manager.create_conclusion(self._session_key, conclusion, peer=peer)
                 if ok:
-                    return json.dumps({"result": f"Conclusion saved for {peer}: {conclusion}"})
+                    return tool_result({"result": f"Conclusion saved for {peer}: {conclusion}"})
                 return tool_error("Failed to save conclusion.")
 
             return tool_error(f"Unknown tool: {tool_name}")
