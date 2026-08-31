@@ -238,6 +238,12 @@ All context files are:
 - **Truncated** — capped at `context_file_max_chars` characters using a 70/20 head/tail split with a truncation marker. The cap scales with the model's context window (20,000-char floor, 500K ceiling); an explicit `context_file_max_chars` in `config.yaml` always wins.
 - **YAML frontmatter stripped** — `.hermes.md` frontmatter is removed (reserved for future config overrides)
 
+Profile-configured `agent.context_files` are assembled separately in declared
+order and appended to the cross-session-stable tier. Their relative paths are
+resolved against the active profile's `HERMES_HOME`, and the aggregate raw
+content is capped by `agent.context_files_max_chars`. They are never reloaded
+mid-session, preserving the cached system-prompt prefix.
+
 ## API-call-time-only layers
 
 These are intentionally *not* persisted as part of the cached system prompt:

@@ -1028,6 +1028,17 @@ skills:
 # Agent Behavior
 # =============================================================================
 agent:
+  # Stable policies/contracts to preload before the first model call. Entries
+  # are processed in order; relative paths resolve from the active profile's
+  # HERMES_HOME. String entries are required by default.
+  # context_files:
+  #   - POLICY.md
+  #   - path: agents/CONTRACT.md
+  #     required: true
+  #   - path: LOCAL_OVERRIDES.md
+  #     required: false
+  # context_files_max_chars: 100000
+
   # Maximum tool-calling iterations per conversation (default: 500)
   # Higher = more room for complex tasks, but costs more tokens
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
