@@ -91,6 +91,22 @@ def _esecret_bool(name: str, default: bool = False) -> bool:
     return is_truthy_value(_get_esecret(name, ""), default=default)
 
 
+def _coerce_valid_port(value: Any, default: int) -> int:
+    """Coerce a port from env/YAML config into a valid TCP port number.
+
+    Accepts the ``EMAIL_IMAP_PORT``/``EMAIL_SMTP_PORT`` env value or the
+    ``platforms.email.imap.port`` YAML value (seeded into extra). Invalid or
+    out-of-range values (0, 65536, non-numeric) fall back to *default* rather
+    than reaching ``imaplib``/``smtplib`` and raising a confusing
+    ``gaierror``/``OverflowError`` deep in the connect path.
+    """
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return port if 1 <= port <= 65535 else default
+
+
 # Automated sender patterns — emails from these are silently ignored
 _NOREPLY_PATTERNS = (
     "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
@@ -553,10 +569,31 @@ class EmailAdapter(BasePlatformAdapter):
         self._address = (_get_secret("EMAIL_ADDRESS", "") or extra.get("address", "")).strip()
         self._password = _get_secret("EMAIL_PASSWORD", "")
         self._imap_host = (_get_secret("EMAIL_IMAP_HOST", "") or extra.get("imap_host", "")).strip()
-        self._imap_port = _esecret_int("EMAIL_IMAP_PORT", 993)
+        self._imap_port = _coerce_valid_port(
+            _get_secret("EMAIL_IMAP_PORT", "").strip() or extra.get("imap_port"), 993,
+        )
         self._smtp_host = (_get_secret("EMAIL_SMTP_HOST", "") or extra.get("smtp_host", "")).strip()
-        self._smtp_port = _esecret_int("EMAIL_SMTP_PORT", 587)
+        self._smtp_port = _coerce_valid_port(
+            _get_secret("EMAIL_SMTP_PORT", "").strip() or extra.get("smtp_port"), 587,
+        )
         self._poll_interval = _esecret_int("EMAIL_POLL_INTERVAL", 15)
+
+        # IMAP encryption mode: "tls" (implicit TLS via IMAP4_SSL, default for
+        # port 993) or "starttls" (STARTTLS via IMAP4 + starttls(), default for
+        # port 143).  Read from env var, then extra dict (seeded by the
+        # email plugin's apply_yaml_config_fn from ``platforms.email.imap``),
+        # then auto-detect by port number.
+        raw_enc = (
+            _get_secret("EMAIL_IMAP_ENCRYPTION", "").strip().lower()
+            or str(extra.get("imap_encryption", "")).strip().lower()
+        )
+        if raw_enc in ("starttls", "start-tls", "start_tls"):
+            self._imap_encryption = "starttls"
+        elif raw_enc in ("tls", "ssl", "implicit"):
+            self._imap_encryption = "tls"
+        else:
+            # Auto-detect: port 143 → STARTTLS, everything else → implicit TLS
+            self._imap_encryption = "starttls" if self._imap_port == 143 else "tls"
 
         # Skip attachments — configured via config.yaml:
         #   platforms:
@@ -626,6 +663,25 @@ class EmailAdapter(BasePlatformAdapter):
         except (ValueError, TypeError):
             # Fallback: just clear old entries if sort fails
             self._seen_uids = set(list(self._seen_uids)[-self._seen_uids_max // 2:])
+
+    def _connect_imap(self) -> imaplib.IMAP4:
+        """Create an IMAP connection using the configured encryption mode.
+
+        When *starttls* is configured (or auto-detected for port 143), connects
+        via plain ``IMAP4`` and upgrades with ``starttls()``.  Otherwise uses
+        ``IMAP4_SSL`` for implicit TLS (port 993 default).
+
+        This mirrors ``_connect_smtp()`` which selects ``SMTP_SSL`` vs
+        ``SMTP`` + ``starttls()`` based on port.
+        """
+        ctx = ssl.create_default_context()
+        if self._imap_encryption == "starttls":
+            imap = imaplib.IMAP4(self._imap_host, self._imap_port, timeout=30)
+            imap.starttls(ssl_context=ctx)
+            return imap
+        return imaplib.IMAP4_SSL(
+            self._imap_host, self._imap_port, timeout=30, ssl_context=ctx,
+        )
 
     def _connect_smtp(self) -> smtplib.SMTP:
         """Create an SMTP connection, selecting the correct protocol for the port.
@@ -711,7 +767,7 @@ class EmailAdapter(BasePlatformAdapter):
             # (#79889).
             imap = None
             try:
-                imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+                imap = self._connect_imap()
                 imap.login(self._address, self._password)
                 _send_imap_id(imap)
                 imap.select("INBOX")
@@ -855,7 +911,7 @@ class EmailAdapter(BasePlatformAdapter):
         results = []
         imap: Optional[imaplib.IMAP4] = None
         try:
-            imap = imaplib.IMAP4_SSL(self._imap_host, self._imap_port, timeout=30)
+            imap = self._connect_imap()
             try:
                 imap.login(self._address, self._password)
                 _send_imap_id(imap)
@@ -1491,6 +1547,36 @@ def _build_adapter(config):
     return EmailAdapter(config)
 
 
+def _apply_yaml_config(yaml_cfg: dict, email_cfg: dict) -> "dict | None":
+    """Translate config.yaml ``platforms.email.imap``/``smtp`` blocks into
+    PlatformConfig.extra entries.
+
+    Implements the apply_yaml_config_fn contract (#24849). The adapter
+    resolves ``imap_host``/``imap_port``/``imap_encryption`` (and the SMTP
+    twins) from env first, then from extra — seeding extra here makes the
+    nested YAML config effective for YAML-only setups (#51263) while env
+    vars keep precedence. SMTP ``encryption`` is deliberately not bridged:
+    ``_connect_smtp()`` selects implicit TLS vs STARTTLS by port, so no
+    adapter consumer exists for it.
+    """
+    extras: dict = {}
+    imap_block = email_cfg.get("imap")
+    if isinstance(imap_block, dict):
+        if "host" in imap_block:
+            extras.setdefault("imap_host", imap_block["host"])
+        if "port" in imap_block:
+            extras.setdefault("imap_port", imap_block["port"])
+        if "encryption" in imap_block:
+            extras.setdefault("imap_encryption", imap_block["encryption"])
+    smtp_block = email_cfg.get("smtp")
+    if isinstance(smtp_block, dict):
+        if "host" in smtp_block:
+            extras.setdefault("smtp_host", smtp_block["host"])
+        if "port" in smtp_block:
+            extras.setdefault("smtp_port", smtp_block["port"])
+    return extras or None
+
+
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     ctx.register_platform(
@@ -1501,6 +1587,7 @@ def register(ctx) -> None:
         is_connected=_is_connected,
         required_env=["EMAIL_ADDRESS", "EMAIL_PASSWORD", "EMAIL_SMTP_HOST"],
         install_hint="Email uses the Python stdlib (smtplib/imaplib) — no extra deps",
+        apply_yaml_config_fn=_apply_yaml_config,
         allowed_users_env="EMAIL_ALLOWED_USERS",
         allow_all_env="EMAIL_ALLOW_ALL_USERS",
         cron_deliver_env_var="EMAIL_HOME_ADDRESS",

@@ -1122,5 +1122,186 @@ class TestSenderAuthentication(unittest.TestCase):
         self.assertFalse(ok, reason)
 
 
+class TestIMAPEncryptionMode(unittest.TestCase):
+    """Test IMAP connection mode selection based on encryption config (#51263)."""
+
+    def _make_adapter(self, **env_overrides):
+        """Create an EmailAdapter with mocked env vars."""
+        from gateway.config import PlatformConfig
+        base_env = {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }
+        base_env.update(env_overrides)
+        with patch.dict(os.environ, base_env):
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(PlatformConfig(enabled=True))
+        return adapter
+
+    def test_default_port_993_uses_tls(self):
+        """Default port 993 should use implicit TLS (IMAP4_SSL)."""
+        adapter = self._make_adapter()
+        self.assertEqual(adapter._imap_encryption, "tls")
+
+    def test_port_143_auto_detects_starttls(self):
+        """Port 143 without explicit encryption should auto-detect STARTTLS."""
+        adapter = self._make_adapter(EMAIL_IMAP_PORT="143")
+        self.assertEqual(adapter._imap_encryption, "starttls")
+
+    def test_explicit_starttls_env_var(self):
+        """EMAIL_IMAP_ENCRYPTION=starttls should force STARTTLS mode."""
+        adapter = self._make_adapter(EMAIL_IMAP_ENCRYPTION="starttls")
+        self.assertEqual(adapter._imap_encryption, "starttls")
+
+    def test_explicit_tls_env_var(self):
+        """EMAIL_IMAP_ENCRYPTION=tls should force implicit TLS mode."""
+        adapter = self._make_adapter(EMAIL_IMAP_PORT="143", EMAIL_IMAP_ENCRYPTION="tls")
+        self.assertEqual(adapter._imap_encryption, "tls")
+
+    def test_starttls_from_extra_dict(self):
+        """imap_encryption in extra dict should be respected."""
+        from gateway.config import PlatformConfig
+        with patch.dict(os.environ, {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_HOST": "imap.test.com",
+            "EMAIL_SMTP_HOST": "smtp.test.com",
+        }):
+            config = PlatformConfig(enabled=True, extra={"imap_encryption": "start-tls"})
+            from plugins.platforms.email.adapter import EmailAdapter
+            adapter = EmailAdapter(config)
+        self.assertEqual(adapter._imap_encryption, "starttls")
+
+    def test_connect_imap_starttls(self):
+        """_connect_imap should use IMAP4 + starttls for STARTTLS mode."""
+        adapter = self._make_adapter(EMAIL_IMAP_PORT="143")
+        with patch("plugins.platforms.email.adapter.imaplib.IMAP4") as mock_imap4, \
+                patch("plugins.platforms.email.adapter.ssl.create_default_context") as mock_ctx:
+            mock_ctx.return_value = "fake_ctx"
+            mock_instance = mock_imap4.return_value
+            result = adapter._connect_imap()
+            mock_imap4.assert_called_once_with("imap.test.com", 143, timeout=30)
+            mock_instance.starttls.assert_called_once_with(ssl_context="fake_ctx")
+            self.assertIs(result, mock_instance)
+
+    def test_connect_imap_implicit_tls(self):
+        """_connect_imap should use IMAP4_SSL for implicit TLS mode."""
+        adapter = self._make_adapter()
+        with patch("plugins.platforms.email.adapter.imaplib.IMAP4_SSL") as mock_imap4ssl, \
+                patch("plugins.platforms.email.adapter.ssl.create_default_context") as mock_ctx:
+            mock_ctx.return_value = "fake_ctx"
+            mock_instance = mock_imap4ssl.return_value
+            result = adapter._connect_imap()
+            mock_imap4ssl.assert_called_once_with(
+                "imap.test.com", 993, timeout=30, ssl_context="fake_ctx",
+            )
+            self.assertIs(result, mock_instance)
+
+
+class TestEmailYamlConfigBridge(unittest.TestCase):
+    """Nested ``platforms.email.imap``/``smtp`` YAML must reach the adapter
+    through the email plugin's apply_yaml_config_fn hook.
+
+    This is the end-to-end path the #51263 review asked to be covered: the
+    adapter used to resolve ports only from ``EMAIL_*`` env vars, so a
+    YAML-only ``imap.port: 143`` setup silently kept implicit TLS on 993."""
+
+    _YAML = """\
+platforms:
+  email:
+    enabled: true
+    imap:
+      host: imap.test.com
+      port: 143
+      encryption: start-tls
+    smtp:
+      host: smtp.test.com
+      port: 465
+"""
+
+    def _load_and_build(self, yaml_text=None, env_overrides=None):
+        """Write config.yaml into a temp HERMES_HOME, run the full
+        load_gateway_config() path, and build the adapter from the resulting
+        PlatformConfig — mirroring how the gateway constructs it."""
+        import tempfile
+        from pathlib import Path
+        from gateway.config import load_gateway_config, Platform
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        # Base env satisfies the adapter's required secrets; port/encryption
+        # vars are blanked so the YAML values are what the adapter resolves.
+        env = {
+            "EMAIL_ADDRESS": "hermes@test.com",
+            "EMAIL_PASSWORD": "secret",
+            "EMAIL_IMAP_PORT": "",
+            "EMAIL_SMTP_PORT": "",
+            "EMAIL_IMAP_ENCRYPTION": "",
+        }
+        env.update(env_overrides or {})
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td) / ".hermes"
+            home.mkdir()
+            (home / "config.yaml").write_text(
+                yaml_text if yaml_text is not None else self._YAML,
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"HERMES_HOME": str(home), **env}):
+                config = load_gateway_config()
+                adapter = EmailAdapter(config.platforms[Platform.EMAIL])
+        return config.platforms[Platform.EMAIL], adapter
+
+    def test_nested_yaml_seeds_extra(self):
+        from gateway.config import Platform
+        pconfig, _ = self._load_and_build()
+        extra = pconfig.extra or {}
+        self.assertEqual(extra.get("imap_port"), 143)
+        self.assertEqual(extra.get("imap_encryption"), "start-tls")
+        self.assertEqual(extra.get("imap_host"), "imap.test.com")
+        self.assertEqual(extra.get("smtp_port"), 465)
+
+    def test_nested_yaml_reaches_adapter_as_starttls(self):
+        """imap.port 143 + encryption start-tls must produce an adapter that
+        connects via plain IMAP4 upgraded with starttls()."""
+        _, adapter = self._load_and_build()
+        self.assertEqual(adapter._imap_port, 143)
+        self.assertEqual(adapter._imap_encryption, "starttls")
+        self.assertEqual(adapter._smtp_port, 465)
+        with patch("plugins.platforms.email.adapter.imaplib.IMAP4") as mock_imap4, \
+                patch("plugins.platforms.email.adapter.imaplib.IMAP4_SSL") as mock_imap4ssl, \
+                patch("plugins.platforms.email.adapter.ssl.create_default_context") as mock_ctx:
+            mock_ctx.return_value = "fake_ctx"
+            adapter._connect_imap()
+            mock_imap4.assert_called_once_with("imap.test.com", 143, timeout=30)
+            mock_imap4.return_value.starttls.assert_called_once_with(
+                ssl_context="fake_ctx",
+            )
+            mock_imap4ssl.assert_not_called()
+
+    def test_env_port_overrides_yaml(self):
+        """EMAIL_IMAP_PORT keeps env > YAML precedence over the bridge. The
+        explicit YAML ``encryption: start-tls`` still wins over port-based
+        auto-detection — only the port itself is overridden."""
+        _, adapter = self._load_and_build(
+            env_overrides={"EMAIL_IMAP_PORT": "993"},
+        )
+        self.assertEqual(adapter._imap_port, 993)
+        self.assertEqual(adapter._imap_encryption, "starttls")
+
+    def test_invalid_yaml_port_falls_back_to_default(self):
+        _, adapter = self._load_and_build(
+            yaml_text=(
+                "platforms:\n"
+                "  email:\n"
+                "    enabled: true\n"
+                "    imap:\n"
+                "      port: 99999\n"
+            ),
+        )
+        self.assertEqual(adapter._imap_port, 993)
+        self.assertEqual(adapter._imap_encryption, "tls")
+
+
 if __name__ == "__main__":
     unittest.main()
