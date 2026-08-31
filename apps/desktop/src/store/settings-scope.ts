@@ -17,21 +17,12 @@ export const $settingsScopeProfile = computed([$settingsScopeOverride, $activeGa
 )
 
 // ── Request-scope form (THE value to hand to API helpers) ──────────────────
-// The store contract and the API contract disagree about `null`:
-//   - here, `null` means "follow the app's active profile" (no override);
-//   - in api/client.ts `profileScoped()`/`capabilityScoped()`, `null` means
-//     "deliberately suppress the active profile and target primary/default" —
-//     only `undefined` falls back to the active profile.
-// Passing the raw override into an API helper therefore silently retargets
-// every read/write to the primary profile whenever no override is set — the
-// "model change reverts when I re-enter the tab" class of bug (#90549: the
-// page WROTE the right profile but READ primary back). Always send this
-// computed (or `override ?? undefined`) on requests; keep the raw override
-// only for UI concerns (selector highlight, cache keys, remount keys).
-export const $settingsRequestProfile = computed(
-  $settingsScopeOverride,
-  (override): string | undefined => override ?? undefined
-)
+// Always send the concrete profile shown by the selector. Falling back to the
+// ambient API profile makes Settings writes depend on a second store staying in
+// lockstep; registered shared remotes can otherwise drop `?profile=` and write
+// the launch profile. This also avoids the raw override's incompatible `null`
+// meaning in profileScoped()/capabilityScoped() (target primary/default).
+export const $settingsRequestProfile = $settingsScopeProfile
 
 // Select the profile the settings pages should edit. Picking the app's active
 // profile stores `null` (no override) so the scope keeps following the app on

@@ -9,6 +9,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
+import { pathForRegistryBackendRequest } from './connection-config'
 import type { ConnectionRegistry } from './connection-registry'
 import {
   agentHandle,
@@ -33,6 +34,7 @@ import {
   removeConnection,
   resolvedConnectionId,
   resolveRegistryLocalRoute,
+  reuseMatchingPrimarySharedRemoteBackend,
   reuseMatchingPrimarySshBackend,
   setConnectionLaunchMode,
   setLastUsedConnection,
@@ -260,6 +262,70 @@ test('registry primary reuses a matching primary backend descriptor', () => {
 
   assert.equal(registrySourceOwnsPrimaryBackend(registry, 'hermes-vps', descriptor), true)
   assert.equal(registrySourceOwnsPrimaryBackend(registry, LOCAL_CONNECTION_ID, descriptor), false)
+})
+
+test('reused URL primary preserves shared profile routing while SSH stays isolated', async () => {
+  const registry = normalizeRegistry({
+    version: REGISTRY_VERSION,
+    primary: 'shared-gateway',
+    launchMode: 'primary',
+    lastUsed: 'shared-gateway',
+    connections: [
+      { id: LOCAL_CONNECTION_ID, kind: 'local', label: 'This device' },
+      {
+        id: 'shared-gateway',
+        kind: 'remote',
+        label: 'Shared gateway',
+        url: 'https://gateway.example',
+        authMode: 'token'
+      }
+    ]
+  })
+
+  const source = registry.connections.find(connection => connection.id === registry.primary)!
+
+  const reused = await reuseMatchingPrimarySharedRemoteBackend({
+    connectionId: source.id,
+    ensurePrimary: async () => ({
+      connectionId: source.id,
+      mode: 'remote',
+      remoteKind: 'url'
+    }),
+    profile: 'secondary',
+    registry,
+    source
+  })
+
+  assert.ok(reused)
+  assert.equal(reused.sharedRemote, true)
+  assert.equal(
+    pathForRegistryBackendRequest('/api/model/set', reused.profile, reused),
+    '/api/model/set?profile=secondary'
+  )
+
+  let sshPrimaryResolved = false
+  assert.equal(
+    await reuseMatchingPrimarySharedRemoteBackend({
+      connectionId: 'ssh-primary',
+      ensurePrimary: async () => {
+        sshPrimaryResolved = true
+
+        return { mode: 'remote', remoteKind: 'ssh' }
+      },
+      profile: 'secondary',
+      registry: {
+        ...registry,
+        primary: 'ssh-primary',
+        connections: [
+          ...registry.connections,
+          { id: 'ssh-primary', kind: 'ssh', label: 'SSH primary', host: 'example' }
+        ]
+      },
+      source: { id: 'ssh-primary', kind: 'ssh', label: 'SSH primary', host: 'example' }
+    }),
+    null
+  )
+  assert.equal(sshPrimaryResolved, false)
 })
 
 test('resolvedConnectionId identifies local and migrated remote descriptors', () => {

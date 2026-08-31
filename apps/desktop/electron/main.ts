@@ -136,11 +136,11 @@ import {
   parseBackendScopeKey,
   reconcileAppliedGlobalConnection,
   reconcileRegistryDrift,
-  registrySourceOwnsPrimaryBackend,
   rememberSshEnumeration,
   removeConnection,
   resolvedConnectionId,
   resolveRegistryLocalRoute,
+  reuseMatchingPrimarySharedRemoteBackend,
   reuseMatchingPrimarySshBackend,
   setConnectionLaunchMode,
   setLastUsedConnection,
@@ -11144,16 +11144,16 @@ async function ensureRegistryBackend(connectionId, profile, managedUpdateCorrela
   // resolves its live descriptor back to this exact source id; otherwise one
   // Desktop window starts two isolated servers whose transient runtime ids
   // are not interchangeable.
-  if (id === registry.primary && source.kind !== 'local' && source.kind !== 'ssh') {
-    const primaryDescriptor = await ensureBackend(profile)
+  const sharedPrimary = await reuseMatchingPrimarySharedRemoteBackend({
+    connectionId: id,
+    ensurePrimary: () => ensureBackend(profile),
+    profile,
+    registry,
+    source
+  })
 
-    if (registrySourceOwnsPrimaryBackend(registry, id, primaryDescriptor)) {
-      return {
-        ...primaryDescriptor,
-        profile: profileKey,
-        connectionId: id
-      }
-    }
+  if (sharedPrimary) {
+    return sharedPrimary
   }
 
   if (source.kind === 'local') {

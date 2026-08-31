@@ -17,6 +17,7 @@ const getGlobalModelOptions = vi.fn()
 const getAuxiliaryModels = vi.fn()
 const getMoaModels = vi.fn()
 const setModelAssignment = vi.fn()
+const setModelAssignmentProfile = vi.fn()
 const getRecommendedDefaultModel = vi.fn()
 const saveMoaModels = vi.fn()
 const setEnvVar = vi.fn()
@@ -34,7 +35,11 @@ vi.mock('@/hermes', () => ({
   getApiRequestProfile: () => 'default',
   getMoaModels: (profile?: null | string) => getMoaModels(profile),
   profileScopeKey: (scope?: null | string) => (scope ?? '').trim() || 'default',
-  setModelAssignment: (body: unknown) => setModelAssignment(body),
+  setModelAssignment: (body: unknown, profile?: null | string) => {
+    setModelAssignmentProfile(profile)
+
+    return setModelAssignment(body)
+  },
   getRecommendedDefaultModel: (slug: string) => getRecommendedDefaultModel(slug),
   saveMoaModels: (body: unknown) => saveMoaModels(body),
   setEnvVar: (key: string, value: string) => setEnvVar(key, value),
@@ -122,6 +127,21 @@ describe('ModelSettings profile scope', () => {
     expect(getGlobalModelOptions).toHaveBeenCalledWith(undefined, 'research')
     expect(getAuxiliaryModels).toHaveBeenCalledWith('research')
     expect(getMoaModels).toHaveBeenCalledWith('research')
+  })
+
+  it('writes the main model through the explicit scope override', async () => {
+    await renderModelSettings('research')
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Apply' }))
+
+    await waitFor(() =>
+      expect(setModelAssignment).toHaveBeenCalledWith({
+        model: 'hermes-4',
+        provider: 'nous',
+        scope: 'main'
+      })
+    )
+    expect(setModelAssignmentProfile).toHaveBeenCalledWith('research')
   })
 })
 
