@@ -822,6 +822,12 @@ def test_tools_list_exposes_exactly_the_fifteen_approved_tools(db: SessionDB) ->
         response = _rpc(client, "tools/list")
 
     names = {tool["name"] for tool in response["result"]["tools"]}
+    assert not any(
+        "acknowledge" in name
+        or "attempt_zero" in name
+        or "unrecoverable" in name
+        for name in names
+    )
     assert (
         names
         == EXPECTED_TOOLS

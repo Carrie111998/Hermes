@@ -238,7 +238,7 @@ def _default_db_path() -> Path:
 # name-gated in session_bridge_migrations, not version-gated). Live DBs sit
 # at 28 without the upstream migrations, so those are re-gated on < 29
 # below (both are idempotent/self-gating).
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -1766,12 +1766,139 @@ BEGIN
     SELECT RAISE(ABORT, 'sidebar precreate resolutions overlap unbound evidence');
 END;
 
+CREATE TABLE IF NOT EXISTS session_sidebar_v2_attempt_zero_resolutions (
+    job_id TEXT PRIMARY KEY
+        REFERENCES session_sidebar_jobs(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    source_session_id TEXT NOT NULL UNIQUE,
+    bridge_id TEXT NOT NULL UNIQUE,
+    failure_state TEXT NOT NULL CHECK (failure_state = 'sidebar_failed'),
+    failure_code TEXT NOT NULL CHECK (failure_code = 'native_create_ambiguous'),
+    failure_attempts INTEGER NOT NULL CHECK (failure_attempts = 0),
+    failure_next_attempt_at REAL NOT NULL,
+    failure_updated_at REAL NOT NULL,
+    reservation_reserved_at REAL NOT NULL,
+    reservation_reconciliation_proof_digest TEXT NOT NULL UNIQUE
+        REFERENCES session_sidebar_reconciliation_proofs(proof_digest)
+        ON UPDATE RESTRICT ON DELETE RESTRICT,
+    reservation_reconciliation_generation TEXT NOT NULL,
+    proof_completed_at REAL NOT NULL,
+    proof_expires_at REAL NOT NULL,
+    proof_inventory_digest TEXT NOT NULL CHECK (
+        length(proof_inventory_digest) = 64
+        AND proof_inventory_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    resolution_code TEXT NOT NULL CHECK (
+        resolution_code = 'v2_attempt_zero_create_unrecoverable'
+    ),
+    evidence_kind TEXT NOT NULL CHECK (
+        evidence_kind =
+            'codex_inventory_marker_and_recovery_zero_with_bound_absence_proof'
+    ),
+    evidence_version INTEGER NOT NULL CHECK (evidence_version = 1),
+    evidence_digest TEXT NOT NULL CHECK (
+        length(evidence_digest) = 64
+        AND evidence_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    resolved_at REAL NOT NULL,
+    CHECK (proof_expires_at > proof_completed_at),
+    CHECK (resolved_at >= failure_updated_at),
+    CHECK (resolved_at >= proof_completed_at),
+    CHECK (resolved_at <= proof_expires_at)
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_v2_attempt_zero_resolutions_no_replacement
+BEFORE INSERT ON session_sidebar_v2_attempt_zero_resolutions
+WHEN EXISTS (
+    SELECT 1 FROM session_sidebar_v2_attempt_zero_resolutions AS existing
+     WHERE existing.job_id = NEW.job_id
+        OR existing.idempotency_key = NEW.idempotency_key
+        OR existing.source_session_id = NEW.source_session_id
+        OR existing.bridge_id = NEW.bridge_id
+)
+OR EXISTS (
+    SELECT 1 FROM session_sidebar_terminal_resolutions AS existing
+     WHERE existing.job_id = NEW.job_id
+        OR existing.idempotency_key = NEW.idempotency_key
+        OR existing.source_session_id = NEW.source_session_id
+        OR existing.bridge_id = NEW.bridge_id
+)
+OR EXISTS (
+    SELECT 1 FROM session_sidebar_precreate_resolutions AS existing
+     WHERE existing.job_id = NEW.job_id
+        OR existing.idempotency_key = NEW.idempotency_key
+        OR existing.source_session_id = NEW.source_session_id
+        OR existing.bridge_id = NEW.bridge_id
+)
+OR EXISTS (
+    SELECT 1 FROM session_sidebar_unbound_resolutions AS existing
+     WHERE existing.job_id = NEW.job_id
+        OR existing.idempotency_key = NEW.idempotency_key
+        OR existing.source_session_id = NEW.source_session_id
+        OR existing.bridge_id = NEW.bridge_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar v2 attempt-zero resolutions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_v2_attempt_zero_resolutions_no_update
+BEFORE UPDATE ON session_sidebar_v2_attempt_zero_resolutions
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar v2 attempt-zero resolutions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_v2_attempt_zero_resolutions_no_delete
+BEFORE DELETE ON session_sidebar_v2_attempt_zero_resolutions
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar v2 attempt-zero resolutions are immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_terminal_resolutions_no_v2_attempt_zero_overlap
+BEFORE INSERT ON session_sidebar_terminal_resolutions
+WHEN EXISTS (
+    SELECT 1 FROM session_sidebar_v2_attempt_zero_resolutions AS existing
+     WHERE existing.job_id = NEW.job_id
+        OR existing.idempotency_key = NEW.idempotency_key
+        OR existing.source_session_id = NEW.source_session_id
+        OR existing.bridge_id = NEW.bridge_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar terminal resolutions overlap v2 attempt-zero evidence');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_precreate_resolutions_no_v2_attempt_zero_overlap
+BEFORE INSERT ON session_sidebar_precreate_resolutions
+WHEN EXISTS (
+    SELECT 1 FROM session_sidebar_v2_attempt_zero_resolutions AS existing
+     WHERE existing.job_id = NEW.job_id
+        OR existing.idempotency_key = NEW.idempotency_key
+        OR existing.source_session_id = NEW.source_session_id
+        OR existing.bridge_id = NEW.bridge_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar precreate resolutions overlap v2 attempt-zero evidence');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_session_sidebar_unbound_resolutions_no_v2_attempt_zero_overlap
+BEFORE INSERT ON session_sidebar_unbound_resolutions
+WHEN EXISTS (
+    SELECT 1 FROM session_sidebar_v2_attempt_zero_resolutions AS existing
+     WHERE existing.job_id = NEW.job_id
+        OR existing.idempotency_key = NEW.idempotency_key
+        OR existing.source_session_id = NEW.source_session_id
+        OR existing.bridge_id = NEW.bridge_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'sidebar unbound resolutions overlap v2 attempt-zero evidence');
+END;
+
 CREATE TABLE IF NOT EXISTS session_sidebar_orphan_resolution_quarantine (
     resolution_table TEXT NOT NULL CHECK (
         resolution_table IN (
             'session_sidebar_terminal_resolutions',
             'session_sidebar_precreate_resolutions',
-            'session_sidebar_unbound_resolutions'
+            'session_sidebar_unbound_resolutions',
+            'session_sidebar_v2_attempt_zero_resolutions'
         )
     ),
     original_resolution_rowid INTEGER NOT NULL,
@@ -2199,6 +2326,7 @@ _SIDEBAR_RESOLUTION_TABLES = (
     "session_sidebar_terminal_resolutions",
     "session_sidebar_precreate_resolutions",
     "session_sidebar_unbound_resolutions",
+    "session_sidebar_v2_attempt_zero_resolutions",
 )
 
 _SIDEBAR_ORPHAN_RESOLUTION_QUARANTINE_COLUMNS = (
@@ -3192,6 +3320,123 @@ class SessionDB:
         """Ensure live core and bridge tables have every declared column."""
         self._reconcile_columns_from_sql(cursor, SCHEMA_SQL)
         self._reconcile_columns_from_sql(cursor, BRIDGE_SCHEMA_SQL)
+
+    @staticmethod
+    def _v33_sidebar_resolution_schema() -> tuple[str, dict[str, str]]:
+        """Return the canonical v33 ledger table and trigger definitions."""
+        table_name = "session_sidebar_v2_attempt_zero_resolutions"
+        trigger_names = (
+            "trg_session_sidebar_terminal_resolutions_no_v2_attempt_zero_overlap",
+            "trg_session_sidebar_precreate_resolutions_no_v2_attempt_zero_overlap",
+            "trg_session_sidebar_unbound_resolutions_no_v2_attempt_zero_overlap",
+            "trg_session_sidebar_v2_attempt_zero_resolutions_no_replacement",
+            "trg_session_sidebar_v2_attempt_zero_resolutions_no_update",
+            "trg_session_sidebar_v2_attempt_zero_resolutions_no_delete",
+        )
+        reference = sqlite3.connect(":memory:")
+        try:
+            reference.executescript(BRIDGE_SCHEMA_SQL)
+            table_row = reference.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table_name,),
+            ).fetchone()
+            expected_triggers = {
+                name: sql
+                for name, sql in reference.execute(
+                    "SELECT name, sql FROM sqlite_master "
+                    "WHERE type = 'trigger' AND name IN ("
+                    + ", ".join("?" for _ in trigger_names)
+                    + ")",
+                    trigger_names,
+                ).fetchall()
+            }
+        finally:
+            reference.close()
+        if (
+            table_row is None
+            or not isinstance(table_row[0], str)
+            or set(expected_triggers) != set(trigger_names)
+        ):
+            raise RuntimeError("v33 sidebar terminal resolution schema incomplete")
+        return table_row[0], expected_triggers
+
+    @classmethod
+    def _repair_v33_sidebar_resolution_table(cls, cursor: sqlite3.Cursor) -> None:
+        """Restore an empty malformed v33 ledger without discarding evidence."""
+        table_name = "session_sidebar_v2_attempt_zero_resolutions"
+        expected_table_sql, _ = cls._v33_sidebar_resolution_schema()
+        current = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        current_sql = None if current is None else current[0]
+        if isinstance(current_sql, str) and " ".join(current_sql.split()) == " ".join(
+            expected_table_sql.split()
+        ):
+            return
+        if current is not None:
+            row_count = cursor.execute(
+                f'SELECT COUNT(*) FROM "{table_name}"'
+            ).fetchone()[0]
+            if int(row_count):
+                raise RuntimeError(
+                    "malformed v33 sidebar terminal resolution ledger contains evidence"
+                )
+            trigger_rows = cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+                (table_name,),
+            ).fetchall()
+            for trigger_row in trigger_rows:
+                quoted_name = str(trigger_row[0]).replace('"', '""')
+                cursor.execute(f'DROP TRIGGER "{quoted_name}"')
+            cursor.execute(f'DROP TABLE "{table_name}"')
+        cursor.execute(expected_table_sql)
+
+    @classmethod
+    def _repair_v33_sidebar_resolution_triggers(cls, cursor: sqlite3.Cursor) -> None:
+        """Restore the exact v33 trigger definitions before granting v33."""
+        _, expected = cls._v33_sidebar_resolution_schema()
+        for name, expected_sql in expected.items():
+            current = cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                (name,),
+            ).fetchone()
+            current_sql = None if current is None else current[0]
+            if isinstance(current_sql, str) and " ".join(current_sql.split()) == " ".join(
+                expected_sql.split()
+            ):
+                continue
+            quoted_name = name.replace('"', '""')
+            cursor.execute(f'DROP TRIGGER IF EXISTS "{quoted_name}"')
+            cursor.execute(expected_sql)
+
+    @classmethod
+    def _validate_v33_sidebar_resolution_schema(cls, cursor: sqlite3.Cursor) -> None:
+        """Require byte-equivalent canonical v33 table and trigger authority."""
+        table_name = "session_sidebar_v2_attempt_zero_resolutions"
+        expected_table_sql, expected_triggers = cls._v33_sidebar_resolution_schema()
+        table_row = cursor.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        if (
+            table_row is None
+            or not isinstance(table_row[0], str)
+            or " ".join(table_row[0].split()) != " ".join(expected_table_sql.split())
+        ):
+            raise RuntimeError("v33 sidebar terminal resolution schema incomplete")
+        for name, expected_sql in expected_triggers.items():
+            trigger_row = cursor.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                (name,),
+            ).fetchone()
+            if (
+                trigger_row is None
+                or not isinstance(trigger_row[0], str)
+                or " ".join(trigger_row[0].split())
+                != " ".join(expected_sql.split())
+            ):
+                raise RuntimeError("v33 sidebar terminal resolution schema incomplete")
 
     @staticmethod
     def _canonicalize_legacy_claude_cost(raw: object, rowid: int) -> str:
@@ -4499,10 +4744,37 @@ class SessionDB:
                 else:
                     fts_migrations_complete = False
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
-                cursor.execute(
-                    "UPDATE schema_version SET version = ?",
-                    (SCHEMA_VERSION,),
-                )
+                # Schema DDL is normally declarative and idempotent.  This v33
+                # ledger is exceptional: once a prior runtime has created the
+                # pre-v33 tables, CREATE ... IF NOT EXISTS cannot add the new
+                # cross-ledger exclusion triggers.  Re-run the complete
+                # idempotent block before advancing the schema marker so an
+                # upgraded DB cannot present a partial terminal-resolution
+                # authority as valid.
+                if current_version < 33:
+                    # CREATE ... IF NOT EXISTS cannot repair malformed same-named
+                    # objects. Repair and validate the complete v33 authority in
+                    # one transaction with its marker so a failed open cannot
+                    # persist a partial ledger migration.
+                    try:
+                        cursor.execute("BEGIN IMMEDIATE")
+                        self._repair_v33_sidebar_resolution_table(cursor)
+                        self._repair_v33_sidebar_resolution_triggers(cursor)
+                        self._validate_v33_sidebar_resolution_schema(cursor)
+                        cursor.execute(
+                            "UPDATE schema_version SET version = ?",
+                            (SCHEMA_VERSION,),
+                        )
+                        self._conn.commit()
+                    except Exception:
+                        if self._conn.in_transaction:
+                            self._conn.rollback()
+                        raise
+                else:
+                    cursor.execute(
+                        "UPDATE schema_version SET version = ?",
+                        (SCHEMA_VERSION,),
+                    )
 
         # Unique title index — always ensure it exists. Older databases may
         # contain duplicate aliases from before the constraint was enforced;

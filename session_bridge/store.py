@@ -278,6 +278,11 @@ SIDEBAR_UNBOUND_EVIDENCE_KIND = (
     "codex_inventory_marker_and_recovery_zero_no_rollout"
 )
 SIDEBAR_UNBOUND_EVIDENCE_VERSION = 1
+SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE = "v2_attempt_zero_create_unrecoverable"
+SIDEBAR_V2_ATTEMPT_ZERO_EVIDENCE_KIND = (
+    "codex_inventory_marker_and_recovery_zero_with_bound_absence_proof"
+)
+SIDEBAR_V2_ATTEMPT_ZERO_EVIDENCE_VERSION = 1
 
 
 class SidebarNativeTaskNotIndexed(ValueError):
@@ -426,6 +431,49 @@ _SIDEBAR_UNBOUND_LEDGER_SQL_REQUIREMENTS = (
     "AND evidence_digest NOT GLOB '*[^0-9a-f]*' )",
     "resolved_at REAL NOT NULL",
     "CHECK (resolved_at >= failure_updated_at)",
+)
+_SIDEBAR_V2_ATTEMPT_ZERO_LEDGER_COLUMNS = (
+    "job_id", "idempotency_key", "source_session_id", "bridge_id",
+    "failure_state", "failure_code", "failure_attempts",
+    "failure_next_attempt_at", "failure_updated_at", "reservation_reserved_at",
+    "reservation_reconciliation_proof_digest",
+    "reservation_reconciliation_generation", "proof_completed_at",
+    "proof_expires_at", "proof_inventory_digest", "resolution_code",
+    "evidence_kind", "evidence_version", "evidence_digest", "resolved_at",
+)
+_SIDEBAR_V2_ATTEMPT_ZERO_LEDGER_SQL_REQUIREMENTS = (
+    "job_id TEXT PRIMARY KEY REFERENCES session_sidebar_jobs(id) "
+    "ON UPDATE RESTRICT ON DELETE RESTRICT",
+    "idempotency_key TEXT NOT NULL UNIQUE",
+    "source_session_id TEXT NOT NULL UNIQUE",
+    "bridge_id TEXT NOT NULL UNIQUE",
+    "failure_state TEXT NOT NULL CHECK (failure_state = 'sidebar_failed')",
+    "failure_code TEXT NOT NULL CHECK (failure_code = 'native_create_ambiguous')",
+    "failure_attempts INTEGER NOT NULL CHECK (failure_attempts = 0)",
+    "failure_next_attempt_at REAL NOT NULL",
+    "failure_updated_at REAL NOT NULL",
+    "reservation_reserved_at REAL NOT NULL",
+    "reservation_reconciliation_proof_digest TEXT NOT NULL UNIQUE REFERENCES "
+    "session_sidebar_reconciliation_proofs(proof_digest) ON UPDATE RESTRICT "
+    "ON DELETE RESTRICT",
+    "reservation_reconciliation_generation TEXT NOT NULL",
+    "proof_completed_at REAL NOT NULL",
+    "proof_expires_at REAL NOT NULL",
+    "proof_inventory_digest TEXT NOT NULL CHECK ( "
+    "length(proof_inventory_digest) = 64 AND proof_inventory_digest NOT GLOB "
+    "'*[^0-9a-f]*' )",
+    "resolution_code TEXT NOT NULL CHECK ( resolution_code = "
+    "'v2_attempt_zero_create_unrecoverable' )",
+    "evidence_kind TEXT NOT NULL CHECK ( evidence_kind = "
+    "'codex_inventory_marker_and_recovery_zero_with_bound_absence_proof' )",
+    "evidence_version INTEGER NOT NULL CHECK (evidence_version = 1)",
+    "evidence_digest TEXT NOT NULL CHECK ( length(evidence_digest) = 64 "
+    "AND evidence_digest NOT GLOB '*[^0-9a-f]*' )",
+    "resolved_at REAL NOT NULL",
+    "CHECK (proof_expires_at > proof_completed_at)",
+    "CHECK (resolved_at >= failure_updated_at)",
+    "CHECK (resolved_at >= proof_completed_at)",
+    "CHECK (resolved_at <= proof_expires_at)",
 )
 PUBLIC_SIDEBAR_STATE = {
     SidebarJobState.PENDING.value: "pending",
@@ -666,6 +714,75 @@ def sidebar_unbound_terminal_evidence_digest(
         allow_nan=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def sidebar_v2_attempt_zero_terminal_evidence_digest(
+    *,
+    job: Mapping[str, Any],
+    reservation: Mapping[str, Any],
+    proof: Mapping[str, Any],
+    candidate: SidebarCandidate,
+) -> str:
+    """Hash the exact v2 reservation, bound proof, failure, and zero probes."""
+
+    document = {
+        "candidate": {
+            "source_session_id": candidate.source_session_id,
+            "provider": candidate.provider.value,
+            "bridge_id": candidate.bridge_id,
+            "title": candidate.title,
+            "cwd": candidate.cwd,
+            "git_root": candidate.git_root,
+            "git_branch": candidate.git_branch,
+            "git_head": candidate.git_head,
+            "worktree_id": candidate.worktree_id,
+            "eligible_at": candidate.eligible_at,
+        },
+        "evidence_kind": SIDEBAR_V2_ATTEMPT_ZERO_EVIDENCE_KIND,
+        "evidence_version": SIDEBAR_V2_ATTEMPT_ZERO_EVIDENCE_VERSION,
+        "job": {
+            key: job.get(key)
+            for key in (
+                "id", "idempotency_key", "source_session_id", "bridge_id",
+                "state", "attempts", "next_attempt_at", "lease_digest",
+                "lease_expires_at", "completion_digest", "codex_thread_id",
+                "error_code", "eligible_at", "created_at", "updated_at",
+                "visible_at", "reconciliation_proof_digest",
+            )
+        },
+        "provider_probe": [
+            {"method": "signed_marker_inventory", "result": None},
+            {"method": "recovery_key_inventory", "result": None},
+        ],
+        "reconciliation_proof": {
+            key: proof.get(key)
+            for key in (
+                "proof_digest", "job_id", "source_session_id", "bridge_id",
+                "marker_digest", "placement_generation", "delivery_generation",
+                "reconciliation_generation", "completed_at", "expires_at",
+                "inventory_digest", "state", "match_count",
+                "recovered_thread_id", "fixed_reason", "created_at",
+            )
+        },
+        "reservation": {
+            key: reservation.get(key)
+            for key in (
+                "version", "job_id", "source_session_id", "bridge_id",
+                "recovery_key", "reserved_at", "reconciliation_proof_digest",
+                "reconciliation_generation",
+            )
+        },
+        "resolution_code": SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            document,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _claude_error_detail(value: object) -> str:
@@ -5912,6 +6029,8 @@ class SessionBridgeStore:
         precreate_effective = 0
         unbound_total = 0
         unbound_effective = 0
+        v2_attempt_zero_total = 0
+        v2_attempt_zero_effective = 0
         try:
             if not SessionBridgeStore._sidebar_terminal_resolution_ledger_is_valid(
                 conn
@@ -5928,6 +6047,7 @@ class SessionBridgeStore:
                         SIDEBAR_TERMINAL_RESOLUTION_CODE: 0,
                         SIDEBAR_PRECREATE_RESOLUTION_CODE: 0,
                         SIDEBAR_UNBOUND_RESOLUTION_CODE: 0,
+                        SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE: 0,
                     },
                 }
             total = int(
@@ -6214,9 +6334,142 @@ class SessionBridgeStore:
                         unbound_effective += 1
                 except (TypeError, ValueError):
                     continue
-            total = bound_total + precreate_total + unbound_total
+            v2_attempt_zero_total = int(
+                conn.execute(
+                    "SELECT COUNT(*) AS resolution_count "
+                    "FROM session_sidebar_v2_attempt_zero_resolutions"
+                ).fetchone()["resolution_count"]
+            )
+            v2_candidates = conn.execute(
+                """SELECT resolution.job_id
+                     FROM session_sidebar_v2_attempt_zero_resolutions AS resolution
+                     JOIN session_sidebar_jobs AS job
+                       ON job.id = resolution.job_id
+                      AND resolution.idempotency_key = job.idempotency_key
+                      AND resolution.source_session_id = job.source_session_id
+                      AND resolution.bridge_id = job.bridge_id
+                      AND resolution.failure_state = job.state
+                      AND resolution.failure_code = job.error_code
+                      AND resolution.failure_attempts = job.attempts
+                      AND resolution.failure_next_attempt_at = job.next_attempt_at
+                      AND resolution.failure_updated_at = job.updated_at
+                     JOIN session_sidebar_reconciliation_proofs AS proof
+                       ON proof.proof_digest =
+                          resolution.reservation_reconciliation_proof_digest
+                      AND proof.job_id = resolution.job_id
+                      AND proof.source_session_id = resolution.source_session_id
+                      AND proof.bridge_id = resolution.bridge_id
+                      AND proof.reconciliation_generation =
+                          resolution.reservation_reconciliation_generation
+                      AND proof.completed_at = resolution.proof_completed_at
+                      AND proof.expires_at = resolution.proof_expires_at
+                      AND proof.inventory_digest = resolution.proof_inventory_digest
+                    WHERE resolution.resolution_code = ?
+                      AND resolution.evidence_kind = ?
+                      AND resolution.evidence_version = ?
+                      AND job.state = ? AND job.error_code = ? AND job.attempts = 0
+                      AND job.codex_thread_id IS NULL
+                      AND job.lease_digest IS NULL AND job.lease_expires_at IS NULL
+                      AND job.completion_digest IS NULL AND job.visible_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM external_sessions AS external
+                           WHERE external.provider = ?
+                             AND external.origin_bridge_id = job.bridge_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM session_links AS link
+                           WHERE link.bridge_id = job.bridge_id
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM session_sidebar_exclusions AS exclusion
+                           WHERE exclusion.source_session_id = job.source_session_id
+                      )""",
+                (
+                    SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE,
+                    SIDEBAR_V2_ATTEMPT_ZERO_EVIDENCE_KIND,
+                    SIDEBAR_V2_ATTEMPT_ZERO_EVIDENCE_VERSION,
+                    SidebarJobState.FAILED.value,
+                    "native_create_ambiguous",
+                    Provider.CODEX.value,
+                ),
+            ).fetchall()
+            for row in v2_candidates:
+                try:
+                    job_row = conn.execute(
+                        "SELECT * FROM session_sidebar_jobs WHERE id = ?", (row["job_id"],)
+                    ).fetchone()
+                    resolution_row = conn.execute(
+                        "SELECT * FROM session_sidebar_v2_attempt_zero_resolutions "
+                        "WHERE job_id = ?", (row["job_id"],)
+                    ).fetchone()
+                    if job_row is None or resolution_row is None:
+                        continue
+                    job = dict(job_row)
+                    resolution = dict(resolution_row)
+                    reservation_row = conn.execute(
+                        "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                        (_sidebar_create_reservation_state_key(job["source_session_id"]),),
+                    ).fetchone()
+                    proof_row = conn.execute(
+                        "SELECT * FROM session_sidebar_reconciliation_proofs "
+                        "WHERE proof_digest = ?",
+                        (resolution["reservation_reconciliation_proof_digest"],),
+                    ).fetchone()
+                    if reservation_row is None or proof_row is None:
+                        continue
+                    reservation = _decode_sidebar_create_reservation(
+                        reservation_row["value_json"],
+                        expected_source_session_id=job["source_session_id"],
+                    )
+                    proof = dict(proof_row)
+                    candidate = _validated_sidebar_cutover_candidate(conn, job)
+                    canonical = sidebar_v2_attempt_zero_terminal_evidence_digest(
+                        job=job, reservation=reservation, proof=proof,
+                        candidate=candidate,
+                    )
+                    if (
+                        reservation.get("version") == 2
+                        and set(reservation) == _SIDEBAR_CREATE_RESERVATION_FIELDS
+                        and reservation.get("job_id") == resolution["job_id"]
+                        and reservation.get("source_session_id")
+                        == resolution["source_session_id"]
+                        and reservation.get("bridge_id") == resolution["bridge_id"]
+                        and reservation.get("reserved_at")
+                        == resolution["reservation_reserved_at"]
+                        and reservation.get("reconciliation_proof_digest")
+                        == resolution["reservation_reconciliation_proof_digest"]
+                        and reservation.get("reconciliation_generation")
+                        == resolution["reservation_reconciliation_generation"]
+                        and proof.get("job_id") == resolution["job_id"]
+                        and proof.get("source_session_id")
+                        == resolution["source_session_id"]
+                        and proof.get("bridge_id") == resolution["bridge_id"]
+                        and proof.get("reconciliation_generation")
+                        == resolution["reservation_reconciliation_generation"]
+                        and proof.get("state") == "absence_proven"
+                        and proof.get("match_count") == 0
+                        and proof.get("recovered_thread_id") is None
+                        and proof.get("fixed_reason") is None
+                        and resolution["proof_completed_at"] == proof["completed_at"]
+                        and resolution["proof_expires_at"] == proof["expires_at"]
+                        and resolution["proof_inventory_digest"] == proof["inventory_digest"]
+                        and resolution["resolution_code"]
+                        == SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE
+                        and resolution["evidence_kind"]
+                        == SIDEBAR_V2_ATTEMPT_ZERO_EVIDENCE_KIND
+                        and resolution["evidence_version"]
+                        == SIDEBAR_V2_ATTEMPT_ZERO_EVIDENCE_VERSION
+                        and hmac.compare_digest(resolution["evidence_digest"], canonical)
+                    ):
+                        v2_attempt_zero_effective += 1
+                except (TypeError, ValueError):
+                    continue
+            total = (
+                bound_total + precreate_total + unbound_total + v2_attempt_zero_total
+            )
             effective = (
                 bound_effective + precreate_effective + unbound_effective
+                + v2_attempt_zero_effective
             )
             ledger_valid = True
         except sqlite3.DatabaseError:
@@ -6232,6 +6485,10 @@ class SessionBridgeStore:
             by_resolution_code[SIDEBAR_PRECREATE_RESOLUTION_CODE] = precreate_effective
         if ledger_valid and unbound_total:
             by_resolution_code[SIDEBAR_UNBOUND_RESOLUTION_CODE] = unbound_effective
+        if ledger_valid and v2_attempt_zero_total:
+            by_resolution_code[SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE] = (
+                v2_attempt_zero_effective
+            )
         return {
             "total": total,
             "effective": effective,
@@ -6328,6 +6585,17 @@ class SessionBridgeStore:
                 "SELECT RAISE(ABORT, 'sidebar terminal resolutions overlap unbound "
                 "evidence'); END"
             ),
+            "trg_session_sidebar_terminal_resolutions_no_v2_attempt_zero_overlap": (
+                "CREATE TRIGGER "
+                "trg_session_sidebar_terminal_resolutions_no_v2_attempt_zero_overlap "
+                "BEFORE INSERT ON session_sidebar_terminal_resolutions WHEN EXISTS ( "
+                "SELECT 1 FROM session_sidebar_v2_attempt_zero_resolutions AS existing "
+                "WHERE existing.job_id = NEW.job_id OR existing.idempotency_key = "
+                "NEW.idempotency_key OR existing.source_session_id = "
+                "NEW.source_session_id OR existing.bridge_id = NEW.bridge_id ) BEGIN "
+                "SELECT RAISE(ABORT, 'sidebar terminal resolutions overlap v2 "
+                "attempt-zero evidence'); END"
+            ),
         }
         if {row["name"] for row in triggers} != set(expected_trigger_sql):
             return False
@@ -6420,6 +6688,17 @@ class SessionBridgeStore:
                 "SELECT RAISE(ABORT, 'sidebar precreate resolutions overlap unbound "
                 "evidence'); END"
             ),
+            "trg_session_sidebar_precreate_resolutions_no_v2_attempt_zero_overlap": (
+                "CREATE TRIGGER "
+                "trg_session_sidebar_precreate_resolutions_no_v2_attempt_zero_overlap "
+                "BEFORE INSERT ON session_sidebar_precreate_resolutions WHEN EXISTS ( "
+                "SELECT 1 FROM session_sidebar_v2_attempt_zero_resolutions AS existing "
+                "WHERE existing.job_id = NEW.job_id OR existing.idempotency_key = "
+                "NEW.idempotency_key OR existing.source_session_id = "
+                "NEW.source_session_id OR existing.bridge_id = NEW.bridge_id ) BEGIN "
+                "SELECT RAISE(ABORT, 'sidebar precreate resolutions overlap v2 "
+                "attempt-zero evidence'); END"
+            ),
         }
         if {row["name"] for row in triggers} != set(expected_trigger_sql):
             return False
@@ -6503,6 +6782,17 @@ class SessionBridgeStore:
                 "BEFORE DELETE ON session_sidebar_unbound_resolutions BEGIN SELECT "
                 "RAISE(ABORT, 'sidebar unbound resolutions are immutable'); END"
             ),
+            "trg_session_sidebar_unbound_resolutions_no_v2_attempt_zero_overlap": (
+                "CREATE TRIGGER "
+                "trg_session_sidebar_unbound_resolutions_no_v2_attempt_zero_overlap "
+                "BEFORE INSERT ON session_sidebar_unbound_resolutions WHEN EXISTS ( "
+                "SELECT 1 FROM session_sidebar_v2_attempt_zero_resolutions AS existing "
+                "WHERE existing.job_id = NEW.job_id OR existing.idempotency_key = "
+                "NEW.idempotency_key OR existing.source_session_id = "
+                "NEW.source_session_id OR existing.bridge_id = NEW.bridge_id ) BEGIN "
+                "SELECT RAISE(ABORT, 'sidebar unbound resolutions overlap v2 "
+                "attempt-zero evidence'); END"
+            ),
         }
         if {row["name"] for row in triggers} != set(expected_trigger_sql):
             return False
@@ -6511,6 +6801,101 @@ class SessionBridgeStore:
             if not isinstance(trigger_sql, str):
                 return False
             if " ".join(trigger_sql.split()) != expected_trigger_sql[trigger["name"]]:
+                return False
+        return SessionBridgeStore._sidebar_v2_attempt_zero_resolution_ledger_is_valid(
+            conn
+        )
+
+    @staticmethod
+    def _sidebar_v2_attempt_zero_resolution_ledger_is_valid(
+        conn: sqlite3.Connection,
+    ) -> bool:
+        table = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("session_sidebar_v2_attempt_zero_resolutions",),
+        ).fetchone()
+        if table is None or not isinstance(table["sql"], str):
+            return False
+        normalized_table_sql = " ".join(table["sql"].split())
+        if any(
+            requirement not in normalized_table_sql
+            for requirement in _SIDEBAR_V2_ATTEMPT_ZERO_LEDGER_SQL_REQUIREMENTS
+        ):
+            return False
+        columns = conn.execute(
+            'PRAGMA table_info("session_sidebar_v2_attempt_zero_resolutions")'
+        ).fetchall()
+        if tuple(row["name"] for row in columns) != _SIDEBAR_V2_ATTEMPT_ZERO_LEDGER_COLUMNS:
+            return False
+        if not columns or int(columns[0]["pk"]) != 1:
+            return False
+        foreign_keys = conn.execute(
+            'PRAGMA foreign_key_list("session_sidebar_v2_attempt_zero_resolutions")'
+        ).fetchall()
+        if {
+            (row["from"], row["table"], row["to"], row["on_update"], row["on_delete"])
+            for row in foreign_keys
+        } != {
+            ("job_id", "session_sidebar_jobs", "id", "RESTRICT", "RESTRICT"),
+            (
+                "reservation_reconciliation_proof_digest",
+                "session_sidebar_reconciliation_proofs", "proof_digest",
+                "RESTRICT", "RESTRICT",
+            ),
+        }:
+            return False
+        triggers = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' "
+            "AND tbl_name = 'session_sidebar_v2_attempt_zero_resolutions'"
+        ).fetchall()
+        expected_trigger_sql = {
+            "trg_session_sidebar_v2_attempt_zero_resolutions_no_replacement": (
+                "CREATE TRIGGER "
+                "trg_session_sidebar_v2_attempt_zero_resolutions_no_replacement "
+                "BEFORE INSERT ON session_sidebar_v2_attempt_zero_resolutions WHEN "
+                "EXISTS ( SELECT 1 FROM "
+                "session_sidebar_v2_attempt_zero_resolutions AS existing WHERE "
+                "existing.job_id = NEW.job_id OR existing.idempotency_key = "
+                "NEW.idempotency_key OR existing.source_session_id = "
+                "NEW.source_session_id OR existing.bridge_id = NEW.bridge_id ) OR "
+                "EXISTS ( SELECT 1 FROM session_sidebar_terminal_resolutions AS "
+                "existing WHERE existing.job_id = NEW.job_id OR "
+                "existing.idempotency_key = NEW.idempotency_key OR "
+                "existing.source_session_id = NEW.source_session_id OR "
+                "existing.bridge_id = NEW.bridge_id ) OR EXISTS ( SELECT 1 FROM "
+                "session_sidebar_precreate_resolutions AS existing WHERE "
+                "existing.job_id = NEW.job_id OR existing.idempotency_key = "
+                "NEW.idempotency_key OR existing.source_session_id = "
+                "NEW.source_session_id OR existing.bridge_id = NEW.bridge_id ) OR "
+                "EXISTS ( SELECT 1 FROM session_sidebar_unbound_resolutions AS "
+                "existing WHERE existing.job_id = NEW.job_id OR "
+                "existing.idempotency_key = NEW.idempotency_key OR "
+                "existing.source_session_id = NEW.source_session_id OR "
+                "existing.bridge_id = NEW.bridge_id ) BEGIN SELECT RAISE(ABORT, "
+                "'sidebar v2 attempt-zero resolutions are immutable'); END"
+            ),
+            "trg_session_sidebar_v2_attempt_zero_resolutions_no_update": (
+                "CREATE TRIGGER "
+                "trg_session_sidebar_v2_attempt_zero_resolutions_no_update "
+                "BEFORE UPDATE ON session_sidebar_v2_attempt_zero_resolutions BEGIN "
+                "SELECT RAISE(ABORT, 'sidebar v2 attempt-zero resolutions are "
+                "immutable'); END"
+            ),
+            "trg_session_sidebar_v2_attempt_zero_resolutions_no_delete": (
+                "CREATE TRIGGER "
+                "trg_session_sidebar_v2_attempt_zero_resolutions_no_delete "
+                "BEFORE DELETE ON session_sidebar_v2_attempt_zero_resolutions BEGIN "
+                "SELECT RAISE(ABORT, 'sidebar v2 attempt-zero resolutions are "
+                "immutable'); END"
+            ),
+        }
+        if {row["name"] for row in triggers} != set(expected_trigger_sql):
+            return False
+        for trigger in triggers:
+            sql = trigger["sql"]
+            if not isinstance(sql, str):
+                return False
+            if " ".join(sql.split()) != expected_trigger_sql[trigger["name"]]:
                 return False
         return True
 
@@ -7199,6 +7584,26 @@ class SessionBridgeStore:
             ):
                 raise ValueError("invalid sidebar reconciliation proof identity")
             return result
+
+    def get_sidebar_reconciliation_proof_by_digest(
+        self,
+        proof_digest: object,
+    ) -> dict[str, Any] | None:
+        """Read one exact persisted reconciliation proof by authoritative digest."""
+
+        normalized_digest = _lowercase_sha256(
+            proof_digest,
+            "sidebar reconciliation proof digest",
+        )
+        with self.db._lock:
+            conn = self.db._conn
+            assert conn is not None
+            proof = conn.execute(
+                "SELECT * FROM session_sidebar_reconciliation_proofs "
+                "WHERE proof_digest = ?",
+                (normalized_digest,),
+            ).fetchone()
+            return None if proof is None else dict(proof)
 
     def clear_sidebar_create_reservation(
         self,
@@ -8447,6 +8852,233 @@ class SessionBridgeStore:
 
         return self.db._execute_write(_write)
 
+    def acknowledge_sidebar_v2_attempt_zero_resolution(
+        self,
+        *,
+        job_id: object,
+        expected_error_code: object,
+        expected_attempts: object,
+        expected_next_attempt_at: object,
+        expected_updated_at: object,
+        expected_reconciliation_proof_digest: object,
+        expected_reconciliation_generation: object,
+        evidence_digest: object,
+        marker_secret: object,
+        now: object,
+    ) -> dict[str, Any]:
+        """Append one exact, fresh proof-bound v2 attempts-zero resolution."""
+
+        from .sidebar import sidebar_bridge_id, sidebar_idempotency_key
+
+        expected_job_id = _exact_nonempty_text(job_id, "sidebar job ID")
+        expected_error = _exact_nonempty_text(
+            expected_error_code, "expected sidebar failure"
+        )
+        if expected_error != "native_create_ambiguous":
+            raise ValueError("expected sidebar failure does not match")
+        _nonnegative_integer(expected_attempts, "expected sidebar attempts")
+        attempts = cast(int, expected_attempts)
+        if attempts != 0:
+            raise ValueError("v2 attempt-zero sidebar failure has attempts")
+        next_attempt_at = _finite_number(
+            expected_next_attempt_at, "expected sidebar next attempt"
+        )
+        updated_at = _finite_number(expected_updated_at, "expected sidebar update time")
+        proof_digest = _lowercase_sha256(
+            expected_reconciliation_proof_digest,
+            "expected sidebar reconciliation proof digest",
+        )
+        proof_generation = _exact_nonempty_text(
+            expected_reconciliation_generation,
+            "expected sidebar reconciliation generation",
+        )
+        evidence = _sha256_text(
+            evidence_digest, "sidebar v2 attempt-zero resolution evidence digest"
+        )
+        if type(marker_secret) is not bytes or not marker_secret:
+            raise ValueError("sidebar v2 attempt-zero marker secret is malformed")
+        secret = cast(bytes, marker_secret)
+        resolved_at = _finite_number(now, "sidebar v2 attempt-zero resolution time")
+
+        def _write(conn: sqlite3.Connection) -> dict[str, Any]:
+            if not self._sidebar_terminal_resolution_ledger_is_valid(conn):
+                raise ValueError("invalid sidebar terminal resolution ledger")
+            job = conn.execute(
+                "SELECT * FROM session_sidebar_jobs WHERE id = ?", (expected_job_id,)
+            ).fetchone()
+            if job is None:
+                raise ValueError("expected sidebar v2 attempt-zero resolution does not match")
+            source_session_id = _exact_nonempty_text(
+                job["source_session_id"], "sidebar source session ID"
+            )
+            idempotency_key = sidebar_idempotency_key(source_session_id)
+            bridge_id = sidebar_bridge_id(source_session_id)
+            canonical_job_id = (
+                "sidebar-job:"
+                + hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+            )
+            reservation_row = conn.execute(
+                "SELECT value_json FROM session_bridge_state WHERE key = ?",
+                (_sidebar_create_reservation_state_key(source_session_id),),
+            ).fetchone()
+            proof_row = conn.execute(
+                "SELECT * FROM session_sidebar_reconciliation_proofs "
+                "WHERE proof_digest = ?",
+                (proof_digest,),
+            ).fetchone()
+            if reservation_row is None or proof_row is None:
+                raise ValueError("expected sidebar v2 attempt-zero resolution does not match")
+            reservation = _decode_sidebar_create_reservation(
+                reservation_row["value_json"],
+                expected_source_session_id=source_session_id,
+            )
+            proof = dict(proof_row)
+            candidate = _validated_sidebar_cutover_candidate(conn, dict(job))
+            marker = encode_bridge_marker(
+                BridgeMarkerPayload(
+                    bridge_id=bridge_id,
+                    source_session_id=source_session_id,
+                    target_provider=Provider.CODEX,
+                    policy_generation=1,
+                ),
+                secret,
+            )
+            if (
+                canonical_job_id != expected_job_id
+                or job["idempotency_key"] != idempotency_key
+                or job["bridge_id"] != bridge_id
+                or reservation.get("version") != 2
+                or set(reservation) != _SIDEBAR_CREATE_RESERVATION_FIELDS
+                or reservation.get("job_id") != expected_job_id
+                or reservation.get("bridge_id") != bridge_id
+                or reservation.get("reconciliation_proof_digest") != proof_digest
+                or reservation.get("reconciliation_generation") != proof_generation
+                or proof.get("job_id") != expected_job_id
+                or proof.get("source_session_id") != source_session_id
+                or proof.get("bridge_id") != bridge_id
+                or proof.get("reconciliation_generation") != proof_generation
+                or proof.get("state") != "absence_proven"
+                or proof.get("match_count") != 0
+                or proof.get("recovered_thread_id") is not None
+                or proof.get("fixed_reason") is not None
+                or job["reconciliation_proof_digest"] != proof_digest
+                or not hmac.compare_digest(
+                    proof["marker_digest"],
+                    hashlib.sha256(marker.encode("utf-8")).hexdigest(),
+                )
+                or not hmac.compare_digest(
+                    reservation["recovery_key"],
+                    _sidebar_cutover_recovery_key(dict(job), marker_secret=secret),
+                )
+                or job["codex_thread_id"] is not None
+                or job["state"] != SidebarJobState.FAILED.value
+                or job["error_code"] != expected_error
+                or job["attempts"] != attempts
+                or job["next_attempt_at"] != next_attempt_at
+                or job["updated_at"] != updated_at
+                or job["lease_digest"] is not None
+                or job["lease_expires_at"] is not None
+                or job["completion_digest"] is not None
+                or job["visible_at"] is not None
+            ):
+                raise ValueError("expected sidebar v2 attempt-zero resolution does not match")
+            if resolved_at < max(updated_at, float(proof["completed_at"])):
+                raise ValueError("sidebar v2 attempt-zero resolution time precedes evidence")
+            if resolved_at > float(proof["expires_at"]):
+                raise ValueError("sidebar v2 attempt-zero reconciliation proof expired")
+            materialized = conn.execute(
+                """SELECT 1 WHERE EXISTS (
+                       SELECT 1 FROM external_sessions AS external
+                        WHERE external.provider = ? AND external.origin_bridge_id = ?
+                   ) OR EXISTS (
+                       SELECT 1 FROM session_links AS link WHERE link.bridge_id = ?
+                   ) OR EXISTS (
+                       SELECT 1 FROM session_sidebar_exclusions AS exclusion
+                        WHERE exclusion.source_session_id = ?
+                   )""",
+                (Provider.CODEX.value, bridge_id, bridge_id, source_session_id),
+            ).fetchone()
+            if materialized is not None:
+                raise ValueError("expected sidebar v2 attempt-zero resolution does not match")
+            canonical_evidence = sidebar_v2_attempt_zero_terminal_evidence_digest(
+                job=dict(job), reservation=reservation, proof=proof, candidate=candidate
+            )
+            if not hmac.compare_digest(evidence, canonical_evidence):
+                raise ValueError("sidebar v2 attempt-zero resolution evidence does not match")
+            expected_fields = {
+                "job_id": expected_job_id,
+                "idempotency_key": idempotency_key,
+                "source_session_id": source_session_id,
+                "bridge_id": bridge_id,
+                "failure_state": SidebarJobState.FAILED.value,
+                "failure_code": expected_error,
+                "failure_attempts": attempts,
+                "failure_next_attempt_at": next_attempt_at,
+                "failure_updated_at": updated_at,
+                "reservation_reserved_at": reservation["reserved_at"],
+                "reservation_reconciliation_proof_digest": proof_digest,
+                "reservation_reconciliation_generation": proof_generation,
+                "proof_completed_at": proof["completed_at"],
+                "proof_expires_at": proof["expires_at"],
+                "proof_inventory_digest": proof["inventory_digest"],
+                "resolution_code": SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE,
+                "evidence_kind": SIDEBAR_V2_ATTEMPT_ZERO_EVIDENCE_KIND,
+                "evidence_version": SIDEBAR_V2_ATTEMPT_ZERO_EVIDENCE_VERSION,
+                "evidence_digest": canonical_evidence,
+            }
+            existing = conn.execute(
+                "SELECT * FROM session_sidebar_v2_attempt_zero_resolutions WHERE job_id = ?",
+                (expected_job_id,),
+            ).fetchone()
+            if existing is not None:
+                if any(existing[key] != value for key, value in expected_fields.items()):
+                    raise ValueError("conflicting sidebar v2 attempt-zero resolution")
+                return {
+                    "job_id": expected_job_id,
+                    "state": SidebarJobState.FAILED.value,
+                    "error_code": expected_error,
+                    "resolution_code": SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE,
+                    "created": False,
+                }
+            try:
+                cursor = conn.execute(
+                    """INSERT INTO session_sidebar_v2_attempt_zero_resolutions (
+                           job_id, idempotency_key, source_session_id, bridge_id,
+                           failure_state, failure_code, failure_attempts,
+                           failure_next_attempt_at, failure_updated_at,
+                           reservation_reserved_at,
+                           reservation_reconciliation_proof_digest,
+                           reservation_reconciliation_generation,
+                           proof_completed_at, proof_expires_at, proof_inventory_digest,
+                           resolution_code, evidence_kind, evidence_version,
+                           evidence_digest, resolved_at
+                       ) VALUES (
+                           :job_id, :idempotency_key, :source_session_id, :bridge_id,
+                           :failure_state, :failure_code, :failure_attempts,
+                           :failure_next_attempt_at, :failure_updated_at,
+                           :reservation_reserved_at,
+                           :reservation_reconciliation_proof_digest,
+                           :reservation_reconciliation_generation,
+                           :proof_completed_at, :proof_expires_at, :proof_inventory_digest,
+                           :resolution_code, :evidence_kind, :evidence_version,
+                           :evidence_digest, :resolved_at
+                       )""",
+                    {**expected_fields, "resolved_at": resolved_at},
+                )
+            except sqlite3.IntegrityError:
+                raise ValueError("conflicting sidebar v2 attempt-zero resolution") from None
+            if cursor.rowcount != 1:
+                raise ValueError("expected sidebar v2 attempt-zero resolution does not match")
+            return {
+                "job_id": expected_job_id,
+                "state": SidebarJobState.FAILED.value,
+                "error_code": expected_error,
+                "resolution_code": SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE,
+                "created": True,
+            }
+
+        return self.db._execute_write(_write)
+
     def acknowledge_sidebar_unbound_resolution(
         self,
         *,
@@ -8749,6 +9381,11 @@ class SessionBridgeStore:
                 "WHERE job_id = ? LIMIT 1",
                 (job["id"],),
             ).fetchone()
+            v2_attempt_zero_resolution = conn.execute(
+                "SELECT 1 FROM session_sidebar_v2_attempt_zero_resolutions "
+                "WHERE job_id = ? LIMIT 1",
+                (job["id"],),
+            ).fetchone()
             reservation_row = conn.execute(
                 "SELECT value_json FROM session_bridge_state WHERE key = ?",
                 (_sidebar_create_reservation_state_key(source_id),),
@@ -8775,6 +9412,7 @@ class SessionBridgeStore:
                 or terminal_resolution is not None
                 or precreate_resolution is not None
                 or unbound_resolution is not None
+                or v2_attempt_zero_resolution is not None
                 or reservation is None
                 or reservation["job_id"] != expected_job_id
                 or reservation["source_session_id"] != source_id
@@ -8875,6 +9513,15 @@ class SessionBridgeStore:
                     (job["id"],),
                 ).fetchone()
             )
+            v2_attempt_zero_resolution = (
+                None
+                if job is None
+                else conn.execute(
+                    "SELECT 1 FROM session_sidebar_v2_attempt_zero_resolutions "
+                    "WHERE job_id = ? LIMIT 1",
+                    (job["id"],),
+                ).fetchone()
+            )
             if (
                 job is None
                 or job["id"] != job_id
@@ -8888,6 +9535,7 @@ class SessionBridgeStore:
                 or terminal_resolution is not None
                 or precreate_resolution is not None
                 or unbound_resolution is not None
+                or v2_attempt_zero_resolution is not None
             ):
                 raise ValueError("expected sidebar failure does not match")
             cursor = conn.execute(

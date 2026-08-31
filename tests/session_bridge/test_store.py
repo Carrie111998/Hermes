@@ -73,6 +73,7 @@ from session_bridge.store import (
     sidebar_precreate_terminal_evidence_digest,
     sidebar_terminal_evidence_digest,
     sidebar_unbound_terminal_evidence_digest,
+    sidebar_v2_attempt_zero_terminal_evidence_digest,
 )
 from session_bridge.worktree import WorktreeSnapshot, capture_worktree_snapshot
 
@@ -608,6 +609,7 @@ def test_fresh_schema_has_current_version_and_sidebar_terminal_ledgers(db) -> No
         "trg_session_sidebar_terminal_resolutions_no_delete",
         "trg_session_sidebar_terminal_resolutions_no_precreate_overlap",
         "trg_session_sidebar_terminal_resolutions_no_unbound_overlap",
+        "trg_session_sidebar_terminal_resolutions_no_v2_attempt_zero_overlap",
     }
     assert _rows(
         db,
@@ -649,6 +651,7 @@ def test_fresh_schema_has_current_version_and_sidebar_terminal_ledgers(db) -> No
         "trg_session_sidebar_precreate_resolutions_no_update",
         "trg_session_sidebar_precreate_resolutions_no_delete",
         "trg_session_sidebar_precreate_resolutions_no_unbound_overlap",
+        "trg_session_sidebar_precreate_resolutions_no_v2_attempt_zero_overlap",
     }
     assert _rows(
         db,
@@ -688,6 +691,7 @@ def test_fresh_schema_has_current_version_and_sidebar_terminal_ledgers(db) -> No
         "trg_session_sidebar_unbound_resolutions_no_replacement",
         "trg_session_sidebar_unbound_resolutions_no_update",
         "trg_session_sidebar_unbound_resolutions_no_delete",
+        "trg_session_sidebar_unbound_resolutions_no_v2_attempt_zero_overlap",
     }
 
 
@@ -793,6 +797,7 @@ def test_current_database_additively_repairs_terminal_ledger_without_data_loss(
                 "trg_session_sidebar_terminal_resolutions_no_delete",
                 "trg_session_sidebar_terminal_resolutions_no_precreate_overlap",
                 "trg_session_sidebar_terminal_resolutions_no_unbound_overlap",
+        "trg_session_sidebar_terminal_resolutions_no_v2_attempt_zero_overlap",
             }
             assert _rows(
                 reopened,
@@ -811,6 +816,7 @@ def test_current_database_additively_repairs_terminal_ledger_without_data_loss(
                 "trg_session_sidebar_precreate_resolutions_no_update",
                 "trg_session_sidebar_precreate_resolutions_no_delete",
                 "trg_session_sidebar_precreate_resolutions_no_unbound_overlap",
+        "trg_session_sidebar_precreate_resolutions_no_v2_attempt_zero_overlap",
             }
             assert _rows(
                 reopened,
@@ -828,6 +834,7 @@ def test_current_database_additively_repairs_terminal_ledger_without_data_loss(
                 "trg_session_sidebar_unbound_resolutions_no_replacement",
                 "trg_session_sidebar_unbound_resolutions_no_update",
                 "trg_session_sidebar_unbound_resolutions_no_delete",
+        "trg_session_sidebar_unbound_resolutions_no_v2_attempt_zero_overlap",
             }
         finally:
             reopened.close()
@@ -7816,6 +7823,7 @@ def _record_absence_proof(
     placement_generation: int = 1,
     delivery_generation: int = 1,
     generation: str = "scan:1",
+    marker_digest: str = "1" * 64,
 ) -> dict[str, Any]:
     evidence = SidebarReconciliationEvidence.create(
         state=SidebarReconciliationState.ABSENCE_PROVEN,
@@ -7823,7 +7831,7 @@ def _record_absence_proof(
         completed_at=completed_at,
         expires_at=expires_at,
         inventory_digest="2" * 64,
-        marker_digest="1" * 64,
+        marker_digest=marker_digest,
         match_count=0,
         recovered_thread_id=None,
         fixed_reason=None,
@@ -9723,6 +9731,595 @@ def test_precreate_cutover_resolution_is_append_only_and_unblocks_without_native
                 (failed["id"],),
             )
         )
+
+
+def _v2_attempt_zero_resolution_fixture(
+    db: SessionDB,
+    *,
+    native_id: str,
+    proof_expires_at: float = 180.0,
+) -> tuple[
+    SessionBridgeStore,
+    SidebarCandidate,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    bytes,
+]:
+    marker_secret = f"{native_id}-secret".encode("utf-8")
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(f"{native_id}-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id=native_id)
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=candidate.bridge_id,
+            source_session_id=candidate.source_session_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        marker_secret,
+    )
+    proof = _record_absence_proof(
+        store,
+        lease["lease_token"],
+        completed_at=100.0,
+        expires_at=proof_expires_at,
+        generation=f"scan:{native_id}",
+        marker_digest=hashlib.sha256(marker.encode("utf-8")).hexdigest(),
+    )
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key=sidebar_create_recovery_key(marker, marker_secret),
+        reconciliation_proof_digest=proof["proof_digest"],
+        reconciliation_generation=proof["reconciliation_generation"],
+        now=105.0,
+    )
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=110.0,
+    )
+    evidence = sidebar_v2_attempt_zero_terminal_evidence_digest(
+        job=failed,
+        reservation=reservation,
+        proof=proof,
+        candidate=candidate,
+    )
+    arguments = {
+        "job_id": failed["id"],
+        "expected_error_code": failed["error_code"],
+        "expected_attempts": failed["attempts"],
+        "expected_next_attempt_at": failed["next_attempt_at"],
+        "expected_updated_at": failed["updated_at"],
+        "expected_reconciliation_proof_digest": proof["proof_digest"],
+        "expected_reconciliation_generation": proof["reconciliation_generation"],
+        "evidence_digest": evidence,
+        "marker_secret": marker_secret,
+        "now": 120.0,
+    }
+    return store, candidate, failed, reservation, proof, arguments, marker_secret
+
+
+def test_v2_attempt_zero_resolution_binds_fresh_exact_absence_proof(db) -> None:
+    store, candidate, failed, _reservation, proof, arguments, _marker_secret = (
+        _v2_attempt_zero_resolution_fixture(
+            db,
+            native_id="v2-attempt-zero-production",
+        )
+    )
+
+    first = store.acknowledge_sidebar_v2_attempt_zero_resolution(**arguments)
+    replay = store.acknowledge_sidebar_v2_attempt_zero_resolution(
+        **{**arguments, "now": 130.0}
+    )
+
+    assert first["created"] is True
+    assert replay == {**first, "created": False}
+    [audit] = _rows(db, "SELECT * FROM session_sidebar_v2_attempt_zero_resolutions")
+    assert audit["reservation_reconciliation_proof_digest"] == proof["proof_digest"]
+    assert audit["reservation_reconciliation_generation"] == proof["reconciliation_generation"]
+    status = store.sidebar_delivery_status(now=140.0)
+    assert status["blocking_failed_count"] == 0
+    assert status["terminal_resolutions"]["by_resolution_code"] == {
+        "native_thread_unrecoverable": 0,
+        "v2_attempt_zero_create_unrecoverable": 1,
+    }
+    with pytest.raises(ValueError, match="expected sidebar failure"):
+        store.retry_failed_sidebar_job(
+            source_session_id=candidate.source_session_id,
+            expected_error_code="native_create_ambiguous",
+            now=150.0,
+        )
+    with pytest.raises(ValueError, match="precedes evidence|expired"):
+        store.acknowledge_sidebar_v2_attempt_zero_resolution(
+            **{**arguments, "now": 181.0}
+        )
+    drifted_thread_id = "v2-attempt-zero-drifted-bound-thread"
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_sidebar_jobs SET codex_thread_id = ? WHERE id = ?",
+            (drifted_thread_id, failed["id"]),
+        )
+    )
+    with pytest.raises(ValueError, match="expected bound sidebar failure"):
+        store.retry_failed_bound_sidebar_job(
+            job_id=failed["id"],
+            source_session_id=candidate.source_session_id,
+            codex_thread_id=drifted_thread_id,
+            expected_error_code="native_create_ambiguous",
+            confirmation="PRESERVE_EXACT_BOUND_TASK",
+            now=190.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "materialization",
+    ("external_session", "session_link", "sidebar_exclusion"),
+)
+def test_v2_attempt_zero_resolution_becomes_ineffective_after_materialization(
+    db,
+    materialization: str,
+) -> None:
+    store, candidate, failed, _reservation, _proof, arguments, _secret = (
+        _v2_attempt_zero_resolution_fixture(
+            db,
+            native_id=f"v2-attempt-zero-late-{materialization}",
+        )
+    )
+    store.acknowledge_sidebar_v2_attempt_zero_resolution(**arguments)
+
+    if materialization == "external_session":
+        _seed_sidebar_codex_target(store, candidate, "late-materialized-thread")
+    elif materialization == "session_link":
+        db.ensure_session("late-link-target", source="cli")
+        db._execute_write(
+            lambda conn: conn.execute(
+                """INSERT INTO session_links (
+                       id, from_session_id, to_session_id, relation,
+                       bridge_id, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    "late-v2-resolution-link",
+                    candidate.source_session_id,
+                    "late-link-target",
+                    Relation.MIRRORS.value,
+                    candidate.bridge_id,
+                    130.0,
+                ),
+            )
+        )
+    else:
+        store.record_sidebar_exclusion(
+            candidate.source_session_id,
+            candidate.provider,
+            "source_cwd_missing",
+            now=130.0,
+        )
+
+    status = store.sidebar_delivery_status(now=140.0)
+    assert status["terminal_resolution_ledger_valid"] is True
+    assert status["blocking_failed_count"] == 1
+    assert status["terminally_resolved_failed_count"] == 0
+    assert status["ineffective_terminal_resolution_count"] == 1
+    assert status["terminal_resolutions"]["by_resolution_code"] == {
+        "native_thread_unrecoverable": 0,
+        "v2_attempt_zero_create_unrecoverable": 0,
+    }
+    assert failed["state"] == SidebarJobState.FAILED.value
+
+
+@pytest.mark.parametrize(
+    ("field_name", "wrong_value"),
+    (
+        ("idempotency_key", "wrong-idempotency"),
+        ("source_session_id", "wrong-source"),
+        ("bridge_id", "wrong-bridge"),
+        ("failure_next_attempt_at", 111.0),
+        ("failure_updated_at", 111.0),
+        ("reservation_reserved_at", 106.0),
+        ("reservation_reconciliation_generation", "wrong-generation"),
+        ("proof_completed_at", 101.0),
+        ("proof_expires_at", 181.0),
+        ("proof_inventory_digest", "f" * 64),
+    ),
+)
+def test_v2_attempt_zero_resolution_revalidates_every_immutable_identity_field(
+    db,
+    field_name: str,
+    wrong_value: object,
+) -> None:
+    store, _candidate, failed, reservation, proof, arguments, _secret = (
+        _v2_attempt_zero_resolution_fixture(
+            db,
+            native_id=f"v2-attempt-zero-ledger-{field_name}",
+        )
+    )
+    canonical_values = {
+        "job_id": failed["id"],
+        "idempotency_key": failed["idempotency_key"],
+        "source_session_id": failed["source_session_id"],
+        "bridge_id": failed["bridge_id"],
+        "failure_state": failed["state"],
+        "failure_code": failed["error_code"],
+        "failure_attempts": failed["attempts"],
+        "failure_next_attempt_at": failed["next_attempt_at"],
+        "failure_updated_at": failed["updated_at"],
+        "reservation_reserved_at": reservation["reserved_at"],
+        "reservation_reconciliation_proof_digest": proof["proof_digest"],
+        "reservation_reconciliation_generation": proof["reconciliation_generation"],
+        "proof_completed_at": proof["completed_at"],
+        "proof_expires_at": proof["expires_at"],
+        "proof_inventory_digest": proof["inventory_digest"],
+        "resolution_code": "v2_attempt_zero_create_unrecoverable",
+        "evidence_kind": (
+            "codex_inventory_marker_and_recovery_zero_with_bound_absence_proof"
+        ),
+        "evidence_version": 1,
+        "evidence_digest": arguments["evidence_digest"],
+        "resolved_at": arguments["now"],
+    }
+    canonical_values[field_name] = wrong_value
+    columns = tuple(canonical_values)
+    db._execute_write(
+        lambda conn: conn.execute(
+            "INSERT INTO session_sidebar_v2_attempt_zero_resolutions ("
+            + ", ".join(columns)
+            + ") VALUES ("
+            + ", ".join(f":{name}" for name in columns)
+            + ")",
+            canonical_values,
+        )
+    )
+
+    status = store.sidebar_delivery_status(now=140.0)
+    assert status["terminal_resolution_ledger_valid"] is True
+    assert status["blocking_failed_count"] == 1
+    assert status["terminally_resolved_failed_count"] == 0
+    assert status["ineffective_terminal_resolution_count"] == 1
+
+
+def test_v2_attempt_zero_resolution_accepts_exact_proof_expiry_boundary(db) -> None:
+    store, _candidate, _failed, _reservation, _proof, arguments, _secret = (
+        _v2_attempt_zero_resolution_fixture(
+            db,
+            native_id="v2-attempt-zero-expiry-boundary",
+            proof_expires_at=120.0,
+        )
+    )
+
+    result = store.acknowledge_sidebar_v2_attempt_zero_resolution(
+        **{**arguments, "now": 120.0}
+    )
+
+    assert result["created"] is True
+
+
+@pytest.mark.parametrize(
+    ("argument", "value", "match"),
+    (
+        ("expected_reconciliation_proof_digest", "f" * 64, "does not match"),
+        ("expected_reconciliation_generation", "scan:changed", "does not match"),
+        ("expected_attempts", 1, "attempts"),
+        ("expected_updated_at", 111.0, "does not match"),
+        ("evidence_digest", "a" * 64, "evidence does not match"),
+    ),
+)
+def test_v2_attempt_zero_resolution_rejects_authority_or_snapshot_drift(
+    db,
+    argument: str,
+    value: object,
+    match: str,
+) -> None:
+    store, _candidate, _failed, _reservation, _proof, arguments, _secret = (
+        _v2_attempt_zero_resolution_fixture(
+            db,
+            native_id=f"v2-attempt-zero-drift-{argument}",
+        )
+    )
+
+    with pytest.raises(ValueError, match=match):
+        store.acknowledge_sidebar_v2_attempt_zero_resolution(
+            **{**arguments, argument: value}
+        )
+    assert _rows(
+        db,
+        "SELECT * FROM session_sidebar_v2_attempt_zero_resolutions",
+    ) == []
+
+
+@pytest.mark.parametrize("malformation", ("version_one", "missing_field", "extra_field"))
+def test_v2_attempt_zero_resolution_rejects_nonexact_reservation(
+    db,
+    malformation: str,
+) -> None:
+    store, candidate, _failed, reservation, _proof, arguments, _secret = (
+        _v2_attempt_zero_resolution_fixture(
+            db,
+            native_id=f"v2-attempt-zero-reservation-{malformation}",
+        )
+    )
+    changed = dict(reservation)
+    if malformation == "version_one":
+        changed = {
+            key: value
+            for key, value in changed.items()
+            if key not in {
+                "reconciliation_proof_digest",
+                "reconciliation_generation",
+            }
+        }
+        changed["version"] = 1
+    elif malformation == "missing_field":
+        changed.pop("reconciliation_generation")
+    else:
+        changed["unexpected"] = "forbidden"
+    key = (
+        "session-bridge:sidebar-create:"
+        + hashlib.sha256(candidate.source_session_id.encode("utf-8")).hexdigest()
+    )
+    db._execute_write(
+        lambda conn: conn.execute(
+            "UPDATE session_bridge_state SET value_json = ? WHERE key = ?",
+            (
+                json.dumps(changed, sort_keys=True, separators=(",", ":")),
+                key,
+            ),
+        )
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="does not match|malformed|invalid sidebar create reservation",
+    ):
+        store.acknowledge_sidebar_v2_attempt_zero_resolution(**arguments)
+    assert _rows(
+        db,
+        "SELECT * FROM session_sidebar_v2_attempt_zero_resolutions",
+    ) == []
+
+
+def test_v2_attempt_zero_resolution_rejects_materialized_native_lineage(db) -> None:
+    store, candidate, _failed, _reservation, _proof, arguments, _secret = (
+        _v2_attempt_zero_resolution_fixture(
+            db,
+            native_id="v2-attempt-zero-materialized",
+        )
+    )
+    _seed_sidebar_codex_target(store, candidate, "v2-attempt-zero-native")
+
+    with pytest.raises(ValueError, match="does not match"):
+        store.acknowledge_sidebar_v2_attempt_zero_resolution(**arguments)
+    assert _rows(
+        db,
+        "SELECT * FROM session_sidebar_v2_attempt_zero_resolutions",
+    ) == []
+
+
+def _insert_overlapping_existing_sidebar_resolution(
+    db: SessionDB,
+    *,
+    table_name: str,
+    failed: Mapping[str, Any],
+) -> None:
+    common = (
+        failed["id"],
+        failed["idempotency_key"],
+        failed["source_session_id"],
+        failed["bridge_id"],
+    )
+    if table_name == "session_sidebar_terminal_resolutions":
+        sql = """INSERT INTO session_sidebar_terminal_resolutions (
+                     job_id, idempotency_key, source_session_id, bridge_id,
+                     codex_thread_id, failure_state, failure_code,
+                     failure_attempts, failure_next_attempt_at,
+                     failure_updated_at, resolution_code, evidence_kind,
+                     evidence_version, evidence_digest, resolved_at
+                 ) VALUES (?, ?, ?, ?, 'overlap-thread', 'sidebar_failed',
+                     'native_create_ambiguous', 0, 110, 110,
+                     'native_thread_unrecoverable',
+                     'codex_app_server_read_not_loaded_resume_no_rollout',
+                     1, ?, 120)"""
+        parameters = (*common, "a" * 64)
+    elif table_name == "session_sidebar_precreate_resolutions":
+        sql = """INSERT INTO session_sidebar_precreate_resolutions (
+                     job_id, idempotency_key, source_session_id, bridge_id,
+                     failure_state, failure_code, failure_attempts,
+                     failure_next_attempt_at, failure_updated_at,
+                     cutover_applied_at, reservation_reserved_at,
+                     resolution_code, evidence_kind, evidence_version,
+                     evidence_digest, resolved_at
+                 ) VALUES (?, ?, ?, ?, 'sidebar_failed',
+                     'native_create_ambiguous', 0, 110, 110, 105, 105,
+                     'precutover_create_unrecoverable',
+                     'codex_inventory_marker_and_recovery_zero_no_rollout', 1, ?, 120)"""
+        parameters = (*common, "b" * 64)
+    elif table_name == "session_sidebar_unbound_resolutions":
+        sql = """INSERT INTO session_sidebar_unbound_resolutions (
+                     job_id, idempotency_key, source_session_id, bridge_id,
+                     failure_state, failure_code, failure_attempts,
+                     failure_next_attempt_at, failure_updated_at,
+                     reservation_reserved_at, resolution_code, evidence_kind,
+                     evidence_version, evidence_digest, resolved_at
+                 ) VALUES (?, ?, ?, ?, 'sidebar_failed',
+                     'native_create_ambiguous', 1, 110, 110, 105,
+                     'native_create_unrecoverable',
+                     'codex_inventory_marker_and_recovery_zero_no_rollout', 1, ?, 120)"""
+        parameters = (*common, "c" * 64)
+    else:
+        raise AssertionError(f"unsupported test ledger: {table_name}")
+    db._execute_write(lambda conn: conn.execute(sql, parameters))
+
+
+@pytest.mark.parametrize(
+    "table_name",
+    (
+        "session_sidebar_terminal_resolutions",
+        "session_sidebar_precreate_resolutions",
+        "session_sidebar_unbound_resolutions",
+    ),
+)
+@pytest.mark.parametrize("v2_first", (False, True))
+def test_v2_attempt_zero_resolution_excludes_every_existing_ledger_both_orders(
+    db,
+    table_name: str,
+    v2_first: bool,
+) -> None:
+    store, _candidate, failed, _reservation, _proof, arguments, _secret = (
+        _v2_attempt_zero_resolution_fixture(
+            db,
+            native_id=f"v2-overlap-{table_name}-{v2_first}",
+        )
+    )
+    if v2_first:
+        store.acknowledge_sidebar_v2_attempt_zero_resolution(**arguments)
+        with pytest.raises(sqlite3.IntegrityError, match="overlap"):
+            _insert_overlapping_existing_sidebar_resolution(
+                db,
+                table_name=table_name,
+                failed=failed,
+            )
+    else:
+        _insert_overlapping_existing_sidebar_resolution(
+            db,
+            table_name=table_name,
+            failed=failed,
+        )
+        with pytest.raises(ValueError, match="conflicting"):
+            store.acknowledge_sidebar_v2_attempt_zero_resolution(**arguments)
+
+    total = sum(
+        db._conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+        for name in (
+            "session_sidebar_terminal_resolutions",
+            "session_sidebar_precreate_resolutions",
+            "session_sidebar_unbound_resolutions",
+            "session_sidebar_v2_attempt_zero_resolutions",
+        )
+    )
+    assert total == 1
+
+
+def test_v2_attempt_zero_resolution_exact_replay_is_concurrently_idempotent(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v2-attempt-zero-concurrent.db"
+    initial_db = SessionDB(path)
+    try:
+        _store, _candidate, _failed, _reservation, _proof, arguments, _secret = (
+            _v2_attempt_zero_resolution_fixture(
+                initial_db,
+                native_id="v2-attempt-zero-concurrent",
+            )
+        )
+    finally:
+        initial_db.close()
+
+    def acknowledge() -> bool:
+        local_db = SessionDB(path)
+        try:
+            local_store = SessionBridgeStore(local_db)
+            return bool(
+                local_store.acknowledge_sidebar_v2_attempt_zero_resolution(
+                    **arguments
+                )["created"]
+            )
+        finally:
+            local_db.close()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        created = sorted(pool.map(lambda _item: acknowledge(), range(2)))
+
+    assert created == [False, True]
+    reopened = SessionDB(path)
+    try:
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) FROM session_sidebar_v2_attempt_zero_resolutions"
+        ).fetchone()[0] == 1
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize(
+    "trigger_name",
+    (
+        "trg_session_sidebar_v2_attempt_zero_resolutions_no_replacement",
+        "trg_session_sidebar_v2_attempt_zero_resolutions_no_update",
+        "trg_session_sidebar_v2_attempt_zero_resolutions_no_delete",
+        "trg_session_sidebar_terminal_resolutions_no_v2_attempt_zero_overlap",
+        "trg_session_sidebar_precreate_resolutions_no_v2_attempt_zero_overlap",
+        "trg_session_sidebar_unbound_resolutions_no_v2_attempt_zero_overlap",
+    ),
+)
+def test_v2_attempt_zero_resolution_fails_closed_when_trigger_missing(
+    db,
+    trigger_name: str,
+) -> None:
+    store, _candidate, _failed, _reservation, _proof, arguments, _secret = (
+        _v2_attempt_zero_resolution_fixture(
+            db,
+            native_id=f"v2-attempt-zero-missing-{trigger_name[-12:]}",
+        )
+    )
+    db._execute_write(
+        lambda conn: conn.execute(f'DROP TRIGGER "{trigger_name}"')
+    )
+
+    with pytest.raises(ValueError, match="invalid sidebar terminal resolution ledger"):
+        store.acknowledge_sidebar_v2_attempt_zero_resolution(**arguments)
+    status = store.sidebar_delivery_status(now=130.0)
+    assert status["terminal_resolution_ledger_valid"] is False
+    assert "sidebar_terminal_resolution_ledger_invalid" in status["execution_blockers"]
+
+
+def test_v2_attempt_zero_resolution_fails_closed_when_trigger_sql_is_corrupt(
+    db,
+) -> None:
+    store, _candidate, _failed, _reservation, _proof, arguments, _secret = (
+        _v2_attempt_zero_resolution_fixture(
+            db,
+            native_id="v2-attempt-zero-corrupt-trigger",
+        )
+    )
+
+    def corrupt_trigger(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "DROP TRIGGER "
+            "trg_session_sidebar_v2_attempt_zero_resolutions_no_replacement"
+        )
+        conn.execute(
+            """CREATE TRIGGER
+                   trg_session_sidebar_v2_attempt_zero_resolutions_no_replacement
+               BEFORE INSERT ON session_sidebar_v2_attempt_zero_resolutions
+               WHEN EXISTS (
+                   SELECT 1 FROM session_sidebar_v2_attempt_zero_resolutions
+               ) OR EXISTS (
+                   SELECT 1 FROM session_sidebar_terminal_resolutions
+               ) OR EXISTS (
+                   SELECT 1 FROM session_sidebar_precreate_resolutions
+               ) OR EXISTS (
+                   SELECT 1 FROM session_sidebar_unbound_resolutions
+               )
+               BEGIN
+                   SELECT RAISE(
+                       ABORT,
+                       'sidebar v2 attempt-zero resolutions are immutable'
+                   );
+               END"""
+        )
+
+    db._execute_write(corrupt_trigger)
+
+    with pytest.raises(ValueError, match="invalid sidebar terminal resolution ledger"):
+        store.acknowledge_sidebar_v2_attempt_zero_resolution(**arguments)
+    status = store.sidebar_delivery_status(now=130.0)
+    assert status["terminal_resolution_ledger_valid"] is False
+    assert "sidebar_terminal_resolution_ledger_invalid" in status["execution_blockers"]
 
 
 def test_unbound_create_resolution_is_append_only_after_exact_absence(db) -> None:

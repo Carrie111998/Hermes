@@ -136,6 +136,7 @@ from .store import (
     SIDEBAR_SOURCE_CWD_REPAIR_CONFIRMATION,
     SIDEBAR_TERMINAL_RESOLUTION_CODE,
     SIDEBAR_UNBOUND_RESOLUTION_CODE,
+    SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE,
     SessionBridgeStore,
     SidebarSource,
     redact_codex_thread_id,
@@ -143,6 +144,7 @@ from .store import (
     sidebar_bound_retry_authority_matches,
     sidebar_terminal_evidence_digest,
     sidebar_unbound_terminal_evidence_digest,
+    sidebar_v2_attempt_zero_terminal_evidence_digest,
 )
 
 
@@ -933,6 +935,14 @@ class _Backend(Protocol):
         *,
         job_id: str,
         expected_error_code: str,
+    ) -> Mapping[str, Any]: ...
+    def sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+        self,
+        *,
+        job_id: str,
+        expected_error_code: str,
+        reconciliation_proof_digest: str,
+        reconciliation_generation: str,
     ) -> Mapping[str, Any]: ...
     def claude_visibility_status(self) -> Mapping[str, Any]: ...
     def claude_visibility_backfill(
@@ -2259,6 +2269,191 @@ class ProductionBackend:
             ),
             "error_code": "native_create_ambiguous",
             "resolution_code": SIDEBAR_UNBOUND_RESOLUTION_CODE,
+        }
+
+    def sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+        self,
+        *,
+        job_id: str,
+        expected_error_code: str,
+        reconciliation_proof_digest: str,
+        reconciliation_generation: str,
+    ) -> Mapping[str, Any]:
+        """Freshly falsify native materialization, then CAS one exact v2 proof."""
+
+        if (
+            re.fullmatch(r"sidebar-job:[0-9a-f]{64}", job_id) is None
+            or expected_error_code != "native_create_ambiguous"
+            or re.fullmatch(r"[0-9a-f]{64}", reconciliation_proof_digest) is None
+            or not isinstance(reconciliation_generation, str)
+            or not reconciliation_generation
+            or reconciliation_generation != reconciliation_generation.strip()
+            or "\n" in reconciliation_generation
+            or "\r" in reconciliation_generation
+        ):
+            raise RolloutGateBlocked("sidebar_v2_attempt_zero_snapshot_mismatch")
+        try:
+            marker_secret = resolve_marker_key()
+            if type(marker_secret) is not bytes or not marker_secret:
+                raise ValueError("marker key is unavailable")
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
+            raise ConfigurationFailure(
+                "sidebar_v2_attempt_zero_probe_unavailable"
+            ) from None
+
+        store = self._require_store()
+        try:
+            job = store.get_sidebar_job_by_id(job_id)
+            if job is None:
+                raise ValueError("missing sidebar job")
+            source_session_id = job.get("source_session_id")
+            if not isinstance(source_session_id, str):
+                raise ValueError("missing sidebar source identity")
+            expected_idempotency_key = sidebar_idempotency_key(source_session_id)
+            expected_bridge_id = sidebar_bridge_id(source_session_id)
+            expected_job_id = (
+                "sidebar-job:"
+                + hashlib.sha256(expected_idempotency_key.encode("utf-8")).hexdigest()
+            )
+            attempts = job.get("attempts")
+            next_attempt_at = job.get("next_attempt_at")
+            updated_at = job.get("updated_at")
+            if (
+                job.get("id") != job_id
+                or job_id != expected_job_id
+                or job.get("idempotency_key") != expected_idempotency_key
+                or job.get("bridge_id") != expected_bridge_id
+                or job.get("codex_thread_id") is not None
+                or job.get("state") != SidebarJobState.FAILED.value
+                or job.get("error_code") != expected_error_code
+                or attempts != 0
+                or type(attempts) is not int
+                or not _is_finite_number(next_attempt_at)
+                or not _is_finite_number(updated_at)
+                or not _is_finite_number(job.get("eligible_at"))
+                or not _is_finite_number(job.get("created_at"))
+                or job.get("lease_digest") is not None
+                or job.get("lease_expires_at") is not None
+                or job.get("completion_digest") is not None
+                or job.get("visible_at") is not None
+                or job.get("reconciliation_proof_digest")
+                != reconciliation_proof_digest
+            ):
+                raise ValueError("sidebar v2 attempt-zero snapshot mismatch")
+
+            candidate = store.get_sidebar_candidate_for_delivery(source_session_id)
+            if (
+                not isinstance(candidate, SidebarCandidate)
+                or candidate.source_session_id != source_session_id
+                or candidate.bridge_id != expected_bridge_id
+                or candidate.eligible_at != float(job["eligible_at"])
+            ):
+                raise ValueError("sidebar v2 attempt-zero candidate mismatch")
+            expected_marker = BridgeMarkerPayload(
+                bridge_id=expected_bridge_id,
+                source_session_id=source_session_id,
+                target_provider=Provider.CODEX,
+                policy_generation=1,
+            )
+            marker = encode_bridge_marker(expected_marker, marker_secret)
+            expected_recovery_key = sidebar_create_recovery_key(marker, marker_secret)
+            reservation = store.get_sidebar_create_reservation(source_session_id)
+            validate_sidebar_create_reservation(
+                reservation,
+                job_id=job_id,
+                source_session_id=source_session_id,
+                bridge_id=expected_bridge_id,
+                expected_recovery_key=expected_recovery_key,
+            )
+            if (
+                not isinstance(reservation, Mapping)
+                or reservation.get("version") != 2
+                or reservation.get("reconciliation_proof_digest")
+                != reconciliation_proof_digest
+                or reservation.get("reconciliation_generation")
+                != reconciliation_generation
+            ):
+                raise ValueError("sidebar v2 attempt-zero reservation mismatch")
+            proof = store.get_sidebar_reconciliation_proof_by_digest(
+                reconciliation_proof_digest
+            )
+            marker_digest = hashlib.sha256(marker.encode("utf-8")).hexdigest()
+            if (
+                proof is None
+                or proof.get("job_id") != job_id
+                or proof.get("source_session_id") != source_session_id
+                or proof.get("bridge_id") != expected_bridge_id
+                or proof.get("reconciliation_generation")
+                != reconciliation_generation
+                or proof.get("marker_digest") != marker_digest
+                or proof.get("state") != "absence_proven"
+                or proof.get("match_count") != 0
+                or proof.get("recovered_thread_id") is not None
+                or proof.get("fixed_reason") is not None
+                or not _is_finite_number(proof.get("completed_at"))
+                or not _is_finite_number(proof.get("expires_at"))
+            ):
+                raise ValueError("sidebar v2 attempt-zero proof mismatch")
+        except (KeyError, TypeError, ValueError):
+            raise RolloutGateBlocked(
+                "sidebar_v2_attempt_zero_snapshot_mismatch"
+            ) from None
+
+        verifier = self._require_sidebar_terminal_verifier(
+            marker_secret=marker_secret,
+        )
+        try:
+            marker_match = verifier.find_by_marker_including_archived(expected_marker)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ProviderDegraded("sidebar_v2_attempt_zero_probe_failed") from None
+        if marker_match is not None:
+            raise RolloutGateBlocked("native_thread_materialized")
+        try:
+            recovery_match = verifier.find_by_recovery_key(
+                cast(Mapping[str, Any], reservation)["recovery_key"],
+                expected_cwd=candidate.cwd,
+                deadline=time.monotonic() + 240.0,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise ProviderDegraded("sidebar_v2_attempt_zero_probe_failed") from None
+        if recovery_match is not None:
+            raise RolloutGateBlocked("native_thread_materialized")
+
+        evidence_digest = sidebar_v2_attempt_zero_terminal_evidence_digest(
+            job=job,
+            reservation=cast(Mapping[str, Any], reservation),
+            proof=proof,
+            candidate=candidate,
+        )
+        try:
+            result = store.acknowledge_sidebar_v2_attempt_zero_resolution(
+                job_id=job_id,
+                expected_error_code=expected_error_code,
+                expected_attempts=job["attempts"],
+                expected_next_attempt_at=job["next_attempt_at"],
+                expected_updated_at=job["updated_at"],
+                expected_reconciliation_proof_digest=reconciliation_proof_digest,
+                expected_reconciliation_generation=reconciliation_generation,
+                evidence_digest=evidence_digest,
+                marker_secret=marker_secret,
+                now=time.time(),
+            )
+        except (TypeError, ValueError):
+            raise RolloutGateBlocked(
+                "sidebar_v2_attempt_zero_snapshot_mismatch"
+            ) from None
+        return {
+            "status": (
+                "acknowledged"
+                if result.get("created") is True
+                else "already_acknowledged"
+            ),
+            "error_code": "native_create_ambiguous",
+            "resolution_code": SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE,
         }
 
     def claude_visibility_status(self) -> Mapping[str, Any]:
@@ -4011,6 +4206,32 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
     )
 
+    sidebar_v2_attempt_zero_terminal = commands.add_parser(
+        "sidebar-acknowledge-v2-attempt-zero-unrecoverable",
+        help="acknowledge one proof-bound v2 attempts-zero create with no native task",
+    )
+    sidebar_v2_attempt_zero_terminal.add_argument(
+        "--job-id", type=_sidebar_terminal_job_id, required=True
+    )
+    sidebar_v2_attempt_zero_terminal.add_argument(
+        "--expected-error-code",
+        choices=("native_create_ambiguous",),
+        required=True,
+    )
+    sidebar_v2_attempt_zero_terminal.add_argument(
+        "--reconciliation-proof-digest",
+        type=_sidebar_terminal_proof_digest,
+        required=True,
+    )
+    sidebar_v2_attempt_zero_terminal.add_argument(
+        "--reconciliation-generation", required=True
+    )
+    sidebar_v2_attempt_zero_terminal.add_argument(
+        "--confirm",
+        choices=("v2-proof-bound-create-unrecoverable",),
+        required=True,
+    )
+
     claude_visibility_status = commands.add_parser(
         "claude-visibility-status",
         help="show sanitized Claude native visibility status",
@@ -4353,6 +4574,17 @@ def _main_unscoped(
                 backend.sidebar_acknowledge_unbound_unrecoverable(
                     job_id=args.job_id,
                     expected_error_code=args.expected_error_code,
+                )
+            )
+            _emit(payload)
+            return EXIT_OK
+        if args.command == "sidebar-acknowledge-v2-attempt-zero-unrecoverable":
+            payload = _public_sidebar_terminal_resolution_result(
+                backend.sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+                    job_id=args.job_id,
+                    expected_error_code=args.expected_error_code,
+                    reconciliation_proof_digest=args.reconciliation_proof_digest,
+                    reconciliation_generation=args.reconciliation_generation,
                 )
             )
             _emit(payload)
@@ -5011,6 +5243,7 @@ def _public_sidebar_status(
         SIDEBAR_TERMINAL_RESOLUTION_CODE,
         SIDEBAR_PRECREATE_RESOLUTION_CODE,
         SIDEBAR_UNBOUND_RESOLUTION_CODE,
+        SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE,
     }
     if any(code not in known_resolution_codes for code in resolution_codes_source):
         raise ConfigurationFailure("invalid_sidebar_status")
@@ -5026,14 +5259,21 @@ def _public_sidebar_status(
     unbound_code_count = _status_count(
         resolution_codes_source.get(SIDEBAR_UNBOUND_RESOLUTION_CODE, 0)
     )
+    v2_attempt_zero_code_count = _status_count(
+        resolution_codes_source.get(SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE, 0)
+    )
     if (
         blocking_failed_count + terminally_resolved_failed_count
         != state_counts[SidebarJobState.FAILED.value]
         or terminal_total != terminal_effective + terminal_ineffective
         or terminal_effective != terminally_resolved_failed_count
         or terminal_ineffective != ineffective_terminal_resolution_count
-        or terminal_code_count + precreate_code_count + unbound_code_count
-        != terminal_effective
+        or (
+            terminal_code_count
+            + precreate_code_count
+            + unbound_code_count
+            + v2_attempt_zero_code_count
+        ) != terminal_effective
     ):
         raise ConfigurationFailure("invalid_sidebar_status")
     raw_execution_blockers = raw.get("execution_blockers")
@@ -5254,6 +5494,16 @@ def _public_sidebar_status(
                 SIDEBAR_TERMINAL_RESOLUTION_CODE: terminal_code_count,
                 SIDEBAR_PRECREATE_RESOLUTION_CODE: precreate_code_count,
                 SIDEBAR_UNBOUND_RESOLUTION_CODE: unbound_code_count,
+                **(
+                    {
+                        SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE: (
+                            v2_attempt_zero_code_count
+                        )
+                    }
+                    if SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE
+                    in resolution_codes_source
+                    else {}
+                ),
             },
         },
         "execution_blockers": execution_blockers,
@@ -5461,6 +5711,7 @@ def _public_sidebar_terminal_resolution_result(
         SIDEBAR_TERMINAL_RESOLUTION_CODE,
         SIDEBAR_PRECREATE_RESOLUTION_CODE,
         SIDEBAR_UNBOUND_RESOLUTION_CODE,
+        SIDEBAR_V2_ATTEMPT_ZERO_RESOLUTION_CODE,
     }:
         raise ProviderDegraded("invalid_sidebar_terminal_resolution_result")
     return {
@@ -5606,6 +5857,12 @@ def _sidebar_terminal_job_id(value: str) -> str:
 def _sidebar_terminal_thread_id(value: str) -> str:
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,511}", value) is None:
         raise argparse.ArgumentTypeError("invalid Codex thread ID")
+    return value
+
+
+def _sidebar_terminal_proof_digest(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise argparse.ArgumentTypeError("invalid sidebar reconciliation proof digest")
     return value
 
 

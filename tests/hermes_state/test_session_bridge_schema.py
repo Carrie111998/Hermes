@@ -15,6 +15,7 @@ EXPECTED_BRIDGE_TABLES = {
     "session_sidebar_jobs",
     "session_sidebar_reconciliation_proofs",
     "session_sidebar_terminal_resolutions",
+    "session_sidebar_v2_attempt_zero_resolutions",
     "session_context_packs",
     "session_bridge_state",
 }
@@ -340,6 +341,99 @@ def test_sidebar_reconciliation_proof_schema_is_append_only(tmp_path):
         db.close()
 
 
+def test_sidebar_v2_attempt_zero_resolution_schema_is_append_only(tmp_path):
+    db = hermes_state.SessionDB(tmp_path / "sidebar-v2-attempt-zero.db")
+    try:
+        columns = tuple(
+            row[1]
+            for row in db._conn.execute(
+                'PRAGMA table_info("session_sidebar_v2_attempt_zero_resolutions")'
+            )
+        )
+        foreign_keys = {
+            (row[3], row[2], row[4], row[5], row[6])
+            for row in db._conn.execute(
+                'PRAGMA foreign_key_list("session_sidebar_v2_attempt_zero_resolutions")'
+            )
+        }
+        triggers = {
+            row[0]
+            for row in db._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+                ("session_sidebar_v2_attempt_zero_resolutions",),
+            )
+        }
+        table_row = db._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("session_sidebar_v2_attempt_zero_resolutions",),
+        ).fetchone()
+        assert columns == (
+            "job_id", "idempotency_key", "source_session_id", "bridge_id",
+            "failure_state", "failure_code", "failure_attempts",
+            "failure_next_attempt_at", "failure_updated_at", "reservation_reserved_at",
+            "reservation_reconciliation_proof_digest",
+            "reservation_reconciliation_generation", "proof_completed_at",
+            "proof_expires_at", "proof_inventory_digest", "resolution_code",
+            "evidence_kind", "evidence_version", "evidence_digest", "resolved_at",
+        )
+        assert foreign_keys == {
+            ("job_id", "session_sidebar_jobs", "id", "RESTRICT", "RESTRICT"),
+            (
+                "reservation_reconciliation_proof_digest",
+                "session_sidebar_reconciliation_proofs", "proof_digest",
+                "RESTRICT", "RESTRICT",
+            ),
+        }
+        assert table_row is not None
+        table_sql = _normalized_sql(table_row[0])
+        assert "failure_attempts INTEGER NOT NULL CHECK (failure_attempts = 0)" in table_sql
+        assert "CHECK (resolved_at <= proof_expires_at)" in table_sql
+        assert triggers == {
+            "trg_session_sidebar_v2_attempt_zero_resolutions_no_replacement",
+            "trg_session_sidebar_v2_attempt_zero_resolutions_no_update",
+            "trg_session_sidebar_v2_attempt_zero_resolutions_no_delete",
+        }
+    finally:
+        db.close()
+
+
+def test_sidebar_resolution_ledgers_exclude_v2_attempt_zero_in_both_orders(tmp_path):
+    db = hermes_state.SessionDB(tmp_path / "sidebar-v2-mutual-exclusion.db")
+    try:
+        triggers_by_table = {
+            table: {
+                row[0]
+                for row in db._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+                    (table,),
+                )
+            }
+            for table in (
+                "session_sidebar_terminal_resolutions",
+                "session_sidebar_precreate_resolutions",
+                "session_sidebar_unbound_resolutions",
+                "session_sidebar_v2_attempt_zero_resolutions",
+            )
+        }
+        replacement = db._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            ("trg_session_sidebar_v2_attempt_zero_resolutions_no_replacement",),
+        ).fetchone()
+        assert replacement is not None
+        replacement_sql = _normalized_sql(replacement[0])
+        assert "trg_session_sidebar_terminal_resolutions_no_v2_attempt_zero_overlap" in triggers_by_table["session_sidebar_terminal_resolutions"]
+        assert "trg_session_sidebar_precreate_resolutions_no_v2_attempt_zero_overlap" in triggers_by_table["session_sidebar_precreate_resolutions"]
+        assert "trg_session_sidebar_unbound_resolutions_no_v2_attempt_zero_overlap" in triggers_by_table["session_sidebar_unbound_resolutions"]
+        for existing_table in (
+            "session_sidebar_terminal_resolutions",
+            "session_sidebar_precreate_resolutions",
+            "session_sidebar_unbound_resolutions",
+        ):
+            assert existing_table in replacement_sql
+    finally:
+        db.close()
+
+
 def test_v20_database_upgrades_without_changing_existing_rows(tmp_path):
     db_path = tmp_path / "v20.db"
     message_id = _prepare_v20_database(db_path)
@@ -396,6 +490,273 @@ def test_reopening_upgraded_database_is_idempotent(tmp_path):
         )
     finally:
         conn.close()
+
+
+def test_v32_database_repairs_same_named_malformed_v33_trigger_before_advancing(
+    tmp_path,
+):
+    db_path = tmp_path / "v32-malformed-v33-trigger.db"
+    initial = hermes_state.SessionDB(db_path)
+    initial.close()
+
+    trigger_name = "trg_session_sidebar_v2_attempt_zero_resolutions_no_update"
+    malformed_sql = f"""CREATE TRIGGER {trigger_name}
+        BEFORE UPDATE ON session_sidebar_v2_attempt_zero_resolutions
+        BEGIN SELECT 1; END"""
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.execute(f'DROP TRIGGER "{trigger_name}"')
+        raw.execute(malformed_sql)
+        raw.execute("UPDATE schema_version SET version = 32")
+        raw.commit()
+    finally:
+        raw.close()
+
+    upgraded = hermes_state.SessionDB(db_path)
+    try:
+        conn = upgraded._conn
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 33
+        repaired_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (trigger_name,),
+        ).fetchone()[0]
+        assert " ".join(repaired_sql.split()) != " ".join(malformed_sql.split())
+        from session_bridge.store import SessionBridgeStore
+
+        assert SessionBridgeStore._sidebar_terminal_resolution_ledger_is_valid(conn)
+    finally:
+        upgraded.close()
+
+
+def test_v32_v33_trigger_repair_rolls_back_before_schema_marker_on_failure(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "v32-v33-trigger-rollback.db"
+    initial = hermes_state.SessionDB(db_path)
+    initial.close()
+
+    trigger_name = "trg_session_sidebar_v2_attempt_zero_resolutions_no_update"
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.execute("UPDATE schema_version SET version = 32")
+        raw.commit()
+    finally:
+        raw.close()
+
+    original_repair = hermes_state.SessionDB._repair_v33_sidebar_resolution_triggers
+
+    def fail_after_repair(cursor):
+        original_repair(cursor)
+        cursor.execute(f'DROP TRIGGER "{trigger_name}"')
+        raise RuntimeError("injected v33 repair failure")
+
+    monkeypatch.setattr(
+        hermes_state.SessionDB,
+        "_repair_v33_sidebar_resolution_triggers",
+        staticmethod(fail_after_repair),
+    )
+    with pytest.raises(RuntimeError, match="injected v33 repair failure"):
+        hermes_state.SessionDB(db_path)
+
+    raw = sqlite3.connect(db_path)
+    try:
+        assert raw.execute("SELECT version FROM schema_version").fetchone()[0] == 32
+        assert raw.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (trigger_name,),
+        ).fetchone() is not None
+    finally:
+        raw.close()
+
+
+def test_v32_database_repairs_malformed_same_named_v33_ledger_before_advancing(
+    tmp_path,
+):
+    db_path = tmp_path / "v32-malformed-v33-ledger.db"
+    initial = hermes_state.SessionDB(db_path)
+    initial.close()
+
+    raw = sqlite3.connect(db_path)
+    try:
+        trigger_rows = raw.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+            ("session_sidebar_v2_attempt_zero_resolutions",),
+        ).fetchall()
+        for (trigger_name,) in trigger_rows:
+            raw.execute(f'DROP TRIGGER "{trigger_name}"')
+        raw.execute("DROP TABLE session_sidebar_v2_attempt_zero_resolutions")
+        raw.execute(
+            "CREATE TABLE session_sidebar_v2_attempt_zero_resolutions "
+            "(job_id TEXT PRIMARY KEY)"
+        )
+        raw.execute("UPDATE schema_version SET version = 32")
+        raw.commit()
+    finally:
+        raw.close()
+
+    upgraded = hermes_state.SessionDB(db_path)
+    try:
+        assert upgraded._conn.execute(
+            "SELECT version FROM schema_version"
+        ).fetchone()[0] == 33
+        from session_bridge.store import SessionBridgeStore
+
+        assert SessionBridgeStore._sidebar_terminal_resolution_ledger_is_valid(
+            upgraded._conn
+        )
+    finally:
+        upgraded.close()
+
+
+def test_v32_database_refuses_to_replace_malformed_v33_ledger_with_evidence(
+    tmp_path,
+):
+    db_path = tmp_path / "v32-malformed-v33-ledger-with-evidence.db"
+    initial = hermes_state.SessionDB(db_path)
+    initial.close()
+
+    raw = sqlite3.connect(db_path)
+    try:
+        trigger_rows = raw.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+            ("session_sidebar_v2_attempt_zero_resolutions",),
+        ).fetchall()
+        for (trigger_name,) in trigger_rows:
+            raw.execute(f'DROP TRIGGER "{trigger_name}"')
+        raw.execute("DROP TABLE session_sidebar_v2_attempt_zero_resolutions")
+        raw.execute(
+            "CREATE TABLE session_sidebar_v2_attempt_zero_resolutions "
+            "(job_id TEXT PRIMARY KEY)"
+        )
+        raw.execute(
+            "INSERT INTO session_sidebar_v2_attempt_zero_resolutions (job_id) "
+            "VALUES ('preserve-me')"
+        )
+        raw.execute("UPDATE schema_version SET version = 32")
+        raw.commit()
+    finally:
+        raw.close()
+
+    with pytest.raises(
+        RuntimeError,
+        match="malformed v33 sidebar terminal resolution ledger contains evidence",
+    ):
+        hermes_state.SessionDB(db_path)
+
+    raw = sqlite3.connect(db_path)
+    try:
+        assert raw.execute("SELECT version FROM schema_version").fetchone()[0] == 32
+        assert raw.execute(
+            "SELECT job_id FROM session_sidebar_v2_attempt_zero_resolutions"
+        ).fetchall() == [("preserve-me",)]
+    finally:
+        raw.close()
+
+
+def test_v32_database_adds_v2_attempt_zero_ledger_preserves_rows_and_reopens(
+    tmp_path,
+):
+    db_path = tmp_path / "v32-to-v33.db"
+    initial = hermes_state.SessionDB(db_path)
+    try:
+        conn = initial._conn
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            ("v32-preserved-session", "cli", 1000.0),
+        )
+        message_id = conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES (?, ?, ?, ?)",
+            ("v32-preserved-session", "user", "preserve through v33", 1001.0),
+        ).lastrowid
+        conn.commit()
+    finally:
+        initial.close()
+
+    v33_trigger_names = (
+        "trg_session_sidebar_terminal_resolutions_no_v2_attempt_zero_overlap",
+        "trg_session_sidebar_precreate_resolutions_no_v2_attempt_zero_overlap",
+        "trg_session_sidebar_unbound_resolutions_no_v2_attempt_zero_overlap",
+        "trg_session_sidebar_v2_attempt_zero_resolutions_no_replacement",
+        "trg_session_sidebar_v2_attempt_zero_resolutions_no_update",
+        "trg_session_sidebar_v2_attempt_zero_resolutions_no_delete",
+    )
+    raw = sqlite3.connect(db_path)
+    try:
+        # A genuine v32 database never had these v33 objects.  Drop the
+        # complete new cross-ledger trigger set while keeping every earlier
+        # object intact so the upgrade must restore them rather than relying
+        # on a fresh database's full schema creation.
+        for trigger_name in v33_trigger_names:
+            raw.execute(f'DROP TRIGGER "{trigger_name}"')
+        raw.execute("DROP TABLE session_sidebar_v2_attempt_zero_resolutions")
+        raw.execute("UPDATE schema_version SET version = 32")
+        raw.commit()
+    finally:
+        raw.close()
+
+    upgraded = hermes_state.SessionDB(db_path)
+    try:
+        conn = upgraded._conn
+        assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 33
+        assert tuple(
+            conn.execute(
+                "SELECT id, source, started_at FROM sessions WHERE id = ?",
+                ("v32-preserved-session",),
+            ).fetchone()
+        ) == ("v32-preserved-session", "cli", 1000.0)
+        assert tuple(
+            conn.execute(
+                "SELECT id, session_id, role, content FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+        ) == (
+            message_id,
+            "v32-preserved-session",
+            "user",
+            "preserve through v33",
+        )
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("session_sidebar_v2_attempt_zero_resolutions",),
+        ).fetchone() is not None
+        trigger_names = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        }
+        assert set(v33_trigger_names) <= trigger_names
+        # The store's trust decision is strict about the exact complete trigger
+        # sets, so an upgraded v32 database must be admitted as a sound ledger
+        # authority rather than merely contain the new table.
+        from session_bridge.store import SessionBridgeStore
+
+        assert SessionBridgeStore._sidebar_terminal_resolution_ledger_is_valid(conn)
+    finally:
+        upgraded.close()
+
+    reopened = hermes_state.SessionDB(db_path)
+    try:
+        assert [
+            tuple(row)
+            for row in reopened._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchall()
+        ] == [(33,)]
+        assert reopened._conn.execute(
+            "SELECT content FROM messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()[0] == "preserve through v33"
+        assert {
+            row[0]
+            for row in reopened._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            ).fetchall()
+        } >= set(v33_trigger_names)
+    finally:
+        reopened.close()
 
 
 CLAUDE_CHARACTERIZATION_EVENT_COLUMNS = (

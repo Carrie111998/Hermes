@@ -161,6 +161,13 @@ class FakeBackend:
             "resolution_code": "native_create_unrecoverable",
         }
     )
+    sidebar_v2_attempt_zero_terminal_payload: dict[str, Any] = field(
+        default_factory=lambda: {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "v2_attempt_zero_create_unrecoverable",
+        }
+    )
     sidebar_bound_retry_payload: dict[str, Any] = field(
         default_factory=lambda: {
             "status": "requeued",
@@ -395,6 +402,23 @@ class FakeBackend:
             expected_error_code,
         ))
         return dict(self.sidebar_unbound_terminal_payload)
+
+    def sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+        self,
+        *,
+        job_id: str,
+        expected_error_code: str,
+        reconciliation_proof_digest: str,
+        reconciliation_generation: str,
+    ) -> dict[str, Any]:
+        self.calls.append((
+            "sidebar_acknowledge_v2_attempt_zero_unrecoverable",
+            job_id,
+            expected_error_code,
+            reconciliation_proof_digest,
+            reconciliation_generation,
+        ))
+        return dict(self.sidebar_v2_attempt_zero_terminal_payload)
 
     def sidebar_retry_bound(
         self,
@@ -2164,6 +2188,83 @@ def test_sidebar_unbound_acknowledgement_requires_exact_operator_authority_and_s
         assert private not in rendered
 
 
+def test_sidebar_v2_attempt_zero_acknowledgement_requires_exact_authority_and_sanitizes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    job_id = "sidebar-job:" + "d" * 64
+    proof_digest = "e" * 64
+    generation = "codex:exact-generation"
+    backend = FakeBackend(
+        sidebar_v2_attempt_zero_terminal_payload={
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "v2_attempt_zero_create_unrecoverable",
+            "job_id": job_id,
+            "reconciliation_proof_digest": proof_digest,
+            "reconciliation_generation": generation,
+            "cwd": "C:/private/project",
+        }
+    )
+
+    assert _run(
+        [
+            "sidebar-acknowledge-v2-attempt-zero-unrecoverable",
+            "--job-id", job_id,
+            "--expected-error-code", "native_create_ambiguous",
+            "--reconciliation-proof-digest", proof_digest,
+            "--reconciliation-generation", generation,
+            "--confirm", "v2-proof-bound-create-unrecoverable",
+        ],
+        backend,
+    ) == 0
+
+    assert backend.calls == [
+        (
+            "sidebar_acknowledge_v2_attempt_zero_unrecoverable",
+            job_id,
+            "native_create_ambiguous",
+            proof_digest,
+            generation,
+        ),
+        ("close",),
+    ]
+    rendered = capsys.readouterr().out
+    assert json.loads(rendered) == {
+        "status": "acknowledged",
+        "error_code": "native_create_ambiguous",
+        "resolution_code": "v2_attempt_zero_create_unrecoverable",
+    }
+    for private in (job_id, proof_digest, generation, "private/project"):
+        assert private not in rendered
+
+
+@pytest.mark.parametrize(
+    "argv",
+    (
+        [
+            "sidebar-acknowledge-v2-attempt-zero-unrecoverable",
+            "--job-id", "sidebar-job:" + "d" * 64,
+            "--expected-error-code", "native_create_ambiguous",
+            "--reconciliation-proof-digest", "e" * 64,
+            "--reconciliation-generation", "codex:exact-generation",
+        ],
+        [
+            "sidebar-acknowledge-v2-attempt-zero-unrecoverable",
+            "--job-id", "sidebar-job:" + "d" * 64,
+            "--expected-error-code", "native_create_ambiguous",
+            "--reconciliation-proof-digest", "not-a-digest",
+            "--reconciliation-generation", "codex:exact-generation",
+            "--confirm", "v2-proof-bound-create-unrecoverable",
+        ],
+    ),
+)
+def test_sidebar_v2_attempt_zero_acknowledgement_parser_rejects_incomplete_authority(
+    argv: list[str],
+) -> None:
+    with pytest.raises(SystemExit):
+        main(argv)
+
+
 class _TerminalProbeClient:
     def __init__(self, *, scenario: str, thread_id: str) -> None:
         self.scenario = scenario
@@ -2236,14 +2337,17 @@ def _record_cli_absence_proof(
     lease_token: str,
     *,
     completed_at: float = 100.0,
+    expires_at: float | None = None,
+    generation: str | None = None,
+    marker_digest: str = "1" * 64,
 ) -> dict[str, Any]:
     evidence = SidebarReconciliationEvidence.create(
         state=SidebarReconciliationState.ABSENCE_PROVEN,
-        generation=f"cli-scan:{completed_at}",
+        generation=generation or f"cli-scan:{completed_at}",
         completed_at=completed_at,
-        expires_at=completed_at + 1_000.0,
+        expires_at=completed_at + 1_000.0 if expires_at is None else expires_at,
         inventory_digest="2" * 64,
-        marker_digest="1" * 64,
+        marker_digest=marker_digest,
         match_count=0,
         recovered_thread_id=None,
         fixed_reason=None,
@@ -2897,6 +3001,461 @@ def _production_unbound_resolution_backend(
     backend._store = store
     backend._catalog = UnifiedCatalog(db, store)
     return backend, store, failed, reservation, candidate
+
+
+def _production_v2_attempt_zero_resolution_backend(
+    tmp_path: Path,
+    *,
+    marker_secret: bytes,
+    proof_ttl_seconds: float = 1_000.0,
+) -> tuple[
+    ProductionBackend,
+    SessionBridgeStore,
+    dict[str, Any],
+    dict[str, Any],
+    dict[str, Any],
+    SidebarCandidate,
+]:
+    db = SessionDB(tmp_path / "v2-attempt-zero-terminal.db")
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=lambda: "v2-attempt-zero-terminal-token",
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    base = time.time() - 10.0
+    source_session_id = "hermes:v2-attempt-zero-terminal"
+    db.ensure_session(source_session_id, source="cli")
+    candidate = SidebarCandidate(
+        source_session_id=source_session_id,
+        provider=Provider.HERMES,
+        bridge_id=sidebar_bridge_id(source_session_id),
+        title="[Hermes] v2 attempts-zero terminal evidence",
+        cwd=str(tmp_path),
+        git_root=None,
+        git_branch=None,
+        git_head=None,
+        worktree_id=None,
+        eligible_at=base,
+    )
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=base, limit=1)[0]
+    expected_marker = BridgeMarkerPayload(
+        bridge_id=candidate.bridge_id,
+        source_session_id=candidate.source_session_id,
+        target_provider=Provider.CODEX,
+        policy_generation=1,
+    )
+    marker = encode_bridge_marker(expected_marker, marker_secret)
+    proof = _record_cli_absence_proof(
+        store,
+        lease["lease_token"],
+        completed_at=base,
+        expires_at=base + proof_ttl_seconds,
+        generation="codex:v2-attempt-zero-exact",
+        marker_digest=hashlib.sha256(marker.encode("utf-8")).hexdigest(),
+    )
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key=sidebar_create_recovery_key(marker, marker_secret),
+        reconciliation_proof_digest=proof["proof_digest"],
+        reconciliation_generation=proof["reconciliation_generation"],
+        now=base + 1.0,
+    )
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=base + 2.0,
+    )
+    backend = ProductionBackend(BridgeConfig())
+    backend._db = db
+    backend._store = store
+    backend._catalog = UnifiedCatalog(db, store)
+    return backend, store, failed, reservation, proof, candidate
+
+
+def test_production_v2_attempt_zero_acknowledgement_uses_fresh_exact_cwd_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"v2-attempt-zero-cli-marker-secret"
+    backend, store, failed, reservation, proof, candidate = (
+        _production_v2_attempt_zero_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    before = store.get_sidebar_job_for_source(candidate.source_session_id)
+    try:
+        first = backend.sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+            job_id=failed["id"],
+            expected_error_code="native_create_ambiguous",
+            reconciliation_proof_digest=proof["proof_digest"],
+            reconciliation_generation=proof["reconciliation_generation"],
+        )
+        replay = backend.sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+            job_id=failed["id"],
+            expected_error_code="native_create_ambiguous",
+            reconciliation_proof_digest=proof["proof_digest"],
+            reconciliation_generation=proof["reconciliation_generation"],
+        )
+
+        assert first == {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "v2_attempt_zero_create_unrecoverable",
+        }
+        assert replay == {**first, "status": "already_acknowledged"}
+        assert len(verifier.terminal_marker_calls) == 2
+        assert verifier.marker_calls == []
+        assert [
+            (recovery_key, cwd)
+            for recovery_key, cwd, _deadline in verifier.recovery_calls
+        ] == [(reservation["recovery_key"], candidate.cwd)] * 2
+        assert verifier.create_calls == []
+        assert store.get_sidebar_job_for_source(candidate.source_session_id) == before
+    finally:
+        backend.close()
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_exception", "expected_recovery_calls"),
+    (
+        ("marker_match", RolloutGateBlocked, 0),
+        ("archived_marker_match", RolloutGateBlocked, 0),
+        ("recovery_match", RolloutGateBlocked, 1),
+        ("marker_error", ProviderDegraded, 0),
+        ("recovery_error", ProviderDegraded, 1),
+    ),
+)
+def test_production_v2_attempt_zero_acknowledgement_fails_closed_without_two_zero_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expected_exception: type[Exception],
+    expected_recovery_calls: int,
+) -> None:
+    marker_secret = b"v2-attempt-zero-cli-marker-secret"
+    backend, store, failed, _reservation, proof, candidate = (
+        _production_v2_attempt_zero_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier(scenario)
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    try:
+        with pytest.raises(expected_exception):
+            backend.sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+                reconciliation_proof_digest=proof["proof_digest"],
+                reconciliation_generation=proof["reconciliation_generation"],
+            )
+        assert len(verifier.terminal_marker_calls) == 1
+        assert len(verifier.recovery_calls) == expected_recovery_calls
+        assert verifier.create_calls == []
+        assert store.db._conn.execute(
+            "SELECT COUNT(*) FROM session_sidebar_v2_attempt_zero_resolutions"
+        ).fetchone()[0] == 0
+        assert store.get_sidebar_job_for_source(candidate.source_session_id) is not None
+    finally:
+        backend.close()
+
+
+def test_production_v2_attempt_zero_snapshot_change_after_probes_is_cas_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"v2-attempt-zero-cli-marker-secret"
+    backend, store, failed, _reservation, proof, candidate = (
+        _production_v2_attempt_zero_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+    original_recovery_probe = verifier.find_by_recovery_key
+
+    def drift_after_probe(
+        recovery_key: str,
+        *,
+        expected_cwd: str,
+        deadline: float,
+    ) -> str | None:
+        result = original_recovery_probe(
+            recovery_key,
+            expected_cwd=expected_cwd,
+            deadline=deadline,
+        )
+        store.db._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE session_sidebar_jobs SET updated_at = updated_at + 1 "
+                "WHERE id = ?",
+                (failed["id"],),
+            )
+        )
+        return result
+
+    verifier.find_by_recovery_key = drift_after_probe  # type: ignore[method-assign]
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    try:
+        with pytest.raises(
+            RolloutGateBlocked,
+            match="sidebar_v2_attempt_zero_snapshot_mismatch",
+        ):
+            backend.sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+                reconciliation_proof_digest=proof["proof_digest"],
+                reconciliation_generation=proof["reconciliation_generation"],
+            )
+        assert store.db._conn.execute(
+            "SELECT COUNT(*) FROM session_sidebar_v2_attempt_zero_resolutions"
+        ).fetchone()[0] == 0
+        assert verifier.create_calls == []
+        assert store.get_sidebar_job_for_source(candidate.source_session_id) is not None
+    finally:
+        backend.close()
+
+
+def test_production_v2_attempt_zero_materialization_after_probes_is_cas_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"v2-attempt-zero-cli-marker-secret"
+    backend, store, failed, _reservation, proof, candidate = (
+        _production_v2_attempt_zero_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+    original_recovery_probe = verifier.find_by_recovery_key
+
+    def materialize_after_probe(
+        recovery_key: str,
+        *,
+        expected_cwd: str,
+        deadline: float,
+    ) -> str | None:
+        result = original_recovery_probe(
+            recovery_key,
+            expected_cwd=expected_cwd,
+            deadline=deadline,
+        )
+        target_session_id = "codex:v2-attempt-zero-raced-native"
+        store.db.ensure_session(target_session_id, source="cli")
+        store.db._execute_write(
+            lambda conn: conn.execute(
+                """INSERT INTO external_sessions (
+                       session_id, provider, native_id, native_status,
+                       first_indexed_at, last_indexed_at, parser_version,
+                       origin_kind, origin_bridge_id
+                   ) VALUES (?, 'codex', ?, 'idle', ?, ?, 1,
+                       'bridge_placeholder', ?)""",
+                (
+                    target_session_id,
+                    "v2-attempt-zero-raced-native",
+                    time.time(),
+                    time.time(),
+                    candidate.bridge_id,
+                ),
+            )
+        )
+        return result
+
+    verifier.find_by_recovery_key = materialize_after_probe  # type: ignore[method-assign]
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    try:
+        with pytest.raises(
+            RolloutGateBlocked,
+            match="sidebar_v2_attempt_zero_snapshot_mismatch",
+        ):
+            backend.sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+                reconciliation_proof_digest=proof["proof_digest"],
+                reconciliation_generation=proof["reconciliation_generation"],
+            )
+        assert store.db._conn.execute(
+            "SELECT COUNT(*) FROM session_sidebar_v2_attempt_zero_resolutions"
+        ).fetchone()[0] == 0
+        assert verifier.create_calls == []
+    finally:
+        backend.close()
+
+
+def test_production_v2_attempt_zero_expired_proof_rejected_after_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"v2-attempt-zero-cli-marker-secret"
+    backend, store, failed, _reservation, proof, _candidate = (
+        _production_v2_attempt_zero_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+            proof_ttl_seconds=5.0,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    try:
+        with pytest.raises(
+            RolloutGateBlocked,
+            match="sidebar_v2_attempt_zero_snapshot_mismatch",
+        ):
+            backend.sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+                reconciliation_proof_digest=proof["proof_digest"],
+                reconciliation_generation=proof["reconciliation_generation"],
+            )
+        assert len(verifier.terminal_marker_calls) == 1
+        assert len(verifier.recovery_calls) == 1
+        assert store.db._conn.execute(
+            "SELECT COUNT(*) FROM session_sidebar_v2_attempt_zero_resolutions"
+        ).fetchone()[0] == 0
+    finally:
+        backend.close()
+
+
+def test_production_v2_attempt_zero_proof_expiring_during_second_probe_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"v2-attempt-zero-cli-marker-secret"
+    backend, store, failed, _reservation, proof, _candidate = (
+        _production_v2_attempt_zero_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+            proof_ttl_seconds=1_000.0,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+    clock = {"now": float(proof["expires_at"]) - 1.0}
+    original_recovery_probe = verifier.find_by_recovery_key
+
+    def expire_during_recovery_probe(
+        recovery_key: str,
+        *,
+        expected_cwd: str,
+        deadline: float,
+    ) -> str | None:
+        result = original_recovery_probe(
+            recovery_key,
+            expected_cwd=expected_cwd,
+            deadline=deadline,
+        )
+        clock["now"] = float(proof["expires_at"]) + 0.001
+        return result
+
+    verifier.find_by_recovery_key = expire_during_recovery_probe  # type: ignore[method-assign]
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: clock["now"])
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    try:
+        with pytest.raises(
+            RolloutGateBlocked,
+            match="sidebar_v2_attempt_zero_snapshot_mismatch",
+        ):
+            backend.sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+                reconciliation_proof_digest=proof["proof_digest"],
+                reconciliation_generation=proof["reconciliation_generation"],
+            )
+        assert len(verifier.terminal_marker_calls) == 1
+        assert len(verifier.recovery_calls) == 1
+        assert verifier.create_calls == []
+        assert store.db._conn.execute(
+            "SELECT COUNT(*) FROM session_sidebar_v2_attempt_zero_resolutions"
+        ).fetchone()[0] == 0
+    finally:
+        backend.close()
+
+
+def test_production_v2_attempt_zero_recovery_probe_enforces_exact_candidate_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_secret = b"v2-attempt-zero-cli-marker-secret"
+    backend, store, failed, _reservation, proof, candidate = (
+        _production_v2_attempt_zero_resolution_backend(
+            tmp_path,
+            marker_secret=marker_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+
+    def wrong_cwd_probe(
+        recovery_key: str,
+        *,
+        expected_cwd: str,
+        deadline: float,
+    ) -> None:
+        verifier.recovery_calls.append((recovery_key, expected_cwd, deadline))
+        if expected_cwd == candidate.cwd:
+            raise RuntimeError("provider reports recovery-key cwd mismatch")
+
+    verifier.find_by_recovery_key = wrong_cwd_probe  # type: ignore[method-assign]
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret: verifier,
+        raising=False,
+    )
+    try:
+        with pytest.raises(ProviderDegraded, match="sidebar_v2_attempt_zero_probe_failed"):
+            backend.sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+                reconciliation_proof_digest=proof["proof_digest"],
+                reconciliation_generation=proof["reconciliation_generation"],
+            )
+        assert verifier.recovery_calls[0][1] == candidate.cwd
+        assert store.db._conn.execute(
+            "SELECT COUNT(*) FROM session_sidebar_v2_attempt_zero_resolutions"
+        ).fetchone()[0] == 0
+    finally:
+        backend.close()
 
 
 def test_production_unbound_acknowledgement_probes_exact_identities_and_replays(
@@ -4030,6 +4589,76 @@ def test_sidebar_status_accepts_and_preserves_precreate_terminal_resolution(
         "precutover_create_unrecoverable": 1,
         "native_create_unrecoverable": 0,
     }
+
+def test_sidebar_status_accepts_v2_attempt_zero_without_private_proof_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    proof_digest = "e" * 64
+    generation = "codex:private-generation"
+    backend = _production_sidebar_backend({
+        "eligible_by_provider": {"claude": 1, "hermes": 0},
+        "counts": {"sidebar_failed": 1},
+        "blocking_failed_count": 0,
+        "terminally_resolved_failed_count": 1,
+        "ineffective_terminal_resolution_count": 0,
+        "terminal_resolution_ledger_valid": True,
+        "terminal_resolutions": {
+            "total": 1,
+            "effective": 1,
+            "ineffective": 0,
+            "by_resolution_code": {
+                "native_thread_unrecoverable": 0,
+                "v2_attempt_zero_create_unrecoverable": 1,
+            },
+            "proof_digest": proof_digest,
+            "reconciliation_generation": generation,
+            "private_rows": [{"cwd": "C:/private/v2"}],
+        },
+        "execution_blockers": [],
+        "oldest_pending_age_seconds": None,
+        "last_heartbeat_at": None,
+        "last_visible_task_id": None,
+        "recent_error_codes": ["native_create_ambiguous"],
+        "delivery_latency_seconds": {},
+    })
+
+    status = backend.sidebar_status()
+
+    assert status["healthy"] is True
+    assert status["terminal_resolutions"]["by_resolution_code"] == {
+        "native_thread_unrecoverable": 0,
+        "precutover_create_unrecoverable": 0,
+        "native_create_unrecoverable": 0,
+        "v2_attempt_zero_create_unrecoverable": 1,
+    }
+    rendered = json.dumps(status)
+    for private in (proof_digest, generation, "private/v2", "private_rows"):
+        assert private not in rendered
+
+
+def test_sidebar_status_rejects_unknown_terminal_resolution_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    backend = _production_sidebar_backend({
+        "counts": {"sidebar_failed": 1},
+        "blocking_failed_count": 0,
+        "terminally_resolved_failed_count": 1,
+        "ineffective_terminal_resolution_count": 0,
+        "terminal_resolution_ledger_valid": True,
+        "terminal_resolutions": {
+            "total": 1,
+            "effective": 1,
+            "ineffective": 0,
+            "by_resolution_code": {"private_unbounded_code": 1},
+        },
+        "execution_blockers": [],
+    })
+
+    with pytest.raises(ConfigurationFailure, match="invalid_sidebar_status"):
+        backend.sidebar_status()
+
 
 def test_sidebar_status_accepts_and_preserves_unbound_terminal_resolution(
     monkeypatch: pytest.MonkeyPatch,
