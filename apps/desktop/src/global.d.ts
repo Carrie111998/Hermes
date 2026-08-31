@@ -291,6 +291,14 @@ declare global {
       setActiveWork?: (payload: HermesActiveWork) => void
       setTitleBarTheme?: (payload: HermesTitleBarTheme) => void
       setNativeTheme?: (mode: 'dark' | 'light' | 'system') => void
+      /** Linux titlebar controls: system hides Electron's overlay on compositor-managed Wayland. */
+      windowControls?: {
+        compositorManaged: boolean
+        mode: 'hidden' | 'native' | 'system'
+        supported: boolean
+        setMode: (mode: 'hidden' | 'native' | 'system') => void
+        onChanged: (callback: (mode: 'hidden' | 'native' | 'system') => void) => () => void
+      }
       /** Main-process fact: this OS can back glass with a native material. */
       glassSupported?: boolean
       /** Main-process fact: this OS can do any translucency at all (not Linux). */

@@ -359,6 +359,12 @@ export const zhHant = defineLocale({
       uiScaleTitle: '介面縮放',
       uiScaleDesc: (percent: number) =>
         `縮放整個應用程式的文字與介面。也可使用 Cmd/Ctrl 加 +、- 或 0 調整。目前：${percent}%`,
+      windowControlsTitle: '視窗控制',
+      windowControlsDesc:
+        '選擇是否顯示 Electron 的最小化、最大化與關閉按鈕。系統模式會在 Hyprland 上隱藏它們；原生模式一律顯示；隱藏模式交由視窗合成器管理。',
+      windowControlsSystem: '系統',
+      windowControlsNative: '原生',
+      windowControlsHidden: '隱藏',
       sessionDensityTitle: '工作階段列表密度',
       sessionDensityDesc: '選擇側邊欄工作階段標題下方顯示的資訊量。',
       sessionDensityCompact: '緊湊',

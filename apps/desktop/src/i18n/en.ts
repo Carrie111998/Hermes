@@ -546,6 +546,12 @@ export const en: Translations = {
       uiScaleTitle: 'UI Scale',
       uiScaleDesc: (percent: number) =>
         `Scales text and controls across the whole app. Cmd/Ctrl with +, - and 0 also works. Current: ${percent}%.`,
+      windowControlsTitle: 'Window Controls',
+      windowControlsDesc:
+        'Choose whether Electron shows minimize, maximize, and close controls. System hides them on compositor-managed Wayland sessions such as Hyprland, Sway, river, niri, and dwl; Native always shows them; Hidden leaves window management to your compositor.',
+      windowControlsSystem: 'System',
+      windowControlsNative: 'Native',
+      windowControlsHidden: 'Hidden',
       sessionDensityTitle: 'Session List Density',
       sessionDensityDesc: 'Choose how much context appears beneath session titles in the sidebar.',
       sessionDensityCompact: 'Compact',

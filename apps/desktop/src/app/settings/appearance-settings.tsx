@@ -47,6 +47,12 @@ import {
   TRANSLUCENCY_SUPPORTED
 } from '@/store/translucency'
 import { $vibeHeartsEnabled, setVibeHeartsEnabled } from '@/store/vibe-hearts-enabled'
+import {
+  $windowControlsMode,
+  setWindowControlsMode,
+  WINDOW_CONTROLS_SUPPORTED,
+  type WindowControlsMode
+} from '@/store/window-controls'
 import { $zoomPercent, setZoomPercent } from '@/store/zoom'
 import { getBaseColors, useTheme } from '@/themes/context'
 import { installVscodeThemeFromMarketplace } from '@/themes/install'
@@ -364,6 +370,7 @@ export function AppearanceSettings() {
   const backdrop = useStore($backdrop)
   const introSplash = useStore($introSplash)
   const installs = useStore($marketplaceInstalls)
+  const windowControlsMode = useStore($windowControlsMode)
   const profiles = useStore($profiles)
   const activeProfileKey = normalizeProfileKey(useStore($activeGatewayProfile))
   const a = t.settings.appearance
@@ -445,6 +452,12 @@ export function AppearanceSettings() {
   ] as const satisfies readonly { id: EmbedMode; label: string }[]
 
   const uiScaleOptions = UI_SCALE_PRESETS.map(preset => ({ id: preset, label: `${preset}%` }))
+
+  const windowControlsOptions = [
+    { id: 'system', label: a.windowControlsSystem },
+    { id: 'native', label: a.windowControlsNative },
+    { id: 'hidden', label: a.windowControlsHidden }
+  ] as const satisfies readonly { id: WindowControlsMode; label: string }[]
 
   const matchedScalePreset = matchUiScalePreset(zoomPercent)
 
@@ -582,6 +595,24 @@ export function AppearanceSettings() {
           />
 
           <TerminalFontSetting />
+
+          {WINDOW_CONTROLS_SUPPORTED && (
+            <ListRow
+              action={
+                <SegmentedControl
+                  onChange={id => {
+                    triggerHaptic('selection')
+                    setWindowControlsMode(id)
+                  }}
+                  options={windowControlsOptions}
+                  value={windowControlsMode}
+                />
+              }
+              description={a.windowControlsDesc}
+              id={appearanceSettingElementId(APPEARANCE_SETTING_IDS.windowControls)}
+              title={a.windowControlsTitle}
+            />
+          )}
 
           <ListRow
             action={
