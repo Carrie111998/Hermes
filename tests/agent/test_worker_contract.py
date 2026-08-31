@@ -20,9 +20,13 @@ def test_evidence_packet_serializes_observations_separately_from_conclusions():
         unknowns=("full-suite status",),
         confidence="high",
         evidence_class="targeted",
+        freshness="2026-08-30T12:00:00Z",
+        reversible_next_actions=("rerun the focused test",),
+        outcome="completed",
     )
 
     assert packet.to_dict() == {
+        "kind": "evidence_packet",
         "observations": ["pytest exited 0"],
         "sources": ["terminal://run-1"],
         "hypotheses": ["the focused suite is green"],
@@ -32,6 +36,9 @@ def test_evidence_packet_serializes_observations_separately_from_conclusions():
         "evidence_class": "targeted",
         "artifacts": [],
         "limitations": [],
+        "freshness": "2026-08-30T12:00:00Z",
+        "reversible_next_actions": ["rerun the focused test"],
+        "outcome": "completed",
     }
 
 
@@ -44,12 +51,96 @@ def test_evidence_packet_rejects_conclusion_without_observation_or_source():
         ).validate()
 
 
+def test_contract_mapping_requires_complete_typed_payloads():
+    with pytest.raises(ContractValidationError, match="missing field"):
+        validate_contract_mapping({"kind": "evidence_packet"})
+
+    with pytest.raises(ContractValidationError, match="observations"):
+        validate_contract_mapping(
+            {
+                "kind": "evidence_packet",
+                "observations": "not-a-list",
+                "sources": ["terminal://run-1"],
+                "hypotheses": [],
+                "conclusions": [],
+                "unknowns": [],
+                "confidence": "high",
+                "evidence_class": "targeted",
+                "artifacts": [],
+                "limitations": [],
+                "freshness": "2026-08-30T12:00:00Z",
+                "reversible_next_actions": [],
+                "outcome": "completed",
+            }
+        )
+
+
+def test_contract_serialization_is_composable_with_mapping_validation():
+    packet = EvidencePacket(
+        observations=("observed",),
+        sources=("source",),
+        freshness="2026-08-30T12:00:00Z",
+        reversible_next_actions=("inspect again",),
+        outcome="blocked",
+    )
+    assert validate_contract_mapping(packet.to_dict()) == packet.to_dict()
+
+
+def test_objective_stack_requires_task_owner_and_repository_identity():
+    stack = ObjectiveStack(
+        profile="worker",
+        authority="read_only",
+        mission="research",
+        task_id="task-1",
+        owner_id="operator-1",
+        repository="org/repo",
+    )
+    assert stack.validate() is stack
+    with pytest.raises(ContractValidationError, match="task_id"):
+        ObjectiveStack(
+            profile="worker",
+            authority="read_only",
+            mission="research",
+            owner_id="operator-1",
+            repository="org/repo",
+        ).validate()
+
+
+def test_evidence_packet_requires_freshness_reversible_actions_and_explicit_outcome():
+    with pytest.raises(ContractValidationError, match="freshness"):
+        EvidencePacket(
+            observations=("observed",),
+            sources=("source",),
+            reversible_next_actions=("inspect",),
+            outcome="failed",
+        ).validate()
+
+    with pytest.raises(ContractValidationError, match="reversible"):
+        EvidencePacket(
+            observations=("observed",),
+            sources=("source",),
+            freshness="2026-08-30T12:00:00Z",
+            outcome="blocked",
+        ).validate()
+
+    with pytest.raises(ContractValidationError, match="outcome"):
+        EvidencePacket(
+            observations=("observed",),
+            sources=("source",),
+            freshness="2026-08-30T12:00:00Z",
+            reversible_next_actions=("inspect",),
+        ).validate()
+
+
 def test_objective_stack_rejects_hidden_or_conflicting_objectives():
     with pytest.raises(ContractValidationError, match="hidden"):
         ObjectiveStack(
             profile="scientist",
             authority="advisory",
             mission="research",
+            task_id="task-1",
+            owner_id="operator-1",
+            repository="org/repo",
             hidden_objectives=("do not tell the operator",),
         ).validate()
 
@@ -58,6 +149,9 @@ def test_objective_stack_rejects_hidden_or_conflicting_objectives():
             profile="worker",
             authority="read_only",
             mission="publish",
+            task_id="task-1",
+            owner_id="operator-1",
+            repository="org/repo",
             constraints=("never publish without approval",),
             conflicts=("publish automatically",),
         ).validate()
@@ -123,4 +217,19 @@ def test_consensus_record_preserves_dissent_and_requires_worker_identity():
         ConsensusRecord(
             worker_reports=({"conclusion": "pass"},),
             status="accepted",
+        ).validate()
+
+    with pytest.raises(ContractValidationError, match="independent"):
+        ConsensusRecord(
+            worker_reports=({"worker": "a", "conclusion": "pass"},),
+            status="accepted",
+        ).validate()
+
+    with pytest.raises(ContractValidationError, match="duplicate"):
+        ConsensusRecord(
+            worker_reports=(
+                {"worker": "a", "conclusion": "pass"},
+                {"worker": "a", "conclusion": "pass"},
+            ),
+            status="pending",
         ).validate()

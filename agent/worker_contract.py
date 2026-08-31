@@ -29,6 +29,7 @@ _CAPABILITY_STATUSES = {"proposed", "tested", "reviewed", "active"}
 _CONSENSUS_STATUSES = {"pending", "partial", "needs_review", "accepted", "rejected"}
 _VERBOSITIES = {"concise", "normal", "detailed"}
 _DIRECTNESS = {"low", "normal", "high"}
+_OUTCOMES = {"completed", "partial", "blocked", "failed"}
 
 
 def _require_text(name: str, value: Any) -> str:
@@ -70,6 +71,9 @@ class EvidencePacket:
     evidence_class: str = "unknown"
     artifacts: tuple[str, ...] = ()
     limitations: tuple[str, ...] = ()
+    freshness: str = ""
+    reversible_next_actions: tuple[str, ...] = ()
+    outcome: str = ""
 
     def validate(self) -> "EvidencePacket":
         observations = _validate_texts("observations", self.observations)
@@ -88,11 +92,17 @@ class EvidencePacket:
             raise ContractValidationError("observations require sources")
         if conclusions and not sources:
             raise ContractValidationError("conclusions require sources")
+        _require_text("freshness", self.freshness)
+        next_actions = _validate_texts("reversible_next_actions", self.reversible_next_actions)
+        if not next_actions:
+            raise ContractValidationError("reversible_next_actions must not be empty")
+        _validate_choice("outcome", self.outcome, _OUTCOMES)
         return self
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
         return {
+            "kind": "evidence_packet",
             "observations": list(self.observations),
             "sources": list(self.sources),
             "hypotheses": list(self.hypotheses),
@@ -102,6 +112,9 @@ class EvidencePacket:
             "evidence_class": self.evidence_class,
             "artifacts": list(self.artifacts),
             "limitations": list(self.limitations),
+            "freshness": self.freshness,
+            "reversible_next_actions": list(self.reversible_next_actions),
+            "outcome": self.outcome,
         }
 
 
@@ -112,6 +125,9 @@ class ObjectiveStack:
     profile: str
     authority: str
     mission: str
+    task_id: str = ""
+    owner_id: str = ""
+    repository: str = ""
     constraints: tuple[str, ...] = ()
     forbidden_actions: tuple[str, ...] = ()
     hidden_objectives: tuple[str, ...] = ()
@@ -121,6 +137,9 @@ class ObjectiveStack:
         _require_text("profile", self.profile)
         _require_text("authority", self.authority)
         _require_text("mission", self.mission)
+        _require_text("task_id", self.task_id)
+        _require_text("owner_id", self.owner_id)
+        _require_text("repository", self.repository)
         _validate_texts("constraints", self.constraints)
         _validate_texts("forbidden_actions", self.forbidden_actions)
         hidden = _validate_texts("hidden_objectives", self.hidden_objectives)
@@ -134,9 +153,13 @@ class ObjectiveStack:
     def to_dict(self) -> dict[str, Any]:
         self.validate()
         return {
+            "kind": "objective_stack",
             "profile": self.profile,
             "authority": self.authority,
             "mission": self.mission,
+            "task_id": self.task_id,
+            "owner_id": self.owner_id,
+            "repository": self.repository,
             "constraints": list(self.constraints),
             "forbidden_actions": list(self.forbidden_actions),
             "hidden_objectives": [],
@@ -172,6 +195,7 @@ class CapabilityRecord:
     def to_dict(self) -> dict[str, Any]:
         self.validate()
         return {
+            "kind": "capability",
             "name": self.name,
             "owner_profile": self.owner_profile,
             "authority": self.authority,
@@ -195,18 +219,25 @@ class ConsensusRecord:
     def validate(self) -> "ConsensusRecord":
         if not self.worker_reports:
             raise ContractValidationError("worker_reports must not be empty")
+        workers: set[str] = set()
         for index, report in enumerate(self.worker_reports):
             if not isinstance(report, Mapping):
                 raise ContractValidationError(f"worker_reports[{index}] must be an object")
-            _require_text(f"worker_reports[{index}].worker", report.get("worker"))
+            worker = _require_text(f"worker_reports[{index}].worker", report.get("worker"))
+            if worker in workers:
+                raise ContractValidationError("worker_reports must contain independent workers; duplicate worker")
+            workers.add(worker)
         _validate_texts("agreement", self.agreement)
         _validate_texts("dissent", self.dissent)
-        _validate_choice("status", self.status, _CONSENSUS_STATUSES)
+        status = _validate_choice("status", self.status, _CONSENSUS_STATUSES)
+        if status == "accepted" and len(workers) < 2:
+            raise ContractValidationError("accepted consensus requires independent worker reports")
         return self
 
     def to_dict(self) -> dict[str, Any]:
         self.validate()
         return {
+            "kind": "consensus",
             "worker_reports": [dict(report) for report in self.worker_reports],
             "agreement": list(self.agreement),
             "dissent": list(self.dissent),
@@ -240,6 +271,7 @@ class WorkerMode:
     def to_dict(self) -> dict[str, Any]:
         self.validate()
         return {
+            "kind": "worker_mode",
             "name": self.name,
             "verbosity": self.verbosity,
             "directness": self.directness,
@@ -261,12 +293,18 @@ _CONTRACT_FIELDS = {
         "evidence_class",
         "artifacts",
         "limitations",
+        "freshness",
+        "reversible_next_actions",
+        "outcome",
     },
     "objective_stack": {
         "kind",
         "profile",
         "authority",
         "mission",
+        "task_id",
+        "owner_id",
+        "repository",
         "constraints",
         "forbidden_actions",
         "hidden_objectives",
@@ -297,7 +335,7 @@ _CONTRACT_FIELDS = {
 
 
 def validate_contract_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Reject unknown fields before a serialized contract is interpreted."""
+    """Validate a complete serialized contract before it is interpreted."""
 
     if not isinstance(value, Mapping):
         raise ContractValidationError("contract must be an object")
@@ -308,4 +346,23 @@ def validate_contract_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
     if unknown:
         field_names = ", ".join(sorted(str(field) for field in unknown))
         raise ContractValidationError(f"unknown field(s): {field_names}")
+    missing = _CONTRACT_FIELDS[kind] - set(value)
+    if missing:
+        field_names = ", ".join(sorted(missing))
+        raise ContractValidationError(f"missing field(s): {field_names}")
+    payload = dict(value)
+    payload.pop("kind")
+    constructors = {
+        "evidence_packet": EvidencePacket,
+        "objective_stack": ObjectiveStack,
+        "capability": CapabilityRecord,
+        "consensus": ConsensusRecord,
+        "worker_mode": WorkerMode,
+    }
+    try:
+        constructors[kind](**payload).validate()
+    except ContractValidationError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise ContractValidationError(f"invalid {kind} payload: {exc}") from exc
     return value
