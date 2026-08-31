@@ -63,6 +63,18 @@
       "capabilities": ["tools"],
       "api_version": 1,
       "added_at": "2026-08-12"
+    },
+    {
+      "name": "brave-search",
+      "description": "Brave Search Pro provider with LLM Context, Place Search, media, news, and discussion modes for Hermes web search.",
+      "author": "Dewaldt Huysamen (GodsBoy)",
+      "tags": ["search", "brave", "llm-context", "places", "web"],
+      "repo": "GodsBoy/hermes-brave-search-pro",
+      "ref": "1e2b4e6ac8d1b5dec43813e8b31e1b56b3e435a6",
+      "homepage": "https://github.com/GodsBoy/hermes-brave-search-pro",
+      "capabilities": ["tools"],
+      "api_version": 1,
+      "added_at": "2026-08-31"
     }
   ]
 }
