@@ -173,6 +173,15 @@ class MemoryStore:
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
 
+    # Cap on SUCCESSFUL writes in ONE turn. The failure cap above can't stop a
+    # loop made entirely of successful mutations: every success resets the
+    # failure counter, so a model oscillating add -> remove -> add on the
+    # bounded store can churn it indefinitely, burning the turn's API budget
+    # and destroying unrelated durable facts along the way (issue #81120).
+    # Beyond this cap further writes are refused with a terminal result and
+    # the store keeps its last known-good state; the turn's reply continues.
+    _MAX_SUCCESSFUL_WRITES_PER_TURN = 6
+
     def __init__(
         self,
         memory_char_limit: int = 2200,
@@ -192,14 +201,46 @@ class MemoryStore:
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
+        # Per-turn counter of successful writes (#81120); same turn-boundary
+        # reset as the failure counter above.
+        self._successful_writes = 0
 
     def target_enabled(self, target: str) -> bool:
         """Return whether this session's selected built-in store is writable."""
         return self.user_profile_enabled if target == "user" else self.memory_enabled
 
     def reset_consolidation_failures(self) -> None:
-        """Reset the per-turn consolidation-failure counter (call at turn start)."""
+        """Reset the per-turn memory guard counters (call at turn start).
+
+        Covers both the consolidation-failure budget (#42405) and the
+        successful-write budget (#81120): a new user turn is a fresh,
+        legitimate maintenance episode.
+        """
         self._consolidation_failures = 0
+        self._successful_writes = 0
+
+    def _write_budget_response(self) -> Optional[Dict[str, Any]]:
+        """Terminal refusal once the per-turn successful-write cap is hit.
+
+        Returns ``None`` while the budget lasts, so mutation entry points can
+        guard with ``budget = self._write_budget_response(); if budget: return budget``.
+        The refusal leaves the store untouched and tells the model to finish
+        its reply — mirroring the degraded terminal shape of
+        ``_consolidation_failure`` (#42405).
+        """
+        if self._successful_writes < self._MAX_SUCCESSFUL_WRITES_PER_TURN:
+            return None
+        return {
+            "success": False,
+            "done": True,
+            "error": (
+                f"Memory write budget for this turn is exhausted "
+                f"({self._MAX_SUCCESSFUL_WRITES_PER_TURN} successful writes). "
+                "Stop making memory calls — leave memory as it is and continue "
+                "with your reply to the user. Further changes can wait for a "
+                "later turn."
+            ),
+        }
 
     def _consolidation_failure(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """Count an at-capacity consolidation failure and degrade gracefully.
@@ -423,6 +464,9 @@ class MemoryStore:
             return {"success": False, "error": scan_error}
 
         with self._file_lock(self._path_for(target)):
+            budget = self._write_budget_response()
+            if budget:
+                return budget
             # Re-read from disk under lock to pick up writes from other sessions.
             # For add (append-only), we skip the drift guard — appending never
             # clobbers existing content, so round-trip mismatches from prior
@@ -485,6 +529,9 @@ class MemoryStore:
             return {"success": False, "error": scan_error}
 
         with self._file_lock(self._path_for(target)):
+            budget = self._write_budget_response()
+            if budget:
+                return budget
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -548,6 +595,9 @@ class MemoryStore:
             return {"success": False, "error": "old_text cannot be empty."}
 
         with self._file_lock(self._path_for(target)):
+            budget = self._write_budget_response()
+            if budget:
+                return budget
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -610,6 +660,9 @@ class MemoryStore:
                     return {"success": False, "error": f"Operation {i + 1}: {scan_error}"}
 
         with self._file_lock(self._path_for(target)):
+            budget = self._write_budget_response()
+            if budget:
+                return budget
             bak = self._reload_target(target)
             if bak is _READ_FAILED:
                 return _read_failed_error(self._path_for(target))
@@ -728,6 +781,12 @@ class MemoryStore:
         # per-turn failure budget resets (the cap counts consecutive failures,
         # not lifetime ones within a turn) (#42405).
         self._consolidation_failures = 0
+        # ...but a success still consumes the per-turn successful-write budget:
+        # a loop made entirely of successful mutations is exactly what that
+        # budget exists to bound (#81120). Idempotent no-op successes (duplicate
+        # add) count too — re-issuing an already-saved write is the same
+        # repeat behaviour the budget suppresses.
+        self._successful_writes += 1
         entries = self._entries_for(target)
         current = self._char_count(target)
         limit = self._char_limit(target)
