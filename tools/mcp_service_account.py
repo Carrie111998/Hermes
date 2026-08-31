@@ -46,15 +46,37 @@ falls back to ``os.environ`` in single-profile mode.
 
 Token caching
 -------------
-Tokens are cached at ``$HERMES_HOME/mcp-tokens/<server>-sa.json`` with
-file permissions 0o600 and atomic write (O_EXCL temp-then-rename). Two
-Hermes profiles with the same server name get separate cache files
-because the path is rooted at the profile's ``HERMES_HOME``.
+Tokens are cached at
+``$HERMES_HOME/mcp-tokens/service-account/<server>-<digest>.json`` with
+file permissions 0o600 and atomic write (O_EXCL temp-then-rename).
+
+Three separate collisions are ruled out by that layout:
+
+- **Across profiles** — the path is rooted at the owning profile's
+  ``HERMES_HOME``, so two profiles using the same server name never share a
+  token. The owning home is passed explicitly by ``MCPServerTask``; it is not
+  re-derived from ambient state.
+- **Against browser OAuth** — service-account tokens live in their own
+  ``service-account/`` subdirectory. The previous ``<server>-sa.json``
+  convention shared a directory with browser OAuth's ``<server>.json``, so a
+  server named ``foo-sa`` aliased the service-account cache of ``foo``.
+- **Across server names and identities** — ``<digest>`` is a SHA-256 prefix
+  over the raw server name and the credential identity, which restores the
+  distinctions the filename sanitizer erases (``a/b`` and ``a_b`` both
+  sanitize to ``a_b``).
+
+Cached tokens are additionally **bound** to the identity that minted them —
+``grant_type``, ``token_url``, ``client_id``, ``username``, ``scope`` and the
+credential env-var *names* (see :func:`sa_identity_fingerprint`). Changing any
+of them invalidates the cache instead of continuing to present a token for the
+previous identity. Only env-var names are hashed; no secret value is.
 
 The access token is cached; the service-account password is never written
 to disk. If the server returns a ``refresh_token``, it is cached and used
 on subsequent renewals, falling back to a fresh service-account exchange
-if the refresh fails.
+if the refresh fails. When a refresh response omits ``refresh_token``
+(permitted by RFC 6749 §6, meaning "keep the one you have") the existing
+refresh token is retained rather than dropped.
 
 httpx compatibility
 -------------------
@@ -67,15 +89,22 @@ httpx.Auth)`` object and therefore acceptable to ``AsyncClient(auth=...)``.
 
 Security
 --------
-- The token endpoint must be ``https://``.  This is enforced both when the
-  config is validated and again immediately before every token request, so
-  a credential-bearing form can never be sent in the clear.
-- Token-endpoint redirects are **not** followed.  A 307/308 is
-  method-preserving, so an authorization server (or a compromised or
-  misconfigured one) could otherwise redirect the POST — password and
-  client secret included — to an origin the config never authorised.  The
-  config proves exactly one secret sink; runtime does not widen it.  A 3xx
-  from the token endpoint is surfaced as an error.
+- **Transport.**  ``https://`` token endpoints are always accepted.  Plain
+  ``http://`` is accepted **only** for loopback hosts (``localhost``,
+  ``127.0.0.1``, ``::1``), where the request never reaches a network — the
+  same carve-out RFC 8252 §8.3 makes for native-app loopback.  A plaintext
+  non-loopback endpoint is refused, because the token request carries a
+  long-lived service-account password (RFC 6749 §2.3.1).  This is enforced
+  when the config is validated *and* again immediately before every token
+  request, so a config that bypassed validation cannot slip past.  Loopback
+  plaintext logs a warning on each exchange.
+- **Redirects.**  Token-endpoint redirects are **not** followed, regardless
+  of scheme.  A 307/308 is method-preserving, so an authorization server (or
+  a compromised or misconfigured one) could otherwise redirect the POST —
+  password and client secret included — to an origin the config never
+  authorised.  The config proves exactly one secret sink; runtime does not
+  widen it.  A 3xx from the token endpoint is surfaced as an error, and the
+  ``Location`` is never logged.
 - TLS verification is always on; no way to disable it from config.
 - Passwords, access tokens, Authorization header values, and token
   responses are never logged.  Errors are redacted before surfacing.
@@ -87,6 +116,7 @@ Security
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -95,6 +125,7 @@ import secrets
 import stat
 import time
 import threading as _threading
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any, Optional
 
@@ -132,6 +163,55 @@ _GRANT_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 
 #: Required regardless of strategy.
 _COMMON_REQUIRED_FIELDS: tuple[str, ...] = ("token_url", "client_id")
+
+#: Hosts for which a plaintext ``http://`` token endpoint is accepted.
+#: Loopback never leaves the machine, so there is no network path on which the
+#: credential could be observed — the same carve-out RFC 8252 §8.3 makes for
+#: native-app loopback redirects. Every other host must be https://: the token
+#: request carries a long-lived service-account password (RFC 6749 §2.3.1).
+_PLAINTEXT_OK_HOSTS: frozenset[str] = frozenset(
+    {"localhost", "127.0.0.1", "::1", "[::1]"}
+)
+
+
+def _token_url_scheme_error(name: str, token_url: str) -> Optional[str]:
+    """Return an error string when *token_url* may not carry credentials.
+
+    ``https://`` is always accepted. ``http://`` is accepted only for loopback
+    hosts. Anything else — a non-loopback http:// host, or a non-HTTP scheme —
+    is refused.
+    """
+    text = str(token_url)
+    if text.startswith("https://"):
+        return None
+    if not text.startswith("http://"):
+        return (
+            f"MCP server '{name}': service_account.token_url must be an "
+            "http(s):// URL"
+        )
+    try:
+        host = (urlsplit(text).hostname or "").lower()
+    except ValueError:
+        host = ""
+    if host in _PLAINTEXT_OK_HOSTS:
+        return None
+    return (
+        f"MCP server '{name}': service_account.token_url must use https:// — "
+        "the token request carries the service-account password, which must "
+        "not cross a network in plaintext (RFC 6749 §2.3.1). Plain http:// is "
+        "accepted only for loopback hosts (localhost, 127.0.0.1, ::1)."
+    )
+
+
+def _is_loopback_plaintext(token_url: str) -> bool:
+    """True when *token_url* is an accepted plaintext loopback endpoint."""
+    text = str(token_url)
+    if not text.startswith("http://"):
+        return False
+    try:
+        return (urlsplit(text).hostname or "").lower() in _PLAINTEXT_OK_HOSTS
+    except ValueError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -209,12 +289,10 @@ def validate_service_account_config(name: str, cfg: dict) -> list[str]:
             errors.append(f"MCP server '{name}': service_account.{field} is required")
 
     token_url = cfg.get("token_url", "")
-    if token_url and not str(token_url).startswith("https://"):
-        errors.append(
-            f"MCP server '{name}': service_account.token_url must be an "
-            "https:// URL — the token request carries the service-account "
-            "password and must not be sent over plaintext HTTP"
-        )
+    if token_url:
+        scheme_error = _token_url_scheme_error(name, token_url)
+        if scheme_error:
+            errors.append(scheme_error)
 
     for env_field in ("password_env", "client_secret_env"):
         val = cfg.get(env_field)
@@ -273,18 +351,76 @@ def _resolve_client_secret(cfg: dict) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 
+def sa_identity_fingerprint(cfg: dict) -> str:
+    """Return a stable fingerprint of the credential identity in *cfg*.
+
+    A cached access token is only valid for the exact identity it was minted
+    for. Every field below changes *who* the token represents or *what* it is
+    good for, so a change to any of them must invalidate the cache rather than
+    keep presenting a token for the previous identity:
+
+    - ``token_url``  — which authorization server issued it
+    - ``client_id``  — which OAuth client it belongs to
+    - ``username``   — which service account it authenticates
+    - ``scope``      — what it is authorized to do
+    - ``password_env`` / ``client_secret_env`` — which credential minted it
+
+    ``password_env`` is an env-var NAME, never a value; nothing secret is
+    hashed here, and the digest is not a secret either.
+    """
+    material = "\x00".join(
+        str(cfg.get(field, ""))
+        for field in (
+            "grant_type",
+            "token_url",
+            "client_id",
+            "username",
+            "scope",
+            "password_env",
+            "client_secret_env",
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def _get_sa_token_dir(hermes_home: Optional[str | Path] = None) -> Path:
+    """Return the service-account token directory for a profile.
+
+    Deliberately a SUBDIRECTORY of the browser-OAuth token dir rather than a
+    sibling filename convention. The old layout wrote
+    ``mcp-tokens/<server>-sa.json`` alongside browser OAuth's
+    ``mcp-tokens/<server>.json``, so a server literally named ``foo-sa``
+    produced the same path as the service-account cache for server ``foo`` —
+    one server's credential silently served as another's. Separate namespaces
+    make that structurally impossible.
+    """
+    from tools.mcp_oauth import _get_token_dir
+
+    return _get_token_dir(hermes_home) / "service-account"
+
+
 def _get_sa_token_path(
-    server_name: str, hermes_home: Optional[str | Path] = None
+    server_name: str,
+    hermes_home: Optional[str | Path] = None,
+    identity: Optional[str] = None,
 ) -> Path:
     """Return the path to the service-account token cache file.
 
-    Kept in the same ``mcp-tokens`` directory as OAuth tokens so directory
-    permissions (0o700) are already correct.  The ``-sa`` suffix distinguishes
-    this file from the OAuth ``.json`` file for the same server name.
-    """
-    from tools.mcp_oauth import _get_token_dir, _safe_filename
+    The filename is ``<sanitized-name>-<digest>.json``. ``_safe_filename`` is
+    lossy — it maps every non-word character to ``_``, so ``tool/hive``,
+    ``tool.hive`` and ``tool_hive`` all sanitize to ``tool_hive`` and would
+    otherwise share one cache file. The digest is taken over the RAW server
+    name (plus the credential identity when known), which restores the
+    distinction the sanitizer destroys.
 
-    return _get_token_dir(hermes_home) / f"{_safe_filename(server_name)}-sa.json"
+    Rooted at the owning profile's ``HERMES_HOME``, so two profiles using the
+    same server name never share a token — see ``build_service_account_auth``.
+    """
+    from tools.mcp_oauth import _safe_filename
+
+    digest_material = server_name if identity is None else f"{server_name}\x00{identity}"
+    digest = hashlib.sha256(digest_material.encode("utf-8")).hexdigest()[:16]
+    return _get_sa_token_dir(hermes_home) / f"{_safe_filename(server_name)}-{digest}.json"
 
 
 def _read_token_cache(path: Path) -> dict | None:
@@ -337,12 +473,51 @@ class _CachedToken:
         access_token: str,
         expires_at: float,
         refresh_token: Optional[str] = None,
+        identity: Optional[str] = None,
+        issued_at: Optional[float] = None,
+        lifetime: Optional[float] = None,
     ):
         self.access_token = access_token
         self.expires_at = expires_at
         self.refresh_token = refresh_token
+        # Fingerprint of the credential identity this token was minted for
+        # (see sa_identity_fingerprint). Checked on load; a mismatch means the
+        # operator changed username/client_id/scope/token_url and the cached
+        # token no longer represents what the config asks for.
+        self.identity = identity
+        self.issued_at = issued_at if issued_at is not None else time.time()
+        # NOMINAL lifetime in seconds, i.e. the ``expires_in`` the
+        # authorization server actually returned. ``None`` means unknown.
+        #
+        # It is deliberately NOT inferred from ``expires_at - now``: that
+        # conflates "a 30-second token" with "a one-hour token observed 30
+        # seconds before it expires", and the two need opposite handling —
+        # the first should still be used, the second must be renewed.
+        self.lifetime = lifetime
 
-    def is_valid(self, buffer: float = _PROACTIVE_RENEW_BUFFER_SECONDS) -> bool:
+    def renew_buffer(self) -> float:
+        """Seconds before expiry at which this token should be renewed.
+
+        A flat 60s buffer is wrong for genuinely short-lived tokens: an
+        authorization server issuing ``expires_in: 30`` would produce a token
+        that is *never* valid, so ``_get_cached_token`` always misses,
+        ``_acquire_token`` re-exchanges on every single MCP request, and the
+        provider melts the token endpoint while never caching anything. When
+        the nominal lifetime is known and short, scale the buffer down to half
+        of it so the token is still used for the first half of its life.
+
+        When the lifetime is unknown, keep the flat buffer — that is the
+        historical behaviour and the safe default.
+        """
+        if self.lifetime is None:
+            return float(_PROACTIVE_RENEW_BUFFER_SECONDS)
+        if self.lifetime <= 0:
+            return 0.0
+        return min(float(_PROACTIVE_RENEW_BUFFER_SECONDS), self.lifetime / 2.0)
+
+    def is_valid(self, buffer: Optional[float] = None) -> bool:
+        if buffer is None:
+            buffer = self.renew_buffer()
         return time.time() < self.expires_at - buffer
 
     @classmethod
@@ -352,10 +527,18 @@ class _CachedToken:
         if not at or not ea:
             return None
         try:
+            expires_at = float(ea)
+            issued_at = data.get("issued_at")
+            issued_at = float(issued_at) if issued_at is not None else None
+            lifetime = data.get("lifetime")
+            lifetime = float(lifetime) if lifetime is not None else None
             return cls(
                 access_token=str(at),
-                expires_at=float(ea),
+                expires_at=expires_at,
                 refresh_token=data.get("refresh_token") or None,
+                identity=data.get("identity") or None,
+                issued_at=issued_at,
+                lifetime=lifetime,
             )
         except (TypeError, ValueError):
             return None
@@ -364,9 +547,14 @@ class _CachedToken:
         d: dict = {
             "access_token": self.access_token,
             "expires_at": self.expires_at,
+            "issued_at": self.issued_at,
         }
+        if self.lifetime is not None:
+            d["lifetime"] = self.lifetime
         if self.refresh_token:
             d["refresh_token"] = self.refresh_token
+        if self.identity:
+            d["identity"] = self.identity
         return d
 
 
@@ -386,19 +574,28 @@ async def _post_token_request(
     Never logs form values (which include the password).  Raises ``ValueError``
     with a redacted error message on any failure.
 
-    The ``https://`` requirement is re-checked here rather than trusted from
+    The transport requirement is re-checked here rather than trusted from
     validation time: this is the last point before a credential-bearing body
     leaves the process, and the caller may have been handed a config that
-    never passed through :func:`validate_service_account_config`.
+    never passed through :func:`validate_service_account_config`. ``https://``
+    is always allowed; ``http://`` only for loopback, which never reaches a
+    network.
 
     The caller must supply a client with redirects disabled; a 3xx from the
-    token endpoint therefore falls through to the non-2xx branch and is
+    token endpoint therefore falls through to the redirect branch and is
     reported as an error rather than replaying the form at a new origin.
     """
-    if not str(token_url).startswith("https://"):
+    if _token_url_scheme_error(server_name, token_url) is not None:
         raise ValueError(
             f"MCP service-account '{server_name}': refusing to send "
-            "credentials to a non-https:// token endpoint"
+            "credentials to a plaintext non-loopback token endpoint"
+        )
+    if _is_loopback_plaintext(token_url):
+        logger.warning(
+            "MCP service-account '%s': token endpoint is plaintext http:// on "
+            "a loopback host. This is accepted for local development only — "
+            "use https:// for any endpoint reachable over a network.",
+            server_name,
         )
 
     try:
@@ -474,6 +671,10 @@ def _parse_token_response(
         access_token=access_token,
         expires_at=t + expires_in,
         refresh_token=body.get("refresh_token") or None,
+        issued_at=t,
+        # The server's own expires_in is the only trustworthy source for the
+        # nominal lifetime — see _CachedToken.renew_buffer.
+        lifetime=float(expires_in),
     )
 
 
@@ -549,13 +750,21 @@ class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
             if hermes_home is not None
             else get_hermes_home()
         )
-        self._cache_path = _get_sa_token_path(server_name, self._hermes_home)
+        self._identity = sa_identity_fingerprint(self._cfg)
+        self._cache_path = _get_sa_token_path(
+            server_name, self._hermes_home, self._identity
+        )
         # In-memory token — avoids a disk read on every request.
         self._mem_token: Optional[_CachedToken] = None
 
     @property
     def _refresh_lock(self) -> asyncio.Lock:
-        return _get_refresh_lock(self._server_name, self._hermes_home)
+        # Keyed by (home, server, identity): two profiles never share a lock,
+        # and neither do two different credential identities that happen to
+        # use the same server name.
+        return _get_refresh_lock(
+            f"{self._server_name}\x00{self._identity}", self._hermes_home
+        )
 
     # -- Token resolution ----------------------------------------------------
 
@@ -563,9 +772,28 @@ class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
         data = _read_token_cache(self._cache_path)
         if data is None:
             return None
-        return _CachedToken.from_dict(data)
+        token = _CachedToken.from_dict(data)
+        if token is None:
+            return None
+        # Identity binding: a token minted for a different token_url /
+        # client_id / username / scope must never be presented for this
+        # config, even if it landed at this path (stale file, restored
+        # backup, edited config). Absent identity = written by an older
+        # build; treat as a mismatch and re-mint rather than trusting it.
+        if token.identity != self._identity:
+            logger.debug(
+                "MCP service-account '%s': cached token identity does not "
+                "match the current config; discarding and re-minting",
+                self._server_name,
+            )
+            _delete_token_cache(self._cache_path)
+            return None
+        return token
 
     def _save_to_disk(self, token: _CachedToken) -> None:
+        # Stamp the identity at the single write boundary rather than in each
+        # exchange path, so no minting route can persist an unbound token.
+        token.identity = self._identity
         try:
             _write_token_cache(self._cache_path, token.to_dict())
         except OSError as exc:
@@ -630,6 +858,7 @@ class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
             http_client, cfg["token_url"], form, self._server_name
         )
         token = _parse_token_response(body, self._server_name)
+        token.identity = self._identity
         del password
         if client_secret:
             del client_secret
@@ -656,7 +885,16 @@ class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
             body = await _post_token_request(
                 http_client, cfg["token_url"], form, self._server_name
             )
-            return _parse_token_response(body, self._server_name)
+            token = _parse_token_response(body, self._server_name)
+            # RFC 6749 §6: the refresh response MAY omit refresh_token, which
+            # means "keep using the one you have". Parsing it as None would
+            # persist a token with no refresh credential and force a full
+            # service-account exchange (re-reading the long-lived password) on
+            # the very next renewal — the opposite of what the AS asked for.
+            if not token.refresh_token:
+                token.refresh_token = refresh_token
+            token.identity = self._identity
+            return token
         except ValueError:
             logger.debug(
                 "MCP service-account '%s': refresh_token grant failed, "
@@ -756,13 +994,26 @@ class ServiceAccountAuth(_SA_AUTH_BASE):  # type: ignore[valid-type,misc]
             if response.status_code != 401:
                 return
 
-            # 401: invalidate cache and retry once.
+            # 401: invalidate and retry once.
+            #
+            # Only invalidate if the token we actually SENT is still the
+            # cached one. Under concurrency a 401 can arrive late: request A
+            # goes out on token T1, T1 expires, request B refreshes to T2, and
+            # only then does A's 401 (for T1) come back. Unconditionally
+            # clearing here would throw away the perfectly good T2 that B just
+            # minted — and every in-flight delayed 401 would do it again,
+            # producing an exchange storm where one refresh was needed. When
+            # the cache has already moved on, just retry with the current
+            # token.
+            stale = token.access_token
             logger.debug(
                 "MCP service-account '%s': received 401, refreshing token",
                 self._server_name,
             )
-            self._mem_token = None
-            _delete_token_cache(self._cache_path)
+            current = self._mem_token
+            if current is None or current.access_token == stale:
+                self._mem_token = None
+                _delete_token_cache(self._cache_path)
 
             token = await self._acquire_token(token_client)
             request.headers["Authorization"] = f"Bearer {token.access_token}"
@@ -786,20 +1037,78 @@ def build_service_account_auth(
     MCP server config dict.  Call this once per server and cache the result;
     it manages its own token state.
 
+    ``hermes_home`` should be the OWNING profile's canonical home. It pins
+    the token cache file and the refresh lock, so two profiles configuring
+    the same logical server name never share a minted token. Callers inside
+    the multiplexed gateway pass it explicitly (``MCPServerTask`` passes the
+    identity it was constructed with); when omitted it falls back to the
+    ambient ``get_hermes_home()``, which is correct for single-profile use.
+
     Raises ``ValueError`` if the config is missing required fields.
     """
     errors = validate_service_account_config(server_name, sa_config)
     if errors:
         raise ValueError("; ".join(errors))
-    return ServiceAccountAuth(server_name, sa_config, hermes_home=hermes_home)
+    auth = ServiceAccountAuth(server_name, sa_config, hermes_home=hermes_home)
+    # Diagnostics: profile identity + server name only. password_env is a
+    # variable NAME (not a value) and is the exact field that made the
+    # cross-profile bug visible, so it is safe and useful to record; no
+    # secret, token or header value is ever logged here.
+    logger.debug(
+        "MCP service-account '%s': bound to profile home %s "
+        "(password_env=%s, cache=%s)",
+        server_name,
+        auth._hermes_home,
+        sa_config.get("password_env", ""),
+        auth._cache_path,
+    )
+    return auth
 
 
 def remove_service_account_tokens(
     server_name: str,
     *,
     hermes_home: Optional[str | Path] = None,
+    sa_config: Optional[dict] = None,
 ) -> None:
-    """Delete the on-disk service-account token cache for *server_name*."""
-    path = _get_sa_token_path(server_name, hermes_home)
-    _delete_token_cache(path)
-    logger.info("MCP service-account '%s': removed token cache", server_name)
+    """Delete the on-disk service-account token cache for *server_name*.
+
+    Cache filenames carry an identity digest, so removing "the" cache for a
+    server means removing every identity ever cached under that name unless
+    the caller pins one via ``sa_config``. Sweeping by prefix keeps ``hermes
+    mcp logout``-style flows from leaving a token behind after the operator
+    edited ``username`` or ``scope``.
+
+    Only ever deletes inside this profile's service-account directory.
+    """
+    if sa_config is not None:
+        _delete_token_cache(
+            _get_sa_token_path(
+                server_name, hermes_home, sa_identity_fingerprint(sa_config)
+            )
+        )
+        logger.info("MCP service-account '%s': removed token cache", server_name)
+        return
+
+    from tools.mcp_oauth import _safe_filename
+
+    token_dir = _get_sa_token_dir(hermes_home)
+    prefix = f"{_safe_filename(server_name)}-"
+    removed = 0
+    try:
+        candidates = list(token_dir.glob(f"{prefix}*.json"))
+    except OSError:
+        candidates = []
+    for path in candidates:
+        _delete_token_cache(path)
+        removed += 1
+    # Legacy layout (mcp-tokens/<server>-sa.json) written by earlier builds.
+    legacy = _get_sa_token_dir(hermes_home).parent / f"{_safe_filename(server_name)}-sa.json"
+    if legacy.exists():
+        _delete_token_cache(legacy)
+        removed += 1
+    logger.info(
+        "MCP service-account '%s': removed %d token cache file(s)",
+        server_name,
+        removed,
+    )
