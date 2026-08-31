@@ -988,11 +988,15 @@ def convert_messages_to_converse(
         if role == "tool":
             # Tool result messages → merge into the preceding user turn
             tool_call_id = msg.get("tool_call_id", "")
-            result_content = content if isinstance(content, str) else json.dumps(content)
+            if isinstance(content, list):
+                result_blocks = _convert_content_to_converse(content)
+            else:
+                result_content = content if isinstance(content, str) else json.dumps(content)
+                result_blocks = [{"text": _safe_text(result_content)}]
             tool_result_block = {
                 "toolResult": {
                     "toolUseId": tool_call_id,
-                    "content": [{"text": _safe_text(result_content)}],
+                    "content": result_blocks,
                 }
             }
             # In Converse, tool results go in a "user" role message
@@ -1022,6 +1026,8 @@ def convert_messages_to_converse(
                     args_dict = json.loads(args_str) if isinstance(args_str, str) else args_str
                 except (json.JSONDecodeError, TypeError):
                     args_dict = {}
+                if not isinstance(args_dict, dict):
+                    args_dict = {"_value": args_dict}
                 content_blocks.append({
                     "toolUse": {
                         "toolUseId": tc.get("id", ""),
@@ -1055,12 +1061,13 @@ def convert_messages_to_converse(
                 })
             continue
 
-    # Converse requires the first message to be from the user
-    if converse_msgs and converse_msgs[0]["role"] != "user":
+    # Converse requires non-empty messages and leading/trailing user messages
+    if not converse_msgs:
+        converse_msgs.append({"role": "user", "content": [{"text": _EMPTY_TEXT_PLACEHOLDER}]})
+    elif converse_msgs[0]["role"] != "user":
         converse_msgs.insert(0, {"role": "user", "content": [{"text": _EMPTY_TEXT_PLACEHOLDER}]})
 
-    # Converse requires the last message to be from the user
-    if converse_msgs and converse_msgs[-1]["role"] != "user":
+    if converse_msgs[-1]["role"] != "user":
         converse_msgs.append({"role": "user", "content": [{"text": _EMPTY_TEXT_PLACEHOLDER}]})
 
     return (system_blocks if system_blocks else None, converse_msgs)
