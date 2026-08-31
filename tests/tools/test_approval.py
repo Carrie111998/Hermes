@@ -471,6 +471,96 @@ class TestSensitiveCopyMovePattern:
             assert dangerous is False, cmd
 
 
+class TestShellStartupFileParity:
+    """Every shell-EXECUTED startup file must be gated, not just five of them.
+
+    ``_SHELL_RC_FILES`` originally listed ``.bashrc``, ``.zshrc``, ``.profile``,
+    ``.bash_profile``, ``.zprofile`` (69dd0f7cf1, to stop unprompted backdoor
+    installs). Siblings with identical execution semantics were left ungated, so
+    the same backdoor landed under a different filename:
+
+    * ``.bash_aliases`` is sourced BY ``.bashrc`` — the stock Debian/Ubuntu
+      ``/etc/skel/.bashrc`` does exactly that — so it substitutes directly for a
+      gated file.
+    * ``.zshenv`` is sourced for EVERY zsh invocation including non-interactive
+      scripts, strictly broader than the gated ``.zshrc``.
+    * ``.zlogin`` / ``.bash_login`` / ``.login`` (login) and ``.zlogout`` /
+      ``.bash_logout`` (logout) share the trigger class of ``.profile``.
+    * ``.kshrc`` / ``.cshrc`` / ``.tcshrc`` are the ksh/csh/tcsh ``.bashrc``.
+
+    Measured before: 0/7 write vectors gated for each of the ten.
+    """
+
+    NEWLY_GATED = (
+        ".zshenv", ".zlogin", ".zlogout", ".bash_aliases", ".bash_login",
+        ".bash_logout", ".kshrc", ".cshrc", ".tcshrc", ".login",
+    )
+    ALREADY_GATED = (
+        ".bashrc", ".zshrc", ".profile", ".bash_profile", ".zprofile",
+    )
+    WRITE_VECTORS = (
+        "echo x >> {p}",
+        "echo x > {p}",
+        "echo x | tee -a {p}",
+        "cp /tmp/evil {p}",
+        "mv /tmp/evil {p}",
+        "install -m600 /tmp/c {p}",
+        "sed -i 's/a/b/' {p}",
+    )
+
+    def test_sibling_startup_files_are_gated(self):
+        for name in self.NEWLY_GATED:
+            for vector in self.WRITE_VECTORS:
+                command = vector.format(p=f"~/{name}")
+                dangerous, key, _ = detect_dangerous_command(command)
+                assert dangerous is True, command
+                assert key is not None, command
+
+    def test_original_five_still_gated(self):
+        """Widening the alternation must not regress the pre-existing five."""
+        for name in self.ALREADY_GATED:
+            for vector in self.WRITE_VECTORS:
+                command = vector.format(p=f"~/{name}")
+                dangerous, key, _ = detect_dangerous_command(command)
+                assert dangerous is True, command
+
+    def test_letter_continuation_near_misses_stay_safe(self):
+        """A longer name that merely starts with a gated one must not match.
+
+        Only letter-continuation forms are asserted. ``~/.bashrc.bak`` and
+        ``~/.zshrc-template`` DO flag, because ``\\b`` treats ``.`` and ``-`` as
+        word boundaries — pre-existing behaviour of this shared pattern on
+        unmodified main, not a property of this change.
+        """
+        for command in (
+            "echo x >> ~/.logins.json",
+            "echo x >> ~/.zshenvrc-notes",
+            "echo x >> ~/.kshrcx",
+            "echo x >> ~/.loginx",
+        ):
+            dangerous, key, _ = detect_dangerous_command(command)
+            assert dangerous is False, command
+            assert key is None, command
+
+    def test_unrelated_dotfiles_and_reads_stay_safe(self):
+        """Non-executed dotfiles, non-$HOME paths, and reads are not writes to a
+        startup file. ``.inputrc`` is readline config, not shell code, so it is
+        deliberately out of scope."""
+        for command in (
+            "echo x >> ~/.gitconfig",
+            "echo x >> ~/.vimrc",
+            "echo x >> ~/.tmux.conf",
+            "echo x >> ~/.inputrc",
+            "echo x >> /opt/app/.bashrc",
+            "echo x >> ./project/.zshenv",
+            "cat ~/.zshenv",
+            "grep alias ~/.bash_aliases",
+            "sed -n '1,5p' ~/.zshrc",
+        ):
+            dangerous, key, _ = detect_dangerous_command(command)
+            assert dangerous is False, command
+
+
 class TestSensitiveInPlaceEditPattern:
     """Detect in-place edits to user startup and credential files."""
 
