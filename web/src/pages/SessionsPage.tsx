@@ -1278,7 +1278,17 @@ export default function SessionsPage() {
     onDelete: useCallback(
       async (id: string) => {
         try {
-          await api.deleteSession(id);
+          // Route the delete at the row's owning profile — the list stamp
+          // is the store the row was actually read from, and the global
+          // management profile can lag it (it stays "" when the sticky
+          // active profile equals the dashboard process's own, so the
+          // request would hit the process store and get a false
+          // already_absent success). Search rows carry no stamp; passing
+          // undefined falls back to the management profile like before.
+          const rowProfile = (searchResults ?? sessions).find(
+            (s) => s.id === id,
+          )?.profile;
+          await api.deleteSession(id, rowProfile);
           setSessions((prev) => prev.filter((s) => s.id !== id));
           setTotal((prev) => prev - 1);
           if (expandedId === id) setExpandedId(null);
@@ -1304,6 +1314,8 @@ export default function SessionsPage() {
       [
         expandedId,
         refreshEmptyCount,
+        searchResults,
+        sessions,
         showToast,
         loadStats,
         t.sessions.sessionDeleted,
@@ -1373,7 +1385,21 @@ export default function SessionsPage() {
     }
     setDeletingSelected(true);
     try {
-      const resp = await api.bulkDeleteSessions(ids);
+      // Same per-row ownership routing as the single delete: the selection
+      // comes from one visible list, so its rows share one stamped profile.
+      // Mixed or unstamped (search) selections fall back to the management
+      // profile, matching the pre-fix behavior.
+      const selectionProfiles = new Set(
+        (searchResults ?? sessions)
+          .filter((s) => selectedIds.has(s.id))
+          .map((s) => s.profile)
+          .filter((p): p is string => Boolean(p)),
+      );
+      const selectionProfile =
+        selectionProfiles.size === 1
+          ? [...selectionProfiles][0]
+          : undefined;
+      const resp = await api.bulkDeleteSessions(ids, selectionProfile);
       showToast(
         t.sessions.selectedSessionsDeleted.replace(
           "{count}",
@@ -1404,7 +1430,9 @@ export default function SessionsPage() {
     loadSessions,
     page,
     refreshEmptyCount,
+    searchResults,
     selectedIds,
+    sessions,
     showToast,
     t.sessions.failedToDeleteSelected,
     t.sessions.selectedSessionsDeleted,
