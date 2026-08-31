@@ -435,3 +435,69 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
     finally:
         os.chmod(pkg, 0o755)
+
+
+def test_git_env_disables_pager():
+    env = hermes_main._git_env()
+    assert env["GIT_PAGER"] == "cat"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_ensure_shared_git_history_ok_when_merge_base_exists(tmp_path):
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "f.txt").write_text("a\n")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+    git("clone", "--bare", str(tmp_path), str(tmp_path / "origin.git"))
+    git("remote", "add", "origin", str(tmp_path / "origin.git"))
+    git("fetch", "origin")
+
+    hermes_main._ensure_shared_git_history(["git"], tmp_path, "main")
+
+
+def test_ensure_shared_git_history_aborts_on_unrelated_histories(tmp_path):
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    def git(*args, cwd=None, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd or tmp_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    local = tmp_path / "local"
+    remote = tmp_path / "remote"
+    local.mkdir()
+    remote.mkdir()
+    for repo, msg in ((local, "local-root"), (remote, "remote-root")):
+        git("init", "-q", "-b", "main", cwd=repo)
+        git("config", "user.email", "t@example.com", cwd=repo)
+        git("config", "user.name", "t", cwd=repo)
+        (repo / "f.txt").write_text(msg + "\n")
+        git("add", "-A", cwd=repo)
+        git("commit", "-qm", msg, cwd=repo)
+    git("remote", "add", "origin", str(remote), cwd=local)
+    git("fetch", "origin", cwd=local)
+
+    with pytest.raises(SystemExit) as exited:
+        hermes_main._ensure_shared_git_history(["git"], local, "main")
+    assert exited.value.code == 1

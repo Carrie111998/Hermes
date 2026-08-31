@@ -2251,13 +2251,72 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         logger.debug("Update receipt finalize (zip path) failed: %s", _receipt_exc)
     return desktop_build_ok
 
+def _git_env() -> dict:
+    """Env for git subprocesses: no pager, no interactive prompts.
+
+    ``git stash push`` has been observed to die with SIGPIPE when a pager or
+    rewritten-history checkout leaves the pipe reader gone (#96958). Forcing
+    a non-pager, non-prompt environment keeps the captured-output path
+    deterministic. Built through ``build_subprocess_env`` so this is not a
+    raw ``os.environ.copy()`` spawn site.
+    """
+    from tools.environments.local import build_subprocess_env
+
+    return build_subprocess_env(
+        scrub_secrets=False,
+        inherit_profile_home=False,
+        extra={
+            "GIT_PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
+            "PAGER": "cat",
+        },
+    )
+
+
+def _ensure_shared_git_history(git_cmd: list[str], cwd: Path, branch: str) -> None:
+    """Abort before autostash when HEAD and origin/<branch> share no ancestor.
+
+    A rewritten/force-pushed upstream leaves an empty merge-base. ``git stash``
+    then dies with SIGPIPE and ``hermes update`` reports a generic fetch
+    failure (#96958). Detect that shape up front and print a recoverable
+    error instead of auto ``reset --hard`` (that would discard local commits
+    without asking).
+    """
+    merge_base = subprocess.run(
+        git_cmd + ["merge-base", "HEAD", f"origin/{branch}"],
+        cwd=cwd,
+        capture_output=True,
+        text=True, encoding="utf-8", errors="replace",
+        env=_git_env(),
+    )
+    if merge_base.returncode == 0 and merge_base.stdout.strip():
+        return
+    print("✗ Local history and origin/" + branch + " share no common ancestor.")
+    print("  Upstream was likely rewritten; `hermes update` cannot merge this checkout.")
+    print("  Recover (discards local commits on this branch):")
+    print(f"    cd {cwd} && git fetch origin && git reset --hard origin/{branch}")
+    print("  Then re-run `hermes update`.")
+    raise SystemExit(1)
+
+
+def _hint_unrelated_histories(git_cmd: list[str], cwd: Path) -> None:
+    """Best-effort recovery hint after stash SIGPIPE (#96958)."""
+    print(
+        f"  Recover (discards local commits on this branch): "
+        f"cd {cwd} && git fetch origin && git reset --hard origin/HEAD"
+    )
+    print("  Then re-run `hermes update`.")
+
+
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
+    git_env = _git_env()
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
         check=True,
+        env=git_env,
     )
     if not status.stdout.strip():
         return None
@@ -2271,10 +2330,13 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
+        env=git_env,
     )
     if unmerged.stdout.strip():
         print("→ Clearing unmerged index entries from a previous conflict...")
-        subprocess.run(git_cmd + ["reset"], cwd=cwd, capture_output=True)
+        subprocess.run(
+            git_cmd + ["reset"], cwd=cwd, capture_output=True, env=git_env
+        )
 
     from datetime import datetime, timezone
 
@@ -2287,12 +2349,14 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
+        env=git_env,
     ).stdout.strip()
     push = subprocess.run(
         git_cmd + ["stash", "push", "--include-untracked", "-m", stash_name],
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
+        env=git_env,
     )
     if push.stdout.strip():
         print(push.stdout.strip())
@@ -2301,6 +2365,7 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         cwd=cwd,
         capture_output=True,
         text=True, encoding="utf-8", errors="replace",
+        env=git_env,
     )
     stash_ref = stash_probe.stdout.strip()
     stash_created = (
@@ -2337,8 +2402,15 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
         else:
             # No stash entry was created: the changes were NOT saved.  This
             # is a real failure — bail out before the update touches HEAD.
+            # SIGPIPE (-13 / 141) is the rewritten-history shape in #96958.
             print("✗ Could not stash local changes — update aborted.")
-            if push.stderr.strip():
+            if push.returncode in (-13, 141) or push.returncode < 0:
+                print(
+                    "  git stash died with a broken pipe (SIGPIPE). This usually "
+                    "means local history and origin no longer share an ancestor."
+                )
+                _hint_unrelated_histories(git_cmd, cwd)
+            elif push.stderr.strip():
                 print(f"  {push.stderr.strip().splitlines()[0]}")
             print(
                 "  Commit, stash, or clean up your local changes manually, "
