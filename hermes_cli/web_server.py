@@ -12129,10 +12129,12 @@ async def cancel_oauth_session(
 
 
 def _session_latest_descendant(session_id: str, db):
-    """Resolve a session id to the newest child leaf session.
+    """Resolve a session id to the newest continuation leaf session.
 
     /model may create child sessions. Dashboard refresh should continue the
-    newest child instead of reopening the old parent.
+    newest child instead of reopening the old parent. User-created branches,
+    delegate/reset children, and tool sessions are separate conversations and
+    must not redirect a resume of their parent.
     """
     def row_get(row, key, index):
         if isinstance(row, dict):
@@ -12166,6 +12168,16 @@ def _session_latest_descendant(session_id: str, db):
                 SELECT s.id, s.parent_session_id, s.started_at
                 FROM sessions s
                 JOIN descendants d ON s.parent_session_id = d.id
+                WHERE COALESCE(
+                    json_extract(COALESCE(s.model_config, '{}'), '$._branched_from'), ''
+                ) != d.id
+                  AND COALESCE(
+                    json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from'), ''
+                ) != d.id
+                  AND COALESCE(
+                    json_extract(COALESCE(s.model_config, '{}'), '$._reset_from'), ''
+                ) != d.id
+                  AND COALESCE(s.source, '') != 'tool'
             )
             SELECT id, parent_session_id, started_at FROM descendants
             """,
