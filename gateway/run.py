@@ -8422,12 +8422,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         applying the primary profile's isolation policy.
         """
         profile = str(getattr(source, "profile", "") or "").strip()
+        primary_config = getattr(self, "config", None)
         if not profile:
-            return self.config
+            return primary_config
         configs = getattr(self, "_profile_configs", None)
         if isinstance(configs, dict):
             return configs.get(profile)
-        return self.config if profile == "default" else None
+        return primary_config if profile == "default" else None
 
     def _build_session_context_for_source(
         self,
@@ -8453,8 +8454,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         config = self._session_config_for_source(source)
         if config is None:
-            raise RuntimeError(
-                f"no gateway config registered for session source profile {source.profile!r}"
+            # Preserve the pre-profile fallback for intentionally partial
+            # ``GatewayRunner.__new__`` fixtures. An explicit profile still
+            # fails closed; only an unprofiled source on a runner that has
+            # never been initialized may use the legacy defaults.
+            if source.profile or hasattr(self, "config"):
+                raise RuntimeError(
+                    "no gateway config registered for session source profile "
+                    f"{source.profile!r}"
+                )
+            return build_session_key(
+                source,
+                group_sessions_per_user=True,
+                thread_sessions_per_user=False,
+                profile=None,
             )
         # Mirror SessionStore._resolve_profile_for_key so this fallback path
         # produces the same namespace as the primary path: None (legacy

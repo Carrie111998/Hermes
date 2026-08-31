@@ -82,6 +82,28 @@ def test_session_store_uses_secondary_profile_config_for_session_key(tmp_path):
     assert store._generate_session_key(alice) != store._generate_session_key(bob)
 
 
+def test_partial_runner_session_key_fallback_keeps_explicit_profiles_closed():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="dm-1",
+        chat_type="dm",
+        user_id="alice",
+    )
+
+    assert runner._session_key_for_source(source) == build_session_key(
+        source,
+        group_sessions_per_user=True,
+        thread_sessions_per_user=False,
+        profile=None,
+    )
+
+    with pytest.raises(RuntimeError, match="no gateway config registered"):
+        runner._session_key_for_source(replace(source, profile="missing"))
+
+
 def test_session_context_uses_platform_group_override():
     config = GatewayConfig(
         platforms={
