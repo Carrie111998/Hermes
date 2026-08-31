@@ -2634,6 +2634,7 @@ def _compute_host_turn_frame(
         "history_version": history_version,
         "cols": int(session.get("cols", 80) or 80),
         "cwd": _session_cwd(session),
+        "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(session),
         "profile_home": session.get("profile_home") or "",
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
@@ -2849,12 +2850,12 @@ def _status_update(sid: str, kind: str, text: str | None = None):
         return
     out_kind = kind if text is not None else "status"
     # Auto-compaction reaches us as a generic "lifecycle" status. Re-tag it so
-    # drivers (desktop app) can show an explicit "Summarizing…" indicator —
-    # otherwise a mid-turn compaction looks like the transcript reset itself.
+    # drivers (TUI / desktop) can show an explicit summarizing indicator —
+    # otherwise idle/preflight compaction looks like a hung turn (#97239).
     if out_kind == "lifecycle":
-        from agent.conversation_compression import COMPACTION_STATUS_MARKER
+        from agent.conversation_compression import is_compaction_progress_status
 
-        if COMPACTION_STATUS_MARKER in body:
+        if is_compaction_progress_status(body):
             out_kind = "compacting"
     _emit("status.update", sid, {"kind": out_kind, "text": body})
 
@@ -3220,7 +3221,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # Lazy-resumed (watch) sessions carry the stored conversation
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
-                kw = {"session_db": session_db}
+                kw = {
+                    "session_db": session_db,
+                    "context_cwd_is_launch_artifact": (
+                        _context_cwd_is_launch_artifact(current)
+                    ),
+                }
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)
@@ -3568,6 +3574,15 @@ def _session_cwd(session: dict | None) -> str:
 _LAUNCH_CWD_NOT_A_WORKSPACE = {"desktop"}
 
 
+def _context_cwd_is_launch_artifact(session: dict | None) -> bool:
+    """Whether the session cwd came from app launch rather than user intent."""
+    return bool(
+        session
+        and not session.get("explicit_cwd")
+        and _session_source(session) in _LAUNCH_CWD_NOT_A_WORKSPACE
+    )
+
+
 def _persisted_session_cwd(session: dict) -> str | None:
     """The cwd to stamp on the session's DB row, or None to leave it unset.
 
@@ -3788,13 +3803,17 @@ def _register_session_cwd(session: dict | None) -> None:
         pass
 
 
-def _ensure_session_db_row(session: dict) -> None:
+def _ensure_session_db_row(session: dict) -> bool:
     """Idempotently persist the session's DB row on first real activity.
 
     Called from prompt.submit so a row only exists once the user actually sends
     a message — abandoned drafts never leave an empty "Untitled" session behind.
     Uses INSERT OR IGNORE under the hood, so re-calls (and the AIAgent's own
     lazy create) are no-ops.
+    Returns False only when the store is unavailable (no openable state.db);
+    prompt.submit turns that into an RPC error so a send fails loudly with a
+    toast instead of streaming into a store that will never save it (#98924).
+    Every other outcome — no key, best-effort attempt, success — is True.
 
     A cwd the user *chose* is always persisted. When they made no explicit
     choice the launch directory stands in, and whether that is meaningful
@@ -3824,13 +3843,18 @@ def _ensure_session_db_row(session: dict) -> None:
             db = SessionDB(db_path=Path(profile_home) / "state.db")
         except Exception:
             logger.debug("failed to open profile db for session row", exc_info=True)
-            return
+            return False
         close_db = True
     else:
         db = _get_db()
         close_db = False
     if db is None:
-        return
+        # Fail loud ONLY when the store actually failed to open (#98924):
+        # _db_error records the SessionDB open exception. A None db with no
+        # recorded error means "no store in this context" (degraded harness,
+        # store deliberately absent) — that keeps the pinned best-effort
+        # contract and stays True.
+        return _db_error is None
     # The session's own model/effort/fast pick — the composer override shipped on
     # session.create, or a restored /model switch — must own the row's model +
     # model_config. The agent isn't built yet at first prompt.submit, so derive
@@ -3949,6 +3973,7 @@ def _ensure_session_db_row(session: dict) -> None:
                 db.close()
             except Exception:
                 pass
+    return True
 
 
 def _persist_branch_seed(session: dict) -> None:
@@ -8652,6 +8677,9 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             session["session_key"],
             session_id=session["session_key"],
             platform_override=_session_source(session),
+            context_cwd_is_launch_artifact=(
+                _context_cwd_is_launch_artifact(session)
+            ),
         )
     finally:
         _clear_session_context(tokens)
@@ -8822,6 +8850,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    context_cwd_is_launch_artifact: bool | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -8951,7 +8980,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -8998,6 +9027,16 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    if context_cwd_is_launch_artifact is None:
+        with _sessions_lock:
+            context_session = _sessions.get(sid)
+        context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(
+            context_session
+        )
+    agent._context_cwd_is_launch_artifact = bool(
+        context_cwd_is_launch_artifact
+    )
+    return agent
 
 
 def _init_session(
@@ -9010,6 +9049,7 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    explicit_cwd: bool = False,
 ):
     now = time.time()
     with _sessions_lock:
@@ -9026,6 +9066,7 @@ def _init_session(
             "attached_images": [],
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
+            "explicit_cwd": bool(explicit_cwd),
             "cols": cols,
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
@@ -10431,6 +10472,7 @@ def _deferred_session_record(
     model_override=None,
     resume_runtime_overrides: dict | None = None,
     todo_state: dict | None = None,
+    explicit_cwd: bool = False,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -10447,7 +10489,7 @@ def _deferred_session_record(
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
         "edit_snapshots": {},
-        "explicit_cwd": False,
+        "explicit_cwd": bool(explicit_cwd),
         "history": history,
         "history_lock": threading.Lock(),
         "history_version": 0,

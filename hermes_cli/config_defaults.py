@@ -327,6 +327,17 @@ DEFAULT_CONFIG = {
         # synchronously before the gate runs.  Set to 0 to disable the bound
         # (historical "wait forever" behaviour).
         "gateway_startup_restore_drain_timeout": 30,
+        # Max seconds the boot turn-machinery warm-up (#99373) may hold the
+        # gateway's inbound gate shut.  On a fresh boot the gateway warms the
+        # agent-side turn prerequisites (run_agent import graph, tool schemas
+        # + availability probes, context-file tier) BEFORE accepting inbound
+        # messages, so a message seconds after boot is no longer served with
+        # a skeleton system prompt (missing context files / tool schemas).
+        # On timeout the gate opens anyway and warm-up finishes in the
+        # background — a wedged init can't make the gateway permanently
+        # unavailable.  Set to 0 to disable the warm-up (historical
+        # lazy-init behaviour).
+        "gateway_startup_warmup_timeout": 20,
         # Stale-stream ceiling for local providers (Ollama, oMLX, llama-cpp) in
         # seconds. When the base stale timeout is at its default (180s) and a
         # local endpoint is detected, this finite ceiling replaces the former
@@ -575,12 +586,17 @@ DEFAULT_CONFIG = {
         "record_sessions": False,  # Auto-record browser sessions as WebM videos
         "headed": False,  # Local mode: launch Chromium with a visible window (also skips per-turn cleanup so the window persists between turns; idle reaper still applies)
         "allow_private_urls": False,  # Allow navigating to private/internal IPs (localhost, 192.168.x.x, etc.)
-        # Browser engine for local mode.  Passed as ``--engine <value>`` to
-        # agent-browser v0.25.3+.
-        # "auto"       — use Chrome (default, don't pass --engine at all)
-        # "lightpanda" — use Lightpanda (1.3-5.8x faster navigation, no screenshots)
+        # Local browser engine, for both drivers:
+        #   Browser Use mode (default) — "lightpanda" makes Hermes spawn
+        #     ``lightpanda serve`` per session and point browser_exec at it.
+        #   Built-in tools (backend: off) — passed as ``--engine <value>`` to
+        #     agent-browser v0.25.3+ (with automatic Chrome fallback).
+        # "auto"       — Chrome (default)
+        # "lightpanda" — Lightpanda (faster navigation, no screenshots)
         # "chrome"     — explicitly request Chrome
-        # Also settable via AGENT_BROWSER_ENGINE env var.
+        # Ignored while a cloud provider, Camofox, browser.cdp_url or
+        # browser.use_real_profile is active — `/browser status` and
+        # `hermes doctor` say so. Also settable via AGENT_BROWSER_ENGINE.
         "engine": "auto",
         "auto_local_for_private_urls": True,  # When a cloud provider is set, auto-spawn local Chromium for LAN/localhost URLs instead of sending them to the cloud
         "cdp_url": "",  # Optional persistent CDP endpoint for attaching to an existing Chromium/Chrome
@@ -4494,10 +4510,10 @@ OPTIONAL_ENV_VARS = {
         "category": "tool",
     },
     "AGENT_BROWSER_ENGINE": {
-        "description": "Browser engine for local mode: auto (default Chrome), lightpanda (faster, no screenshots), chrome",
+        "description": "Local browser engine: auto (default Chrome), lightpanda (faster, no screenshots; Browser Use mode spawns lightpanda serve), chrome",
         "prompt": "Browser engine (auto/lightpanda/chrome)",
-        "url": "https://github.com/vercel-labs/agent-browser",
-        "tools": ["browser_navigate", "browser_snapshot", "browser_click", "browser_vision"],
+        "url": "https://lightpanda.io/docs/run-locally/installation/one-liner",
+        "tools": ["browser_exec", "browser_navigate", "browser_snapshot", "browser_click", "browser_vision"],
         "password": False,
         "category": "tool",
         "advanced": True,
