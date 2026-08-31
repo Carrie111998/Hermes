@@ -1,6 +1,6 @@
 {
-  "audited_at": "2026-08-31T15:10:10.019754+07:00",
-  "targets": [
+  "AUDITED_AT": "2026-08-31T15:18:27.666957+07:00",
+  "TARGETS": [
     {
       "target": "codex",
       "status": "ALREADY_CONFIGURED",
@@ -48,11 +48,11 @@
       "target": "hermes",
       "status": "REQUIRES_RESTART",
       "command_path": "C:\\Users\\Vu Tuan\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\hermes.EXE",
-      "rule_path": "C:\\Users\\Vu Tuan\\AppData\\Local\\hermes\\hermes-agent\\AGENTS.md",
+      "rule_path": "C:\\Users\\Vu Tuan\\AppData\\Local\\hermes\\worktrees\\agent-os-rollout-v1-clean\\AGENTS.md",
       "config_path": "C:\\Users\\Vu Tuan\\.hermes\\config.yaml",
       "actual_rule_locations": [
-        "C:\\Users\\Vu Tuan\\AppData\\Local\\hermes\\hermes-agent\\SOUL.md",
-        "C:\\Users\\Vu Tuan\\AppData\\Local\\hermes\\hermes-agent\\AGENTS.md"
+        "C:\\Users\\Vu Tuan\\AppData\\Local\\hermes\\worktrees\\agent-os-rollout-v1-clean\\SOUL.md",
+        "C:\\Users\\Vu Tuan\\AppData\\Local\\hermes\\worktrees\\agent-os-rollout-v1-clean\\AGENTS.md"
       ],
       "reason": "Runtime activation must be deferred until active Hermes work is quiescent."
     }

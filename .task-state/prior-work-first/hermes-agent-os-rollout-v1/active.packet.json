@@ -3,8 +3,8 @@
   "GOAL": "Finalize and safely roll out the existing Agent OS implementation using the accepted prior-work-first baseline, deterministic installer, Codex canary, and deferred Hermes activation when live SignalOps work is active.",
   "CAPABILITY_ID": "HERMES-AGENT-OS-ROLLOUT-V1",
   "PREFLIGHT_STATUS": "verified",
-  "ACCEPTED_HEAD": "0cf5d99fa89058cdba8a3082c02900d47c37ed2a",
-  "ACCEPTED_TREE": "1e2a2496ba233a03ac70a7efb6f82492b8a3f3e3",
+  "ACCEPTED_HEAD": "75a99cc7f9a36a12aa00c8c844ebb1f9363bace8",
+  "ACCEPTED_TREE": "ce0cc19cef73052c26c4940e682578fdbe02667c",
   "FIRST_UNPROVEN_BOUNDARY": "HERMES_RUNTIME_ACTIVATION",
   "KNOWN_FILES": [
     {
@@ -73,51 +73,51 @@
     {
       "name": "pytest",
       "path": "pyproject.toml",
-      "digest": "04115a32c0be51373dfb51eb44243fe66eab97e87a84e992bbbb7fae9e79eead"
+      "digest": "8fdd016886353ed18ad293c840a0422f0f750b64b30d1e19ad21649441b3f80b"
     }
   ],
   "KNOWN_HANDOFFS": [
     {
       "path": ".task-state/prior-work-first/hermes-agent-os-rollout-v1/handoffs/2026-08-31-closeout.md",
-      "digest": "ca354f7505724da1deed70c913c4c3146e480b2fd4162f11f635142603cf6bb7"
+      "digest": "fcb4ac81062e586b602ae29242fd91e452299727222366df482cba36a7222fba"
     }
   ],
   "KNOWN_RECEIPTS": [
     {
       "path": ".task-state/prior-work-first/hermes-agent-os-rollout-v1/receipts/2026-08-31-focused-tests.json",
-      "digest": "259b985075a3f0c7633b286a27185de7e5223be594a055b797b314af58b5c6cb"
+      "digest": "0a2feb76ff01f7952033ef43b9ec1949dfda42e21a67ebfcc09759d7ee3ceda8"
     },
     {
       "path": ".task-state/prior-work-first/hermes-agent-os-rollout-v1/receipts/2026-08-31-audit.json",
-      "digest": "5c23c060ffa77522a5fbe79cacba17acb15769bc09d4fe8aadddfbe419dd1076"
+      "digest": "07e0283cc5e88c447a2a3b37b9fd686c08748aebe6ae818002084665aeac2a6d"
     },
     {
       "path": ".task-state/prior-work-first/hermes-agent-os-rollout-v1/receipts/2026-08-31-codex-canary.json",
-      "digest": "dc7ad95ccb9ad7fd5626e75bc06c0636a3c88aa51f5e446e978cd045ff34d552"
+      "digest": "3378740197abe5d0c60a54725c43b741c05cdb3528e46f10af5b5e0b41c609e7"
     },
     {
       "path": ".task-state/prior-work-first/hermes-agent-os-rollout-v1/receipts/2026-08-31-acceptance.json",
-      "digest": "63afdf0f9d9c77064de0c60317ca822ee57a2d28a2e2b79e7a2670e149dd07b9"
+      "digest": "fc6837520008cbd4254dccc1ca855605f72d1613d4db5d84845a7846071391e5"
     }
   ],
   "KNOWN_WORKTREES": [
     {
-      "path": "C:\\Users\\Vu Tuan\\AppData\\Local\\hermes\\hermes-agent",
-      "branch": "main",
-      "head": "0cf5d99fa89058cdba8a3082c02900d47c37ed2a"
+      "path": "C:\\Users\\Vu Tuan\\AppData\\Local\\hermes\\worktrees\\agent-os-rollout-v1-clean",
+      "branch": "feat/agent-os-rollout-v1-clean",
+      "head": "75a99cc7f9a36a12aa00c8c844ebb1f9363bace8"
     }
   ],
   "KNOWN_BRANCHES": [
     {
-      "branch": "main",
-      "head": "0cf5d99fa89058cdba8a3082c02900d47c37ed2a",
+      "branch": "feat/agent-os-rollout-v1-clean",
+      "head": "75a99cc7f9a36a12aa00c8c844ebb1f9363bace8",
       "upstream": "origin/main"
     }
   ],
   "KNOWN_DRAFT_BUILDS": [],
   "KNOWN_BASELINE_EXCEPTIONS": [
     "Hermes runtime activation is deferred while live Hermes processes and an active SignalOps V2 Codex transaction exist.",
-    "Codex canary required explicit model gpt-5.4 after transient default-model capacity errors."
+    "Codex canary used explicit model gpt-5.4 for deterministic availability in this environment."
   ],
   "RELEVANT_CONTRACT_SLICES": [
     {
@@ -126,7 +126,7 @@
     },
     {
       "path": "SOUL.md",
-      "digest": "fff14e7c38e191bcd4cfd8b08eb36cc02984e6c0a667b77af3edf6a4b03cd2fc"
+      "digest": "12997f63891ebdb870f911f46cf4c5c548d570a148c3eb1713ee8cad41546709"
     },
     {
       "path": "AGENT_OS_CORE.md",
@@ -159,7 +159,7 @@
     {
       "kind": "contract_change",
       "path": "SOUL.md",
-      "expected_digest": "fff14e7c38e191bcd4cfd8b08eb36cc02984e6c0a667b77af3edf6a4b03cd2fc"
+      "expected_digest": "12997f63891ebdb870f911f46cf4c5c548d570a148c3eb1713ee8cad41546709"
     },
     {
       "kind": "contract_change",
@@ -214,14 +214,14 @@
     {
       "kind": "dependency_change",
       "path": "pyproject.toml",
-      "expected_digest": "04115a32c0be51373dfb51eb44243fe66eab97e87a84e992bbbb7fae9e79eead"
+      "expected_digest": "8fdd016886353ed18ad293c840a0422f0f750b64b30d1e19ad21649441b3f80b"
     },
     {
       "kind": "contradictory_machine_evidence",
       "subject": ".task-state/prior-work-first/hermes-agent-os-rollout-v1/receipts/2026-08-31-acceptance.json"
     }
   ],
-  "LAST_MACHINE_VERIFIED_AT": "2026-08-31T15:10:10.019754+07:00",
+  "LAST_MACHINE_VERIFIED_AT": "2026-08-31T15:18:27.666957+07:00",
   "PRIMARY_WRITER": "codex-primary-writer",
   "PARALLEL_SCOUTS": []
 }
