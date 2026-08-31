@@ -3813,6 +3813,59 @@ def run_conversation(
                         error_detail=_refusal_text or "model declined (content_filter)",
                     )
 
+                if (
+                    agent.api_mode == "codex_responses"
+                    and getattr(response, "_stream_no_retry", False)
+                ):
+                    # The Codex stream already delivered this text before its
+                    # transport failed. Replaying the logical request would
+                    # append a second answer from the beginning on every live
+                    # surface. Preserve the partial as a non-failed terminal
+                    # turn instead; callers can explicitly ask to continue.
+                    partial_result = agent._get_transport().normalize_response(response)
+                    partial_content = getattr(partial_result, "content", None) or ""
+                    partial_reasoning = (
+                        getattr(partial_result, "reasoning", None) or ""
+                    )
+                    if partial_content or partial_reasoning:
+                        append_message(
+                            messages,
+                            agent._build_assistant_message(
+                                partial_result,
+                                "incomplete",
+                            ),
+                        )
+                    partial_final = agent._strip_think_blocks(
+                        _join_truncated_parts([
+                            *truncated_response_parts,
+                            partial_content,
+                        ])
+                    ).strip()
+                    if not partial_final:
+                        partial_final = (
+                            "The provider stream ended before completion; "
+                            "no tool was executed."
+                        )
+                    from agent import relay_llm
+
+                    relay_llm.complete_logical_call(
+                        api_request_id,
+                        outcome="failed",
+                    )
+                    agent._cleanup_task_resources(effective_task_id)
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": partial_final,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "partial": True,
+                        "failed": False,
+                        "error": (
+                            "network_stream_interrupted_after_partial_response"
+                        ),
+                    }
+
                 if finish_reason == "length":
                     if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
                         agent._vprint(

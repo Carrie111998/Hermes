@@ -1606,16 +1606,6 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
-    def _on_text_delta(text: str) -> None:
-        agent._codex_streamed_text_parts.append(text)
-        agent._fire_stream_delta(text)
-
-    def _on_reasoning_delta(text: str) -> None:
-        agent._fire_reasoning_delta(text)
-
-    def _on_commentary_message(text: str) -> None:
-        agent._fire_streamed_codex_commentary(text)
-
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
@@ -1627,6 +1617,18 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
         intercepted_events = []
         writer_token = {"value": None}
+        attempt_text_parts: list[str] = []
+
+        def _on_text_delta(text: str) -> None:
+            attempt_text_parts.append(text)
+            agent._codex_streamed_text_parts.append(text)
+            agent._fire_stream_delta(text)
+
+        def _on_reasoning_delta(text: str) -> None:
+            agent._fire_reasoning_delta(text)
+
+        def _on_commentary_message(text: str) -> None:
+            agent._fire_streamed_codex_commentary(text)
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = _sanitize_consumer_codex_request(
@@ -1742,6 +1744,40 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                if attempt_text_parts:
+                    # Once final-answer text has reached a stream consumer, the
+                    # logical request is no longer replayable: a fresh physical
+                    # request starts from the beginning and duplicates the
+                    # already-visible prefix. Preserve the accepted text as an
+                    # explicit partial response so the conversation loop can
+                    # end the turn without retrying this request again.
+                    partial_text = "".join(attempt_text_parts)
+                    logger.warning(
+                        "Codex Responses stream transport failed after partial "
+                        "delivery; not retrying (streamed_chars=%d). %s error=%s",
+                        len(partial_text),
+                        agent._client_log_context(),
+                        exc,
+                    )
+                    return SimpleNamespace(
+                        output=[SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            status="incomplete",
+                            content=[SimpleNamespace(
+                                type="output_text",
+                                text=partial_text,
+                            )],
+                        )],
+                        output_text=partial_text,
+                        usage=None,
+                        status="incomplete",
+                        id=None,
+                        model=api_kwargs.get("model"),
+                        incomplete_details=SimpleNamespace(reason="stream_error"),
+                        error=None,
+                        _stream_no_retry=True,
+                    )
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
