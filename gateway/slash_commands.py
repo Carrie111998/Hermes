@@ -2717,6 +2717,8 @@ class GatewaySlashCommandsMixin:
                 return "Retry failed; transcript was not changed."
         # Reset stored token count — transcript was truncated
         session_entry.last_prompt_tokens = 0
+        session_entry.last_prompt_model = None
+        session_entry.last_prompt_captured_at = None
 
         # Re-send by creating a fake text event with the old message
         retry_event = MessageEvent(
@@ -3254,6 +3256,8 @@ class GatewaySlashCommandsMixin:
 
         # Reset stored token count — transcript was truncated.
         session_entry.last_prompt_tokens = 0
+        session_entry.last_prompt_model = None
+        session_entry.last_prompt_captured_at = None
         # Evict the cached agent so the next turn rebuilds from the active-only
         # transcript and memory providers refresh their per-session caches.
         try:

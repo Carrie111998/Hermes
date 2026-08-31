@@ -809,6 +809,10 @@ class SessionEntry:
     
     # Last API-reported prompt tokens (for accurate compression pre-check)
     last_prompt_tokens: int = 0
+    # Model of the session when last_prompt_tokens was captured (None = unknown/legacy).
+    last_prompt_model: Optional[str] = None
+    # Wall-clock time (epoch seconds) when last_prompt_tokens was captured.
+    last_prompt_captured_at: Optional[float] = None
     
     # Set when a session was created because the previous one expired;
     # consumed once by the message handler to inject a notice into context
@@ -887,6 +891,8 @@ class SessionEntry:
             "cache_write_tokens": self.cache_write_tokens,
             "total_tokens": self.total_tokens,
             "last_prompt_tokens": self.last_prompt_tokens,
+            "last_prompt_model": self.last_prompt_model,
+            "last_prompt_captured_at": self.last_prompt_captured_at,
             "estimated_cost_usd": self.estimated_cost_usd,
             "cost_status": self.cost_status,
             "expiry_finalized": self.expiry_finalized,
@@ -988,6 +994,8 @@ class SessionEntry:
             cache_write_tokens=data.get("cache_write_tokens", 0),
             total_tokens=data.get("total_tokens", 0),
             last_prompt_tokens=data.get("last_prompt_tokens", 0),
+            last_prompt_model=data.get("last_prompt_model"),
+            last_prompt_captured_at=data.get("last_prompt_captured_at"),
             estimated_cost_usd=data.get("estimated_cost_usd", 0.0),
             cost_status=data.get("cost_status", "unknown"),
             expiry_finalized=data.get("expiry_finalized", data.get("memory_flushed", False)),
@@ -3025,6 +3033,8 @@ class SessionStore:
         self,
         session_key: str,
         last_prompt_tokens: int = None,
+        last_prompt_model: Optional[str] = None,
+        last_prompt_captured_at: Optional[float] = None,
         touch_activity: bool = True,
     ) -> None:
         """Update lightweight session metadata after an interaction.
@@ -3041,6 +3051,10 @@ class SessionStore:
                 entry.updated_at = _now()
             if last_prompt_tokens is not None:
                 entry.last_prompt_tokens = last_prompt_tokens
+            if last_prompt_model is not None:
+                entry.last_prompt_model = last_prompt_model
+            if last_prompt_captured_at is not None:
+                entry.last_prompt_captured_at = last_prompt_captured_at
             # Snapshot peer fields while still holding _lock: a concurrent
             # reset/heal may rewrite the entry, and mixing old and new
             # fields would record a torn peer row.

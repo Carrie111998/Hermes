@@ -211,6 +211,14 @@ class TestEstimateRequestTokensRough:
             assert len(mm._TOOLS_TOKENS_CACHE) <= cap
         assert len(mm._TOOLS_TOKENS_CACHE) == cap
 
+    def test_excludes_reasoning_from_wire_shadow(self):
+        """estimate_request_tokens_rough must also exclude reasoning blobs
+        from the wire-shadow estimate (#98975)."""
+        messages = [{"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "ok", "reasoning": "x" * 50_000}]
+        clean = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ok"}]
+        assert estimate_request_tokens_rough(messages) == estimate_request_tokens_rough(clean)
+
 
 # =========================================================================
 # Default context lengths

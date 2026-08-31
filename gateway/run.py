@@ -288,6 +288,18 @@ def hygiene_compaction_recovered(
     )
 
 
+def _hygiene_prompt_snapshot_trusted(
+    stored_tokens: int,
+    stored_model: Optional[str],
+    current_model: str,
+) -> bool:
+    # Trust the stored provider-reported snapshot only when it carries a
+    # positive token count AND a model stamp matching the model that now
+    # resolves for the session.  A cross-model (or unstamped) count is stale
+    # and must not gate the safety-net threshold on a foreign model (#98975).
+    return stored_tokens > 0 and bool(stored_model) and stored_model == current_model
+
+
 def _hygiene_compression_timeout_message(
     *,
     total_exhausted: bool,
@@ -20435,12 +20447,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Prefer actual API-reported tokens from the last turn
                 # (stored in session entry) over the rough char-based estimate.
                 _stored_tokens = session_entry.last_prompt_tokens
-                if _stored_tokens > 0:
+                _stored_model = getattr(session_entry, "last_prompt_model", None)
+                if _hygiene_prompt_snapshot_trusted(_stored_tokens, _stored_model, _hyg_model):
                     _approx_tokens = _stored_tokens
-                    _token_source = "actual"
+                    _token_source = "provider-reported"
                 else:
                     _approx_tokens = estimate_messages_tokens_rough(history)
-                    _token_source = "estimated"
+                    _token_source = "rough-estimate"
                     # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
                     # sessions, but that just means hygiene fires a bit early — which
                     # is safe and harmless.  The 85% threshold already provides ample
@@ -21064,6 +21077,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     if _hyg_rotated:
                                         # Reset stored token count — transcript rewritten
                                         session_entry.last_prompt_tokens = 0
+                                        session_entry.last_prompt_model = None
+                                        session_entry.last_prompt_captured_at = None
                                         history = _compressed
                                         _new_count = len(_compressed)
                                         _new_tokens = estimate_messages_tokens_rough(
@@ -21074,6 +21089,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         # compacted transcript inside _compress_context.
                                         # Reset counts to match the new active set.
                                         session_entry.last_prompt_tokens = 0
+                                        session_entry.last_prompt_model = None
+                                        session_entry.last_prompt_captured_at = None
                                         history = _compressed
                                         _new_count = len(_compressed)
                                         _new_tokens = estimate_messages_tokens_rough(
@@ -21975,6 +21992,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await self.async_session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+                last_prompt_model=agent_result.get("model"),
+                last_prompt_captured_at=time.time() if agent_result.get("last_prompt_tokens", 0) else None,
                 touch_activity=not bool(getattr(event, "internal", False)),
             )
 
