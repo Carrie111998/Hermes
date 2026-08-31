@@ -26,6 +26,7 @@ Electron main process both use this without loading the full CLI.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -57,6 +58,36 @@ def icon_path(project_root: Path) -> Path:
     return project_root / "apps" / "desktop" / "assets" / "icon.png"
 
 
+def _resolve_exec_path(path: Path) -> Path:
+    """Resolve ``path`` to a real executable, keeping venv symlinks intact.
+
+    ``uv venv`` (and pip) create ``bin/python`` as a symlink into a shared
+    base-interpreter tree. ``Path.resolve()`` follows that link, turning
+    ``sys.executable`` into a bare interpreter that no longer activates the
+    venv: CPython discovers ``pyvenv.cfg`` from the *unresolved* argv[0], so
+    a ``.desktop`` Exec prefixed with the resolved path boots without the
+    venv's site-packages and dies on the first third-party import.
+    """
+    for base in (path.parent, *path.parent.parents):
+        if (base / "pyvenv.cfg").is_file():
+            return path
+    return path.resolve()
+
+
+def _is_python_interpreter(bin_path: Path) -> bool:
+    """Whether ``bin_path`` is a Python interpreter binary, not a script.
+
+    Distinguishes the updater's ``python -m hermes_cli.main ...`` drive form
+    (where ``argv[0]`` is the interpreter itself) from console-scripts and
+    native launchers, which take ``desktop`` as a plain argument. Matches
+    ``python``, ``python3``, ``python3.11``, ``python2.7`` — and rejects
+    lookalikes like ``python3-config``.
+    """
+    return bin_path.name == "python" or re.fullmatch(
+        r"python[23](\d+)?(\.\d+)?", bin_path.name
+    ) is not None
+
+
 def resolve_exec_command() -> str:
     """Build the absolute ``Exec=`` command line for ``hermes desktop``.
 
@@ -66,9 +97,10 @@ def resolve_exec_command() -> str:
     """
     from hermes_cli.relaunch import resolve_hermes_bin
 
+    exe = _resolve_exec_path(Path(sys.executable))
     bin_path = resolve_hermes_bin()
     if bin_path:
-        resolved = Path(bin_path).resolve()
+        resolved = _resolve_exec_path(Path(bin_path))
         if _needs_interpreter(resolved):
             # The resolved launcher is a Python script whose shebang points at
             # a NON-venv interpreter (e.g. the repo's `hermes` script with
@@ -78,11 +110,17 @@ def resolve_exec_command() -> str:
             # third-party import (#90292) — silently, since Terminal=false.
             # sys.executable is the interpreter actually running Hermes (the
             # venv one), so prefix it explicitly.
-            argv = [str(Path(sys.executable).resolve()), str(resolved), "desktop"]
+            argv = [str(exe), str(resolved), "desktop"]
+        elif _is_python_interpreter(resolved):
+            # argv[0] was the interpreter itself (e.g. the updater drives
+            # `python -m hermes_cli.main desktop --build-only`). Bare
+            # ``<python> desktop`` would treat `desktop` as a script path;
+            # pass the CLI module instead.
+            argv = [str(exe), "-m", "hermes_cli.main", "desktop"]
         else:
             argv = [str(resolved), "desktop"]
     else:
-        argv = [str(Path(sys.executable).resolve()), "-m", "hermes_cli.main", "desktop"]
+        argv = [str(exe), "-m", "hermes_cli.main", "desktop"]
     return " ".join(_quote_exec_arg(a) for a in argv)
 
 
@@ -106,7 +144,7 @@ def _needs_interpreter(bin_path: Path) -> bool:
     # A python shebang pointing INSIDE the running interpreter's environment
     # already resolves correctly; anything else (``/usr/bin/env python3``,
     # a system path) would escape the venv when spawned by the DE.
-    exe_dir = str(Path(sys.executable).resolve().parent)
+    exe_dir = str(_resolve_exec_path(Path(sys.executable)).parent)
     return exe_dir not in shebang
 
 

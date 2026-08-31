@@ -92,11 +92,21 @@ def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
 # python script whose `#!/usr/bin/env python3` shebang resolves to the SYSTEM
 # interpreter when the DE spawns the .desktop entry → ModuleNotFoundError,
 # silent (Terminal=false). The Exec line must prefix sys.executable for any
-# resolved bin that is a python script escaping the running venv.
+# resolved bin that is a python script escaping the running venv. Runs inside
+# a simulated uv-style venv so the expected prefix is a concrete path, not a
+# mirror of the implementation.
 def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_home, monkeypatch):
-    import sys
-
     root = _make_project(tmp_path)
+    base = tmp_path / "base" / "bin"
+    base.mkdir(parents=True)
+    base_python = base / "python3.11"
+    base_python.write_bytes(b"\x7fELF fake base python")
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    (venv / "pyvenv.cfg").write_text("home = /shared/base\n")
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(base_python)
+    monkeypatch.setattr(lde.sys, "executable", str(venv / "bin" / "python"))
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
     hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
@@ -107,10 +117,22 @@ def test_exec_prefixes_interpreter_for_env_shebang_python_script(tmp_path, xdg_h
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    interpreter = str(Path(sys.executable).resolve())
-    assert exec_line.split(" ")[0].strip('"') == interpreter
+    # The venv-preserving interpreter is prefixed — the resolved base
+    # interpreter that would escape the venv must NOT appear.
+    assert exec_line.split(" ")[0].strip('"') == str(venv / "bin" / "python")
+    assert str(base_python) not in exec_line
     assert str(hermes_bin) in exec_line
     assert exec_line.endswith("desktop")
+
+
+def test_is_python_interpreter_distinguishes_binary_from_launcher():
+    assert lde._is_python_interpreter(Path("python"))
+    assert lde._is_python_interpreter(Path("python3"))
+    assert lde._is_python_interpreter(Path("python3.11"))
+    assert lde._is_python_interpreter(Path("python2.7"))
+    assert not lde._is_python_interpreter(Path("python3-config"))
+    assert not lde._is_python_interpreter(Path("python-hermes"))
+    assert not lde._is_python_interpreter(Path("hermes"))
 
 
 def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypatch):
@@ -130,13 +152,21 @@ def test_exec_leaves_shell_wrapper_launchers_alone(tmp_path, xdg_home, monkeypat
 
 
 def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch):
-    import sys
-
     root = _make_project(tmp_path)
+    base = tmp_path / "base" / "bin"
+    base.mkdir(parents=True)
+    base_python = base / "python3.11"
+    base_python.write_bytes(b"\x7fELF fake base python")
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    (venv / "pyvenv.cfg").write_text("home = /shared/base\n")
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(base_python)
+    monkeypatch.setattr(lde.sys, "executable", str(venv / "bin" / "python"))
     hermes_bin = tmp_path / "bin" / "hermes"
     hermes_bin.parent.mkdir()
-    interpreter = str(Path(sys.executable).resolve())
-    hermes_bin.write_text(f"#!{interpreter}\nimport hermes_cli\n", encoding="utf-8")
+    # Console-script shebang points at the venv interpreter itself.
+    hermes_bin.write_text(f"#!{venv / 'bin' / 'python'}\nimport hermes_cli\n", encoding="utf-8")
     hermes_bin.chmod(0o755)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
@@ -147,6 +177,72 @@ def test_exec_leaves_venv_shebang_scripts_alone(tmp_path, xdg_home, monkeypatch)
     # Console-script with the venv's own interpreter in the shebang: correct
     # as-is, prefixing would only add noise.
     assert exec_line == f"{hermes_bin} desktop"
+
+
+def test_exec_keeps_venv_symlink_in_interpreter_prefix(tmp_path, xdg_home, monkeypatch):
+    """uv-style venv symlink must stay in the Exec, not resolve to the base.
+
+    ``uv venv`` (and pip) make ``bin/python`` a symlink into a shared base
+    interpreter tree. Resolving it escapes the venv: pyvenv.cfg is discovered
+    from the *unresolved* argv[0], so the .desktop Exec would boot a bare
+    interpreter and crash on the first third-party import (ModuleNotFoundError
+    for yaml/dotenv — exactly the reported flash-crash on launch).
+    """
+    root = _make_project(tmp_path)
+    base = tmp_path / "uv-python" / "bin"
+    base.mkdir(parents=True)
+    base_python = base / "python3.11"
+    base_python.write_bytes(b"\x7fELF\x02\x01\x01 fake base python")
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    (venv / "pyvenv.cfg").write_text("home = /shared/base\n")
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(base_python)
+    monkeypatch.setattr(lde.sys, "executable", str(venv / "bin" / "python"))
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("#!/usr/bin/env python3\nimport hermes_cli\n", encoding="utf-8")
+    hermes_bin.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    # The venv path is preserved — NOT the resolved base interpreter.
+    assert exec_line.startswith(str(venv / "bin" / "python"))
+    assert str(base_python) not in exec_line
+    assert str(hermes_bin) in exec_line
+    assert exec_line.endswith("desktop")
+
+
+def test_exec_uses_module_form_when_bin_is_python_interpreter(tmp_path, xdg_home, monkeypatch):
+    """argv[0] == the interpreter itself (updater drive form) → ``-m`` form.
+
+    The updater runs ``python -m hermes_cli.main desktop --build-only``, so
+    resolve_hermes_bin() returns the interpreter. A bare ``<python> desktop``
+    Exec would treat ``desktop`` as a script path and crash.
+    """
+    root = _make_project(tmp_path)
+    base = tmp_path / "base" / "bin"
+    base.mkdir(parents=True)
+    base_python = base / "python3.11"
+    base_python.write_bytes(b"\x7fELF fake")
+    venv = tmp_path / "venv"
+    venv.mkdir()
+    (venv / "pyvenv.cfg").write_text("home = /shared/base\n")
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(base_python)
+    monkeypatch.setattr(lde.sys, "executable", str(venv / "bin" / "python"))
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(venv / "bin" / "python")
+    )
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == f"{venv / 'bin' / 'python'} -m hermes_cli.main desktop"
 
 
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
