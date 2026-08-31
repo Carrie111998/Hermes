@@ -530,6 +530,25 @@ def _normalize_codex_app_server_turn_timeout(value: Any) -> float:
     return seconds
 
 
+def _normalize_codex_app_server_post_tool_quiet_timeout(value: Any) -> float:
+    """Coerce the Codex post-tool inactivity watchdog interval.
+
+    Keep the historical 90-second default for backward compatibility, while
+    allowing long-running coding profiles to align this watchdog with their
+    absolute turn deadline. Invalid values must not disable the watchdog.
+    """
+    default = 90.0
+    if isinstance(value, bool):
+        return default
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(seconds) or seconds <= 0:
+        return default
+    return seconds
+
+
 def _refuse_checkpoint_required_on_codex_app_server(
     checkpoint_required: bool, api_mode: Optional[str]
 ) -> None:
@@ -2040,6 +2059,14 @@ def init_agent(
     agent.codex_app_server_turn_timeout = (
         _normalize_codex_app_server_turn_timeout(
             _agent_section.get("codex_app_server_turn_timeout", 600)
+        )
+    )
+    # Codex can legitimately spend longer than 90 seconds reasoning after a
+    # tool result. Keep the historical watchdog default, but let long-running
+    # profiles raise it independently from the absolute turn deadline.
+    agent.codex_app_server_post_tool_quiet_timeout = (
+        _normalize_codex_app_server_post_tool_quiet_timeout(
+            _agent_section.get("codex_app_server_post_tool_quiet_timeout", 90)
         )
     )
     _require_codex_cwd = _agent_section.get(

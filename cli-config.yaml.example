@@ -1077,6 +1077,11 @@ agent:
   # Positive seconds only; invalid values use the 600-second default.
   # codex_app_server_turn_timeout: 600
 
+  # Fast-fail watchdog after a completed Codex tool item. If Codex emits no
+  # further protocol activity for this many seconds, Hermes retires the session.
+  # Long-running profiles may align this with their turn timeout. Default 90.
+  # codex_app_server_post_tool_quiet_timeout: 90
+
   # Require Codex app-server handoffs to name their repository explicitly as
   # [HERMES_RUNTIME_CWD=/absolute/path] in the first 1 KiB. The marker is
   # removed before Codex sees the request. Default false preserves implicit cwd.

@@ -129,6 +129,10 @@ DEFAULT_CONFIG = {
         # its inner tool loop. Positive numeric values only; invalid values
         # fall back to the backward-compatible 600-second default.
         "codex_app_server_turn_timeout": 600,
+        # Fast-fail a Codex app-server turn that emits a tool result and then
+        # no further protocol activity. Long-running coding profiles may raise
+        # this independently from the absolute turn deadline.
+        "codex_app_server_post_tool_quiet_timeout": 90,
         # Optional structured handoff boundary for Codex app-server turns.
         # False preserves the historical implicit agent cwd. When true, each
         # handoff must carry [HERMES_RUNTIME_CWD=/absolute/repository].

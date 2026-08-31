@@ -155,6 +155,15 @@ class TestExtractCacheBustingConfig:
 
         assert out["agent.codex_app_server_turn_timeout"] == 3600
 
+    def test_reads_codex_app_server_post_tool_quiet_timeout(self):
+        from gateway.run import GatewayRunner
+
+        out = GatewayRunner._extract_cache_busting_config(
+            {"agent": {"codex_app_server_post_tool_quiet_timeout": 3600}}
+        )
+
+        assert out["agent.codex_app_server_post_tool_quiet_timeout"] == 3600
+
     def test_reads_codex_app_server_cwd_contract(self):
         from gateway.run import GatewayRunner
 

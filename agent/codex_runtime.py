@@ -1072,6 +1072,13 @@ def run_codex_app_server_turn(
         turn_timeout = float(
             getattr(agent, "codex_app_server_turn_timeout", 600.0)
         )
+        post_tool_quiet_timeout = float(
+            getattr(
+                agent,
+                "codex_app_server_post_tool_quiet_timeout",
+                90.0,
+            )
+        )
         turn_deadline = time.monotonic() + turn_timeout
         try:
             thread_id = agent._codex_session.ensure_started(
@@ -1098,6 +1105,7 @@ def run_codex_app_server_turn(
             turn = agent._codex_session.run_turn(
                 user_input=codex_user_input,
                 turn_timeout=turn_timeout,
+                post_tool_quiet_timeout=post_tool_quiet_timeout,
                 turn_deadline=turn_deadline,
             )
     except Exception as exc:

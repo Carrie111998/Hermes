@@ -8,7 +8,7 @@ Full reference: https://hermes-agent.nousresearch.com/docs/user-guide/configurat
 | Section | Key options |
 |---------|-------------|
 | `model` | `default`, `provider`, `base_url`, `api_key`, `context_length`, `aliases`, `openai_runtime` (`auto` or `codex_app_server`) |
-| `agent` | `max_turns` (90), `tool_use_enforcement`, `service_tier`, `verify_on_stop`, `coding_context` (`auto`, `focus`, `on`, `off`), `codex_app_server_turn_timeout` (600), `codex_app_server_require_explicit_cwd` (false), `codex_app_server_workspace_roots` ([]) |
+| `agent` | `max_turns` (90), `tool_use_enforcement`, `service_tier`, `verify_on_stop`, `coding_context` (`auto`, `focus`, `on`, `off`), `codex_app_server_turn_timeout` (600), `codex_app_server_post_tool_quiet_timeout` (90), `codex_app_server_require_explicit_cwd` (false), `codex_app_server_workspace_roots` ([]) |
 | `terminal` | `backend` (local/docker/ssh/modal/daytona/singularity), `cwd`, `timeout` (180) |
 | `compression` | `enabled`, `threshold` (0.50), `target_ratio` (0.20) |
 | `display` | `skin`, `interface` (cli/tui), `language`, `show_reasoning`, `show_cost`, `pet` |
@@ -30,7 +30,11 @@ normal Hermes provider/runtime loop; `codex_app_server` hands the inner coding
 loop to Codex while Hermes retains the session shell.
 `agent.codex_app_server_turn_timeout` sets that runtime's absolute per-turn
 deadline in seconds (default 600) and is independent of `terminal.timeout`.
-Use a positive number such as `3600` for longer coding turns. Structured
+Use a positive number such as `3600` for longer coding turns. The separate
+`agent.codex_app_server_post_tool_quiet_timeout` watchdog defaults to 90 seconds
+after a completed Codex tool item; raise it for profiles where post-tool
+reasoning can legitimately stay quiet longer, commonly to the turn deadline.
+Structured
 handoffs may include `[HERMES_RUNTIME_CWD=/absolute/path]` in the first 1 KiB;
 the path must resolve inside `agent.codex_app_server_workspace_roots` (an empty
 list means the normal agent cwd only). Set

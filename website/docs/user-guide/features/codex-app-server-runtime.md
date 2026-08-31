@@ -198,6 +198,7 @@ model:
 
 agent:
   codex_app_server_turn_timeout: 3600  # default 600 seconds
+  codex_app_server_post_tool_quiet_timeout: 3600  # default 90 seconds
   codex_app_server_require_explicit_cwd: true
   codex_app_server_workspace_roots:
     - /home/user/projects
@@ -211,6 +212,13 @@ fall back to 600 seconds. If the deadline expires before the matching
 `turn/completed` notification, Hermes interrupts and retires the app-server
 session and reports a timeout instead of treating the last streamed assistant
 message as a completed answer.
+
+`agent.codex_app_server_post_tool_quiet_timeout` is a second watchdog that starts
+when a Codex tool item completes and resets on any later protocol activity. Its
+backward-compatible default is 90 seconds. Long reasoning after a tool can
+legitimately exceed that interval, so long-running profiles should raise it,
+commonly to the same value as `codex_app_server_turn_timeout`. Invalid,
+non-positive, or non-finite values fall back to 90 seconds.
 
 For repository-scoped handoffs, put this structured marker in the first 1 KiB
 of the message:

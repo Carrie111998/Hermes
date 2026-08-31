@@ -27310,6 +27310,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "proactive_prune_min_reclaim_tokens"),
         ("compression", "min_tail_user_messages"),
         ("agent", "codex_app_server_turn_timeout"),
+        ("agent", "codex_app_server_post_tool_quiet_timeout"),
         ("agent", "codex_app_server_require_explicit_cwd"),
         ("agent", "codex_app_server_workspace_roots"),
         ("agent", "disabled_toolsets"),

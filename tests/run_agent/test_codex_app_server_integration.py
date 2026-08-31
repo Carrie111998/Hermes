@@ -108,6 +108,14 @@ class TestTurnTimeoutConfiguration:
         assert agent.codex_app_server_turn_timeout == 3600.0
         assert captured["turn_timeout"] == 3600.0
 
+    def test_configured_post_tool_quiet_timeout_reaches_run_turn(self, monkeypatch):
+        agent, captured = self._run_with_config(
+            monkeypatch,
+            {"codex_app_server_post_tool_quiet_timeout": "3600"},
+        )
+        assert agent.codex_app_server_post_tool_quiet_timeout == 3600.0
+        assert captured["post_tool_quiet_timeout"] == 3600.0
+
     def test_default_timeout_remains_600(self, monkeypatch):
         from hermes_cli.config_defaults import DEFAULT_CONFIG
 
@@ -115,6 +123,17 @@ class TestTurnTimeoutConfiguration:
         assert DEFAULT_CONFIG["agent"]["codex_app_server_turn_timeout"] == 600
         assert agent.codex_app_server_turn_timeout == 600.0
         assert captured["turn_timeout"] == 600.0
+
+    def test_default_post_tool_quiet_timeout_remains_90(self, monkeypatch):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        agent, captured = self._run_with_config(monkeypatch, {})
+        assert (
+            DEFAULT_CONFIG["agent"]["codex_app_server_post_tool_quiet_timeout"]
+            == 90
+        )
+        assert agent.codex_app_server_post_tool_quiet_timeout == 90.0
+        assert captured["post_tool_quiet_timeout"] == 90.0
 
     @pytest.mark.parametrize(
         "raw",
@@ -124,6 +143,19 @@ class TestTurnTimeoutConfiguration:
         from agent.agent_init import _normalize_codex_app_server_turn_timeout
 
         assert _normalize_codex_app_server_turn_timeout(raw) == 600.0
+
+    @pytest.mark.parametrize(
+        "raw",
+        [True, False, 0, -1, "not-a-number", "nan", "inf", float("inf")],
+    )
+    def test_invalid_post_tool_quiet_timeout_values_fall_back_to_default(
+        self, raw
+    ):
+        from agent.agent_init import (
+            _normalize_codex_app_server_post_tool_quiet_timeout,
+        )
+
+        assert _normalize_codex_app_server_post_tool_quiet_timeout(raw) == 90.0
 
     def test_explicit_cwd_contract_is_loaded_from_agent_config(self):
         config = {
