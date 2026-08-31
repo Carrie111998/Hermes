@@ -21,9 +21,29 @@ requires_env:
     prompt: "SMTP host"
     password: false
 optional_env:
+  - name: EMAIL_IMAP_PORT
+    description: "IMAP port (default 993)"
+    prompt: "IMAP port"
+    password: false
+  - name: EMAIL_IMAP_SECURITY
+    description: "IMAP transport: tls, starttls, or plain (default tls)"
+    prompt: "IMAP security mode"
+    password: false
+  - name: EMAIL_IMAP_TLS_VERIFY
+    description: "Verify the IMAP TLS certificate (default true)"
+    prompt: "Verify IMAP TLS certificate"
+    password: false
   - name: EMAIL_SMTP_PORT
     description: "SMTP port (default 587)"
     prompt: "SMTP port"
+    password: false
+  - name: EMAIL_SMTP_SECURITY
+    description: "SMTP transport: tls, starttls, or plain (default depends on port)"
+    prompt: "SMTP security mode"
+    password: false
+  - name: EMAIL_SMTP_TLS_VERIFY
+    description: "Verify the SMTP TLS certificate (default true)"
+    prompt: "Verify SMTP TLS certificate"
     password: false
   - name: EMAIL_IMAP_HOST
     description: "IMAP host for inbound polling (e.g. imap.gmail.com)"

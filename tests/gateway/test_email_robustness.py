@@ -6,10 +6,13 @@ Validates that:
 - Message-ID generation handles a missing '@' in EMAIL_ADDRESS
 """
 
+import asyncio
 import os
+import ssl
 import unittest
 import uuid
 from email.mime.text import MIMEText
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -66,6 +69,85 @@ class TestImapResponseGuard(unittest.TestCase):
     def test_none_element_skipped(self):
         results = self._fetch_with([("OK", [None])])
         self.assertEqual(results, [])
+
+
+class TestMailSecurityModes(unittest.TestCase):
+    """Explicit bridge TLS settings are honored by IMAP and SMTP paths."""
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_IMAP_HOST": "127.0.0.1",
+        "EMAIL_IMAP_PORT": "1143",
+        "EMAIL_IMAP_SECURITY": "starttls",
+        "EMAIL_IMAP_TLS_VERIFY": "false",
+        "EMAIL_SMTP_HOST": "127.0.0.1",
+        "EMAIL_SMTP_PORT": "1025",
+        "EMAIL_SMTP_SECURITY": "starttls",
+        "EMAIL_SMTP_TLS_VERIFY": "false",
+    })
+    def test_starttls_uses_plain_clients_and_unverified_contexts(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        adapter = EmailAdapter(PlatformConfig(enabled=True))
+
+        imap = MagicMock()
+        smtp = MagicMock()
+        with patch("imaplib.IMAP4", return_value=imap) as imap_cls, \
+             patch("imaplib.IMAP4_SSL") as imap_ssl_cls, \
+             patch("smtplib.SMTP", return_value=smtp) as smtp_cls, \
+             patch("smtplib.SMTP_SSL") as smtp_ssl_cls:
+            self.assertIs(adapter._connect_imap(), imap)
+            self.assertIs(adapter._connect_smtp(), smtp)
+
+        imap_cls.assert_called_once_with("127.0.0.1", 1143, timeout=30)
+        imap_ssl_cls.assert_not_called()
+        imap.starttls.assert_called_once()
+        self.assertIsInstance(
+            imap.starttls.call_args.kwargs["ssl_context"], ssl.SSLContext
+        )
+        self.assertEqual(
+            imap.starttls.call_args.kwargs["ssl_context"].verify_mode,
+            ssl.CERT_NONE,
+        )
+        smtp_cls.assert_called_once()
+        smtp_ssl_cls.assert_not_called()
+        smtp.starttls.assert_called_once()
+        self.assertEqual(
+            smtp.starttls.call_args.kwargs["context"].verify_mode,
+            ssl.CERT_NONE,
+        )
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_SMTP_HOST": "127.0.0.1",
+        "EMAIL_SMTP_PORT": "1025",
+        "EMAIL_SMTP_SECURITY": "starttls",
+        "EMAIL_SMTP_TLS_VERIFY": "false",
+    })
+    def test_standalone_sender_honors_starttls_without_delivery(self):
+        from plugins.platforms.email.adapter import _standalone_send
+
+        smtp = MagicMock()
+        with patch("smtplib.SMTP", return_value=smtp) as smtp_cls, \
+             patch("smtplib.SMTP_SSL") as smtp_ssl_cls:
+            result = asyncio.run(_standalone_send(
+                SimpleNamespace(extra={}),
+                "nobody@example.invalid",
+                "test",
+            ))
+
+        self.assertEqual(result["success"], True)
+        smtp_cls.assert_called_once_with("127.0.0.1", 1025)
+        smtp_ssl_cls.assert_not_called()
+        smtp.starttls.assert_called_once()
+        self.assertEqual(
+            smtp.starttls.call_args.kwargs["context"].verify_mode,
+            ssl.CERT_NONE,
+        )
+        smtp.send_message.assert_called_once()
 
 
 class TestMessageIdDomain(unittest.TestCase):
