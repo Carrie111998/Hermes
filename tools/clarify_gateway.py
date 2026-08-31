@@ -222,6 +222,15 @@ TEXT_REJECTED_PROSE = "rejected_prose"
 TEXT_REJECTED_SELECTION = "rejected_selection"
 TEXT_NO_PENDING = "no_pending"
 
+# Sentinel passed to :func:`resolve_gateway_clarify` when a clarify is
+# cancelled without a real answer (cleared session, or prose flung against a
+# native multiple-choice prompt that the caller then continues as a normal
+# turn). The waiting agent observes this as "no response". Deliberately the
+# empty string, matching ``clear_session`` — but named so an empty *user*
+# response (a genuine blank) is distinguishable in intent from a cancel at
+# call sites that want to be explicit.
+CANCEL_SENTINEL = ""
+
 
 def _selection_attempt_tokens(
     text: str,
@@ -454,7 +463,7 @@ def attempt_text_response_for_session(session_key: str, response: str) -> str:
         # (#84608). The gateway also releases the wait explicitly on
         # TEXT_REJECTED_PROSE; resolving an already-set entry is a no-op.
         if not entry.awaiting_text:
-            resolve_gateway_clarify(entry.clarify_id, "")
+            resolve_gateway_clarify(entry.clarify_id, CANCEL_SENTINEL)
         return TEXT_REJECTED_PROSE
 
     if resolve_gateway_clarify(entry.clarify_id, coerced):
@@ -470,6 +479,14 @@ def resolve_text_response_for_session(session_key: str, response: str) -> bool:
     Rejected prose, rejected selections, and missing prompts all return False;
     use :func:`attempt_text_response_for_session` when the caller must
     distinguish those cases (gateway deadlock vs multi-select retry).
+
+    Note the return-value contract is intentionally coarse: ``False`` covers
+    both "rejected, entry still pending" and "entry was resolved/cancelled
+    with :data:`CANCEL_SENTINEL` (and is therefore gone from the pending
+    index)".  A caller that loops over the pending index will observe the
+    consumed-entry case correctly (the entry is simply no longer there on its
+    next check); callers that need the distinction should use
+    :func:`attempt_text_response_for_session`.
     """
     return attempt_text_response_for_session(session_key, response) == TEXT_RESOLVED
 
@@ -529,7 +546,7 @@ def clear_session(session_key: str) -> int:
             # response by inspecting the wait_for_response return value
             # alongside its own timeout deadline.  Most callers just treat any
             # falsy result as "user did not respond".
-            entry.response = ""
+            entry.response = CANCEL_SENTINEL
             entry.event.set()
             cancelled += 1
     return cancelled
