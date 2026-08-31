@@ -19,6 +19,7 @@ from agent.prompt_builder import (
     build_skills_system_prompt,
     build_context_files_prompt,
     build_profile_context_files_prompt,
+    list_profile_context_files,
     CONTEXT_FILE_MAX_CHARS,
     _dynamic_context_file_max_chars,
     _get_context_file_max_chars,
@@ -505,7 +506,35 @@ class TestBuildContextFilesPrompt:
         assert "Selected policy." in result
         assert "Ambient policy." not in result
 
-    @pytest.mark.parametrize("path", ["*.md", ".env", ".env.local"])
+    def test_configured_profile_context_uses_selected_profile_per_file_limit(
+        self, tmp_path, monkeypatch
+    ):
+        ambient = tmp_path / "ambient"
+        selected = tmp_path / "selected"
+        ambient.mkdir()
+        selected.mkdir()
+        content = "Selected policy text"
+        (selected / "POLICY.md").write_text(content, encoding="utf-8")
+        (ambient / "config.yaml").write_text(
+            "context_file_max_chars: 5\n", encoding="utf-8"
+        )
+        (selected / "config.yaml").write_text(
+            "context_file_max_chars: 50\n"
+            "agent:\n  context_files: [POLICY.md]\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(ambient))
+
+        result = build_profile_context_files_prompt(home_override=selected)
+        diagnostics = list_profile_context_files(home_override=selected)
+
+        assert content in result
+        assert "truncated" not in result
+        assert diagnostics[0]["status"] == "loaded"
+
+    @pytest.mark.parametrize(
+        "path", ["*.md", ".env", ".env.local", ".ENV", ".Env.Local"]
+    )
     def test_configured_profile_context_rejects_implicit_or_secret_paths(
         self, tmp_path, monkeypatch, path
     ):

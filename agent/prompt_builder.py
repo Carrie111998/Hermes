@@ -13,6 +13,7 @@ import sys
 import threading
 import contextvars
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 
 from hermes_constants import (
@@ -2395,19 +2396,24 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
     )
 
 
-def _profile_context_file_specs(home: Path) -> tuple[List[dict], int]:
-    """Resolve and validate profile context-file configuration."""
+@contextmanager
+def _profile_home_override(home: Path):
+    """Resolve all profile context settings against the selected profile."""
     token = None
     if get_hermes_home() != home:
         token = set_hermes_home_override(home)
     try:
-        from hermes_cli.config import load_config_readonly
-
-        config = load_config_readonly()
+        yield
     finally:
         if token is not None:
             reset_hermes_home_override(token)
 
+
+def _profile_context_file_specs(home: Path) -> tuple[List[dict], int]:
+    """Resolve and validate profile context-file configuration."""
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly()
     agent_config = config.get("agent") or {}
     if not isinstance(agent_config, dict):
         return [], 100_000
@@ -2447,7 +2453,8 @@ def _profile_context_file_specs(home: Path) -> tuple[List[dict], int]:
         if not path.is_absolute():
             path = home / path
         path = path.resolve()
-        if path.name == ".env" or path.name.startswith(".env."):
+        name = path.name.casefold()
+        if name == ".env" or name.startswith(".env."):
             raise ValueError("agent.context_files must not load environment files")
         specs.append({"path": path, "required": required})
     return specs, total_limit
@@ -2459,37 +2466,38 @@ def list_profile_context_files(
 ) -> List[dict]:
     """Return ordered path, size, hash, and load status diagnostics."""
     home = Path(home_override) if home_override is not None else get_hermes_home()
-    specs, _ = _profile_context_file_specs(home)
-    max_chars = _get_context_file_max_chars(context_length)
-    diagnostics: List[dict] = []
-    for spec in specs:
-        path = spec["path"]
-        required = spec["required"]
-        try:
-            raw = path.read_bytes()
-            content = raw.decode("utf-8")
-        except (OSError, UnicodeError):
+    with _profile_home_override(home):
+        specs, _ = _profile_context_file_specs(home)
+        max_chars = _get_context_file_max_chars(context_length)
+        diagnostics: List[dict] = []
+        for spec in specs:
+            path = spec["path"]
+            required = spec["required"]
+            try:
+                raw = path.read_bytes()
+                content = raw.decode("utf-8")
+            except (OSError, UnicodeError):
+                diagnostics.append({
+                    "path": str(path),
+                    "required": required,
+                    "status": "missing_required" if required else "missing_optional",
+                    "chars": 0,
+                    "bytes": 0,
+                    "sha256": "",
+                })
+                continue
+            findings = _scan_for_threats(content, scope="context")
+            status = "blocked" if findings else (
+                "truncated" if len(content) > max_chars else "loaded"
+            )
             diagnostics.append({
                 "path": str(path),
                 "required": required,
-                "status": "missing_required" if required else "missing_optional",
-                "chars": 0,
-                "bytes": 0,
-                "sha256": "",
+                "status": status,
+                "chars": len(content),
+                "bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
             })
-            continue
-        findings = _scan_for_threats(content, scope="context")
-        status = "blocked" if findings else (
-            "truncated" if len(content) > max_chars else "loaded"
-        )
-        diagnostics.append({
-            "path": str(path),
-            "required": required,
-            "status": status,
-            "chars": len(content),
-            "bytes": len(raw),
-            "sha256": hashlib.sha256(raw).hexdigest(),
-        })
     return diagnostics
 
 
@@ -2498,39 +2506,40 @@ def _load_profile_context_files(
     context_length: Optional[int] = None,
 ) -> List[str]:
     """Load the profile's explicitly configured context files in order."""
-    specs, total_limit = _profile_context_file_specs(home)
-    sections: List[str] = []
-    total_chars = 0
-    for spec in specs:
-        path = spec["path"]
-        required = spec["required"]
-        try:
-            content = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as exc:
-            if not required:
-                logger.info("Optional profile context file unavailable: %s", path)
+    with _profile_home_override(home):
+        specs, total_limit = _profile_context_file_specs(home)
+        sections: List[str] = []
+        total_chars = 0
+        for spec in specs:
+            path = spec["path"]
+            required = spec["required"]
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                if not required:
+                    logger.info("Optional profile context file unavailable: %s", path)
+                    continue
+                raise ValueError(
+                    f"Required profile context file is unavailable: {path}: {exc}"
+                ) from exc
+            total_chars += len(content)
+            if total_chars > total_limit:
+                raise ValueError(
+                    "Profile context files total "
+                    f"{total_chars} chars exceeds agent.context_files_max_chars "
+                    f"limit of {total_limit}"
+                )
+            content = content.strip()
+            if not content:
                 continue
-            raise ValueError(
-                f"Required profile context file is unavailable: {path}: {exc}"
-            ) from exc
-        total_chars += len(content)
-        if total_chars > total_limit:
-            raise ValueError(
-                "Profile context files total "
-                f"{total_chars} chars exceeds agent.context_files_max_chars "
-                f"limit of {total_limit}"
+            content = _scan_context_content(content, str(path))
+            content = _truncate_content(
+                content,
+                str(path),
+                context_length=context_length,
+                read_path=str(path),
             )
-        content = content.strip()
-        if not content:
-            continue
-        content = _scan_context_content(content, str(path))
-        content = _truncate_content(
-            content,
-            str(path),
-            context_length=context_length,
-            read_path=str(path),
-        )
-        sections.append(f"## {path}\n\n{content}")
+            sections.append(f"## {path}\n\n{content}")
     return sections
 
 
