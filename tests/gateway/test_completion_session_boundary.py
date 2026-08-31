@@ -363,10 +363,18 @@ def test_watch_match_from_user_closed_session_is_dropped(monkeypatch):
             {"ended_at": 1786288000.0, "end_reason": "session_reset"}
         ),
     )
+    classifier = AsyncMock(return_value="terminal")
+    runner._classify_completion_target = classifier
+    monkeypatch.setattr(
+        ProcessRegistry,
+        "should_surface_process_notification",
+        staticmethod(lambda evt, surface_child=None: True),
+    )
     completion_queue = queue_mod.Queue()
     completion_queue.put(_watch_evt("sess-closed"))
     asyncio.run(runner._drain_watch_notifications(completion_queue))
 
+    classifier.assert_awaited_once_with("sess-closed")
     adapter.handle_message.assert_not_awaited()
     adapter.send.assert_not_awaited()
 

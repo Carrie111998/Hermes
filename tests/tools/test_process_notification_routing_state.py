@@ -14,6 +14,7 @@ def _child_session(**overrides):
         "session_key": "sa-0-childroute",
         "parent_session_id": "root-session",
         "notification_session_key": "root-session",
+        "owner_task_id": "sa-0-childroute",
         "started_at": 1234.5,
     }
     values.update(overrides)
@@ -93,6 +94,7 @@ def test_checkpoint_roundtrip_preserves_notification_and_process_scopes(
     stored = json.loads(checkpoint.read_text(encoding="utf-8"))
     assert stored[0]["session_key"] == "sa-0-childroute"
     assert stored[0]["notification_session_key"] == "root-session"
+    assert stored[0]["owner_task_id"] == "sa-0-childroute"
     assert stored[0]["parent_session_id"] == "root-session"
 
     reader = ProcessRegistry()
@@ -103,6 +105,7 @@ def test_checkpoint_roundtrip_preserves_notification_and_process_scopes(
     assert recovered is not None
     assert recovered.session_key == "sa-0-childroute"
     assert recovered.notification_session_key == "root-session"
+    assert recovered.owner_task_id == "sa-0-childroute"
     assert recovered.parent_session_id == "root-session"
     assert reader.pending_watchers[0]["session_key"] == "root-session"
     assert reader.pending_watchers[0]["parent_session_id"] == "root-session"
@@ -164,8 +167,6 @@ def test_spawn_local_checkpoint_includes_notify_flags_before_exit(
 def test_fast_nonzero_exit_queues_completion_when_notify_set_at_spawn(
     tmp_path, monkeypatch
 ):
-    import time
-
     checkpoint = tmp_path / "processes.json"
     monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", checkpoint)
     registry = ProcessRegistry()
@@ -178,20 +179,118 @@ def test_fast_nonzero_exit_queues_completion_when_notify_set_at_spawn(
         parent_session_id="root-session",
         notify_on_complete=True,
     )
-    deadline = time.time() + 10
-    while time.time() < deadline and not session.exited:
-        time.sleep(0.05)
+    event = registry.completion_queue.get(timeout=10)
+
     assert session.exited is True
     assert session.exit_code == 7
+    assert event["type"] == "completion"
+    assert event["exit_code"] == 7
+    assert event["parent_session_id"] == "root-session"
+    assert event["session_key"] == "root-session"
+    assert registry.completion_queue.empty()
 
-    events = []
+
+def test_reader_fast_exit_cannot_resurrect_finished_session(tmp_path, monkeypatch):
+    """Reader completion before registration must leave one finished owner."""
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", checkpoint)
+    registry = ProcessRegistry()
+
+    class _ImmediateThread:
+        def __init__(self, *, target, args=(), **_kwargs):
+            self._target = target
+            self._args = args
+
+        def start(self):
+            self._target(*self._args)
+
+    monkeypatch.setattr(process_registry_module.threading, "Thread", _ImmediateThread)
+    session = registry.spawn_local(
+        command="exit 7",
+        cwd=str(tmp_path),
+        task_id="sa-0-fast-race",
+        session_key="sa-0-fast-race",
+        notification_session_key="root-session",
+        parent_session_id="root-session",
+        notify_on_complete=True,
+    )
+
+    assert session.exited is True
+    assert session.id not in registry._running
+    assert session.id in registry._finished
+
+
+def test_reader_exit_before_finish_remains_registered(tmp_path, monkeypatch):
+    """The spawn return must never expose a session owned by neither map."""
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", checkpoint)
+    registry = ProcessRegistry()
+
+    class _ExitBeforeFinishThread:
+        def __init__(self, *, target, args=(), **_kwargs):
+            self._session = args[0]
+
+        def start(self):
+            self._session.exited = True
+            self._session.exit_code = 7
+            self._session.completion_reason = "exited"
+
+    monkeypatch.setattr(
+        process_registry_module.threading,
+        "Thread",
+        _ExitBeforeFinishThread,
+    )
+    session = registry.spawn_local(
+        command="exit 7",
+        cwd=str(tmp_path),
+        task_id="sa-0-mid-finish",
+        session_key="sa-0-mid-finish",
+    )
+
+    assert session.id in registry._running
+    assert session.id not in registry._finished
+    registry._move_to_finished(session)
+    assert session.id not in registry._running
+    assert session.id in registry._finished
+
+
+def test_spawn_via_env_failed_start_queues_one_routed_completion(
+    tmp_path, monkeypatch
+):
+    """A remote launch without a PID must fail visibly, not look running."""
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", checkpoint)
+    registry = ProcessRegistry()
     while not registry.completion_queue.empty():
-        events.append(registry.completion_queue.get_nowait())
-    completions = [evt for evt in events if evt.get("type") == "completion"]
-    assert len(completions) == 1
-    assert completions[0]["exit_code"] == 7
-    assert completions[0]["parent_session_id"] == "root-session"
-    assert completions[0]["session_key"] == "root-session"
+        registry.completion_queue.get_nowait()
+
+    class _Env:
+        def execute(self, *_args, **_kwargs):
+            return {"output": "remote launch produced no pid", "returncode": 2}
+
+    session = registry.spawn_via_env(
+        env=_Env(),
+        command="broken-remote-launch",
+        task_id="sa-0-remote-fail",
+        session_key="sa-0-remote-fail",
+        notification_session_key="root-session",
+        parent_session_id="root-session",
+        notify_on_complete=True,
+    )
+    event = registry.completion_queue.get_nowait()
+
+    assert session.exited is True
+    assert session.exit_code == 2
+    assert session.completion_reason == "failed_start"
+    assert session.id not in registry._running
+    assert session.id in registry._finished
+    assert event["type"] == "completion"
+    assert event["task_id"] == "sa-0-remote-fail"
+    assert event["owner_task_id"] == "sa-0-remote-fail"
+    assert event["session_key"] == "root-session"
+    assert event["parent_session_id"] == "root-session"
+    assert event["completion_reason"] == "failed_start"
+    assert registry.completion_queue.empty()
 
 
 def test_should_surface_failed_child_but_suppress_successful_child_noise(

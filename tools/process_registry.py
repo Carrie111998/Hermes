@@ -412,6 +412,7 @@ class ProcessSession:
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     notification_session_key: str = ""          # Delivery route only; not process ownership
+    owner_task_id: str = ""                     # Raw spawning task id; not process cleanup ownership
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
     _watch_suppressed: int = field(default=0, repr=False)    # matches dropped by rate limit
     _watch_disabled: bool = field(default=False, repr=False) # permanently killed after strike limit
@@ -1013,6 +1014,7 @@ class ProcessRegistry:
         env_vars: dict = None,
         use_pty: bool = False,
         notification_session_key: str = "",
+        owner_task_id: str = "",
         parent_session_id: str = "",
         notify_on_complete: bool = False,
         watch_patterns: list = None,
@@ -1049,6 +1051,7 @@ class ProcessRegistry:
             task_id=task_id,
             session_key=session_key,
             notification_session_key=notification_session_key,
+            owner_task_id=owner_task_id or task_id,
             parent_session_id=parent_session_id,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
@@ -1128,7 +1131,8 @@ class ProcessRegistry:
 
                 with self._lock:
                     self._prune_if_needed()
-                    self._running[session.id] = session
+                    if session.id not in self._finished:
+                        self._running[session.id] = session
 
                 self._write_checkpoint()
                 return session
@@ -1234,7 +1238,8 @@ class ProcessRegistry:
 
             with self._lock:
                 self._prune_if_needed()
-                self._running[session.id] = session
+                if session.id not in self._finished:
+                    self._running[session.id] = session
 
             self._write_checkpoint()
         except Exception:
@@ -1278,6 +1283,7 @@ class ProcessRegistry:
         session_key: str = "",
         timeout: int = 10,
         notification_session_key: str = "",
+        owner_task_id: str = "",
         parent_session_id: str = "",
         notify_on_complete: bool = False,
         watch_patterns: list = None,
@@ -1306,6 +1312,7 @@ class ProcessRegistry:
             task_id=task_id,
             session_key=session_key,
             notification_session_key=notification_session_key,
+            owner_task_id=owner_task_id or task_id,
             parent_session_id=parent_session_id,
             cwd=cwd,
             started_at=time.time(),
@@ -1666,6 +1673,7 @@ class ProcessRegistry:
                 ),
                 "parent_session_id": session.parent_session_id,
                 "task_id": session.task_id,
+                "owner_task_id": session.owner_task_id or session.task_id,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -1905,7 +1913,7 @@ class ProcessRegistry:
         """
         if evt.get("type") == "async_delegation":
             return True
-        task_id = str(evt.get("task_id") or "")
+        task_id = str(evt.get("owner_task_id") or evt.get("task_id") or "")
         if not task_id.startswith("sa-"):
             return True
         if surface_child is None:
@@ -1925,6 +1933,7 @@ class ProcessRegistry:
             "session_key": session.notification_session_key or session.session_key,
             "parent_session_id": session.parent_session_id,
             "task_id": session.task_id,
+            "owner_task_id": session.owner_task_id or session.task_id,
             "command": session.command,
             "platform": session.watcher_platform,
             "chat_id": session.watcher_chat_id,
@@ -2881,6 +2890,7 @@ class ProcessRegistry:
                             "task_id": s.task_id,
                             "session_key": s.session_key,
                             "notification_session_key": s.notification_session_key,
+                            "owner_task_id": s.owner_task_id or s.task_id,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -2974,6 +2984,7 @@ class ProcessRegistry:
                 notification_session_key=entry.get(
                     "notification_session_key", ""
                 ),
+                owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
@@ -3298,8 +3309,8 @@ def _format_async_delegation(evt: dict) -> str:
 def _delegation_attribution_line(evt: dict) -> "str | None":
     """One-line delegation attribution for a child-originated process event.
 
-    Subagents run their terminal sessions under ``task_id == subagent_id``
-    (delegate_tool._run_single_child). When a background process they started
+    Subagents stamp their raw id in ``owner_task_id`` while ``task_id`` remains
+    the execution-backend cleanup key. When a background process they started
     completes, its notification is routed to the PARENT conversation by
     design (children consume their own waits via process(wait); anything
     that outlives the child must land where a durable consumer exists).
@@ -3308,7 +3319,7 @@ def _delegation_attribution_line(evt: dict) -> "str | None":
     the task_id against the live + recently-finished subagent registry and
     return a short provenance line, or None for parent-owned processes.
     """
-    task_id = str(evt.get("task_id") or "")
+    task_id = str(evt.get("owner_task_id") or evt.get("task_id") or "")
     if not task_id.startswith("sa-"):
         return None
     try:

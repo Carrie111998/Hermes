@@ -222,9 +222,10 @@ def format_subagent_failure_line(
 def get_subagent_attribution(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """Resolve a process task_id to its originating delegation, if any.
 
-    Children run their terminal sessions under ``task_id == subagent_id``
-    (see _run_single_child's child_task_id), so a background process spawned
-    by a subagent carries that id in ``ProcessSession.task_id``. Returns
+    Children invoke terminal tools under ``task_id == subagent_id`` (see
+    _run_single_child's child_task_id). Shared execution backends may collapse
+    ``ProcessSession.task_id`` to a sandbox key, so notification routing stamps
+    the raw child id separately in ``ProcessSession.owner_task_id``. Returns
     ``{subagent_id, goal, delegation_id, owner_agent_session_id}`` for live AND
     recently-finished children, or None when the task_id is not a known
     subagent.

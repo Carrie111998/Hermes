@@ -27476,6 +27476,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     {
                         "type": "completion",
                         "task_id": getattr(session, "task_id", "") or "",
+                        "owner_task_id": (
+                            getattr(session, "owner_task_id", "")
+                            or getattr(session, "task_id", "")
+                            or ""
+                        ),
                         "exit_code": session.exit_code,
                         "completion_reason": getattr(
                             session, "completion_reason", "exited"
@@ -27521,6 +27526,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "termination_source": getattr(session, "termination_source", ""),
                         "output": _out,
                         "task_id": getattr(session, "task_id", "") or "",
+                        "owner_task_id": (
+                            getattr(session, "owner_task_id", "")
+                            or getattr(session, "task_id", "")
+                            or ""
+                        ),
                         # Spawning conversation's session-db id (stamped at
                         # spawn time in terminal_tool). Lets the delivery
                         # pre-flight drop this completion when the user closed
