@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesConfigRecord } from '@/hermes'
@@ -19,6 +19,22 @@ function LanguageProbe({ target = 'zh' }: { target?: Locale }) {
       <p data-testid="save-error">{saveError?.message ?? ''}</p>
       <button onClick={() => void setLocale(target).catch(() => undefined)} type="button">
         switch
+      </button>
+    </div>
+  )
+}
+
+function RapidSwitchProbe() {
+  const { locale, setLocale } = useI18n()
+
+  return (
+    <div>
+      <p data-testid="locale">{locale}</p>
+      <button onClick={() => void setLocale('ja').catch(() => undefined)} type="button">
+        Japanese
+      </button>
+      <button onClick={() => void setLocale('zh').catch(() => undefined)} type="button">
+        Chinese
       </button>
     </div>
   )
@@ -48,7 +64,7 @@ describe('I18nProvider', () => {
       </I18nProvider>
     )
 
-    expect(screen.getByTestId('locale').textContent).toBe('zh')
+    await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('zh'))
     expect(screen.getByTestId('label').textContent).toBe('语言')
 
     fireEvent.click(screen.getByRole('button', { name: 'switch' }))
@@ -209,6 +225,71 @@ describe('I18nProvider', () => {
     expect(screen.getByTestId('locale').textContent).toBe('ja')
   })
 
+  it('does not let a late config load overwrite an explicit locale choice', async () => {
+    let resolveInitialConfig!: (config: HermesConfigRecord) => void
+
+    const initialConfig = new Promise<HermesConfigRecord>(resolve => {
+      resolveInitialConfig = resolve
+    })
+
+    const saveConfig = vi.fn().mockResolvedValue({ ok: true })
+
+    const configClient: I18nConfigClient = {
+      getConfig: vi.fn().mockReturnValueOnce(initialConfig).mockResolvedValueOnce({ display: { language: 'en' } }),
+      saveConfig
+    }
+
+    render(
+      <I18nProvider configClient={configClient}>
+        <LanguageProbe target="ja" />
+      </I18nProvider>
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'switch' }))
+    await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('ja'))
+    await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1))
+
+    resolveInitialConfig({ display: { language: 'zh' } })
+    await act(async () => Promise.resolve())
+    await waitFor(() => expect(screen.getByTestId('loading').textContent).toBe('false'))
+
+    expect(screen.getByTestId('locale').textContent).toBe('ja')
+  })
+
+  it('serializes saves so a slower earlier switch cannot overwrite the latest choice', async () => {
+    let finishFirstSave!: (result: { ok: boolean }) => void
+
+    const firstSave = new Promise<{ ok: boolean }>(resolve => {
+      finishFirstSave = resolve
+    })
+
+    const saveConfig = vi.fn().mockReturnValueOnce(firstSave).mockResolvedValueOnce({ ok: true })
+
+    const configClient: I18nConfigClient = {
+      getConfig: vi.fn().mockResolvedValue({ display: { language: 'en' } }),
+      saveConfig
+    }
+
+    render(
+      <I18nProvider configClient={configClient}>
+        <RapidSwitchProbe />
+      </I18nProvider>
+    )
+
+    await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('en'))
+    fireEvent.click(screen.getByRole('button', { name: 'Japanese' }))
+    await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('ja'))
+    await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(1))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Chinese' }))
+    await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('zh'))
+    expect(saveConfig).toHaveBeenCalledTimes(1)
+
+    finishFirstSave({ ok: true })
+    await waitFor(() => expect(saveConfig).toHaveBeenCalledTimes(2))
+    expect(saveConfig.mock.calls[1]?.[0]).toMatchObject({ display: { language: 'zh' } })
+  })
+
   it('applies RTL direction for Arabic and restores LTR on switch back', async () => {
     render(
       <I18nProvider configClient={null} initialLocale="ar">
@@ -216,15 +297,15 @@ describe('I18nProvider', () => {
       </I18nProvider>
     )
 
-    expect(screen.getByTestId('locale').textContent).toBe('ar')
-    expect(document.documentElement.dir).toBe('rtl')
-    expect(document.documentElement.lang).toBe('ar')
+    await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('ar'))
+    expect(window.document.documentElement.dir).toBe('rtl')
+    expect(window.document.documentElement.lang).toBe('ar')
 
     fireEvent.click(screen.getByRole('button', { name: 'switch' }))
 
     await waitFor(() => expect(screen.getByTestId('locale').textContent).toBe('en'))
-    expect(document.documentElement.dir).toBe('ltr')
-    expect(document.documentElement.lang).toBe('en')
+    expect(window.document.documentElement.dir).toBe('ltr')
+    expect(window.document.documentElement.lang).toBe('en')
   })
 
   it('rolls back the visible locale when saving fails', async () => {

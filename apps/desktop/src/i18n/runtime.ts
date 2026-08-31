@@ -1,4 +1,4 @@
-import { TRANSLATIONS } from './catalog'
+import { getTranslations } from './catalog'
 import { DEFAULT_LOCALE } from './languages'
 import type { Locale } from './types'
 
@@ -62,5 +62,5 @@ export function getRuntimeI18nLocale(): Locale {
 }
 
 export function translateNow(key: string, ...args: unknown[]): string {
-  return translateFrom(locale => TRANSLATIONS[locale], runtimeLocale, key, args)
+  return translateFrom(getTranslations, runtimeLocale, key, args)
 }

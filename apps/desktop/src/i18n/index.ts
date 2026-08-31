@@ -1,4 +1,4 @@
-export { TRANSLATIONS } from './catalog'
+export { getTranslations, loadTranslations } from './catalog'
 export {
   getConfigDisplayLanguage,
   type I18nConfigClient,

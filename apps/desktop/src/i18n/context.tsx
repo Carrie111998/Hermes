@@ -2,7 +2,7 @@ import { createContext, type ReactNode, useCallback, useContext, useEffect, useM
 
 import { getHermesConfigRecord, type HermesConfigRecord, saveHermesConfig } from '@/hermes'
 
-import { TRANSLATIONS } from './catalog'
+import { getTranslations, loadTranslations } from './catalog'
 import { DEFAULT_LOCALE, localeConfigValue, normalizeLocale } from './languages'
 import { setRuntimeI18nLocale } from './runtime'
 import type { Locale, Translations } from './types'
@@ -83,7 +83,7 @@ const I18nContext = createContext<I18nContextValue>({
   locale: DEFAULT_LOCALE,
   saveError: null,
   setLocale: async () => {},
-  t: TRANSLATIONS[DEFAULT_LOCALE]
+  t: getTranslations(DEFAULT_LOCALE)
 })
 
 export interface I18nProviderProps {
@@ -93,12 +93,15 @@ export interface I18nProviderProps {
 }
 
 export function I18nProvider({ children, configClient = defaultConfigClient, initialLocale }: I18nProviderProps) {
-  const [locale, setLocaleState] = useState<Locale>(() => normalizeLocale(initialLocale))
+  const [locale, setLocaleState] = useState<Locale>(DEFAULT_LOCALE)
+  const [translations, setTranslations] = useState<Translations>(() => getTranslations(DEFAULT_LOCALE))
   const [isLoadingConfig, setIsLoadingConfig] = useState(false)
   const [isSavingLocale, setIsSavingLocale] = useState(false)
   const [configLoadError, setConfigLoadError] = useState<Error | null>(null)
   const [saveError, setSaveError] = useState<Error | null>(null)
   const localeRef = useRef(locale)
+  const localeRequestRef = useRef(0)
+  const saveQueueRef = useRef<Promise<void>>(Promise.resolve())
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -107,34 +110,46 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
     applyDocumentLocale(locale)
   }, [locale])
 
+  // eslint-disable-next-line no-restricted-syntax -- request-generation ref cancels stale async config/catalog loads
   useEffect(() => {
-    if (!configClient) {
-      return
+    if (!configClient && normalizeLocale(initialLocale) === DEFAULT_LOCALE) {
+      return undefined
     }
 
     let cancelled = false
+    const requestId = localeRequestRef.current + 1
+
+    localeRequestRef.current = requestId
 
     setIsLoadingConfig(true)
     setConfigLoadError(null)
 
-    configClient
-      .getConfig()
-      .then(config => {
-        if (!cancelled) {
-          setLocaleState(normalizeLocale(getConfigDisplayLanguage(config)))
+    const loadInitialLocale = async () => {
+      try {
+        const next = configClient
+          ? normalizeLocale(getConfigDisplayLanguage(await configClient.getConfig()))
+          : normalizeLocale(initialLocale)
+
+        const nextTranslations = await loadTranslations(next)
+
+        if (!cancelled && localeRequestRef.current === requestId) {
+          setTranslations(nextTranslations)
+          setLocaleState(next)
         }
-      })
-      .catch(error => {
-        if (!cancelled) {
+      } catch (error) {
+        if (!cancelled && localeRequestRef.current === requestId) {
           setConfigLoadError(toError(error))
+          setTranslations(getTranslations(DEFAULT_LOCALE))
           setLocaleState(DEFAULT_LOCALE)
         }
-      })
-      .finally(() => {
-        if (!cancelled) {
+      } finally {
+        if (!cancelled && localeRequestRef.current === requestId) {
           setIsLoadingConfig(false)
         }
-      })
+      }
+    }
+
+    void loadInitialLocale()
 
     return () => {
       cancelled = true
@@ -143,33 +158,59 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
 
   const setLocale = useCallback(
     async (next: Locale) => {
+      const requestId = localeRequestRef.current + 1
       const previousLocale = localeRef.current
+      const previousTranslations = getTranslations(previousLocale)
 
+      localeRequestRef.current = requestId
       setSaveError(null)
-      setLocaleState(next)
-
-      if (!configClient) {
-        return
-      }
-
+      setIsLoadingConfig(false)
       setIsSavingLocale(true)
 
       try {
-        const latestConfig = await configClient.getConfig()
-        const result = await configClient.saveConfig(withConfigDisplayLanguage(latestConfig, next))
+        const nextTranslations = await loadTranslations(next)
 
-        if (!result.ok) {
-          throw new Error('Failed to save language')
+        if (localeRequestRef.current !== requestId) {
+          return
+        }
+
+        setTranslations(nextTranslations)
+        setLocaleState(next)
+
+        if (configClient) {
+          const saveOperation = saveQueueRef.current.then(async () => {
+            const latestConfig = await configClient.getConfig()
+
+            if (localeRequestRef.current !== requestId) {
+              return
+            }
+
+            const result = await configClient.saveConfig(withConfigDisplayLanguage(latestConfig, next))
+
+            if (localeRequestRef.current === requestId && !result.ok) {
+              throw new Error('Failed to save language')
+            }
+          })
+
+          saveQueueRef.current = saveOperation.catch(() => undefined)
+          await saveOperation
         }
       } catch (error) {
+        if (localeRequestRef.current !== requestId) {
+          return
+        }
+
         const nextError = toError(error)
 
+        setTranslations(previousTranslations)
         setLocaleState(previousLocale)
         setSaveError(nextError)
 
         throw nextError
       } finally {
-        setIsSavingLocale(false)
+        if (localeRequestRef.current === requestId) {
+          setIsSavingLocale(false)
+        }
       }
     },
     [configClient]
@@ -183,9 +224,9 @@ export function I18nProvider({ children, configClient = defaultConfigClient, ini
       locale,
       saveError,
       setLocale,
-      t: TRANSLATIONS[locale]
+      t: translations
     }),
-    [configLoadError, isLoadingConfig, isSavingLocale, locale, saveError, setLocale]
+    [configLoadError, isLoadingConfig, isSavingLocale, locale, saveError, setLocale, translations]
   )
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>
