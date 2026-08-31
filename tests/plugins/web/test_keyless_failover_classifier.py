@@ -100,6 +100,36 @@ class TestSearchFailover:
         assert result["success"] is True
         assert result["data"]["served_by"] == "parallel"
 
+    def test_masked_429_walks_full_ring_to_keenable(self, monkeypatch):
+        """Multi-hop: masked shape failures and rate limits on the first three
+        vendors must not strand the request — the walk reaches keenable."""
+
+        def exa_shape(query):
+            return {"success": False, "error": SHAPE_ERROR}
+
+        def parallel_429(query):
+            return {"success": False, "error": "HTTP 429: slow down"}
+
+        def firecrawl_shape(query):
+            return {
+                "success": False,
+                "error": "Keyless Firecrawl search failed: Unrecognized MCP response shape.",
+            }
+
+        def keenable_ok(query):
+            return {"success": True, "data": {"web": [{"title": "t", "url": "u", "description": "d"}]}}
+
+        calls = _make_ring(
+            monkeypatch,
+            {"exa": exa_shape, "parallel": parallel_429, "firecrawl": firecrawl_shape, "keenable": keenable_ok},
+        )
+
+        result = km.search_with_failover("exa", "q")
+
+        assert calls == ["exa", "parallel", "firecrawl", "keenable"]
+        assert result["success"] is True
+        assert result["data"]["served_by"] == "keenable"
+
     def test_explicit_rate_limit_still_fails_over(self, monkeypatch):
         """Classic 429s advance the ring; if every vendor throttles, the
         walk exhausts with the aggregate error."""
@@ -188,6 +218,38 @@ class TestExtractFailover:
         assert len(results) == 2 and results[0]["url"] == shape_url  # order kept
         assert results[0].get("error") is None and results[0]["served_by"] == "parallel"
         assert results[1]["content"] == "body" and "served_by" not in results[1]
+
+    def test_extract_full_ring_walk_to_keenable(self, monkeypatch):
+        """Extract multi-hop: three retryable failures must push the batch to
+        the last ring vendor and succeed there, with attribution intact."""
+
+        def throttled(urls):
+            return [{"url": u, "title": "", "content": "", "error": "HTTP 429: slow down"} for u in urls]
+
+        def firecrawl_shape(urls):
+            return [
+                {
+                    "url": u,
+                    "title": "",
+                    "content": "",
+                    "error": "Keyless Firecrawl extract failed: Unrecognized MCP response shape.",
+                }
+                for u in urls
+            ]
+
+        def keenable_ok(urls):
+            return [{"url": u, "title": "k", "content": "keenable content"} for u in urls]
+
+        calls = _make_ring(
+            monkeypatch,
+            {"exa": throttled, "parallel": throttled, "firecrawl": firecrawl_shape, "keenable": keenable_ok},
+        )
+
+        results = km.extract_with_failover("exa", ["https://a.example"])
+
+        assert calls == ["exa", "parallel", "firecrawl", "keenable"]
+        assert len(results) == 1
+        assert results[0]["served_by"] == "keenable" and "error" not in results[0]
 
     def test_extract_retryable_url_exhausting_all_vendors_keeps_last_error(self, monkeypatch):
         def throttled(urls):
