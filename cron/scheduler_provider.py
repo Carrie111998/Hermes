@@ -20,6 +20,7 @@ selected via the `cron.provider` config key (empty = built-in).
 from __future__ import annotations
 
 import threading
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -373,7 +374,11 @@ class InProcessCronScheduler(CronScheduler):
     def start(self, stop_event, *, adapters=None, loop=None, interval=60, can_dispatch=None):
         import logging
         from cron.scheduler import tick as cron_tick
-        from cron.jobs import record_ticker_heartbeat
+        from cron.jobs import (
+            get_ticker_authority_counts,
+            record_ticker_heartbeat,
+            record_ticker_state,
+        )
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
@@ -403,7 +408,29 @@ class InProcessCronScheduler(CronScheduler):
         # Heartbeat once before the first sleep so `hermes cron status` sees a
         # live ticker immediately after startup, not only after the first tick.
         record_ticker_heartbeat()
+        ticker_started_at = time.time()
+        last_success_at = None
+        record_ticker_state(
+            "idle",
+            ticker_started_at_epoch=ticker_started_at,
+            last_success_at_epoch=last_success_at,
+            **get_ticker_authority_counts(),
+        )
+        resume_gap = 0.0
         while not stop_event.is_set():
+            # Publish the preceding wait's oversized gap BEFORE cron_tick enters
+            # catch-up. Windows monotonic time advances through Modern Standby,
+            # while some platforms' monotonic clocks do not, so use the larger
+            # wall/monotonic wait and subtract the one expected interval. Timing
+            # only stop_event.wait excludes a slow cron_tick from suspend time.
+            counts = get_ticker_authority_counts()
+            record_ticker_state(
+                "dispatching",
+                resume_gap_seconds=resume_gap,
+                ticker_started_at_epoch=ticker_started_at,
+                last_success_at_epoch=last_success_at,
+                **counts,
+            )
             ok = False
             try:
                 if can_dispatch is not None and not can_dispatch():
@@ -430,4 +457,18 @@ class InProcessCronScheduler(CronScheduler):
             # clean tick, so status can tell "alive but failing every tick" from
             # "actually firing jobs" (#32612, #32895).
             record_ticker_heartbeat(success=ok)
+            if ok:
+                last_success_at = time.time()
+            record_ticker_state(
+                "completed" if ok else "failed",
+                resume_gap_seconds=resume_gap,
+                ticker_started_at_epoch=ticker_started_at,
+                last_success_at_epoch=last_success_at,
+                **get_ticker_authority_counts(),
+            )
+            wait_wall = time.time()
+            wait_monotonic = time.monotonic()
             stop_event.wait(interval)
+            wall_wait = max(0.0, time.time() - wait_wall)
+            monotonic_wait = max(0.0, time.monotonic() - wait_monotonic)
+            resume_gap = max(0.0, max(wall_wait, monotonic_wait) - interval)

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import logging
+import math
 import shutil
 import tempfile
 import threading
@@ -130,6 +131,11 @@ def _get_ticker_success_file() -> Path:
     that is alive but failing every tick.
     """
     return _current_cron_store().cron_dir / "ticker_last_success"
+
+
+def _get_ticker_state_file() -> Path:
+    """Structured scheduler progress shared with the external watchdog."""
+    return _current_cron_store().cron_dir / "ticker_state.json"
 
 
 # Backward-compatible module-level path SNAPSHOTS, resolved once at import for
@@ -1036,6 +1042,175 @@ def record_ticker_heartbeat(success: bool = False) -> None:
             _atomic_write_epoch(_get_ticker_success_file())
         except Exception:
             pass
+
+
+_TICKER_PHASES = frozenset({"idle", "dispatching", "completed", "failed"})
+_TICKER_COUNT_MAX = 100_000
+_TICKER_RESUME_GAP_MAX_SECONDS = 31_536_000.0
+
+
+def _bounded_ticker_count(value: Any) -> int:
+    try:
+        value = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(0, min(value, _TICKER_COUNT_MAX))
+
+
+def record_ticker_state(
+    phase: str,
+    *,
+    due_count: int = 0,
+    claimed_count: int = 0,
+    running_count: int = 0,
+    resume_gap_seconds: float = 0.0,
+    ticker_started_at_epoch: Optional[float] = None,
+    last_success_at_epoch: Optional[float] = None,
+) -> None:
+    """Atomically publish bounded scheduler progress for independent observers.
+
+    This supplements rather than replaces the legacy epoch heartbeat.  It is
+    deliberately best-effort: observability must never become scheduler
+    authority or prevent a tick.
+    """
+    if phase not in _TICKER_PHASES:
+        return
+    try:
+        gap = float(resume_gap_seconds)
+    except (TypeError, ValueError, OverflowError):
+        gap = 0.0
+    if not math.isfinite(gap):
+        gap = 0.0
+    gap = max(0.0, min(gap, _TICKER_RESUME_GAP_MAX_SECONDS))
+    now_epoch = time.time()
+
+    def _bounded_epoch(value: Optional[float], default: float) -> float:
+        if value is None:
+            return default
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return default
+        if not math.isfinite(parsed) or parsed < 0 or parsed > now_epoch + 300.0:
+            return default
+        return parsed
+
+    payload = {
+        "version": 1,
+        "phase": phase,
+        "updated_at_epoch": now_epoch,
+        "ticker_started_at_epoch": _bounded_epoch(ticker_started_at_epoch, now_epoch),
+        "last_success_at_epoch": (
+            _bounded_epoch(last_success_at_epoch, now_epoch)
+            if last_success_at_epoch is not None else None
+        ),
+        "counts": {
+            "due": _bounded_ticker_count(due_count),
+            "claimed": _bounded_ticker_count(claimed_count),
+            "running": _bounded_ticker_count(running_count),
+        },
+        "resume_gap_seconds": gap,
+    }
+    path = _get_ticker_state_file()
+    tmp_path = None
+    try:
+        ensure_dirs()
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".tmp", prefix=".ticker_state_"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        atomic_replace(tmp_path, path)
+    except BaseException:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def get_ticker_state() -> Optional[Dict[str, Any]]:
+    """Read and strictly validate the structured ticker progress artifact."""
+    try:
+        data = json.loads(_get_ticker_state_file().read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or data.get("version") != 1:
+            return None
+        phase = data.get("phase")
+        updated = data.get("updated_at_epoch")
+        counts = data.get("counts")
+        gap = data.get("resume_gap_seconds")
+        started = data.get("ticker_started_at_epoch")
+        last_success = data.get("last_success_at_epoch")
+        if phase not in _TICKER_PHASES or not isinstance(counts, dict):
+            return None
+        if type(updated) not in (int, float) or not math.isfinite(updated):
+            return None
+        if type(gap) not in (int, float) or not math.isfinite(gap):
+            return None
+        if type(started) not in (int, float) or not math.isfinite(started):
+            return None
+        if last_success is not None and (
+            type(last_success) not in (int, float) or not math.isfinite(last_success)
+        ):
+            return None
+        expected = {"due", "claimed", "running"}
+        if set(counts) != expected:
+            return None
+        if any(type(counts[key]) is not int or not 0 <= counts[key] <= _TICKER_COUNT_MAX
+               for key in expected):
+            return None
+        if not 0.0 <= gap <= _TICKER_RESUME_GAP_MAX_SECONDS:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def get_ticker_state_age() -> Optional[float]:
+    state = get_ticker_state()
+    if state is None:
+        return None
+    return max(0.0, time.time() - float(state["updated_at_epoch"]))
+
+
+def get_ticker_authority_counts() -> Dict[str, int]:
+    """Bounded due/claimed/running census from existing cron authorities."""
+    due_count = 0
+    try:
+        now = _hermes_now()
+        for job in load_jobs():
+            # Match the due scan's actual admission gates. ``enabled`` is the
+            # persisted scheduler switch; resume barriers independently keep a
+            # nominally enabled row out of dispatch and therefore out of the
+            # observable due count too.
+            if not job.get("enabled", True) or _resume_barrier(job) is not None:
+                continue
+            raw = job.get("next_run_at")
+            if not raw:
+                continue
+            try:
+                if _ensure_aware(datetime.fromisoformat(raw)) <= now:
+                    due_count += 1
+            except (TypeError, ValueError):
+                continue
+    except Exception:
+        due_count = 0
+    claimed = running = 0
+    try:
+        from cron.executions import nonterminal_execution_counts
+
+        counts = nonterminal_execution_counts()
+        claimed = counts.get("claimed", 0)
+        running = counts.get("running", 0)
+    except Exception:
+        pass
+    return {
+        "due_count": _bounded_ticker_count(due_count),
+        "claimed_count": _bounded_ticker_count(claimed),
+        "running_count": _bounded_ticker_count(running),
+    }
 
 
 def _epoch_file_age(path: Path) -> Optional[float]:

@@ -18,6 +18,7 @@ drives it and stops promptly.
 """
 import threading
 import time
+from datetime import timedelta
 from unittest.mock import patch
 
 
@@ -756,6 +757,141 @@ def test_heartbeat_roundtrip_and_age(tmp_path, monkeypatch):
     jobs.record_ticker_heartbeat(success=True)
     ok = jobs.get_ticker_success_age()
     assert ok is not None and 0.0 <= ok < 5.0
+
+
+def test_structured_ticker_state_roundtrip_is_bounded_and_atomic(tmp_path, monkeypatch):
+    """The independent scheduler signal carries phase + bounded authority counts.
+
+    The legacy epoch heartbeat stays intact for older status readers; the
+    structured artifact is the watchdog's independent evidence that catch-up is
+    progressing rather than merely that the HTTP/event-bus process exists.
+    """
+    import cron.jobs as jobs
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    assert jobs.get_ticker_state() is None
+
+    jobs.record_ticker_state(
+        "dispatching",
+        due_count=3,
+        claimed_count=2,
+        running_count=1,
+        resume_gap_seconds=3600.0,
+    )
+
+    state = jobs.get_ticker_state()
+    assert state is not None
+    assert state["phase"] == "dispatching"
+    assert state["ticker_started_at_epoch"] <= state["updated_at_epoch"]
+    assert state["last_success_at_epoch"] is None
+    assert state["counts"] == {"due": 3, "claimed": 2, "running": 1}
+    assert state["resume_gap_seconds"] == 3600.0
+    assert 0.0 <= jobs.get_ticker_state_age() < 5.0
+    assert not list((tmp_path / "cron").glob(".ticker_state_*.tmp"))
+
+
+def test_structured_ticker_state_clamps_untrusted_counts(tmp_path, monkeypatch):
+    import cron.jobs as jobs
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    jobs.record_ticker_state(
+        "completed",
+        due_count=-9,
+        claimed_count=10**12,
+        running_count="malformed",
+        resume_gap_seconds=float("inf"),
+    )
+    state = jobs.get_ticker_state()
+    assert state["counts"] == {"due": 0, "claimed": 100_000, "running": 0}
+    assert state["resume_gap_seconds"] == 0.0
+
+
+def test_ticker_authority_due_count_matches_dispatch_admission(monkeypatch):
+    """Disabled and resume-barriered rows are not reported as dispatchable due work."""
+    import cron.jobs as jobs
+
+    now = jobs._hermes_now()
+    overdue = (now - timedelta(minutes=5)).isoformat()
+    monkeypatch.setattr(
+        jobs,
+        "load_jobs",
+        lambda: [
+            {"id": "due", "enabled": True, "next_run_at": overdue},
+            {"id": "disabled", "enabled": False, "next_run_at": overdue},
+            {
+                "id": "barriered",
+                "enabled": True,
+                "next_run_at": overdue,
+                "resume_barrier": {
+                    "reason": "operator hold",
+                    "set_at": now.isoformat(),
+                    "set_by": "test",
+                },
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        "cron.executions.nonterminal_execution_counts",
+        lambda: {"claimed": 2, "running": 1},
+    )
+
+    assert jobs.get_ticker_authority_counts() == {
+        "due_count": 1,
+        "claimed_count": 2,
+        "running_count": 1,
+    }
+
+
+def test_ticker_publishes_resume_before_second_catchup_dispatch(monkeypatch):
+    """A Modern-Standby wall jump is visible before cron_tick enters catch-up."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    wall = [1000.0]
+    mono = [500.0]
+    waits = [0]
+    phases = []
+    ticks = []
+
+    class _TwoTicks:
+        def is_set(self):
+            return waits[0] >= 2
+
+        def wait(self, _interval):
+            waits[0] += 1
+            if waits[0] == 1:
+                # Windows monotonic time advances through Modern Standby too.
+                # The resume signature is therefore the oversized loop gap,
+                # not a wall-minus-monotonic delta (which stays near zero).
+                wall[0] += 3600.0
+                mono[0] += 3600.0
+            return False
+
+    monkeypatch.setattr("cron.scheduler_provider.time.time", lambda: wall[0])
+    monkeypatch.setattr("cron.scheduler_provider.time.monotonic", lambda: mono[0])
+    monkeypatch.setattr(
+        "cron.jobs.record_ticker_state",
+        lambda phase, **evidence: phases.append((phase, dict(evidence))),
+    )
+    monkeypatch.setattr("cron.jobs.record_ticker_heartbeat", lambda **_kwargs: None)
+    monkeypatch.setattr("cron.jobs.get_ticker_authority_counts", lambda: {
+        "due_count": 4, "claimed_count": 1, "running_count": 1,
+    })
+    monkeypatch.setattr(
+        "cron.scheduler.tick",
+        lambda *a, **k: ticks.append(len(phases)) or 0,
+    )
+    monkeypatch.setattr(InProcessCronScheduler, "recover_interrupted", lambda _self: 0)
+
+    InProcessCronScheduler().start(_TwoTicks(), interval=60)
+
+    assert len(ticks) == 2
+    resume_dispatch = [
+        evidence for phase, evidence in phases
+        if phase == "dispatching" and evidence.get("resume_gap_seconds", 0) > 3000
+    ]
+    assert len(resume_dispatch) == 1
+    assert phases.index(("dispatching", resume_dispatch[0])) < ticks[1]
+    assert resume_dispatch[0]["due_count"] == 4
 
 
 def test_heartbeat_age_detects_staleness(tmp_path, monkeypatch):

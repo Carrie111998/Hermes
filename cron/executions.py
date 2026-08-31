@@ -338,6 +338,25 @@ def nonterminal_execution_census() -> List[Dict[str, Any]]:
     return _nonterminal_execution_census_path(EXECUTIONS_FILE, create=True)
 
 
+def nonterminal_execution_counts() -> Dict[str, int]:
+    """Storage-only claimed/running counts for scheduler observability.
+
+    Unlike ``nonterminal_execution_census()``, this does not probe each owner
+    process. The ticker calls it twice per iteration, so liveness classification
+    here would turn a bounded heartbeat write into a process-enumeration stall.
+    These are descriptive counts, never admission or recovery authority.
+    """
+    with _lock, _connect() as conn:
+        rows = conn.execute(
+            """SELECT status, COUNT(*) AS n FROM executions
+               WHERE status IN ('claimed','running') GROUP BY status"""
+        ).fetchall()
+    counts = {"claimed": 0, "running": 0}
+    for row in rows:
+        counts[str(row["status"])] = int(row["n"])
+    return counts
+
+
 #: Hard cap on how many non-terminal rows one admission check will probe.
 #:
 #: Measured 2026-08-24, warm, against a copy of the real 10,000-row
