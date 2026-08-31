@@ -6368,7 +6368,14 @@ def run_job(
 
             if _session_db_timeout > 0:
                 _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                _session_db_future = _session_db_pool.submit(SessionDB)
+                # ThreadPoolExecutor does not copy ContextVars. Preserve the
+                # multiplex ticker's per-profile HERMES_HOME override so the
+                # bounded worker opens the job owner's state.db, not the
+                # dashboard/gateway process profile's store (#97489).
+                _session_db_context = contextvars.copy_context()
+                _session_db_future = _session_db_pool.submit(
+                    _session_db_context.run, SessionDB
+                )
                 try:
                     _session_db = _session_db_future.result(timeout=_session_db_timeout)
                 except concurrent.futures.TimeoutError:

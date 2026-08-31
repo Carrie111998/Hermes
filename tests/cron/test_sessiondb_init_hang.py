@@ -75,6 +75,53 @@ def _session_db_executor(timeouts: list, *, instant_timeout: bool = True):
 
 
 class TestSessionDbInitTimeout:
+    def test_bounded_init_preserves_profile_home_scope(self, tmp_path, monkeypatch):
+        """The timeout worker must open the owning profile's state store."""
+        from hermes_constants import (
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        root_home = tmp_path / "dashboard"
+        profile_home = tmp_path / "profiles" / "north-caribbean"
+        root_home.mkdir()
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(root_home))
+        monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "10")
+        opened_homes = []
+        fake_db = MagicMock()
+
+        def _scoped_session_db():
+            opened_homes.append(get_hermes_home())
+            return fake_db
+
+        job = {"id": "profile-scoped-db", "name": "test", "prompt": "hello"}
+        with patch("cron.scheduler._hermes_home", profile_home), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", side_effect=_scoped_session_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value=_RUNTIME,
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            token = set_hermes_home_override(profile_home)
+            try:
+                success, _output, final_response, _error = run_job(job)
+            finally:
+                reset_hermes_home_override(token)
+
+        assert success is True
+        assert final_response == "ok"
+        assert opened_homes == [profile_home]
+        assert mock_agent_cls.call_args.kwargs["session_db"] is fake_db
+
     def test_run_job_does_not_hang_when_sessiondb_init_wedges(self, tmp_path, monkeypatch):
         """run_job proceeds without a session store when SessionDB init times out."""
         monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "0.2")
