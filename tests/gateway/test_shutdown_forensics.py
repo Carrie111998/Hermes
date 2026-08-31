@@ -141,7 +141,7 @@ class TestCheckSystemdTimingAlignment:
         monkeypatch.setattr(
             "builtins.open",
             lambda *args, **kwargs: io.StringIO(
-                "0::/system.slice/hermes-gateway.service\n"
+                "0::/hermes-gateway.service\n"
             ),
         )
         calls = []
@@ -171,6 +171,54 @@ class TestCheckSystemdTimingAlignment:
         assert result is not None
         assert result["timeout_stop_sec"] == 210.0
         assert result["mismatch"] is False
+
+    @pytest.mark.parametrize(
+        ("cgroup_path", "expected_user_scope", "expected_timeout", "expected_mismatch"),
+        [
+            ("/system.slice/hermes-gateway.service", False, 210.0, False),
+            (
+                "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+                "hermes-gateway.service",
+                True,
+                90.0,
+                True,
+            ),
+        ],
+    )
+    def test_cgroup_scope_selects_manager_when_both_units_are_loaded(
+        self,
+        monkeypatch,
+        cgroup_path,
+        expected_user_scope,
+        expected_timeout,
+        expected_mismatch,
+    ):
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        monkeypatch.setattr(
+            "builtins.open",
+            lambda *args, **kwargs: io.StringIO(
+                f"0::{cgroup_path}\n"
+            ),
+        )
+        calls = []
+
+        def fake_run(command, **kwargs):
+            is_user = "--user" in command
+            calls.append(is_user)
+            timeout = "1min 30s" if is_user else "3min 30s"
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"LoadState=loaded\nTimeoutStopUSec={timeout}\n",
+            )
+
+        monkeypatch.setattr(sf.subprocess, "run", fake_run)
+
+        result = sf.check_systemd_timing_alignment(180.0, 0.0)
+
+        assert calls == [expected_user_scope]
+        assert result is not None
+        assert result["timeout_stop_sec"] == expected_timeout
+        assert result["mismatch"] is expected_mismatch
 
     def test_returns_none_when_unit_undeterminable(self, monkeypatch):
         monkeypatch.setenv("INVOCATION_ID", "abc")
