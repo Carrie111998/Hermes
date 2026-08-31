@@ -196,6 +196,11 @@ if [ "$DEV_SANDBOX_INTERACTIVE" = true ]; then
   dev_mounts=(--dev /dev)
 fi
 
+# npm bypasses the MITM proxy on purpose. Node trusts only the real CA bundle
+# (NODE_EXTRA_CA_CERTS above), never the sandbox's minted CA, so every registry
+# fetch through the proxy dies with UNABLE_TO_VERIFY_LEAF_SIGNATURE. Direct
+# connection (slirp NAT, real certs) is the intended reach: the sandbox
+# isolates from the host, not from the internet.
 exec bwrap \
   --unshare-pid \
   --die-with-parent --proc /proc --tmpfs /tmp \
@@ -221,7 +226,7 @@ exec bwrap \
   --setenv HTTP_PROXY http://127.0.0.1:8080 \
   --setenv HTTPS_PROXY http://127.0.0.1:8080 \
   --setenv ALL_PROXY http://127.0.0.1:8080 \
-  --setenv NO_PROXY '' \
+  --setenv NO_PROXY registry.npmjs.org \
   --setenv DEV_SANDBOX_INTERACTIVE "$DEV_SANDBOX_INTERACTIVE" \
   --setenv ELECTRON_DISABLE_SANDBOX 1 \
   "${node_env[@]}" \

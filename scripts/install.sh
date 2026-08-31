@@ -492,6 +492,18 @@ configure_managed_node_npm_prefix() {
     printf 'prefix=%s\n' "$(dirname "$link_dir")" > "$HERMES_HOME/node/etc/npmrc"
 }
 
+# Make node-gyp compile native addons (node-pty, etc.) against the managed
+# Node's own headers instead of resolving a host Node's install dir. The dev
+# sandbox exports npm_config_nodedir from the *host*'s `command -v node`
+# (e.g. /usr/local on a runner), which has no headers — node-gyp then fails
+# with "common.gypi not found". The managed Node ships include/node/, so point
+# node-gyp at it once the managed Node is on PATH.
+point_node_gyp_at_managed_node() {
+    if [ -d "$HERMES_HOME/node/include/node" ]; then
+        export npm_config_nodedir="$HERMES_HOME/node"
+    fi
+}
+
 get_hermes_command_path() {
     local link_dir
     link_dir="$(get_command_link_dir)"
@@ -943,6 +955,10 @@ check_node() {
     if command -v node &> /dev/null && command -v npm &> /dev/null \
         && node_satisfies_build "$(node --version)"; then
         if npm_supports_npmrc "$(npm --version 2>/dev/null)"; then
+            # `node` on PATH may be the managed Node's symlink (install_node
+            # links it into the command link dir), so node-gyp must use the
+            # managed headers, not the host-derived npm_config_nodedir.
+            point_node_gyp_at_managed_node
             log_success "Node.js $(node --version) found"
             HAS_NODE=true
             return 0
@@ -956,6 +972,7 @@ check_node() {
     # Prefer a Hermes-managed Node from a previous run over a too-old system one.
     if [ -x "$HERMES_HOME/node/bin/node" ] && [ -x "$HERMES_HOME/node/bin/npm" ] \
         && node_satisfies_build "$("$HERMES_HOME/node/bin/node" --version)"; then
+        point_node_gyp_at_managed_node
         export PATH="$HERMES_HOME/node/bin:$PATH"
         log_success "Node.js $("$HERMES_HOME/node/bin/node" --version) found (Hermes-managed)"
         HAS_NODE=true
@@ -1080,6 +1097,7 @@ install_node() {
     ln -sf "$HERMES_HOME/node/bin/npx"  "$node_link_dir/npx"
 
     configure_managed_node_npm_prefix
+    point_node_gyp_at_managed_node
 
     export PATH="$HERMES_HOME/node/bin:$PATH"
 
@@ -2464,7 +2482,7 @@ install_node_deps() {
         # Capture npm output so failures are diagnosable (#87340).
         local npm_log
         npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --loglevel error \
                 >"$npm_log" 2>&1; then
             log_error "npm install failed or timed out; Node.js dependencies were not installed"
             if [ -s "$npm_log" ]; then
@@ -2580,7 +2598,7 @@ install_node_deps() {
         # Capture npm output so failures are diagnosable (#87340).
         local tui_npm_log
         tui_npm_log="$(mktemp)"
-        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --silent \
+        if ! run_with_timeout "$NODE_DEPS_TIMEOUT" npm install --loglevel error \
                 >"$tui_npm_log" 2>&1; then
             log_error "TUI npm install failed or timed out; TUI dependencies were not installed"
             if [ -s "$tui_npm_log" ]; then
