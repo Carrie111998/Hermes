@@ -1504,11 +1504,45 @@ export function reconcileRegistryDrift(
   const config = v1 && typeof v1 === 'object' ? (v1 as Record<string, any>) : {}
   const unchanged = { changed: false, registry }
 
-  if (!modeIsRemoteLike(config.mode)) {
+  if (!modeIsRemoteLike(config.mode) && config.mode !== 'ssh') {
     return unchanged
   }
 
   const block = config.remote && typeof config.remote === 'object' ? config.remote : {}
+
+  if (config.mode === 'ssh') {
+    // SSH-only v1 route: register it when no matching ssh entry exists. This
+    // is the drift state — the one-time migration ran before this SSH host was
+    // configured, so the registry never learned about it (#96742).
+    const ssh = normalizeSshConfig({ ...block, mode: 'ssh' })
+
+    if (!ssh) {
+      return unchanged
+    }
+
+    const { mode: _mode, ...sshFields } = ssh
+    const sshKey = (c: { host?: string; port?: number; remoteProfile?: string; user?: string }) =>
+      `${(c.user || '').toLowerCase()}@${(c.host || '').toLowerCase()}:${c.port ?? 22}::${(c.remoteProfile || '').trim()}`
+
+    const alreadyRegistered = registry.connections.some(
+      c => c.kind === 'ssh' && sshKey(c) === sshKey(sshFields)
+    )
+
+    if (alreadyRegistered) {
+      return unchanged
+    }
+
+    const entry = normalizeConnectionInput(
+      {
+        kind: 'ssh',
+        label: uniqueLabel(ssh.host, registry.connections.map(c => c.label)),
+        ...sshFields
+      },
+      registry
+    )
+
+    return { changed: true, registry: { ...upsertConnection(registry, entry), primary: entry.id, lastUsed: entry.id } }
+  }
 
   let url = ''
 
