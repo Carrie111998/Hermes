@@ -806,3 +806,138 @@ class TestRunsProviderAuthFailure:
                 assert status["status"] == "failed"
                 assert status["error"] == "⚠️ Provider authentication failed: No credentials found for provider 'nous'"
                 assert status["last_event"] == "run.failed"
+
+
+def _make_transcript_agent(captured: dict):
+    """Agent whose run reports a transcript-shaped result carrying tool_calls.
+
+    The assistant tool_call message is the piece the flattened
+    conversation_history contract drops, so its survival is what distinguishes
+    lossless chaining from the legacy empty-store fallback.
+    """
+    mock_agent = MagicMock()
+
+    def _run(user_message=None, conversation_history=None, task_id=None):
+        captured.setdefault("user_messages", []).append(user_message)
+        captured.setdefault("histories", []).append(conversation_history)
+        return {
+            "final_response": "all done",
+            "messages": [
+                {"role": "user", "content": user_message},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{\"cmd\": \"ls\"}"},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "a.txt"},
+                {"role": "assistant", "content": "all done"},
+            ],
+        }
+
+    mock_agent.run_conversation.side_effect = _run
+    mock_agent.session_prompt_tokens = 0
+    mock_agent.session_completion_tokens = 0
+    mock_agent.session_total_tokens = 0
+    return mock_agent
+
+
+async def _wait_completed(cli, run_id: str) -> dict:
+    status = {}
+    for _ in range(40):
+        status_resp = await cli.get(f"/v1/runs/{run_id}")
+        status = await status_resp.json()
+        if status["status"] in {"completed", "failed"}:
+            break
+        await asyncio.sleep(0.05)
+    return status
+
+
+class TestRunTranscriptPersistence:
+    """Completed runs must be stored so previous_response_id chains losslessly.
+
+    /v1/runs has always consumed stored transcripts via previous_response_id,
+    but never wrote one — a chained second turn fell back to whatever the
+    caller squashed into conversation_history (no tool calls) or to nothing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_completed_run_is_stored_with_full_transcript(self, adapter):
+        app = _create_runs_app(adapter)
+        captured = {}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = _make_transcript_agent(captured)
+
+                resp = await cli.post("/v1/runs", json={
+                    "input": "list files",
+                    "session_id": "sess-chain-1",
+                    "instructions": "be brief",
+                })
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                status = await _wait_completed(cli, run_id)
+                assert status["status"] == "completed"
+
+                stored = adapter._response_store.get(run_id)
+        assert stored is not None, "completed run must be persisted under its own id"
+        assert stored["instructions"] == "be brief"
+        assert stored["session_id"] == "sess-chain-1"
+
+        hist = stored["conversation_history"]
+        roles = [m.get("role") for m in hist]
+        assert "user" in roles and "tool" in roles
+        assert any(
+            m.get("role") == "assistant" and m.get("tool_calls") for m in hist
+        ), "chained transcript must keep tool_calls, not the flattened text-only version"
+
+        # The same session_id maps the run as the latest link of that chain.
+        assert adapter._response_store.get_conversation("sess-chain-1") == run_id
+
+    @pytest.mark.asyncio
+    async def test_previous_response_id_replays_stored_transcript(self, adapter):
+        app = _create_runs_app(adapter)
+        captured = {}
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = _make_transcript_agent(captured)
+
+                resp = await cli.post("/v1/runs", json={"input": "list files"})
+                first_run = (await resp.json())["run_id"]
+                assert (await _wait_completed(cli, first_run))["status"] == "completed"
+
+                follow = await cli.post("/v1/runs", json={
+                    "input": "and the second one?",
+                    "previous_response_id": first_run,
+                })
+                assert follow.status == 202
+                second_run = (await follow.json())["run_id"]
+                assert (await _wait_completed(cli, second_run))["status"] == "completed"
+
+        second_history = captured["histories"][1]
+        assert second_history, (
+            "second turn must inherit history from the stored first run, not start empty"
+        )
+        assert any(m.get("role") == "assistant" and m.get("tool_calls") for m in second_history)
+
+    @pytest.mark.asyncio
+    async def test_store_false_opts_out_of_persistence(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_create.return_value = _make_transcript_agent({})
+
+                resp = await cli.post("/v1/runs", json={
+                    "input": "ephemeral", "store": False,
+                })
+                run_id = (await resp.json())["run_id"]
+                assert (await _wait_completed(cli, run_id))["status"] == "completed"
+
+                status = await cli.get(f"/v1/runs/{run_id}")
+                assert (await status.json())["status"] == "completed"
+
+        assert adapter._response_store.get(run_id) is None

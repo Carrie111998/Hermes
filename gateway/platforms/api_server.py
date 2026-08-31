@@ -7619,6 +7619,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         instructions = body.get("instructions")
         previous_response_id = body.get("previous_response_id")
+        # Runs persist their transcripts for previous_response_id chaining (see
+        # the completion handler below), so they honor the same opt-out flag
+        # /v1/responses accepts — same default: store unless told otherwise.
+        store = _coerce_request_bool(body.get("store"), default=True)
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
@@ -7921,6 +7925,36 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.completed",
                         **({"pending_steer": pending_steer} if pending_steer else {}),
                     )
+                    # Persist the run's full transcript (tool calls included)
+                    # so a follow-up request chained via previous_response_id
+                    # replays exactly what this run saw. /v1/runs has always
+                    # consumed stored transcripts but never wrote one — every
+                    # chained turn fell back to the caller-flattened
+                    # conversation_history or started empty. Mirrors the
+                    # /v1/responses persistence block.
+                    if store and isinstance(result, dict):
+                        try:
+                            full_history = self._build_response_conversation_history(
+                                conversation_history, user_message, result, final_response,
+                            )
+                            self._response_store.put(run_id, {
+                                "response": {
+                                    "id": run_id,
+                                    "object": "hermes.run",
+                                    "status": "completed",
+                                    "output": final_response,
+                                    "usage": usage,
+                                },
+                                "conversation_history": full_history,
+                                "instructions": instructions,
+                                "session_id": session_id,
+                            })
+                            if session_id:
+                                self._response_store.set_conversation(session_id, run_id)
+                        except Exception:
+                            logger.exception(
+                                "[api_server] failed to persist run %s for chaining", run_id,
+                            )
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
