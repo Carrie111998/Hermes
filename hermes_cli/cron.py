@@ -183,23 +183,25 @@ def cron_list(show_all: bool = False):
             status = color("[paused]", Colors.YELLOW)
         elif state == "completed":
             status = color("[completed]", Colors.BLUE)
+        elif state == "error":
+            # Scheduler-terminal error (e.g. malformed schedule, croniter
+            # missing) — never show a scheduled-but-broken job as armed.
+            status = color("[error]", Colors.RED)
+        elif not job.get("enabled", True):
+            status = color("[disabled]", Colors.RED)
         elif job.get("last_status") == "error":
             # Job is armed but its last run failed — surface that in the
             # header instead of a misleading green [active] (#99583).
-            # Edge case: a disabled job (enabled=False) with last_status==error
-            # also lands here. That is rare (you'd have to disable after a
-            # failure) and the header still wins over [disabled] because the
-            # failure is the more actionable signal right now. If this ever
-            # becomes a problem, reorder: check enabled before last_status.
+            # `enabled` is honoured first so a disabled job with a failed
+            # last run shows [disabled], not [active!]: it will NOT retry,
+            # so lifecycle state is the more actionable signal.
             streak = int(job.get("failure_streak") or 0)
             if streak >= 2:
                 status = color(f"[active! {streak} fails]", Colors.YELLOW)
             else:
                 status = color("[active!]", Colors.YELLOW)
-        elif job.get("enabled", True):
-            status = color("[active]", Colors.GREEN)
         else:
-            status = color("[disabled]", Colors.RED)
+            status = color("[active]", Colors.GREEN)
 
         print(f"  {color(job_id, Colors.YELLOW)} {status}")
         print(f"    Name:      {name}")

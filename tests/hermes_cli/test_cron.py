@@ -508,6 +508,56 @@ class TestCronListErroredHeader:
         assert "[active]" in out
         assert "[active!]" not in out
 
+    def test_disabled_job_with_failed_last_run_shows_disabled(self, tmp_cron_dir, capsys, monkeypatch):
+        # enabled is honoured before last_status: a disabled job whose last
+        # run failed must show [disabled], not [active!] — it will NOT retry.
+        from cron.jobs import create_job
+
+        job = create_job(prompt="x", schedule="0 11 * * *")
+        monkeypatch.setattr(
+            "cron.jobs.list_jobs",
+            lambda include_disabled=False: [
+                {
+                    **job,
+                    "enabled": False,
+                    "state": "scheduled",
+                    "last_status": "error",
+                    "last_error": "Script not found",
+                    "failure_streak": 2,
+                }
+            ],
+        )
+        cron_cli.cron_list(show_all=True)
+        out = capsys.readouterr().out
+        assert "[disabled]" in out
+        assert "[active!]" not in out
+
+    def test_scheduler_error_state_shows_error(self, tmp_cron_dir, capsys, monkeypatch):
+        # A scheduler-terminal error (state="error", e.g. malformed schedule)
+        # must not display as armed — it shows [error] regardless of
+        # last_status or enabled.
+        from cron.jobs import create_job
+
+        job = create_job(prompt="x", schedule="0 11 * * *")
+        monkeypatch.setattr(
+            "cron.jobs.list_jobs",
+            lambda include_disabled=False: [
+                {
+                    **job,
+                    "state": "error",
+                    "last_status": "error",
+                    "last_error": "bad schedule",
+                    "failure_streak": 1,
+                }
+            ],
+        )
+        cron_cli.cron_list(show_all=True)
+        out = capsys.readouterr().out
+        assert "[error]" in out
+        assert "[active!]" not in out
+        assert "[active]" not in out.replace("[active!]", "")
+        assert "[disabled]" not in out
+
     def test_job_that_never_ran_stays_green(self, tmp_cron_dir, capsys, monkeypatch):
         # last_status is None (never fired) — must NOT trigger the error branch.
         from cron.jobs import create_job
