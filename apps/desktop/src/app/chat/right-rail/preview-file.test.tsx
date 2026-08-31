@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { MarkdownPreview } from './preview-file'
@@ -13,7 +13,7 @@ describe('MarkdownPreview', () => {
     cleanup()
   })
 
-  it('renders block and inline math through KaTeX', () => {
+  it('renders block and inline math through KaTeX after the deferred plugin loads', async () => {
     // KaTeX marks its output; raw "$" delimiters must be gone.
     const { container } = render(
       <MarkdownPreview
@@ -21,7 +21,7 @@ describe('MarkdownPreview', () => {
       />
     )
 
-    expect(container.querySelector('.katex')).not.toBeNull()
+    await waitFor(() => expect(container.querySelector('.katex')).not.toBeNull())
     expect(screen.queryByText(/\$\$/)).toBeNull()
   })
 

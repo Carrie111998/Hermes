@@ -30,8 +30,8 @@ import {
   writeDesktopFileText
 } from '@/lib/desktop-fs'
 import { Check, Pencil, X } from '@/lib/icons'
-import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { isComposerChord } from '@/lib/keybinds/chords'
+import { useLazyMathPlugin } from '@/lib/lazy-math-plugin'
 import { shikiLanguageForFilename } from '@/lib/markdown-code'
 import { normalizeFilePreviewMath } from '@/lib/markdown-preprocess'
 import { cn } from '@/lib/utils'
@@ -45,11 +45,6 @@ const TEXT_PREVIEW_MAX_BYTES = 512 * 1024
 const SOURCE_CHUNK_LINES = 200
 const SOURCE_LINE_PX = 20
 const SOURCE_OVERSCAN_LINES = 400
-
-// Math plugin for the static file preview, configured once at module scope.
-// Mirrors the chat transcript's plugin (`markdown-text.tsx`) — same memoized
-// KaTeX wrapper, with `singleDollarTextMath: true` so `$x$` renders inline.
-const previewMathPlugin = createMemoizedMathPlugin({ singleDollarTextMath: true })
 
 type EmptyStateTone = 'neutral' | 'warning'
 
@@ -430,6 +425,8 @@ const MARKDOWN_COMPONENTS = {
 
 export function MarkdownPreview({ text }: { text: string }) {
   const mathText = useMemo(() => normalizeFilePreviewMath(text), [text])
+  const math = useLazyMathPlugin(mathText)
+  const plugins = useMemo(() => (math ? { math } : {}), [math])
 
   return (
     <div className="preview-markdown mx-auto max-w-3xl px-4 py-3 text-sm text-foreground" data-selectable-text="true">
@@ -438,7 +435,7 @@ export function MarkdownPreview({ text }: { text: string }) {
         controls={false}
         mode="static"
         parseIncompleteMarkdown={false}
-        plugins={{ math: previewMathPlugin }}
+        plugins={plugins}
       >
         {mathText}
       </Streamdown>
