@@ -11764,6 +11764,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
 _KANBAN_NOTIFY_KINDS = (
     "completed", "blocked", "gave_up", "crashed", "timed_out",
     "status", "archived", "unblocked",
+    "review_requested", "changes_requested", "block_loop_detected",
 )
 _KANBAN_SILENT_KINDS = frozenset({"archived", "unblocked"})
 _KANBAN_POLL_SECONDS = 5.0
@@ -11907,6 +11908,34 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
     if kind == "status":
         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
+    if kind == "review_requested":
+        handoff = ""
+        summary = payload.get("summary")
+        if summary:
+            lines = str(summary).strip().splitlines()
+            handoff = f"\n{lines[0][:200]}" if lines else f"\n{str(summary)[:200]}"
+        return f"👀 {board_tag}{tag}Kanban {task_id} ready for review — {title}{handoff}"
+    if kind == "changes_requested":
+        try:
+            from gateway.kanban_watchers import _safe_review_reason
+        except Exception:
+            def _safe_review_reason(value, limit=160):
+                text = " ".join(("" if value is None else str(value)).split())
+                return text[:limit]
+        reason = _safe_review_reason(payload.get("reason")) or "reviewer feedback requires changes"
+        reviewer = _safe_review_reason(payload.get("reviewer"), 48)
+        implementer = _safe_review_reason(payload.get("implementer"), 48)
+        provenance = ""
+        if reviewer:
+            provenance += f" — reviewer @{reviewer}"
+        if implementer:
+            provenance += f" → implementer @{implementer}"
+        return f"🛑 {board_tag}Kanban {task_id} review requested changes/BLOCK: {reason}{provenance}"
+    if kind == "block_loop_detected":
+        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
+        recurrences = payload.get("recurrences")
+        rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
+        return f"🛑 {board_tag}{tag}Kanban {task_id} routed to TRIAGE — needs a human decision{rc}{reason}"
     return None
 
 
