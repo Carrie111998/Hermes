@@ -180,7 +180,12 @@ def test_bootstrap_chooses_unique_newest_record_per_group_not_whole_record(
     assert json.loads(record.desired_groups["field:title"])["value"] == "New title"
     assert json.loads(record.desired_groups["field:isArchived"])["value"] is False
     assert len(record.mutations) == 2
-    assert not plan.conflicts
+    conflict = next(
+        item
+        for item in plan.conflicts
+        if item.group_name == "unknown:destinationOnly"
+    )
+    assert conflict.reason == "unknown_field_unclassified"
 
 
 def test_bootstrap_equal_newest_same_value_is_safe(tmp_path: Path) -> None:
@@ -344,13 +349,26 @@ def test_steady_state_merges_disjoint_replica_changes(tmp_path: Path) -> None:
     assert not plan.conflicts
 
 
-def test_steady_state_all_replicas_removing_unknown_key_propagates_absence(
+def test_steady_state_unknown_key_change_is_quarantined_and_preserved(
     tmp_path: Path,
 ) -> None:
     a, b, c = (tmp_path / name for name in ("a", "b", "c"))
     for root in (a, b, c):
         _write_record(root, "local_one", mtime_ns=100, futureDesktopField="present")
     initial = build_registry_sync_plan(_scan(a, b, c), baselines=())
+    classified_baselines = tuple(initial.proposed_baselines) + tuple(
+        RegistryBaseline(
+            filename="local_one.json",
+            root_id=root_id,
+            group_name="unknown:futureDesktopField",
+            value_json=json.dumps(
+                {"state": "present", "value": "present"},
+                separators=(",", ":"),
+            ),
+            revision=1,
+        )
+        for root_id in initial.scan.roots
+    )
 
     for root in (a, b):
         path = root / "local_one.json"
@@ -358,18 +376,21 @@ def test_steady_state_all_replicas_removing_unknown_key_propagates_absence(
         del record["futureDesktopField"]
         path.write_text(json.dumps(record), encoding="utf-8")
 
-    plan = build_registry_sync_plan(_scan(a, b, c), baselines=initial.proposed_baselines)
+    plan = build_registry_sync_plan(_scan(a, b, c), baselines=classified_baselines)
 
-    desired = plan.records["local_one.json"].desired_groups[
-        "field:futureDesktopField"
-    ]
-    assert json.loads(desired) == {"state": "absent"}
-    patch_c = next(
-        mutation
-        for mutation in plan.records["local_one.json"].mutations
-        if mutation.root_id == _root_id(plan.scan, c)
+    conflict = next(
+        item
+        for item in plan.conflicts
+        if item.group_name == "unknown:futureDesktopField"
     )
-    assert "futureDesktopField" not in json.loads(patch_c.after_bytes)
+    assert conflict.reason == "unknown_field_unclassified"
+    assert "unknown:futureDesktopField" not in plan.records[
+        "local_one.json"
+    ].desired_groups
+    assert not plan.records["local_one.json"].mutations
+    assert json.loads((c / "local_one.json").read_text(encoding="utf-8"))[
+        "futureDesktopField"
+    ] == "present"
 
 
 def test_steady_state_protected_linkage_change_is_quarantined(
@@ -476,7 +497,7 @@ def test_missing_cli_session_id_is_distinct_protected_linkage_value(
     assert conflict.reason == "protected_linkage_divergence"
 
 
-def test_unknown_future_key_is_synchronized_as_independent_atomic_field(
+def test_unknown_future_key_is_quarantined_without_bootstrap_winner(
     tmp_path: Path,
 ) -> None:
     a, b, c = (tmp_path / name for name in ("a", "b", "c"))
@@ -486,10 +507,21 @@ def test_unknown_future_key_is_synchronized_as_independent_atomic_field(
 
     plan = build_registry_sync_plan(_scan(a, b, c), baselines=())
 
-    desired = plan.records["local_one.json"].desired_groups[
-        "field:futureDesktopField"
-    ]
-    assert json.loads(desired)["value"] == {"new": [1, 2]}
+    conflict = next(
+        item
+        for item in plan.conflicts
+        if item.group_name == "unknown:futureDesktopField"
+    )
+    assert conflict.reason == "unknown_field_unclassified"
+    assert set(conflict.candidates) == {
+        _root_id(plan.scan, a),
+        _root_id(plan.scan, b),
+        _root_id(plan.scan, c),
+    }
+    assert "unknown:futureDesktopField" not in plan.records[
+        "local_one.json"
+    ].desired_groups
+    assert not plan.records["local_one.json"].mutations
 
 
 def test_apply_patch_requires_exact_expected_before_hash(tmp_path: Path) -> None:

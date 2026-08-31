@@ -55,9 +55,9 @@ _GROUP_FIELDS: Mapping[str, tuple[str, ...]] = MappingProxyType(
 )
 
 # All fields observed in the three enrolled Desktop stores on 2026-08-30.  Keys not
-# listed here are still synchronized as independent opaque values so a Desktop update
-# cannot silently lose a new characteristic.  Adding a field to a correlated group
-# changes conflict semantics and therefore requires a grouping-version bump.
+# listed here are preserved in place but quarantined from convergence until their
+# semantics are classified.  Adding a field to a correlated group changes conflict
+# semantics and therefore requires a grouping-version bump.
 _OBSERVED_FIELDS = frozenset(
     {
         "alwaysAllowedReasons",
@@ -274,7 +274,7 @@ def canonical_group_value(record: Mapping[str, Any]) -> dict[str, str]:
 
     known = _IDENTITY_FIELDS | _PROTECTED_FIELDS | _GROUPED_FIELDS | _INDEPENDENT_FIELDS
     for field in sorted(set(record) - known):
-        values[f"field:{field}"] = _canonical_single_value(record, field)
+        values[f"unknown:{field}"] = _canonical_single_value(record, field)
     return values
 
 
@@ -442,7 +442,7 @@ def scan_desktop_registry_roots(roots: Iterable[Path]) -> RegistryScan:
 def _value_for_group(observation: RegistryRecordObservation, group_name: str) -> str:
     if group_name in observation.group_values:
         return observation.group_values[group_name]
-    if group_name.startswith(("field:", "protected:")):
+    if group_name.startswith(("field:", "protected:", "unknown:")):
         return _ABSENT_JSON
     raise ValueError(f"observation lacks required group {group_name}")
 
@@ -516,9 +516,11 @@ def _validate_baselines(
             raise ValueError(f"baseline references missing record {filename}")
         groups = {baseline.group_name for baseline in baselines}
         groups.update(
-            set().union(
+            group_name
+            for group_name in set().union(
                 *(set(observation.group_values) for observation in observations.values())
             )
+            if not group_name.startswith("unknown:")
         )
         expected_roots = set(scan.roots)
         for group_name in groups:
@@ -584,6 +586,14 @@ def _steady_state_decision(
         baseline = baseline_index[(filename, root_id, group_name)]
         if value != baseline.value_json:
             changed[root_id] = value
+
+    if group_name.startswith("unknown:"):
+        return None, RegistryConflict(
+            filename=filename,
+            group_name=group_name,
+            reason="unknown_field_unclassified",
+            candidates=MappingProxyType(current),
+        )
 
     if group_name.startswith("protected:"):
         if changed:
@@ -661,18 +671,23 @@ def build_registry_sync_plan(
                 decision, conflict = _steady_state_decision(
                     filename, group_name, observations, baseline_index
                 )
-            elif group_name.startswith("protected:"):
+            elif group_name.startswith(("protected:", "unknown:")):
                 values = {
                     root_id: _value_for_group(observation, group_name)
                     for root_id, observation in observations.items()
                 }
-                if len(set(values.values())) == 1:
+                if group_name.startswith("protected:") and len(set(values.values())) == 1:
                     decision, conflict = next(iter(values.values())), None
                 else:
+                    reason = (
+                        "protected_linkage_divergence"
+                        if group_name.startswith("protected:")
+                        else "unknown_field_unclassified"
+                    )
                     decision, conflict = None, RegistryConflict(
                         filename=filename,
                         group_name=group_name,
-                        reason="protected_linkage_divergence",
+                        reason=reason,
                         candidates=MappingProxyType(values),
                     )
             else:
