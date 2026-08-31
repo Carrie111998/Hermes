@@ -3001,18 +3001,59 @@ class TestCooldownReentryAbort:
             "agent.context_compressor.call_llm",
             side_effect=ConnectionError("Connection error."),
         ):
-            first = c.compress(msgs, current_tokens=999999, force=True)
+            first = c.compress(msgs, current_tokens=94_000, force=True)
         assert first == msgs
         assert c._last_compress_aborted is True
         assert c._last_summary_network_failure is True
 
-        second = c.compress(msgs, current_tokens=999999)
+        second = c.compress(msgs, current_tokens=94_000)
         assert second == msgs, (
             "Second compress during cooldown must abort (preserve messages), "
             "not drop the middle window via static-fallback"
         )
         assert c._last_compress_aborted is True
         assert c._last_summary_fallback_used is False
+
+    def test_network_failure_at_emergency_pressure_uses_static_fallback(self):
+        """A failed summarizer must not strand a session at the context limit.
+
+        Below the emergency boundary the existing preserve-and-retry behavior
+        remains safer.  Once the rendered request reaches 95% of the model
+        window, preserving the oversized transcript makes every later turn
+        less recoverable.  The local redacted handoff must win at that point.
+        """
+        with patch(
+            "agent.context_compressor.get_model_context_length",
+            return_value=100_000,
+        ):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
+            _ = c.context_length
+        msgs = self._msgs(12)
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=ConnectionError("Connection error."),
+        ):
+            result = c.compress(msgs, current_tokens=95_000, force=True)
+
+        assert result != msgs
+        assert c._last_compress_aborted is False
+        assert c._last_summary_fallback_used is True
+        assert c._last_summary_dropped_count > 0
+        assert (
+            c._last_compression_telemetry["failure_class"]
+            == "summary_network_emergency_fallback"
+        )
+        assert any(
+            "deterministic fallback" in str(message.get("content", ""))
+            for message in result
+        )
 
     def test_auth_failure_cooldown_reentry_still_aborts(self):
         """Same re-entry hole for auth failures: a 401 sets the flag, cooldown

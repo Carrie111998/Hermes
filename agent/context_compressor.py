@@ -1306,6 +1306,10 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 _FALLBACK_SUMMARY_MAX_CHARS = 8_000
 _FALLBACK_PREVIOUS_SUMMARY_MAX_CHARS = 3_000
 _FALLBACK_TURN_MAX_CHARS = 700
+# A transient summary outage should preserve the transcript while there is
+# still room to retry.  At this boundary, however, preserving every message
+# can strand the session beyond the provider window before the next retry.
+_EMERGENCY_FALLBACK_CONTEXT_RATIO = 0.95
 _AUTO_FOCUS_MAX_TURNS = 3
 _AUTO_FOCUS_TURN_MAX_CHARS = 260
 _AUTO_FOCUS_MAX_CHARS = 700
@@ -8044,18 +8048,33 @@ This compaction should PRIORITISE preserving all information related to the focu
         #           surface a warning.
         # Default is False (historical behavior).
         #
-        # EXCEPTION — terminal access/quota, transient network failures, and
-        # empty-content provider degradation always abort. Missing credentials,
+        # EXCEPTION — terminal access/quota and empty-content provider
+        # degradation always abort. Transient network failures abort while the
+        # request remains below the emergency pressure boundary; at 95% of the
+        # model window the existing deterministic handoff is safer than
+        # preserving a transcript that may no longer fit on the next turn.
+        # Missing credentials,
         # 401/402/403 access failures, confirmed non-resetting quota exhaustion,
         # and HTTP 200 empty responses from degraded channels cannot be repaired
         # by immediately generating a static placeholder. In all of these cases,
         # rotating into a child session with a placeholder summary degrades the
         # conversation for zero benefit. Preserve it unchanged until access or
         # provider health is restored (#29559, #25585, #94448).
+        emergency_network_fallback = bool(
+            self._last_summary_network_failure
+            and display_tokens
+            >= int(self.context_length * _EMERGENCY_FALLBACK_CONTEXT_RATIO)
+        )
+        if emergency_network_fallback:
+            telemetry["failure_class"] = "summary_network_emergency_fallback"
+
         if not summary and not feasibility_skip and (
             self.abort_on_summary_failure
             or self._last_summary_auth_failure
-            or self._last_summary_network_failure
+            or (
+                self._last_summary_network_failure
+                and not emergency_network_fallback
+            )
             or self._last_summary_empty_content_failure
             or self._last_summary_truncated_failure
         ):
