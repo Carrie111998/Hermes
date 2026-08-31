@@ -2806,6 +2806,16 @@ def _resolve_command_cwd(
     sanitizers (#50636, #54447); this is the per-command sibling site.
     """
     if workdir:
+        from agent.runtime_cwd import resolve_kanban_worker_cwd
+
+        worker_cwd = resolve_kanban_worker_cwd(workdir)
+        if worker_cwd is not None:
+            # A model commonly sends ``workdir="."``. Passing that relative
+            # value through lets a stale profile-owned LocalEnvironment
+            # interpret it against the stable checkout instead of the
+            # dispatcher-owned task worktree. Resolve it to an absolute path
+            # while the worker process is still anchored in its workspace.
+            return os.path.abspath(os.path.expanduser(worker_cwd))
         return workdir
     recorded = get_session_cwd(session_key)
     if env_type not in _CONTAINER_BACKENDS:
