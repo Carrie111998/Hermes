@@ -12,7 +12,7 @@ import json
 import os
 import stat
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field as _dataclass_field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
@@ -163,6 +163,23 @@ class RegistryRecordObservation:
 class RegistryScan:
     roots: Mapping[str, RegistryRootObservation]
     records: Mapping[str, Mapping[str, RegistryRecordObservation]]
+
+
+@dataclass
+class RegistryScanCache:
+    """Reuse observations for files whose stat evidence is unchanged.
+
+    Keyed by normcased path; the value pairs the exact stat identity
+    ``(st_dev, st_ino, st_size, st_mtime_ns)`` -- the same evidence tuple the
+    strict stable read captures -- with the frozen observation it produced.
+    A file matching all four is not re-read or re-canonicalized, which keeps a
+    steady-state cycle's cost proportional to recent activity instead of store
+    size. Entries for files no longer present are evicted after every scan.
+    """
+
+    entries: dict[
+        str, tuple[tuple[int, int, int, int], RegistryRecordObservation]
+    ] = _dataclass_field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -379,7 +396,9 @@ def _root_identity(root: Path) -> tuple[str, Path]:
     return root_id, resolved
 
 
-def scan_desktop_registry_roots(roots: Iterable[Path]) -> RegistryScan:
+def scan_desktop_registry_roots(
+    roots: Iterable[Path], *, cache: RegistryScanCache | None = None
+) -> RegistryScan:
     """Capture a complete stable scan of an explicitly enrolled replica set."""
     root_list = tuple(Path(root) for root in roots)
     if not root_list:
@@ -388,6 +407,7 @@ def scan_desktop_registry_roots(roots: Iterable[Path]) -> RegistryScan:
     root_observations: dict[str, RegistryRootObservation] = {}
     canonical_roots: dict[str, Path] = {}
     record_observations: dict[str, dict[str, RegistryRecordObservation]] = {}
+    seen_cache_keys: set[str] = set()
 
     for root in root_list:
         root_id, resolved = _root_identity(root)
@@ -406,27 +426,70 @@ def scan_desktop_registry_roots(roots: Iterable[Path]) -> RegistryScan:
         )
         for filename in filenames:
             path = resolved / filename
-            raw, record_stat = _stable_read(path)
-            record = _parse_record(raw, path)
-            expected_session_id = filename[: -len(".json")]
-            session_id = record.get("sessionId")
-            if not isinstance(session_id, str) or session_id != expected_session_id:
-                raise RegistryScanError(f"registry identity mismatch: {path}")
-            observation = RegistryRecordObservation(
-                root_id=root_id,
-                filename=filename,
-                path=path,
-                session_id=session_id,
-                exact_bytes=raw,
-                byte_hash=hashlib.sha256(raw).hexdigest(),
-                mtime_ns=record_stat.st_mtime_ns,
-                record=MappingProxyType(record),
-                group_values=MappingProxyType(canonical_group_value(record)),
-            )
+            observation: RegistryRecordObservation | None = None
+            cache_key = os.path.normcase(str(path))
+            if cache is not None:
+                seen_cache_keys.add(cache_key)
+                cached = cache.entries.get(cache_key)
+                if cached is not None:
+                    try:
+                        current = path.stat(follow_symlinks=False)
+                    except OSError as exc:
+                        raise RegistryScanError(
+                            f"registry record changed or disappeared: {path}"
+                        ) from exc
+                    identity = (
+                        current.st_dev,
+                        current.st_ino,
+                        current.st_size,
+                        current.st_mtime_ns,
+                    )
+                    stored_identity, stored_observation = cached
+                    if (
+                        identity == stored_identity
+                        and stored_observation.root_id == root_id
+                        and stored_observation.filename == filename
+                    ):
+                        observation = stored_observation
+            if observation is None:
+                raw, record_stat = _stable_read(path)
+                record = _parse_record(raw, path)
+                expected_session_id = filename[: -len(".json")]
+                session_id = record.get("sessionId")
+                if (
+                    not isinstance(session_id, str)
+                    or session_id != expected_session_id
+                ):
+                    raise RegistryScanError(f"registry identity mismatch: {path}")
+                observation = RegistryRecordObservation(
+                    root_id=root_id,
+                    filename=filename,
+                    path=path,
+                    session_id=session_id,
+                    exact_bytes=raw,
+                    byte_hash=hashlib.sha256(raw).hexdigest(),
+                    mtime_ns=record_stat.st_mtime_ns,
+                    record=MappingProxyType(record),
+                    group_values=MappingProxyType(canonical_group_value(record)),
+                )
+                if cache is not None:
+                    cache.entries[cache_key] = (
+                        (
+                            record_stat.st_dev,
+                            record_stat.st_ino,
+                            record_stat.st_size,
+                            record_stat.st_mtime_ns,
+                        ),
+                        observation,
+                    )
             record_observations.setdefault(filename, {})[root_id] = observation
 
         if _list_record_names(resolved) != filenames:
             raise RegistryScanError(f"registry root membership changed during scan: {root}")
+
+    if cache is not None:
+        for stale_key in set(cache.entries) - seen_cache_keys:
+            del cache.entries[stale_key]
 
     return RegistryScan(
         roots=MappingProxyType(root_observations),

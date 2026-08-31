@@ -817,3 +817,90 @@ def test_baseline_requires_every_root_and_group(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="incomplete baseline"):
         build_registry_sync_plan(scan, baselines=incomplete)
+
+
+def test_scan_cache_reuses_unchanged_observations(tmp_path, monkeypatch) -> None:
+    from session_bridge import desktop_registry as module
+    from session_bridge.desktop_registry import RegistryScanCache
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    _write_record(a, "local_one", mtime_ns=100, title="A")
+    _write_record(b, "local_one", mtime_ns=200, title="B")
+
+    reads: list[Path] = []
+    original = module._stable_read
+
+    def counting_stable_read(path: Path):
+        reads.append(path)
+        return original(path)
+
+    monkeypatch.setattr(module, "_stable_read", counting_stable_read)
+
+    cache = RegistryScanCache()
+    first = scan_desktop_registry_roots((a, b), cache=cache)
+    assert len(reads) == 2
+
+    second = scan_desktop_registry_roots((a, b), cache=cache)
+    assert len(reads) == 2  # no re-reads for unchanged files
+    for filename, observations in first.records.items():
+        for root_id, observation in observations.items():
+            assert second.records[filename][root_id] is observation
+
+
+def test_scan_cache_rereads_changed_files_and_evicts_deleted(
+    tmp_path,
+) -> None:
+    from session_bridge.desktop_registry import RegistryScanCache
+
+    a, b = tmp_path / "a", tmp_path / "b"
+    _write_record(a, "local_one", mtime_ns=100, title="A")
+    _write_record(b, "local_one", mtime_ns=200, title="B")
+    _write_record(a, "local_two", mtime_ns=100)
+    _write_record(b, "local_two", mtime_ns=100)
+
+    cache = RegistryScanCache()
+    scan_desktop_registry_roots((a, b), cache=cache)
+
+    path = a / "local_one.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["title"] = "Changed"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    os.utime(path, ns=(300, 300))
+    (a / "local_two.json").unlink()
+    (b / "local_two.json").unlink()
+
+    fresh = scan_desktop_registry_roots((a, b), cache=cache)
+
+    changed = next(
+        observation
+        for observation in fresh.records["local_one.json"].values()
+        if observation.path == path
+    )
+    assert json.loads(changed.exact_bytes)["title"] == "Changed"
+    assert "local_two.json" not in fresh.records
+    assert all("local_two" not in key for key in cache.entries)
+
+
+def test_scan_cache_produces_identical_plans(tmp_path) -> None:
+    from session_bridge.desktop_registry import RegistryScanCache
+
+    a, b, c = (tmp_path / name for name in ("a", "b", "c"))
+    _write_record(a, "local_one", mtime_ns=100, title="Old")
+    _write_record(b, "local_one", mtime_ns=300, title="Newest")
+    _write_record(c, "local_one", mtime_ns=200, title="Middle")
+
+    cache = RegistryScanCache()
+    cached = build_registry_sync_plan(
+        scan_desktop_registry_roots((a, b, c), cache=cache), baselines=()
+    )
+    uncached = build_registry_sync_plan(
+        scan_desktop_registry_roots((a, b, c)), baselines=()
+    )
+
+    assert (
+        cached.records["local_one.json"].desired_groups
+        == uncached.records["local_one.json"].desired_groups
+    )
+    assert len(cached.records["local_one.json"].mutations) == len(
+        uncached.records["local_one.json"].mutations
+    )

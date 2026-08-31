@@ -28,6 +28,7 @@ from .desktop_registry import (
     DESKTOP_REGISTRY_GROUPING_VERSION,
     RegistryBaseline,
     RegistryMutationConflict,
+    RegistryScanCache,
     RegistryScanError,
     apply_registry_mutation,
     build_registry_sync_plan,
@@ -65,6 +66,15 @@ class DesktopRegistrySyncWorker:
         self._monotonic = monotonic
         self._id_factory = id_factory or (lambda: str(uuid.uuid4()))
         self._last_run_at: float | None = None
+        # Persistent across cycles and shared by both scans of one cycle:
+        # unchanged files (same dev/ino/size/mtime_ns) are not re-read or
+        # re-canonicalized, which keeps the CPU cost of a steady-state cycle
+        # proportional to recent activity. Without it, every ~5-minute cycle
+        # spent 60-90s of GIL-bound work over ~11,800 files, degrading the
+        # async server enough that a concurrent launcher health smoke could
+        # time out and falsely retire the healthy service tree (observed
+        # 2026-08-31 10:18).
+        self._scan_cache = RegistryScanCache()
 
     def run_once(self) -> dict[str, int]:
         counters = {
@@ -100,7 +110,9 @@ class DesktopRegistrySyncWorker:
             counters["recovered_runs"] = 1
 
         try:
-            scan = scan_desktop_registry_roots(self._registry_roots)
+            scan = scan_desktop_registry_roots(
+                self._registry_roots, cache=self._scan_cache
+            )
         except RegistryScanError:
             counters["scan_failed"] = 1
             return counters
@@ -151,7 +163,9 @@ class DesktopRegistrySyncWorker:
                     counters[key] += 1
 
         try:
-            fresh = scan_desktop_registry_roots(self._registry_roots)
+            fresh = scan_desktop_registry_roots(
+                self._registry_roots, cache=self._scan_cache
+            )
             verification = verify_registry_sync_plan(plan, fresh)
         except (RegistryScanError, ValueError):
             if run_id is not None:
