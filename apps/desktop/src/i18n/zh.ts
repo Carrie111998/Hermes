@@ -3198,6 +3198,7 @@ export const zh: Translations = {
     officeTruncated: '仅预览前若干工作表、行或幻灯片。',
     officeParseError: '无法解析此 Office 文档。',
     slideLabel: index => `幻灯片 ${index}`,
+    formulaBarLabel: '公式',
     noInlineTitle: '没有内联预览',
     noInlineBody: mimeType => `${mimeType || '此文件类型'} 仍可作为上下文附件。`,
     edit: '编辑',
