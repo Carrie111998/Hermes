@@ -2458,7 +2458,7 @@ async def _reclaim_stale(runner: object) -> None:
 
 
 @_contextmanager
-def _profile_runtime_scope(profile_home: "Path"):
+def _profile_runtime_scope(profile_home: "Path", *, hydrate_secrets: bool = True):
     """Scope config/skills/memory AND credentials to a profile for one turn.
 
     Combines the two seams the multiplexer needs:
@@ -2485,7 +2485,8 @@ def _profile_runtime_scope(profile_home: "Path"):
     from hermes_cli.env_loader import hydrate_profile_secret_sources
 
     home_token = set_hermes_home_override(str(profile_home))
-    hydrate_profile_secret_sources(Path(profile_home))
+    if hydrate_secrets:
+        hydrate_profile_secret_sources(Path(profile_home))
     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
     try:
         yield
@@ -16582,10 +16583,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = None
                 try:
                     from hermes_cli.profiles import get_profile_dir
+                    from hermes_cli.env_loader import hydrate_profile_secret_sources
                     from gateway.config import load_gateway_config
 
                     profile_home = get_profile_dir(profile_name)
-                    with _profile_runtime_scope(profile_home):
+                    # Like the #16856 MCP discovery path, hydrate external secret
+                    # sources off-loop so they cannot starve platform heartbeats.
+                    await asyncio.to_thread(
+                        hydrate_profile_secret_sources, profile_home
+                    )
+                    with _profile_runtime_scope(profile_home, hydrate_secrets=False):
                         profile_config = load_gateway_config().platforms.get(platform)
                         if profile_config is None or not profile_config.enabled:
                             return
