@@ -64,7 +64,8 @@ mcp_servers:
 | `idle_timeout_seconds` | number | stdio | Optional stdio server recycle after idle time (`0` disables). May also live under a `lifecycle:` mapping |
 | `max_lifetime_seconds` | number | stdio | Optional stdio server recycle after age (`0` disables). May also live under a `lifecycle:` mapping |
 | `tools` | mapping | both | Filtering and utility-tool policy |
-| `auth` | string | HTTP | Authentication method. Set to `oauth` to enable OAuth 2.1 with PKCE |
+| `auth` | string | HTTP | Authentication method. `oauth` = OAuth 2.1 PKCE (browser login). `service_account` = M2M client-credentials exchange (see below). |
+| `service_account` | mapping | HTTP | Service-account config block (required when `auth: service_account`). See `service_account` sub-keys below. |
 | `sampling` | mapping | both | Server-initiated LLM request policy (see MCP guide) |
 | `elicitation` | mapping | both | Server-initiated user-input requests. `enabled` (default `true`) and `timeout` in seconds (default `300`). Form-mode requests route through the approval surface; URL-mode is declined (see MCP guide) |
 | `trust` | string | both | Trust tier: `full` (default) or `untrusted`. On an `untrusted` server, every write-capable tool call (any tool without a `readOnlyHint: true` annotation) requires user approval through the standard approval surface before it runs. `readOnlyHint` is a server-supplied *hint* — a lying server can at most skip approval for tools it claims are read-only, never gain extra access — so mark any server you don't fully control as `untrusted`. Unrecognized values are treated as `untrusted` (fail-closed) |
@@ -378,6 +379,77 @@ mcp_servers:
 `client_metadata_url` must be an HTTPS URL with a path (no bare origin, no fragment, no userinfo, no `.`/`..` segments) that returns `200` and `Content-Type: application/json` with **no redirect** — authorization servers are forbidden from following redirects when fetching it. Hermes still pins its callback to the same `27890`–`27894` range, so a self-hosted document must declare all ten loopback URIs (`http://127.0.0.1:<port>/callback` and `http://localhost:<port>/callback` for each port), and its `client_id` must be its own URL.
 
 `user_agent` replaces the HTTP library's default `User-Agent` on **token-endpoint requests only** (authorization-code exchange and refresh) — some authorization servers and WAFs reject the default `python-httpx/...` value there. It never applies to MCP traffic or OAuth discovery, and no other token-request headers are configurable. Empty or null values are ignored.
+
+## Service-account (M2M) authentication
+
+For HTTP MCP servers that authenticate machine identities rather than human users, use `auth: service_account`. This is distinct from `auth: oauth` (which opens a browser window for user login) — no browser interaction is needed. Hermes exchanges a long-lived service-account credential for a short-lived Bearer access token and renews it automatically.
+
+This is a generic OAuth 2.0 `client_credentials`-style exchange. Any identity provider that accepts the grant type works — the example below uses Authentik, but the same config works with any compatible IdP.
+
+```yaml
+mcp_servers:
+  toolhive:
+    url: https://mcp.example.com/mcp
+    auth: service_account
+    service_account:
+      token_url: https://idp.example.com/application/o/toolhive/token/
+      client_id: toolhive
+      username: zug
+      password_env: AUTHENTIK_ZUG_APP_PASSWORD   # env-var NAME, not the value
+      scope: "openid profile groups toolhive-audience"
+      client_secret_env: MY_CLIENT_SECRET        # optional
+```
+
+**Secret values must never appear in `config.yaml`**. Only environment-variable *names* belong in the config. The values are read at runtime from the process environment, which is populated from `$HERMES_HOME/.env` before any MCP connection is made. Put the actual secrets there:
+
+```sh
+# ~/.hermes/.env  (or the active profile's .env)
+AUTHENTIK_ZUG_APP_PASSWORD=your-app-password-here
+```
+
+### `service_account` sub-keys
+
+| Key | Required | Meaning |
+|---|---|---|
+| `token_url` | yes | OAuth token endpoint URL (`https://` required) |
+| `client_id` | yes | Client ID registered at the IdP |
+| `username` | yes | Service-account username |
+| `password_env` | yes | Name of the environment variable holding the password |
+| `scope` | no | Space-separated OAuth scopes to request |
+| `client_secret_env` | no | Name of the environment variable holding the optional client secret |
+
+### Behavior
+
+- Tokens are cached at `$HERMES_HOME/mcp-tokens/<server>-sa.json` (mode `0600`, atomic write).
+- A valid token is reused across reconnects; a new token is fetched proactively 60 seconds before expiry.
+- If the server returns a `refresh_token`, Hermes uses it on the next renewal before falling back to a fresh service-account exchange.
+- A single `401` response triggers one immediate re-fetch; if the re-fetch also fails, the error is surfaced to the model.
+- Concurrent requests share a single in-process lock so only one token exchange fires at a time.
+- Passwords and access tokens are never logged or written to `config.yaml`.
+- TLS verification is always on; there is no option to disable it for service-account auth.
+
+### Setting up via CLI
+
+```sh
+# 1. Set the secret in your profile's .env
+echo 'AUTHENTIK_ZUG_APP_PASSWORD=my-app-password' >> ~/.hermes/.env
+
+# 2. Add the server with auth: service_account already in config.yaml,
+#    then validate and probe it
+hermes mcp add toolhive \
+  --url https://mcp.example.com/mcp \
+  --auth service_account
+```
+
+Because the password is read from an environment variable, `hermes mcp add` will validate the config and report any missing env-var names without ever prompting for or storing the secret itself.
+
+### Comparison with other auth modes
+
+| Mode | When to use |
+|---|---|
+| `auth: oauth` | Human user login via browser (PKCE). IdP manages sessions. |
+| `auth: service_account` | Machine identity (M2M). Long-lived app password exchanged for short-lived Bearer token. No browser. |
+| `headers:` with `${VAR}` | Static API key injected directly (no exchange, no expiry). |
 
 ## Add to Hermes link
 
