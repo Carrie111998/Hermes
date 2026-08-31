@@ -652,3 +652,218 @@ class LdapAuthProvider(DashboardAuthProvider):
                 conn.unbind()
             except Exception:  # noqa: BLE001
                 pass
+
+
+# ---------------------------------------------------------------------------
+# Plugin entry point
+# ---------------------------------------------------------------------------
+
+
+def _load_config_ldap_section() -> dict:
+    """Return ``dashboard.ldap_auth`` from config.yaml, or ``{}``.
+
+    Robust to load_config() raising, the keys being absent, or the value
+    not being a dict — every shape falls through to ``{}``.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        cfg = load_config()
+    except Exception as exc:  # noqa: BLE001 — broad catch is intentional
+        logger.debug(
+            "dashboard-auth-ldap: load_config() raised %s; "
+            "falling back to env-only configuration",
+            exc,
+        )
+        return {}
+    section = cfg_get(cfg, "dashboard", "ldap_auth", default=None)
+    return section if isinstance(section, dict) else {}
+
+
+def _resolve(env_name: str, cfg_section: dict, cfg_key: str) -> str:
+    """Env-wins-over-config resolution; empty env treated as unset."""
+    env = os.environ.get(env_name, "").strip()
+    if env:
+        return env
+    return str(cfg_section.get(cfg_key, "") or "").strip()
+
+
+def _resolve_bool(env_name: str, cfg_section: dict, cfg_key: str) -> bool:
+    raw = _resolve(env_name, cfg_section, cfg_key)
+    return raw.lower() in ("1", "true", "yes", "on")
+
+
+def _resolve_secret(cfg_section: dict) -> bytes:
+    """Resolve the token-signing secret (base64, hex, or raw text).
+
+    When unset, generates a random per-process secret — sessions then
+    don't survive a restart or span multiple workers (logged at INFO).
+    """
+    raw = _resolve("HERMES_DASHBOARD_LDAP_SECRET", cfg_section, "secret")
+    if not raw:
+        logger.info(
+            "dashboard-auth-ldap: no 'secret' configured; generating a "
+            "random per-process signing key. Sessions will not survive a "
+            "restart or span multiple workers. Set dashboard.ldap_auth."
+            "secret (or HERMES_DASHBOARD_LDAP_SECRET) for stable sessions."
+        )
+        return secrets.token_bytes(32)
+    for decoder in (base64.b64decode, bytes.fromhex):
+        try:
+            decoded = decoder(raw)
+            if len(decoded) >= 16:
+                return decoded
+        except (ValueError, TypeError):
+            pass
+    return raw.encode("utf-8")
+
+
+def _ensure_ldap3() -> None:
+    """Lazy-install ldap3 (tools/lazy_deps.py 'auth.ldap').
+
+    Raises on failure — register() converts that into LAST_SKIP_REASON.
+    Split out as a module function so tests can stub it.
+    """
+    from tools.lazy_deps import ensure
+
+    ensure("auth.ldap", prompt=False)
+
+
+def register(ctx) -> None:
+    """Plugin entry — registers LdapAuthProvider when configured.
+
+    A no-op (with a diagnostic skip reason) unless dashboard.ldap_auth
+    provides a server_url plus exactly one bind mode. ldap3 is only
+    installed once that configuration exists, so unconfigured installs
+    never pay for the dependency.
+    """
+    global LAST_SKIP_REASON
+    LAST_SKIP_REASON = ""
+
+    section = _load_config_ldap_section()
+    server_url = _resolve(
+        "HERMES_DASHBOARD_LDAP_SERVER_URL", section, "server_url"
+    )
+    if not server_url:
+        LAST_SKIP_REASON = (
+            "dashboard.ldap_auth.server_url is not set (and "
+            "HERMES_DASHBOARD_LDAP_SERVER_URL is empty). Set it plus a "
+            "bind mode (user_dn_template, or bind_dn/bind_password + "
+            "user_search_base) under dashboard.ldap_auth in config.yaml "
+            "to enable LDAP dashboard login."
+        )
+        logger.debug("dashboard-auth-ldap: %s", LAST_SKIP_REASON)
+        return
+
+    user_dn_template = _resolve(
+        "HERMES_DASHBOARD_LDAP_USER_DN_TEMPLATE", section, "user_dn_template"
+    )
+    user_search_base = _resolve(
+        "HERMES_DASHBOARD_LDAP_USER_SEARCH_BASE", section, "user_search_base"
+    )
+    if not user_dn_template and not user_search_base:
+        LAST_SKIP_REASON = (
+            "dashboard.ldap_auth.server_url is set but no bind mode is "
+            "configured. Set user_dn_template (direct bind) OR "
+            "user_search_base [+ bind_dn/bind_password] (search-then-bind)."
+        )
+        logger.warning("dashboard-auth-ldap: %s", LAST_SKIP_REASON)
+        return
+
+    try:
+        _ensure_ldap3()
+    except Exception as exc:  # noqa: BLE001 — FeatureUnavailable et al.
+        LAST_SKIP_REASON = (
+            f"the ldap3 dependency is not available and could not be "
+            f"lazy-installed: {exc}. Install it manually: "
+            f"uv pip install 'ldap3==2.9.1' (or: pip install ldap3==2.9.1)."
+        )
+        logger.warning("dashboard-auth-ldap: %s", LAST_SKIP_REASON)
+        return
+
+    ttl_raw = _resolve(
+        "HERMES_DASHBOARD_LDAP_TTL_SECONDS", section, "session_ttl_seconds"
+    )
+    try:
+        ttl = int(ttl_raw) if ttl_raw else _DEFAULT_TTL_SECONDS
+    except ValueError:
+        ttl = _DEFAULT_TTL_SECONDS
+    try:
+        refresh_ttl = int(
+            str(section.get("refresh_ttl_seconds", "") or "").strip()
+            or _DEFAULT_REFRESH_TTL_SECONDS
+        )
+    except ValueError:
+        refresh_ttl = _DEFAULT_REFRESH_TTL_SECONDS
+    try:
+        timeout = float(
+            str(section.get("timeout_seconds", "") or "").strip()
+            or _DEFAULT_TIMEOUT_SECONDS
+        )
+    except ValueError:
+        timeout = _DEFAULT_TIMEOUT_SECONDS
+    verify_on_refresh_raw = section.get("verify_user_on_refresh", True)
+    verify_on_refresh = (
+        str(verify_on_refresh_raw).lower() not in ("0", "false", "no", "off")
+    )
+
+    try:
+        provider = LdapAuthProvider(
+            server_url=server_url,
+            secret=_resolve_secret(section),
+            user_dn_template=user_dn_template,
+            bind_dn=_resolve(
+                "HERMES_DASHBOARD_LDAP_BIND_DN", section, "bind_dn"
+            ),
+            bind_password=_resolve(
+                "HERMES_DASHBOARD_LDAP_BIND_PASSWORD", section, "bind_password"
+            ),
+            user_search_base=user_search_base,
+            user_search_filter=_resolve(
+                "HERMES_DASHBOARD_LDAP_USER_SEARCH_FILTER",
+                section,
+                "user_search_filter",
+            ) or _DEFAULT_USER_SEARCH_FILTER,
+            require_group=_resolve(
+                "HERMES_DASHBOARD_LDAP_REQUIRE_GROUP", section, "require_group"
+            ),
+            email_attribute=str(
+                section.get("email_attribute", "") or ""
+            ).strip() or "mail",
+            display_name_attribute=str(
+                section.get("display_name_attribute", "") or ""
+            ).strip() or "cn",
+            display_name=str(
+                section.get("display_name", "") or ""
+            ).strip() or "LDAP",
+            start_tls=_resolve_bool(
+                "HERMES_DASHBOARD_LDAP_START_TLS", section, "start_tls"
+            ),
+            allow_insecure=_resolve_bool(
+                "HERMES_DASHBOARD_LDAP_ALLOW_INSECURE",
+                section,
+                "allow_insecure",
+            ),
+            ca_certs_file=_resolve(
+                "HERMES_DASHBOARD_LDAP_CA_CERTS_FILE", section, "ca_certs_file"
+            ),
+            session_ttl_seconds=ttl,
+            refresh_ttl_seconds=refresh_ttl,
+            timeout_seconds=timeout,
+            verify_user_on_refresh=verify_on_refresh,
+        )
+    except ValueError as exc:
+        LAST_SKIP_REASON = f"LdapAuthProvider construction failed: {exc}"
+        logger.warning("dashboard-auth-ldap: %s", LAST_SKIP_REASON)
+        return
+
+    ctx.register_dashboard_auth_provider(provider)
+    logger.info(
+        "dashboard-auth-ldap: registered LDAP password provider "
+        "(server=%s, mode=%s%s)",
+        server_url,
+        "direct-bind" if user_dn_template else "search-then-bind",
+        f", require_group={provider._require_group}"
+        if provider._require_group
+        else "",
+    )

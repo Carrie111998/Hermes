@@ -662,3 +662,130 @@ class TestRefreshDirectoryCheck:
         p._factory = broken_factory  # directory gone — token-only refresh
         s2 = p.refresh_session(refresh_token=s.refresh_token)
         assert s2.user_id == "alice"
+
+
+LDAP_ENV_VARS = (
+    "HERMES_DASHBOARD_LDAP_SERVER_URL",
+    "HERMES_DASHBOARD_LDAP_USER_DN_TEMPLATE",
+    "HERMES_DASHBOARD_LDAP_BIND_DN",
+    "HERMES_DASHBOARD_LDAP_BIND_PASSWORD",
+    "HERMES_DASHBOARD_LDAP_USER_SEARCH_BASE",
+    "HERMES_DASHBOARD_LDAP_USER_SEARCH_FILTER",
+    "HERMES_DASHBOARD_LDAP_REQUIRE_GROUP",
+    "HERMES_DASHBOARD_LDAP_START_TLS",
+    "HERMES_DASHBOARD_LDAP_ALLOW_INSECURE",
+    "HERMES_DASHBOARD_LDAP_CA_CERTS_FILE",
+    "HERMES_DASHBOARD_LDAP_SECRET",
+    "HERMES_DASHBOARD_LDAP_TTL_SECONDS",
+)
+
+
+class TestRegister:
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        for var in LDAP_ENV_VARS:
+            monkeypatch.delenv(var, raising=False)
+        # Config-file section must not leak in from the host machine.
+        monkeypatch.setattr(
+            ldap_plugin, "_load_config_ldap_section", lambda: {}
+        )
+        # register() must not hit the network installer in tests.
+        monkeypatch.setattr(ldap_plugin, "_ensure_ldap3", lambda: None)
+
+    def test_skips_without_server_url(self):
+        ctx = MagicMock()
+        ldap_plugin.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_not_called()
+        assert "server_url" in ldap_plugin.LAST_SKIP_REASON
+
+    def test_skips_without_bind_mode(self, monkeypatch):
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_LDAP_SERVER_URL", "ldaps://ldap.example.com"
+        )
+        ctx = MagicMock()
+        ldap_plugin.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_not_called()
+        assert "user_dn_template" in ldap_plugin.LAST_SKIP_REASON
+
+    def test_registers_direct_mode_from_env(self, monkeypatch):
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_LDAP_SERVER_URL", "ldaps://ldap.example.com"
+        )
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_LDAP_USER_DN_TEMPLATE",
+            "uid={username},ou=people,dc=example,dc=com",
+        )
+        ctx = MagicMock()
+        ldap_plugin.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_called_once()
+        provider = ctx.register_dashboard_auth_provider.call_args[0][0]
+        assert provider.name == "ldap"
+        assert ldap_plugin.LAST_SKIP_REASON == ""
+
+    def test_registers_search_mode_from_config(self, monkeypatch):
+        monkeypatch.setattr(
+            ldap_plugin,
+            "_load_config_ldap_section",
+            lambda: {
+                "server_url": "ldaps://ldap.example.com",
+                "bind_dn": "cn=hermes,ou=svc,dc=example,dc=com",
+                "bind_password": "svc-secret",
+                "user_search_base": "ou=people,dc=example,dc=com",
+                "require_group": "cn=hermes-users,ou=groups,dc=example,dc=com",
+                "display_name": "PESCO Active Directory",
+            },
+        )
+        ctx = MagicMock()
+        ldap_plugin.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_called_once()
+        provider = ctx.register_dashboard_auth_provider.call_args[0][0]
+        assert provider.display_name == "PESCO Active Directory"
+
+    def test_env_wins_over_config(self, monkeypatch):
+        monkeypatch.setattr(
+            ldap_plugin,
+            "_load_config_ldap_section",
+            lambda: {
+                "server_url": "ldaps://config-host.example.com",
+                "user_dn_template": "uid={username},dc=example,dc=com",
+            },
+        )
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_LDAP_SERVER_URL", "ldaps://env-host.example.com"
+        )
+        ctx = MagicMock()
+        ldap_plugin.register(ctx)
+        provider = ctx.register_dashboard_auth_provider.call_args[0][0]
+        assert provider._server_url == "ldaps://env-host.example.com"
+
+    def test_construction_error_becomes_skip_reason(self, monkeypatch):
+        # plain ldap:// with no start_tls / allow_insecure → skip, not crash.
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_LDAP_SERVER_URL", "ldap://ldap.example.com"
+        )
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_LDAP_USER_DN_TEMPLATE",
+            "uid={username},dc=example,dc=com",
+        )
+        ctx = MagicMock()
+        ldap_plugin.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_not_called()
+        assert "allow_insecure" in ldap_plugin.LAST_SKIP_REASON
+
+    def test_missing_ldap3_becomes_skip_reason(self, monkeypatch):
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_LDAP_SERVER_URL", "ldaps://ldap.example.com"
+        )
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_LDAP_USER_DN_TEMPLATE",
+            "uid={username},dc=example,dc=com",
+        )
+
+        def boom():
+            raise RuntimeError("lazy install disabled")
+
+        monkeypatch.setattr(ldap_plugin, "_ensure_ldap3", boom)
+        ctx = MagicMock()
+        ldap_plugin.register(ctx)
+        ctx.register_dashboard_auth_provider.assert_not_called()
+        assert "ldap3" in ldap_plugin.LAST_SKIP_REASON
