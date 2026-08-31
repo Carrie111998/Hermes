@@ -57,7 +57,6 @@ import {
   Zap
 } from '@/lib/icons'
 import { getServers } from '@/lib/mcp-servers'
-import { normalize } from '@/lib/text'
 import { cn } from '@/lib/utils'
 import { resolveVersionStatus } from '@/lib/version-status'
 import { $repoWorktrees } from '@/store/coding-status'
@@ -110,6 +109,7 @@ import { usePaletteContributions } from './contrib'
 import { HighlightWatcher } from './highlight-watcher'
 import { MarketplaceThemePage } from './marketplace-theme-page'
 import { PetInlineToggle, PetPalettePage } from './pet-palette-page'
+import { rankPaletteGroups } from './rank-groups'
 
 interface PaletteItem {
   /** Keybind action id — its live combo renders as a hotkey hint. */
@@ -172,84 +172,6 @@ interface SessionEntry {
   title: string
 }
 
-// Ranking happens in React, not cmdk. We score, sort, and prune the groups
-// ourselves and hand cmdk an already-ordered list with `shouldFilter={false}`,
-// leaving it as pure keyboard/selection machinery. (cmdk's own group
-// re-sorting silently no-ops: its sort() queries groups by an internal id that
-// never matches the heading text it writes into `data-value`, so groups always
-// keep source order — which put a generic keyword match like "Capabilities" on
-// top and the auto-highlight on it while an exact "Tools" row sat below.)
-//
-// cmdk still auto-selects the first DOM item whenever the search changes, so
-// rendering best-match-first is what puts the highlight on the best match.
-//
-// AND semantics: every typed word must appear in the label or keywords. The
-// grade rewards matches on the visible label — exact > prefix > whole word >
-// word prefix > substring > scattered terms > keyword-only — so typing "tools"
-// selects the row that says Tools, not a row that hides it in keywords.
-const scoreItem = (item: PaletteItem, needle: string): number => {
-  const label = item.label.toLowerCase()
-  const keys = (item.keywords ?? []).join(' ').toLowerCase()
-  const terms = needle.split(/\s+/).filter(Boolean)
-
-  if (terms.some(term => !label.includes(term) && !keys.includes(term))) {
-    return 0
-  }
-
-  if (label === needle) {
-    return 1
-  }
-
-  if (label.startsWith(needle)) {
-    return 0.9
-  }
-
-  const words = label.split(/[^\p{L}\p{N}]+/u).filter(Boolean)
-
-  if (words.includes(needle)) {
-    return 0.85
-  }
-
-  if (words.some(word => word.startsWith(needle))) {
-    return 0.8
-  }
-
-  if (label.includes(needle)) {
-    return 0.7
-  }
-
-  if (terms.every(term => label.includes(term))) {
-    return 0.6
-  }
-
-  // Matched only via keywords — the weakest, generic-row signal.
-  return 0.4
-}
-
-// Order items within each group by score, order groups by their best item, and
-// drop everything that doesn't match. Ties keep their original order (stable
-// sort), so curated group/item ordering still breaks even scores.
-const rankGroups = (groups: PaletteGroup[], search: string): PaletteGroup[] => {
-  const needle = normalize(search)
-
-  if (!needle) {
-    return groups
-  }
-
-  return groups
-    .map(group => {
-      const scored = group.items
-        .map(item => ({ item, score: scoreItem(item, needle) }))
-        .filter(entry => entry.score > 0)
-        .sort((a, b) => b.score - a.score)
-
-      return { group: { ...group, items: scored.map(entry => entry.item) }, max: scored[0]?.score ?? 0 }
-    })
-    .filter(entry => entry.max > 0)
-    .sort((a, b) => b.max - a.max)
-    .map(entry => entry.group)
-}
-
 // cmdk selection values must be unique; labels alone can repeat (a settings
 // field and a session can share a title). The id suffix disambiguates.
 const paletteValue = (item: PaletteItem): string => `${item.label}\u0001${item.id}`
@@ -277,7 +199,8 @@ const PaletteGroups = memo(function PaletteGroups({
   noResultsLabel,
   onSelectItem,
   onSelectMods,
-  search
+  search,
+  statusLabel
 }: {
   bindings: Record<string, string[]>
   groups: PaletteGroup[]
@@ -286,6 +209,7 @@ const PaletteGroups = memo(function PaletteGroups({
   onSelectItem: (item: PaletteItem) => void
   onSelectMods: (event: { ctrlKey: boolean; metaKey: boolean; shiftKey: boolean }) => void
   search: string
+  statusLabel?: string
 }) {
   const deferred = useDeferredValue(groups, EMPTY_GROUPS)
   // While the rows are still catching up, an empty list means "not rendered
@@ -297,7 +221,7 @@ const PaletteGroups = memo(function PaletteGroups({
       {/* Filtering happens in rankGroups, so cmdk's own CommandEmpty
           (keyed to its internal filter count) would never fire. */}
       {deferred.length === 0 && !pending && (
-        <div className="py-6 text-center text-sm text-muted-foreground">{noResultsLabel}</div>
+        <div className="py-6 text-center text-sm text-muted-foreground">{statusLabel ?? noResultsLabel}</div>
       )}
       {deferred.map((group, index) => (
         <CommandGroup className={HUD_HEADING} heading={group.heading} key={group.heading ?? `palette-group-${index}`}>
@@ -574,12 +498,22 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const [search, setSearch] = useState('')
   const [page, setPage] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
+  const hasRootSearch = !page && Boolean(search.trim())
 
   // The Update row names the same install the statusbar names — same target
   // selection, same resolver. Reduced to the label string: an in-flight apply
   // rewrites these stores on every progress line, and only a changed string
   // should rebuild the palette's groups.
   const connection = useStore($connection)
+
+  const queryScope = [
+    connection?.connectionId ?? '',
+    connection?.mode ?? 'local',
+    connection?.baseUrl ?? '',
+    connection?.remoteIdentity ?? '',
+    connection?.profile ?? ''
+  ].join(':')
+
   const desktopVersion = useStore($desktopVersion)
   const clientStatus = useStore($updateStatus)
   const clientApply = useStore($updateApply)
@@ -641,22 +575,23 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     }
   }, [])
 
-  // Server-backed sources for the type-to-search groups. This component only
-  // exists while the palette is open, so the queries are inherently lazy — no
-  // `enabled` gate needed. react-query handles caching/dedup/staleness, so a
-  // reopen paints from cache and revalidates in the background.
+  // Config loads when the palette opens; the heavier session sources wait for
+  // root-page search text. Scope keys prevent cached rows from one backend or
+  // profile appearing during another backend's revalidation.
   const configQuery = useQuery({
-    queryKey: ['command-palette', 'config'],
+    queryKey: ['command-palette', queryScope, 'config'],
     queryFn: () => getHermesConfigRecord()
   })
 
   const sessionsQuery = useQuery({
-    queryKey: ['command-palette', 'sessions'],
+    enabled: hasRootSearch,
+    queryKey: ['command-palette', queryScope, 'sessions'],
     queryFn: () => listAllProfileSessions(200, 1, 'exclude')
   })
 
   const archivedQuery = useQuery({
-    queryKey: ['command-palette', 'archived'],
+    enabled: hasRootSearch,
+    queryKey: ['command-palette', queryScope, 'archived'],
     queryFn: () => listAllProfileSessions(200, 0, 'only')
   })
 
@@ -666,6 +601,14 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
 
   const sessions = useMemo(() => (sessionsQuery.data?.sessions ?? []).map(toSessionEntry), [sessionsQuery.data])
   const archivedSessions = useMemo(() => (archivedQuery.data?.sessions ?? []).map(toSessionEntry), [archivedQuery.data])
+
+  const sessionSearchStatus = hasRootSearch
+    ? sessionsQuery.isPending || archivedQuery.isPending
+      ? t.common.loading
+      : sessionsQuery.isError || archivedQuery.isError
+        ? t.common.error
+        : undefined
+    : undefined
 
   // Search/sub-page are local to a mount, and this component remounts per open
   // (keyed by open count), so each open starts clean without a reset effect.
@@ -1438,7 +1381,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
 
   const activePage = page ? subPages[page] : null
   const unrankedGroups = activePage ? activePage.groups : groups
-  const visibleGroups = useMemo(() => rankGroups(unrankedGroups, search), [unrankedGroups, search])
+  const visibleGroups = useMemo(() => rankPaletteGroups(unrankedGroups, search), [unrankedGroups, search])
   const placeholder = activePage ? activePage.placeholder : t.commandCenter.searchPlaceholder
 
   // The HighlightWatcher inside <Command> reports the highlighted row (arrows
@@ -1602,6 +1545,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
                 onSelectItem={handleSelect}
                 onSelectMods={noteSelectMods}
                 search={search}
+                statusLabel={sessionSearchStatus}
               />
             )}
           </CommandList>
