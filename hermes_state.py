@@ -5292,8 +5292,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # SQLite build — some surface it as InterfaceError, which lives
         # OUTSIDE DatabaseError and escaped the retry net entirely on
         # attempt 0 — so the check is message-scoped, not class-scoped.
-        def _is_no_more_rows(exc: sqlite3.Error) -> bool:
+        def _is_no_more_rows(exc: BaseException) -> bool:
             return "no more rows available" in str(exc).lower()
+
+        def _is_null_without_exception(exc: BaseException) -> bool:
+            """Recognize SQLite's transient contended-WAL SystemError.
+
+            Some Python/SQLite combinations surface the same driver-level
+            condition covered by ``no more rows available`` as a bare
+            ``SystemError`` instead of a sqlite3.Error.  It is transient under
+            concurrent WAL writers, but the message check must stay narrow so
+            unrelated SystemError instances are never swallowed (#85079).
+            """
+            return (
+                isinstance(exc, SystemError)
+                and "returned null without setting an exception" in str(exc).lower()
+            )
 
         while True:
             try:
@@ -5315,6 +5329,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
                     self._try_incremental_merge_fts()
                 return result
+            except SystemError as exc:
+                # On some Python/SQLite builds, a contended WAL append escapes
+                # as SystemError("returned NULL without setting an exception")
+                # rather than sqlite3.Error.  Treat only this known transient
+                # driver shape as retryable; unrelated SystemError instances
+                # must still propagate unchanged (#85079, #94258).
+                if _is_null_without_exception(exc) and self._sleep_before_write_retry(
+                    deadline, patience_s
+                ):
+                    continue
+                raise
             except SessionCompressionInProgressError:
                 # A live foreign compression lock is transient: the compressor
                 # publishes in a couple of seconds. Without any wait, a steer
