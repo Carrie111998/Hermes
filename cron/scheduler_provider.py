@@ -558,6 +558,8 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
+        default_profile=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -582,6 +584,8 @@ class InProcessCronScheduler(CronScheduler):
                 stop_event,
                 profile_homes=profile_homes,
                 adapters=adapters,
+                profile_adapters=profile_adapters,
+                default_profile=default_profile,
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
@@ -653,6 +657,8 @@ class InProcessCronScheduler(CronScheduler):
         *,
         profile_homes,
         adapters=None,
+        profile_adapters=None,
+        default_profile=None,
         loop=None,
         interval=60,
         can_dispatch=None,
@@ -664,6 +670,16 @@ class InProcessCronScheduler(CronScheduler):
         agent execution to that profile's home — mirroring how
         ``_profile_runtime_scope`` scopes the multiplexed inbound path and
         ``web_server.py`` scopes per-profile cron API calls.
+
+        ``profile_adapters`` maps profile name → that profile's live adapter
+        map (``{Platform: adapter}``), populated once that profile's bot
+        connects. The shared ``adapters`` set belongs to the DEFAULT profile
+        only. A secondary profile is delivered via ITS OWN map only — it must
+        NEVER fall back to the default profile's ``adapters`` (that ships its
+        cron output through the wrong bot), so before its adapter connects —
+        map absent or empty — it simply does not deliver this tick.
+        ``default_profile`` names the profile that owns the shared ``adapters``
+        (the multiplex list always serves ``\"default\"`` first).
         """
         import logging
         from cron.scheduler import tick as cron_tick
@@ -681,6 +697,40 @@ class InProcessCronScheduler(CronScheduler):
             len(profile_homes),
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
+        profile_adapters = profile_adapters or {}
+        # Guard: non-default gateways must not tick other profiles' stores (#99028).
+        # When HERMES_HOME is a named profile (e.g. profiles/engineering) but
+        # profile_homes was built with multiplex=True (cloned config), the
+        # engineering gateway would race the default gateway for the default
+        # store's tick lock and deliver via the wrong bot token. Filter to
+        # the current process's own home only. The gateway layer already does
+        # this (gateway/run.py disables multiplex for non-default HERMES_HOME),
+        # this is defense-in-depth for direct scheduler callers.
+        try:
+            from hermes_constants import get_process_hermes_home, get_default_hermes_root
+
+            cur_home = get_process_hermes_home().resolve()
+            default_root = get_default_hermes_root().resolve()
+            if cur_home != default_root:
+                _filtered = []
+                for _e in profile_homes:
+                    _h = _e[1] if isinstance(_e, tuple) else _e
+                    try:
+                        if Path(_h).resolve() == cur_home:
+                            _filtered.append(_e)
+                    except Exception:
+                        continue
+                if _filtered and len(_filtered) != len(profile_homes):
+                    logger.warning(
+                        "Multiplex cron requested for %d profile(s) but HERMES_HOME %s is non-default — "
+                        "filtering to %d own store(s) only to avoid cross-profile wrong-bot delivery (#99028)",
+                        len(profile_homes),
+                        cur_home,
+                        len(_filtered),
+                    )
+                    profile_homes = _filtered
+        except Exception:
+            pass
 
         # Recovery + initial heartbeat for every profile.
         # A profile may have been deleted since this snapshot was taken;
@@ -711,13 +761,32 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in _existing_profile_homes(profile_homes):
+                        _pname = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
+                                # Deliver each profile's cron via ITS OWN adapters.
+                                # The shared `adapters` set belongs to the default
+                                # profile only. A secondary profile uses its own map
+                                # in profile_adapters[name], which is populated only
+                                # once that profile's bot connects. A secondary must
+                                # NEVER fall back to the default profile's `adapters`
+                                # (that ships its cron output through the wrong bot),
+                                # so before its adapter connects — map absent or empty
+                                # — it simply does not deliver this tick.
+                                # When default_profile is None (legacy callers like
+                                # desktop ticker or pre-#98559 gateway), keep the
+                                # historic shared-adapters behavior for all profiles.
+                                if default_profile is None:
+                                    _tick_adapters = adapters
+                                elif _pname is None or _pname == default_profile:
+                                    _tick_adapters = adapters
+                                else:
+                                    _tick_adapters = (profile_adapters or {}).get(_pname) or {}
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=_tick_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,

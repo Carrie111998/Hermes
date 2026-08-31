@@ -32587,6 +32587,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     cron_stop = threading.Event()
     multiplex_cron = bool(getattr(runner.config, "multiplex_profiles", False))
+    # Guard: multiplex is owned by the default profile's gateway only.
+    # Secondary gateways (HERMES_HOME != default root) must not tick other
+    # profiles' stores, otherwise they race the default gateway and deliver
+    # via the wrong bot token (#99028). Clone-induced multiplex on a secondary
+    # (engineering's config cloned from default) is the exact trigger.
+    try:
+        from hermes_constants import get_process_hermes_home, get_default_hermes_root
+
+        if multiplex_cron and get_process_hermes_home().resolve() != get_default_hermes_root().resolve():
+            logger.warning(
+                "gateway.multiplex_profiles is set but this gateway runs under non-default HERMES_HOME %s — "
+                "ignoring multiplex for cron (single-profile tick) to avoid cross-profile delivery via wrong bot token (#99028)",
+                get_process_hermes_home(),
+            )
+            multiplex_cron = False
+    except Exception:
+        pass
     cron_provider = scheduler_for_profile_mode(
         resolve_cron_scheduler(),
         multiplex_profiles=multiplex_cron,
@@ -32607,6 +32624,20 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
+                # Per-profile adapters so each profile's cron output is
+                # delivered via its own bot/adapter instead of the default
+                # profile's (#99028, #98559 — no fallback for secondaries).
+                cron_start_kwargs["profile_adapters"] = getattr(
+                    runner, "_profile_adapters", None
+                )
+                # runner.adapters belongs to the default profile, which
+                # profiles_to_serve() names "default" in its multiplex list.
+                # Thread that identity so the ticker reserves the shared
+                # adapters for the default profile alone and never routes a
+                # secondary's cron through the default bot (even before its
+                # adapter connects, when profile_adapters[name] is still
+                # absent/empty).
+                cron_start_kwargs["default_profile"] = "default"
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),
