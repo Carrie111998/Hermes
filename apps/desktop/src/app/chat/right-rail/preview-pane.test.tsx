@@ -23,6 +23,20 @@ function stubPdfObjectUrls() {
   return { createObjectURL, revokeObjectURL }
 }
 
+function stubLegacyPdfStream() {
+  const nativeFetch = globalThis.fetch
+
+  const fetchPdf = vi.fn((input: RequestInfo | URL, init?: RequestInit) =>
+    String(input).startsWith('data:')
+      ? nativeFetch(input, init)
+      : Promise.resolve(new Response('Unsupported media type', { status: 415 }))
+  )
+
+  vi.stubGlobal('fetch', fetchPdf)
+
+  return fetchPdf
+}
+
 describe('PreviewPane console state', () => {
   beforeEach(() => {
     vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
@@ -373,10 +387,196 @@ describe('PreviewPane console state', () => {
     expect(fireEvent.click(sourceLink!)).toBe(false)
   })
 
-  it('renders PDF targets in an embedded viewer', async () => {
+  it('streams a local PDF without renderer base64 decoding or object URLs', async () => {
+    const readFileDataUrl = vi.fn(async () => {
+      throw new Error('the primary PDF path must not read a data URL')
+    })
+
+    const atob = vi.fn(() => {
+      throw new Error('the primary PDF path must not decode base64')
+    })
+
+    const { createObjectURL } = stubPdfObjectUrls()
+
+    const fetchPdf = vi.fn(async () =>
+      new Response('%PDF-', {
+        headers: { 'content-type': 'application/pdf' },
+        status: 206
+      })
+    )
+
+    $connection.set({ mode: 'local' } as never)
+    vi.stubGlobal('atob', atob)
+    vi.stubGlobal('fetch', fetchPdf)
+    vi.stubGlobal('window', {
+      ...window,
+      hermesDesktop: {
+        readFileDataUrl
+      }
+    })
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          target={{
+            kind: 'file',
+            label: 'spec.pdf',
+            path: '/tmp/spec.pdf',
+            previewKind: 'pdf',
+            source: '/tmp/spec.pdf',
+            url: 'file:///tmp/spec.pdf'
+          }}
+        />
+      )
+    })
+
+    await waitFor(
+      () =>
+        expect(rendered.container.querySelector('iframe')?.getAttribute('src')).toBe(
+          'hermes-media://stream/%2Ftmp%2Fspec.pdf'
+        ),
+      { container: rendered.container }
+    )
+    expect(fetchPdf).toHaveBeenCalledWith('hermes-media://stream/%2Ftmp%2Fspec.pdf', {
+      headers: { Range: 'bytes=0-4' },
+      signal: expect.any(AbortSignal)
+    })
+    expect(readFileDataUrl).not.toHaveBeenCalled()
+    expect(atob).not.toHaveBeenCalled()
+    expect(createObjectURL).not.toHaveBeenCalled()
+  })
+
+  it('routes a remote PDF through the credential-free profile-scoped stream URL', async () => {
+    const readFileDataUrl = vi.fn()
+
+    const fetchPdf = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response('%PDF-', {
+        headers: { 'content-type': 'application/pdf' },
+        status: 206
+      })
+    )
+
+    $connection.set({
+      connectionId: 'studio-ssh',
+      mode: 'remote',
+      profile: 'voice reviewer',
+      token: 'renderer-secret'
+    } as never)
+    vi.stubGlobal('fetch', fetchPdf)
+    vi.stubGlobal('window', {
+      ...window,
+      hermesDesktop: {
+        readFileDataUrl
+      }
+    })
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          target={{
+            kind: 'file',
+            label: 'spec.pdf',
+            path: '/remote/spec.pdf',
+            previewKind: 'pdf',
+            source: '/remote/spec.pdf',
+            url: 'file:///remote/spec.pdf'
+          }}
+        />
+      )
+    })
+
+    const expectedUrl =
+      'hermes-media://remote/%2Fremote%2Fspec.pdf?connectionId=studio-ssh&profile=voice%20reviewer'
+
+    await waitFor(
+      () => expect(rendered.container.querySelector('iframe')?.getAttribute('src')).toBe(expectedUrl),
+      { container: rendered.container }
+    )
+    expect(fetchPdf.mock.calls[0]?.[0]).toBe(expectedUrl)
+    expect(expectedUrl).not.toContain('renderer-secret')
+    expect(readFileDataUrl).not.toHaveBeenCalled()
+  })
+
+  it('suppresses a stale PDF validation result after the target changes', async () => {
+    const pending = new Map<string, (response: Response) => void>()
+    const requests = new Map<string, RequestInit | undefined>()
+
+    const fetchPdf = vi.fn(
+      (input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>(resolve => {
+          const url = String(input)
+
+          pending.set(url, resolve)
+          requests.set(url, init)
+        })
+    )
+
+    $connection.set({ mode: 'local' } as never)
+    vi.stubGlobal('fetch', fetchPdf)
+    vi.stubGlobal('window', {
+      ...window,
+      hermesDesktop: {
+        readFileDataUrl: vi.fn()
+      }
+    })
+
+    const firstTarget = {
+      kind: 'file' as const,
+      label: 'first.pdf',
+      path: '/tmp/first.pdf',
+      previewKind: 'pdf' as const,
+      source: '/tmp/first.pdf',
+      url: 'file:///tmp/first.pdf'
+    }
+
+    const secondTarget = {
+      ...firstTarget,
+      label: 'second.pdf',
+      path: '/tmp/second.pdf',
+      source: '/tmp/second.pdf',
+      url: 'file:///tmp/second.pdf'
+    }
+
+    const firstUrl = 'hermes-media://stream/%2Ftmp%2Ffirst.pdf'
+    const secondUrl = 'hermes-media://stream/%2Ftmp%2Fsecond.pdf'
+    const rendered = render(<PreviewPane target={firstTarget} />)
+
+    await waitFor(() => expect(pending.has(firstUrl)).toBe(true), { container: rendered.container })
+
+    rendered.rerender(<PreviewPane target={secondTarget} />)
+    await waitFor(() => expect(pending.has(secondUrl)).toBe(true), { container: rendered.container })
+    expect((requests.get(firstUrl)?.signal as AbortSignal).aborted).toBe(true)
+
+    await act(async () => {
+      pending.get(secondUrl)?.(
+        new Response('%PDF-', {
+          headers: { 'content-type': 'application/pdf' },
+          status: 206
+        })
+      )
+    })
+    await waitFor(() => expect(rendered.container.querySelector('iframe')?.getAttribute('src')).toBe(secondUrl), {
+      container: rendered.container
+    })
+
+    await act(async () => {
+      pending.get(firstUrl)?.(
+        new Response('%PDF-', {
+          headers: { 'content-type': 'application/pdf' },
+          status: 206
+        })
+      )
+    })
+    expect(rendered.container.querySelector('iframe')?.getAttribute('src')).toBe(secondUrl)
+  })
+
+  it('falls back to an embedded blob for a runtime without PDF stream support', async () => {
     const dataUrl = 'data:application/pdf;base64,JVBERi0xLjQ='
     const readFileDataUrl = vi.fn(async () => dataUrl)
     const { createObjectURL, revokeObjectURL } = stubPdfObjectUrls()
+    stubLegacyPdfStream()
     $connection.set({ mode: 'local' } as never)
     vi.stubGlobal('window', {
       ...window,
@@ -437,9 +637,10 @@ describe('PreviewPane console state', () => {
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:pdf-preview-2')
   })
 
-  it('accepts case-insensitive metadata and percent-escaped base64', async () => {
+  it('accepts case-insensitive metadata and percent-escaped base64 in the compatibility path', async () => {
     const readFileDataUrl = vi.fn(async () => 'data:APPLICATION/PDF;BASE64,%4AVBERi0xLjQ=')
     const { createObjectURL } = stubPdfObjectUrls()
+    stubLegacyPdfStream()
     $connection.set({ mode: 'local' } as never)
     vi.stubGlobal('window', {
       ...window,
@@ -477,6 +678,7 @@ describe('PreviewPane console state', () => {
   ])('rejects %s before creating an object URL', async (_case, dataUrl, expectedError) => {
     const readFileDataUrl = vi.fn(async () => dataUrl)
     const { createObjectURL } = stubPdfObjectUrls()
+    stubLegacyPdfStream()
     $connection.set({ mode: 'local' } as never)
     vi.stubGlobal('window', {
       ...window,
@@ -512,6 +714,7 @@ describe('PreviewPane console state', () => {
     const filePath = '/remote/spec.pdf'
     const dataUrl = 'data:application/pdf;base64,JVBERi0xLjQ='
     stubPdfObjectUrls()
+    stubLegacyPdfStream()
 
     const readFileDataUrl = vi.fn(async () => {
       throw new Error('File preview failed: file does not exist')

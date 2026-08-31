@@ -8,6 +8,7 @@ const STREAMABLE_MEDIA_EXTENSIONS = [
   '.mp4',
   '.ogg',
   '.opus',
+  '.pdf',
   '.wav',
   '.webm'
 ] as const

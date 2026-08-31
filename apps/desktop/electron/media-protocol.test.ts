@@ -30,9 +30,10 @@ function request(url: string, headers: Record<string, string> = {}, method = 'GE
 }
 
 describe('media protocol helpers', () => {
-  it('recognises only supported audio/video extensions case-insensitively', () => {
+  it('recognises only supported streaming extensions case-insensitively', () => {
     expect(isStreamableMediaPath('/tmp/render.MP4')).toBe(true)
     expect(isStreamableMediaPath('/tmp/voice.flac')).toBe(true)
+    expect(isStreamableMediaPath('/tmp/spec.PDF')).toBe(true)
     expect(isStreamableMediaPath('/tmp/secrets.txt')).toBe(false)
   })
 
@@ -77,6 +78,20 @@ describe('createMediaProtocolHandler', () => {
     expect(headers.get('authorization')).toBeNull()
   })
 
+  it('streams local PDFs through the same range-aware file dependency', async () => {
+    const deps = dependencies()
+
+    const response = await createMediaProtocolHandler(deps)(
+      request('hermes-media://stream/%2Ftmp%2Fspec.pdf', { Range: 'bytes=0-4' })
+    )
+
+    expect(response.status).toBe(206)
+    expect(deps.resolveLocalFile).toHaveBeenCalledWith('/tmp/spec.pdf')
+    expect(deps.fetchLocal).toHaveBeenCalledOnce()
+    const [, headers] = vi.mocked(deps.fetchLocal).mock.calls[0]
+    expect(headers.get('range')).toBe('bytes=0-4')
+  })
+
   it('preserves explicit HEAD requests through the local stream fetch', async () => {
     const fetchLocal = vi.fn(async (..._args: unknown[]) => new Response(null, { status: 200 }))
 
@@ -94,7 +109,7 @@ describe('createMediaProtocolHandler', () => {
     expect(deps.resolveRemoteConnection).not.toHaveBeenCalled()
   })
 
-  it('proxies token-auth remote media without placing the token in the URL', async () => {
+  it('proxies token-auth remote PDFs without placing the token in the URL', async () => {
     const deps = dependencies({
       resolveRemoteConnection: vi.fn(async () => ({
         authMode: 'token' as const,
@@ -105,8 +120,8 @@ describe('createMediaProtocolHandler', () => {
     })
 
     const response = await createMediaProtocolHandler(deps)(
-      request('hermes-media://remote/%2Froot%2Foutputs%2Frender.mp4?connectionId=work-ssh&profile=reviewer', {
-        Range: 'bytes=0-1023'
+      request('hermes-media://remote/%2Froot%2Foutputs%2Fspec.pdf?connectionId=work-ssh&profile=reviewer', {
+        Range: 'bytes=0-4'
       })
     )
 
@@ -116,10 +131,10 @@ describe('createMediaProtocolHandler', () => {
     const [rawUrl, headers] = vi.mocked(deps.fetchRemote).mock.calls[0]
     const url = new URL(rawUrl)
     expect(url.pathname).toBe('/hermes/api/files/stream')
-    expect(url.searchParams.get('path')).toBe('/root/outputs/render.mp4')
+    expect(url.searchParams.get('path')).toBe('/root/outputs/spec.pdf')
     expect(url.searchParams.has('token')).toBe(false)
     expect(headers.get('x-hermes-session-token')).toBe('s e/cret')
-    expect(headers.get('range')).toBe('bytes=0-1023')
+    expect(headers.get('range')).toBe('bytes=0-4')
   })
 
   it('adds profile scope when one registry backend serves multiple profiles', async () => {

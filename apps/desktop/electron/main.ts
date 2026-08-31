@@ -1313,7 +1313,7 @@ app.setAboutPanelOptions({
   copyright: 'Copyright © 2026 Nous Research'
 })
 
-// Custom scheme for streaming audio/video into the renderer. Local paths read
+// Custom scheme for streaming audio/video/PDF into the renderer. Local paths read
 // from this machine; remote paths are proxied through the configured gateway
 // with main-process authentication. This avoids whole-file data URLs and keeps
 // playback seekable and Range-aware. Must be registered before app readiness.

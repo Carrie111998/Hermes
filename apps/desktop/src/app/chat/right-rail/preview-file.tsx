@@ -34,6 +34,7 @@ import { createMemoizedMathPlugin } from '@/lib/katex-memo'
 import { isComposerChord } from '@/lib/keybinds/chords'
 import { shikiLanguageForFilename } from '@/lib/markdown-code'
 import { normalizeFilePreviewMath } from '@/lib/markdown-preprocess'
+import { isRemoteGateway, mediaGatewayStreamUrl, mediaStreamUrl } from '@/lib/media'
 import { cn } from '@/lib/utils'
 import type { PreviewTarget } from '@/store/preview'
 import { setPreviewDirty } from '@/store/preview-edit'
@@ -226,7 +227,7 @@ function looksBinaryBytes(bytes: Uint8Array) {
   return suspicious / Math.min(bytes.length, 4096) > 0.12
 }
 
-function dataUrlToBlob(dataUrl: string) {
+async function dataUrlToPdfBlob(dataUrl: string, signal: AbortSignal) {
   const comma = dataUrl.indexOf(',')
 
   if (comma < 0 || !dataUrl.startsWith('data:')) {
@@ -238,31 +239,55 @@ function dataUrlToBlob(dataUrl: string) {
     .split(';')
     .map(part => part.trim().toLowerCase())
 
-  const payload = dataUrl.slice(comma + 1)
-
   if (metadata[0] !== 'application/pdf' || !metadata.slice(1).includes('base64')) {
     throw new Error('Invalid PDF data URL type')
   }
 
-  let binary: string
+  let response: Response
 
   try {
-    binary = atob(decodeURIComponent(payload))
-  } catch {
+    // Let the browser's asynchronous data-URL loader decode the compatibility
+    // payload. The primary filesystem path never reaches this fallback, and no
+    // renderer-side atob/per-byte copy is needed when an older runtime does.
+    response = await fetch(dataUrl, { signal })
+  } catch (error) {
+    if (signal.aborted) {
+      throw error
+    }
+
     throw new Error('Invalid PDF data URL payload')
   }
 
-  if (!binary.startsWith('%PDF-')) {
+  const mimeType = response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase()
+
+  if (!response.ok || mimeType !== 'application/pdf') {
+    throw new Error('Invalid PDF data URL type')
+  }
+
+  const blob = await response.blob()
+  const header = await blob.slice(0, 5).text()
+
+  if (header !== '%PDF-') {
     throw new Error('Invalid PDF file header')
   }
 
-  const bytes = new Uint8Array(binary.length)
+  return blob
+}
 
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index)
+async function validatePdfStreamResponse(response: Response) {
+  const mimeType = response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase()
+
+  // A successful five-byte range is the performance contract: accepting a 200
+  // here could make validation buffer the entire PDF in the renderer.
+  if (response.status !== 206 || mimeType !== 'application/pdf') {
+    throw new Error('Invalid PDF response type')
   }
 
-  return new Blob([bytes], { type: 'application/pdf' })
+  const header = new TextDecoder().decode(await response.arrayBuffer())
+
+  if (header !== '%PDF-') {
+    throw new Error('Invalid PDF file header')
+  }
 }
 
 async function readTextPreview(filePath: string) {
@@ -754,7 +779,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
       setState({ loading: true })
 
       try {
-        if (isImage || isPdf) {
+        if (isImage) {
           // Prefer bytes the caller already handed us (a pasted/dropped
           // screenshot) over re-reading a path that may be transient/unreadable.
           const dataUrl = target.dataUrl || (await readDesktopFileDataUrl(filePath))
@@ -762,6 +787,12 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
           if (active) {
             setState({ dataUrl, loading: false })
           }
+
+          return
+        }
+
+        if (isPdf) {
+          setState({ loading: false })
 
           return
         }
@@ -829,31 +860,76 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     setPdfUrl(undefined)
     setPdfError(undefined)
 
-    if (!isPdf || !state.dataUrl) {
+    if (!isPdf) {
       return
     }
 
-    // Chromium's PDF viewer is blank for large data: URLs in an iframe. Use a
-    // blob URL instead, and revoke it when the target or loaded bytes change.
-    if (typeof URL.createObjectURL !== 'function') {
-      setPdfError('PDF preview requires object URL support')
+    const controller = new AbortController()
+    const streamUrl = isRemoteGateway() ? mediaGatewayStreamUrl(filePath) : mediaStreamUrl(filePath)
+    let objectUrl: string | undefined
 
-      return
+    async function loadPdf() {
+      let streamError: unknown
+
+      try {
+        const response = await fetch(streamUrl, {
+          headers: { Range: 'bytes=0-4' },
+          signal: controller.signal
+        })
+
+        await validatePdfStreamResponse(response)
+
+        if (!controller.signal.aborted) {
+          setPdfUrl(streamUrl)
+        }
+
+        return
+      } catch (error) {
+        if (controller.signal.aborted) {
+          return
+        }
+
+        streamError = error
+      }
+
+      // Compatibility for an Electron process/backend that predates PDF support
+      // in hermes-media. Decode through the browser asynchronously, then retain
+      // the existing blob URL lifecycle until that runtime is restarted.
+      try {
+        const dataUrl = target.dataUrl || (await readDesktopFileDataUrl(filePath))
+
+        if (typeof URL.createObjectURL !== 'function') {
+          throw new Error('PDF preview requires object URL support')
+        }
+
+        const blob = await dataUrlToPdfBlob(dataUrl, controller.signal)
+
+        if (controller.signal.aborted) {
+          return
+        }
+
+        objectUrl = URL.createObjectURL(blob)
+        setPdfUrl(objectUrl)
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          const fallbackError = error instanceof Error ? error.message : String(error)
+          const primaryError = streamError instanceof Error ? streamError.message : String(streamError)
+
+          setPdfError(fallbackError || primaryError)
+        }
+      }
     }
 
-    let objectUrl: string
+    void loadPdf()
 
-    try {
-      objectUrl = URL.createObjectURL(dataUrlToBlob(state.dataUrl))
-      setPdfUrl(objectUrl)
-    } catch (error) {
-      setPdfError(error instanceof Error ? error.message : String(error))
+    return () => {
+      controller.abort()
 
-      return
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl)
+      }
     }
-
-    return () => URL.revokeObjectURL(objectUrl)
-  }, [isPdf, state.dataUrl])
+  }, [filePath, fsCacheKey, isPdf, reloadKey, target.dataUrl])
 
   // Editing is only offered for whole, readable text — never images, binaries,
   // or files we only loaded the first 512 KB of (saving would drop the tail).
@@ -1080,7 +1156,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     )
   }
 
-  if (isPdf && state.dataUrl && pdfUrl) {
+  if (isPdf && pdfUrl) {
     return (
       <div className="h-full w-full overflow-hidden bg-transparent">
         <iframe
@@ -1093,7 +1169,7 @@ export function LocalFilePreview({ reloadKey, target }: { reloadKey: number; tar
     )
   }
 
-  if (isPdf && state.dataUrl) {
+  if (isPdf) {
     return <PageLoader label={t.preview.loading} />
   }
 

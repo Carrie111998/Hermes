@@ -174,6 +174,24 @@ def test_stream_requires_header_auth_and_supports_ranges(forced_files_client):
     assert client.get("/api/files/stream", params=params).status_code == 401
 
 
+def test_stream_serves_pdf_inline_with_range(forced_files_client):
+    client, root = forced_files_client
+    file_path = _seed_file(client, root, name="out/spec.pdf")
+    file_path.write_bytes(b"%PDF-1.7")
+
+    response = client.get(
+        "/api/files/stream",
+        params={"path": str(file_path)},
+        headers={"Range": "bytes=0-4"},
+    )
+
+    assert response.status_code == 206
+    assert response.content == b"%PDF-"
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-range"] == "bytes 0-4/8"
+    assert response.headers["content-disposition"].startswith("inline;")
+
+
 def test_stream_rejects_non_media_active_content(forced_files_client):
     client, root = forced_files_client
 

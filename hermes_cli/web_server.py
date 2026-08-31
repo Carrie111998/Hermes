@@ -2148,6 +2148,7 @@ _STREAMABLE_MEDIA_EXTENSIONS = frozenset(
         ".mp4",
         ".ogg",
         ".opus",
+        ".pdf",
         ".wav",
         ".webm",
     }
@@ -2906,10 +2907,11 @@ async def download_managed_file(request: Request, path: str):
 @app.get("/api/files/stream")
 @app.head("/api/files/stream")
 async def stream_managed_file(request: Request, path: str):
-    """Stream managed audio/video inline with HTTP Range support.
+    """Stream managed audio/video/PDF files inline with HTTP Range support.
 
     Electron's Chromium media pipeline may reject an attachment response used
-    as an ``<audio>`` or ``<video>`` source. This route shares the download
+    as an ``<audio>`` or ``<video>`` source. PDF previews use the same route to
+    avoid whole-file base64 copies. This route shares the download
     endpoint's authentication, size cap, sensitive-file guard, MIME detection,
     and Starlette ``FileResponse`` range handling, but explicitly marks the
     response inline so metadata loading, playback, and seeking work remotely.
