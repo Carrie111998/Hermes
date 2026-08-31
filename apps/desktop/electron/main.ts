@@ -5360,18 +5360,6 @@ const RENDER_TITLE_MAX_CONCURRENT = 2
 const RENDER_TITLE_TIMEOUT_MS = 8000
 const RENDER_TITLE_GRACE_MS = 700
 
-// Resource types we cancel before the network even fires — keeps the hidden
-// renderer fast and cuts third-party tracking noise.
-const RENDER_TITLE_BLOCKED_RESOURCES = new Set([
-  'cspReport',
-  'font',
-  'imageset',
-  'media',
-  'object',
-  'ping',
-  'stylesheet'
-])
-
 let linkTitleSession = null
 let oauthSession = null
 let renderTitleInFlight = 0
@@ -5527,10 +5515,11 @@ function getLinkTitleSession() {
   }
 
   linkTitleSession = session.fromPartition('hermes:link-titles', { cache: false })
-  linkTitleSession.webRequest.onBeforeRequest((details, callback) => {
-    callback({ cancel: RENDER_TITLE_BLOCKED_RESOURCES.has(details.resourceType) })
-  })
-  guardLinkTitleSession(linkTitleSession)
+  // One onBeforeRequest registration owns everything this window's requests
+  // must pass: resource blocks AND the B6 SSRF guard (per-request hostname +
+  // DNS verdict, every redirect hop included). A second registration would
+  // replace this one, not stack on it.
+  guardLinkTitleSession(linkTitleSession, { resolveHost: resolveHostAddresses })
 
   return linkTitleSession
 }
