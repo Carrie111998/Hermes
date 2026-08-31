@@ -91,15 +91,23 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # left the bypassable approval layer (tools/approval.py, skipped on
     # force=True) as the only cover, while this hard block — documented as
     # "force=True cannot help here" — let them through (#80260).
-    r"|(?:launchctl\s+(?:kickstart|unload|load|stop|restart|submit|bootstrap|bootout|remove|disable)\b[^\n]*\bhermes[.\-]?gateway)"
+    r"|(?:launchctl\s+(?:kickstart|unload|load|stop|restart|submit|bootstrap|bootout|remove|disable)\b[^\n]{0,300}\bhermes[.\-]?gateway)"
     # Branch C: systemctl ops on a hermes-gateway unit.
-    r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
+    r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]{0,300}\bhermes[.\-]?gateway)"
     # Branch D: pkill / kill targeting the hermes gateway process. Both
     # token orders because real reproductions show both.
     # Leading \b ensures we match "pkill" or "kill" as whole words, not as
     # suffixes of other words (e.g. "skill" -> "kill").
-    r"|(?:\bp?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:\bp?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    #
+    # Fix: bound [^\n]* to at most 200 characters (#98869).  On single-line
+    # files (e.g. compact 1 MB JSON) [^\n]* matches the entire content, so
+    # three unrelated words — "kill" in one JSON field, "hermes" in another,
+    # "gateway" in a third — can trigger a false-positive block.  Bounding
+    # the inter-word span to 200 chars keeps the match command-shaped (a real
+    # kill invocation is a short token sequence) while eliminating cross-field
+    # contamination.
+    r"|(?:\bp?kill\b[^\n]{0,200}\bhermes\b[^\n]{0,200}\bgateway)"
+    r"|(?:\bp?kill\b[^\n]{0,200}\bgateway\b[^\n]{0,200}\bhermes)"
 )
 
 
