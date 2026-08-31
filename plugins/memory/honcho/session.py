@@ -183,11 +183,19 @@ class HonchoSessionManager:
         self._observation_mode: str = (
             config.observation_mode if config else "directional"
         )
-        # Per-peer observation booleans (granular, from config)
+        # Per-peer observation booleans (granular, from config). These stay a
+        # config snapshot: server-synced values live in _session_observation
+        # keyed by honcho session id, so one session's sync can never retune
+        # the recall routing of another served by the same manager (#98936).
         self._user_observe_me: bool = config.user_observe_me if config else True
         self._user_observe_others: bool = config.user_observe_others if config else True
         self._ai_observe_me: bool = config.ai_observe_me if config else True
         self._ai_observe_others: bool = config.ai_observe_others if config else True
+        # honcho session id → observation flags synced from the server during
+        # session setup. Whole-dict entries are assigned in one statement, so
+        # lock-free reads observe either the old or the new snapshot, never a
+        # partial one.
+        self._session_observation: dict[str, dict[str, bool]] = {}
         self._message_max_chars: int = (
             config.message_max_chars if config else 25000
         )
@@ -368,6 +376,34 @@ class HonchoSessionManager:
                     return self._peers_cache.setdefault(peer_id, peer)
             # Client rebuilt mid-resolve — drop the stale object and retry.
 
+    def _observation_flags(
+        self, honcho_session_id: str
+    ) -> tuple[bool, bool, bool, bool]:
+        """Observation flags for one session.
+
+        Server-synced values if the session completed setup, else the config
+        snapshot defaults. Per-session scoping is what keeps recall routing
+        honest when one manager serves sessions with diverging configs (#98936).
+        """
+        synced = self._session_observation.get(honcho_session_id)
+        if synced is not None:
+            return (
+                synced["user_observe_me"],
+                synced["user_observe_others"],
+                synced["ai_observe_me"],
+                synced["ai_observe_others"],
+            )
+        return (
+            self._user_observe_me,
+            self._user_observe_others,
+            self._ai_observe_me,
+            self._ai_observe_others,
+        )
+
+    def _ai_observes_others(self, session: HonchoSession) -> bool:
+        """Whether the AI peer observes other peers, for this session's routing."""
+        return self._observation_flags(session.honcho_session_id)[3]
+
     def _get_or_create_honcho_session(
         self, session_id: str, user_peer: Any, assistant_peer: Any
     ) -> tuple[Any, list]:
@@ -385,17 +421,25 @@ class HonchoSessionManager:
         self._authed_call("session setup", lambda: self._sdk_session(session_id))
 
         # Configure per-peer observation from granular booleans.
-        # These map 1:1 to Honcho's SessionPeerConfig toggles.
+        # These map 1:1 to Honcho's SessionPeerConfig toggles. Read per-session
+        # so a session that already synced its server config keeps those
+        # values instead of re-applying the manager-wide defaults.
+        (
+            user_observe_me,
+            user_observe_others,
+            ai_observe_me,
+            ai_observe_others,
+        ) = self._observation_flags(session_id)
         auth_dead = False
         try:
             from honcho.session import SessionPeerConfig
             user_config = SessionPeerConfig(
-                observe_me=self._user_observe_me,
-                observe_others=self._user_observe_others,
+                observe_me=user_observe_me,
+                observe_others=user_observe_others,
             )
             ai_config = SessionPeerConfig(
-                observe_me=self._ai_observe_me,
-                observe_others=self._ai_observe_others,
+                observe_me=ai_observe_me,
+                observe_others=ai_observe_others,
             )
             peer_entries = [(user_peer, user_config), (assistant_peer, ai_config)]
 
@@ -406,8 +450,10 @@ class HonchoSessionManager:
 
             # Sync back: server-side config (set via Honcho UI) wins over
             # local defaults. Read the effective config after add_peers.
-            # Note: observation booleans are manager-scoped, not per-session.
-            # Last session init wins. Fine for CLI; gateway should scope per-session.
+            # Observation booleans are scoped per session: manager-level
+            # fields stay as the config snapshot, and each session's sync is
+            # stored under its own id so the last initialization can no
+            # longer retune every other session the manager serves (#98936).
             try:
                 def _read_server_configs() -> tuple[Any, Any]:
                     sdk_session = self._sdk_session(session_id)
@@ -419,18 +465,29 @@ class HonchoSessionManager:
                 server_user, server_ai = self._authed_call(
                     "peer configuration read", _read_server_configs
                 )
+                synced = {
+                    "user_observe_me": user_observe_me,
+                    "user_observe_others": user_observe_others,
+                    "ai_observe_me": ai_observe_me,
+                    "ai_observe_others": ai_observe_others,
+                }
                 if server_user.observe_me is not None:
-                    self._user_observe_me = server_user.observe_me
+                    synced["user_observe_me"] = server_user.observe_me
                 if server_user.observe_others is not None:
-                    self._user_observe_others = server_user.observe_others
+                    synced["user_observe_others"] = server_user.observe_others
                 if server_ai.observe_me is not None:
-                    self._ai_observe_me = server_ai.observe_me
+                    synced["ai_observe_me"] = server_ai.observe_me
                 if server_ai.observe_others is not None:
-                    self._ai_observe_others = server_ai.observe_others
+                    synced["ai_observe_others"] = server_ai.observe_others
+                self._session_observation[session_id] = synced
                 logger.debug(
-                    "Honcho observation synced from server: user(me=%s,others=%s) ai(me=%s,others=%s)",
-                    self._user_observe_me, self._user_observe_others,
-                    self._ai_observe_me, self._ai_observe_others,
+                    "Honcho observation synced from server for session '%s': "
+                    "user(me=%s,others=%s) ai(me=%s,others=%s)",
+                    session_id,
+                    synced["user_observe_me"],
+                    synced["user_observe_others"],
+                    synced["ai_observe_me"],
+                    synced["ai_observe_others"],
                 )
             except HonchoAuthError:
                 raise
@@ -919,7 +976,7 @@ class HonchoSessionManager:
             level = self._default_reasoning_level()
 
         def _chat_once() -> str:
-            if self._ai_observe_others:
+            if self._ai_observes_others(session):
                 # AI peer can observe other peers — use assistant as observer.
                 ai_peer_obj = self._get_or_create_peer(session.assistant_peer_id)
                 if target_peer_id == session.assistant_peer_id:
@@ -1429,7 +1486,7 @@ class HonchoSessionManager:
         if target_peer_id == session.assistant_peer_id:
             return session.assistant_peer_id, session.assistant_peer_id
 
-        if self._ai_observe_others:
+        if self._ai_observes_others(session):
             return session.assistant_peer_id, target_peer_id
 
         return target_peer_id, None
@@ -1574,7 +1631,7 @@ class HonchoSessionManager:
         if target_peer_id == session.assistant_peer_id:
             observer = self._get_or_create_peer(session.assistant_peer_id)
             return observer.conclusions_of(session.assistant_peer_id)
-        elif self._ai_observe_others:
+        elif self._ai_observes_others(session):
             observer = self._get_or_create_peer(session.assistant_peer_id)
             return observer.conclusions_of(target_peer_id)
         else:
