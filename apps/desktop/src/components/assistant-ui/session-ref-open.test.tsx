@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { __resetSessionLinkTitleCache } from '@/lib/session-link-title'
 import { $previewTabs, closeRightRail } from '@/store/preview'
+import type * as ProfileModule from '@/store/profile'
 
 import { DirectiveContent } from './directive-text'
 import { MarkdownTextContent } from './markdown-text'
@@ -14,7 +15,7 @@ vi.mock('@/app/open-session', () => ({
   openSession: (...args: unknown[]) => openSession(...args)
 }))
 vi.mock('@/store/profile', async importActual => ({
-  ...(await importActual<typeof import('@/store/profile')>()),
+  ...(await importActual<typeof ProfileModule>()),
   ensureGatewayProfile: (...args: unknown[]) => ensureGatewayProfile(...args)
 }))
 

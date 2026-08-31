@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/i18n'
 import { $previewTabs, closeRightRail } from '@/store/preview'
+import type * as ProfileModule from '@/store/profile'
 
 import { ComposerDirectiveActions } from './directive-actions'
 import { refChipElement } from './rich-editor'
@@ -14,7 +15,7 @@ const ensureGatewayProfile = vi.fn().mockResolvedValue(undefined)
 
 vi.mock('@/app/open-session', () => ({ openSession: (...args: unknown[]) => openSession(...args) }))
 vi.mock('@/store/profile', async importActual => ({
-  ...(await importActual<typeof import('@/store/profile')>()),
+  ...(await importActual<typeof ProfileModule>()),
   ensureGatewayProfile: (...args: unknown[]) => ensureGatewayProfile(...args)
 }))
 
