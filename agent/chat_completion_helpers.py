@@ -16,6 +16,7 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
 from __future__ import annotations
 
 import contextvars
+import copy
 import json
 import logging
 import math
@@ -3132,7 +3133,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         _needs_sanitize = agent._should_sanitize_tool_calls()
         api_messages = []
         for msg in messages:
-            api_msg = msg.copy()
+            api_msg = copy.deepcopy(msg)
             agent._copy_reasoning_content_for_api(msg, api_msg)
             if agent._reasoning_replay_field_for_api() != "reasoning":
                 api_msg.pop("reasoning", None)
@@ -3180,7 +3181,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         if agent.prefill_messages:
             sys_offset = 1 if effective_system else 0
             for idx, pfm in enumerate(agent.prefill_messages):
-                api_messages.insert(sys_offset + idx, pfm.copy())
+                # Prefills are inserted after the history loop above, so they
+                # must pass through the same replay/provenance gate explicitly.
+                # Sanitize a structural copy: prefill_messages is reusable
+                # session state, and later tool-call repair mutates nested data.
+                prefill_api = copy.deepcopy(pfm)
+                agent._copy_reasoning_content_for_api(pfm, prefill_api)
+                api_messages.insert(sys_offset + idx, prefill_api)
 
         # Same safety net as the main loop: repair tool-call/result
         # pairing before asking for a final summary.  Compression and

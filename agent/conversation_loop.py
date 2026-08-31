@@ -2671,6 +2671,7 @@ def run_conversation(
             api_msg.pop("reasoning", None)
             api_msg.pop("reasoning_content", None)
             api_msg.pop("reasoning_details", None)
+            api_msg.pop("anthropic_content_blocks", None)
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
