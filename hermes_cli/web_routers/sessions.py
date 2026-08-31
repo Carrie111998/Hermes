@@ -16,6 +16,7 @@ import asyncio  # noqa: F401 — used by handlers
 import json
 import logging
 import time  # noqa: F401
+from pathlib import Path
 from typing import Any, Dict, List, Optional  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
@@ -558,27 +559,72 @@ async def get_session_stats(profile: Optional[str] = None):
         db.close()
 
 
-@manage_router.get("/api/sessions/{session_id}")
-async def get_session_detail(session_id: str, profile: Optional[str] = None):
-    db = _open_session_db_for_profile(profile, read_only=True)
+def _lookup_session_in_profile(session_id: str, candidate: Optional[str]):
+    db = _open_session_db_for_profile(candidate, read_only=True)
     try:
         sid = db.resolve_session_id(session_id)
-        session = db.get_session(sid) if sid else None
-        if not session:
-            raise HTTPException(status_code=404, detail="Session not found")
-        # Always stamp the owning profile — the serving profile is known even
-        # when the request carries no ``?profile=`` (it's this process's own
-        # profile). Stamping only on explicit ``?profile=`` left rows for the
-        # default/primary profile systematically unowned, so multi-profile
-        # clients resolved them to whichever gateway happened to be active
-        # (cross-profile open asymmetry, #67603 family).
-        session["profile"] = (
-            _cron_profile_home(profile)[0] if profile else _cron_default_profile()
-        )
-        session["is_default_profile"] = session["profile"] == "default"
-        return session
+        return db.get_session(sid) if sid else None
     finally:
         db.close()
+
+
+def _profile_has_session_store(candidate: str) -> bool:
+    """True only if ``candidate`` already has a non-empty state.db.
+
+    Read-only opens bootstrap a missing/zero-byte store (see
+    ``_open_session_db_at_path``), so the cross-profile fallback below must
+    skip candidates that fail this check rather than open them — otherwise
+    every configured-but-never-run profile on disk gets a state.db created
+    as a side effect of an unrelated session-id miss.
+    """
+    _, home = _cron_profile_home(candidate)
+    try:
+        return (Path(home) / "state.db").stat().st_size > 0
+    except OSError:
+        return False
+
+
+@manage_router.get("/api/sessions/{session_id}")
+async def get_session_detail(session_id: str, profile: Optional[str] = None):
+    def _lookup():
+        resolved_profile = profile
+        session = _lookup_session_in_profile(session_id, profile)
+        if not session and not profile:
+            # Bot sessions live in their own profile's state.db. A request
+            # that omits ?profile= only checked the default profile above,
+            # so a bot chat opened without its owning profile 404s here even
+            # though it exists on disk (cross-profile open asymmetry, #67603
+            # family). Fall back across the other local profiles that
+            # already have a session store; an explicit ?profile= that
+            # misses stays a real 404 rather than guessing elsewhere.
+            from hermes_cli.kanban_db import list_profiles_on_disk
+
+            for name in list_profiles_on_disk():
+                if name == "default":
+                    continue  # already tried above via the profile=None lookup
+                if not _profile_has_session_store(name):
+                    continue
+                candidate_session = _lookup_session_in_profile(session_id, name)
+                if candidate_session:
+                    return candidate_session, name
+        return session, resolved_profile
+
+    session, resolved_profile = await asyncio.to_thread(_lookup)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    # Always stamp the owning profile — the serving profile is known even
+    # when the request carries no ``?profile=`` (it's this process's own
+    # profile). Stamping only on explicit ``?profile=`` left rows for the
+    # default/primary profile systematically unowned, so multi-profile
+    # clients resolved them to whichever gateway happened to be active
+    # (cross-profile open asymmetry, #67603 family).
+    session["profile"] = (
+        _cron_profile_home(resolved_profile)[0]
+        if resolved_profile
+        else _cron_default_profile()
+    )
+    session["is_default_profile"] = session["profile"] == "default"
+    return session
 
 
 @manage_router.get("/api/sessions/{session_id}/latest-descendant")
