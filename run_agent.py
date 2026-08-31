@@ -3343,14 +3343,41 @@ class AIAgent:
             if event is None:
                 return
             fence = vars(self).get("_active_compression_commit_fence")
+            try_cancel = getattr(
+                type(fence), "try_cancel_before_commit", None
+            )
+            if callable(try_cancel):
+                try:
+                    # Non-blocking admission (#98351). During a commit the
+                    # worker RETAINS the fence lock until finish_commit(), so
+                    # the blocking cancel_before_commit pins this thread —
+                    # and the _pending_redirect_lock it holds — behind the
+                    # whole SessionDB mutation: /stop and /new stop
+                    # answering while a large-session commit runs, and the
+                    # gateway turn-timeout watchdog hangs interrupting the
+                    # very turn it must reap. None means a commit is in
+                    # flight: publish the stop now instead of waiting. The
+                    # commit itself is still never abandoned mid-mutation,
+                    # and the conversation thread observes the stop as soon
+                    # as the compression call returns — every stop producer
+                    # only sets the flag, none consumes "commit settled".
+                    try_cancel(fence)
+                    event.set()
+                    return
+                except Exception:
+                    logger.debug(
+                        "Compression hard-cancel fence admission failed",
+                        exc_info=True,
+                    )
             cancel_before_commit = getattr(
                 type(fence), "cancel_before_commit", None
             )
             if callable(cancel_before_commit):
                 try:
-                    # This sets the Event while holding the same lock used by
-                    # begin_commit(). If commit already won, it waits for that
-                    # tracked mutation to finish before publishing the stop.
+                    # Legacy fence (no non-blocking form): set the Event
+                    # while holding the same lock used by begin_commit(). If
+                    # commit already won, it waits for that tracked mutation
+                    # to finish before publishing the stop.
                     cancel_before_commit(fence, event)
                     return
                 except Exception:

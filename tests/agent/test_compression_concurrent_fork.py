@@ -2040,8 +2040,17 @@ def test_hard_cancel_between_compress_return_and_commit_begin_wins_atomically(
     assert db.get_compression_lock_holder(session_id) is None
 
 
-def test_hard_stop_waits_for_commit_already_admitted(tmp_path: Path) -> None:
-    """A surfaced stop never races an untracked post-return transcript commit."""
+def test_hard_stop_returns_promptly_while_commit_in_flight(tmp_path: Path) -> None:
+    """A surfaced stop must not block behind an in-flight commit (#98351).
+
+    The commit worker retains the fence lock until finish_commit(), so a
+    blocking cancel admission pins the stop caller (and the redirect lock it
+    holds) behind the whole SessionDB mutation — /stop and /new stop
+    answering during a large-session commit. The stop is published
+    immediately instead; the already-admitted commit still runs to
+    completion (never abandoned mid-mutation) and releases its durable
+    lock, so the end state is identical to the old wait-then-publish one.
+    """
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "HARD_CANCEL_AFTER_COMMIT_ADMISSION"
     db.create_session(session_id, source="tui")
@@ -2082,14 +2091,13 @@ def test_hard_stop_waits_for_commit_already_admitted(tmp_path: Path) -> None:
         daemon=True,
     )
     stop.start()
-    assert not stop_returned.wait(timeout=0.1)
+    assert stop_returned.wait(timeout=2)
+    assert not stop.is_alive()
     allow_commit.set()
     compression.join(timeout=5)
     stop.join(timeout=5)
 
     assert not compression.is_alive()
-    assert not stop.is_alive()
-    assert stop_returned.is_set()
     assert compression_result["value"][0][0]["content"] == (
         "[CONTEXT COMPACTION] summary"
     )
