@@ -249,10 +249,39 @@ describe('desktop slash command curation', () => {
       'diff <id>',
       'approval'
     ])
+    expect(filterDesktopSubcommandCompletions('/skills\tap', hubItems).map(item => item.text)).toEqual([
+      'pending',
+      'approve <id>',
+      'reject',
+      'diff <id>',
+      'approval'
+    ])
     // Command-token stage (`/skills` itself, no space) passes through.
     expect(filterDesktopSubcommandCompletions('/skills', hubItems)).toHaveLength(hubItems.length)
     // Unrestricted commands keep their full arg completions.
     expect(filterDesktopSubcommandCompletions('/memory ', hubItems)).toHaveLength(hubItems.length)
+  })
+
+  it('lets a live catalog narrow the static /skills allowlist', () => {
+    rememberDesktopCommandsCatalog({
+      commands: {
+        '/skills': {
+          argument_mode: 'options',
+          desktop: null,
+          desktop_subcommands: ['pending', 'approve', 'reject']
+        }
+      },
+      canon: { '/skills': '/skills' }
+    })
+
+    expect(desktopSubcommandAllowlist('/skills')).toEqual(['pending', 'approve', 'reject'])
+    expect(desktopSubcommandUnavailableMessage('/skills', 'diff a1b2')).toContain('/skills diff')
+    expect(desktopSubcommandUnavailableMessage('/skills', 'pending')).toBeNull()
+  })
+
+  it('falls back to the static /skills allowlist when the catalog has none', () => {
+    expect(desktopSubcommandAllowlist('/skills')).toEqual(['pending', 'approve', 'reject', 'diff', 'approval'])
+    expect(desktopSubcommandUnavailableMessage('/skills', 'diff a1b2')).toBeNull()
   })
 
   it('routes /pet through the desktop action handler and drops /pets', () => {

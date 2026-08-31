@@ -486,7 +486,23 @@ export function canonicalDesktopSlashCommand(command: string): string {
 
 /** Resolve a command (or alias) to its desktop spec, or null for unknown/extension commands. */
 export function resolveDesktopCommand(command: string): DesktopCommandSpec | null {
-  return SPEC_BY_NAME.get(canonicalDesktopSlashCommand(command)) ?? specFromCatalog(command)
+  const staticSpec = SPEC_BY_NAME.get(canonicalDesktopSlashCommand(command))
+  const catalogSpec = specFromCatalog(command)
+
+  // Static rows keep old backends from hiding a current Desktop surface.
+  // When a live catalog names subcommands, that allowlist wins so a newer
+  // backend can narrow (or expand) without a Desktop rebuild.
+  if (staticSpec) {
+    const catalogSubs = catalogSpec?.desktopSubcommands
+
+    if (catalogSubs && catalogSubs.length > 0) {
+      return { ...staticSpec, desktopSubcommands: catalogSubs }
+    }
+
+    return staticSpec
+  }
+
+  return catalogSpec
 }
 
 /** Subcommands the desktop may forward for *command*; null = unrestricted. */
@@ -529,17 +545,14 @@ export function desktopSubcommandUnavailableMessage(command: string, arg: string
  * once the query is past the command token (`/skills …`); command-stage
  * completions pass through untouched.
  */
-export function filterDesktopSubcommandCompletions<T extends { text: string }>(
-  text: string,
-  items: readonly T[]
-): T[] {
+export function filterDesktopSubcommandCompletions<T extends { text: string }>(text: string, items: readonly T[]): T[] {
   const command = normalizeCommand(text)
   const allowed = desktopSubcommandAllowlist(command)
   const rest = text.slice(command.length)
 
   // Only the argument stage (`/skills …`, including a bare trailing space)
   // carries subcommand items; command-token completions pass through.
-  if (!allowed || !rest.startsWith(' ')) {
+  if (!allowed || !/^\s/.test(rest)) {
     return [...items]
   }
 
