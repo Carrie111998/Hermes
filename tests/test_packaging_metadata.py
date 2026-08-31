@@ -120,6 +120,32 @@ def test_starlette_pinned_above_cve_2026_48710_floor_in_pyproject():
         )
 
 
+def test_locked_msal_supports_pinned_cryptography_50():
+    """MSAL 1.38 lifts the cryptography ceiling to include the core 50.x pin.
+
+    Older MSAL releases declare ``cryptography<49``. uv's deliberate
+    cryptography override can resolve that graph, but the installed environment
+    remains formally inconsistent and ``uv pip check`` fails. Keep the young
+    compatible MSAL release visible through the repository's 14-day cutoff and
+    locked at or above the first compatible version.
+    """
+    pyproject = tomllib.loads(
+        (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    exemptions = pyproject["tool"]["uv"].get("exclude-newer-package", {})
+    assert exemptions.get("msal") is False, (
+        "msal must bypass exclude-newer until 1.38.0 ages through the 14-day "
+        "window; otherwise lock regeneration can restore the cryptography<49 conflict"
+    )
+
+    versions = _locked_versions("msal")
+    assert versions, "msal not found in uv.lock"
+    assert all(_version_tuple(version) >= (1, 38, 0) for version in versions), (
+        f"uv.lock resolves incompatible MSAL version(s) {sorted(versions)}; "
+        "MSAL >=1.38.0 is required with cryptography 50.x"
+    )
+
+
 def test_locked_starlette_is_not_vulnerable_to_cve_2026_48710():
     """The committed uv.lock must resolve starlette to a patched version.
 
