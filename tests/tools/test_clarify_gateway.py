@@ -52,6 +52,25 @@ class TestClarifyPrimitive:
         assert cm.resolve_gateway_clarify("id-race", "") is False
         assert entry.response == "A"
 
+    def test_cross_route_cancellation_cannot_overwrite_resolved_answer(self):
+        from tools import clarify_gateway as cm
+
+        entry = cm.register(
+            "id-route-race",
+            "sk-route-race",
+            "Pick one",
+            ["A", "B"],
+            route_scope={"platform": "buzz", "chat_id": "room", "thread_id": "one"},
+        )
+
+        assert cm.resolve_gateway_clarify("id-route-race", "A") is True
+        assert cm.resolve_pending_outside_route(
+            "sk-route-race",
+            {"platform": "buzz", "chat_id": "room", "thread_id": "two"},
+            "__cancelled__",
+        ) is False
+        assert entry.response == "A"
+
     def test_open_ended_auto_awaits_text(self):
         """Clarify with no choices is in text-capture mode immediately."""
         from tools import clarify_gateway as cm

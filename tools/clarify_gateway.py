@@ -355,6 +355,7 @@ def resolve_pending_outside_route(
             entry = _entries.get(cid)
             if (
                 entry is None
+                or entry.event.is_set()
                 or entry.route_scope is None
                 or entry.route_scope == normalized_route_scope
             ):
