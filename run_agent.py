@@ -144,6 +144,10 @@ from model_tools import (
 from tools.terminal_tool import cleanup_vm, get_active_env
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
+from tools.tool_result_sanitization import (
+    sanitize_tool_result_for_sink,
+    sanitize_tool_result_projection_for_sink,
+)
 
 
 # Agent internals extracted to agent/ package for modularity
@@ -208,6 +212,14 @@ from agent.trajectory import (
     convert_scratchpad_to_think,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.tool_result_persistence import (
+    _EPHEMERAL_SCAFFOLDING_FLAGS,
+    format_file_mutation_failure_footer,
+    is_ephemeral_scaffolding as _is_ephemeral_scaffolding,
+    safe_session_filename_component as _safe_session_filename_component,
+    save_session_log as _save_session_log_to_file,
+    sanitize_tool_message_value,
+)
 from agent.tool_dispatch_helpers import (
     _should_parallelize_tool_batch,  # noqa: F401  # re-exported for tests that `from run_agent import _should_parallelize_tool_batch`
     _is_destructive_command,  # noqa: F401  # re-exported for tests that access `run_agent._is_destructive_command`
@@ -221,46 +233,8 @@ from agent.tool_dispatch_helpers import (
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
+from tools.tool_result_sanitization import sanitize_tool_result_for_sink
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
-
-
-# Internal flags that mark a message as ephemeral empty-response/prefill
-# recovery scaffolding: the synthetic assistant "(empty)" turn and user nudge
-# injected after an empty response, the terminal "(empty)" sentinel, and the
-# thinking-only prefill placeholder. These exist only to drive the next API
-# retry; the in-memory loop pops them before appending the real response.
-# Persistence must mirror that, otherwise an append-only flush can commit them
-# to the session store and a resumed session replays synthetic "(empty)"/nudge
-# turns as if they were genuine context.
-_EPHEMERAL_SCAFFOLDING_FLAGS = (
-    "_empty_recovery_synthetic",
-    "_empty_terminal_sentinel",
-    "_thinking_prefill",
-    # verify-on-stop and pre_verify nudges append a synthetic user nudge to
-    # keep the agent going one more turn before it can claim completion.
-    # The nudge exists only to drive the verification loop; persisting it
-    # poisons the resumed transcript and breaks prompt-prefix cache reuse
-    # on later turns. The assistant candidate is NOT synthetic — it is
-    # persisted and emitted as an interim message (#65919).
-    "_verification_stop_synthetic",
-    "_pre_verify_synthetic",
-    # kanban worker stop-guard: narrated exit without kanban_complete/block
-    "_kanban_stop_synthetic",
-    # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
-    # empty tool_calls array): the interim narration-only assistant turn
-    # and the "issue the actual tool call now" user nudge exist only to
-    # drive the bounded retry. Persisting them would replay the internal
-    # retry instruction as user-authored context on resume.
-    "_dropped_toolcall_nudge",
-)
-
-
-def _is_ephemeral_scaffolding(msg: Any) -> bool:
-    """Return True when ``msg`` is internal recovery scaffolding that must never
-    be persisted to the durable transcript (SQLite session store or JSON log)."""
-    return isinstance(msg, dict) and any(
-        msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
-    )
 
 
 _MAX_TOOL_WORKERS = 8
@@ -353,31 +327,6 @@ def _qwen_portal_headers() -> dict:
         "X-DashScope-UserAgent": _ua,
         "X-DashScope-AuthType": "qwen-oauth",
     }
-
-
-def _safe_session_filename_component(session_id: str) -> str:
-    """Return a stable, path-safe filename component for a session ID.
-
-    Session IDs can originate from untrusted input (e.g. the
-    ``X-Hermes-Session-Id`` API header) and are otherwise interpolated raw
-    into on-disk artifact filenames under ``~/.hermes/sessions/``.  Without
-    sanitization, a traversal-shaped ID such as ``../../../../etc/pwned``
-    would let a caller write the session snapshot / request dump outside the
-    sessions directory.  This collapses every non ``[A-Za-z0-9_-]`` character
-    to ``_`` (so no path separators or ``.`` survive), caps the length, and —
-    when sanitization changed the string — appends a short content hash so two
-    distinct IDs that sanitize to the same component don't collide.  The
-    result is always a single, traversal-free path segment.
-    """
-    raw = str(session_id or "").strip()
-    sanitized = re.sub(r"[^\w-]", "_", raw).strip("._")
-    sanitized = sanitized[:96] or "session"
-    if raw and sanitized == raw:
-        return sanitized
-    digest = hashlib.sha256(
-        raw.encode("utf-8", errors="surrogatepass")
-    ).hexdigest()[:12]
-    return f"{sanitized}_{digest}"
 
 
 class _StreamErrorEvent(Exception):
@@ -2356,6 +2305,19 @@ class AIAgent:
                     and sanitize_context(content).strip() != content.strip()
                 ):
                     _row_api_content = content
+                # The session database is a durable external sink.  Tool
+                # results can arrive here through bypass/transform paths that
+                # did not pass through the primary executor, so enforce the
+                # same projection at the writer boundary rather than relying
+                # on upstream callers.  Keep model-facing messages untouched;
+                # only the row values handed to SQLite are sanitized.
+                if role == "tool":
+                    if content is not None:
+                        content = sanitize_tool_message_value(content)
+                    if _row_api_content is not None:
+                        _row_api_content = sanitize_tool_message_value(
+                            _row_api_content
+                        )
                 # Persist multimodal tool results as their text summary only —
                 # base64 images would bloat the session DB and aren't useful
                 # for cross-session replay.
@@ -2378,6 +2340,10 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
+                if role == "tool" and tool_calls_data is not None:
+                    tool_calls_data = sanitize_tool_result_projection_for_sink(
+                        tool_calls_data
+                    )
                 _row = {
                     "role": role,
                     "content": content,
@@ -3208,97 +3174,8 @@ class AIAgent:
         return content
 
     def _save_session_log(self, messages: List[Dict[str, Any]] = None):
-        """Optional per-session JSON snapshot writer.
-
-        Gated by ``sessions.write_json_snapshots`` (default False).  state.db
-        is the canonical message store; this writer exists only for users
-        whose external tooling consumes ``~/.hermes/sessions/session_{sid}.json``
-        directly.  When the flag is off this is a fast no-op.
-
-        When enabled, rewrites the snapshot after every persistence point with
-        the full message list (assistant content normalized via
-        ``_clean_session_content`` to convert REASONING_SCRATCHPAD to think
-        tags).  The truncation guard ("don't overwrite a larger log with
-        fewer messages") is preserved so resume + branch don't clobber a
-        fuller existing snapshot.
-        """
-        if not getattr(self, "_session_json_enabled", False):
-            return
-        messages = messages or self._session_messages
-        if not messages:
-            return
-
-        # Re-derive the target path each call so /branch and /compress
-        # session-id changes land in the right file without any re-point
-        # bookkeeping at the call sites.  Sanitize the session ID into a
-        # single traversal-free path segment — session IDs can come from
-        # untrusted input (X-Hermes-Session-Id header) and must not escape
-        # the sessions directory.
-        try:
-            safe_sid = _safe_session_filename_component(self.session_id)
-            log_file = self.logs_dir / f"session_{safe_sid}.json"
-        except Exception:
-            return
-
-        try:
-            cleaned = []
-            for msg in messages:
-                # Mirror the SQLite flush: ephemeral recovery scaffolding is
-                # internal retry state, never durable transcript content.
-                if _is_ephemeral_scaffolding(msg):
-                    continue
-                if msg.get("role") == "assistant" and msg.get("content"):
-                    msg = dict(msg)
-                    msg["content"] = self._clean_session_content(msg["content"])
-                # Defence-in-depth: redact credentials from every message
-                # content before persistence. Catches PATs / API keys / Bearer
-                # tokens that may have leaked into assistant responses, tool
-                # output, or user paste. Respects HERMES_REDACT_SECRETS via
-                # redact_sensitive_text — no-op when disabled. (#19798, #19845)
-                if "content" in msg:
-                    msg = dict(msg)
-                    msg["content"] = self._redact_message_content(msg.get("content"))
-                cleaned.append(msg)
-
-            # Guard: never overwrite a larger session log with fewer messages.
-            # Protects against data loss when a resumed agent starts with
-            # partial history and would otherwise clobber the full JSON log.
-            if log_file.exists():
-                try:
-                    existing = json.loads(log_file.read_text(encoding="utf-8"))
-                    existing_count = existing.get("message_count", len(existing.get("messages", [])))
-                    if existing_count > len(cleaned):
-                        logging.debug(
-                            "Skipping session log overwrite: existing has %d messages, current has %d",
-                            existing_count, len(cleaned),
-                        )
-                        return
-                except Exception:
-                    pass  # corrupted existing file — allow the overwrite
-
-            entry = {
-                "session_id": self.session_id,
-                "model": self.model,
-                "base_url": self.base_url,
-                "platform": self.platform,
-                "session_start": self.session_start.isoformat(),
-                "last_updated": datetime.now().isoformat(),
-                "system_prompt": redact_sensitive_text(self._cached_system_prompt or ""),
-                "tools": self.tools or [],
-                "message_count": len(cleaned),
-                "messages": cleaned,
-            }
-
-            atomic_json_write(
-                log_file,
-                entry,
-                indent=2,
-                default=str,
-            )
-
-        except Exception as e:
-            if self.verbose_logging:
-                logging.warning(f"Failed to save session log: {e}")
+        """Forwarder — see ``agent.tool_result_persistence.save_session_log``."""
+        return _save_session_log_to_file(self, messages)
 
 
     def interrupt(
@@ -3829,44 +3706,8 @@ class AIAgent:
 
     @classmethod
     def _format_file_mutation_failure_footer(cls, failed: Dict[str, Dict[str, Any]]) -> str:
-        """Render the per-turn failed-mutation dict as a user-facing footer.
-
-        Displays up to 10 paths with their first error preview, then a
-        count of any additional failures.  Returns an empty string when
-        the dict is empty so callers can concatenate unconditionally.
-
-        Every file path that reaches the user-facing text — both the bullet
-        path and any path echoed inside the tool's error preview — is
-        backtick-wrapped via ``_neutralize_footer_paths`` so the gateway's
-        bare-path media extractor can never auto-attach a protected file
-        (e.g. ``~/.hermes/config.yaml``) to a messaging channel (#35584).
-        """
-        if not failed:
-            return ""
-        lines = [
-            "⚠️ File-mutation verifier: "
-            f"{len(failed)} file(s) were NOT modified this turn despite any "
-            "wording above that may suggest otherwise. Run `git status` or "
-            "`read_file` to confirm."
-        ]
-        shown = 0
-        for path, info in failed.items():
-            if shown >= 10:
-                break
-            preview = (info.get("error_preview") or "").strip()
-            tool = info.get("tool") or "patch"
-            if preview:
-                lines.append(f"  • `{path}` — [{tool}] {preview}")
-            else:
-                lines.append(f"  • `{path}` — [{tool}] failed")
-            shown += 1
-        remaining = len(failed) - shown
-        if remaining > 0:
-            lines.append(f"  • … and {remaining} more")
-        # Neutralize any path the preview text echoed (the bullet path is
-        # already backticked above; the lookbehind keeps it from being
-        # double-wrapped).
-        return cls._neutralize_footer_paths("\n".join(lines))
+        """Forwarder — see ``agent.tool_result_persistence``."""
+        return format_file_mutation_failure_footer(failed, cls._neutralize_footer_paths)
 
     def _turn_completion_explainer_enabled(self) -> bool:
         """Check whether the end-of-turn completion explainer footer is on.

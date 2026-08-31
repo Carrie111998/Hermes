@@ -164,3 +164,65 @@ def test_transform_tool_result_integration_with_real_plugin(monkeypatch, tmp_pat
         dispatch_result='{"payload": 42}',
     )
     assert out == 'CANON[some_tool]{"payload": 42}'
+
+
+def test_transform_hook_receives_sink_safe_projection(monkeypatch):
+    raw = "lowercasecredential1234567890abcde"
+    captured = {}
+
+    def _hook(hook_name, **kwargs):
+        if hook_name == "transform_tool_result":
+            captured.update(kwargs)
+        return []
+
+    out = _run_handle_function_call(
+        monkeypatch,
+        dispatch_result=raw,
+        invoke_hook=_hook,
+    )
+    assert out == raw
+    assert raw not in captured["result"]
+    assert "redacted" in captured["result"].lower()
+
+
+def test_hooks_receive_sink_safe_args_and_middleware_trace(monkeypatch):
+    raw = "opaque-r3-hook-SECRET-123456"
+    captured = {}
+
+    def _hook(hook_name, **kwargs):
+        captured[hook_name] = kwargs
+        return []
+
+    _run_handle_function_call(
+        monkeypatch,
+        tool_args={
+            "nested": {"credential": raw},
+            "url": f"https://example.test/callback?token={raw}",
+        },
+        invoke_hook=_hook,
+    )
+    # Inject the trace through the real public dispatcher path as well.
+    model_tools._emit_post_tool_call_hook(
+        function_name="dummy_tool",
+        function_args={"x": raw},
+        result="ok",
+        middleware_trace=[{"trace": raw, "bytes": b"safe"}],
+    )
+    for payload in captured.values():
+        assert raw not in repr(payload)
+        assert "redacted" in repr(payload).lower()
+
+
+def test_dispatch_exception_log_has_no_raw_traceback(caplog, monkeypatch):
+    raw = "lowercasecredential1234567890abcde"
+    from tools.registry import registry
+
+    monkeypatch.setattr(registry, "dispatch", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError(raw)))
+    monkeypatch.setattr(model_tools, "_READ_SEARCH_TOOLS", frozenset())
+    with caplog.at_level("ERROR"):
+        result = model_tools.handle_function_call(
+            "dummy_tool", {}, task_id="t1", tool_call_id="tc1",
+            skip_pre_tool_call_hook=True,
+        )
+    assert raw not in caplog.text
+    assert raw not in result

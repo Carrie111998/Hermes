@@ -39,6 +39,11 @@ from tools.registry import (
     tool_error,
 )
 from toolsets import resolve_toolset, validate_toolset
+from tools.tool_result_sanitization import (
+    sanitize_exception_for_sink,
+    sanitize_tool_result_for_sink,
+    sanitize_tool_result_projection_for_sink,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +252,7 @@ try:
     from hermes_cli.plugins import discover_plugins
     discover_plugins()
 except Exception as e:
-    logger.debug("Plugin discovery failed: %s", e)
+    logger.debug("Plugin discovery failed: %s", sanitize_exception_for_sink(e))
 
 
 # =============================================================================
@@ -660,7 +665,7 @@ def _compute_tool_definitions(
         from tools.schema_sanitizer import sanitize_tool_schemas
         filtered_tools = sanitize_tool_schemas(filtered_tools)
     except Exception as e:  # pragma: no cover — defensive
-        logger.warning("Schema sanitization skipped: %s", e)
+        logger.warning("Schema sanitization skipped: %s", sanitize_exception_for_sink(e))
 
     # ── Tool Search (progressive disclosure) ────────────────────────────
     # Conditionally replace MCP + plugin (non-core) tools with three bridge
@@ -695,7 +700,7 @@ def _compute_tool_definitions(
                 )
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
-        logger.warning("Tool search assembly skipped: %s", e)
+        logger.warning("Tool search assembly skipped: %s", sanitize_exception_for_sink(e))
 
     return filtered_tools
 
@@ -748,7 +753,7 @@ def _resolve_active_context_length() -> int:
                 logger.debug(
                     "Runtime credential resolution failed for tool-search "
                     "context gate (provider=%s): %s — using config values only",
-                    provider, rt_exc,
+                    provider, sanitize_exception_for_sink(rt_exc),
                 )
         # Fast path: a previously discovered on-disk cache entry is plenty
         # for SIZING the tool-search gate — unlike compression budgeting, a
@@ -776,7 +781,7 @@ def _resolve_active_context_length() -> int:
             provider=provider,
         ) or 0)
     except Exception as e:
-        logger.debug("Could not resolve active context length: %s", e)
+        logger.debug("Could not resolve active context length: %s", sanitize_exception_for_sink(e))
         return 0
 
 
@@ -1217,11 +1222,17 @@ def _emit_post_tool_call_hook(
                 function_name,
                 result,
             )
+        safe_result = sanitize_tool_result_for_sink(result)
+        safe_error_message = (
+            sanitize_tool_result_for_sink(error_message)
+            if error_message is not None
+            else None
+        )
         invoke_hook(
             "post_tool_call",
             tool_name=function_name,
-            args=function_args,
-            result=result,
+            args=sanitize_tool_result_projection_for_sink(function_args),
+            result=safe_result,
             task_id=task_id or "",
             session_id=session_id or "",
             tool_call_id=tool_call_id or "",
@@ -1230,11 +1241,16 @@ def _emit_post_tool_call_hook(
             duration_ms=duration_ms,
             status=status,
             error_type=error_type,
-            error_message=error_message,
-            middleware_trace=list(middleware_trace or []),
+            error_message=safe_error_message,
+            middleware_trace=sanitize_tool_result_projection_for_sink(
+                list(middleware_trace or [])
+            ),
         )
     except Exception as _hook_err:
-        logger.debug("post_tool_call hook error: %s", _hook_err)
+        logger.debug(
+            "post_tool_call hook error: %s",
+            sanitize_tool_result_for_sink(_hook_err),
+        )
 
 
 def handle_function_call(
@@ -1412,7 +1428,10 @@ def handle_function_call(
             _tool_original_args = _tool_request_mw.original_payload
             _tool_middleware_trace = _tool_request_mw.trace
         except Exception as _mw_err:
-            logger.debug("tool_request middleware error: %s", _mw_err)
+            logger.debug(
+                "tool_request middleware error: %s",
+                sanitize_exception_for_sink(_mw_err),
+            )
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
@@ -1446,7 +1465,10 @@ def handle_function_call(
                 if modified_args is not None:
                     function_args = modified_args
             except Exception as _hook_err:
-                logger.debug("pre_tool_call hook error: %s", _hook_err)
+                logger.debug(
+                    "pre_tool_call hook error: %s",
+                    sanitize_exception_for_sink(_hook_err),
+                )
 
             if block_message is not None:
                 result = tool_error(block_message)
@@ -1489,7 +1511,10 @@ def handle_function_call(
                 )
                 return edit_block_message
         except Exception as _edit_approval_err:
-            logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
+            logger.debug(
+                "ACP edit approval guard error: %s",
+                sanitize_exception_for_sink(_edit_approval_err),
+            )
             if function_name in {"write_file", "patch"}:
                 result = tool_error("Edit approval denied: approval guard failed")
                 _emit_post_tool_call_hook(
@@ -1609,11 +1634,21 @@ def handle_function_call(
                     function_name,
                     result,
                 )
+                # The transform hook is an observer-capable sink.  Give it the
+                # same total safe projection as post_tool_call; the raw result
+                # remains local and is returned unchanged when no transform
+                # replaces it.
+                safe_result = sanitize_tool_result_for_sink(result)
+                safe_error_message = (
+                    sanitize_tool_result_for_sink(error_message)
+                    if error_message is not None
+                    else None
+                )
                 hook_results = invoke_hook(
                     "transform_tool_result",
                     tool_name=function_name,
-                    args=function_args,
-                    result=result,
+                    args=sanitize_tool_result_projection_for_sink(function_args),
+                    result=safe_result,
                     task_id=task_id or "",
                     session_id=session_id or "",
                     tool_call_id=tool_call_id or "",
@@ -1622,21 +1657,31 @@ def handle_function_call(
                     duration_ms=duration_ms,
                     status=status,
                     error_type=error_type,
-                    error_message=error_message,
+                    error_message=safe_error_message,
                 )
                 for hook_result in hook_results:
                     if isinstance(hook_result, str):
                         result = hook_result
                         break
         except Exception as _hook_err:
-            logger.debug("transform_tool_result hook error: %s", _hook_err)
+            logger.debug(
+                "transform_tool_result hook error: %s",
+                sanitize_tool_result_for_sink(_hook_err),
+            )
 
         return result
 
     except Exception as e:
-        error_msg = f"Error executing {function_name}: {str(e)}"
-        logger.exception(error_msg)
-        result = tool_error(_sanitize_tool_error(error_msg))
+        error_msg = (
+            f"Error executing {function_name}: "
+            f"{sanitize_exception_for_sink(e)}"
+        )
+        safe_error_msg = sanitize_tool_result_for_sink(error_msg)
+        # Do not attach the original exception object: logging handlers format
+        # its traceback independently of the sanitized message and would
+        # reintroduce the raw exception text into the sink.
+        logger.error(safe_error_msg)
+        result = tool_error(safe_error_msg)
         duration_ms = (
             int((time.monotonic() - _dispatch_start) * 1000)
             if _dispatch_start is not None
@@ -1654,8 +1699,10 @@ def handle_function_call(
             duration_ms=duration_ms,
             status="error",
             error_type=type(e).__name__,
-            error_message=str(e),
-            middleware_trace=list(_tool_middleware_trace),
+            error_message=sanitize_tool_result_for_sink(e),
+            middleware_trace=sanitize_tool_result_projection_for_sink(
+                list(_tool_middleware_trace)
+            ),
         )
         return result
 

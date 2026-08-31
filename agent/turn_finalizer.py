@@ -30,6 +30,7 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from tools.tool_result_sanitization import sanitize_exception_for_sink
 
 
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
@@ -105,11 +106,11 @@ def _record_kanban_budget_exhausted(
                 _conn.close()
             except Exception:
                 pass
-    except Exception:
+    except Exception as exc:
         logger.warning(
-            "Failed to record budget-exhausted failure for task %s",
+            "Failed to record budget-exhausted failure for task %s: %s",
             kanban_task,
-            exc_info=True,
+            sanitize_exception_for_sink(exc),
         )
 
 
@@ -290,15 +291,17 @@ def finalize_turn(
     try:
         agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
     except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
+        safe_save_error = sanitize_exception_for_sink(_save_err)
+        _cleanup_errors.append(f"save_trajectory: {safe_save_error}")
+        logger.error("finalize_turn: _save_trajectory failed: %s", safe_save_error)
 
     # Clean up VM and browser for this task after conversation completes
     try:
         agent._cleanup_task_resources(effective_task_id)
     except Exception as _cleanup_err:
-        _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
-        logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
+        safe_cleanup_error = sanitize_exception_for_sink(_cleanup_err)
+        _cleanup_errors.append(f"cleanup_task_resources: {safe_cleanup_error}")
+        logger.error("finalize_turn: _cleanup_task_resources failed: %s", safe_cleanup_error)
 
     # Persist session to both JSON log and SQLite only after private retry
     # scaffolding has been removed. Otherwise a later user "continue" turn
@@ -459,12 +462,16 @@ def finalize_turn(
                             _before, _after,
                         )
             except Exception as _mc_err:
-                logger.info("Micro-compaction failed: %s", _mc_err)
+                logger.info(
+                    "Micro-compaction failed: %s",
+                    sanitize_exception_for_sink(_mc_err),
+                )
 
         agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
-        _cleanup_errors.append(f"persist_session: {_persist_err}")
-        logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+        safe_persist_error = sanitize_exception_for_sink(_persist_err)
+        _cleanup_errors.append(f"persist_session: {safe_persist_error}")
+        logger.error("finalize_turn: _persist_session failed: %s", safe_persist_error)
 
     # The gateway owns a separate in-memory history snapshot. Keep it current
     # even when finalization reports a cleanup error: a later prompt must not be
@@ -541,7 +548,10 @@ def finalize_turn(
                 if footer:
                     final_response = final_response.rstrip() + "\n\n" + footer
         except Exception as _ver_err:
-            logger.debug("file-mutation verifier footer failed: %s", _ver_err)
+            logger.debug(
+                "file-mutation verifier footer failed: %s",
+                sanitize_exception_for_sink(_ver_err),
+            )
 
     # Turn-completion explainer.
     # When a turn ends abnormally after substantive work — empty content
@@ -599,7 +609,10 @@ def finalize_turn(
                                 _stripped + "\n\n" + _explanation
                             )
         except Exception as _exp_err:
-            logger.debug("turn-completion explainer failed: %s", _exp_err)
+            logger.debug(
+                "turn-completion explainer failed: %s",
+                sanitize_exception_for_sink(_exp_err),
+            )
 
     _response_transformed = False
     _pre_transform_response = None

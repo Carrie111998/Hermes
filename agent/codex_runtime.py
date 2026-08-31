@@ -24,6 +24,11 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from tools.tool_result_sanitization import (
+    sanitize_exception_for_sink,
+    sanitize_tool_result_for_sink,
+    sanitize_tool_result_projection_for_sink,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +152,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             except Exception as exc:
                 logger.debug(
                     "Codex app-server api-call persistence failed (session=%s): %s",
-                    agent.session_id, exc,
+                    agent.session_id, sanitize_exception_for_sink(exc),
                 )
         return {}
 
@@ -188,8 +193,11 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
             context_window = getattr(turn, "model_context_window", None)
             if isinstance(context_window, int) and context_window > 0:
                 compressor.context_length = context_window
-        except Exception:
-            logger.debug("codex app-server usage update failed", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "codex app-server usage update failed: %s",
+                sanitize_exception_for_sink(exc),
+            )
 
     agent.session_prompt_tokens += prompt_tokens
     agent.session_completion_tokens += completion_tokens
@@ -238,7 +246,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         except Exception as exc:
             logger.debug(
                 "Codex app-server token persistence failed (session=%s, tokens=%d): %s",
-                agent.session_id, total_tokens, exc,
+                agent.session_id, total_tokens, sanitize_exception_for_sink(exc),
             )
 
     return {
@@ -331,8 +339,11 @@ def _record_codex_app_server_compaction(
                     "turn_id": turn_id,
                 },
             )
-    except Exception:
-        logger.debug("event_callback error on codex session:compress", exc_info=True)
+    except Exception as exc:
+        logger.debug(
+            "event_callback error on codex session:compress: %s",
+            sanitize_exception_for_sink(exc),
+        )
 
     return True
 
@@ -421,6 +432,10 @@ def _codex_item_to_args(item: dict) -> dict:
 def _codex_item_to_preview(item: dict) -> Any:
     """Short human-readable preview for the tool.started bubble. Returns
     None when no useful preview is available (Hermes' UI tolerates None)."""
+    # Preview construction is itself an external display sink.  Normalize the
+    # complete item first so command text, paths, and structured arguments all
+    # use the same total projection as callback args.
+    item = sanitize_tool_result_projection_for_sink(item)
     item_type = item.get("type") or ""
     if item_type == "commandExecution":
         cmd = item.get("command") or ""
@@ -454,12 +469,12 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
     same outcome string that ends up in the messages list."""
     item_type = item.get("type") or ""
     if item_type == "commandExecution":
-        out = item.get("aggregatedOutput") or ""
+        out = sanitize_tool_result_for_sink(item.get("aggregatedOutput") or "")
         exit_code = item.get("exitCode")
         is_error = bool(exit_code is not None and exit_code != 0)
         if is_error:
             out = f"[exit {exit_code}]\n{out}"
-        return out, is_error
+        return out[:4000], is_error
     if item_type == "fileChange":
         status = item.get("status") or "unknown"
         n = len(item.get("changes") or [])
@@ -470,13 +485,14 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
     if item_type == "mcpToolCall":
         error = item.get("error")
         if error:
+            safe_error = sanitize_tool_result_for_sink(error)
             return (
-                f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}",
+                sanitize_tool_result_for_sink(f"[error] {safe_error[:1000]}"),
                 True,
             )
         result = item.get("result")
         return (
-            json.dumps(result, ensure_ascii=False)[:4000]
+            sanitize_tool_result_for_sink(result)[:4000]
             if result is not None else "",
             False,
         )
@@ -484,7 +500,7 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
         content_items = item.get("contentItems") or []
         if isinstance(content_items, list) and content_items:
             return (
-                json.dumps(content_items, ensure_ascii=False)[:4000],
+                sanitize_tool_result_for_sink(content_items)[:4000],
                 not bool(item.get("success", True)),
             )
         success = item.get("success", True)
@@ -547,17 +563,20 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     def _fire_tool_started(item: dict) -> None:
         item_id = item.get("id") or ""
         name = _codex_item_to_tool_name(item)
-        args = _codex_item_to_args(item)
+        safe_item = sanitize_tool_result_projection_for_sink(item)
+        safe_name = sanitize_tool_result_for_sink(name)
+        args = _codex_item_to_args(safe_item)
         if item_id:
-            started[item_id] = (name, args, time.monotonic())
+            started[item_id] = (safe_name, args, time.monotonic())
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
-                cb("tool.started", name, _codex_item_to_preview(item), args)
+                cb("tool.started", safe_name, _codex_item_to_preview(safe_item), args)
             except Exception:
                 logger.debug(
-                    "tool_progress_callback raised on tool.started for %s",
-                    name, exc_info=True,
+                    "tool_progress_callback raised on tool.started for %s: %s",
+                    safe_name,
+                    sanitize_tool_result_for_sink("callback failure"),
                 )
         # Authoritative stable-ID tool card (TUI / desktop). Fires
         # alongside tool_progress so surfaces that render structured tool
@@ -566,15 +585,19 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         start_cb = getattr(agent, "tool_start_callback", None)
         if start_cb is not None:
             try:
-                start_cb(_stable_call_id(item, name), name, args)
+                start_cb(_stable_call_id(safe_item, safe_name), safe_name, args)
             except Exception:
                 logger.debug(
-                    "tool_start_callback raised for %s", name, exc_info=True,
+                    "tool_start_callback raised for %s: %s",
+                    safe_name,
+                    sanitize_tool_result_for_sink("callback failure"),
                 )
 
     def _fire_tool_completed(item: dict) -> None:
         item_id = item.get("id") or ""
         name = _codex_item_to_tool_name(item)
+        safe_item = sanitize_tool_result_projection_for_sink(item)
+        safe_name = sanitize_tool_result_for_sink(name)
         prior = started.pop(item_id, None)
         # Prefer codex's own durationMs when present so the bubble shows
         # exact tool wall-time; fall back to our started timestamp; fall
@@ -590,21 +613,30 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
-                cb("tool.completed", name, None, None,
-                   duration=duration, is_error=is_error, result=result)
+                cb("tool.completed", safe_name, None, None,
+                   duration=duration, is_error=is_error,
+                   result=sanitize_tool_result_for_sink(result))
             except Exception:
                 logger.debug(
-                    "tool_progress_callback raised on tool.completed for %s",
-                    name, exc_info=True,
+                    "tool_progress_callback raised on tool.completed for %s: %s",
+                    sanitize_tool_result_for_sink(name),
+                    sanitize_tool_result_for_sink("callback failure"),
                 )
         complete_cb = getattr(agent, "tool_complete_callback", None)
         if complete_cb is not None:
-            args = prior[1] if prior is not None else _codex_item_to_args(item)
+            args = prior[1] if prior is not None else _codex_item_to_args(safe_item)
             try:
-                complete_cb(_stable_call_id(item, name), name, args, result)
+                complete_cb(
+                    _stable_call_id(safe_item, safe_name),
+                    safe_name,
+                    args,
+                    sanitize_tool_result_for_sink(result),
+                )
             except Exception:
                 logger.debug(
-                    "tool_complete_callback raised for %s", name, exc_info=True,
+                    "tool_complete_callback raised for %s: %s",
+                    sanitize_tool_result_for_sink(name),
+                    sanitize_tool_result_for_sink("callback failure"),
                 )
 
     def _fire_text_delta(params: dict) -> None:
@@ -616,8 +648,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             return
         try:
             fn(text)
-        except Exception:
-            logger.debug("_fire_stream_delta raised", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "_fire_stream_delta raised: %s",
+                sanitize_exception_for_sink(exc),
+            )
 
     def _fire_reasoning_delta(params: dict) -> None:
         text = params.get("delta") or params.get("text") or ""
@@ -628,8 +663,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             return
         try:
             fn(text)
-        except Exception:
-            logger.debug("_fire_reasoning_delta raised", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "_fire_reasoning_delta raised: %s",
+                sanitize_exception_for_sink(exc),
+            )
 
     def _fire_agent_message_completed(item: dict) -> None:
         text = item.get("text") or ""
@@ -645,9 +683,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             return
         try:
             emit({"role": "assistant", "content": text})
-        except Exception:
+        except Exception as exc:
             logger.debug(
-                "_emit_interim_assistant_message raised", exc_info=True,
+                "_emit_interim_assistant_message raised: %s",
+                sanitize_exception_for_sink(exc),
             )
 
     def on_event(note: dict) -> None:
@@ -744,11 +783,11 @@ def run_codex_app_server_turn(
             from tools.approval import is_approval_bypass_active
 
             auto_approve_requests = is_approval_bypass_active()
-        except Exception:
+        except Exception as exc:
             logger.debug(
                 "codex app-server: approval-bypass lookup failed; "
-                "keeping fail-closed default",
-                exc_info=True,
+                "keeping fail-closed default: %s",
+                sanitize_exception_for_sink(exc),
             )
 
         # Bridge codex JSON-RPC notifications (item/started, item/completed,
@@ -775,7 +814,8 @@ def run_codex_app_server_turn(
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
-        logger.exception("codex app-server turn failed")
+        safe_error = sanitize_exception_for_sink(exc)
+        logger.error("codex app-server turn failed: %s", safe_error)
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
         try:
@@ -823,6 +863,12 @@ def run_codex_app_server_turn(
     if _user_interrupted:
         agent.clear_interrupt()
 
+    safe_turn_error = (
+        sanitize_tool_result_for_sink(turn.error)
+        if turn.error is not None
+        else None
+    )
+
     # If the turn signalled the underlying client is wedged (deadline
     # blown, post-tool watchdog tripped, OAuth refresh died, subprocess
     # exited), retire the session so the next turn respawns codex
@@ -831,7 +877,7 @@ def run_codex_app_server_turn(
     if getattr(turn, "should_retire", False):
         logger.warning(
             "codex app-server session retired (turn error: %s)",
-            turn.error,
+            safe_turn_error,
         )
         try:
             agent._codex_session.close()
@@ -863,11 +909,11 @@ def run_codex_app_server_turn(
         if getattr(agent, "_session_db", None) is not None:
             try:
                 _codex_flush_ok = agent._flush_messages_to_session_db(messages)
-            except Exception:
+            except Exception as exc:
                 _codex_flush_ok = False
                 logger.warning(
-                    "codex app-server projected-message flush failed",
-                    exc_info=True,
+                    "codex app-server projected-message flush failed: %s",
+                    sanitize_exception_for_sink(exc),
                 )
             if _codex_flush_ok is False:
                 # Unlike the chat-completions loop (which fails closed BEFORE
@@ -920,8 +966,11 @@ def run_codex_app_server_turn(
                 interrupted=False,
                 messages=messages,
             )
-        except Exception:
-            logger.debug("external memory sync raised", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "external memory sync raised: %s",
+                sanitize_exception_for_sink(exc),
+            )
 
     # Background review fork — same cadence + signature as the default
     # path (line ~15449). Only fires when a trigger actually tripped AND
@@ -937,11 +986,19 @@ def run_codex_app_server_turn(
                 review_memory=should_review_memory,
                 review_skills=should_review_skills,
             )
-        except Exception:
-            logger.debug("background review spawn raised", exc_info=True)
+        except Exception as exc:
+            logger.debug(
+                "background review spawn raised: %s",
+                sanitize_exception_for_sink(exc),
+            )
 
+    safe_final_response = (
+        sanitize_tool_result_for_sink(turn.final_text)
+        if turn.error is not None
+        else turn.final_text
+    )
     return {
-        "final_response": turn.final_text,
+        "final_response": safe_final_response,
         "messages": messages,
         "api_calls": api_calls,
         "completed": not turn.interrupted and turn.error is None,
@@ -952,7 +1009,7 @@ def run_codex_app_server_turn(
             if _interrupt_message
             else {}
         ),
-        "error": turn.error,
+        "error": safe_turn_error,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after
@@ -1147,10 +1204,13 @@ def _consume_codex_event_stream(
                 # Control-flow signals from watchdog/cancellation hooks must
                 # propagate, not get swallowed as "debug noise".
                 raise
-            except Exception:
+            except Exception as exc:
                 # Genuine bugs in third-party debug/log hooks shouldn't break
                 # stream consumption.
-                logger.debug("Codex stream on_event hook raised", exc_info=True)
+                logger.debug(
+                    "Codex stream on_event hook raised: %s",
+                    sanitize_exception_for_sink(exc),
+                )
         if interrupt_check is not None and interrupt_check():
             break
 
@@ -1217,14 +1277,20 @@ def _consume_codex_event_stream(
                 if on_commentary_message is None and on_reasoning_delta is not None:
                     try:
                         on_reasoning_delta(delta_text)
-                    except Exception:
-                        logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
+                    except Exception as exc:
+                        logger.debug(
+                            "Codex stream on_reasoning_delta raised: %s",
+                            sanitize_exception_for_sink(exc),
+                        )
             elif delta_text and active_message_phase == "analysis":
                 if on_reasoning_delta is not None:
                     try:
                         on_reasoning_delta(delta_text)
-                    except Exception:
-                        logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
+                    except Exception as exc:
+                        logger.debug(
+                            "Codex stream on_reasoning_delta raised: %s",
+                            sanitize_exception_for_sink(exc),
+                        )
             elif delta_text:
                 collected_text_deltas.append(delta_text)
                 if not has_tool_calls:
@@ -1233,13 +1299,19 @@ def _consume_codex_event_stream(
                         if on_first_delta is not None:
                             try:
                                 on_first_delta()
-                            except Exception:
-                                logger.debug("Codex stream on_first_delta raised", exc_info=True)
+                            except Exception as exc:
+                                logger.debug(
+                                    "Codex stream on_first_delta raised: %s",
+                                    sanitize_exception_for_sink(exc),
+                                )
                     if on_text_delta is not None:
                         try:
                             on_text_delta(delta_text)
-                        except Exception:
-                            logger.debug("Codex stream on_text_delta raised", exc_info=True)
+                        except Exception as exc:
+                            logger.debug(
+                                "Codex stream on_text_delta raised: %s",
+                                sanitize_exception_for_sink(exc),
+                            )
             continue
 
         if "function_call" in event_type:
@@ -1282,8 +1354,11 @@ def _consume_codex_event_stream(
                     active_summary_index = summary_index
                 try:
                     on_reasoning_delta(reasoning_text)
-                except Exception:
-                    logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
+                except Exception as exc:
+                    logger.debug(
+                        "Codex stream on_reasoning_delta raised: %s",
+                        sanitize_exception_for_sink(exc),
+                    )
             continue
 
         if event_type == "response.output_item.done":
@@ -1325,10 +1400,10 @@ def _consume_codex_event_stream(
                     if commentary_text:
                         try:
                             on_commentary_message(commentary_text)
-                        except Exception:
+                        except Exception as exc:
                             logger.debug(
-                                "Codex stream on_commentary_message raised",
-                                exc_info=True,
+                                "Codex stream on_commentary_message raised: %s",
+                                sanitize_exception_for_sink(exc),
                             )
                     commentary_text_deltas = []
             continue

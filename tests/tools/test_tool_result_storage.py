@@ -1,5 +1,8 @@
 """Tests for tools/tool_result_storage.py -- 3-layer tool result persistence."""
 
+import multiprocessing
+from pathlib import Path
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -21,9 +24,22 @@ from tools.tool_result_storage import (
     cleanup_spillover_cache,
     enforce_turn_budget,
     generate_preview,
+    extract_persisted_path,
     get_spillover_dir,
     maybe_persist_tool_result,
 )
+
+
+def _cross_process_spillover_writer(barrier, queue):
+    """Publish the same logical filename from an independent process."""
+    import tools.tool_result_storage as storage
+
+    barrier.wait(timeout=10)
+    path = storage._write_to_spillover(
+        "opaque-r3-process-race-SECRET-123456",
+        "same-name.txt",
+    )
+    queue.put(path)
 
 
 # ── generate_preview ──────────────────────────────────────────────────
@@ -127,12 +143,15 @@ class TestResolveStorageDir:
 
 
 class TestSafeResultFilename:
-    def test_preserves_normal_tool_call_id(self):
-        assert _safe_result_filename("tc_456") == "tc_456.txt"
+    def test_uses_digest_only_for_normal_tool_call_id(self):
+        filename = _safe_result_filename("tc_456")
+        assert filename.startswith("tool_result_")
+        assert filename.endswith(".txt")
+        assert "tc_456" not in filename
 
     def test_replaces_path_and_shell_metacharacters(self):
         filename = _safe_result_filename("../outside/$(whoami);x")
-        assert filename.startswith("outside_whoami_x_")
+        assert filename.startswith("tool_result_")
         assert filename.endswith(".txt")
         assert "/" not in filename
         assert "$" not in filename
@@ -194,7 +213,8 @@ class TestMaybePersistToolResult:
             threshold=30_000,
         )
         assert PERSISTED_OUTPUT_TAG in result
-        assert "tc_456.txt" in result
+        assert _safe_result_filename("tc_456") in result
+        assert "tc_456" not in result
         assert len(result) < len(content)
 
     def test_persists_full_content_as_is(self):
@@ -222,6 +242,81 @@ class TestMaybePersistToolResult:
         assert env.execute.call_args[1]["stdin_data"] == content
 
 
+    def test_direct_spillover_write_redacts_sensitive_bytes(self, tmp_path, monkeypatch):
+        """The low-level spill sink must not accept raw result bytes."""
+        import tools.tool_result_storage as storage
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        sentinel = "sk-r3-cand-001-nonreusable-1234567890"
+        path = storage._write_to_spillover(
+            f"ordinary {sentinel} "
+            f'{{"apiKey": "{sentinel}"}} '
+            f"https://example.test/callback?token={sentinel}",
+            "direct.txt",
+        )
+
+        assert path is not None
+        stored = (tmp_path / ".hermes" / "cache" / "spillover" / "direct.txt").read_text(encoding="utf-8")
+        assert sentinel not in stored
+        assert "redacted" in stored
+
+
+    def test_persisted_preview_and_sink_are_redacted(self, tmp_path, monkeypatch):
+        """The preview and every persistence representation omit raw secrets."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        sentinel = "sk-r3-cand-001-nonreusable-1234567890"
+        content = (
+            "x" * 40_000
+            + f" ordinary {sentinel} "
+            + f'{{"nested": {{"token": "{sentinel}"}}}} '
+            + f"https://example.test/callback?token={sentinel}"
+        )
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_redact",
+            env=None,
+            threshold=30_000,
+        )
+
+        assert PERSISTED_OUTPUT_TAG in result
+        assert sentinel not in result
+        stored_path = extract_persisted_path(result)
+        assert stored_path is not None
+        stored = open(stored_path, encoding="utf-8").read()
+        assert sentinel not in stored
+        assert "redacted" in stored
+
+    def test_same_name_publication_is_unique_across_processes(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        context = multiprocessing.get_context("spawn")
+        barrier = context.Barrier(2)
+        queue = context.Queue()
+        workers = [
+            context.Process(
+                target=_cross_process_spillover_writer,
+                args=(barrier, queue),
+            )
+            for _ in range(2)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=30)
+        assert all(worker.exitcode == 0 for worker in workers)
+        paths = [queue.get(timeout=5) for _ in workers]
+        assert all(paths)
+        spill_dir = tmp_path / ".hermes" / "cache" / "spillover"
+        files = sorted(spill_dir.glob("*.txt"))
+        assert len(files) == 2
+        assert len({Path(path).name for path in paths}) == 2
+        for path in files:
+            stored = path.read_text(encoding="utf-8")
+            assert "opaque-r3-process-race-SECRET-123456" not in stored
+            assert "redacted" in stored
+
+
     def test_tool_use_id_cannot_escape_storage_dir(self):
         env = MagicMock()
         # Readability probe fails -> in-sandbox write is the reference path.
@@ -241,9 +336,9 @@ class TestMaybePersistToolResult:
         cmd = env.execute.call_args[0][0]
         target = cmd.split("cat > ", 1)[1].split(" <<", 1)[0]
 
-        assert "Full output saved to: /tmp/hermes-results/outside_whoami_x_" in result
-        assert "/tmp/hermes-results/../" not in result
-        assert target.startswith("/tmp/hermes-results/outside_whoami_x_")
+        assert "../outside/$(whoami);x" not in result
+        assert "/tmp/hermes-results/tool_result_" in result
+        assert "/tmp/hermes-results/" in target
         assert "/../" not in target
         assert "$(whoami)" not in target
         assert ";" not in target
@@ -356,7 +451,7 @@ class TestSpillover:
         )
         assert PERSISTED_OUTPUT_TAG in result
         assert "could not be saved" not in result
-        spill_file = get_spillover_dir() / "tc_mcp_1.txt"
+        spill_file = get_spillover_dir() / _safe_result_filename("tc_mcp_1")
         assert spill_file.exists()
         assert spill_file.read_text(encoding="utf-8") == content
         assert str(spill_file) in result
@@ -375,7 +470,7 @@ class TestSpillover:
             threshold=30_000,
         )
         assert PERSISTED_OUTPUT_TAG in result
-        assert (get_spillover_dir() / "tc_local_1.txt").exists()
+        assert (get_spillover_dir() / _safe_result_filename("tc_local_1")).exists()
         env.execute.assert_not_called()
 
     def test_remote_env_probe_success_references_mounted_path(self):
@@ -394,7 +489,7 @@ class TestSpillover:
         )
         assert PERSISTED_OUTPUT_TAG in result
         # Canonical host copy always exists now.
-        assert (get_spillover_dir() / "tc_remote_1.txt").exists()
+        assert (get_spillover_dir() / _safe_result_filename("tc_remote_1")).exists()
         # Only the readability probe ran — no cat-into-sandbox call.
         assert env.execute.call_count == 1
         assert "test -r" in env.execute.call_args[0][0]
@@ -417,10 +512,12 @@ class TestSpillover:
             threshold=30_000,
         )
         assert PERSISTED_OUTPUT_TAG in result
-        assert "/tmp/hermes-results/tc_remote_2.txt" in result
+        assert "/tmp/hermes-results/" in result
+        assert _safe_result_filename("tc_remote_2") in result
+        assert "tc_remote_2" not in result
         assert env.execute.call_count == 2
         # Host canonical copy exists regardless.
-        assert (get_spillover_dir() / "tc_remote_2.txt").exists()
+        assert (get_spillover_dir() / _safe_result_filename("tc_remote_2")).exists()
 
     def test_spillover_write_failure_falls_back_to_inline(self, monkeypatch):
         import tools.tool_result_storage as trs
@@ -444,8 +541,8 @@ class TestSpillover:
         spill_dir.mkdir(parents=True, exist_ok=True)
         old = spill_dir / "old.txt"
         new = spill_dir / "new.txt"
-        old.write_text("old")
-        new.write_text("new")
+        old.write_text("old", encoding="utf-8")
+        new.write_text("new", encoding="utf-8")
         stale = _time.time() - (48 * 3600)
         os.utime(old, (stale, stale))
 
@@ -466,7 +563,7 @@ class TestSpillover:
         spill_dir = get_spillover_dir()
         spill_dir.mkdir(parents=True, exist_ok=True)
         old = spill_dir / "ancient.txt"
-        old.write_text("ancient")
+        old.write_text("ancient", encoding="utf-8")
         stale = _time.time() - (48 * 3600)
         os.utime(old, (stale, stale))
 
@@ -479,7 +576,7 @@ class TestSpillover:
         )
 
         assert not old.exists()
-        assert (spill_dir / "tc_prune_1.txt").exists()
+        assert (spill_dir / _safe_result_filename("tc_prune_1")).exists()
 
 
 # ── recovery hint in the persisted preview ────────────────────────────

@@ -33,6 +33,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from tools.tool_result_sanitization import sanitize_tool_result_for_sink
+
 
 def _deterministic_call_id(item_type: str, item_id: str) -> str:
     """Stable id for tool_call message correlation.
@@ -162,7 +164,7 @@ class CodexEventProjector:
         if self._pending_reasoning:
             assistant_msg["reasoning"] = "\n".join(self._pending_reasoning)
             self._pending_reasoning = []
-        output = item.get("aggregatedOutput") or ""
+        output = sanitize_tool_result_for_sink(item.get("aggregatedOutput") or "")
         exit_code = item.get("exitCode")
         if exit_code is not None and exit_code != 0:
             output = f"[exit {exit_code}]\n{output}"
@@ -243,9 +245,13 @@ class CodexEventProjector:
         result = item.get("result")
         error = item.get("error")
         if error:
-            content = f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}"
+            # Sanitize before any serialization.  Codex MCP errors are
+            # untrusted structured values and may be cyclic, deeply nested, or
+            # backed by hostile conversion methods.
+            safe_error = sanitize_tool_result_for_sink(error)
+            content = sanitize_tool_result_for_sink(f"[error] {safe_error[:1000]}")
         elif result is not None:
-            content = json.dumps(result, ensure_ascii=False)[:4000]
+            content = sanitize_tool_result_for_sink(result)[:4000]
         else:
             content = ""
         tool_msg = {
@@ -284,7 +290,7 @@ class CodexEventProjector:
             self._pending_reasoning = []
         content_items = item.get("contentItems") or []
         if isinstance(content_items, list) and content_items:
-            content = json.dumps(content_items, ensure_ascii=False)[:4000]
+            content = sanitize_tool_result_for_sink(content_items)
         else:
             success = item.get("success")
             content = f"success={success}"
@@ -300,10 +306,7 @@ class CodexEventProjector:
     def _project_opaque(self, item: dict, item_type: str) -> ProjectionResult:
         # Record the existence of the item without inventing tool_calls.
         # Memory review will see this and may or may not save anything.
-        try:
-            payload = json.dumps(item, ensure_ascii=False)[:1500]
-        except (TypeError, ValueError):
-            payload = repr(item)[:1500]
+        payload = sanitize_tool_result_for_sink(item)[:1500]
         return ProjectionResult(
             messages=[
                 {

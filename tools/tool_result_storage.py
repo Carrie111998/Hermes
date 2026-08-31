@@ -12,28 +12,9 @@ Defense against context-window overflow operates at three levels:
    in-context content is replaced with a preview + file path reference.
 
    The canonical home is ALWAYS host-side:
-   ``$HERMES_HOME/cache/spillover/{tool_use_id}.txt`` — alongside the other
-   Hermes-owned caches (images, audio, documents, ...) instead of littering
-   the OS temp dir. This needs no sandbox environment, so it also works for
-   sessions that never ran a terminal command (MCP-only, cron, gateway) —
-   previously those hit the inline-truncate fallback because
-   ``get_active_env()`` returned None until the first terminal call created
-   an environment.
-
-   What the model sees depends on the backend:
-
-   - **Local backend (or no active env):** the host path itself.
-   - **Remote backends (docker/ssh/modal/daytona):** ``cache/spillover`` is
-     in the auto-mounted/synced cache-dir list (tools/credential_files.py),
-     so the reference is the translated in-sandbox path (probed for
-     readability first). When the sandbox can't see it (e.g. a persistent
-     container created before spillover joined the mount list), fall back
-     to writing a copy into the sandbox temp dir via env.execute().
-
-   The spillover dir is pruned two ways: the gateway housekeeping loop
-   sweeps it hourly with the other media caches, and a once-per-process
-   best-effort prune runs on the first spill so CLI-only installs (which
-   never run gateway housekeeping) self-clean too.
+   ``$HERMES_HOME/cache/spillover/{digest-only-id}.txt`` — alongside the other
+   Hermes-owned caches. Remote backends use a translated path when mounted,
+   otherwise they receive a sandbox temp copy.
 
 3. **Per-turn aggregate budget** (enforce_turn_budget): After all tool
    results in a single assistant turn are collected, if the total exceeds
@@ -48,13 +29,17 @@ import os
 import re
 import shlex
 import threading
+import tempfile
 import time
 import uuid
-
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
     BudgetConfig,
     DEFAULT_BUDGET,
+)
+from tools.tool_result_sanitization import (
+    sanitize_exception_for_sink,
+    sanitize_tool_result_for_sink,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,15 +54,14 @@ _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
 
 _spillover_prune_lock = threading.Lock()
+_spillover_publish_lock = threading.Lock()
 _spillover_pruned_once = False
-
 
 def get_spillover_dir():
     """Return $HERMES_HOME/cache/spillover as a Path (not created)."""
     from hermes_constants import get_hermes_home
 
     return get_hermes_home() / SPILLOVER_SUBDIR
-
 
 def cleanup_spillover_cache(max_age_hours: int = SPILLOVER_MAX_AGE_HOURS) -> int:
     """Delete spillover files older than *max_age_hours*.
@@ -102,7 +86,6 @@ def cleanup_spillover_cache(max_age_hours: int = SPILLOVER_MAX_AGE_HOURS) -> int
             continue
     return removed
 
-
 def _prune_spillover_once() -> None:
     """Best-effort prune, at most once per process.
 
@@ -120,8 +103,7 @@ def _prune_spillover_once() -> None:
         if removed:
             logger.debug("Pruned %d expired spillover file(s)", removed)
     except Exception as exc:
-        logger.debug("Spillover prune failed: %s", exc)
-
+        logger.debug("Spillover prune failed: %s", sanitize_exception_for_sink(exc))
 
 def _is_host_side_env(env) -> bool:
     """True when the spill file should be written by this process directly.
@@ -141,41 +123,57 @@ def _is_host_side_env(env) -> bool:
     except Exception:
         return False
 
-
-def _write_to_spillover(content: str, filename: str):
-    """Write content host-side to $HERMES_HOME/cache/spillover.
-
-    Returns the absolute path string on success, None on failure.
-    """
+def _write_to_spillover(content, filename: str):
+    """Atomically publish sanitized content without same-name aliasing."""
+    temporary_path = None
+    safe_content = sanitize_tool_result_for_sink(content)
+    if not isinstance(filename, str) or not filename: filename = "tool_result.txt"
+    if os.path.basename(filename) != filename or _UNSAFE_RESULT_FILENAME_CHARS.search(filename):
+        filename = _safe_result_filename(filename)
     try:
         spill_dir = get_spillover_dir()
         spill_dir.mkdir(parents=True, exist_ok=True)
-        path = spill_dir / filename
-        path.write_text(content, encoding="utf-8", errors="replace")
-    except OSError as exc:
-        logger.warning("Spillover write failed for %s: %s", filename, exc)
+        with _spillover_publish_lock:
+            path = spill_dir / filename
+            fd, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=spill_dir)
+            with os.fdopen(fd, "w", encoding="utf-8", errors="replace") as stream: stream.write(safe_content)
+            for _ in range(100):
+                try:
+                    os.link(temporary_path, path)
+                    os.unlink(temporary_path); temporary_path = None
+                    break
+                except FileExistsError:
+                    path = spill_dir / f"{path.stem}_{uuid.uuid4().hex[:16]}{path.suffix}"
+                    continue
+            else:
+                raise FileExistsError("could not reserve a unique spillover path")
+    except Exception as exc:
+        logger.warning(
+            "Spillover write failed for %s: %s",
+            sanitize_tool_result_for_sink(filename),
+            sanitize_exception_for_sink(exc),
+        )
         return None
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
     _prune_spillover_once()
     return str(path)
 
-
 def _sandbox_visible_spillover_path(host_path: str, env) -> str | None:
-    """Return the path where a remote backend can read *host_path*, or None.
-
-    ``cache/spillover`` is one of the auto-mounted/synced cache dirs
-    (tools/credential_files.py), so on docker it is bind-mounted and on
-    modal/ssh/daytona it is file-synced into the sandbox. Translate the
-    host path with the same helper the image tools use, force a sync for
-    synced backends, then PROBE readability — a persistent docker
-    container created before spillover joined the mount list won't have
-    the bind mount, and must fall back to the in-sandbox write.
-    """
+    """Return the readable remote path for a host spill, if mounted."""
     try:
         from tools.credential_files import to_agent_visible_cache_path
 
         visible = to_agent_visible_cache_path(host_path)
     except Exception as exc:
-        logger.debug("Spillover path translation failed: %s", exc)
+        logger.debug(
+            "Spillover path translation failed: %s",
+            sanitize_exception_for_sink(exc),
+        )
         return None
 
     sync_manager = getattr(env, "_sync_manager", None)
@@ -183,16 +181,18 @@ def _sandbox_visible_spillover_path(host_path: str, env) -> str | None:
         try:
             sync_manager.sync(force=True)
         except Exception as exc:
-            logger.debug("Spillover sync failed: %s", exc)
+            logger.debug("Spillover sync failed: %s", sanitize_exception_for_sink(exc))
 
     try:
         result = env.execute(f"test -r {shlex.quote(visible)}", timeout=15)
         if result.get("returncode", 1) == 0:
             return visible
     except Exception as exc:
-        logger.debug("Spillover readability probe failed: %s", exc)
+        logger.debug(
+            "Spillover readability probe failed: %s",
+            sanitize_exception_for_sink(exc),
+        )
     return None
-
 
 def _resolve_storage_dir(env) -> str:
     """Return the best temp-backed storage dir for this environment."""
@@ -202,31 +202,26 @@ def _resolve_storage_dir(env) -> str:
             try:
                 temp_dir = get_temp_dir()
             except Exception as exc:
-                logger.debug("Could not resolve env temp dir: %s", exc)
+                logger.debug(
+                    "Could not resolve env temp dir: %s",
+                    sanitize_exception_for_sink(exc),
+                )
             else:
                 if temp_dir:
                     temp_dir = temp_dir.rstrip("/") or "/"
                     return f"{temp_dir}/hermes-results"
     return STORAGE_DIR
 
-
 def _safe_result_filename(tool_use_id: str) -> str:
-    """Return a single safe filename for a tool result id."""
-    raw_id = str(tool_use_id or "tool_result")
-    safe_stem = _UNSAFE_RESULT_FILENAME_CHARS.sub("_", raw_id).strip("._-")
-    changed = safe_stem != raw_id
+    """Return a digest-only filename that never exposes a caller-supplied id."""
+    raw_id = tool_use_id if isinstance(tool_use_id, str) else "tool_result"
+    digest = hashlib.sha256(raw_id.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return f"tool_result_{digest}.txt"
 
-    if not safe_stem:
-        safe_stem = "tool_result"
-        changed = True
-
-    if changed or len(safe_stem) > _MAX_RESULT_FILENAME_STEM:
-        digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:12]
-        safe_stem = safe_stem[:_MAX_RESULT_FILENAME_STEM].rstrip("._-") or "tool_result"
-        safe_stem = f"{safe_stem}_{digest}"
-
-    return f"{safe_stem}.txt"
-
+def _safe_result_id_label(tool_use_id: str) -> str:
+    """Return a short non-reusable correlation label for logs."""
+    raw_id = tool_use_id if isinstance(tool_use_id, str) else "tool_result"
+    return hashlib.sha256(raw_id.encode("utf-8", errors="replace")).hexdigest()[:12]
 
 def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) -> tuple[str, bool]:
     """Truncate at last newline within max_chars. Returns (preview, has_more)."""
@@ -238,16 +233,14 @@ def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) 
         truncated = truncated[:last_nl + 1]
     return truncated, True
 
-
 def _heredoc_marker(content: str) -> str:
     """Return a heredoc delimiter that doesn't collide with content."""
     if HEREDOC_MARKER not in content:
         return HEREDOC_MARKER
     return f"HERMES_PERSIST_{uuid.uuid4().hex[:8]}"
 
-
-def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
-    """Write content into the sandbox via env.execute(). Returns True on success.
+def _write_to_sandbox(content, remote_path: str, env) -> bool:
+    """Write sanitized content into the sandbox via env.execute().
 
     Pushes ``content`` through stdin rather than embedding it in the command
     string. Linux's ``MAX_ARG_STRLEN`` caps any single argv element at 128 KB
@@ -260,10 +253,10 @@ def _write_to_sandbox(content: str, remote_path: str, env) -> bool:
     the exec-arg ceiling.
     """
     storage_dir = os.path.dirname(remote_path)
+    content = sanitize_tool_result_for_sink(content)
     cmd = f"mkdir -p {shlex.quote(storage_dir)} && cat > {shlex.quote(remote_path)}"
     result = env.execute(cmd, timeout=30, stdin_data=content)
     return result.get("returncode", 1) == 0
-
 
 def _build_persisted_message(
     preview: str,
@@ -293,10 +286,7 @@ def _build_persisted_message(
         msg += "\n..."
     msg += f"\n{PERSISTED_OUTPUT_CLOSING_TAG}"
     return msg
-
-
 _PERSISTED_PATH_RE = re.compile(r"^Full output saved to: (.+)$", re.MULTILINE)
-
 
 def extract_persisted_path(content: str) -> str | None:
     """Return the file path from a <persisted-output> replacement block.
@@ -336,29 +326,32 @@ def maybe_persist_tool_result(
     Returns:
         Original content if small, or <persisted-output> replacement.
     """
+    safe_content = sanitize_tool_result_for_sink(content)
+    content_length = len(content) if isinstance(content, str) else len(safe_content)
     effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
 
     if effective_threshold == float("inf"):
-        return content
+        return content if isinstance(content, str) else safe_content
 
-    if len(content) <= effective_threshold:
-        return content
+    if content_length <= effective_threshold:
+        return content if isinstance(content, str) else safe_content
 
     filename = _safe_result_filename(tool_use_id)
-    preview, has_more = generate_preview(content, max_chars=config.preview_size)
+    safe_content = sanitize_tool_result_for_sink(content)
+    preview, has_more = generate_preview(safe_content, max_chars=config.preview_size)
 
     # Always persist host-side first: $HERMES_HOME/cache/spillover is the
     # single canonical home for spilled results (with the other Hermes-owned
     # caches, pruned by gateway housekeeping) regardless of backend.
-    host_path = _write_to_spillover(content, filename)
+    host_path = _write_to_spillover(safe_content, filename)
 
     if _is_host_side_env(env):
         if host_path is not None:
             logger.info(
-                "Persisted large tool result: %s (%s, %d chars -> %s)",
-                tool_name, tool_use_id, len(content), host_path,
+                "Persisted large tool result: %s (correlation=%s, %d chars -> %s)",
+                tool_name, _safe_result_id_label(tool_use_id), content_length, host_path,
             )
-            return _build_persisted_message(preview, has_more, len(content), host_path)
+            return _build_persisted_message(preview, has_more, content_length, host_path)
     elif env is not None:
         # Remote backend: the spillover dir is auto-mounted (docker) or
         # file-synced (modal/ssh/daytona) into the sandbox, so reference the
@@ -367,31 +360,35 @@ def maybe_persist_tool_result(
             visible = _sandbox_visible_spillover_path(host_path, env)
             if visible is not None:
                 logger.info(
-                    "Persisted large tool result: %s (%s, %d chars -> %s [host: %s])",
-                    tool_name, tool_use_id, len(content), visible, host_path,
+                    "Persisted large tool result: %s (correlation=%s, %d chars -> %s [host: %s])",
+                    tool_name, _safe_result_id_label(tool_use_id), content_length, visible, host_path,
                 )
-                return _build_persisted_message(preview, has_more, len(content), visible)
+                return _build_persisted_message(preview, has_more, content_length, visible)
         # Fallback: write into the sandbox temp dir (pre-existing containers
         # without the spillover mount, translation/probe failures).
         storage_dir = _resolve_storage_dir(env)
         remote_path = f"{storage_dir}/{filename}"
         try:
-            if _write_to_sandbox(content, remote_path, env):
+            if _write_to_sandbox(safe_content, remote_path, env):
                 logger.info(
-                    "Persisted large tool result: %s (%s, %d chars -> %s)",
-                    tool_name, tool_use_id, len(content), remote_path,
+                    "Persisted large tool result: %s (correlation=%s, %d chars -> %s)",
+                    tool_name, _safe_result_id_label(tool_use_id), content_length, remote_path,
                 )
-                return _build_persisted_message(preview, has_more, len(content), remote_path)
+                return _build_persisted_message(preview, has_more, content_length, remote_path)
         except Exception as exc:
-            logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
+            logger.warning(
+                "Sandbox write failed for correlation=%s: %s",
+                _safe_result_id_label(tool_use_id),
+                sanitize_exception_for_sink(exc),
+            )
 
     logger.info(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
-        tool_name, len(content),
+        tool_name, content_length,
     )
     return (
         f"{preview}\n\n"
-        f"[Truncated: tool response was {len(content):,} chars. "
+        f"[Truncated: tool response was {content_length:,} chars. "
         f"Full output could not be saved to sandbox.]"
     )
 
@@ -413,6 +410,9 @@ def enforce_turn_budget(
     total_size = 0
     for i, msg in enumerate(tool_messages):
         content = msg.get("content", "")
+        if not isinstance(content, str):
+            content = sanitize_tool_result_for_sink(content)
+            msg["content"] = content
         size = len(content)
         total_size += size
         if PERSISTED_OUTPUT_TAG not in content:
@@ -443,8 +443,8 @@ def enforce_turn_budget(
             total_size += len(replacement)
             tool_messages[idx]["content"] = replacement
             logger.info(
-                "Budget enforcement: persisted tool result %s (%d chars)",
-                tool_use_id, size,
+                "Budget enforcement: persisted tool result correlation=%s (%d chars)",
+                _safe_result_id_label(tool_use_id), size,
             )
 
     return tool_messages

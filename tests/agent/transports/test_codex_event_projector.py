@@ -71,6 +71,34 @@ class TestProjectionInvariants:
         r = p.project({"method": "totally/unknown", "params": {}})
         assert r.messages == []
 
+    def test_mcp_hostile_structured_error_is_total_before_serialization(self) -> None:
+        class Hostile:
+            def __str__(self):
+                raise AssertionError("str must not run")
+
+            def __repr__(self):
+                raise AssertionError("repr must not run")
+
+        circular = []
+        circular.append(circular)
+        error = {
+            "message": Hostile(),
+            "nested": circular,
+            "token": "opaque-r3-projector-SECRET-123456",
+        }
+        result = CodexEventProjector().project({
+            "method": "item/completed",
+            "params": {"item": {
+                "type": "mcpToolCall",
+                "id": "mcp-hostile",
+                "error": error,
+            }},
+        })
+        assert result.messages[1]["role"] == "tool"
+        content = result.messages[1]["content"]
+        assert "opaque-r3-projector-SECRET-123456" not in content
+        assert "redacted" in content.lower()
+
 
 class TestCommandExecutionProjection:
     """Real captured notification → assistant tool_call + tool result."""

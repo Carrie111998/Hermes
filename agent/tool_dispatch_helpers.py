@@ -37,6 +37,10 @@ from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
 )
 from tools.threat_patterns import scan_for_threats
+from tools.tool_result_sanitization import (
+    sanitize_exception_for_sink,
+    sanitize_tool_result_for_sink,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -530,7 +534,10 @@ def _extract_landed_file_mutation_paths(
 
 def _extract_error_preview(result: Any, max_len: int = 180) -> str:
     """Pull a one-line error summary out of a tool result for footer display."""
-    text = _multimodal_text_summary(result) if result is not None else ""
+    try:
+        text = _multimodal_text_summary(result) if result is not None else ""
+    except Exception:
+        text = ""
     if not isinstance(text, str):
         try:
             text = str(text)
@@ -546,7 +553,9 @@ def _extract_error_preview(result: Any, max_len: int = 180) -> str:
                 text = data["error"]
         except Exception:
             pass
-    # Collapse whitespace, trim to max_len.
+    # This preview is copied into turn state and later rendered in the final
+    # response, so it is itself a non-model sink boundary.
+    text = sanitize_tool_result_for_sink(text)
     text = " ".join(text.split())
     if len(text) > max_len:
         text = text[: max_len - 1] + "…"
@@ -628,7 +637,11 @@ def make_tool_result_message(
     try:
         risk_metadata = _tool_output_risk_metadata(name, content)
     except Exception as exc:
-        logger.debug("Tool output risk scan failed for %s: %s", name, exc)
+        logger.debug(
+            "Tool output risk scan failed for %s: %s",
+            name,
+            sanitize_exception_for_sink(exc),
+        )
     else:
         if risk_metadata is not None:
             message["_tool_output_risk"] = risk_metadata
