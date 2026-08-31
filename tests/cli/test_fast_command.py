@@ -199,7 +199,7 @@ class TestFastModeRouting(unittest.TestCase):
         cli_mod = _import_cli()
         stub = SimpleNamespace(
             model="old-model",
-            api_key="secret-not-for-plugin",
+            api_key="redacted-fixture",
             base_url="https://api.anthropic.com",
             provider="anthropic",
             requested_provider="anthropic",
@@ -246,7 +246,7 @@ class TestFastModeRouting(unittest.TestCase):
         assert route["middleware_trace"] == [{"source": "test"}]
         assert stub.model == "old-model"
         assert stub.provider == "anthropic"
-        assert stub.api_key == "secret-not-for-plugin"
+        assert stub.api_key == "redacted-fixture"
 
     def test_turn_route_selection_is_ephemeral_across_two_turns(self):
         cli_mod = _import_cli()
@@ -295,6 +295,36 @@ class TestFastModeRouting(unittest.TestCase):
         assert second["runtime"]["api_key"] == "primary-key"
         assert calls[1]["model"] == "primary-a"
         assert calls[1]["provider"] == "primary"
+
+    def test_turn_route_middleware_timeout_fails_open_to_primary(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="primary-a",
+            api_key="primary-key",
+            base_url="https://primary.example/v1",
+            provider="primary",
+            requested_provider="primary",
+            api_mode="chat_completions",
+            acp_command=None,
+            acp_args=[],
+            _credential_pool=None,
+            service_tier=None,
+            agent=None,
+            session_id="session-timeout",
+        )
+
+        with patch(
+            "hermes_cli.middleware.apply_turn_route_middleware",
+            side_effect=TimeoutError("turn-route timeout"),
+        ):
+            route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "route this")
+
+        assert route["model"] == "primary-a"
+        assert route["runtime"]["provider"] == "primary"
+        assert route["runtime"]["api_key"] == "primary-key"
+        assert stub.model == "primary-a"
+        assert stub.provider == "primary"
+        assert stub.api_key == "primary-key"
 
 
 class TestAnthropicFastMode(unittest.TestCase):
