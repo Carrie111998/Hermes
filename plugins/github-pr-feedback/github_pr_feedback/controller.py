@@ -348,9 +348,11 @@ class LocalGitRepository:
         if not source.exists():
             return
         resolved_source = source.resolve(strict=True)
+        managed_venv_root = (repository_root.parent / "venvs").resolve(strict=False)
+        governed_roots = (*_ADDITIONAL_GOVERNED_VENV_ROOTS, managed_venv_root)
         is_governed_root = resolved_source.is_relative_to(repository_root) or any(
             resolved_source == root or resolved_source.is_relative_to(root)
-            for root in _ADDITIONAL_GOVERNED_VENV_ROOTS
+            for root in governed_roots
         )
         if (
             not is_governed_root
