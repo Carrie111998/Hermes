@@ -92,6 +92,14 @@ describe('acceptsTriggerCompletion', () => {
 describe('implicitSlashAcceptIndex', () => {
   const rows = ['/compress', '/review', '/resume']
 
+  it('honours an arrowed pick on a bare slash query', () => {
+    expect(implicitSlashAcceptIndex('', rows, 1, true)).toBe(1)
+  })
+
+  it('does not accept the default row on a bare slash query', () => {
+    expect(implicitSlashAcceptIndex('', rows, 0, false)).toBeNull()
+  })
+
   it('completes a prefix of the highlighted row', () => {
     expect(implicitSlashAcceptIndex('com', rows, 0, false)).toBe(0)
   })

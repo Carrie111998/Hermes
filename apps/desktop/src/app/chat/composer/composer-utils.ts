@@ -106,12 +106,12 @@ export function implicitSlashAcceptIndex(
 ): number | null {
   const typed = slashCompletionToken(query)
 
-  if (!typed) {
-    return null
-  }
-
   if (activeExplicit && itemTexts[activeIndex] != null) {
     return activeIndex
+  }
+
+  if (!typed) {
+    return null
   }
 
   const exact = itemTexts.findIndex(text => slashCompletionToken(text) === typed)
