@@ -120,6 +120,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--max-turns",
+        dest="max_turns",
+        type=int,
+        help=(
+            "Per-job agent turn budget, overriding agent.max_turns for this job "
+            "only. For long multi-phase jobs that need more turns than the "
+            "shared default. Omit to follow config."
+        ),
+    )
+    cron_create.add_argument(
         "--continuity",
         dest="continuity",
         action="store_const",
@@ -252,6 +262,15 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "Pin this job's reasoning (thinking) effort: none, minimal, low, "
             "medium, high, xhigh, max, or ultra. Pass empty string to clear "
             "the pin and follow config resolution."
+        ),
+    )
+    cron_edit.add_argument(
+        "--max-turns",
+        dest="max_turns",
+        type=int,
+        help=(
+            "Per-job agent turn budget, overriding agent.max_turns for this job "
+            "only. Pass 0 to clear the override and follow config."
         ),
     )
 

@@ -2101,6 +2101,31 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     return text
 
 
+def _normalize_job_max_turns(value: Any) -> Optional[int]:
+    """Validate a per-job agent turn budget at the storage choke point.
+
+    Returns None for unset (None, empty string, or 0 — the CLI's "clear"
+    spelling), the positive int for valid input, and raises ValueError for
+    anything else so a typo never persists and then surfaces hours later as an
+    unexplained mid-run stop.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        turns = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Invalid max_turns {value!r}: pass a positive integer (0 or empty clears the override)."
+        )
+    if turns == 0:
+        return None
+    if turns < 0:
+        raise ValueError(f"Invalid max_turns {turns}: pass a positive integer (0 clears the override).")
+    return turns
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -2204,6 +2229,7 @@ def create_job(
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    max_turns: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -2261,6 +2287,12 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+        max_turns: Optional per-job agent turn budget, overriding the global
+                ``agent.max_turns`` for this job only. Long multi-phase jobs
+                (browse → plan → generate → QA) legitimately need more turns
+                than the shared default, and raising the global value for
+                them would spend the same budget on every other job. Absent
+                or 0 means follow config. Ignored when ``no_agent=True``.
         reasoning_effort: Optional per-job reasoning effort pin. One of the
                 canonical Hermes levels (none|minimal|low|medium|high|xhigh|
                 max|ultra, case-insensitive). When set, it wins over BOTH the
@@ -2306,6 +2338,7 @@ def create_job(
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
     normalized_reasoning_effort = _normalize_reasoning_effort(reasoning_effort)
+    normalized_max_turns = _normalize_job_max_turns(max_turns)
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
@@ -2422,6 +2455,9 @@ def create_job(
     # absent key = job follows config resolution (pre-feature behavior).
     if normalized_reasoning_effort is not None:
         job["reasoning_effort"] = normalized_reasoning_effort
+    # And for the per-job turn budget: absent key = global agent.max_turns.
+    if normalized_max_turns is not None:
+        job["max_turns"] = normalized_max_turns
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -2536,6 +2572,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["reasoning_effort"] = _normalize_reasoning_effort(
                     updates["reasoning_effort"]
                 )
+            # Same for the per-job turn budget: positive int, 0/empty clears,
+            # anything else raises before the merge.
+            if "max_turns" in updates:
+                updates["max_turns"] = _normalize_job_max_turns(updates["max_turns"])
 
             # Normalize repeat the same way create_job does. Callers pass
             # either the stored dict shape ({"times": N, "completed": M}) or

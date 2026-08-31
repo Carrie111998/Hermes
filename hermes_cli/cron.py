@@ -545,6 +545,7 @@ def cron_create(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        max_turns=getattr(args, "max_turns", None),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -555,6 +556,8 @@ def cron_create(args):
     if result.get("skills"):
         print(f"  Skills: {', '.join(result['skills'])}")
     job_data = result.get("job", {})
+    if job_data.get("max_turns"):
+        print(f"  Max turns: {job_data['max_turns']}")
     if job_data.get("script"):
         print(f"  Script: {job_data['script']}")
     if job_data.get("monitor_script"):
@@ -620,6 +623,7 @@ def cron_edit(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        max_turns=getattr(args, "max_turns", None),
     )
     if not result.get("success"):
         print(color(f"Failed to update job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -633,6 +637,8 @@ def cron_edit(args):
         print(f"  Skills: {', '.join(updated['skills'])}")
     else:
         print("  Skills: none")
+    if updated.get("max_turns"):
+        print(f"  Max turns: {updated['max_turns']}")
     if updated.get("script"):
         print(f"  Script: {updated['script']}")
     if updated.get("monitor_script"):

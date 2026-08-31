@@ -5418,6 +5418,33 @@ class _BoundedCronSessionDB:
         return _bounded
 
 
+def _resolve_job_turn_limit(job: dict, config_limit: int) -> int:
+    """Per-job ``max_turns`` wins over the global ``agent.max_turns``.
+
+    Long multi-phase jobs (browse → plan → generate → QA) legitimately need
+    more turns than the shared default, and raising the global value to suit
+    them would spend the same budget on every other job. The value is
+    validated at the store choke point (``cron/jobs.py::_normalize_job_max_turns``);
+    a garbage value in a hand-edited store warns and follows config instead
+    of killing the tick.
+    """
+    raw = job.get("max_turns")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return config_limit
+    job_name = job.get("name") or job.get("id") or "cron job"
+    try:
+        turns = int(raw)
+    except (TypeError, ValueError):
+        turns = 0
+    if turns <= 0:
+        logger.warning(
+            "Job '%s': ignoring invalid max_turns %r; using %s", job_name, raw, config_limit
+        )
+        return config_limit
+    logger.info("Job '%s': per-job max_turns override -> %s", job_name, turns)
+    return turns
+
+
 def run_job(
     job: dict,
     *,
@@ -6025,6 +6052,7 @@ def run_job(
         if _mt is None:
             _mt = _cfg.get("max_turns")
         max_iterations = _resolve_turn_limit(_mt)
+        max_iterations = _resolve_job_turn_limit(job, max_iterations)
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
