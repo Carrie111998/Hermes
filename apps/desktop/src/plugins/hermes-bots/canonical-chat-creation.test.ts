@@ -37,6 +37,7 @@ vi.mock('@hermes/plugin-sdk', () => ({
 }))
 
 vi.mock('./routing', () => ({
+  aliasIdentityFor: () => null,
   backendTargetProfile: (route: { targetProfile?: string } | null, name: string) => route?.targetProfile ?? name,
   botConnectionRoute: () => null,
   botRosterMeta: () => ({}),
@@ -195,11 +196,11 @@ describe('the lazy row is materialized before anything else touches it', () => {
 
     const { createCanonicalChat } = await loadModule()
 
-    await createCanonicalChat('ops', { kickoff: true })
+    await createCanonicalChat({ display_name: 'Operations Agent', name: 'ops' }, { kickoff: true })
 
     expect(hostMock.openSession).toHaveBeenCalledWith(
       'stored-1',
-      expect.objectContaining({ tabTitle: 'Bot Chat', workspaceMode: 'bots', workspaceOwnerKey: 'bot:ops' })
+      expect.objectContaining({ tabTitle: 'Operations Agent', workspaceMode: 'bots', workspaceOwnerKey: 'bot:ops' })
     )
   })
 

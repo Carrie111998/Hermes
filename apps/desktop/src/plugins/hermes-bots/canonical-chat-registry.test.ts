@@ -43,6 +43,7 @@ vi.mock('@hermes/plugin-sdk', () => ({
 }))
 
 vi.mock('./routing', () => ({
+  aliasIdentityFor: () => null,
   backendTargetProfile: (route: { targetProfile?: string } | null, name: string) => route?.targetProfile ?? name,
   botConnectionRoute: () => null,
   botRosterMeta: () => ({}),
@@ -105,7 +106,7 @@ describe('the registry row wins, always', () => {
     })
 
     const { openBotCanonicalChat } = await loadModule()
-    const opened = await openBotCanonicalChat('ops')
+    const opened = await openBotCanonicalChat({ display_name: 'Operations Agent', name: 'ops' })
 
     expect(opened).toEqual({ openedId: 'forever-chat', registryId: 'forever-chat' })
     expect(hostMock.openSession).toHaveBeenCalledTimes(1)
@@ -117,7 +118,9 @@ describe('the registry row wins, always', () => {
       profile: 'ops',
       // Opening a bot leaves the Sessions workspace on its current gateway.
       keepAllProfilesScope: true,
-      tabTitle: 'Bot Chat',
+      // The stored title remains the canonical registry identity, while the
+      // renderer-only tab title tells concurrently open bots apart.
+      tabTitle: 'Operations Agent',
       workspaceMode: 'bots',
       workspaceOwnerKey: 'bot:ops'
     })

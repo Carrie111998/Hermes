@@ -12,6 +12,7 @@ import * as sdk from '@hermes/plugin-sdk'
 import { host } from '@hermes/plugin-sdk'
 
 import { $botMeta, botMetaKey, botOwner, persistBotMetaSnapshot } from './data'
+import { displayName } from './labels'
 import { backendTargetProfile, botConnectionRoute, botRosterMeta, botWorkspaceOwnerKey, requestForBot } from './routing'
 import type { RpcErrorLike } from './routing'
 import { getPluginCtx } from './shared'
@@ -46,6 +47,12 @@ export const PROFILE_SESSION_LIST_LIMIT = 200
  *  click path's tile-staleness probe (hermes-agent#90102), which must
  *  recognize canonical-titled tabs without restating the literal. */
 export const CANONICAL_CHAT_TITLE = 'Bot Chat'
+
+/** Keep the durable registry title canonical while the renderer labels each
+ *  open tab with the same friendly identity shown in the Bots roster. */
+function botTabTitle(bot: RosterRow): string {
+  return displayName(bot, botRosterMeta(bot, $botMeta.get())) || CANONICAL_CHAT_TITLE
+}
 
 /** A `session.list` row as the registry lookup reads it. CanonicalSession
  *  models the roster's `canonical_session` field, which carries no
@@ -135,7 +142,7 @@ async function openStoredBotChat(
     workspaceMode: 'bots',
     workspaceOwnerKey: ownerKey,
     retryHydrationTimeoutOnce: true,
-    tabTitle: CANONICAL_CHAT_TITLE
+    tabTitle: botTabTitle(bot)
   })
 
   return storedId
@@ -292,7 +299,7 @@ export function createCanonicalChat(
       keepAllProfilesScope: route ? true : false,
       workspaceMode: 'bots',
       workspaceOwnerKey: botWorkspaceOwnerKey(bot),
-      tabTitle: CANONICAL_CHAT_TITLE
+      tabTitle: botTabTitle(bot)
     })
 
   if (inflight) {
