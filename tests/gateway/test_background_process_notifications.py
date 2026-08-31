@@ -580,6 +580,45 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
     assert posts == ["raw-origin-sid"]
 
 
+@pytest.mark.asyncio
+async def test_async_delegation_does_not_infer_wake_target_from_raw_session_key(
+    monkeypatch, tmp_path,
+):
+    """Delegation wakes require their dispatch-captured API session id.
+
+    A raw ``session_key`` is not sufficient ownership evidence: restored or
+    legacy events can carry an unrelated gateway key. Treating that key as the
+    self-post target can wake and contend with another session indefinitely.
+    """
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    api_adapter = SimpleNamespace(
+        supports_async_delivery=False,
+        handle_message=AsyncMock(),
+        _host="127.0.0.1", _port=8642, _api_key="k", _model_name="m",
+    )
+    runner.adapters[Platform.API_SERVER] = api_adapter
+
+    posts = []
+
+    async def fake_self_post(adapter, *, text, session_id):
+        posts.append(session_id)
+
+    import gateway.wake as wake_mod
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_unowned",
+        "session_key": "raw-but-unverified-session",
+        "origin_session_id": "",
+    }
+    result = await runner._inject_watch_notification("[SYSTEM: done]", evt)
+
+    assert result is None
+    assert posts == []
+    api_adapter.handle_message.assert_not_awaited()
+
+
 def test_gateway_drain_retains_and_formats_overflow_events():
     """watch_overflow_* events must survive the gateway drain and render
     their summary — previously they were discarded at the drain (only

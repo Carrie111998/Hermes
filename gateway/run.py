@@ -25629,7 +25629,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # server's own /v1/chat/completions entry point instead of
             # dropping the event.
             raw_sid = str(evt.get("origin_session_id") or "").strip()
-            if not raw_sid:
+            if not raw_sid and evt.get("type") != "async_delegation":
+                # Async delegations capture their owning API session explicitly
+                # at dispatch.  Their session_key may be a legacy/stale gateway
+                # route and is not sufficient ownership evidence for a self-post.
+                # Generic process events predate that field and retain the raw-key
+                # compatibility fallback.
                 _sk = str(evt.get("session_key") or "").strip()
                 if _sk and _parse_session_key(_sk) is None:
                     raw_sid = _sk
