@@ -119,12 +119,23 @@ STRATEGY_FILL_FIRST = "fill_first"
 STRATEGY_ROUND_ROBIN = "round_robin"
 STRATEGY_RANDOM = "random"
 STRATEGY_LEAST_USED = "least_used"
+# Timer-based rotation: stay on one credential until a configured interval has
+# elapsed, instead of rotating on every selection like ``round_robin``.
+STRATEGY_SCHEDULED_ROUND_ROBIN = "scheduled_round_robin"
 SUPPORTED_POOL_STRATEGIES = {
     STRATEGY_FILL_FIRST,
     STRATEGY_ROUND_ROBIN,
     STRATEGY_RANDOM,
     STRATEGY_LEAST_USED,
+    STRATEGY_SCHEDULED_ROUND_ROBIN,
 }
+
+# Defaults for ``credential_pool_scheduling`` (scheduled_round_robin only).
+SCHEDULED_ROTATION_DEFAULT_INTERVAL_MINUTES = 60
+# Entry field holding the epoch time of the last timed rotation. Written to the
+# entry the pool rotated *to*, so a restart recovers both the cursor and the
+# rotation deadline instead of dropping back to the first credential.
+SCHEDULED_ROTATION_STATE_KEY = "last_rotation_at"
 
 # Cooldown before retrying an exhausted credential.
 # Transient 401 auth failures cool down briefly so single-key setups can recover.
@@ -185,6 +196,9 @@ _EXTRA_KEYS = frozenset({
     # with the entry so a restart doesn't downgrade a billing bench back to a
     # 60s transient cooldown.
     "failure_reason",
+    # Epoch time of the last scheduled_round_robin rotation, written by
+    # ``CredentialPool._persist`` (SCHEDULED_ROTATION_STATE_KEY).
+    "last_rotation_at",
 })
 
 
@@ -557,6 +571,50 @@ def get_pool_strategy(provider: str) -> str:
     return STRATEGY_FILL_FIRST
 
 
+def _scheduled_interval_minutes(value: Any) -> float:
+    """Coerce a configured rotation interval, falling back to the default.
+
+    A non-numeric or non-positive interval would make every selection look
+    overdue and turn timed rotation back into per-request rotation, so it is
+    treated as unset.
+    """
+    try:
+        minutes = float(value)
+    except (TypeError, ValueError):
+        return float(SCHEDULED_ROTATION_DEFAULT_INTERVAL_MINUTES)
+    if minutes <= 0:
+        return float(SCHEDULED_ROTATION_DEFAULT_INTERVAL_MINUTES)
+    return minutes
+
+
+def get_pool_scheduling(provider: str) -> Dict[str, Any]:
+    """Return the ``scheduled_round_robin`` scheduling config for a provider.
+
+    An absent or malformed ``credential_pool_scheduling`` block yields ``{}``;
+    the pool then applies the same defaults documented here, so selecting the
+    strategy without configuring it still rotates hourly across healthy
+    credentials.
+    """
+    config = _load_config_safe()
+    if config is None:
+        return {}
+
+    scheduling = config.get("credential_pool_scheduling")
+    if not isinstance(scheduling, dict):
+        return {}
+
+    cfg = scheduling.get(provider)
+    if not isinstance(cfg, dict):
+        return {}
+
+    return {
+        "enabled": bool(cfg.get("enabled", True)),
+        "interval_minutes": _scheduled_interval_minutes(cfg.get("interval_minutes")),
+        "skip_unhealthy": bool(cfg.get("skip_unhealthy", True)),
+        "rotate_after_request": bool(cfg.get("rotate_after_request", True)),
+    }
+
+
 def credential_pool_matches_provider(
     pool_or_provider: Any,
     provider: Optional[str],
@@ -747,6 +805,52 @@ class CredentialPool:
         # loop runs unbounded and non-interruptible.  Reset whenever a real
         # entry is identified or an escape path returns None.
         self._unmatched_rotation_streak: int = 0
+        # scheduled_round_robin state; inert for every other strategy.
+        # ``_scheduled_interval`` stays None when the strategy is off or
+        # disabled via config, which makes the timed branch a sticky selection
+        # (no rotation deadline ever comes due).
+        self._scheduled_interval: Optional[float] = None
+        self._last_rotation_time: Optional[float] = None
+        self._rotate_after_request: bool = True
+        self._skip_unhealthy: bool = True
+        if self._strategy == STRATEGY_SCHEDULED_ROUND_ROBIN:
+            scheduling = get_pool_scheduling(provider)
+            if scheduling.get("enabled", True):
+                self._scheduled_interval = _scheduled_interval_minutes(
+                    scheduling.get(
+                        "interval_minutes",
+                        SCHEDULED_ROTATION_DEFAULT_INTERVAL_MINUTES,
+                    )
+                ) * 60.0
+            self._rotate_after_request = bool(
+                scheduling.get("rotate_after_request", True)
+            )
+            self._skip_unhealthy = bool(scheduling.get("skip_unhealthy", True))
+            self._restore_rotation_state()
+
+    def _restore_rotation_state(self) -> None:
+        """Recover the timed-rotation cursor and deadline from persistence.
+
+        Without this a restart resets the cursor to the first entry and starts
+        the interval over, so a frequently restarted process would pin
+        credential #1 forever.  The stamp is written by :meth:`_persist` onto
+        the entry that was rotated to, so the newest one identifies both.
+        """
+        newest_at: Optional[float] = None
+        newest_id: Optional[str] = None
+        for entry in self._entries:
+            stamped = _parse_absolute_timestamp(
+                entry.extra.get(SCHEDULED_ROTATION_STATE_KEY)
+            )
+            if stamped is None:
+                continue
+            if newest_at is None or stamped > newest_at:
+                newest_at = stamped
+                newest_id = entry.id
+        if newest_at is None:
+            return
+        self._last_rotation_time = newest_at
+        self._current_id = newest_id
 
     def has_credentials(self) -> bool:
         with self._lock:
@@ -850,11 +954,31 @@ class CredentialPool:
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
         with self._lock:
+            payload = [entry.to_dict() for entry in self._entries]
+            if self._strategy == STRATEGY_SCHEDULED_ROUND_ROBIN:
+                self._stamp_rotation_state(payload)
             write_credential_pool(
                 self.provider,
-                [entry.to_dict() for entry in self._entries],
+                payload,
                 removed_ids=removed_ids,
             )
+
+    def _stamp_rotation_state(self, payload: List[Dict[str, Any]]) -> None:
+        """Record the timed-rotation cursor on the entry it points at.
+
+        Exactly one entry carries ``last_rotation_at``, so a restart reads back
+        both which credential was in use and when it was picked (see
+        :meth:`_restore_rotation_state`).  The stamp is a plain epoch float —
+        no credential material is added to the persisted payload.
+        """
+        for entry in payload:
+            entry.pop(SCHEDULED_ROTATION_STATE_KEY, None)
+        if self._current_id is None or self._last_rotation_time is None:
+            return
+        for entry in payload:
+            if entry.get("id") == self._current_id:
+                entry[SCHEDULED_ROTATION_STATE_KEY] = self._last_rotation_time
+                return
 
     def _is_terminal_auth_failure(
         self,
@@ -2378,6 +2502,9 @@ class CredentialPool:
             self._current_id = entry.id
             return updated, pending_refresh
 
+        if self._strategy == STRATEGY_SCHEDULED_ROUND_ROBIN:
+            return self._select_scheduled(available), pending_refresh
+
         if self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
             entry = available[0]
             rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
@@ -2390,6 +2517,85 @@ class CredentialPool:
         entry = available[0]
         self._current_id = entry.id
         return entry, pending_refresh
+
+    def _select_scheduled(
+        self, available: List[PooledCredential]
+    ) -> PooledCredential:
+        """Pick a credential for ``scheduled_round_robin``.
+
+        Stays on the current credential until the configured interval has
+        elapsed, then advances one step around the priority ring.  Error-driven
+        rotation is untouched: ``mark_exhausted_and_rotate`` benches the entry,
+        which drops it from *available* and forces a move here immediately,
+        without waiting for the timer.
+
+        Callers must hold ``self._lock`` (``_select_unlocked`` does).
+        """
+        now = time.time()
+        current = self._current_unlocked()
+        # A benched (or otherwise unselectable) current must not be handed out;
+        # treat it as "no current" so the ring advances to a healthy entry.
+        if current is not None and all(e.id != current.id for e in available):
+            current = None
+
+        if current is not None:
+            due = (
+                self._scheduled_interval is not None
+                and self._last_rotation_time is not None
+                and (now - self._last_rotation_time) >= self._scheduled_interval
+            )
+            if not due:
+                return current
+            # rotate_after_request: a lease on this credential means a request
+            # is in flight, so hold the rotation and re-check on the next
+            # selection — the deadline stays passed, nothing is lost.
+            if self._rotate_after_request and self._active_leases.get(current.id, 0) > 0:
+                return current
+
+        entry = self._next_scheduled_entry(current, available)
+        if current is not None and entry.id != current.id:
+            logger.info(
+                "credential pool: scheduled rotation %s -> %s (interval %.0fs)",
+                current.label or current.id[:8],
+                entry.label or entry.id[:8],
+                self._scheduled_interval or 0.0,
+            )
+        self._current_id = entry.id
+        self._last_rotation_time = now
+        self._persist()
+        return entry
+
+    def _next_scheduled_entry(
+        self,
+        current: Optional[PooledCredential],
+        available: List[PooledCredential],
+    ) -> PooledCredential:
+        """Return the entry following *current* in the priority ring.
+
+        With ``skip_unhealthy`` the ring is walked until a selectable entry is
+        found.  Without it, rotation only advances when the immediate successor
+        is selectable; an unhealthy successor holds the cursor in place instead
+        of reordering the ring around it.  Either way the result comes from
+        *available*, so a credential in cooldown is never handed out.
+        """
+        available_by_id = {entry.id: entry for entry in available}
+        if current is None:
+            return available[0]
+        start = next(
+            (idx for idx, e in enumerate(self._entries) if e.id == current.id),
+            None,
+        )
+        if start is None:  # pragma: no cover - current always comes from the ring
+            return available[0]
+        for step in range(1, len(self._entries) + 1):
+            candidate = self._entries[(start + step) % len(self._entries)]
+            selectable = available_by_id.get(candidate.id)
+            if selectable is not None:
+                return selectable
+            if not self._skip_unhealthy:
+                break
+        # Nothing else is selectable — stay on the current credential.
+        return available_by_id.get(current.id) or available[0]
 
     def peek(self) -> Optional[PooledCredential]:
         # Single lock acquisition for the whole read; call the unlocked
