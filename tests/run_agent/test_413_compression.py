@@ -1017,7 +1017,7 @@ class TestPreflightCompression:
             return (
                 [
                     {"role": "user", "content": f"summary {compress_calls}"},
-                    {"role": "user", "content": "continue"},
+                    {"role": "assistant", "content": "summary acknowledged"},
                 ],
                 "rebuilt prompt remains oversized",
             )
