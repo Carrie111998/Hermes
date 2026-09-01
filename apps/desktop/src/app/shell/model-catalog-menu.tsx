@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { createContext, type ReactNode, useContext, useEffect, useMemo, useRef, useState } from 'react'
 
+import { ModelPrice } from '@/components/model-price'
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import {
@@ -413,6 +414,12 @@ export function ModelCatalogMenu({
                     const name = modelDisplayParts(family.id).name
                     const caps = group.provider.capabilities?.[family.id]
 
+                    // Price the variant the row actually represents: when the
+                    // active session runs the -fast sibling, show THAT price;
+                    // otherwise the base model's. Rows are collapsed families,
+                    // so the base price stands in for an inactive fast variant.
+                    const price = group.provider.pricing?.[activeId ?? family.id]
+
                     // Effective settings for this row: the live choice when it's
                     // the active model, otherwise its remembered preset. Row
                     // label AND submenu read from these so they never disagree.
@@ -461,8 +468,9 @@ export function ModelCatalogMenu({
                             <HighlightMatches query={search} text={name} />
                             {meta ? <span className="text-(--ui-text-tertiary)"> {meta}</span> : null}
                           </span>
+                          <ModelPrice isCurrent={false} price={price} />
                           {isCurrent ? (
-                            <Codicon className="ml-auto text-foreground" name="check" size="0.75rem" />
+                            <Codicon className="shrink-0 text-foreground" name="check" size="0.75rem" />
                           ) : null}
                         </DropdownMenuSubTrigger>
                         <ModelEditSubmenu

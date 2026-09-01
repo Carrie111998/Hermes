@@ -6,12 +6,13 @@ import { modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
 import { modelSearchText } from '@/lib/model-search-text'
 import { currentPickerSelection } from '@/lib/model-status-label'
 import { normalize } from '@/lib/text'
-import type { ModelOptionProvider, ModelPricing } from '@/types/hermes'
+import type { ModelOptionProvider } from '@/types/hermes'
 
 import type { HermesGateway } from '../hermes'
 import { cn } from '../lib/utils'
 import { startManualOnboarding } from '../store/onboarding'
 
+import { ModelPrice } from './model-price'
 import { InlineNotice } from './notifications'
 import { Button } from './ui/button'
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from './ui/command'
@@ -255,77 +256,8 @@ function ModelResults({
   )
 }
 
-// Compact In/Out $/Mtok price tag, mirroring the CLI picker's price columns.
-// Renders nothing when pricing is unavailable for the model.
-function ModelPrice({ price, isCurrent }: { price?: ModelPricing; isCurrent: boolean }) {
-  const { t } = useI18n()
-  const copy = t.modelPicker
-
-  if (!price || (!price.input && !price.output)) {
-    return null
-  }
-
-  if (price.free) {
-    return (
-      <span className="shrink-0 inline-flex items-center gap-1.5">
-        {typeof price.discount_percent === 'number' ? (
-          <span
-            className={cn(
-              'rounded-sm px-1 py-0.5 text-[0.62rem] font-semibold',
-              isCurrent ? 'bg-primary-foreground/20' : 'bg-amber-500/15 text-amber-700 dark:text-amber-400'
-            )}
-          >
-            -{price.discount_percent}%
-          </span>
-        ) : null}
-        <span
-          className={cn(
-            'shrink-0 rounded-sm px-1 py-0.5 text-[0.62rem] font-semibold uppercase tracking-wide',
-            isCurrent ? 'bg-primary-foreground/20' : 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-          )}
-        >
-          {copy.free}
-        </span>
-      </span>
-    )
-  }
-
-  const onSale = typeof price.discount_percent === 'number' && Boolean(price.was_input || price.was_output)
-
-  return (
-    <span
-      className={cn(
-        'shrink-0 inline-flex items-center gap-1.5 text-[0.66rem] tabular-nums',
-        isCurrent ? 'text-primary-foreground/80' : 'text-muted-foreground'
-      )}
-      title={copy.priceTitle}
-    >
-      {onSale ? (
-        <span
-          className={cn(
-            'rounded-sm px-1 py-0.5 text-[0.62rem] font-semibold',
-            isCurrent ? 'bg-primary-foreground/20' : 'bg-amber-500/15 text-amber-700 dark:text-amber-400'
-          )}
-        >
-          -{price.discount_percent}%
-        </span>
-      ) : null}
-      <span>
-        {price.input || '?'} / {price.output || '?'}
-      </span>
-      {onSale ? (
-        <span
-          className={cn(
-            'line-through decoration-from-font opacity-70',
-            isCurrent ? 'text-primary-foreground/60' : 'text-muted-foreground/80'
-          )}
-        >
-          {copy.wasPrice} {price.was_input || '?'} / {price.was_output || '?'}
-        </span>
-      ) : null}
-    </span>
-  )
-}
+// Compact In/Out $/Mtok price tag extracted to ./model-price so every
+// model-picking surface renders pricing identically.
 
 function LoadingResults() {
   return (

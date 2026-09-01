@@ -31,7 +31,25 @@ beforeEach(() => {
   $visibleModels.set(null)
   setModelVisibilityOpen(false)
   getGlobalModelOptions.mockResolvedValue({
-    providers: [{ models: ['gemini-3.1-pro', 'gemini-2.5-flash'], name: 'Google', slug: 'google' }]
+    providers: [
+      {
+        models: ['gemini-3.1-pro', 'gemini-2.5-flash'],
+        name: 'Google',
+        slug: 'google',
+        pricing: {
+          'gemini-3.1-pro': { cache: null, free: false, input: '$1.25', output: '$10.00' },
+          'gemini-2.5-flash': {
+            cache: null,
+            discount_percent: 75,
+            free: false,
+            input: '$0.075',
+            output: '$0.30',
+            was_input: '$0.30',
+            was_output: '$1.20'
+          }
+        }
+      }
+    ]
   })
 })
 
@@ -104,5 +122,39 @@ describe('the catalog owns model curation', () => {
     fireEvent.click(screen.getByText('Edit models…'))
 
     expect($modelVisibilityOpen.get()).toBe(true)
+  })
+})
+
+// Pricing rides the SAME catalog payload the standalone model picker reads, so
+// the composer dropdown must show what the gateway already sends: per-model
+// in/out $/Mtok, sale badges, and struck-through "was" prices. A row with no
+// pricing entry renders nothing (older backends, providers without live
+// pricing) — never a placeholder.
+describe('per-model pricing in the catalog rows', () => {
+  it('shows input/output price next to each model', async () => {
+    renderMenu()
+
+    await screen.findByText(/Gemini 3\.1 Pro/i)
+    expect(screen.getByText('$1.25 / $10.00')).toBeTruthy()
+    expect(screen.getByText('$0.075 / $0.30')).toBeTruthy()
+  })
+
+  it('surfaces the gateway discount: badge + struck-through was price', async () => {
+    renderMenu()
+
+    await screen.findByText(/Gemini 2\.5 Flash/i)
+    expect(screen.getByText('-75%')).toBeTruthy()
+    expect(screen.getByText(/was \$0\.30 \/ \$1\.20/)).toBeTruthy()
+  })
+
+  it('renders no price tag when the provider sends no pricing', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [{ models: ['gemini-3.1-pro'], name: 'Google', slug: 'google' }]
+    })
+
+    renderMenu()
+
+    await screen.findByText(/Gemini 3\.1 Pro/i)
+    expect(screen.queryByText(/\$\d/)).toBeNull()
   })
 })
