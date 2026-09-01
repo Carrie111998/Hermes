@@ -173,6 +173,70 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
+def test_approval_pending_uses_durable_session_id_after_runtime_reap(monkeypatch):
+    """Reconnect replay must not depend on a stale runtime id."""
+    monkeypatch.setattr(
+        "tools.approval.list_gateway_approvals",
+        lambda session_key: [{"request_id": "approval-1", "session_key": session_key}],
+    )
+
+    result = server._methods["approval.pending"](
+        "r1",
+        {"session_id": "stale-runtime", "stored_session_id": "stored-session"},
+    )
+
+    assert result["result"]["approvals"] == [
+        {"request_id": "approval-1", "session_key": "stored-session"}
+    ]
+
+
+def test_approval_received_uses_durable_session_id_after_runtime_reap(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        "tools.approval.ack_gateway_approval",
+        lambda session_key, request_id: seen.append((session_key, request_id)) or True,
+    )
+
+    result = server._methods["approval.received"](
+        "r1",
+        {
+            "session_id": "stale-runtime",
+            "stored_session_id": "stored-session",
+            "request_id": "approval-1",
+        },
+    )
+
+    assert result["result"]["acknowledged"] is True
+    assert seen == [("stored-session", "approval-1")]
+
+
+def test_approval_respond_uses_durable_session_id_after_runtime_reap(monkeypatch):
+    seen = []
+    monkeypatch.setattr(
+        "tools.approval.resolve_gateway_approval",
+        lambda session_key, choice, **kwargs: seen.append((session_key, choice, kwargs)) or 1,
+    )
+
+    result = server._methods["approval.respond"](
+        "r1",
+        {
+            "session_id": "stale-runtime",
+            "stored_session_id": "stored-session",
+            "request_id": "approval-1",
+            "choice": "once",
+        },
+    )
+
+    assert result["result"]["resolved"] == 1
+    assert seen == [
+        (
+            "stored-session",
+            "once",
+            {"resolve_all": False, "request_id": "approval-1"},
+        )
+    ]
+
+
 def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
     class DbContext:
         def __init__(self, db):

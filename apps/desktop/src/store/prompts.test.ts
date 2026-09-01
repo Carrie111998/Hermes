@@ -121,12 +121,13 @@ describe('approval prompt store', () => {
       }
     }
 
-    await replayPendingApproval(gateway, 's1')
+    await replayPendingApproval(gateway, 'stale-runtime', 'stored-s1')
 
+    $activeSessionId.set('stale-runtime')
     expect($approvalRequest.get()?.requestId).toBe('r1')
     expect(calls).toEqual([
-      ['approval.pending', { session_id: 's1' }],
-      ['approval.received', { request_id: 'r1', session_id: 's1' }]
+      ['approval.pending', { session_id: 'stale-runtime', stored_session_id: 'stored-s1' }],
+      ['approval.received', { request_id: 'r1', session_id: 'stale-runtime', stored_session_id: 'stored-s1' }]
     ])
   })
 })

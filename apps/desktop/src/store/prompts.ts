@@ -115,24 +115,34 @@ export const $approvalRequest = approval.$active
 export const setApprovalRequest = approval.set
 export const clearApprovalRequest = approval.clear
 
-export async function receiveApprovalRequest(gateway: ApprovalGateway | null, request: ApprovalRequest): Promise<void> {
+export async function receiveApprovalRequest(
+  gateway: ApprovalGateway | null,
+  request: ApprovalRequest,
+  storedSessionId?: string | null
+): Promise<void> {
   setApprovalRequest(request)
 
   if (gateway && request.requestId && request.sessionId) {
     await gateway.request('approval.received', {
       request_id: request.requestId,
-      session_id: request.sessionId
+      session_id: request.sessionId,
+      ...(storedSessionId ? { stored_session_id: storedSessionId } : {})
     })
   }
 }
 
-export async function replayPendingApproval(gateway: ApprovalGateway | null, sessionId: string | null): Promise<void> {
+export async function replayPendingApproval(
+  gateway: ApprovalGateway | null,
+  sessionId: string | null,
+  storedSessionId?: string | null
+): Promise<void> {
   if (!gateway || !sessionId) {
     return
   }
 
   const rawResult = await gateway.request('approval.pending', {
-    session_id: sessionId
+    session_id: sessionId,
+    ...(storedSessionId ? { stored_session_id: storedSessionId } : {})
   })
 
   const result =
@@ -144,15 +154,19 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
     return
   }
 
-  await receiveApprovalRequest(gateway, {
-    allowPermanent: pending.allow_permanent !== false,
-    choices: Array.isArray(pending.choices) ? pending.choices.filter(choice => typeof choice === 'string') : undefined,
-    command: typeof pending.command === 'string' ? pending.command : '',
-    description: typeof pending.description === 'string' ? pending.description : 'dangerous command',
-    requestId: pending.request_id,
-    sessionId,
-    smartDenied: pending.smart_denied === true
-  })
+  await receiveApprovalRequest(
+    gateway,
+    {
+      allowPermanent: pending.allow_permanent !== false,
+      choices: Array.isArray(pending.choices) ? pending.choices.filter(choice => typeof choice === 'string') : undefined,
+      command: typeof pending.command === 'string' ? pending.command : '',
+      description: typeof pending.description === 'string' ? pending.description : 'dangerous command',
+      requestId: pending.request_id,
+      sessionId,
+      smartDenied: pending.smart_denied === true
+    },
+    storedSessionId
+  )
 }
 
 /** The prompt request for one specific session — the tile counterpart of the

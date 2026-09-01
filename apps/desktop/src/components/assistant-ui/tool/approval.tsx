@@ -28,7 +28,7 @@ import {
   sessionApprovalInlineVisible,
   sessionApprovalRequest
 } from '@/store/prompts'
-import { requestForOwnedSession } from '@/store/session-states'
+import { requestForOwnedSession, storedSessionIdForRuntimeId } from '@/store/session-states'
 
 import type { ToolPart } from './fallback-model'
 
@@ -157,7 +157,10 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
           {
             choice,
             request_id: request.requestId,
-            session_id: request.sessionId ?? undefined
+            session_id: request.sessionId ?? undefined,
+            ...(request.sessionId && storedSessionIdForRuntimeId(request.sessionId)
+              ? { stored_session_id: storedSessionIdForRuntimeId(request.sessionId) }
+              : {})
           }
         )
         triggerHaptic(choice === 'deny' ? 'cancel' : 'submit')

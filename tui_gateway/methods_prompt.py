@@ -1790,22 +1790,36 @@ def _(rid, params: dict) -> dict:
     return _respond(rid, params, "value", allow_expired=True)
 
 
+def _approval_session_key(params: dict, rid):
+    """Resolve an approval queue by live runtime or durable stored identity."""
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
+    if session is not None:
+        return (str(session["session_key"]), None)
+    stored = str(params.get("stored_session_id") or "").strip()
+    if stored:
+        return (stored, None)
+    _session, err = _sess_nowait(params, rid)
+    return (None, err)
+
+
 @method("approval.pending")
 def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
+    session_key, err = _approval_session_key(params, rid)
     if err:
         return err
     try:
         from tools.approval import list_gateway_approvals
 
-        return _ok(rid, {"approvals": list_gateway_approvals(session["session_key"])})
+        assert session_key is not None
+        return _ok(rid, {"approvals": list_gateway_approvals(session_key)})
     except Exception as e:
         return _err(rid, 5004, str(e))
 
 
 @method("approval.received")
 def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
+    session_key, err = _approval_session_key(params, rid)
     if err:
         return err
     request_id = params.get("request_id")
@@ -1814,9 +1828,10 @@ def _(rid, params: dict) -> dict:
     try:
         from tools.approval import ack_gateway_approval
 
+        assert session_key is not None
         return _ok(
             rid,
-            {"acknowledged": ack_gateway_approval(session["session_key"], request_id)},
+            {"acknowledged": ack_gateway_approval(session_key, request_id)},
         )
     except Exception as e:
         return _err(rid, 5004, str(e))
@@ -1869,7 +1884,7 @@ def _approval_respond_session_fallback(params: dict):
 
 @method("approval.respond")
 def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
+    session_key, err = _approval_session_key(params, rid)
     if err:
         # Session-not-found (4001) only: the client may hold a stale live
         # sid for a session whose runtime was re-minted after a reconnect.
@@ -1880,14 +1895,16 @@ def _(rid, params: dict) -> dict:
         session = _approval_respond_session_fallback(params)
         if session is None:
             return err
+        session_key = session["session_key"]
     try:
         from tools.approval import resolve_gateway_approval
 
+        assert session_key is not None
         return _ok(
             rid,
             {
                 "resolved": resolve_gateway_approval(
-                    session["session_key"],
+                    session_key,
                     params.get("choice", "deny"),
                     resolve_all=params.get("all", False),
                     request_id=params.get("request_id"),
@@ -1915,6 +1932,7 @@ def register(server) -> None:
         _coerce_truncate_int,
         _reconcile_client_ordinal,
         _pending_reaction_notes,
+        _approval_session_key,
         _approval_respond_session_fallback,
     ):
         setattr(

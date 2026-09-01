@@ -12,6 +12,7 @@ import { $gateway, activeGatewayConnectionId } from '@/store/gateway'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { replayPendingApproval } from '@/store/prompts'
 import { setSessionProviderWait } from '@/store/provider-wait'
+import { storedSessionIdForRuntimeId } from '@/store/session-states'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
 import type { RpcEvent } from '@/types/hermes'
 
@@ -198,7 +199,11 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       const replaySessionId = approvalReplaySessionId(event.type, activeSessionIdRef.current, sessionId)
 
       if (replaySessionId) {
-        void replayPendingApproval($gateway.get(), replaySessionId).catch(() => undefined)
+        void replayPendingApproval(
+          $gateway.get(),
+          replaySessionId,
+          storedSessionIdForRuntimeId(replaySessionId)
+        ).catch(() => undefined)
       }
 
       // Mid-turn compaction does not emit another message.start. The first
