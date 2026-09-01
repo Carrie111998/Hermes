@@ -39,6 +39,7 @@ ORIGINAL_ARGS=("$@")
 INSTALL_ROOT="" BRANCH="main" DESKTOP_PID=0 RELAUNCH_TARGET=""
 RELAUNCH_CWD="" SANDBOX_FALLBACK=0 RELAUNCH_ARGS=()
 NO_UI=0 NO_MARKER_CLEANUP=0 SELF_TEST_UI=0 SELF_TEST_GATE=0 SELF_TEST_MARKER=0
+SELF_TEST_MAC_FINALIZE=0 SELF_TEST_FINAL_CODE=0
 HANDOFF_DAEMONIZED=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,6 +53,8 @@ while [ $# -gt 0 ]; do
     --no-marker-cleanup) NO_MARKER_CLEANUP=1; shift ;;
     --self-test-ui) SELF_TEST_UI=1; shift ;;
     --self-test-gate) SELF_TEST_GATE=1; shift ;;
+    --self-test-mac-finalize) SELF_TEST_MAC_FINALIZE=1; shift ;;
+    --self-test-final-code) SELF_TEST_FINAL_CODE="$2"; shift 2 ;;
     --daemonized) HANDOFF_DAEMONIZED=1; shift ;;
     --self-test-marker) SELF_TEST_MARKER=1; NO_UI=1; NO_MARKER_CLEANUP=1; shift ;;
     --) shift; RELAUNCH_ARGS=("$@"); shift $# ;;
@@ -327,13 +330,39 @@ linux_gate() {
 }
 
 mac_swap() {
-  local rebuilt="" c
-  for c in "$INSTALL_ROOT/apps/desktop/release/mac-arm64/Hermes.app" \
-           "$INSTALL_ROOT/apps/desktop/release/mac/Hermes.app"; do
-    [ -d "$c" ] && { rebuilt="$c"; break; }
-  done
+  local rebuilt="" c output_dir backup_dir
+  output_dir="$(dirname "$RELAUNCH_TARGET")"
+  backup_dir="$(dirname "$output_dir")/.hermes-update-backup/$(basename "$output_dir")"
+  case "$RELAUNCH_TARGET" in
+    "$INSTALL_ROOT/apps/desktop/release/mac-arm64/Hermes.app"|\
+    "$INSTALL_ROOT/apps/desktop/release/mac/Hermes.app")
+      if [ -d "$RELAUNCH_TARGET" ] || [ -d "$backup_dir" ]; then
+        rebuilt="$RELAUNCH_TARGET"
+      fi
+      ;;
+  esac
 
-  # Transactional swap: stage a full copy, move the old bundle aside, move
+  if [ -z "$rebuilt" ]; then
+    for c in "$INSTALL_ROOT/apps/desktop/release/mac-arm64/Hermes.app" \
+             "$INSTALL_ROOT/apps/desktop/release/mac/Hermes.app"; do
+      [ -d "$c" ] && { rebuilt="$c"; break; }
+    done
+  fi
+
+  # The CLI-managed mac app normally runs directly from the electron-builder
+  # output directory. before-pack.mjs now preserves that whole output as
+  # release/.hermes-update-backup/<appOutDir> before rebuilding in place.
+  # Finalize that transaction here:
+  # a failed update or an incomplete renderer generation restores the previous
+  # bundle before any relaunch is attempted.
+  if [ -n "$rebuilt" ] && [ "$rebuilt" = "$RELAUNCH_TARGET" ] \
+      && [ -d "$backup_dir" ]; then
+    finalize_in_place_mac_bundle "$rebuilt"
+    return
+  fi
+
+  # Transactional swap for a separately installed target: stage a full copy,
+  # move the old bundle aside, move
   # the copy in. Every step checked; a failed final move ROLLS BACK so the
   # user always has a launchable app, and the result file tells the truth.
   if [ "$FINAL_CODE" -eq 0 ] && [ -n "$rebuilt" ] && [ -d "$RELAUNCH_TARGET" ] && [ "$rebuilt" != "$RELAUNCH_TARGET" ]; then
@@ -361,6 +390,47 @@ mac_swap() {
       log "swapped app bundle"
     fi
   fi
+}
+
+finalize_in_place_mac_bundle() {
+  local bundle="$1" verifier node_bin outcome="" update_state="failure"
+  verifier="$INSTALL_ROOT/apps/desktop/scripts/verify-mac-bundle.mjs"
+  node_bin="$(command -v node 2>/dev/null || true)"
+  [ "$FINAL_CODE" -eq 0 ] && update_state="success"
+
+  if [ -z "$node_bin" ] || [ ! -f "$verifier" ]; then
+    if [ "$FINAL_CODE" -eq 0 ]; then
+      FINAL_CODE=7
+      FINAL_MSG="The update built a new macOS app, but its integrity could not be verified; the previous app backup was kept. Reinstall or run the update again."
+    fi
+    log "ERROR: mac bundle verifier unavailable (node=${node_bin:-missing}, verifier=$verifier)"
+    return 1
+  fi
+
+  outcome="$("$node_bin" "$verifier" --finalize "$bundle" Hermes "$update_state" 2>>"$LOG")"
+  if [ $? -ne 0 ]; then
+    if [ "$FINAL_CODE" -eq 0 ]; then
+      FINAL_CODE=7
+      FINAL_MSG="The updated macOS app was incomplete and its previous backup could not be restored automatically. Reinstall Hermes."
+    fi
+    log "ERROR: mac bundle transaction failed: ${outcome:-no result}"
+    return 1
+  fi
+
+  case "$outcome" in
+    *'"action":"restored-backup"'*)
+      log "restored previous macOS app bundle after update/build integrity failure"
+      if [ "$FINAL_CODE" -eq 0 ]; then
+        DONE_NOTE="Code updated, but the new Desktop app was incomplete; the previous working app was restored. Run the update again."
+      fi
+      ;;
+    *'"action":"kept-new"'*)
+      log "verified new macOS app bundle; retained previous build as rollback material"
+      ;;
+    *)
+      log "mac bundle transaction outcome: $outcome"
+      ;;
+  esac
 }
 
 deliver_outcome() { # the truth-determining half: swap bundles / gate the relaunch
@@ -475,6 +545,20 @@ if [ "$SELF_TEST_GATE" -eq 1 ]; then
   linux_gate
   echo "$GATE${GATE_MSG:+:$GATE_MSG}"
   exit 0
+fi
+
+if [ "$SELF_TEST_MAC_FINALIZE" -eq 1 ]; then
+  # Host-native macOS transaction integration test: exercise the same
+  # verifier + rollback path finish() uses, without running an update or
+  # launching an app.
+  trap - EXIT
+  FINAL_CODE="$SELF_TEST_FINAL_CODE"
+  mac_swap
+  node_bin="$(command -v node 2>/dev/null || true)"
+  [ -n "$node_bin" ] || exit 1
+  "$node_bin" "$INSTALL_ROOT/apps/desktop/scripts/verify-mac-bundle.mjs" \
+    "$RELAUNCH_TARGET" Hermes >/dev/null 2>&1
+  exit $?
 fi
 
 if [ "$SELF_TEST_UI" -eq 1 ]; then
