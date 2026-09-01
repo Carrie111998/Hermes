@@ -16,6 +16,7 @@ off at all.
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -152,6 +153,39 @@ def test_reexec_child_runs_unattended(venv, monkeypatch):
     assert calls[0][2]["stdin"] is cli_main.subprocess.DEVNULL
 
 
+def test_reexec_transfers_receipt_and_snapshot(venv, monkeypatch, tmp_path):
+    from hermes_cli import update_receipt
+    from hermes_cli import update_cmd
+
+    monkeypatch.setattr(sys, "argv", [str(venv / "hermes.exe"), "update"])
+    calls = _capture_popen(monkeypatch)
+    handoff_path = tmp_path / "receipt-handoff.json"
+    monkeypatch.setattr(
+        update_receipt,
+        "prepare_update_receipt_handoff",
+        lambda: handoff_path,
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_LAST_SIBLING_SNAPSHOTS",
+        {"work": "snapshot-work"},
+    )
+
+    assert (
+        cli_main._reexec_dependency_sync_off_windows_shim(
+            pre_update_snapshot_id="snapshot-123"
+        )
+        is True
+    )
+
+    env = calls[0][1]
+    assert env[update_receipt.UPDATE_RECEIPT_HANDOFF_ENV] == str(handoff_path)
+    assert env[cli_main._UPDATE_PRE_SNAPSHOT_ENV] == "snapshot-123"
+    assert json.loads(env[cli_main._UPDATE_SIBLING_SNAPSHOTS_ENV]) == {
+        "work": "snapshot-work"
+    }
+
+
 def test_reexec_does_not_recurse(venv, monkeypatch):
     monkeypatch.setattr(sys, "argv", [str(venv / "hermes.exe"), "update"])
     monkeypatch.setenv(cli_main._UPDATE_REEXEC_ENV, "1")
@@ -181,6 +215,28 @@ def test_reexec_falls_through_when_spawn_fails(venv, monkeypatch, capsys):
 
     assert cli_main._reexec_dependency_sync_off_windows_shim() is False
     assert "-m hermes_cli.main update" in capsys.readouterr().out
+
+
+def test_reexec_spawn_failure_resumes_parent_receipt(venv, monkeypatch, tmp_path):
+    from hermes_cli import update_receipt
+
+    monkeypatch.setattr(sys, "argv", [str(venv / "hermes.exe"), "update"])
+    _capture_popen(monkeypatch, raises=OSError("no exec"))
+    handoff_path = tmp_path / "receipt-handoff.json"
+    resumed = []
+    monkeypatch.setattr(
+        update_receipt,
+        "prepare_update_receipt_handoff",
+        lambda: handoff_path,
+    )
+    monkeypatch.setattr(
+        update_receipt,
+        "resume_update_receipt_handoff",
+        lambda path: resumed.append(path) or True,
+    )
+
+    assert cli_main._reexec_dependency_sync_off_windows_shim() is False
+    assert resumed == [handoff_path]
 
 
 # ---------------------------------------------------------------------------

@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 _RECEIPT_DIR_NAME = "update_receipts"
 _RECEIPT_KEEP = 20  # keep the last N receipts per profile home
+_HANDOFF_STALE_SECONDS = 24 * 60 * 60
+UPDATE_RECEIPT_HANDOFF_ENV = "HERMES_UPDATE_RECEIPT_HANDOFF"
 
 # Module-level current receipt. ``hermes update`` is a single-threaded CLI
 # command; a module singleton lets the 7k-line updater record steps from
@@ -156,10 +158,79 @@ def begin_update_receipt() -> None:
     """Start recording a new update receipt. Never raises."""
     global _current
     try:
+        handoff_path = os.environ.pop(UPDATE_RECEIPT_HANDOFF_ENV, "")
+        if handoff_path and resume_update_receipt_handoff(Path(handoff_path)):
+            return
         _current = UpdateReceipt()
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Could not start update receipt: %s", exc)
         _current = None
+
+
+def prepare_update_receipt_handoff() -> Optional[Path]:
+    """Persist the active receipt for a Windows updater re-exec.
+
+    The pending payload also becomes ``latest.json`` so observers never see
+    the parent process's clean exit as terminal success while the child still
+    owns the dependency sync. The active singleton is released only after
+    both files are durable; a spawn failure can resume the handoff in-process.
+    """
+    global _current
+    receipt = _current
+    if receipt is None:
+        return None
+    try:
+        payload = json.loads(json.dumps(receipt.data, default=str))
+        payload["handoff"] = {
+            "state": "pending",
+            "from_pid": os.getpid(),
+            "at": _utc_now_iso(),
+        }
+        directory = _receipt_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f".handoff_{os.getpid()}_{time.time_ns()}.json"
+        encoded = json.dumps(payload, indent=2, default=str)
+        path.write_text(encoded, encoding="utf-8")
+        (directory / "latest.json").write_text(encoded, encoding="utf-8")
+        _current = None
+        return path
+    except Exception as exc:
+        logger.debug("Could not prepare update receipt handoff: %s", exc)
+        return None
+
+
+def resume_update_receipt_handoff(path: Path) -> bool:
+    """Resume a receipt prepared by :func:`prepare_update_receipt_handoff`."""
+    global _current
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return False
+        handoff = payload.get("handoff")
+        if not isinstance(handoff, dict) or handoff.get("state") != "pending":
+            return False
+        handoff["state"] = "resumed"
+        handoff["to_pid"] = os.getpid()
+        handoff["resumed_at"] = _utc_now_iso()
+        payload["pid"] = os.getpid()
+        receipt = UpdateReceipt.__new__(UpdateReceipt)
+        receipt.data = payload
+        _current = receipt
+        try:
+            latest = _receipt_dir() / "latest.json"
+            latest.write_text(
+                json.dumps(payload, indent=2, default=str), encoding="utf-8"
+            )
+        except OSError:
+            pass
+        try:
+            Path(path).unlink()
+        except OSError:
+            pass
+        return True
+    except Exception as exc:
+        logger.debug("Could not resume update receipt handoff: %s", exc)
+        return False
 
 
 def record_step(name: str, ok: bool, detail: str = "") -> None:
@@ -278,6 +349,17 @@ def _prune_old_receipts(directory: Path) -> None:
         for stale in receipts[_RECEIPT_KEEP:]:
             try:
                 stale.unlink()
+            except OSError:
+                pass
+
+        handoff_cutoff = time.time() - _HANDOFF_STALE_SECONDS
+        for stale_handoff in directory.glob(".handoff_*.json"):
+            try:
+                if (
+                    stale_handoff.is_file()
+                    and stale_handoff.stat().st_mtime < handoff_cutoff
+                ):
+                    stale_handoff.unlink()
             except OSError:
                 pass
     except Exception:

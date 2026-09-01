@@ -12,6 +12,7 @@ Covers:
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,33 @@ class TestReceiptLifecycle:
         _finalize("success")
         assert ur._current is None
 
+    def test_windows_reexec_resumes_same_receipt(self, receipt_home, monkeypatch):
+        ur.begin_update_receipt()
+        ur.record_step("pre_update_backup", True, "snapshot=abc123")
+        started_at = ur._current.data["started_at"]
+        parent_pid = ur._current.data["pid"]
+
+        handoff_path = ur.prepare_update_receipt_handoff()
+
+        assert handoff_path is not None and handoff_path.is_file()
+        assert ur._current is None
+        latest = ur.read_latest_receipt()
+        assert latest["outcome"] == "running"
+        assert latest["finished_at"] is None
+        assert latest["handoff"]["state"] == "pending"
+
+        monkeypatch.setenv(ur.UPDATE_RECEIPT_HANDOFF_ENV, str(handoff_path))
+        ur.begin_update_receipt()
+        assert not handoff_path.exists()
+        path = ur.finalize_update_receipt("success")
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["started_at"] == started_at
+        assert payload["steps"][0]["detail"] == "snapshot=abc123"
+        assert payload["handoff"]["state"] == "resumed"
+        assert payload["handoff"]["from_pid"] == parent_pid
+        assert payload["handoff"]["to_pid"] == os.getpid()
+
     def test_pruning_keeps_recent(self, receipt_home, monkeypatch):
         monkeypatch.setattr(ur, "_RECEIPT_KEEP", 3)
         directory = receipt_home / "logs" / "update_receipts"
@@ -149,6 +177,24 @@ class TestReceiptLifecycle:
             "update_20260104_000000_1.json",
             "update_20260105_000000_1.json",
         ]
+
+    def test_pruning_removes_only_stale_handoff_files(
+        self, receipt_home, monkeypatch
+    ):
+        monkeypatch.setattr(ur, "_HANDOFF_STALE_SECONDS", 10)
+        directory = receipt_home / "logs" / "update_receipts"
+        directory.mkdir(parents=True)
+        stale = directory / ".handoff_stale.json"
+        recent = directory / ".handoff_recent.json"
+        stale.write_text("{}", encoding="utf-8")
+        recent.write_text("{}", encoding="utf-8")
+        now = time.time()
+        os.utime(stale, (now - 20, now - 20))
+
+        ur._prune_old_receipts(directory)
+
+        assert not stale.exists()
+        assert recent.exists()
 
     def test_read_latest_receipt_missing(self, receipt_home):
         assert ur.read_latest_receipt() is None
