@@ -773,6 +773,52 @@ class TestSpawnEnvSanitization:
         # A failed launch must not be exposed as a running/tracked session.
         assert session.id not in registry._running
 
+    def test_spawn_via_env_passes_cwd_to_env_execute(self, registry):
+        """The resolved cwd must reach env.execute (#100020).
+
+        It used to be stored on the session record but never handed to the
+        execution call, so background commands ran in the sandbox's default
+        cwd and anything relative to the requested workdir failed."""
+        class FakeEnv:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, command, **kwargs):
+                self.calls.append(kwargs)
+                return {"output": "123\n", "returncode": 0}
+
+        env = FakeEnv()
+
+        with patch("tools.process_registry.threading.Thread"), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(
+                env, "./gradlew test", cwd="/abs/worktree", timeout=30
+            )
+
+        assert session.pid == 123
+        assert env.calls and env.calls[0].get("cwd") == "/abs/worktree"
+        assert env.calls[0].get("timeout") == 30
+        assert env.calls[0].get("rewrite_compound_background") is False
+
+    def test_spawn_via_env_without_cwd_keeps_default_execution_dir(self, registry):
+        """No requested cwd still executes with the env's own default."""
+        class FakeEnv:
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, command, **kwargs):
+                self.calls.append(kwargs)
+                return {"output": "456\n", "returncode": 0}
+
+        env = FakeEnv()
+
+        with patch("tools.process_registry.threading.Thread"), \
+            patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(env, "echo hello")
+
+        assert session.pid == 456
+        assert env.calls and env.calls[0].get("cwd") == ""
+
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False
