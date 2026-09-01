@@ -9663,9 +9663,12 @@ def _create_with_progress_once(
     stream_kwargs = dict(kwargs)
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
+    stream_client, owns_stream_client = _copy_request_local_streaming_client(client)
     try:
-        chunks = client.chat.completions.create(**stream_kwargs)
+        chunks = stream_client.chat.completions.create(**stream_kwargs)
     except Exception as exc:
+        if owns_stream_client:
+            _close_cached_client(stream_client)
         # Genuine provider failures (auth, credit, rate limit, network) are
         # not streaming's fault — surface them unchanged so the existing
         # recovery chains (credential refresh, pool rotation, provider
@@ -9697,10 +9700,47 @@ def _create_with_progress_once(
     # as provider response progress (TTFP) and forward progress alike.
     if hasattr(chunks, "choices"):
         _notify_aux_provider_response()
+        if owns_stream_client:
+            _close_cached_client(stream_client)
         return chunks
-    return _aggregate_chat_stream(
-        chunks, model=str(kwargs.get("model") or ""), total_ceiling=total_ceiling,
-    )
+    try:
+        return _aggregate_chat_stream(
+            chunks,
+            model=str(kwargs.get("model") or ""),
+            total_ceiling=total_ceiling,
+            request_client=stream_client if owns_stream_client else None,
+        )
+    finally:
+        if owns_stream_client:
+            _close_cached_client(stream_client)
+
+
+def _copy_request_local_streaming_client(client: Any) -> Tuple[Any, bool]:
+    """Give an OpenAI streamed attempt its own httpx connection pool.
+
+    ``OpenAI.copy()`` reuses the source client's pool unless an ``http_client``
+    override is supplied. Build that override through Hermes' normal TLS/proxy
+    path so a timed-out stream can be aborted and closed without poisoning the
+    process-cached auxiliary client used by later retries or sibling tasks.
+    Non-OpenAI adapters do not expose the required copy seam and retain their
+    transport-specific ownership logic.
+    """
+    copy_fn = getattr(client, "copy", None)
+    if not callable(copy_fn) or not hasattr(client, "_client"):
+        return client, False
+    base_url = str(getattr(client, "base_url", "") or "")
+    http_client = _openai_http_client_kwargs(base_url).get("http_client")
+    if http_client is None:
+        return client, False
+    try:
+        return copy_fn(http_client=http_client), True
+    except Exception:
+        _close_cached_client(http_client)
+        logger.debug(
+            "Auxiliary stream: request-local client copy failed; using cached client",
+            exc_info=True,
+        )
+        return client, False
 
 
 def _aggregate_chat_stream(
@@ -9708,6 +9748,7 @@ def _aggregate_chat_stream(
     *,
     model: str = "",
     total_ceiling: Optional[float] = None,
+    request_client: Any = None,
 ) -> Any:
     """Consume a chat.completions chunk stream into a complete response.
 
@@ -9720,10 +9761,101 @@ def _aggregate_chat_stream(
     :class:`_ChatStreamAccumulator`.
     """
     acc = _ChatStreamAccumulator(model=model, total_ceiling=total_ceiling)
+    started = time.monotonic()
+    idle_timeout = _AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS
+    hard_deadline = (
+        started + total_ceiling if total_ceiling is not None else None
+    )
+    watchdog_lock = threading.Lock()
+    watchdog_timer: List[Optional[threading.Timer]] = [None]
+    watchdog_generation = [0]
+    watchdog_expired = threading.Event()
+    stream_finished = threading.Event()
+    saw_progress = threading.Event()
+    timeout_reason = [""]
+
+    def _timeout_message() -> str:
+        elapsed = time.monotonic() - started
+        if timeout_reason[0] == "hard ceiling":
+            return (
+                "Auxiliary streamed call timed out after "
+                f"{float(total_ceiling or elapsed):.0f}s hard ceiling"
+            )
+        if not saw_progress.is_set():
+            return (
+                "Auxiliary streamed call produced no output within "
+                f"{idle_timeout:.1f}s (no-progress timeout, {elapsed:.1f}s elapsed)"
+            )
+        return (
+            "Auxiliary streamed call stalled with no new output for "
+            f"{idle_timeout:.1f}s ({elapsed:.1f}s elapsed)"
+        )
+
+    def _arm_watchdog() -> None:
+        if request_client is None:
+            return
+        now = time.monotonic()
+        delay = idle_timeout
+        if hard_deadline is not None:
+            delay = min(delay, max(hard_deadline - now, 0.0))
+        with watchdog_lock:
+            watchdog_generation[0] += 1
+            generation = watchdog_generation[0]
+            previous = watchdog_timer[0]
+            if previous is not None:
+                previous.cancel()
+
+            def _expire() -> None:
+                with watchdog_lock:
+                    if (
+                        generation != watchdog_generation[0]
+                        or stream_finished.is_set()
+                    ):
+                        return
+                    timeout_reason[0] = (
+                        "hard ceiling"
+                        if hard_deadline is not None
+                        and time.monotonic() >= hard_deadline
+                        else "no progress"
+                    )
+                    watchdog_expired.set()
+                try:
+                    from agent.agent_runtime_helpers import force_close_tcp_sockets
+
+                    force_close_tcp_sockets(request_client)
+                except Exception:
+                    logger.debug(
+                        "Auxiliary stream: socket abort on no-progress timeout failed",
+                        exc_info=True,
+                    )
+
+            timer = threading.Timer(delay, _expire)
+            timer.daemon = True
+            watchdog_timer[0] = timer
+            timer.start()
+
+    _arm_watchdog()
     try:
         for chunk in chunks:
-            acc.feed(chunk)
+            made_progress = acc.feed(chunk)
+            if watchdog_expired.is_set():
+                raise TimeoutError(_timeout_message())
+            if made_progress:
+                saw_progress.set()
+                _arm_watchdog()
+        if watchdog_expired.is_set():
+            raise TimeoutError(_timeout_message())
+    except Exception as exc:
+        if watchdog_expired.is_set() and not isinstance(exc, TimeoutError):
+            raise TimeoutError(_timeout_message()) from exc
+        raise
     finally:
+        stream_finished.set()
+        with watchdog_lock:
+            watchdog_generation[0] += 1
+            timer = watchdog_timer[0]
+        if timer is not None:
+            timer.cancel()
         close_fn = getattr(chunks, "close", None)
         if callable(close_fn):
             try:
@@ -9753,7 +9885,7 @@ class _ChatStreamAccumulator:
         self.resp_id = ""
         self.resp_model = model or ""
 
-    def feed(self, chunk: Any) -> None:
+    def feed(self, chunk: Any) -> bool:
         # Every provider frame records transport-level timing (TTFP
         # telemetry, first-frame-wins); only a substantive payload below
         # ticks the forward-progress hook that keeps compression alive.
@@ -9774,12 +9906,12 @@ class _ChatStreamAccumulator:
             self.usage = chunk_usage
         choices = getattr(chunk, "choices", None) or []
         if not choices:
-            return
+            return False
         choice = choices[0]
         self.finish_reason = getattr(choice, "finish_reason", None) or self.finish_reason
         delta = getattr(choice, "delta", None)
         if delta is None:
-            return
+            return False
         piece = getattr(delta, "content", None)
         if piece:
             self.content_parts.append(piece)
@@ -9830,6 +9962,7 @@ class _ChatStreamAccumulator:
 
         if made_progress:
             _notify_aux_progress()
+        return made_progress
 
     def finish(self) -> Any:
         tool_calls = None

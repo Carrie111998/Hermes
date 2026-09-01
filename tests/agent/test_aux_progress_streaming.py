@@ -24,6 +24,7 @@ from agent.auxiliary_client import (
     _anthropic_event_has_content,
     _aux_stream_total_ceiling,
     _codex_event_has_content,
+    _copy_request_local_streaming_client,
     _create_with_progress,
     _notify_aux_progress,
     _provider_requires_stream,
@@ -195,6 +196,26 @@ class TestCreateWithProgress:
 # ---------------------------------------------------------------------------
 
 class TestAggregateChatStream:
+    def test_request_local_copy_overrides_the_cached_http_pool(self, monkeypatch):
+        shared_pool = object()
+        request_pool = object()
+        local_client = object()
+        source = SimpleNamespace(
+            _client=shared_pool,
+            base_url="https://proxy.example/v1",
+            copy=MagicMock(return_value=local_client),
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._openai_http_client_kwargs",
+            lambda base_url: {"http_client": request_pool},
+        )
+
+        copied, owned = _copy_request_local_streaming_client(source)
+
+        assert copied is local_client
+        assert owned is True
+        source.copy.assert_called_once_with(http_client=request_pool)
+
     def test_tool_call_deltas_are_reassembled(self):
         tc0 = SimpleNamespace(
             index=0, id="call_1",
@@ -229,6 +250,82 @@ class TestAggregateChatStream:
 
         result = _aggregate_chat_stream(_Stream())
         assert result.choices[0].message.content == "ok"
+        assert closed == [True]
+
+    def test_no_progress_watchdog_aborts_request_client_and_times_out(self, monkeypatch):
+        release = threading.Event()
+        aborted = []
+
+        class _BlockedStream:
+            def __iter__(self):
+                release.wait(timeout=1.0)
+                return iter(())
+
+            def close(self):
+                pass
+
+        request_client = object()
+
+        def _abort(client):
+            aborted.append(client)
+            release.set()
+            return 1
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS", 0.02
+        )
+        monkeypatch.setattr(
+            "agent.agent_runtime_helpers.force_close_tcp_sockets", _abort
+        )
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="no-progress timeout"):
+            _aggregate_chat_stream(
+                _BlockedStream(), request_client=request_client, total_ceiling=1.0
+            )
+
+        assert time.monotonic() - started < 0.5
+        assert aborted == [request_client]
+
+    def test_substantive_chunks_rearm_no_progress_watchdog(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.auxiliary_client._AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS", 0.04
+        )
+
+        class _SlowHealthyStream:
+            def __iter__(self):
+                for text in ("a", "b", "c"):
+                    time.sleep(0.025)
+                    yield _chunk(content=text)
+
+            def close(self):
+                pass
+
+        result = _aggregate_chat_stream(
+            _SlowHealthyStream(), request_client=object(), total_ceiling=1.0
+        )
+        assert result.choices[0].message.content == "abc"
+
+    def test_stream_attempt_uses_and_closes_request_local_client(self, monkeypatch):
+        cached_client = _FakeClient(stream_chunks=[])
+        local_client = _FakeClient(
+            stream_chunks=[_chunk(content="isolated", finish_reason="stop")]
+        )
+        closed = []
+        local_client.close = lambda: closed.append(True)
+        monkeypatch.setattr(
+            "agent.auxiliary_client._copy_request_local_streaming_client",
+            lambda client: (local_client, True),
+        )
+
+        with aux_progress_hook(lambda: None):
+            result = _create_with_progress(
+                cached_client, {"model": "m1", "messages": [], "timeout": 30}
+            )
+
+        assert cached_client.calls == []
+        assert local_client.calls[0]["stream"] is True
+        assert result.choices[0].message.content == "isolated"
         assert closed == [True]
 
 
@@ -482,6 +579,8 @@ class TestContentBearingProgress:
                 accumulator.feed(keepalive)
                 accumulator.feed(empty_role_chunk)
         # No substantive payload arrived: the fence must have stayed stale.
+        # Let coarse Windows monotonic clocks advance before observing age.
+        time.sleep(0.01)
         assert fence.seconds_since_progress() > 0.0
 
         with aux_progress_hook(fence.touch_progress):
