@@ -622,8 +622,42 @@ export class JsonRpcGatewayClient {
           this.replayEpoch = epoch
         }
 
-        const generation = result.value.generation
-        const latest = result.value.latest_seq
+        const previousGeneration = this.lastSeenGeneration.get(sid)
+        let replay = result.value
+        let generation = replay.generation
+
+        if (
+          previousGeneration &&
+          typeof generation === 'string' &&
+          generation &&
+          generation !== previousGeneration
+        ) {
+          // The first response was filtered with a watermark from a different
+          // generation. It cannot establish continuity for the recreated ring,
+          // so keep the old checkpoint intact until a zero-based snapshot has
+          // been fetched and (when truncated) authoritatively hydrated.
+          try {
+            const fresh = await this.request<typeof replay>(
+              'session.events.since',
+              { session_id: sid, last_seen: 0 },
+              REPLAY_REQUEST_TIMEOUT_MS
+            )
+
+            if (!Array.isArray(fresh?.events) || fresh.generation !== generation) {
+              throw new Error('Replay generation changed during recovery')
+            }
+
+            replay = fresh
+            generation = fresh.generation
+          } catch {
+            hold.delete(sid)
+            replayRecoveryFailed = true
+
+            continue
+          }
+        }
+
+        const latest = replay.latest_seq
 
         if (
           (typeof generation !== 'string' || !generation) &&
@@ -636,9 +670,9 @@ export class JsonRpcGatewayClient {
           this.lastSeenSeq.delete(sid)
         }
 
-        this.adoptReplayGeneration(sid, generation)
+        const generationChanged = Boolean(previousGeneration && generation !== previousGeneration)
 
-        if (result.value.truncated === true) {
+        if (replay.truncated === true) {
           // A retained tail is not a valid transcript. Rebuild from the
           // authoritative history before releasing live frames that raced the
           // request, then advance to the server snapshot that history covers.
@@ -659,6 +693,10 @@ export class JsonRpcGatewayClient {
             continue
           }
 
+          if (typeof generation === 'string' && generation) {
+            this.lastSeenGeneration.set(sid, generation)
+          }
+
           if (typeof latest === 'number' && Number.isFinite(latest)) {
             this.lastSeenSeq.set(sid, latest)
           }
@@ -666,12 +704,26 @@ export class JsonRpcGatewayClient {
           continue
         }
 
-        for (const event of result.value.events) {
+        if (generationChanged && typeof generation === 'string') {
+          // Commit the new namespace only after its zero-based snapshot is in
+          // hand. This lets its seqs start at one without destroying the old
+          // checkpoint on any request or recovery failure above.
+          this.lastSeenGeneration.set(sid, generation)
+          this.lastSeenSeq.set(sid, 0)
+        } else {
+          this.adoptReplayGeneration(sid, generation)
+        }
+
+        for (const event of replay.events ?? []) {
           if (!event?.type) {
             continue
           }
 
           this.dispatchIfNewer(event as GatewayEvent)
+        }
+
+        if (generationChanged && typeof latest === 'number' && Number.isFinite(latest)) {
+          this.lastSeenSeq.set(sid, Math.max(this.lastSeenSeq.get(sid) ?? 0, latest))
         }
       }
     } catch {

@@ -394,8 +394,122 @@ describe('JsonRpcGatewayClient event-seq tracking + replay resume', () => {
       }
     })
 
+    await vi.waitFor(() => expect(sock.lastRequest().params.last_seen).toBe(0))
+    const freshRequest = sock.lastRequest()
+    sock.serverFrame({
+      jsonrpc: '2.0',
+      id: freshRequest.id,
+      result: {
+        events: [{ type: 'message.delta', session_id: 's1', seq: 1, replay_generation: 'gen-B' }],
+        latest_seq: 1,
+        truncated: false,
+        generation: 'gen-B'
+      }
+    })
+
     await vi.waitFor(() => expect(seen).toEqual([10, 1]))
     expect(client.getSeqWatermarks().s1).toBe(1)
+    client.close()
+  })
+
+  it('refetches a changed generation from zero before releasing later live frames', async () => {
+    const client = makeClient()
+    const seen: number[] = []
+    client.on('message.delta', event => seen.push((event as unknown as { seq: number }).seq))
+
+    const first = client.connect('ws://x')
+    let sock = sockets[sockets.length - 1]
+    sock.open()
+    await first
+    sock.serverFrame({
+      jsonrpc: '2.0',
+      method: 'event',
+      params: { type: 'message.delta', session_id: 's1', seq: 10, replay_generation: 'gen-A' }
+    })
+
+    client.invalidate('drop')
+    const second = client.connect('ws://x')
+    sock = sockets[sockets.length - 1]
+    sock.open()
+    await second
+    await vi.waitFor(() => expect(sock.lastRequest().params).toMatchObject({ session_id: 's1', last_seen: 10 }))
+
+    const staleRequest = sock.lastRequest()
+    sock.serverFrame({
+      jsonrpc: '2.0',
+      id: staleRequest.id,
+      result: { events: [], latest_seq: 2, truncated: false, generation: 'gen-B' }
+    })
+
+    await vi.waitFor(() => expect(sock.lastRequest().params).toMatchObject({ session_id: 's1', last_seen: 0 }))
+    sock.serverFrame({
+      jsonrpc: '2.0',
+      method: 'event',
+      params: { type: 'message.delta', session_id: 's1', seq: 3, replay_generation: 'gen-B' }
+    })
+
+    const freshRequest = sock.lastRequest()
+    sock.serverFrame({
+      jsonrpc: '2.0',
+      id: freshRequest.id,
+      result: {
+        events: [
+          { type: 'message.delta', session_id: 's1', seq: 1, replay_generation: 'gen-B' },
+          { type: 'message.delta', session_id: 's1', seq: 2, replay_generation: 'gen-B' }
+        ],
+        latest_seq: 2,
+        truncated: false,
+        generation: 'gen-B'
+      }
+    })
+
+    await vi.waitFor(() => expect(seen).toEqual([10, 1, 2, 3]))
+    expect(client.getSeqWatermarks().s1).toBe(3)
+    client.close()
+  })
+
+  it('preserves the old generation checkpoint when zero-based recovery fails', async () => {
+    const client = makeClient()
+    const first = client.connect('ws://x')
+    let sock = sockets[sockets.length - 1]
+    sock.open()
+    await first
+    sock.serverFrame({
+      jsonrpc: '2.0',
+      method: 'event',
+      params: { type: 'message.delta', session_id: 's1', seq: 10, replay_generation: 'gen-A' }
+    })
+
+    client.invalidate('drop')
+    const second = client.connect('ws://x')
+    sock = sockets[sockets.length - 1]
+    sock.open()
+    await second
+    await vi.waitFor(() => expect(sock.lastRequest().params.last_seen).toBe(10))
+
+    const staleRequest = sock.lastRequest()
+    sock.serverFrame({
+      jsonrpc: '2.0',
+      id: staleRequest.id,
+      result: { events: [], latest_seq: 2, truncated: true, generation: 'gen-B' }
+    })
+    await vi.waitFor(() => expect(sock.lastRequest().params.last_seen).toBe(0))
+
+    const freshRequest = sock.lastRequest()
+    sock.serverFrame({
+      jsonrpc: '2.0',
+      id: freshRequest.id,
+      error: { code: -32000, message: 'replay unavailable' }
+    })
+
+    await vi.waitFor(() => expect(sock.readyState).toBe(3))
+    expect(client.getSeqWatermarks().s1).toBe(10)
+
+    const third = client.connect('ws://x')
+    sock = sockets[sockets.length - 1]
+    sock.open()
+    await third
+    await vi.waitFor(() => expect(sock.lastRequest().params).toMatchObject({ session_id: 's1', last_seen: 10 }))
     client.close()
   })
 
