@@ -731,12 +731,13 @@ export function useRoster() {
 
 /** Synchronous union-roster read for the composer surfaces (autocomplete
  *  provider + mention middleware). useRoster caches under
- *  [...ROSTER_KEY, activeConnectionId] — a 3-element key — so a bare
- *  getQueryData(ROSTER_KEY) exact-match lookup returns undefined forever
- *  (issue #89303: remote handles absent from @ autocomplete, mentions
- *  unrouted). Read the live connection's entry first, then fall back to a
- *  prefix scan keeping the freshest snapshot. Never throws: cold cache or
- *  legacy queryClient returns null and callers fall back to their own path. */
+ *  [...ROSTER_KEY, activeConnectionId, activeProfile] — a 4-element key — so
+ *  a bare getQueryData(ROSTER_KEY) exact-match lookup returns undefined
+ *  forever (issue #89303: remote handles absent from @ autocomplete,
+ *  mentions unrouted). Read the live connection+profile entry first, then
+ *  the legacy connection-only entry, then fall back to a prefix scan keeping
+ *  the freshest snapshot. Never throws: cold cache or legacy queryClient
+ *  returns null and callers fall back to their own path. */
 export function cachedUnionRoster(): RosterSnapshot | null {
   if (typeof queryClient === 'undefined' || !queryClient || typeof queryClient.getQueryData !== 'function') {
     return null
@@ -744,10 +745,17 @@ export function cachedUnionRoster(): RosterSnapshot | null {
 
   try {
     const connectionId = String(host.state.connectionId?.get?.() || host.activeConnectionId?.() || 'local')
-    const exact = queryClient.getQueryData<RosterSnapshot>([...ROSTER_KEY, connectionId])
+    const activeProfile = String(host.state.profile?.get?.() || 'default').trim() || 'default'
+    const exact = queryClient.getQueryData<RosterSnapshot>([...ROSTER_KEY, connectionId, activeProfile])
 
     if (Array.isArray(exact?.profiles)) {
       return exact
+    }
+
+    const legacyExact = queryClient.getQueryData<RosterSnapshot>([...ROSTER_KEY, connectionId])
+
+    if (Array.isArray(legacyExact?.profiles)) {
+      return legacyExact
     }
 
     if (typeof queryClient.getQueriesData === 'function') {
