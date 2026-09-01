@@ -345,6 +345,10 @@ async def _handle_room_member_grant_refresh(
             ttl_seconds=dispatch_ttl,
             status_expires_at=hard_expiry,
         )
+        # Close the refresh-versus-retirement race. If revocation landed after
+        # the first authorization check, never return the replacement. If it
+        # lands after this check, its scope timestamp also covers this token.
+        self._room_grant_claims(request, permission="dispatch")
     except Exception as exc:
         return _room_grant_error_response(exc, _openai_error=_openai_error)
     return web.json_response(

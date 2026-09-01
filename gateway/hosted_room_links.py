@@ -160,6 +160,22 @@ def load_room_links(db_path: Path | str) -> tuple[StoredRoomLink, ...]:
     return tuple(StoredRoomLink.from_record(row) for row in rows)
 
 
+def load_room_link(
+    db_path: Path | str,
+    *,
+    room_id: str,
+    member_id: str,
+) -> StoredRoomLink | None:
+    """Load one exact persisted route without scanning unrelated rooms."""
+
+    row = hosted_rooms.room_link_record(
+        db_path,
+        room_id=_short_string(room_id, "room_id"),
+        member_id=_short_string(member_id, "member_id"),
+    )
+    return StoredRoomLink.from_record(row) if row is not None else None
+
+
 def load_room_links_tolerant(
     db_path: Path | str,
 ) -> tuple[tuple[StoredRoomLink, ...], tuple[str, ...]]:
