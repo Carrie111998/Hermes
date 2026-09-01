@@ -36,19 +36,13 @@ function PhotonIcon(props: React.SVGProps<SVGSVGElement>) {
   )
 }
 
-// DingTalk's compact list mark uses the same small colored chip as the other
-// platforms, but keeps the brand's filled center at this size. The outer ring
-// preserves the circular silhouette; the white glyph prevents it becoming a
-// generic blue dot.
+// DingTalk's compact list mark is the middle, swept-wing silhouette from the
+// product mark. It needs a solid blue field at 24px; reducing it to a ring or
+// tint makes the wing disappear.
 function DingTalkIcon(props: React.SVGProps<SVGSVGElement>) {
   return (
-    <svg fill="none" viewBox="0 0 24 24" {...props}>
-      <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="1.75" />
-      <circle cx="12" cy="12" fill="currentColor" r="6.25" />
-      <path
-        d="m8.45 7.8 6.6 2.475a1 1 0 0 1 .568 1.33L14.48 13.9h1.5l-4.7 3.75.92-3.53c-2.27-.22-2.94-2.54-3.75-6.32Z"
-        fill="white"
-      />
+    <svg fill="currentColor" viewBox="0 0 24 24" {...props}>
+      <path d="M5.04 5.37c2.9.52 5.85 1.37 8.72 2.6 1.08.47 2.1 1.06 3.03 1.77l1.7-2.3c.3-.4.92-.18.9.32l-.12 3.22 2.35.95c.48.2.42.9-.09 1l-2.45.5c-.22 2.1-1.16 3.83-2.82 5.18-.82.66-1.78 1.12-2.8 1.35l1.08-3.03c-1.47-.04-2.86-.48-4.12-1.3-1.68-1.1-2.78-2.6-3.3-4.52l2.92.6c-.68-1.28-1.52-2.45-2.53-3.48L5.04 5.37Z" />
     </svg>
   )
 }
@@ -76,6 +70,8 @@ type IconKind = 'brand' | 'generic'
 interface PlatformIconSpec {
   Icon?: ComponentType<SVGProps<SVGSVGElement>>
   color: string
+  backgroundColor?: string
+  glyphColor?: string
   kind: IconKind
   monochrome?: boolean
   monogram?: string
@@ -87,7 +83,14 @@ const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   // Slack removed from Simple Icons by Salesforce request — letter monogram.
   slack: { color: '#4A154B', kind: 'brand', monogram: 'S' },
   mattermost: { Icon: SiMattermost, color: '#0058CC', kind: 'brand' },
-  matrix: { Icon: SiMatrix, color: '#0DBD8B', kind: 'brand' },
+  matrix: {
+    Icon: SiMatrix,
+    color: '#000000',
+    backgroundColor: '#F7F7F5',
+    glyphColor: '#000000',
+    kind: 'brand',
+    monochrome: true
+  },
   signal: { Icon: SiSignal, color: '#3A76F0', kind: 'brand' },
   whatsapp: { Icon: SiWhatsapp, color: '#25D366', kind: 'brand' },
   bluebubbles: { color: '#27AE60', kind: 'brand', monogram: 'BB' },
@@ -107,9 +110,23 @@ const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   weixin: { Icon: SiWechat, color: '#07C160', kind: 'brand' },
   wecom: { Icon: WeComIcon, color: '#2BAD13', kind: 'brand' },
   wecom_callback: { Icon: WeComIcon, color: '#2BAD13', kind: 'brand' },
-  dingtalk: { Icon: DingTalkIcon, color: '#0089FF', kind: 'brand' },
+  dingtalk: {
+    Icon: DingTalkIcon,
+    color: '#0089FF',
+    backgroundColor: '#0089FF',
+    glyphColor: '#FFFFFF',
+    kind: 'brand'
+  },
   qqbot: { Icon: SiQq, color: '#EB1923', kind: 'brand' },
-  yuanbao: { color: '#F59E0B', kind: 'brand', monogram: 'YB' }
+  yuanbao: { color: '#F59E0B', kind: 'brand', monogram: 'YB' },
+  // These connectors do not ship a license-auditable glyph in the current
+  // icon package. A deliberate monogram is preferable to an unrelated logo.
+  a2a: { color: '#64748B', kind: 'brand', monogram: 'A2A' },
+  buzz: { color: '#64748B', kind: 'brand', monogram: 'B' },
+  feishu: { color: '#3370FF', kind: 'brand', monogram: 'F' },
+  relay: { color: '#64748B', kind: 'brand', monogram: 'R' },
+  whatsapp_cloud: { Icon: SiWhatsapp, color: '#25D366', kind: 'brand' },
+  msgraph_webhook: { color: '#6264A7', kind: 'brand', monogram: 'M' }
 }
 
 interface PlatformAvatarProps extends Omit<ComponentPropsWithoutRef<'span'>, 'children'> {

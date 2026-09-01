@@ -14,7 +14,8 @@ describe('PlatformAvatar brand glyphs', () => {
     ['google_chat', 'Google Chat'],
     ['line', 'LINE'],
     ['ntfy', 'ntfy'],
-    ['simplex', 'SimpleX Chat']
+    ['simplex', 'SimpleX Chat'],
+    ['whatsapp_cloud', 'WhatsApp Cloud']
   ])('renders a local brand glyph for %s', (platformId, platformName) => {
     const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
 
@@ -27,7 +28,12 @@ describe('PlatformAvatar brand glyphs', () => {
     ['raft', 'Raft', 'R'],
     ['teams', 'Microsoft Teams', 'T'],
     ['bluebubbles', 'BlueBubbles', 'BB'],
-    ['yuanbao', 'Yuanbao', 'YB']
+    ['yuanbao', 'Yuanbao', 'YB'],
+    ['a2a', 'A2A', 'A2A'],
+    ['buzz', 'Buzz', 'B'],
+    ['feishu', 'Feishu / Lark', 'F'],
+    ['relay', 'Relay', 'R'],
+    ['msgraph_webhook', 'Microsoft Graph webhook', 'M']
   ])('renders a stable brand monogram for %s', (platformId, platformName, monogram) => {
     const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
 
@@ -40,5 +46,15 @@ describe('PlatformAvatar brand glyphs', () => {
 
     expect(container.querySelector('svg')).toBeNull()
     expect(screen.getByText('C')).toBeTruthy()
+  })
+
+  it('uses the compact visual treatments for DingTalk and Matrix', () => {
+    const { container: dingtalk } = render(<PlatformAvatar platformId="dingtalk" platformName="DingTalk" />)
+    expect(dingtalk.querySelector('span')?.getAttribute('style')).toContain('background-color: rgb(0, 137, 255)')
+
+    cleanup()
+    const { container: matrix } = render(<PlatformAvatar platformId="matrix" platformName="Matrix" />)
+    expect(matrix.querySelector('span')?.getAttribute('style')).toContain('background-color: rgb(247, 247, 245)')
+    expect(matrix.querySelector('span')?.getAttribute('style')).toContain('color: rgb(0, 0, 0)')
   })
 })
