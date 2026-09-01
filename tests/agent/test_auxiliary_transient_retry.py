@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import os
 import types
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -58,5 +58,94 @@ def test_model_participates_in_client_cache_key():
         api_key="K", model="anthropic/claude-opus-4.8",
     )
     assert k_opus == k_opus2
+
+
+def test_title_generation_timeout_does_not_retry_or_fallback(monkeypatch):
+    """A cosmetic title timeout should keep the derived title, not add load."""
+    from agent.auxiliary_client import call_llm
+
+    client = MagicMock()
+    client.base_url = "http://localhost:13305/v1"
+    client.chat.completions.create.side_effect = TimeoutError("request timed out")
+
+    monkeypatch.setattr("agent.auxiliary_client._TRANSIENT_RETRY_BACKOFF_BASE", 0)
+
+    with (
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("custom", "tiny-title-model", None, None, None)),
+        patch("agent.auxiliary_client._get_cached_client",
+              return_value=(client, "tiny-title-model")),
+        patch("agent.auxiliary_client._get_auxiliary_task_config",
+              return_value={"timeout": 1}),
+        patch("agent.auxiliary_client._try_configured_fallback_chain") as configured,
+        patch("agent.auxiliary_client._try_main_agent_model_fallback") as main_fallback,
+        patch("agent.auxiliary_client._try_payment_fallback") as payment_fallback,
+        pytest.raises(TimeoutError, match="request timed out"),
+    ):
+        call_llm(task="title_generation", messages=[{"role": "user", "content": "title"}])
+
+    assert client.chat.completions.create.call_count == 1
+    configured.assert_not_called()
+    main_fallback.assert_not_called()
+    payment_fallback.assert_not_called()
+
+
+def test_async_title_generation_timeout_does_not_retry_or_fallback():
+    """The async title path must have the same terminal-timeout behavior."""
+    import asyncio
+
+    from agent import auxiliary_client as ac
+
+    client = MagicMock()
+    client.base_url = "http://localhost:13305/v1"
+    client.chat.completions.create = AsyncMock(side_effect=TimeoutError("request timed out"))
+
+    async def run():
+        with (
+            patch.object(ac, "_resolve_task_provider_model",
+                         return_value=("custom", "tiny-title-model", None, None, None)),
+            patch.object(ac, "_get_cached_client",
+                         return_value=(client, "tiny-title-model")),
+            patch.object(ac, "_get_auxiliary_task_config", return_value={"timeout": 1}),
+            patch.object(ac, "_try_configured_fallback_chain") as configured,
+            patch.object(ac, "_try_main_agent_model_fallback") as main_fallback,
+            patch.object(ac, "_try_payment_fallback") as payment_fallback,
+            pytest.raises(TimeoutError, match="request timed out"),
+        ):
+            await ac.async_call_llm(
+                task="title_generation",
+                messages=[{"role": "user", "content": "title"}],
+            )
+        configured.assert_not_called()
+        main_fallback.assert_not_called()
+        payment_fallback.assert_not_called()
+
+    asyncio.run(run())
+    assert client.chat.completions.create.call_count == 1
+
+
+def test_title_generation_forwards_output_cap():
+    """OpenAI-compatible title requests preserve the 64-token cap."""
+    from agent.auxiliary_client import call_llm
+
+    client = MagicMock()
+    client.base_url = "http://localhost:13305/v1"
+    client.chat.completions.create.return_value = MagicMock()
+
+    with (
+        patch("agent.auxiliary_client._resolve_task_provider_model",
+              return_value=("custom", "tiny-title-model", None, None, None)),
+        patch("agent.auxiliary_client._get_cached_client",
+              return_value=(client, "tiny-title-model")),
+        patch("agent.auxiliary_client._validate_llm_response",
+              side_effect=lambda response, _task, **_kwargs: response),
+    ):
+        call_llm(
+            task="title_generation",
+            messages=[{"role": "user", "content": "title"}],
+            max_tokens=64,
+        )
+
+    assert client.chat.completions.create.call_args.kwargs["max_tokens"] == 64
 
 
