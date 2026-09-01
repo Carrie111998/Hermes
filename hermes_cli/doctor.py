@@ -2727,6 +2727,10 @@ def run_doctor(args):
             check_info(note)
 
     _section("API Connectivity")
+    # Normalize proxy env vars (e.g., socks:// -> socks5://) so probes see
+    # the same normalized env the real agent runtime uses (#100080).
+    from utils import normalize_proxy_env_vars
+    normalize_proxy_env_vars()
     # Refactor: every connectivity probe below is HTTP-bound and fully
     # independent. Running them in series spent ~5s wall on a typical
     # workstation (2s of that was boto3's IMDS lookup for AWS credentials,
