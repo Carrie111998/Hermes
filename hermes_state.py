@@ -10607,7 +10607,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Collision: find the highest existing #N variant and increment.
         with self._read_ctx() as conn:
             rows = conn.execute(
-                "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\\\' AND id != ?",
+                "SELECT title FROM sessions WHERE title = ? OR (title LIKE ? ESCAPE '\\' AND id != ?)",
                 (base, f"{escaped} #%", session_id),
             ).fetchall()
         existing_titles = {row["title"] for row in rows}

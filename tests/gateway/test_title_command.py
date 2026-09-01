@@ -128,13 +128,12 @@ class TestHandleTitleCommand:
 
 
 # ---------------------------------------------------------------------------
-# /title in help and known_commands
+# Telegram topic duplicate title handling
 # ---------------------------------------------------------------------------
 
 
-class TestTitleInHelp:
-    """Verify /title appears in help text and known commands."""
-
+class TestTelegramTopicDuplicateTitle:
+    """Tests for Telegram topic duplicate-title lineage handling."""
 
     @pytest.mark.asyncio
     async def test_telegram_topic_duplicate_title_reserves_lineage_alias(self, tmp_path):
@@ -170,17 +169,26 @@ class TestTitleInHelp:
         """Non-Telegram lanes still raise ValueError on duplicate title."""
         from hermes_state import SessionDB
         db = SessionDB(db_path=tmp_path / "state.db")
-        db.create_session("other_session", "api")
+        db.create_session("other_session", "api_server")
         db.set_session_title("other_session", "Taken")
-        db.create_session("test_session_123", "api")
+        db.create_session("test_session_123", "api_server")
 
         runner = _make_runner(session_db=db)
         # Not a telegram topic lane
         runner._is_telegram_topic_lane = lambda _: False
 
-        event = _make_event(text="/title Taken", platform=Platform.API)
+        event = _make_event(text="/title Taken", platform=Platform.API_SERVER)
         result = await runner._handle_title_command(event)
 
         assert "already in use" in result
         assert "⚠️" in result
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# /title in help and known_commands
+# ---------------------------------------------------------------------------
+
+
+class TestTitleInHelp:
+    """Verify /title appears in help text and known commands."""

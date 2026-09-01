@@ -5122,18 +5122,18 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.title.empty_after_clean")
             # Set the title
             try:
+                from hermes_state import SessionDB
                 # Telegram topic lanes allow duplicate visible names via lineage aliases.
                 is_telegram_topic = await asyncio.to_thread(
                     self._is_telegram_topic_lane, source
                 ) if self._session_db else False
                 
                 if is_telegram_topic:
-                    result = await asyncio.to_thread(
-                        self._session_db.set_session_title_with_lineage_collision_handling,
+                    result = await self._session_db.set_session_title_with_lineage_collision_handling(
                         session_id,
                         sanitized,
                         allow_lineage_collision=True,
-                        source=hermes_state.SessionDB.TITLE_SOURCE_USER,
+                        source=SessionDB.TITLE_SOURCE_USER,
                     )
                     if result is None:
                         return t("gateway.title.not_found")
