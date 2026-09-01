@@ -2924,6 +2924,48 @@ class TestNewEndpoints:
         assert data["active_extract_backend"] == "firecrawl"
 
 
+    def test_select_web_extract_on_nous_row_pins_managed_provider(self):
+        """PUT capability=extract on the managed Nous Subscription row must
+        persist the "nous" pin (not its underlying "firecrawl" vendor string),
+        matching apply_provider_selection's whole-provider path — otherwise
+        the pin is indistinguishable from a BYOK firecrawl pick that demands
+        FIRECRAWL_API_KEY (#100513)."""
+        resp = self.client.put(
+            "/api/tools/toolsets/web/provider",
+            json={"provider": "Nous Subscription", "capability": "extract"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["capability"] == "extract"
+
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        assert cfg["web"]["extract_backend"] == "nous"
+        # The shared backend stays untouched ("" is the schema default, not a
+        # write) — search keeps its own chain.
+        assert not (cfg["web"].get("backend") or "").strip()
+
+        # The runtime dispatcher maps the nous pin onto the firecrawl
+        # provider (serviced through the Tool Gateway).
+        from tools.web_tools import _get_extract_backend
+        assert _get_extract_backend() == "firecrawl"
+
+
+    def test_select_web_extract_on_selfhosted_row_still_writes_vendor(self):
+        """The BYOK/self-hosted firecrawl rows keep writing their vendor
+        string — only the managed row persists "nous"."""
+        resp = self.client.put(
+            "/api/tools/toolsets/web/provider",
+            json={"provider": "Firecrawl Self-Hosted", "capability": "extract"},
+        )
+        assert resp.status_code == 200
+
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        assert cfg["web"]["extract_backend"] == "firecrawl"
+
+
     # -- Terminal execution backend picker ---------------------------------
 
 

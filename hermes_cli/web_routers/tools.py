@@ -550,11 +550,22 @@ async def select_toolset_provider(
                             status_code=400,
                             detail=f"{body.provider} does not support {body.capability}",
                         )
+                    # The managed Nous Subscription row carries
+                    # web_backend="firecrawl" but is serviced through the
+                    # Tool Gateway — persist the "nous" pin (same as
+                    # apply_provider_selection's whole-provider path) so the
+                    # per-capability override isn't indistinguishable from a
+                    # BYOK firecrawl pick that demands FIRECRAWL_API_KEY.
+                    from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER
+
+                    managed_feature = bool(prov.get("managed_nous_feature"))
                     web_cfg = config.setdefault("web", {})
                     if not isinstance(web_cfg, dict):
                         web_cfg = {}
                         config["web"] = web_cfg
-                    web_cfg[f"{body.capability}_backend"] = backend
+                    web_cfg[f"{body.capability}_backend"] = (
+                        NOUS_MANAGED_PROVIDER if managed_feature else backend
+                    )
                 else:
                     try:
                         apply_provider_selection(name, body.provider, config)
