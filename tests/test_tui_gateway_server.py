@@ -3879,6 +3879,84 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     assert server._sessions[runtime_sid]["model_override"] == captured["model_override"]
 
 
+def test_eager_resume_reuses_concurrent_winner_without_reentering_resume_lock(
+    monkeypatch,
+):
+    target = "stored-race"
+    live_transport = object()
+    closed = []
+
+    class _StrictResumeLock:
+        def __init__(self):
+            self.held = False
+
+        def __enter__(self):
+            assert not self.held, "session resume lock was re-entered"
+            self.held = True
+            return self
+
+        def __exit__(self, *_args):
+            self.held = False
+
+    class _DB:
+        def get_session(self, session_id):
+            return {"id": session_id, "cwd": "/tmp", "message_count": 1}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def reopen_session(self, _session_id):
+            return None
+
+        def get_messages_as_conversation(self, _session_id, **_kwargs):
+            return [{"role": "user", "content": "hello"}]
+
+    built_agent = types.SimpleNamespace(close=lambda: closed.append("built"))
+    winner = _session(
+        agent=types.SimpleNamespace(),
+        session_key=target,
+        transport=server._detached_ws_transport,
+        running=False,
+        history=[{"role": "user", "content": "hello"}],
+    )
+    server._sessions["winner-sid"] = winner
+    live_results = iter((None, ("winner-sid", winner)))
+
+    monkeypatch.setattr(server, "_session_resume_lock", _StrictResumeLock())
+    monkeypatch.setattr(
+        server, "_find_live_session_by_key", lambda _key: next(live_results)
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_make_agent", lambda *_args, **_kwargs: built_agent)
+
+    try:
+        response = _dispatch_sync(
+            {
+                "id": "eager-race",
+                "method": "session.resume",
+                "params": {
+                    "session_id": target,
+                    "eager_build": True,
+                    "omit_messages": True,
+                },
+            },
+            transport=live_transport,
+        )
+
+        assert response is not None
+        assert response["result"]["session_id"] == "winner-sid"
+        assert winner["transport"] is live_transport
+        assert closed == ["built"]
+    finally:
+        server._sessions.pop("winner-sid", None)
+
+
 def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
     target = "stored-profile-session"
     launch_cwd = tmp_path / "launch"
@@ -4769,7 +4847,7 @@ def test_session_close_settles_active_turn_before_teardown(monkeypatch):
     assert response["result"] == {"closed": True}
 
 
-def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
+def test_ws_orphan_reap_interrupts_isolated_turn_after_running_grace(monkeypatch):
     callbacks = []
     interrupted = []
     torn_down = []
@@ -4794,6 +4872,7 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
         _compute_host_active=True,
         history=[{"role": "assistant", "content": "partial"}],
         queued_prompt={"text": "must not run"},
+        _client_gone_running_deadline=0.0,
     )
     server._sessions["isolated-sid"] = session
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
@@ -4918,6 +4997,222 @@ def test_session_resume_does_not_rebind_after_client_gone_interrupt_claim(monkey
         server._sessions.pop("live-sid", None)
 
 
+def test_lazy_unpersisted_resume_does_not_rebind_after_disconnect_interrupt_claim(
+    monkeypatch,
+):
+    cancelled = []
+
+    class _DB:
+        def get_session(self, _session_id):
+            return None
+
+        def get_session_by_title(self, _title):
+            return None
+
+    class _Timer(threading.Timer):
+        def __init__(self):
+            super().__init__(0, lambda: None)
+
+        def cancel(self):
+            cancelled.append(self)
+
+    live_transport = object()
+    timer = _Timer()
+    session = _session(
+        session_key="stored-lazy",
+        transport=server._detached_ws_transport,
+        running=True,
+        _client_gone_interrupt_requested=True,
+        profile_home=None,
+    )
+    server._sessions["lazy-sid"] = session
+    server._pending_ws_reaps["lazy-sid"] = timer
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    try:
+        response = _dispatch_sync(
+            {
+                "id": "resume-unpersisted-after-claim",
+                "method": "session.resume",
+                "params": {"session_id": "stored-lazy", "omit_messages": True},
+            },
+            transport=live_transport,
+        )
+
+        assert response is not None
+        assert response["error"]["code"] == 4009
+        assert response["error"]["message"] == "session disconnect interrupt settling"
+        assert session["transport"] is server._detached_ws_transport
+        assert server._pending_ws_reaps["lazy-sid"] is timer
+        assert cancelled == []
+    finally:
+        server._sessions.pop("lazy-sid", None)
+        server._pending_ws_reaps.pop("lazy-sid", None)
+
+
+def test_session_activate_does_not_rebind_after_client_gone_interrupt_claim(monkeypatch):
+    live_transport = object()
+    session = _session(
+        transport=server._detached_ws_transport,
+        running=True,
+        _client_gone_interrupt_requested=True,
+    )
+    server._sessions["live-sid"] = session
+    monkeypatch.setattr(server, "current_transport", lambda: live_transport)
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "activate-after-claim",
+                "method": "session.activate",
+                "params": {"session_id": "live-sid"},
+            }
+        )
+
+        assert response is not None
+        assert response["error"]["code"] == 4009
+        assert response["error"]["message"] == "session disconnect interrupt settling"
+        assert session["transport"] is server._detached_ws_transport
+    finally:
+        server._sessions.pop("live-sid", None)
+
+
+def test_prompt_submit_serializes_reconnect_against_orphan_deadline_claim(
+    monkeypatch,
+):
+    import queue
+
+    callbacks = []
+    interrupted = []
+    slot_claims = []
+    progress = queue.Queue()
+    release_reap = threading.Event()
+    thread_errors = []
+
+    class _ObservedLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+
+        def __enter__(self):
+            if not self._lock.acquire(blocking=False):
+                progress.put("resume-lock")
+                self._lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            self._lock.release()
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+            self.daemon = False
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            return None
+
+    def _deadline_check(*_args, **_kwargs):
+        progress.put("reaper")
+        assert release_reap.wait(timeout=5.0)
+        return False
+
+    real_busy_submit = server._handle_busy_submit
+
+    def _busy_submit(*args, **kwargs):
+        progress.put("busy-submit")
+        return real_busy_submit(*args, **kwargs)
+
+    live_transport = object()
+    session = _session(
+        transport=server._detached_ws_transport,
+        running=True,
+        _client_gone_running_deadline=0.0,
+    )
+    server._sessions["deadline-sid"] = session
+    monkeypatch.setattr(server, "_session_resume_lock", _ObservedLock())
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_session_has_active_delegations", _deadline_check)
+    monkeypatch.setattr(
+        server,
+        "_ensure_active_session_slot",
+        lambda sid, claimed: slot_claims.append((sid, claimed)),
+    )
+    monkeypatch.setattr(server, "_handle_busy_submit", _busy_submit)
+    monkeypatch.setattr(
+        server,
+        "_interrupt_session_turn",
+        lambda sid, claimed, *, request_id=None: interrupted.append(
+            (sid, claimed, request_id)
+        )
+        or False,
+    )
+
+    response = {}
+
+    def _run_reap():
+        try:
+            callbacks.pop(0)()
+        except BaseException as exc:  # surface worker failures on the test thread
+            thread_errors.append(exc)
+
+    def _submit():
+        try:
+            response["value"] = _dispatch_sync(
+                {
+                    "id": "submit-during-deadline-claim",
+                    "method": "prompt.submit",
+                    "params": {
+                        "session_id": "deadline-sid",
+                        "text": "run this next",
+                        "queued": True,
+                    },
+                },
+                transport=live_transport,
+            )
+        except BaseException as exc:  # surface worker failures on the test thread
+            thread_errors.append(exc)
+
+    reap_thread = None
+    submit_thread = None
+    try:
+        server._schedule_ws_orphan_reap("deadline-sid")
+        reap_thread = threading.Thread(target=_run_reap)
+        reap_thread.start()
+        assert progress.get(timeout=5.0) == "reaper"
+
+        submit_thread = threading.Thread(target=_submit)
+        submit_thread.start()
+        progress.get(timeout=5.0)
+        release_reap.set()
+        reap_thread.join(timeout=5.0)
+        submit_thread.join(timeout=5.0)
+
+        assert not thread_errors
+        assert not reap_thread.is_alive()
+        assert not submit_thread.is_alive()
+        assert response["value"]["error"] == {
+            "code": 4009,
+            "message": "session disconnect interrupt settling",
+        }
+        assert session["transport"] is server._detached_ws_transport
+        assert session.get("queued_prompt") is None
+        assert slot_claims == []
+        assert interrupted == [
+            ("deadline-sid", session, "client-gone-deadline-sid")
+        ]
+    finally:
+        release_reap.set()
+        if reap_thread is not None:
+            reap_thread.join(timeout=5.0)
+        if submit_thread is not None:
+            submit_thread.join(timeout=5.0)
+        server._sessions.pop("deadline-sid", None)
+        server._pending_ws_reaps.pop("deadline-sid", None)
+
+
 def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
     callbacks = []
     interrupted = []
@@ -4943,6 +5238,7 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
         transport=server._detached_ws_transport,
         running=True,
         _run_thread=_LiveThread(),
+        _client_gone_running_deadline=0.0,
     )
     server._sessions["delegating-turn"] = session
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
@@ -4973,9 +5269,11 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
         server._sessions.pop("delegating-turn", None)
 
 
-def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
+def test_ws_orphan_reap_allows_detached_turn_to_finish(monkeypatch):
     callbacks = []
     interrupted = []
+    torn_down = []
+    disconnecting_transport = object()
 
     class _Timer:
         def __init__(self, _delay, callback):
@@ -4990,11 +5288,10 @@ def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
 
     def _interrupt():
         interrupted.append("interrupted")
-        session["running"] = False
 
     session = _session(
         agent=types.SimpleNamespace(interrupt=_interrupt),
-        transport=server._detached_ws_transport,
+        transport=disconnecting_transport,
         running=True,
         _run_thread=_LiveThread(),
     )
@@ -5002,16 +5299,247 @@ def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
     monkeypatch.setattr(server.threading, "Timer", _Timer)
     monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(
+        server,
+        "_teardown_popped_session",
+        lambda claimed, *, end_reason: torn_down.append((claimed, end_reason)) or True,
+    )
 
     try:
-        server._schedule_ws_orphan_reap("inline-sid")
+        assert server._close_sessions_for_transport(disconnecting_transport) == (0, 1)
         callbacks.pop(0)()
 
-        assert interrupted == ["interrupted"]
-        assert session["_turn_cancel_requested"] is True
+        assert interrupted == []
+        assert session.get("_turn_cancel_requested") is not True
+        assert "inline-sid" in server._sessions
         assert len(callbacks) == 1
+
+        session["running"] = False
+        callbacks.pop(0)()
+
+        assert "inline-sid" not in server._sessions
+        assert torn_down == [(session, "ws_orphan_reap")]
     finally:
         server._sessions.pop("inline-sid", None)
+
+
+def test_ws_orphan_reap_interrupts_turn_after_running_grace(monkeypatch):
+    timers = []
+    interrupted = []
+    now = [100.0]
+    disconnecting_transport = object()
+
+    class _Timer:
+        def __init__(self, delay, callback):
+            timers.append((delay, callback))
+
+        def start(self):
+            return None
+
+    session = _session(
+        agent=types.SimpleNamespace(interrupt=lambda: interrupted.append("interrupted")),
+        transport=disconnecting_transport,
+        running=True,
+    )
+    server._sessions["bounded-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 20.0)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(server, "_resolve_ws_orphan_running_grace", lambda: 10.0)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(
+        server, "_session_has_active_delegations", lambda *_args, **_kwargs: False
+    )
+
+    try:
+        assert server._close_sessions_for_transport(disconnecting_transport) == (0, 1)
+        assert timers[0][0] == 10.0
+        now[0] = 111.0
+        timers.pop(0)[1]()
+
+        assert interrupted == ["interrupted"]
+        assert session["_client_gone_interrupt_requested"] is True
+        assert timers[0][0] == server._WS_ORPHAN_INTERRUPT_REAP_POLL_S
+    finally:
+        server._sessions.pop("bounded-sid", None)
+
+
+def test_ws_orphan_reap_stale_cancelled_timer_cannot_replace_new_detachment(
+    monkeypatch,
+):
+    timers = []
+    now = [100.0]
+
+    class _Timer:
+        def __init__(self, delay, callback):
+            self.delay = delay
+            self.callback = callback
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            self.cancelled = True
+
+    sid = "stale-cancelled-timer"
+    session = _session(
+        transport=server._detached_ws_transport,
+        running=True,
+    )
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 20.0)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(server, "_resolve_ws_orphan_running_grace", lambda: 10.0)
+    monkeypatch.setattr(
+        server, "_session_has_active_delegations", lambda *_args, **_kwargs: False
+    )
+
+    try:
+        server._schedule_ws_orphan_reap(sid)
+        timer_a = timers[-1]
+
+        session["transport"] = object()
+        server._cancel_ws_orphan_reap(sid)
+        assert timer_a.cancelled is True
+
+        session["transport"] = server._detached_ws_transport
+        session.pop("_client_gone_interrupt_requested", None)
+        session.pop("_client_gone_interrupt_polls", None)
+        session.pop("_client_gone_running_deadline", None)
+        server._schedule_ws_orphan_reap(sid)
+        timer_b = timers[-1]
+
+        # Timer.cancel() cannot stop a callback that was already dispatched.
+        # A stale callback from detachment A must not disturb detachment B.
+        timer_a.callback()
+
+        assert server._pending_ws_reaps[sid] is timer_b
+        assert timers == [timer_a, timer_b]
+    finally:
+        server._cancel_ws_orphan_reap(sid)
+        server._sessions.pop(sid, None)
+
+
+def test_ws_orphan_reap_callback_clears_own_registration_after_session_removed(
+    monkeypatch,
+):
+    timers = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            self.callback = callback
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            self.cancelled = True
+
+    sid = "removed-before-reap"
+    server._sessions[sid] = _session(
+        transport=server._detached_ws_transport,
+        running=False,
+    )
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 20.0)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_resolve_ws_orphan_running_grace", lambda: 10.0)
+
+    try:
+        server._schedule_ws_orphan_reap(sid)
+        timer = timers[-1]
+        assert server._pending_ws_reaps[sid] is timer
+
+        # Another lifecycle owner may claim the session without knowing about
+        # this already-dispatched callback. The callback must still remove its
+        # own dead registration, but never one belonging to a later timer.
+        assert server._pop_session_by_id(sid) is not None
+        timer.callback()
+
+        assert sid not in server._pending_ws_reaps
+    finally:
+        server._cancel_ws_orphan_reap(sid)
+        server._sessions.pop(sid, None)
+
+
+def test_ws_orphan_reap_stale_continuation_cannot_replace_new_deadline(
+    monkeypatch,
+):
+    timers = []
+    now = [100.0]
+    running_grace = [100.0]
+
+    class _Timer:
+        def __init__(self, delay, callback):
+            self.delay = delay
+            self.callback = callback
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            self.cancelled = True
+
+    sid = "stale-reap-continuation"
+    session = _session(
+        transport=server._detached_ws_transport,
+        running=True,
+    )
+    server._sessions[sid] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 20.0)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(
+        server, "_resolve_ws_orphan_running_grace", lambda: running_grace[0]
+    )
+    monkeypatch.setattr(
+        server, "_session_has_active_delegations", lambda *_args, **_kwargs: False
+    )
+
+    original_schedule = server._schedule_ws_orphan_reap
+    detachment_b = {}
+
+    try:
+        original_schedule(sid)
+        timer_a = timers[-1]
+        now[0] = 120.0
+
+        def _interleave_reconnect_and_redetach(interleaved_sid, **stale_kwargs):
+            assert interleaved_sid == sid
+
+            session["transport"] = object()
+            server._cancel_ws_orphan_reap(sid)
+            session["transport"] = server._detached_ws_transport
+            session.pop("_client_gone_interrupt_requested", None)
+            session.pop("_client_gone_interrupt_polls", None)
+            session.pop("_client_gone_running_deadline", None)
+
+            running_grace[0] = 10.0
+            original_schedule(sid)
+            detachment_b["timer"] = server._pending_ws_reaps[sid]
+
+            # Resume the stale continuation from detachment A only after B has
+            # registered its own shorter running deadline and timer.
+            original_schedule(sid, **stale_kwargs)
+
+        monkeypatch.setattr(
+            server, "_schedule_ws_orphan_reap", _interleave_reconnect_and_redetach
+        )
+        timer_a.callback()
+
+        timer_b = detachment_b["timer"]
+        assert timer_b.delay == 10.0
+        assert server._pending_ws_reaps[sid] is timer_b
+        assert timers == [timer_a, timer_b]
+    finally:
+        server._cancel_ws_orphan_reap(sid)
+        server._sessions.pop(sid, None)
 
 
 def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeypatch):
@@ -5429,10 +5957,12 @@ def test_resume_rebind_cancels_pending_ws_orphan_reap(monkeypatch):
     try:
         server._schedule_ws_orphan_reap("cancel-sid")
         assert "cancel-sid" in server._pending_ws_reaps
+        assert "_client_gone_running_deadline" in session
 
         server._live_session_payload("cancel-sid", session, transport=_LiveTransport())
 
         assert "cancel-sid" not in server._pending_ws_reaps
+        assert "_client_gone_running_deadline" not in session
         assert len(cancelled) == 1
     finally:
         server._sessions.pop("cancel-sid", None)
@@ -5475,6 +6005,40 @@ def test_claim_or_reuse_live_winner_cancels_pending_reap(monkeypatch):
         assert live == ("winner-sid", winner)
         assert "winner-sid" not in server._pending_ws_reaps
         assert len(cancelled) == 1
+    finally:
+        server._sessions.pop("winner-sid", None)
+        server._sessions.pop("fresh-sid", None)
+        server._pending_ws_reaps.pop("winner-sid", None)
+
+
+def test_claim_or_reuse_live_interrupt_winner_keeps_pending_reap():
+    cancelled = []
+
+    class _Timer(threading.Timer):
+        def __init__(self):
+            super().__init__(0, lambda: None)
+
+        def cancel(self):
+            cancelled.append(self)
+
+    timer = _Timer()
+    winner = _session(
+        session_key="stored-claim",
+        transport=server._detached_ws_transport,
+        running=True,
+        _client_gone_interrupt_requested=True,
+    )
+    server._sessions["winner-sid"] = winner
+    server._pending_ws_reaps["winner-sid"] = timer
+
+    try:
+        live = server._claim_or_reuse_live(
+            "fresh-sid", "stored-claim", _session(), None
+        )
+
+        assert live == ("winner-sid", winner)
+        assert server._pending_ws_reaps["winner-sid"] is timer
+        assert cancelled == []
     finally:
         server._sessions.pop("winner-sid", None)
         server._sessions.pop("fresh-sid", None)
