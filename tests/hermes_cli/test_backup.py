@@ -1854,3 +1854,53 @@ class TestMemoryProviderExternalPaths:
 
 
 
+
+
+# ---------------------------------------------------------------------------
+# backup parser: --quick and --output are mutually exclusive
+# ---------------------------------------------------------------------------
+
+class TestBackupParserQuickOutputExclusive:
+    """`--quick` writes a managed snapshot dir; `--output` only applies to full
+    ZIP backups. Accepting both silently ignored the output path (HERMES-NL-08B).
+    """
+
+    @staticmethod
+    def _parser():
+        import argparse
+
+        from hermes_cli.subcommands.backup import build_backup_parser
+
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_backup_parser(subparsers, cmd_backup=lambda args: 0)
+        return parser, subparsers.choices["backup"]
+
+    @pytest.mark.parametrize("output_flag", ["-o", "--output"])
+    def test_quick_with_output_is_rejected(self, output_flag, tmp_path, capsys):
+        parser, _ = self._parser()
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(["backup", "--quick", output_flag, str(tmp_path / "b.zip")])
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "--output" in err or "-o" in err
+        assert "--quick" in err or "-q" in err
+
+    def test_quick_with_label_still_valid(self):
+        parser, _ = self._parser()
+        args = parser.parse_args(["backup", "--quick", "--label", "pre-update"])
+        assert args.quick is True
+        assert args.label == "pre-update"
+        assert args.output is None
+
+    def test_full_backup_with_output_still_valid(self, tmp_path):
+        target = str(tmp_path / "full.zip")
+        parser, _ = self._parser()
+        args = parser.parse_args(["backup", "-o", target])
+        assert args.quick is False
+        assert args.output == target
+
+    def test_output_help_mentions_quick_incompatibility(self):
+        _, backup_parser = self._parser()
+        action = next(a for a in backup_parser._actions if a.dest == "output")
+        assert "--quick" in action.help
