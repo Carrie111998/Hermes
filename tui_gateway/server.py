@@ -1263,6 +1263,7 @@ def _interrupt_session_turn(
 
     with session["history_lock"]:
         session["_turn_cancel_requested"] = True
+        session.pop("_queued_prompt_claimed", None)
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
         session["_queued_prompt_generation"] = int(
@@ -1433,6 +1434,7 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
                 and (
                     current.get("running")
                     or isinstance(current.get("queued_prompt"), dict)
+                    or current.get("_queued_prompt_claimed") is True
                 )
             ):
                 # Bot Mode owns both the active turn and an acknowledged next
@@ -10392,6 +10394,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if not queued or session.get("running"):
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
+        # Publish ownership before removing the head envelope. The orphan
+        # reaper does not take history_lock, so without this marker it can see
+        # both ``queued_prompt`` empty and ``running`` false in the claim
+        # handoff and tear down already-accepted Bot work.
+        session["_queued_prompt_claimed"] = True
         queued_prompts = session.get("queued_prompts") or []
         session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
         if not queued_prompts:
@@ -10399,26 +10406,32 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
-    use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
-            # Generation cancelled the claim (Stop, compress re-anchor, …).
-            # Do not dispatch — but put the claimed envelope back so a
-            # legitimate follow-up is not silently dropped. Order: claimed
-            # head first, then whatever advanced into the slot while we held
-            # the claim (#84417 belt accuracy).
-            rest: list = []
-            advanced = session.get("queued_prompt")
-            if advanced:
-                rest.append(advanced)
-            rest.extend(session.get("queued_prompts") or [])
-            session["queued_prompt"] = queued
-            if rest:
-                session["queued_prompts"] = rest
-            else:
-                session.pop("queued_prompts", None)
+            # Compression re-anchors a legitimate follow-up and therefore
+            # restores it at the head. Explicit Stop/close owns cancellation:
+            # restoring after its generation bump lets a later submit clear
+            # the latch and resurrect work the user stopped.
+            cancelled = bool(
+                session.get("_turn_cancel_requested")
+                or session.get("_closing")
+            )
+            if not cancelled:
+                rest: list = []
+                advanced = session.get("queued_prompt")
+                if advanced:
+                    rest.append(advanced)
+                rest.extend(session.get("queued_prompts") or [])
+                session["queued_prompt"] = queued
+                if rest:
+                    session["queued_prompts"] = rest
+                else:
+                    session.pop("queued_prompts", None)
+            session.pop("_queued_prompt_claimed", None)
             session["running"] = False
             return True
+        session.pop("_queued_prompt_claimed", None)
+    use_compute_host = _session_uses_compute_host(session)
     dispatch_failed = False
     try:
         if use_compute_host:

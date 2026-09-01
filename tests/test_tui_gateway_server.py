@@ -5084,9 +5084,17 @@ def test_ws_orphan_reap_preserves_opted_in_running_turn_until_it_settles(monkeyp
         assert "bot-sid" in server._sessions
         assert len(callbacks) == 1
 
-        # Once both the active and queued work settle, the detached runtime is
-        # still reclaimed normally.
+        # The queue claim marker closes the atomic handoff after the envelope
+        # leaves ``queued_prompt`` but before the next turn owns ``running``.
         session["queued_prompt"] = None
+        session["_queued_prompt_claimed"] = True
+        callbacks.pop(0)()
+        assert "bot-sid" in server._sessions
+        assert len(callbacks) == 1
+
+        # Once active, queued, and claimed work all settle, the detached
+        # runtime is still reclaimed normally.
+        session.pop("_queued_prompt_claimed", None)
         callbacks.pop(0)()
         assert "bot-sid" not in server._sessions
         assert torn_down == [(session, "ws_orphan_reap")]
@@ -12121,6 +12129,73 @@ def test_new_turn_does_not_inherit_prior_turn_corrections():
 
     assert snapshot["user"] == "second prompt"
     assert "corrections" not in snapshot
+
+
+def test_stop_during_queued_claim_does_not_restore_cancelled_prompt(monkeypatch):
+    session = _session(
+        agent=types.SimpleNamespace(interrupt=lambda: None),
+        queued_prompt={"text": "must stay stopped", "transport": None},
+        preserve_running_on_disconnect=True,
+        running=False,
+    )
+    base_lock = threading.RLock()
+
+    class _ClaimInterlock:
+        entries = 0
+
+        def __enter__(self):
+            base_lock.acquire()
+            self.entries += 1
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            base_lock.release()
+            if self.entries == 1:
+                server._interrupt_session_turn("queue-stop", session)
+            return False
+
+    session["history_lock"] = _ClaimInterlock()
+    monkeypatch.setattr(server, "_clear_pending", lambda _sid: None)
+
+    assert server._drain_queued_prompt("rid", "queue-stop", session) is True
+    assert session.get("queued_prompt") is None
+    assert not session.get("queued_prompts")
+    assert session.get("_queued_prompt_claimed") is not True
+    assert session["running"] is False
+    assert session["_turn_cancel_requested"] is True
+
+
+def test_compression_rotation_during_queued_claim_restores_prompt(monkeypatch):
+    queued = {"text": "survive compression", "transport": None}
+    session = _session(
+        queued_prompt=queued,
+        preserve_running_on_disconnect=True,
+        running=False,
+    )
+    base_lock = threading.RLock()
+
+    class _ClaimInterlock:
+        entries = 0
+
+        def __enter__(self):
+            base_lock.acquire()
+            self.entries += 1
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            base_lock.release()
+            if self.entries == 1:
+                session["_queued_prompt_generation"] = 1
+            return False
+
+    session["history_lock"] = _ClaimInterlock()
+
+    assert server._drain_queued_prompt("rid", "queue-compress", session) is True
+    assert session["queued_prompt"] == queued
+    assert not session.get("queued_prompts")
+    assert session.get("_queued_prompt_claimed") is not True
+    assert session["running"] is False
+    assert session.get("_turn_cancel_requested") is not True
 
 
 def test_session_redirect_queues_during_agent_build_window(monkeypatch):
