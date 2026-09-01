@@ -301,6 +301,9 @@ _DB_PERSISTED_MARKER = "_db_persisted"
 # only reads known columns.
 _COMPACTION_TAIL_MARKER = "_compaction_tail"
 PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY = "_proactive_prune_rearm_tokens"
+ANTI_THRASH_RECOVERY_AT_MODEL_CONFIG_KEY = "_compression_anti_thrash_recovery_at"
+ANTI_THRASH_PROBE_UNTIL_MODEL_CONFIG_KEY = "_compression_anti_thrash_probe_until"
+ANTI_THRASH_PROBE_TOKEN_MODEL_CONFIG_KEY = "_compression_anti_thrash_probe_token"
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
 COMPRESSION_CONTINUATION_USER_CONTENT = (
@@ -2299,10 +2302,14 @@ class ContextCompressor(ContextEngine):
         self._last_aux_model_failure_model = None
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
+        self._fallback_compression_streak = 0
         self._anti_thrash_recovery_deadline = 0.0
+        self._anti_thrash_probe_until = 0.0
+        self._anti_thrash_probe_token = ""
+        self._owns_anti_thrash_probe = False
+        self._persist_anti_thrash_breaker_state()
         self._structural_no_op_backoff_until = 0.0
         self._prellm_skip_count = 0
-        self._fallback_compression_streak = 0
         self._verify_compaction_cleared_threshold = False
         self._last_compression_made_progress = False
         self._summary_failure_cooldown_until = 0.0  # transient errors must not block a fresh session
@@ -2604,6 +2611,9 @@ class ContextCompressor(ContextEngine):
         self._last_compression_savings_pct = 100.0
         self._ineffective_compression_count = 0
         self._anti_thrash_recovery_deadline = 0.0
+        self._anti_thrash_probe_until = 0.0
+        self._anti_thrash_probe_token = ""
+        self._owns_anti_thrash_probe = False
         self._structural_no_op_backoff_until = 0.0
         self._prellm_skip_count = 0
         self._fallback_compression_streak = 0
@@ -2637,11 +2647,16 @@ class ContextCompressor(ContextEngine):
         self._ineffective_compression_count = 0
         self._prellm_skip_count = 0
         self._anti_thrash_recovery_deadline = 0.0
+        self._anti_thrash_probe_until = 0.0
+        self._anti_thrash_probe_token = ""
+        self._owns_anti_thrash_probe = False
         self._structural_no_op_backoff_until = 0.0
         self._proactive_prune_rearm_tokens = 0
         self.get_active_compression_failure_cooldown()
-        self._load_fallback_compression_streak()
-        self._load_ineffective_compression_count()
+        if not self._load_anti_thrash_breaker_state():
+            self._load_fallback_compression_streak()
+            self._load_ineffective_compression_count()
+            self._load_anti_thrash_recovery_deadline()
         self._load_proactive_prune_rearm_tokens()
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
@@ -2650,53 +2665,30 @@ class ContextCompressor(ContextEngine):
         boundary_reason = kwargs.get("boundary_reason")
         old_session_id = kwargs.get("old_session_id")
         session_db = kwargs.get("session_db", getattr(self, "_session_db", None))
-        previous_fallback_streak = self._fallback_compression_streak
-        previous_ineffective_count = self._ineffective_compression_count
+        owned_probe_token = (
+            self._anti_thrash_probe_token if self._owns_anti_thrash_probe else ""
+        )
         if boundary_reason == "compression" and old_session_id:
-            getter = getattr(session_db, "get_compression_fallback_streak", None)
-            if callable(getter):
+            copier = getattr(session_db, "copy_compression_breaker_state", None)
+            if callable(copier):
                 try:
-                    stored_streak = getter(old_session_id)
-                    if isinstance(stored_streak, (int, float, str)):
-                        previous_fallback_streak = max(0, int(stored_streak))
-                except (TypeError, ValueError, sqlite3.Error) as exc:
-                    logger.debug("compression parent fallback streak lookup failed: %s", exc)
+                    copier(old_session_id, session_id)
                 except Exception as exc:
-                    logger.debug(
-                        "compression parent fallback streak lookup failed (non-sqlite): %s",
-                        exc,
-                    )
-            count_getter = getattr(
-                session_db, "get_compression_ineffective_count", None,
-            )
-            if callable(count_getter):
-                try:
-                    stored_count = count_getter(old_session_id)
-                    if isinstance(stored_count, (int, float, str)):
-                        previous_ineffective_count = max(0, int(stored_count))
-                except (TypeError, ValueError, sqlite3.Error) as exc:
-                    logger.debug(
-                        "compression parent ineffective count lookup failed: %s", exc,
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "compression parent ineffective count lookup failed (non-sqlite): %s",
-                        exc,
-                    )
+                    logger.debug("compression breaker rotation copy failed: %s", exc)
         self.bind_session_state(session_db, session_id)
-        if boundary_reason == "compression":
-            # Rotation creates a fresh child row before this callback. Preserve
-            # the logical conversation's streak until boundary bookkeeping
-            # persists the updated value onto the child row.
-            self._fallback_compression_streak = previous_fallback_streak
-            # Same for the anti-thrash strike counter — but unlike the streak,
-            # no later boundary bookkeeping writes it, so persist the carried
-            # value onto the (fresh) child row now. Otherwise a restart between
-            # rotation and the next real-usage verdict would silently disarm
-            # an armed guard (#54923).
-            if self._ineffective_compression_count != previous_ineffective_count:
-                self._ineffective_compression_count = previous_ineffective_count
-                self._persist_ineffective_compression_count()
+        if (
+            boundary_reason == "compression"
+            and owned_probe_token
+            and self._anti_thrash_probe_token == owned_probe_token
+        ):
+            # The same in-process winner owns the copied claim on the child.
+            # Durable counters stay tripped so every sibling remains blocked;
+            # the winner's local one-strike mirrors make its verdict decisive.
+            self._owns_anti_thrash_probe = True
+            if self._ineffective_compression_count >= 2:
+                self._ineffective_compression_count = 1
+            if self._fallback_compression_streak >= 2:
+                self._fallback_compression_streak = 1
 
     def _load_fallback_compression_streak(self) -> None:
         session_db = getattr(self, "_session_db", None)
@@ -2765,6 +2757,64 @@ class ContextCompressor(ContextEngine):
         except Exception as exc:
             logger.debug("compression fallback streak persist failed (non-sqlite): %s", exc)
 
+    def _load_anti_thrash_breaker_state(self) -> bool:
+        """Load the complete durable breaker tuple when SessionDB supports it."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        getter = getattr(session_db, "get_compression_breaker_state", None)
+        if not session_id or not callable(getter):
+            return False
+        try:
+            state = getter(session_id)
+            self._ineffective_compression_count = max(
+                0, int(state.get("ineffective_count", 0) or 0)
+            )
+            self._fallback_compression_streak = max(
+                0, int(state.get("fallback_streak", 0) or 0)
+            )
+            self._anti_thrash_recovery_deadline = max(
+                0.0, float(state.get("recovery_at", 0) or 0)
+            )
+            self._anti_thrash_probe_until = max(
+                0.0, float(state.get("probe_until", 0) or 0)
+            )
+            self._anti_thrash_probe_token = str(state.get("probe_token", "") or "")
+            self._owns_anti_thrash_probe = False
+            return True
+        except (TypeError, ValueError, sqlite3.Error) as exc:
+            logger.debug("compression breaker-state lookup failed: %s", exc)
+        except Exception as exc:
+            logger.debug("compression breaker-state lookup failed (non-sqlite): %s", exc)
+        return False
+
+    def _persist_anti_thrash_breaker_state(self) -> bool:
+        """Persist counters, recovery deadline, and probe claim atomically."""
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        setter = getattr(session_db, "set_compression_breaker_state", None)
+        if not session_id:
+            return True
+        if not callable(setter):
+            return False
+        try:
+            return bool(
+                setter(
+                    session_id,
+                    ineffective_count=self._ineffective_compression_count,
+                    fallback_streak=self._fallback_compression_streak,
+                    recovery_at=self._anti_thrash_recovery_deadline,
+                    probe_until=self._anti_thrash_probe_until,
+                    probe_token=self._anti_thrash_probe_token,
+                )
+            )
+        except sqlite3.Error as exc:
+            logger.debug("compression breaker-state persist failed: %s", exc)
+        except Exception as exc:
+            logger.debug(
+                "compression breaker-state persist failed (non-sqlite): %s", exc
+            )
+        return False
+
     def _load_ineffective_compression_count(self) -> None:
         """Load the durable anti-thrash strike count for the bound session.
 
@@ -2807,6 +2857,103 @@ class ContextCompressor(ContextEngine):
         except Exception as exc:
             logger.debug("compression ineffective count persist failed (non-sqlite): %s", exc)
 
+    def _load_anti_thrash_recovery_deadline(self) -> None:
+        """Restore the wall-clock deadline for the breaker's half-open probe.
+
+        Gateway turns create a fresh ``AIAgent`` for every inbound message.
+        Keeping this deadline only in ``time.monotonic()`` state therefore
+        restarted the full recovery window on every message and could leave a
+        durable tripped counter blocked forever.  ``model_config`` already
+        owns session-scoped auxiliary compaction state, so store an epoch
+        deadline there without adding another schema migration.
+        """
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        getter = getattr(session_db, "get_session_model_config_value", None)
+        if not session_id or not callable(getter):
+            return
+        try:
+            value = getter(
+                session_id,
+                ANTI_THRASH_RECOVERY_AT_MODEL_CONFIG_KEY,
+                0,
+            )
+            self._anti_thrash_recovery_deadline = max(
+                0.0,
+                float(value) if isinstance(value, (int, float, str)) else 0.0,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+            logger.debug("compression recovery deadline lookup failed: %s", exc)
+        except Exception as exc:
+            logger.debug(
+                "compression recovery deadline lookup failed (non-sqlite): %s",
+                exc,
+            )
+
+    def _persist_anti_thrash_recovery_deadline(self) -> bool:
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        patcher = getattr(session_db, "patch_session_model_config", None)
+        if not session_id:
+            return True
+        if not callable(patcher):
+            return False
+        value = self._anti_thrash_recovery_deadline or None
+        try:
+            patcher(
+                session_id,
+                {ANTI_THRASH_RECOVERY_AT_MODEL_CONFIG_KEY: value},
+            )
+            return True
+        except sqlite3.Error as exc:
+            logger.debug("compression recovery deadline persist failed: %s", exc)
+        except Exception as exc:
+            logger.debug(
+                "compression recovery deadline persist failed (non-sqlite): %s",
+                exc,
+            )
+        return False
+
+    def _arm_anti_thrash_recovery_deadline(self) -> bool:
+        if self._anti_thrash_recovery_deadline <= 0.0 or self._owns_anti_thrash_probe:
+            self._anti_thrash_recovery_deadline = (
+                time.time() + self._ANTI_THRASH_RECOVERY_SECONDS
+            )
+        self._anti_thrash_probe_until = 0.0
+        self._anti_thrash_probe_token = ""
+        self._owns_anti_thrash_probe = False
+        if callable(
+            getattr(
+                getattr(self, "_session_db", None),
+                "set_compression_breaker_state",
+                None,
+            )
+        ):
+            return self._persist_anti_thrash_breaker_state()
+        return self._persist_anti_thrash_recovery_deadline()
+
+    def _clear_anti_thrash_recovery_deadline(self) -> None:
+        if (
+            self._anti_thrash_recovery_deadline <= 0.0
+            and self._anti_thrash_probe_until <= 0.0
+            and not self._anti_thrash_probe_token
+        ):
+            return
+        self._anti_thrash_recovery_deadline = 0.0
+        self._anti_thrash_probe_until = 0.0
+        self._anti_thrash_probe_token = ""
+        self._owns_anti_thrash_probe = False
+        if callable(
+            getattr(
+                getattr(self, "_session_db", None),
+                "set_compression_breaker_state",
+                None,
+            )
+        ):
+            self._persist_anti_thrash_breaker_state()
+        else:
+            self._persist_anti_thrash_recovery_deadline()
+
     def _record_ineffective_compression_verdict(self, count: int) -> None:
         """Set the anti-thrash strike counter, keeping the durable copy in sync.
 
@@ -2816,7 +2963,30 @@ class ContextCompressor(ContextEngine):
         if count == self._ineffective_compression_count:
             return
         self._ineffective_compression_count = count
-        self._persist_ineffective_compression_count()
+        atomic_state = callable(
+            getattr(
+                getattr(self, "_session_db", None),
+                "set_compression_breaker_state",
+                None,
+            )
+        )
+        if count >= 2:
+            # One transaction owns counters + deadline + claim. A failed write
+            # leaves the previous durable tuple intact instead of persisting a
+            # permanent trip without its recovery clock.
+            if not self._arm_anti_thrash_recovery_deadline() and not atomic_state:
+                self._persist_ineffective_compression_count()
+        elif self._fallback_compression_streak < 2:
+            self._anti_thrash_recovery_deadline = 0.0
+            self._anti_thrash_probe_until = 0.0
+            self._anti_thrash_probe_token = ""
+            self._owns_anti_thrash_probe = False
+            if not self._persist_anti_thrash_breaker_state() and not atomic_state:
+                self._persist_ineffective_compression_count()
+                self._persist_anti_thrash_recovery_deadline()
+        else:
+            if not self._persist_anti_thrash_breaker_state() and not atomic_state:
+                self._persist_ineffective_compression_count()
 
     def _record_structural_no_op(self, reason: str) -> None:
         """Defer retries after a structural no-op WITHOUT striking the breaker.
@@ -2910,7 +3080,27 @@ class ContextCompressor(ContextEngine):
                 )
         elif self._fallback_compression_streak:
             self._fallback_compression_streak = 0
-        self._persist_fallback_compression_streak()
+        if self._fallback_compression_streak >= 2:
+            atomic_state = callable(
+                getattr(
+                    getattr(self, "_session_db", None),
+                    "set_compression_breaker_state",
+                    None,
+                )
+            )
+            if self._arm_anti_thrash_recovery_deadline() and not atomic_state:
+                self._persist_fallback_compression_streak()
+        elif self._ineffective_compression_count < 2:
+            self._anti_thrash_recovery_deadline = 0.0
+            self._anti_thrash_probe_until = 0.0
+            self._anti_thrash_probe_token = ""
+            self._owns_anti_thrash_probe = False
+            if not self._persist_anti_thrash_breaker_state():
+                self._persist_fallback_compression_streak()
+                self._persist_anti_thrash_recovery_deadline()
+        else:
+            if not self._persist_anti_thrash_breaker_state():
+                self._persist_fallback_compression_streak()
 
     def get_active_compression_failure_cooldown(
         self,
@@ -3225,12 +3415,12 @@ class ContextCompressor(ContextEngine):
 
     # Anti-thrash recovery window (#14694): once the ineffective/fallback
     # breaker trips, automatic compaction stays blocked for this long, then
-    # ONE probe attempt is allowed (counters drop to 1 strike, so another
-    # ineffective pass re-trips immediately). Long enough that a genuinely
+    # the breaker enters probation (counters drop to 1 strike, so another
+    # ineffective verdict re-trips immediately). Long enough that a genuinely
     # incompressible session isn't compacting in a loop; short enough that a
     # session which has since grown real compressible material recovers well
     # before it rides into the provider's hard context limit.
-    _ANTI_THRASH_RECOVERY_SECONDS = 300.0
+    _ANTI_THRASH_RECOVERY_SECONDS = 900.0
 
     # Structural no-op backoff (#93022): when a compression attempt finds
     # nothing eligible inside the protection window (too few messages, empty
@@ -3532,12 +3722,15 @@ class ContextCompressor(ContextEngine):
         # Anti-thrashing: track whether last compression was effective
         self._last_compression_savings_pct: float = 100.0
         self._ineffective_compression_count: int = 0
-        # Monotonic deadline after which a tripped anti-thrash guard grants
-        # one probation probe (#14694). 0.0 = clock not armed. Armed lazily on
-        # the first blocked evaluation; deliberately NOT durable, so a process
-        # restart with a persisted tripped counter (#69872) waits a full fresh
-        # window before probing (#54923: restart must never disarm a guard).
+        # Epoch deadline after which a tripped anti-thrash guard may claim one
+        # probation probe (#14694). Both the deadline and the bounded claim
+        # are durable because gateways create a fresh agent per inbound turn.
         self._anti_thrash_recovery_deadline: float = 0.0
+        self._anti_thrash_probe_until: float = 0.0
+        self._anti_thrash_probe_token: str = ""
+        # Process-local ownership is deliberately not restored on bind: only
+        # the SessionDB transaction that created the claim may set it True.
+        self._owns_anti_thrash_probe: bool = False
         # Pre-LLM feasibility skips (#60451). Observability only; NEVER feeds
         # the ineffectiveness strike latch or the fallback streak breaker.
         self._prellm_skip_count: int = 0
@@ -3892,13 +4085,12 @@ class ContextCompressor(ContextEngine):
         except Exception as exc:
             logger.debug("compression cooldown refresh failed: %s", exc)
         try:
-            self._load_fallback_compression_streak()
+            if not self._load_anti_thrash_breaker_state():
+                self._load_fallback_compression_streak()
+                self._load_ineffective_compression_count()
+                self._load_anti_thrash_recovery_deadline()
         except Exception as exc:
-            logger.debug("compression fallback-streak refresh failed: %s", exc)
-        try:
-            self._load_ineffective_compression_count()
-        except Exception as exc:
-            logger.debug("compression ineffective-count refresh failed: %s", exc)
+            logger.debug("compression breaker-state refresh failed: %s", exc)
 
     def _automatic_compression_blocked(self) -> bool:
         """Return whether automatic compaction is in cooldown or tripped."""
@@ -3958,32 +4150,87 @@ class ContextCompressor(ContextEngine):
         # recovery path the session never auto-compacts again and rides into
         # the provider's hard context limit. Recovery is a probation probe:
         # after _ANTI_THRASH_RECOVERY_SECONDS of continuous block, allow ONE
-        # attempt by dropping the tripped counter(s) to 1 strike (persisted,
-        # so sibling agents on the same session row unblock too). If the probe
-        # is ineffective again the very next verdict re-trips the guard, so
+        # period by dropping the tripped counter(s) to 1 strike (persisted).
+        # The existing per-session compression lease serializes actual
+        # concurrent attempts. If probation is ineffective, the very next
+        # verdict re-trips the guard, so
         # the worst case in the truly-incompressible state is one compaction
         # attempt per recovery window — bounded, not thrash.
         #
-        # The clock is armed lazily on the first BLOCKED evaluation rather
-        # than persisted at trip time: a fresh process that loads a durable
-        # tripped counter (#69872) therefore starts a full window blocked,
-        # preserving the restart-must-not-disarm contract (#54923).
+        # The deadline is armed when the breaker trips and persisted with the
+        # session.  Messaging gateways construct a fresh agent per inbound
+        # turn; a process-local monotonic deadline would restart the wait on
+        # every message and make the half-open probe unreachable.
         if (
             self._ineffective_compression_count >= 2
             or self._fallback_compression_streak >= 2
         ):
-            _now = time.monotonic()
-            if self._anti_thrash_recovery_deadline <= 0.0:
-                self._anti_thrash_recovery_deadline = (
-                    _now + self._ANTI_THRASH_RECOVERY_SECONDS
+            _now = time.time()
+            claimer = getattr(
+                getattr(self, "_session_db", None),
+                "claim_compression_recovery_probe",
+                None,
+            )
+            if getattr(self, "_session_id", "") and callable(claimer):
+                try:
+                    state = claimer(
+                        self._session_id,
+                        now=_now,
+                        recovery_seconds=self._ANTI_THRASH_RECOVERY_SECONDS,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Compression recovery claim failed for session=%s: %s",
+                        self._session_id,
+                        exc,
+                    )
+                    return True
+                self._anti_thrash_recovery_deadline = max(
+                    0.0, float(state.get("recovery_at", 0) or 0)
                 )
-            elif _now >= self._anti_thrash_recovery_deadline:
-                self._anti_thrash_recovery_deadline = 0.0
+                self._anti_thrash_probe_until = max(
+                    0.0, float(state.get("probe_until", 0) or 0)
+                )
+                self._anti_thrash_probe_token = str(
+                    state.get("probe_token", "") or ""
+                )
+                if state.get("claimed"):
+                    self._owns_anti_thrash_probe = True
+                    if self._ineffective_compression_count >= 2:
+                        self._ineffective_compression_count = 1
+                    if self._fallback_compression_streak >= 2:
+                        self._fallback_compression_streak = 1
+                    if not self.quiet_mode:
+                        logger.info(
+                            "Anti-thrashing recovery: %.0fs elapsed — this "
+                            "agent atomically claimed the single compaction probe.",
+                            self._ANTI_THRASH_RECOVERY_SECONDS,
+                        )
+                    return False
+                self._owns_anti_thrash_probe = False
+                if not self.quiet_mode:
+                    remaining_until = max(
+                        self._anti_thrash_recovery_deadline,
+                        self._anti_thrash_probe_until,
+                    )
+                    logger.warning(
+                        "Compression skipped — anti-thrash recovery is blocked "
+                        "for %.0fs more (ineffective=%d fallback=%d).",
+                        max(0.0, remaining_until - _now),
+                        self._ineffective_compression_count,
+                        self._fallback_compression_streak,
+                    )
+                return True
+            if self._anti_thrash_recovery_deadline <= 0.0:
+                # Compatibility for a tripped row written by an older build.
+                self._arm_anti_thrash_recovery_deadline()
+            if _now >= self._anti_thrash_recovery_deadline:
                 if self._ineffective_compression_count >= 2:
                     self._record_ineffective_compression_verdict(1)
                 if self._fallback_compression_streak >= 2:
                     self._fallback_compression_streak = 1
                     self._persist_fallback_compression_streak()
+                self._clear_anti_thrash_recovery_deadline()
                 if not self.quiet_mode:
                     logger.info(
                         "Anti-thrashing recovery: %.0fs elapsed since the "
@@ -4009,7 +4256,32 @@ class ContextCompressor(ContextEngine):
         # Guard not tripped (counters were cleared by an effective compaction
         # or a fitting real-usage reading) — disarm any pending recovery clock
         # so a LATER trip starts its own full window.
-        self._anti_thrash_recovery_deadline = 0.0
+        if self._owns_anti_thrash_probe:
+            validator = getattr(
+                getattr(self, "_session_db", None),
+                "validate_compression_recovery_probe",
+                None,
+            )
+            if getattr(self, "_session_id", "") and callable(validator):
+                try:
+                    if validator(
+                        self._session_id,
+                        probe_token=self._anti_thrash_probe_token,
+                        now=time.time(),
+                    ):
+                        return False
+                except Exception as exc:
+                    logger.warning(
+                        "Compression recovery ownership validation failed for "
+                        "session=%s: %s",
+                        self._session_id,
+                        exc,
+                    )
+                self._owns_anti_thrash_probe = False
+                self._load_anti_thrash_breaker_state()
+                return True
+            return False
+        self._clear_anti_thrash_recovery_deadline()
         return False
 
     # ------------------------------------------------------------------

@@ -46,6 +46,9 @@ from agent.message_sanitization import _sanitize_surrogates
 # predating copy — hermes_state cannot import run_agent (circular) — guarded
 # by test_marker_constant_in_sync.
 from agent.context_compressor import (
+    ANTI_THRASH_PROBE_TOKEN_MODEL_CONFIG_KEY,
+    ANTI_THRASH_PROBE_UNTIL_MODEL_CONFIG_KEY,
+    ANTI_THRASH_RECOVERY_AT_MODEL_CONFIG_KEY,
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY,
 )
 from agent.skill_commands import (
@@ -8434,6 +8437,279 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
         self._execute_write(_do)
+
+    def get_compression_breaker_state(self, session_id: str) -> Dict[str, Any]:
+        """Read the anti-thrash counters and recovery markers as one snapshot."""
+        empty = {
+            "ineffective_count": 0,
+            "fallback_streak": 0,
+            "recovery_at": 0.0,
+            "probe_until": 0.0,
+            "probe_token": "",
+        }
+        if not session_id:
+            return empty
+        with self._read_ctx() as conn:
+            if conn is None:
+                return empty
+            row = conn.execute(
+                "SELECT compression_ineffective_count, "
+                "compression_fallback_streak, model_config "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            return empty
+        raw_config = row["model_config"] if isinstance(row, sqlite3.Row) else row[2]
+        config: Dict[str, Any] = {}
+        if isinstance(raw_config, str) and raw_config.strip():
+            try:
+                parsed = json.loads(raw_config)
+                if isinstance(parsed, dict):
+                    config = parsed
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        def _number(key: str) -> float:
+            try:
+                return max(0.0, float(config.get(key, 0) or 0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        return {
+            "ineffective_count": max(0, int(row[0] or 0)),
+            "fallback_streak": max(0, int(row[1] or 0)),
+            "recovery_at": _number(ANTI_THRASH_RECOVERY_AT_MODEL_CONFIG_KEY),
+            "probe_until": _number(ANTI_THRASH_PROBE_UNTIL_MODEL_CONFIG_KEY),
+            "probe_token": str(
+                config.get(ANTI_THRASH_PROBE_TOKEN_MODEL_CONFIG_KEY, "") or ""
+            ),
+        }
+
+    def set_compression_breaker_state(
+        self,
+        session_id: str,
+        *,
+        ineffective_count: int,
+        fallback_streak: int,
+        recovery_at: float = 0.0,
+        probe_until: float = 0.0,
+        probe_token: str = "",
+    ) -> bool:
+        """Persist the complete anti-thrash tuple in one transaction."""
+        if not session_id:
+            return False
+        ineffective_count = max(0, int(ineffective_count))
+        fallback_streak = max(0, int(fallback_streak))
+        recovery_at = max(0.0, float(recovery_at))
+        probe_until = max(0.0, float(probe_until))
+        probe_token = str(probe_token or "")
+
+        def _do(conn):
+            merged = self._merge_model_config_json(
+                conn,
+                session_id,
+                {
+                    ANTI_THRASH_RECOVERY_AT_MODEL_CONFIG_KEY: recovery_at or None,
+                    ANTI_THRASH_PROBE_UNTIL_MODEL_CONFIG_KEY: probe_until or None,
+                    ANTI_THRASH_PROBE_TOKEN_MODEL_CONFIG_KEY: probe_token or None,
+                },
+            )
+            if merged is _MODEL_CONFIG_ROW_MISSING:
+                return False
+            conn.execute(
+                "UPDATE sessions SET compression_ineffective_count = ?, "
+                "compression_fallback_streak = ?, model_config = ? WHERE id = ?",
+                (ineffective_count, fallback_streak, merged, session_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def claim_compression_recovery_probe(
+        self,
+        session_id: str,
+        *,
+        now: float,
+        recovery_seconds: float,
+    ) -> Dict[str, Any]:
+        """Atomically grant at most one half-open probe for a tripped session.
+
+        Durable counters remain tripped while the winner is running.  The
+        winner uses one-strike local mirrors so its next verdict either clears
+        the tuple or re-arms a full recovery window.  If it dies before a
+        verdict, ``probe_until`` bounds the abandoned claim.
+        """
+        now = float(now)
+        recovery_seconds = max(1.0, float(recovery_seconds))
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT compression_ineffective_count, "
+                "compression_fallback_streak, model_config "
+                "FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return {"claimed": False, "missing": True}
+            ineffective = max(0, int(row[0] or 0))
+            fallback = max(0, int(row[1] or 0))
+            raw_config = row[2]
+            config: Dict[str, Any] = {}
+            if isinstance(raw_config, str) and raw_config.strip():
+                try:
+                    parsed = json.loads(raw_config)
+                    if isinstance(parsed, dict):
+                        config = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            def _number(key: str) -> float:
+                try:
+                    return max(0.0, float(config.get(key, 0) or 0))
+                except (TypeError, ValueError):
+                    return 0.0
+
+            recovery_at = _number(ANTI_THRASH_RECOVERY_AT_MODEL_CONFIG_KEY)
+            probe_until = _number(ANTI_THRASH_PROBE_UNTIL_MODEL_CONFIG_KEY)
+            probe_token = str(
+                config.get(ANTI_THRASH_PROBE_TOKEN_MODEL_CONFIG_KEY, "") or ""
+            )
+            original_recovery_at = recovery_at
+            original_probe_until = probe_until
+            original_probe_token = probe_token
+            # Epoch time is the only clock that survives a process restart.
+            # A backward wall-clock jump must not turn one recovery window
+            # into an unbounded latch, so clamp future markers to one window
+            # from the first post-jump observation. A forward jump deliberately
+            # fails open: an early bounded probe is safer than permanent block.
+            upper_bound = now + recovery_seconds
+            recovery_at = min(recovery_at, upper_bound)
+            probe_until = min(probe_until, upper_bound)
+            tripped = ineffective >= 2 or fallback >= 2
+            claimed = False
+            if not tripped:
+                recovery_at = 0.0
+                probe_until = 0.0
+                probe_token = ""
+            elif probe_until > now:
+                pass
+            elif probe_until > 0.0:
+                # The previous winner never produced a verdict. Its bounded
+                # claim has elapsed, so this transaction may replace it.
+                claimed = True
+                recovery_at = 0.0
+                probe_until = now + recovery_seconds
+                probe_token = uuid.uuid4().hex
+            elif recovery_at <= 0.0:
+                # Compatibility for rows written before the durable clock.
+                recovery_at = now + recovery_seconds
+                probe_until = 0.0
+                probe_token = ""
+            elif recovery_at <= now:
+                claimed = True
+                recovery_at = 0.0
+                probe_until = now + recovery_seconds
+                probe_token = uuid.uuid4().hex
+
+            if (
+                recovery_at != original_recovery_at
+                or probe_until != original_probe_until
+                or probe_token != original_probe_token
+            ):
+                merged = self._merge_model_config_json(
+                    conn,
+                    session_id,
+                    {
+                        ANTI_THRASH_RECOVERY_AT_MODEL_CONFIG_KEY: recovery_at or None,
+                        ANTI_THRASH_PROBE_UNTIL_MODEL_CONFIG_KEY: probe_until or None,
+                        ANTI_THRASH_PROBE_TOKEN_MODEL_CONFIG_KEY: probe_token or None,
+                    },
+                    on_missing="raise",
+                )
+                conn.execute(
+                    "UPDATE sessions SET model_config = ? WHERE id = ?",
+                    (merged, session_id),
+                )
+            return {
+                "claimed": claimed,
+                "missing": False,
+                "ineffective_count": ineffective,
+                "fallback_streak": fallback,
+                "recovery_at": recovery_at,
+                "probe_until": probe_until,
+                "probe_token": probe_token,
+            }
+
+        return self._execute_write(_do)
+
+    def copy_compression_breaker_state(
+        self, parent_session_id: str, child_session_id: str,
+    ) -> bool:
+        """Copy the complete breaker tuple across rotation atomically."""
+        if not parent_session_id or not child_session_id:
+            return False
+
+        def _do(conn):
+            parent = conn.execute(
+                "SELECT compression_ineffective_count, "
+                "compression_fallback_streak, model_config "
+                "FROM sessions WHERE id = ?",
+                (parent_session_id,),
+            ).fetchone()
+            if parent is None:
+                return False
+            raw_config = parent[2]
+            config: Dict[str, Any] = {}
+            if isinstance(raw_config, str) and raw_config.strip():
+                try:
+                    parsed = json.loads(raw_config)
+                    if isinstance(parsed, dict):
+                        config = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            merged = self._merge_model_config_json(
+                conn,
+                child_session_id,
+                {
+                    ANTI_THRASH_RECOVERY_AT_MODEL_CONFIG_KEY: config.get(
+                        ANTI_THRASH_RECOVERY_AT_MODEL_CONFIG_KEY
+                    ),
+                    ANTI_THRASH_PROBE_UNTIL_MODEL_CONFIG_KEY: config.get(
+                        ANTI_THRASH_PROBE_UNTIL_MODEL_CONFIG_KEY
+                    ),
+                    ANTI_THRASH_PROBE_TOKEN_MODEL_CONFIG_KEY: config.get(
+                        ANTI_THRASH_PROBE_TOKEN_MODEL_CONFIG_KEY
+                    ),
+                },
+            )
+            if merged is _MODEL_CONFIG_ROW_MISSING:
+                return False
+            conn.execute(
+                "UPDATE sessions SET compression_ineffective_count = ?, "
+                "compression_fallback_streak = ?, model_config = ? WHERE id = ?",
+                (max(0, int(parent[0] or 0)), max(0, int(parent[1] or 0)), merged,
+                 child_session_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
+    def validate_compression_recovery_probe(
+        self, session_id: str, *, probe_token: str, now: float,
+    ) -> bool:
+        """Return whether ``probe_token`` still owns the unexpired claim."""
+        if not session_id or not probe_token:
+            return False
+        state = self.get_compression_breaker_state(session_id)
+        return (
+            state["probe_token"] == probe_token
+            and float(state["probe_until"] or 0) > float(now)
+            and (
+                int(state["ineffective_count"] or 0) >= 2
+                or int(state["fallback_streak"] or 0) >= 2
+            )
+        )
 
     # ──────────────────────────────────────────────────────────────────────
     # Compression locks
