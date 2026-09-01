@@ -76,6 +76,5 @@ describe('markdown documents delivered via MEDIA', () => {
 
     expect(await screen.findByText('clip.mp4')).toBeTruthy()
     expect(screen.queryByText(/^Loading /)).toBeNull()
-    expect(screen.getByRole('button', { name: /save as/i })).toBeTruthy()
   })
 })

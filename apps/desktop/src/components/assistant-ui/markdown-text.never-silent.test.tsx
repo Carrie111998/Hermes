@@ -1,6 +1,7 @@
 import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { closePreviewForSource } from '@/store/preview'
 import { $connection } from '@/store/session'
 
 import { MarkdownImage, MarkdownTextContent } from './markdown-text'
@@ -41,6 +42,10 @@ describe('never-silent media cards (M4)', () => {
   afterEach(() => {
     cleanup()
 
+    // The click-through test opens a preview tab in the shared store; close
+    // it so later tests see the default "Open preview" state.
+    closePreviewForSource('/tmp/data.bin')
+
     return import('@/lib/media-store').then(({ resetMediaDeliverables }) => {
       resetMediaDeliverables()
       $connection.set(null)
@@ -64,21 +69,31 @@ describe('never-silent media cards (M4)', () => {
     expect(screen.getByRole('button', { name: /save as/i })).toBeTruthy()
   })
 
-  it('renders the fallback card from the href size when no event row is in memory', async () => {
+  it('renders the href-carried size on the structured file card when no event row is in memory', async () => {
     render(<MarkdownTextContent isRunning={false} text={`[File: data.bin](#media:%2Ftmp%2Fdata.bin?~=16)`} />)
 
-    // `file`-kind refs never reach a resolver — the unsupported-fallback fires
-    // synchronously, proving the href-size codec reaches the card without any
-    // event row in memory.
-    expect(await screen.findByText(/no inline preview/i)).toBeTruthy()
-    expect(screen.getByText('16 B')).toBeTruthy()
+    // Post-#97812 file-kind refs render PreviewAttachment: a structured card
+    // with name + Download + Open preview — never a bare anchor and never a
+    // dead "Loading" link. The href-size codec feeding the card is covered
+    // unit-level in media.meta.test.ts.
+    expect(await screen.findByText('data.bin')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /download/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /open preview/i })).toBeTruthy()
+    expect(screen.queryByText(/^Loading /)).toBeNull()
+
+    // Click-through is wired: Open preview toggles to the active "Hide"
+    // state (the local preview route accepts the target without throwing).
+    screen.getByRole('button', { name: /open preview/i }).click()
+    expect(await screen.findByRole('button', { name: /hide/i })).toBeTruthy()
   })
 
-  it('renders a fallback card for a denied non-media file link instead of a bare link', async () => {
+  it('renders a structured card for a denied non-media file link instead of a bare link', async () => {
     render(<MarkdownTextContent isRunning={false} text={`[File: data.bin](#media:%2Ftmp%2Fdata.bin)`} />)
 
-    expect(await screen.findByText(/no inline preview/i)).toBeTruthy()
-    expect(screen.getByRole('button', { name: /save as/i })).toBeTruthy()
+    expect(await screen.findByText('data.bin')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /download/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /open preview/i })).toBeTruthy()
+    expect(screen.queryByText(/^Loading /)).toBeNull()
   })
 
   it('still renders an inline image when the file resolves', async () => {
