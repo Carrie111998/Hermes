@@ -122,6 +122,14 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         // 404 every new chat — fall through to reseed from the profile default.
         // Reads the model-options cache the composer already populated; an
         // unknown/not-yet-loaded catalog conservatively preserves the pick.
+        //
+        // #96063: a manual pick's provider can also drift from the config
+        // default (the user picked `custom:token-plan-a` once, then the config
+        // default flipped back to `custom:aliyun-coding-plan`). The pill
+        // surfaces that drift via a muted provider tag so the user can spot
+        // the stale route; we deliberately do NOT auto-reset a manual pick
+        // here — the user made an explicit choice and wiping it on every
+        // refresh would be a worse UX surprise than a visible mismatch.
         const keepManualPick = () => {
           if (force || !$currentModel.get() || getCurrentModelSource() !== 'manual') {
             return false
