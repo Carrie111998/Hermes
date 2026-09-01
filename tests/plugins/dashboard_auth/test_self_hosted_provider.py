@@ -855,6 +855,39 @@ class TestPluginRegister:
         registered = ctx.register_dashboard_auth_provider.call_args.args[0]
         assert registered._extra_authorize_params == {"access_type": "offline"}
 
+    def test_extra_authorize_params_whitespace_stripped(
+        self, patch_config, monkeypatch
+    ):
+        # Whitespace around keys/values must not reach the authorize URL:
+        # ``access_type = offline`` would otherwise urlencode as
+        # ``access_type+=+offline`` and be rejected by the IdP. Both surfaces
+        # (env query string and config mapping) strip the same way.
+        patch_config(
+            {
+                "self_hosted": {
+                    "issuer": _ISSUER,
+                    "client_id": _CLIENT_ID,
+                    "extra_authorize_params": {" audience ": " cfg-aud "},
+                }
+            }
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        registered = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert registered._extra_authorize_params == {"audience": "cfg-aud"}
+
+        monkeypatch.setenv(
+            "HERMES_DASHBOARD_OIDC_EXTRA_AUTHORIZE_PARAMS",
+            "access_type = offline & prompt = consent",
+        )
+        ctx = MagicMock()
+        oidc_plugin.register(ctx)
+        registered = ctx.register_dashboard_auth_provider.call_args.args[0]
+        assert registered._extra_authorize_params == {
+            "access_type": "offline",
+            "prompt": "consent",
+        }
+
     def test_extra_authorize_params_non_dict_config_ignored(
         self, patch_config, monkeypatch
     ):

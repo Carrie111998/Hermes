@@ -216,11 +216,12 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         self._client_secret = (client_secret or "").strip()
         # IdP-specific /authorize parameters (e.g. Google's
         # access_type=offline). Values are coerced to str so a YAML `offline:`
-        # style typo can't smuggle a non-string into urlencode later. Keys
-        # overlapping the standard OIDC set are ignored at use time — see
-        # start_login.
+        # style typo can't smuggle a non-string into urlencode later; both
+        # sides are stripped so incidental whitespace can't turn a key/value
+        # into something the IdP won't recognize. Keys overlapping the
+        # standard OIDC set are ignored at use time — see start_login.
         self._extra_authorize_params: Dict[str, str] = {
-            str(k).strip(): str(v)
+            str(k).strip(): str(v).strip()
             for k, v in (extra_authorize_params or {}).items()
             if str(k).strip()
         }
@@ -836,13 +837,20 @@ def _resolve_extra_authorize_params(cfg_value: Any) -> Dict[str, str]:
     A non-dict config value resolves to ``{}`` (standard behaviour) rather
     than failing registration — a typo in an optional enhancement must not
     take the auth gate down.
+
+    Both surfaces strip whitespace around keys and values: an env form like
+    ``access_type = offline`` would otherwise urlencode the spaces, and the
+    IdP would reject a key it doesn't recognize.
     """
     env = os.environ.get(_EXTRA_AUTHORIZE_PARAMS_ENV, "").strip()
     if env:
-        return dict(urllib.parse.parse_qsl(env, keep_blank_values=True))
+        return {
+            k.strip(): v.strip()
+            for k, v in urllib.parse.parse_qsl(env, keep_blank_values=True)
+        }
     if isinstance(cfg_value, dict):
         return {
-            str(k).strip(): str(v)
+            str(k).strip(): str(v).strip()
             for k, v in cfg_value.items()
             if str(k).strip()
         }
