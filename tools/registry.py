@@ -300,8 +300,18 @@ class ToolRegistry:
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
             )
-            if check_fn and toolset not in self._toolset_checks:
-                self._toolset_checks[toolset] = check_fn
+            if check_fn:
+                existing_check = self._toolset_checks.get(toolset)
+                if existing_check is None:
+                    self._toolset_checks[toolset] = check_fn
+                elif existing_check is not check_fn:
+
+                    def _combined_check(
+                        _a: Callable = existing_check, _b: Callable = check_fn
+                    ) -> bool:
+                        return bool(_a()) or bool(_b())
+
+                    self._toolset_checks[toolset] = _combined_check
             self._generation += 1
 
     def deregister(self, name: str) -> None:
