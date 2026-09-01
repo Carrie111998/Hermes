@@ -514,10 +514,12 @@ export function ModelCatalogMenu({
                     const isCurrent = activeId !== null
                     const name = modelDisplayParts(family.id).name
                     const caps = group.provider.capabilities?.[family.id]
+
                     // Managed local model loading into memory right now:
                     // real load percent, keyed by exact model id (remote
                     // providers never collide with GGUF stems).
-                    const loadProgress = loadingModels[family.id] ?? (family.fastId ? loadingModels[family.fastId] : undefined)
+                    const loadProgress =
+                      loadingModels[family.id] ?? (family.fastId ? loadingModels[family.fastId] : undefined)
 
                     // Effective settings for this row: the live choice when it's
                     // the active model, otherwise its remembered preset. Row
@@ -614,7 +616,9 @@ export function ModelCatalogMenu({
                   })}
                 {!collapsed &&
                   slug === LOCAL_PROVIDER_SLUG &&
-                  shownDownloads.map(job => <DownloadingModelRow jobId={job.jobId} key={job.jobId} target={job.target} />)}
+                  shownDownloads.map(job => (
+                    <DownloadingModelRow jobId={job.jobId} key={job.jobId} target={job.target} />
+                  ))}
               </DropdownMenuGroup>
             )
           })}
@@ -692,10 +696,7 @@ function DownloadingModelRow({ jobId, target }: { jobId: string; target: string 
   const { t } = useI18n()
   const copy = t.modelPicker
 
-  const percent = useStoreSelector(
-    $localRuntimeJobs,
-    jobs => jobs.find(job => job.job_id === jobId)?.percent ?? null
-  )
+  const percent = useStoreSelector($localRuntimeJobs, jobs => jobs.find(job => job.job_id === jobId)?.percent ?? null)
 
   return (
     <DropdownMenuItem
@@ -718,6 +719,30 @@ function DownloadingModelRow({ jobId, target }: { jobId: string; target: string 
       </span>
     </DropdownMenuItem>
   )
+}
+
+function preferredFamilyRank(
+  preferredRanks: ReadonlyMap<string, number>,
+  provider: string,
+  family: ModelFamily
+): number | undefined {
+  let rank: number | undefined
+
+  // A rendered row represents both the base model and its optional -fast
+  // sibling. Rank the row by whichever configured member appears first.
+  for (const model of [family.id, family.fastId]) {
+    if (!model) {
+      continue
+    }
+
+    const candidate = preferredRanks.get(modelVisibilityKey(provider, normalize(model)))
+
+    if (candidate !== undefined && (rank === undefined || candidate < rank)) {
+      rank = candidate
+    }
+  }
+
+  return rank
 }
 
 // Collapsed we show the user's chosen models (or the curated default); typing
@@ -785,10 +810,11 @@ function groupModels(
         : undefined
 
     const families = allFamilies.filter(family => shown.has(family.id) || family.id === activeId)
+    const providerId = normalize(provider.slug)
 
     families.sort((a, b) => {
-      const aRank = preferredRanks.get(modelVisibilityKey(normalize(provider.slug), normalize(a.id)))
-      const bRank = preferredRanks.get(modelVisibilityKey(normalize(provider.slug), normalize(b.id)))
+      const aRank = preferredFamilyRank(preferredRanks, providerId, a)
+      const bRank = preferredFamilyRank(preferredRanks, providerId, b)
 
       if (aRank === undefined && bRank === undefined) {
         return 0
