@@ -2530,7 +2530,9 @@ export const en: Translations = {
         description: 'Walk through how the selected code works and link to the key files.',
         text: 'Please explain how this works and point me to the key files.'
       }
-    }
+    },
+    quoteSelected: 'Quote in chat',
+    addImageToChat: 'Add to chat'
   },
 
   statusStack: {
@@ -3272,7 +3274,8 @@ export const en: Translations = {
       restoreNext: 'Restore next checkpoint',
       goForward: 'Go forward',
       sendEdited: 'Send edited message',
-      attachingFile: 'Attaching…'
+      attachingFile: 'Attaching…',
+      quoteInChat: 'Quote in chat'
     },
     approval: {
       gatewayDisconnected: 'Hermes gateway is not connected',
