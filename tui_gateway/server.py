@@ -4476,7 +4476,13 @@ def _load_dashboard_process_isolation_config(cfg: dict | None = None) -> dict[st
     }
 
 
-def _load_cfg_raw() -> dict:
+def _active_cfg_path() -> Path:
+    override = get_hermes_home_override()
+    home = override if isinstance(override, str) and override else _hermes_home
+    return Path(home) / "config.yaml"
+
+
+def _load_cfg_raw(path: Path | None = None) -> dict:
     """Read the active profile's config.yaml EXACTLY as written (write-back primitive).
 
     ONLY legal for read→mutate→``_save_cfg`` round-trips (and raw-file
@@ -4491,9 +4497,7 @@ def _load_cfg_raw() -> dict:
         # remote profile loads ITS config (model, skills, prompt); otherwise the
         # launch profile's _hermes_home. Cache is keyed on the resolved path, so
         # profiles don't clobber each other.
-        override = get_hermes_home_override()
-        home = override if isinstance(override, str) and override else _hermes_home
-        p = Path(home) / "config.yaml"
+        p = path or _active_cfg_path()
         mtime = p.stat().st_mtime if p.exists() else None
         with _cfg_lock:
             if _cfg_cache is not None and _cfg_mtime == mtime and _cfg_path == p:
@@ -4530,7 +4534,30 @@ def _load_cfg() -> dict:
     round-trips or expanded/overlaid values get persisted into the user's
     file.
     """
-    cfg = _apply_managed(_load_cfg_raw())
+    cfg_path = _active_cfg_path()
+    cfg = _apply_managed(_load_cfg_raw(cfg_path))
+    # A profile that opted into inheritance carries only its own overrides on
+    # disk; the rest lives in the root config. Resolving it here keeps this
+    # reader agreeing with hermes_cli.config.load_config — without it an
+    # inheriting profile reads as model-less and callers fall through to their
+    # own defaults, which is how a room ended up pinned to a model the
+    # configured provider does not serve.
+    if cfg.get("inherit") is True:
+        try:
+            from hermes_cli.config import (
+                _deep_merge,
+                _load_inherited_config,
+                _normalize_root_model_keys,
+            )
+
+            inherited = _normalize_root_model_keys(_load_inherited_config(cfg_path))
+            if isinstance(inherited, dict) and inherited:
+                inherited.pop("inherit", None)
+                cfg = _deep_merge(inherited, cfg)
+        except Exception:
+            # Inheritance is an enhancement over the raw read: if it cannot be
+            # resolved, the profile's own config still stands.
+            pass
     try:
         from hermes_cli.config import _expand_env_vars
 
