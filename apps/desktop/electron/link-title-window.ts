@@ -76,7 +76,11 @@ export function createLinkTitleWindow(BrowserWindow, partitionSession) {
 // Chromium's are separate lookups, so a TOCTOU swap between them is theoretical;
 // pinning Chromium's connection to our answers is not worth the resolver-rules
 // plumbing for a short-lived title window.
-export function decideLinkTitleRequest(resourceType, url, { connectedIp, resolvedAddresses } = {}) {
+export function decideLinkTitleRequest(
+  resourceType: string,
+  url: string,
+  { connectedIp, resolvedAddresses }: { connectedIp?: string; resolvedAddresses?: string[] } = {}
+) {
   if (RENDER_TITLE_BLOCKED_RESOURCES.has(resourceType)) {
     return true
   }
@@ -112,7 +116,10 @@ export function decideLinkTitleRequest(resourceType, url, { connectedIp, resolve
   return false
 }
 
-export function guardLinkTitleSession(partitionSession, { resolveHost } = {}) {
+export function guardLinkTitleSession(
+  partitionSession: any,
+  { resolveHost }: { resolveHost?: (hostname: string) => Promise<string[]> } = {}
+) {
   try {
     partitionSession.on('will-download', (_event, item) => item.cancel())
   } catch {
