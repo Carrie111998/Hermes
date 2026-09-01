@@ -71,7 +71,15 @@ def _make_agent(tmp_path: Path) -> AIAgent:
                         "description": "test tool",
                         "parameters": {"type": "object", "properties": {}},
                     },
-                }
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "delegate_task",
+                        "description": "test delegate tool",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
             ],
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -287,6 +295,80 @@ def test_sequential_tool_interrupt_hides_lifecycle_cancel_detail(tmp_path, monke
     assert "user interrupt" not in messages[0]["content"]
     assert "PRIVATE_LIFECYCLE_REASON_DO_NOT_COPY" not in terminal_events[0]["error_message"]
     assert terminal_events[0]["error_type"] == "tool_interrupted"
+
+
+def _delegate_call(call_id: str = "delegate-1"):
+    return SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=SimpleNamespace(
+            name="delegate_task",
+            arguments=(
+                '{"action": "spawn", "tasks": ['
+                '{"goal": "research A"}, {"goal": "research B"}]}'
+            ),
+        ),
+    )
+
+
+def test_sequential_timeout_does_not_cut_delegate_task_dispatch(
+    tmp_path, monkeypatch
+):
+    """delegate_task dispatch must not be preempted by the generic tool deadline.
+
+    delegate_task(background) hands children to a detached executor and returns
+    a handle; the children keep running past the return. The dispatch itself
+    (building N child agents, or the forced-synchronous fallback joining them on
+    finite runtimes such as Kanban workers) can outlast the 420s concurrent-tool
+    deadline, but that generic deadline must not fire against it — otherwise the
+    parent turn sees ``timed out after 420.0s`` while the subagents are still
+    alive in the background (incident c4669b45...). Mirrors the clarify
+    exemption via ``_TOOL_DEADLINE_EXEMPT``.
+    """
+    agent = _make_agent(tmp_path)
+    monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "1.0")
+
+    dispatched_payload = {
+        "status": "dispatched",
+        "mode": "background",
+        "count": 2,
+        "delegation_id": "deleg-xyz",
+    }
+
+    def _dispatch_delegate(next_args):
+        # Dispatch outlasts the 1.0s generic deadline (child construction / the
+        # forced-sync join). It must still return its handle, not be cut.
+        time.sleep(1.3)
+        return json.dumps(dispatched_payload, ensure_ascii=False)
+
+    monkeypatch.setattr(agent, "_dispatch_delegate_task", _dispatch_delegate)
+    terminal_events: list[dict] = []
+
+    def _capture_terminal_event(*_args, **kwargs):
+        terminal_events.append(kwargs)
+
+    messages: list[dict] = []
+    started = time.monotonic()
+    with patch(
+        "agent.tool_executor._emit_terminal_post_tool_call",
+        side_effect=_capture_terminal_event,
+    ):
+        execute_tool_calls_sequential(
+            agent,
+            SimpleNamespace(tool_calls=[_delegate_call()]),
+            messages,
+            "task",
+        )
+
+    assert time.monotonic() - started < 10.0
+    assert [message["tool_call_id"] for message in messages] == ["delegate-1"]
+    assert "timed out" not in messages[0]["content"]
+    payload = json.loads(messages[0]["content"])
+    assert payload["status"] == "dispatched"
+    assert payload["delegation_id"] == "deleg-xyz"
+    assert not any(
+        event.get("error_type") == "tool_timeout" for event in terminal_events
+    )
 
 
 @pytest.mark.parametrize(

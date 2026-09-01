@@ -44,6 +44,26 @@ logger = logging.getLogger(__name__)
 # When any of these appear in a batch, we fall back to sequential execution.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
 
+# Tools whose dispatch is self-bounded and must NOT be preempted by the generic
+# per-call tool deadline (``timeouts.tools.sequential_call`` /
+# ``HERMES_CONCURRENT_TOOL_TIMEOUT_S``, default 420s). The generic deadline
+# exists to preempt a tool that genuinely wedges; these tools instead own their
+# own bound and can legitimately run longer than 420s without being stuck:
+#   * ``clarify``       — blocks on a human; bounded by ``agent.clarify_timeout``
+#                         (default 3600s, or unlimited when <= 0).
+#   * ``delegate_task`` — background spawn returns a handle almost immediately
+#                         and the children run detached past the return; the
+#                         forced-synchronous fallback (finite runtimes such as
+#                         Kanban workers / one-shot HTTP) joins its own children,
+#                         each bounded by ``delegation.max_iterations`` and its
+#                         own activity heartbeat. Applying the 420s deadline here
+#                         returned ``timed out after 420.0s`` to the parent turn
+#                         while the subagents were still alive in the background
+#                         (incident c4669b45...). ``list``/``steer``/``stop``
+#                         control actions return synchronously and fast, so the
+#                         exemption is harmless for them.
+_TOOL_DEADLINE_EXEMPT = _NEVER_PARALLEL_TOOLS | frozenset({"delegate_task"})
+
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
     "ha_get_state",
@@ -833,6 +853,7 @@ def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
 
 __all__ = [
     "_NEVER_PARALLEL_TOOLS",
+    "_TOOL_DEADLINE_EXEMPT",
     "_PARALLEL_SAFE_TOOLS",
     "_PATH_SCOPED_TOOLS",
     "_PATH_SCOPED_READERS",

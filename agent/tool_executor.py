@@ -34,7 +34,7 @@ from agent.display import (
 )
 from agent.message_sanitization import coalesce_tool_call_id
 from agent.tool_dispatch_helpers import (
-    _NEVER_PARALLEL_TOOLS,
+    _TOOL_DEADLINE_EXEMPT,
     _is_destructive_command,
     _is_multimodal_tool_result,
     _multimodal_text_summary,
@@ -834,6 +834,12 @@ def _run_sequential_tool_execution_middleware(
     timeout (``agent.clarify_timeout``: default 3600s, or unlimited when
     ``<= 0``) owns that wait. Applying the generic tool deadline here would
     return ``tool_timeout`` while the prompt and worker stay active.
+
+    ``delegate_task`` is exempt for the same reason (``_TOOL_DEADLINE_EXEMPT``):
+    background spawn returns a handle and the children run detached past the
+    return, and the forced-synchronous fallback joins its own children, each
+    bounded by ``delegation.max_iterations`` and an activity heartbeat — so the
+    generic 420s deadline must not fire against it (incident c4669b45...).
     """
     timeout_s = _resolve_sequential_tool_timeout()
     kwargs = {
@@ -846,7 +852,7 @@ def _run_sequential_tool_execution_middleware(
         "display_index": display_index,
         "middleware_trace": middleware_trace,
     }
-    if function_name in _NEVER_PARALLEL_TOOLS:
+    if function_name in _TOOL_DEADLINE_EXEMPT:
         return _run_agent_tool_execution_middleware(agent, **kwargs)
 
     from tools.daemon_pool import DaemonThreadPoolExecutor
