@@ -335,11 +335,13 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # produces a fresh inode, so stat() sees a new mtime_ns and the next
 # load repopulates automatically — no explicit invalidation hook.
 # Cached tuple is (user_mtime_ns, user_size, managed_mtime_ns, managed_size,
-# merged_value, env_ref_snapshot) — the managed-file signature is folded in so
-# editing the managed-scope config.yaml invalidates the cache (see
-# managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
-# changes value (late .env load, in-process rotation — #58514).
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+# root_mtime_ns, root_size, merged_value, env_ref_snapshot) — the managed-file
+# signature is folded in so editing the managed-scope config.yaml invalidates
+# the cache (see managed_scope), the root-file signature so an inheriting
+# profile follows edits to the config it inherits from, and the env snapshot
+# invalidates it when a referenced ${VAR} changes value (late .env load,
+# in-process rotation — #58514).
+_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -4023,6 +4025,63 @@ def apply_terminal_config_to_env(
     return target
 
 
+def _resolve_root_config_path(config_path: Path) -> Optional[Path]:
+    """Return the root profile's config for a named profile, if there is one.
+
+    Named profiles live at ``<root>/profiles/<name>/``, so the root config is
+    two levels up. Returns ``None`` for the root profile itself — it has no
+    parent, and inheriting from yourself is a loop, not a feature.
+    """
+    profile_dir = config_path.parent
+    if profile_dir.parent.name != "profiles":
+        return None
+
+    root_config = profile_dir.parent.parent / "config.yaml"
+    return root_config if root_config != config_path else None
+
+
+def _warn_nested_inherit(user_config: Dict[str, Any], config_path: Path) -> None:
+    """Warn when ``inherit: true`` sits inside a section instead of at the top.
+
+    Inheritance is a whole-file switch, so a nested `inherit` does nothing. It
+    also fails quietly in the worst way: the section it was meant to fill stays
+    empty, and the user sees a missing model rather than a misplaced key.
+    """
+    nested = [
+        key
+        for key, value in user_config.items()
+        if isinstance(value, dict) and value.get("inherit") is True
+    ]
+    if not nested:
+        return
+
+    where = ", ".join(f"{key}.inherit" for key in sorted(nested))
+    print(
+        f"⚠ {config_path}: {where} has no effect — `inherit: true` applies to the "
+        "whole file and must sit at the top level.",
+        file=sys.stderr,
+    )
+
+
+def _load_inherited_config(config_path: Path) -> Dict[str, Any]:
+    """Read the root profile's config to fill gaps in an inheriting profile.
+
+    A root that is missing or unreadable yields ``{}``: inheritance is a
+    convenience, and a profile that works on its own must keep working when
+    the parent it borrows from is broken.
+    """
+    root_config_path = _resolve_root_config_path(config_path)
+    if root_config_path is None:
+        return {}
+
+    try:
+        with open(root_config_path, encoding="utf-8") as f:
+            return fast_safe_load(f) or {}
+    except Exception as e:
+        _warn_config_parse_failure(root_config_path, e, fallback="no inheritance")
+        return {}
+
+
 def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         ensure_hermes_home()
@@ -4048,30 +4107,45 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         except OSError:
             managed_sig = (0, 0)
 
-        # Combined cache signature: user file + managed file. None only when the
-        # user config is absent AND no managed file exists (nothing to cache on).
+        # Same reasoning for the inherited root config: a profile that inherits
+        # depends on a second file, so a root edit has to invalidate the cache
+        # too. Stat it unconditionally — reading `inherit` would mean parsing
+        # the profile config on every load, which is the work the cache exists
+        # to avoid. (0, 0) means "no root config to inherit from".
+        root_cfg_path = _resolve_root_config_path(config_path)
+        try:
+            rst = root_cfg_path.stat() if root_cfg_path else None
+            root_sig = (rst.st_mtime_ns, rst.st_size) if rst else (0, 0)
+        except OSError:
+            root_sig = (0, 0)
+
+        # Combined cache signature: user file + managed file + inherited root.
+        # None only when the user config is absent AND no managed file exists
+        # (nothing to cache on).
         if user_sig is not None:
-            cache_sig: Optional[Tuple[int, int, int, int]] = (
+            cache_sig: Optional[Tuple[int, int, int, int, int, int]] = (
                 user_sig[0],
                 user_sig[1],
                 managed_sig[0],
                 managed_sig[1],
+                root_sig[0],
+                root_sig[1],
             )
         elif managed_sig != (0, 0):
-            cache_sig = (0, 0, managed_sig[0], managed_sig[1])
+            cache_sig = (0, 0, managed_sig[0], managed_sig[1], root_sig[0], root_sig[1])
         else:
             cache_sig = None
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if cached is not None and cache_sig is not None and cached[:6] == cache_sig:
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
             # Without this, a load_config() that ran before load_hermes_dotenv()
             # pins unexpanded literals (e.g. auxiliary.<task>.api_key) for the
             # life of the process (#58514).
-            env_snapshot = cached[5] if len(cached) > 5 else {}
+            env_snapshot = cached[7] if len(cached) > 7 else {}
             if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
-                return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
+                return copy.deepcopy(cached[6]) if want_deepcopy else cached[6]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
@@ -4086,6 +4160,29 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         agent_user_config["max_turns"] = user_config["max_turns"]
                     user_config["agent"] = agent_user_config
                     user_config.pop("max_turns", None)
+
+                # Opt-in inheritance: a profile that asks for it reads the root
+                # profile's config as a base layer, then overrides it with its
+                # own keys. Off by default, so profiles stay isolated unless
+                # their owner says otherwise.
+                if user_config.get("inherit") is True:
+                    inherited = _load_inherited_config(config_path)
+                    inherited.pop("inherit", None)
+                    if inherited:
+                        config = _deep_merge(config, inherited)
+                    elif _resolve_root_config_path(config_path) is None:
+                        # `inherit: true` was asked for and could not be
+                        # honoured — the profile is not where inheritance can
+                        # find a root. Silence here reproduces the bug this
+                        # feature exists to fix: a config that reads as empty
+                        # for a reason nothing on screen explains.
+                        print(
+                            f"⚠ {config_path}: `inherit: true` has no effect here — "
+                            "inheritance expects a profile at <root>/profiles/<name>/.",
+                            file=sys.stderr,
+                        )
+                else:
+                    _warn_nested_inherit(user_config, config_path)
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
@@ -4125,6 +4222,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         _LOAD_CONFIG_CACHE[path_key] = (
                             cache_sig[0], cache_sig[1],
                             cache_sig[2], cache_sig[3],
+                            cache_sig[4], cache_sig[5],
                             lkg_copy, _empty_env,
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
