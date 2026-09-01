@@ -1484,6 +1484,7 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
     else:
         agent._interrupt_message = None
+        agent._interrupt_stop_kind = None
         agent._tool_interrupt_reason = None
         agent._interrupt_thread_signal_pending = False
 
