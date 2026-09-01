@@ -14,7 +14,21 @@ _profile_scoped = _registry.profile_scoped
 @method("session.create")
 def _(rid, params: dict) -> dict:
     sid = uuid.uuid4().hex[:8]
-    key = _new_session_key()
+    restore_session_id = str(params.get("restore_session_id") or "").strip()
+    if restore_session_id:
+        parts = restore_session_id.split("_")
+        valid_restore_id = (
+            len(parts) == 3
+            and len(parts[0]) == 8
+            and parts[0].isdigit()
+            and len(parts[1]) == 6
+            and parts[1].isdigit()
+            and len(parts[2]) == 6
+            and all(char in "0123456789abcdef" for char in parts[2])
+        )
+        if not valid_restore_id:
+            return _err(rid, 4006, "invalid restore_session_id")
+    key = restore_session_id or _new_session_key()
     cols = int(params.get("cols", 80))
     history = _coerce_seed_history(params.get("messages"))
     title = str(params.get("title") or "").strip()
@@ -41,6 +55,20 @@ def _(rid, params: dict) -> dict:
     # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
+
+    # Reject an already-live key in this process before reserving it below. The
+    # database reservation handles OTHER gateway processes; this cheap local
+    # guard avoids materializing a row for an ordinary live lazy session.
+    if restore_session_id:
+        restore_home = str(profile_home) if profile_home is not None else None
+        with _sessions_lock:
+            if any(
+                isinstance(record, dict)
+                and str(record.get("session_key") or "") == restore_session_id
+                and (record.get("profile_home") or None) == restore_home
+                for record in _sessions.values()
+            ):
+                return _err(rid, 4090, "restore_session_id is already live")
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
@@ -69,6 +97,24 @@ def _(rid, params: dict) -> dict:
         create_service_tier_override = (
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
+
+    # A restored key is client-supplied and must be claimed atomically across
+    # EVERY gateway sharing this profile DB. The zero-message row is the durable
+    # inter-process reservation (normal lists still filter it out); a later real
+    # turn enriches it through SessionDB.create_session's conflict-update path.
+    if restore_session_id:
+        with _profile_db(params) as restore_db:
+            if restore_db is None:
+                return _db_unavailable_error(rid, code=5000)
+            reserved = restore_db.try_reserve_restored_draft_session(
+                restore_session_id,
+                source=source,
+                model=create_model or _resolve_model(),
+                cwd=raw_cwd if explicit_cwd else None,
+                profile_name=profile,
+            )
+        if not reserved:
+            return _err(rid, 4090, "restore_session_id already exists")
 
     ready = threading.Event()
     now = time.time()
@@ -113,12 +159,11 @@ def _(rid, params: dict) -> dict:
         }
         _register_session_cwd(_sessions[sid])
 
-    # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
-    # launch (and every "New agent" / draft) opens a session here just to paint
-    # the composer, so eagerly creating a row left an "Untitled" empty session
-    # behind for every launch the user never typed into. The row is now created
-    # lazily on the first prompt (see _ensure_session_db_row + prompt.submit),
-    # and the AIAgent's own INSERT-OR-IGNORE persists it on the first turn too.
+    # NOTE: ordinary creates intentionally persist no DB row here. Every
+    # TUI/desktop launch opens a session just to paint the composer, so eager
+    # rows left "Untitled" litter. A RESTORED draft is the exception: its empty
+    # row above is an inter-process ownership claim, and min_messages=1 keeps it
+    # out of normal lists until the first real turn enriches it.
 
     # Return the lightweight session immediately so Ink can paint the composer
     # + skeleton panel, then build the real AIAgent just after this response is
