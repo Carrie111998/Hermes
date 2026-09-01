@@ -214,3 +214,76 @@ def test_synthetic_plugin_end_to_end(tmp_path, monkeypatch):
         provider="acmecloud",
     )
     assert other.reason == FailoverReason.rate_limit
+
+
+def test_primary_auth_failure_context_is_content_bounded(monkeypatch):
+    seen = {}
+    manager = plugins_mod.PluginManager()
+    manager._discovered = True
+
+    def observe(**kwargs):
+        seen.update(kwargs)
+
+    manager._hooks["primary_auth_failure_context"] = [observe]
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", manager)
+
+    plugins_mod.notify_primary_auth_failure(
+        provider="openai-codex",
+        status_code=401,
+        detail="credential rejected",
+        turn_id="turn-1",
+        session_id="session-1",
+        event_origin="client",
+    )
+
+    assert seen["failure_scope"] == "primary_model"
+    assert seen["turn_id"] == "turn-1"
+    assert seen["session_id"] == "session-1"
+    assert seen["event_origin"] == "client"
+    assert "conversation_history" not in seen
+    assert "user_message" not in seen
+
+
+def test_client_safe_auth_failure_transform_and_safe_default(monkeypatch):
+    manager = plugins_mod.PluginManager()
+    manager._discovered = True
+    manager._hooks["client_safe_auth_failure"] = [
+        lambda **kwargs: {"message": "Reconnect the primary model, then retry."}
+    ]
+    monkeypatch.setattr(plugins_mod, "_plugin_manager", manager)
+
+    result = plugins_mod.transform_client_auth_failure(
+        default_message="Authentication failed.",
+        provider="openai-codex",
+        status_code=401,
+        turn_id="turn-1",
+        session_id="session-1",
+        event_origin="client",
+    )
+    assert result == "Reconnect the primary model, then retry."
+
+    seen = {}
+    manager._hooks["client_safe_auth_failure"] = [
+        lambda **kwargs: seen.update(kwargs) or {"message": "Reconnect now."}
+    ]
+    result = plugins_mod.transform_client_auth_failure(
+        default_message="Authentication failed.",
+        provider="openai-codex",
+        status_code=None,
+        turn_id="turn-2",
+        session_id="session-1",
+        event_origin="client",
+    )
+    assert result == "Reconnect now."
+    assert seen["status_code"] is None
+
+    manager._hooks["client_safe_auth_failure"] = [lambda **kwargs: None]
+    result = plugins_mod.transform_client_auth_failure(
+        default_message="Authentication failed.",
+        provider="openai-codex",
+        status_code=401,
+        turn_id="turn-1",
+        session_id="session-1",
+        event_origin="client",
+    )
+    assert result == "Authentication failed."

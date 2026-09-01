@@ -614,6 +614,7 @@ def init_agent(
     pass_session_id: bool = False,
     requested_provider: str = None,
     capabilities: Optional[Dict[str, bool]] = None,
+    runtime_policy_origin: str = "internal",
 ):
     """
     Initialize the AI Agent.
@@ -704,6 +705,11 @@ def init_agent(
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
+    if runtime_policy_origin not in {"client", "internal"}:
+        raise ValueError("runtime_policy_origin must be 'client' or 'internal'")
+    # Establish trusted provenance before provider construction. Init-time
+    # fallback policy must not run with a platform/session heuristic.
+    agent._runtime_policy_origin = runtime_policy_origin
     # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
     agent.base_url = base_url or ""
     provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
@@ -1417,6 +1423,20 @@ def init_agent(
                         _fb_entries = [fallback_model]
                     _fb_resolved = False
                     for _fb in _fb_entries:
+                        from hermes_cli.plugins import (
+                            get_fallback_candidate_block_reason,
+                        )
+
+                        _fb_block = get_fallback_candidate_block_reason(
+                            entry=_fb,
+                            reason="auth",
+                            turn_id="",
+                            session_id=str(session_id or ""),
+                            event_origin=runtime_policy_origin,
+                        )
+                        if _fb_block:
+                            logger.warning("Init-time fallback denied: %s", _fb_block)
+                            continue
                         try:
                             from hermes_cli.fallback_config import resolve_entry_api_key
                             _fb_explicit_key = resolve_entry_api_key(_fb)

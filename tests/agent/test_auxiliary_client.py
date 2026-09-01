@@ -4094,7 +4094,7 @@ class TestCompressionFallbackContextFilter:
             self._make_chain_entry("big-provider", "huge-1m"),
         ]
 
-        def fake_resolve(entry):
+        def fake_resolve(entry, **_kwargs):
             if entry is entries[0]:
                 return small_client, "tiny-8k"
             return large_client, "huge-1m"
@@ -4368,6 +4368,30 @@ class TestMoaAggregatorStreamingBypass:
 
 
 class TestSynchronousFallbackCachePlans:
+    def test_policy_denial_precedes_auxiliary_fallback_resolution(self, monkeypatch):
+        from agent.auxiliary_client import _try_configured_fallback_chain
+
+        monkeypatch.setattr(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            lambda task: {
+                "fallback_chain": [
+                    {"provider": "openrouter", "model": "paid/model"}
+                ]
+            },
+        )
+        resolve = MagicMock()
+        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", resolve)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_fallback_candidate_block_reason",
+            lambda **kwargs: "denied auxiliary fallback",
+        )
+
+        assert _try_configured_fallback_chain(
+            task="moa_aggregator",
+            failed_provider="primary",
+        ) == (None, None, "")
+        resolve.assert_not_called()
+
     @staticmethod
     def _run_configured_fallback(monkeypatch, entry):
         from agent.auxiliary_client import (

@@ -3184,7 +3184,9 @@ class TestRunConversation:
 
         assert result["final_response"] == "Recovered on fallback"
         assert result["completed"] is True
-        mock_try_activate_fallback.assert_called_once_with()
+        mock_try_activate_fallback.assert_called_once_with(
+            FailoverReason.content_policy_blocked
+        )
         assert mock_run_codex_stream.call_count == 2
         assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
         assert hook_events[0]["retryable"] is False
@@ -3687,7 +3689,8 @@ class TestRunConversation:
 
         fallback_called = {"called": False}
 
-        def _mock_fallback():
+        def _mock_fallback(reason=None):
+            assert reason == FailoverReason.unknown
             fallback_called["called"] = True
             # Simulate what _try_activate_fallback does: just advance the
             # index and set the flag (the client is already mocked).
@@ -3724,7 +3727,8 @@ class TestRunConversation:
             empty_resp, empty_resp, empty_resp, empty_resp,  # fallback exhausted
         ]
 
-        def _mock_fallback():
+        def _mock_fallback(reason=None):
+            assert reason == FailoverReason.unknown
             if agent._fallback_index >= len(agent._fallback_chain):
                 return False
             agent._fallback_index += 1

@@ -569,6 +569,7 @@ class AIAgent:
         pass_session_id: bool = False,
         requested_provider: str = None,
         capabilities: Dict[str, bool] | None = None,
+        runtime_policy_origin: str = "internal",
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -586,6 +587,7 @@ class AIAgent:
             provider=provider,
             requested_provider=requested_provider,
             capabilities=capabilities,
+            runtime_policy_origin=runtime_policy_origin,
             api_mode=api_mode,
             acp_command=acp_command,
             acp_args=acp_args,
@@ -7401,10 +7403,15 @@ class AIAgent:
         from agent.chat_completion_helpers import interruptible_streaming_api_call
         return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
 
-    def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
+    def _try_activate_fallback(
+        self,
+        reason: "FailoverReason | None" = None,
+        *,
+        _arm_cooldown: bool = True,
+    ) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
-        return try_activate_fallback(self, reason)
+        return try_activate_fallback(self, reason, _arm_cooldown=_arm_cooldown)
 
     def _has_pending_fallback(self) -> bool:
         """Whether a fallback provider is actually available to switch to.
@@ -9799,7 +9806,8 @@ def main(
             disabled_toolsets=disabled_toolsets_list,
             save_trajectories=save_trajectories,
             verbose_logging=verbose,
-            log_prefix_chars=log_prefix_chars
+            log_prefix_chars=log_prefix_chars,
+            runtime_policy_origin="client",
         )
     except RuntimeError as e:
         print(f"❌ Failed to initialize agent: {e}")

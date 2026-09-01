@@ -197,6 +197,7 @@ def test_oneshot_calls_ensure_helper_before_aiagent(monkeypatch):
         "ensure_mcp_discovery_before_agent_build must be called BEFORE AIAgent "
         "construction in oneshot._run_agent (#38448)"
     )
+    assert 'runtime_policy_origin="client"' in src
 
 
 # ── _init_agent ordering: discovery before AIAgent (CLI path) ───────────────

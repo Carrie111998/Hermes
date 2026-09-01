@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from typing import (Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple, Type, Union)
+from urllib.parse import urlsplit
 
 from hermes_constants import (
     get_hermes_home,
@@ -216,6 +217,15 @@ VALID_HOOKS: Set[str] = {
     # Contract: the transform-family first-valid-wins shape in
     # docs/plugins/hook-taxonomy.md.
     "transform_api_error_classification",
+    # Runtime policy seams.  These hooks carry already-resolved execution
+    # context so plugins do not need to reach into private agent/tool state.
+    # ``effective_file_search_context`` and ``fallback_candidate_decision``
+    # are explicit policy decisions: once registered, callbacks must return
+    # allow/block and missing/invalid decisions fail closed.
+    "effective_file_search_context",
+    "primary_auth_failure_context",
+    "fallback_candidate_decision",
+    "client_safe_auth_failure",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
@@ -396,6 +406,10 @@ VALID_HOOKS: Set[str] = {
 # Support for a shell response shape can lift an event out of this set.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
     "transform_api_error_classification",
+    "effective_file_search_context",
+    "primary_auth_failure_context",
+    "fallback_candidate_decision",
+    "client_safe_auth_failure",
 }
 
 # Timeout coverage is an allowlist for the agent-turn hot path, not every
@@ -436,11 +450,17 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: Set[str] = {
     "pre_verify",
     "on_session_start",
     "on_session_end",
+    "primary_auth_failure_context",
+    "client_safe_auth_failure",
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
 # Skipping would let the tool run without a completed policy decision.
-_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {"pre_tool_call"}
+_HOOK_TIMEOUT_FAIL_CLOSED_HOOKS: Set[str] = {
+    "pre_tool_call",
+    "effective_file_search_context",
+    "fallback_candidate_decision",
+}
 
 # Documented parent-thread serialization contract — never move the callback
 # body onto a timeout worker (see website/docs/user-guide/features/hooks.md).
@@ -7025,6 +7045,201 @@ def get_plugin_error_classification(
             skipped_valid,
         )
     return winner
+
+
+def get_file_search_policy_decision(
+    *,
+    path: str,
+    cwd: str,
+    backend: str,
+    is_local: bool,
+) -> tuple[Optional[str], str]:
+    """Return ``(block_message, effective_path)`` for a file search.
+
+    The caller owns backend/cwd resolution and invokes this helper before any
+    search or existence-check subprocess.  A registered policy must explicitly return
+    ``{"action": "allow"}`` or
+    ``{"action": "block", "message": ...}``.  Missing, invalid, raised, or
+    timed-out policy decisions fail closed; no registered hook preserves the
+    built-in search behavior.
+    """
+    manager = _delivery_manager()
+    callbacks = manager.iter_hook_callbacks("effective_file_search_context")
+    if not callbacks:
+        return None, path
+    try:
+        results = manager.invoke_hook(
+            "effective_file_search_context",
+            path=path,
+            cwd=cwd,
+            backend=backend,
+            is_local=bool(is_local),
+        )
+    except Exception as exc:
+        logger.warning("File-search policy dispatch failed: %s", exc)
+        return "File search blocked because its runtime policy could not be evaluated.", path
+
+    if len(results) != len(callbacks):
+        return "File search blocked because a runtime policy returned no decision.", path
+
+    saw_allow = False
+    for result in results:
+        if not isinstance(result, dict):
+            return "File search blocked because a runtime policy returned an invalid decision.", path
+        action = str(result.get("action") or "").strip().lower()
+        if action == "block":
+            message = result.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip(), path
+            return "File search blocked by runtime policy.", path
+        if action == "allow":
+            if "path" in result:
+                return "File search blocked because runtime policies cannot rewrite paths.", path
+            saw_allow = True
+            continue
+        if action not in {"allow", "block"}:
+            return "File search blocked because a runtime policy returned an invalid decision.", path
+    if not saw_allow:
+        return "File search blocked because its runtime policy returned no decision.", path
+    return None, path
+
+
+def notify_primary_auth_failure(
+    *,
+    provider: str,
+    status_code: int,
+    detail: str,
+    turn_id: str,
+    session_id: str,
+    event_origin: str,
+) -> None:
+    """Notify policy plugins of a verified primary-model auth failure."""
+    if not has_hook("primary_auth_failure_context"):
+        return
+    invoke_hook(
+        "primary_auth_failure_context",
+        provider=provider,
+        status_code=int(status_code),
+        detail=detail,
+        failure_scope="primary_model",
+        turn_id=turn_id,
+        session_id=session_id,
+        event_origin=event_origin,
+    )
+
+
+def get_fallback_candidate_block_reason(
+    *,
+    entry: Dict[str, Any],
+    reason: str,
+    turn_id: str,
+    session_id: str,
+    event_origin: str,
+) -> Optional[str]:
+    """Return why a fallback candidate is denied, or ``None`` when allowed.
+
+    Candidate policy is fail closed once a hook is registered.  Every callback
+    runs; any valid block wins, otherwise at least one explicit allow is
+    required.  This makes a broken paid-routing policy unable to degrade into
+    an ungoverned network call.
+    """
+    manager = _delivery_manager()
+    callbacks = manager.iter_hook_callbacks("fallback_candidate_decision")
+    if not callbacks:
+        return None
+    # Fallback entries may contain inline credentials.  Runtime policy gets
+    # only the non-secret routing facts needed to decide whether dispatch is
+    # allowed; plugin code must never receive the source entry wholesale.
+    policy_entry = {
+        key: entry[key]
+        for key in ("provider", "model", "api_mode")
+        if key in entry
+    }
+    if entry.get("base_url"):
+        try:
+            parsed = urlsplit(str(entry["base_url"]))
+            host = parsed.hostname or ""
+            if ":" in host and not host.startswith("["):
+                host = f"[{host}]"
+            port = f":{parsed.port}" if parsed.port is not None else ""
+            # Only the endpoint origin is a routing fact. Userinfo, path,
+            # query, and fragment can all carry tenant credentials and are
+            # deliberately excluded from plugin-visible policy payloads.
+            if parsed.scheme and host:
+                policy_entry["base_url"] = f"{parsed.scheme.lower()}://{host}{port}"
+        except (TypeError, ValueError):
+            pass
+    try:
+        results = manager.invoke_hook(
+            "fallback_candidate_decision",
+            entry=policy_entry,
+            reason=reason,
+            turn_id=turn_id,
+            session_id=session_id,
+            event_origin=event_origin,
+        )
+    except Exception as exc:
+        logger.warning("Fallback candidate policy dispatch failed: %s", exc)
+        return "Fallback blocked because its runtime policy could not be evaluated."
+
+    if len(results) != len(callbacks):
+        return "Fallback blocked because a runtime policy returned no decision."
+
+    saw_allow = False
+    for result in results:
+        if not isinstance(result, dict):
+            return "Fallback blocked because a runtime policy returned an invalid decision."
+        action = str(result.get("action") or "").strip().lower()
+        if action == "block":
+            message = result.get("message")
+            return (
+                message.strip()
+                if isinstance(message, str) and message.strip()
+                else "Fallback blocked by runtime policy."
+            )
+        if action == "allow":
+            saw_allow = True
+            continue
+        return "Fallback blocked because a runtime policy returned an invalid decision."
+    if saw_allow:
+        return None
+    return "Fallback blocked because its runtime policy returned no decision."
+
+
+def transform_client_auth_failure(
+    *,
+    default_message: str,
+    provider: str,
+    status_code: int | None,
+    turn_id: str,
+    session_id: str,
+    event_origin: str,
+) -> str:
+    """Return a bounded client-safe message for a terminal auth failure."""
+    safe_default = (
+        default_message.strip()
+        or "Authentication failed. Please reconnect the provider and retry."
+    )
+    if not has_hook("client_safe_auth_failure"):
+        return safe_default
+    try:
+        results = invoke_hook(
+            "client_safe_auth_failure",
+            default_message=safe_default,
+            provider=provider,
+            status_code=(int(status_code) if status_code is not None else None),
+            turn_id=turn_id,
+            session_id=session_id,
+            event_origin=event_origin,
+        )
+    except Exception as exc:
+        logger.warning("Client auth-failure transform failed: %s", exc)
+        return safe_default
+    for result in results:
+        message = result.get("message") if isinstance(result, dict) else result
+        if isinstance(message, str) and message.strip():
+            return message.strip()[:500]
+    return safe_default
 
 
 def _ensure_plugins_discovered(force: bool = False) -> PluginManager:

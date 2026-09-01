@@ -4548,6 +4548,7 @@ def test_make_agent_passes_configured_fallback_chain(monkeypatch):
     assert agent.model == "gpt-5.5"
     assert captured["fallback_model"] == fallback_chain
     assert captured["platform"] == "tui"
+    assert captured["runtime_policy_origin"] == "client"
 
 
 def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
@@ -4567,6 +4568,7 @@ def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
     kwargs = server._background_agent_kwargs(agent, "task-id")
 
     assert kwargs["fallback_model"] == chain
+    assert kwargs["runtime_policy_origin"] == "internal"
 
 
 def test_background_agent_kwargs_preserves_empty_fallback_chain(monkeypatch):

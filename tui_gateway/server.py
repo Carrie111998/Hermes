@@ -8624,6 +8624,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
         "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
         "platform": "tui",
+        "runtime_policy_origin": "internal",
         "session_db": _get_db(),
         "fallback_model": _agent_fallback_model(agent),
     }
@@ -9115,6 +9116,7 @@ def _make_agent(
         provider_require_parameters=_pr.get("require_parameters", False),
         provider_data_collection=_pr.get("data_collection"),
         platform=_resolve_agent_platform(platform_override),
+        runtime_policy_origin="client",
         session_id=session_id or key,
         session_db=session_db if session_db is not None else _get_db(),
         ephemeral_system_prompt=system_prompt or None,

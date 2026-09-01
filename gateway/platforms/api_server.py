@@ -3127,6 +3127,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "enabled_toolsets": enabled_toolsets,
             "session_id": session_id,
             "platform": "api_server",
+            "runtime_policy_origin": "client",
             "stream_delta_callback": stream_delta_callback,
             "tool_progress_callback": tool_progress_callback,
             "tool_start_callback": tool_start_callback,
