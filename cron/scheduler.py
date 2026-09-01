@@ -2701,9 +2701,12 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
                 filter_benign_darwin_subprocess_stderr,
             )
 
-            tail = filter_benign_darwin_subprocess_stderr(
-                (result.stderr or result.stdout or "").strip()
-            )[-500:]
+            # Never filter stdout: only the stderr source is sanitized before
+            # the fallback to stdout. (#54833)
+            stderr_clean = filter_benign_darwin_subprocess_stderr(
+                (result.stderr or "").strip()
+            )
+            tail = (stderr_clean or (result.stdout or "").strip())[-500:]
             msg = (
                 f"bot-chat delivery to profile "
                 f"'{profile or '(own)'}' failed (exit {result.returncode})"

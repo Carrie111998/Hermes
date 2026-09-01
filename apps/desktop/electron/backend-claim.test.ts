@@ -130,3 +130,44 @@ test('attach tolerates a child with missing stdio streams', () => {
   tail.attach({ stderr: null, stdout: null })
   assert.equal(tail.text(), '')
 })
+
+// --- #54833: benign Darwin malloc noise filtered from stderr, never stdout ---
+
+const MALLOC_NOISE =
+  "MallocStackLogging: can't turn off malloc stack logging because it was not enabled."
+
+test('output tail suppresses the exact stderr noise line on darwin', () => {
+  const prev = process.platform
+  Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true })
+  try {
+    const child = { stderr: new EventEmitter(), stdout: new EventEmitter() }
+    const tail = createBackendOutputTail(4096)
+
+    tail.attach(child)
+    child.stderr.emit('data', Buffer.from(`real boot error\nPython(12) ${MALLOC_NOISE}\n`))
+    child.stderr.emit('end')
+
+    assert.match(tail.text(), /real boot error/)
+    assert.doesNotMatch(tail.text(), /MallocStackLogging/)
+  } finally {
+    Object.defineProperty(process, 'platform', { value: prev, configurable: true })
+  }
+})
+
+test('output tail retains the literal sentence when it arrives on stdout', () => {
+  const prev = process.platform
+  Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true })
+  try {
+    const child = { stderr: new EventEmitter(), stdout: new EventEmitter() }
+    const tail = createBackendOutputTail(4096)
+
+    tail.attach(child)
+    child.stdout.emit('data', Buffer.from(`tool printed: ${MALLOC_NOISE}\n`))
+    child.stderr.emit('data', Buffer.from(''))
+    child.stderr.emit('end')
+
+    assert.match(tail.text(), new RegExp(MALLOC_NOISE.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+  } finally {
+    Object.defineProperty(process, 'platform', { value: prev, configurable: true })
+  }
+})

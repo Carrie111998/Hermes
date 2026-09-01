@@ -12084,12 +12084,14 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   // backend stderr before it reaches desktop.log; stdout is never filtered.
   const stderrNoiseSink = createBenignStderrSink(rememberLog)
   child.stderr?.on('data', stderrNoiseSink)
-  child.stderr?.on('end', () => {
+  const flushStderrTail = () => {
     const rest = stderrNoiseSink.flush()
     if (rest) {
       rememberLog(rest)
     }
-  })
+  }
+  child.stderr?.on('end', flushStderrTail)
+  child.stderr?.on('close', flushStderrTail)
 
   let ready = false
   let rejectStart = null
@@ -12493,12 +12495,14 @@ async function startHermes() {
     // #54833: same benign-stderr filter as the pooled backend path above.
     const hermesStderrSink = createBenignStderrSink(rememberLog)
     hermesProcess.stderr?.on('data', hermesStderrSink)
-    hermesProcess.stderr?.on('end', () => {
+    const flushHermesStderrTail = () => {
       const rest = hermesStderrSink.flush()
       if (rest) {
         rememberLog(rest)
       }
-    })
+    }
+    hermesProcess.stderr?.on('end', flushHermesStderrTail)
+    hermesProcess.stderr?.on('close', flushHermesStderrTail)
     let backendReady = false
     let rejectBackendStart = null
 
