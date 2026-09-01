@@ -8149,16 +8149,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         extra = getattr(getattr(adapter, "config", None), "extra", None)
         store = getattr(self, "session_store", None)
         if store is not None and isinstance(extra, dict):
+            # An explicit None in extra means "no override" — fall back to
+            # the gateway default rather than bool-coercing None to False.
+            group = extra.get("group_sessions_per_user")
+            thread = extra.get("thread_sessions_per_user")
+            if group is None:
+                group = getattr(self.config, "group_sessions_per_user", True)
+            if thread is None:
+                thread = getattr(self.config, "thread_sessions_per_user", False)
             store.register_platform_session_scope(
                 platform.value,
-                group_sessions_per_user=extra.get(
-                    "group_sessions_per_user",
-                    getattr(self.config, "group_sessions_per_user", True),
-                ),
-                thread_sessions_per_user=extra.get(
-                    "thread_sessions_per_user",
-                    getattr(self.config, "thread_sessions_per_user", False),
-                ),
+                group_sessions_per_user=group,
+                thread_sessions_per_user=thread,
                 profile=profile,
             )
 
@@ -20664,7 +20666,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             })
         
         # Build session context
-        context = build_session_context(source, self.config, session_entry)
+        context = build_session_context(
+            source, self.config, session_entry, session_store=self.session_store
+        )
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
