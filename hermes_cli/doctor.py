@@ -409,12 +409,12 @@ def _doctor_memory_config(hermes_home: Path | None = None) -> dict:
     """Return the effective memory section used by doctor diagnostics."""
     home = hermes_home if hermes_home is not None else HERMES_HOME
     try:
-        from hermes_cli.config import read_user_config_raw
+        from hermes_cli.config import _expand_env_vars, read_user_config_raw
 
         config_path = home / "config.yaml"
         if not config_path.exists():
             return {}
-        config = read_user_config_raw(config_path)
+        config = _expand_env_vars(read_user_config_raw(config_path))
         try:
             from hermes_cli import managed_scope
 

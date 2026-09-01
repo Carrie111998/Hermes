@@ -379,6 +379,25 @@ class TestDoctorMemoryProviderSection:
         if not memory_enabled and not user_profile_enabled:
             assert "Built-in memory files disabled by config" in out
 
+    def test_builtin_store_flags_expand_environment_references(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("MEMORY_ENABLED", "true")
+        out = self._run_doctor_and_capture(
+            monkeypatch,
+            tmp_path,
+            provider="mnemosyne",
+            memory_config={
+                "memory_enabled": "${MEMORY_ENABLED}",
+                "user_profile_enabled": False,
+            },
+            stale_builtin_files=True,
+        )
+
+        assert "MEMORY.md exists" in out
+        assert "USER.md exists" not in out
+        assert "Built-in memory files disabled by config" not in out
+
 
 def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkeypatch, tmp_path):
     helper = TestDoctorMemoryProviderSection()
