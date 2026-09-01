@@ -1463,6 +1463,7 @@ class LineAdapter(BasePlatformAdapter):
         audio_path: str,
         duration_ms: int = 1000,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
     ) -> SendResult:
         path = Path(audio_path)
         if not path.exists() or not path.is_file():
