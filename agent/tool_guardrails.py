@@ -117,7 +117,7 @@ class ToolCallGuardrailConfig:
     warnings_enabled: bool = True
     hard_stop_enabled: bool = False
     exact_failure_warn_after: int = 2
-    exact_failure_block_after: int = 5
+    exact_failure_block_after: int = 33
     same_tool_failure_warn_after: int = 3
     same_tool_failure_halt_after: int = 8
     no_progress_warn_after: int = 2
@@ -337,6 +337,12 @@ class ToolCallGuardrailController:
         self.config = config or ToolCallGuardrailConfig()
         self.reset_for_turn()
 
+    def reset_on_file_mutation(self) -> None:
+        """Reset failure and no-progress guardrail streaks when a file write lands."""
+        self._exact_failure_counts.clear()
+        self._same_tool_failure_counts.clear()
+        self._no_progress.clear()
+
     def reset_for_turn(self) -> None:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
@@ -435,6 +441,9 @@ class ToolCallGuardrailController:
         *,
         failed: bool | None = None,
     ) -> ToolGuardrailDecision:
+        if file_mutation_result_landed(tool_name, result):
+            self.reset_on_file_mutation()
+
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
         if failed is None:
