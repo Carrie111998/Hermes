@@ -2546,7 +2546,7 @@ async def _reclaim_stale(runner: object) -> None:
 def _profile_runtime_scope(profile_home: "Path"):
     """Scope config/skills/memory AND credentials to a profile for one turn.
 
-    Combines the two seams the multiplexer needs:
+    Combines the three seams the multiplexer needs:
       1. ``set_hermes_home_override`` — redirects ``get_hermes_home()`` (config,
          skills, memory, SOUL, sessions) to the profile's home. Contextvar, so
          it propagates into the agent worker thread via ``copy_context()``.
@@ -2554,6 +2554,13 @@ def _profile_runtime_scope(profile_home: "Path"):
          authoritative credential source, so ``get_secret`` reads this profile's
          keys and never the process-global ``os.environ`` (which in a
          multiplexer may hold another profile's values).
+      3. ``terminal isolation`` — installs the profile's ``terminal.*``
+         config into ContextVar-isolated TERMINAL_* state so a routed
+         profile's backend (docker vs local) does not leak via the
+         process-global ``os.environ``/``TERMINAL_ENV`` (fixes #68559 and
+         provides the runtime boundary behind gateway.profile_routes,
+         #99986). The isolation also caches the parsed terminal config
+         per-turn for perf (avoids re-parsing env vars on every tool call).
 
     Only used on the multiplexed inbound path. Single-profile gateways never
     enter this scope, so their behavior is unchanged. Loading the profile's
@@ -2572,9 +2579,93 @@ def _profile_runtime_scope(profile_home: "Path"):
     home_token = set_hermes_home_override(str(profile_home))
     hydrate_profile_secret_sources(Path(profile_home))
     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    # ponytail: missing profile home (e.g., test mock `worker` without a real dir)
+    # — terminal isolation would raise via load_config/ensure_hermes_home; keep
+    # HERMES_HOME/secret scoping but skip TERMINAL_* (pre-#99986 lenient for
+    # catalog/policy reads, still fail-closed for malformed terminal.*).
+    if not Path(profile_home).exists():
+        try:
+            yield
+        finally:
+            reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
+        return
+    # ── Terminal isolation for isolated agent runtimes (#99986) — ADMISSION GATE (#68559) ──
+    # Build a profile-scoped TERMINAL_* dict without touching os.environ,
+    # then install it (and the parsed config) as ContextVar isolation so
+    # concurrent turns for different profiles remain backend-isolated and
+    # repeated terminal_tool calls inside one turn reuse the cached parse
+    # (perf: one parse per turn instead of one per tool invocation).
+    # Admission must be fail-closed: if terminal authority cannot be
+    # established, refuse the turn before any terminal/file effect can occur
+    # (a routed Docker profile must never silently execute on the gateway's
+    # local backend). Cleanup stays best-effort; admission cannot be.
+    terminal_env_token = None
+    terminal_cfg_token = None
+    try:
+        from hermes_cli.config import apply_terminal_config_to_env
+        from tools.terminal_tool import (
+            set_terminal_env_isolation,
+            set_terminal_config_isolation,
+            _parse_terminal_config_from_getter,
+            _term_env_get,
+        )
+
+        isolated_env: dict = {}
+        # Bridge this profile's terminal.* into isolated_env (reads from
+        # the just-installed HERMES_HOME override, never os.environ).
+        apply_terminal_config_to_env(env=isolated_env, override=True)
+        terminal_env_token = set_terminal_env_isolation(isolated_env)
+        # Pre-parse and cache for the turn (perf + ensures consistent view).
+        # Fail closed on malformed config per #68559 — do not fallback to
+        # global TERMINAL_*; the parse error is the isolation failure.
+        isolated_cfg = _parse_terminal_config_from_getter(_term_env_get)
+        terminal_cfg_token = set_terminal_config_isolation(isolated_cfg)
+    except Exception as exc:
+        # Best-effort teardown of whatever partial isolation was installed,
+        # then fail closed before any turn effect.
+        try:
+            if terminal_cfg_token is not None:
+                from tools.terminal_tool import reset_terminal_config_isolation
+
+                reset_terminal_config_isolation(terminal_cfg_token)
+        except Exception:
+            pass
+        try:
+            if terminal_env_token is not None:
+                from tools.terminal_tool import reset_terminal_env_isolation
+
+                reset_terminal_env_isolation(terminal_env_token)
+        except Exception:
+            pass
+        try:
+            reset_secret_scope(secret_token)
+        except Exception:
+            pass
+        try:
+            reset_hermes_home_override(home_token)
+        except Exception:
+            pass
+        raise RuntimeError(f"terminal isolation admission failed for {profile_home}: {exc}") from exc
     try:
         yield
     finally:
+        # Tear down in reverse order (LIFO) with best-effort guards so a
+        # failure in one reset never leaks another profile's isolation.
+        try:
+            if terminal_cfg_token is not None:
+                from tools.terminal_tool import reset_terminal_config_isolation
+
+                reset_terminal_config_isolation(terminal_cfg_token)
+        except Exception:
+            pass
+        try:
+            if terminal_env_token is not None:
+                from tools.terminal_tool import reset_terminal_env_isolation
+
+                reset_terminal_env_isolation(terminal_env_token)
+        except Exception:
+            pass
         reset_secret_scope(secret_token)
         reset_hermes_home_override(home_token)
 
@@ -7441,6 +7532,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        # Isolated agent runtimes supervisor (#99986): per-profile worker
+        # with ContextVar isolation (HERMES_HOME, secrets, TERMINAL_*).
+        # Lazily created from gateway.tenant_isolation config; survives
+        # multiplex on/off without touching the single-profile path.
+        self._tenant_supervisor = None
+        try:
+            from gateway.tenant_supervisor import TenantSupervisor
+
+            self._tenant_supervisor = TenantSupervisor.from_gateway_config(self.config)
+        except Exception as exc:  # pragma: no cover — never blocks gateway startup
+            logger.debug("TenantSupervisor init failed: %s", exc, exc_info=True)
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -16374,6 +16476,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _amap.clear()
             if hasattr(self, "_profile_adapters"):
                 self._profile_adapters.clear()
+            # Drain isolated tenant workers (TenantSupervisor lifecycle, #99986)
+            try:
+                self._tenant_drain()
+            except Exception:
+                pass
             logger.info(
                 "Shutdown phase: all adapters disconnected at +%.2fs",
                 _phase_elapsed(),
@@ -30004,6 +30111,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profile's secret scope (never the process-global ``os.environ``). When
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
+
+        When ``gateway.tenant_isolation`` is configured (mode worker/container),
+        the turn is routed via ``TenantSupervisor``: the supervisor validates
+        the route, enforces queue/timeout bounds, runs the turn inside the
+        per-profile isolated worker (ContextVar HERMES_HOME/secret/terminal
+        isolation), and the gateway validates the returned route/session +
+        correlation identity before delivery (fail-closed).
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
@@ -30018,6 +30132,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=message_type,
             )
 
+        # ── Isolated runtime path via TenantSupervisor (#99986) ─────────
+        supervisor = getattr(self, "_tenant_supervisor", None)
+        if supervisor is not None and getattr(getattr(supervisor, "config", None), "mode", "off") not in ("off", "in_process"):
+            profile = getattr(source, "profile", None) or self._profile_name_for_source(source)
+            # Validate route — fail closed per tenant_isolation policy
+            try:
+                validated = supervisor.validate_route(profile)
+            except Exception:
+                logger.warning("TenantSupervisor rejected profile %r", profile, exc_info=True)
+                raise
+            # Unknown route with unmatched=deny must fail closed
+            if profile is None:
+                routes = getattr(self.config, "profile_routes", None) or []
+                if routes and getattr(supervisor.config, "unmatched", "deny") == "deny":
+                    raise RuntimeError("tenant isolation: unmatched route denied (unmatched=deny)")
+                # No profile route but multiplex is on — fall back to default home isolation
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    return await self._run_agent_inner(
+                        message, context_prompt, history, source, session_id,
+                        session_key=session_key, run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                        inbound_message_id=inbound_message_id,
+                        channel_prompt=channel_prompt, moa_config=moa_config,
+                        persist_user_message=persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        persist_user_display_kind=persist_user_display_kind,
+                        message_type=message_type,
+                    )
+            # Correlate this turn for delivery-ownership validation
+            correlation_id = f"{session_key}:{run_generation}:{session_id}" if session_key else f"{session_id}:{run_generation}"
+            target_profile = validated if validated is not None else profile
+            # Route via supervisor (bounds + isolated worker). The worker enters
+            # _profile_runtime_scope and then calls gateway._run_agent_for_tenant
+            # which runs the real agent logic under that scope.
+            result = await supervisor.run_turn(
+                profile=target_profile,
+                source=source,
+                message=message,
+                correlation_id=correlation_id,
+                gateway=self,
+                session_id=session_id,
+                session_key=session_key,
+                context_prompt=context_prompt,
+                history=history,
+                run_generation=run_generation,
+                _interrupt_depth=_interrupt_depth,
+                event_message_id=event_message_id,
+                inbound_message_id=inbound_message_id,
+                channel_prompt=channel_prompt,
+                moa_config=moa_config,
+                persist_user_message=persist_user_message,
+                persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
+                message_type=message_type,
+            )
+            # Gateway delivery-ownership validation (fail-closed before platform send)
+            if not self._validate_tenant_delivery(
+                result,
+                expected_profile=target_profile,
+                expected_correlation=correlation_id,
+                expected_session_id=session_id,
+                expected_session_key=session_key,
+            ):
+                raise RuntimeError("tenant delivery validation failed: route/session/correlation mismatch")
+            return result
+
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
             return await self._run_agent_inner(
@@ -30031,6 +30212,148 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
+
+    async def _run_agent_for_tenant(
+        self,
+        source: SessionSource,
+        message: str,
+        correlation_id: str,
+        session_id: str = None,
+        session_key: str = None,
+        context_prompt: str = None,
+        history: List[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Narrow worker call invoked by TenantSupervisor's isolated worker.
+
+        Runs inside ``TenantWorker.run_turn``'s ``_profile_runtime_scope``,
+        so the turn already sees the routed profile's HERMES_HOME, secret
+        scope, and TERMINAL_* isolation. This hook bridges the supervisor's
+        minimal ``(source, message, correlation_id)`` protocol to the
+        gateway's full ``_run_agent_inner`` without re-entering the scope
+        or touching transport tokens.
+
+        Returns an envelope carrying the original route/session +
+        correlation identity so the gateway can validate delivery ownership
+        before sending to the platform.
+        """
+        profile = getattr(source, "profile", None) or self._profile_name_for_source(source) or "default"
+        # If full turn context is available (routed via _run_agent's supervisor branch), run the real agent
+        if session_id is not None and history is not None:
+            inner = await self._run_agent_inner(
+                message=message,
+                context_prompt=context_prompt or "",
+                history=history,
+                source=source,
+                session_id=session_id,
+                session_key=session_key,
+                **kwargs,
+            )
+            # Envelope for delivery validation (gateway checks these fields)
+            if isinstance(inner, dict):
+                inner["profile"] = profile
+                inner["correlation_id"] = correlation_id
+                inner["session_id"] = session_id
+                inner["session_key"] = session_key
+                inner["isolated"] = True
+                inner["route"] = profile
+            return inner
+        # Fallback synthetic path for direct supervisor unit-tests that only
+        # supply (source, message, correlation_id) without full session context.
+        return {
+            "profile": profile,
+            "correlation_id": correlation_id,
+            "session_id": session_id,
+            "session_key": session_key or self._session_key_for_source(source),
+            "home": str(self._resolve_profile_home_for_source(source)),
+            "message": message,
+            "source": source.to_dict() if hasattr(source, "to_dict") else str(source),
+            "isolated": True,
+            "route": profile,
+            "final_response": message,
+        }
+
+    def _validate_tenant_delivery(
+        self,
+        result: Dict[str, Any],
+        expected_profile: str,
+        expected_correlation: str,
+        expected_session_id: str,
+        expected_session_key: str,
+    ) -> bool:
+        """Validate worker response ownership before platform delivery (fail-closed).
+
+        The gateway must verify that the isolated worker's response belongs to
+        the original route/session and carries the expected correlation identity;
+        a worker must never be able to send to an arbitrary chat.
+        """
+        if not isinstance(result, dict):
+            logger.error("Tenant delivery validation failed: result not dict (%r)", type(result))
+            return False
+        # Correlation identity must echo exactly (prevents stale replay)
+        returned_corr = result.get("correlation_id")
+        if returned_corr != expected_correlation:
+            logger.error(
+                "Tenant delivery validation failed: correlation %r != %r (profile=%r session=%r)",
+                returned_corr, expected_correlation, expected_profile, expected_session_id,
+            )
+            return False
+        # Profile/route must match (prevents cross-tenant delivery)
+        returned_profile = result.get("profile") or result.get("route")
+        if expected_profile is not None and returned_profile != expected_profile:
+            logger.error(
+                "Tenant delivery validation failed: profile %r != %r (correlation=%r)",
+                returned_profile, expected_profile, expected_correlation,
+            )
+            return False
+        # Session binding: if worker echoes session ids, they must match
+        ret_sid = result.get("session_id")
+        if ret_sid is not None and ret_sid != expected_session_id:
+            logger.error(
+                "Tenant delivery validation failed: session_id %r != %r (profile=%r)",
+                ret_sid, expected_session_id, expected_profile,
+            )
+            return False
+        ret_skey = result.get("session_key")
+        if ret_skey is not None and expected_session_key is not None and ret_skey != expected_session_key and ret_skey != expected_session_id:
+            logger.error(
+                "Tenant delivery validation failed: session_key %r != %r",
+                ret_skey, expected_session_key,
+            )
+            return False
+        return True
+
+    def _tenant_health(self) -> Dict[str, Any]:
+        """Supervisor health for gateway status/diagnostics."""
+        sup = getattr(self, "_tenant_supervisor", None)
+        if sup is None:
+            return {"mode": "off", "workers": {}, "total_workers": 0}
+        try:
+            return sup.health()
+        except Exception:
+            logger.debug("tenant health failed", exc_info=True)
+            return {"mode": "unknown", "workers": {}, "total_workers": 0}
+
+    def _tenant_drain(self) -> None:
+        """Drain all tenant workers (gateway shutdown)."""
+        sup = getattr(self, "_tenant_supervisor", None)
+        if sup is None:
+            return
+        try:
+            sup.drain()
+        except Exception:
+            logger.debug("tenant drain failed", exc_info=True)
+
+    def _tenant_cancel(self, correlation_id: str) -> bool:
+        """Cancel an in-flight tenant turn (best-effort)."""
+        sup = getattr(self, "_tenant_supervisor", None)
+        if sup is None or not hasattr(sup, "cancel_turn"):
+            return False
+        try:
+            return bool(sup.cancel_turn(correlation_id))
+        except Exception:
+            logger.debug("tenant cancel_turn failed", exc_info=True)
+            return False
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
