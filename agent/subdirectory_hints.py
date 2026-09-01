@@ -48,12 +48,14 @@ _COMMAND_TOOLS = {"terminal"}
 _MAX_ANCESTOR_WALK = 5
 
 # Directory names that never contain authoritative project context.
-# Backups, vendored deps, VCS internals, and caches routinely hold *copies* of
-# AGENTS.md; loading those duplicates real context and inflates the prompt.
+# Backups, vendored deps, VCS internals, caches, and per-user agent config
+# directories routinely hold *copies* of AGENTS.md/CLAUDE.md; loading those
+# duplicates or imports foreign-agent instructions into the active session.
 _EXCLUDED_DIR_NAMES = frozenset({
     "node_modules", "venv", ".venv", "__pycache__",
     ".git", ".hg", ".svn",
     ".Trash", ".cache", ".tox", ".mypy_cache", ".pytest_cache",
+    ".claude", ".codex", ".cursor", ".config",
     "site-packages", "dist-packages",
     "backups", "backup", ".backups",
     "vendor", "third_party",
