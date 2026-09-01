@@ -17,6 +17,8 @@ Usage:
 """
 
 import json
+import logging
+import math
 import sqlite3
 import time
 from collections import Counter, defaultdict
@@ -31,6 +33,9 @@ from agent.usage_pricing import (
     format_duration_compact,
     has_known_pricing,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _fmt_est_cost(est_cost: float) -> str:
@@ -82,6 +87,22 @@ def _estimate_cost(
         base_url=base_url,
     )
     return float(result.amount_usd or 0.0), result.status
+
+
+def _safe_fromtimestamp(ts: float) -> datetime | None:
+    """Convert Unix timestamp to datetime, returning None for out-of-range/non-finite values.
+
+    Malformed timestamps (inf, nan, or platform time_t overflow) are logged and return None.
+    Callers skip or handle None values so invalid data never crashes insights (#99959).
+    """
+    if not math.isfinite(ts):
+        logger.debug(f"Skipping non-finite timestamp {ts}")
+        return None
+    try:
+        return datetime.fromtimestamp(ts)
+    except (OverflowError, OSError, ValueError) as e:
+        logger.debug(f"Skipping out-of-range timestamp {ts}: {e}")
+        return None
 
 
 
@@ -545,8 +566,11 @@ class InsightsEngine:
         total_hours = sum(durations) / 3600 if durations else 0
         avg_duration = sum(durations) / len(durations) if durations else 0
 
-        # Earliest and latest session
-        started_timestamps = [s["started_at"] for s in sessions if s.get("started_at")]
+        # Earliest and latest session (filter out malformed timestamps)
+        started_timestamps = [
+            s["started_at"] for s in sessions
+            if s.get("started_at") and math.isfinite(s["started_at"])
+        ]
         date_range_start = min(started_timestamps) if started_timestamps else None
         date_range_end = max(started_timestamps) if started_timestamps else None
 
@@ -857,7 +881,9 @@ class InsightsEngine:
             ts = s.get("started_at")
             if not ts:
                 continue
-            dt = datetime.fromtimestamp(ts)
+            dt = _safe_fromtimestamp(ts)
+            if not dt:
+                continue
             day_counts[dt.weekday()] += 1
             hour_counts[dt.hour] += 1
             daily_counts[dt.strftime("%Y-%m-%d")] += 1
@@ -920,21 +946,23 @@ class InsightsEngine:
                 key=lambda s: (s["ended_at"] - s["started_at"]),
             )
             dur = longest["ended_at"] - longest["started_at"]
+            dt_longest = _safe_fromtimestamp(longest["started_at"])
             top.append({
                 "label": "Longest session",
                 "session_id": longest["id"][:16],
                 "value": format_duration_compact(dur),
-                "date": datetime.fromtimestamp(longest["started_at"]).strftime("%b %d"),
+                "date": dt_longest.strftime("%b %d") if dt_longest else "?",
             })
 
         # Most messages
         most_msgs = max(sessions, key=lambda s: s.get("message_count") or 0)
         if (most_msgs.get("message_count") or 0) > 0:
+            dt_msgs = _safe_fromtimestamp(most_msgs["started_at"]) if most_msgs.get("started_at") else None
             top.append({
                 "label": "Most messages",
                 "session_id": most_msgs["id"][:16],
                 "value": f"{most_msgs['message_count']} msgs",
-                "date": datetime.fromtimestamp(most_msgs["started_at"]).strftime("%b %d") if most_msgs.get("started_at") else "?",
+                "date": dt_msgs.strftime("%b %d") if dt_msgs else "?",
             })
 
         # Most tokens
@@ -944,21 +972,23 @@ class InsightsEngine:
         )
         token_total = (most_tokens.get("input_tokens") or 0) + (most_tokens.get("output_tokens") or 0)
         if token_total > 0:
+            dt_tokens = _safe_fromtimestamp(most_tokens["started_at"]) if most_tokens.get("started_at") else None
             top.append({
                 "label": "Most tokens",
                 "session_id": most_tokens["id"][:16],
                 "value": f"{token_total:,} tokens",
-                "date": datetime.fromtimestamp(most_tokens["started_at"]).strftime("%b %d") if most_tokens.get("started_at") else "?",
+                "date": dt_tokens.strftime("%b %d") if dt_tokens else "?",
             })
 
         # Most tool calls
         most_tools = max(sessions, key=lambda s: s.get("tool_call_count") or 0)
         if (most_tools.get("tool_call_count") or 0) > 0:
+            dt_tools = _safe_fromtimestamp(most_tools["started_at"]) if most_tools.get("started_at") else None
             top.append({
                 "label": "Most tool calls",
                 "session_id": most_tools["id"][:16],
                 "value": f"{most_tools['tool_call_count']} calls",
-                "date": datetime.fromtimestamp(most_tools["started_at"]).strftime("%b %d") if most_tools.get("started_at") else "?",
+                "date": dt_tools.strftime("%b %d") if dt_tools else "?",
             })
 
         return top
@@ -995,10 +1025,13 @@ class InsightsEngine:
 
         # Date range
         if o.get("date_range_start") and o.get("date_range_end"):
-            start_str = datetime.fromtimestamp(o["date_range_start"]).strftime("%b %d, %Y")
-            end_str = datetime.fromtimestamp(o["date_range_end"]).strftime("%b %d, %Y")
-            lines.append(f"  Period: {start_str} — {end_str}")
-            lines.append("")
+            start_dt = _safe_fromtimestamp(o["date_range_start"])
+            end_dt = _safe_fromtimestamp(o["date_range_end"])
+            if start_dt and end_dt:
+                start_str = start_dt.strftime("%b %d, %Y")
+                end_str = end_dt.strftime("%b %d, %Y")
+                lines.append(f"  Period: {start_str} — {end_str}")
+                lines.append("")
 
         # Overview
         lines.append("  📋 Overview")
@@ -1075,7 +1108,8 @@ class InsightsEngine:
             for skill in top_skills[:10]:
                 last_used = "—"
                 if skill.get("last_used_at"):
-                    last_used = datetime.fromtimestamp(skill["last_used_at"]).strftime("%b %d")
+                    dt_skill = _safe_fromtimestamp(skill["last_used_at"])
+                    last_used = dt_skill.strftime("%b %d") if dt_skill else "?"
                 lines.append(
                     f"  {skill['skill'][:28]:<28} {skill['view_count']:>7,} {skill['manage_count']:>7,} {last_used:>11}"
                 )
@@ -1191,7 +1225,8 @@ class InsightsEngine:
             for skill in skills["top_skills"][:5]:
                 suffix = ""
                 if skill.get("last_used_at"):
-                    suffix = f", last used {datetime.fromtimestamp(skill['last_used_at']).strftime('%b %d')}"
+                    dt_last = _safe_fromtimestamp(skill['last_used_at'])
+                    suffix = f", last used {dt_last.strftime('%b %d')}" if dt_last else ""
                 lines.append(
                     f"  {skill['skill']} — {skill['view_count']:,} loads, {skill['manage_count']:,} edits{suffix}"
                 )

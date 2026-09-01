@@ -774,3 +774,84 @@ class TestEdgeCases:
         assert "Unknown" in text
 
 
+class TestMalformedTimestamps:
+    """Regression tests for #99959: malformed timestamps crash insights."""
+
+    def test_out_of_range_started_at_does_not_crash(self, db):
+        """One session with a valid timestamp, one with ~8.4e252 — generate() succeeds."""
+        now = time.time()
+        # Normal session
+        db.create_session(session_id="normal", source="cli", model="gpt-4o")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = 'normal'", (now - 86400,))
+        db.end_session("normal", end_reason="user_exit")
+        db._conn.execute("UPDATE sessions SET ended_at = ? WHERE id = 'normal'", (now - 86400 + 600,))
+        db.update_token_counts("normal", input_tokens=1000, output_tokens=500)
+        db.append_message("normal", role="user", content="hello")
+        db.append_message("normal", role="assistant", content="hi")
+
+        # Malformed session (corrupt timestamp)
+        db.create_session(session_id="corrupt", source="cli", model="gpt-4o")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = 'corrupt'", (8.4e252,))
+        db.end_session("corrupt", end_reason="error")
+        db.update_token_counts("corrupt", input_tokens=200, output_tokens=100)
+        db.append_message("corrupt", role="user", content="test")
+        db.append_message("corrupt", role="assistant", content="reply")
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        # Should not raise OverflowError
+        report = engine.generate(days=30)
+
+        assert report["empty"] is False
+        # Both sessions are included in the session count
+        assert report["overview"]["total_sessions"] == 2
+        # Tokens from both sessions counted
+        assert report["overview"]["total_input_tokens"] == 1200
+        # Activity patterns skipped the corrupt session, only normal one counted
+        act = report["activity"]
+        assert act["active_days"] == 1
+
+    def test_malformed_timestamp_omitted_from_date_range(self, db):
+        """Date range excludes out-of-range timestamps."""
+        now = time.time()
+        db.create_session(session_id="ok", source="cli", model="gpt-4o")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = 'ok'", (now - 86400,))
+        db.end_session("ok", end_reason="user_exit")
+
+        db.create_session(session_id="bad", source="cli", model="gpt-4o")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = 'bad'", (float('inf'),))
+        db.end_session("bad", end_reason="error")
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        o = report["overview"]
+        # Only the valid timestamp is used for date range
+        assert o["date_range_start"] == now - 86400
+        assert o["date_range_end"] == now - 86400
+
+    def test_format_terminal_with_malformed_timestamps(self, db):
+        """Terminal format does not crash when sessions have bad timestamps."""
+        now = time.time()
+        db.create_session(session_id="s1", source="cli", model="gpt-4o")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = 's1'", (now - 86400,))
+        db.end_session("s1", end_reason="user_exit")
+        db.update_token_counts("s1", input_tokens=5000, output_tokens=2000)
+        db.append_message("s1", role="user", content="hello")
+
+        db.create_session(session_id="s_nan", source="cli", model="gpt-4o")
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = 's_nan'", (8.4e252,))
+        db.end_session("s_nan", end_reason="error")
+        db.update_token_counts("s_nan", input_tokens=1000, output_tokens=500)
+        db.append_message("s_nan", role="user", content="bad")
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        # Should not crash
+        text = engine.format_terminal(report)
+        assert "📊 Hermes Insights" in text
+        # Malformed timestamp rendered as "?"
+        assert "(?, s_nan)" in text or "(?, s_huge)" in text
+
+
