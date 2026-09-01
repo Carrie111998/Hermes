@@ -262,6 +262,32 @@ describe('desktop slash command curation', () => {
     expect(filterDesktopSubcommandCompletions('/memory ', hubItems)).toHaveLength(hubItems.length)
   })
 
+  it('normalizes the raw command prefix before filtering subcommands', () => {
+    const hubItems = [
+      { text: 'install' },
+      { text: 'pending' },
+      { text: 'approve <id>' },
+      { text: 'reject' },
+      { text: 'diff <id>' },
+      { text: 'approval' }
+    ]
+    const allowed = ['pending', 'approve <id>', 'reject', 'diff <id>', 'approval']
+
+    expect(filterDesktopSubcommandCompletions(' /skills ', hubItems).map(item => item.text)).toEqual(allowed)
+    expect(filterDesktopSubcommandCompletions('skills ', hubItems).map(item => item.text)).toEqual(allowed)
+  })
+
+  it('filters value completions by the first subcommand', () => {
+    expect(filterDesktopSubcommandCompletions('/skills approval o', [{ text: 'on' }, { text: 'off' }])).toEqual([
+      { text: 'on' },
+      { text: 'off' }
+    ])
+    expect(filterDesktopSubcommandCompletions('/skills approve a1b', [{ text: 'a1b2' }])).toEqual([{ text: 'a1b2' }])
+    expect(filterDesktopSubcommandCompletions('/skills install g', [{ text: 'github.com/example/skill' }])).toEqual(
+      []
+    )
+  })
+
   it('lets a live catalog narrow the static /skills allowlist', () => {
     rememberDesktopCommandsCatalog({
       commands: {
