@@ -4997,7 +4997,23 @@ class TelegramAdapter(BasePlatformAdapter):
             
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
-            logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
+            # WARNING, not INFO, so the success line reaches the same console
+            # sink as the "Connecting to Telegram (attempt N/8)…" line above.
+            #
+            # The attempt line is emitted at WARNING and therefore appears on
+            # the terminal; a successful connect was INFO and went only to the
+            # log file. A perfectly healthy startup then looked permanently
+            # stalled at "attempt 1/8" while the bot was already serving
+            # traffic — the "logging illusion" half of #90835, confirmed on
+            # main by triage and independently reported by two users who each
+            # spent hours debugging a non-existent hang (their gateways were
+            # connected the whole time).
+            #
+            # Promoting only this one terminal line keeps genuine hangs
+            # visible: with both sides of the transition on the console, a
+            # real stall is now the absence of a success line rather than an
+            # ambiguous last-line-was-an-attempt.
+            logger.warning("[%s] Connected to Telegram (%s mode)", self.name, mode)
 
             # Start the persistent heartbeat loop in polling mode. Webhook mode
             # receives updates via incoming pushes — there is no long-poll
