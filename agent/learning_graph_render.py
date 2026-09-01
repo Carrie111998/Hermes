@@ -608,22 +608,6 @@ def build_summary(payload: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _merge_runs(cells: Iterable[Run]) -> Row:
-    out: Row = []
-    for run in cells:
-        text, style, alpha = run[0], run[1], (run[2] if len(run) > 2 else 1.0)
-        hex_override = run[3] if len(run) > 3 else None
-        prev_hex = out[-1][3] if out and len(out[-1]) > 3 else None
-        if out and out[-1][1] == style and abs(out[-1][2] - alpha) < 1e-6 and prev_hex == hex_override:
-            out[-1][0] += text
-        else:
-            merged: Run = [text, style, alpha]
-            if hex_override:
-                merged.append(hex_override)
-            out.append(merged)
-    return out
-
-
 def render_frames(payload: dict[str, Any], *, cols: int = 80, rows: int = 16, frames: int = 48) -> dict[str, Any]:
     """Pre-render a full play-through (reveal 0→1) plus static legend/summary."""
     frames = max(2, min(frames, 240))
