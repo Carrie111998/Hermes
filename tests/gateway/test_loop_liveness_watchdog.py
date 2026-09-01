@@ -403,3 +403,49 @@ def test_loop_scheduling_witness_is_served_by_the_loop_itself():
     assert "await asyncio.start_unix_server(" in body, (
         "the loop-scheduling witness socket is not armed by the loop task"
     )
+
+
+def test_witness_absent_platform_logs_calmly_without_a_traceback(tmp_path):
+    """No AF_UNIX (native Windows) is a platform fact, not a bind failure.
+
+    Letting ``asyncio.start_unix_server`` raise into the except-arm printed an
+    ``AttributeError`` traceback on every gateway startup, which operators read
+    as a crash. The witness is still absent — ``loop_tick_socket`` stays False
+    so probes classify UNKNOWN, never WEDGED — but the log stays a one-liner.
+    """
+    written = {}
+
+    def capture_write(**kwargs):
+        written.update(kwargs)
+        return pathlib.Path("/dev/null")
+
+    async def scenario() -> None:
+        # Delete rather than patch to False: the production gate is a
+        # hasattr() capability check, matching a real AF_UNIX-less build.
+        with (
+            patch.object(asyncio, "start_unix_server", create=True),
+            patch(
+                "gateway.shutdown_watchdog.write_loop_heartbeat", capture_write
+            ),
+            patch("gateway.shutdown_watchdog.logger.warning") as warning,
+            patch("gateway.shutdown_watchdog.logger.info") as info,
+        ):
+            delattr(asyncio, "start_unix_server")
+            await loop_heartbeat_forever(
+                interval_s=60.0,
+                home=tmp_path,
+                should_continue=lambda: False,
+            )
+        assert not warning.called, (
+            "the absent-witness platform still logs a warning traceback: %r"
+            % (warning.call_args_list,)
+        )
+        assert info.called, "the absent witness was not reported at all"
+        assert any(
+            "Loop tick socket unsupported" in str(call.args[0])
+            for call in info.call_args_list
+        ), "no calm one-liner explaining the missing witness"
+
+    asyncio.run(scenario())
+    # The fail-safe half of the contract: probes must still see no witness.
+    assert written["extra"]["loop_tick_socket"] is False
