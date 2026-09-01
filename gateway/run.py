@@ -23577,10 +23577,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         session_id: str,
         title: str,
-    ) -> None:
+    ) -> Optional[bool]:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
-        if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
+        if not await asyncio.to_thread(self._is_telegram_topic_lane, source):
             return
+        if not source.chat_id or not source.thread_id:
+            return False
 
         # Operator can fully disable per-topic auto-rename via
         # extra.disable_topic_auto_rename. Useful when topics are managed
@@ -23618,13 +23620,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id=str(source.thread_id),
                 )
                 if binding and str(binding.get("session_id") or "") != str(session_id):
-                    return
+                    return False
             except Exception:
                 logger.debug("Failed to verify Telegram topic binding before rename", exc_info=True)
-                return
+                return False
 
         if adapter is None:
-            return
+            return False
         topic_name = self._sanitize_telegram_topic_title(title)
         try:
             rename_topic = getattr(adapter, "rename_dm_topic", None)
@@ -23634,14 +23636,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id=str(source.thread_id),
                     name=topic_name,
                 )
-                return
+                return True
 
             bot = getattr(adapter, "_bot", None)
             edit_forum_topic = getattr(bot, "edit_forum_topic", None) if bot is not None else None
             if edit_forum_topic is None:
                 edit_forum_topic = getattr(bot, "editForumTopic", None) if bot is not None else None
             if edit_forum_topic is None:
-                return
+                return False
             try:
                 await edit_forum_topic(
                     chat_id=int(source.chat_id),
@@ -23654,8 +23656,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_thread_id=source.thread_id,
                     name=topic_name,
                 )
+            return True
         except Exception:
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
+            return False
 
     def _telegram_topic_auto_rename_disabled(self, source: SessionSource) -> bool:
         """Return True when operator disabled per-topic auto-rename for this Telegram chat.

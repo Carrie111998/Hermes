@@ -9202,13 +9202,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ).fetchone()
         return row is not None
 
-    def _set_session_title(
+    def _write_session_title(
         self,
         session_id: str,
         title: str,
         *,
         source: str,
-    ) -> bool:
+        lineage_fallback: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
         """Write a title, enforcing provenance precedence.
 
         ``source`` is one of ``TITLE_SOURCE_{DERIVED,LLM,USER}``. A ``user``
@@ -9233,7 +9234,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             ).fetchone()
             if current is None:
-                return 0
+                return False, None
             # The canonical Bot Chat's NAME is its identity: Bot Mode resolves
             # the forever-chat by exact-title lookup on every open, so renaming
             # the row orphans the entire conversation — the next click mints an
@@ -9256,8 +9257,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             if not is_user and current["title"] is not None:
                 if self._title_rank(current["title_source"]) >= new_rank:
-                    return 0
+                    return False, current["title"]
 
+            persisted_title = title
             if title:
                 # Check uniqueness (allow the same session to keep its own title)
                 cursor = conn.execute(
@@ -9285,6 +9287,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             "UPDATE sessions SET title = NULL WHERE id = ?",
                             (conflict_id,),
                         )
+                    elif lineage_fallback:
+                        match = re.match(r"^(.*?) #(\d+)$", title)
+                        base = match.group(1) if match else title
+                        escaped = _escape_like(base)
+                        rows = conn.execute(
+                            "SELECT title FROM sessions "
+                            "WHERE title = ? OR title LIKE ? ESCAPE '\\'",
+                            (base, f"{escaped} #%"),
+                        ).fetchall()
+                        max_num = 1
+                        for row in rows:
+                            numbered = re.match(r"^.* #(\d+)$", row["title"])
+                            if numbered:
+                                max_num = max(max_num, int(numbered.group(1)))
+                        while True:
+                            max_num += 1
+                            suffix = f" #{max_num}"
+                            candidate = f"{base[:self.MAX_TITLE_LENGTH - len(suffix)]}{suffix}"
+                            occupied = conn.execute(
+                                "SELECT 1 FROM sessions WHERE title = ? AND id != ?",
+                                (candidate, session_id),
+                            ).fetchone()
+                            if occupied is None:
+                                persisted_title = candidate
+                                break
                     else:
                         raise ValueError(
                             f"Title '{title}' is already in use by session {conflict_id}"
@@ -9296,17 +9323,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "UPDATE sessions SET title = ?, title_source = ? "
                 "WHERE id = ? AND title IS ? AND title_source IS ?",
                 (
-                    title,
+                    persisted_title,
                     source if title else None,
                     session_id,
                     current["title"],
                     current["title_source"],
                 ),
             )
-            return cursor.rowcount
+            return cursor.rowcount > 0, persisted_title
 
-        rowcount = self._execute_write(_do)
-        return rowcount > 0
+        return self._execute_write(_do)
+
+    def _set_session_title(
+        self,
+        session_id: str,
+        title: str,
+        *,
+        source: str,
+    ) -> bool:
+        written, _ = self._write_session_title(
+            session_id,
+            title,
+            source=source,
+        )
+        return written
 
     def set_session_title(self, session_id: str, title: str) -> bool:
         """Set or update a session's title on the user's behalf.
@@ -9322,6 +9362,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return self._set_session_title(
             session_id, title, source=self.TITLE_SOURCE_USER
         )
+
+    def set_session_title_in_lineage(
+        self, session_id: str, title: str
+    ) -> Optional[str]:
+        """Atomically persist a unique user title from the requested lineage.
+
+        The exact sanitized title is preferred. If another session owns it,
+        the next `` #N`` alias is selected and written in the same
+        ``BEGIN IMMEDIATE`` transaction, so concurrent callers cannot reserve
+        the same alias. Returns the persisted title, or ``None`` when the
+        session was not found.
+        """
+        written, persisted_title = self._write_session_title(
+            session_id,
+            title,
+            source=self.TITLE_SOURCE_USER,
+            lineage_fallback=True,
+        )
+        return persisted_title if written else None
 
     def set_auto_title(self, session_id: str, title: str, *, source: str) -> bool:
         """Set an automatically generated title, honoring provenance precedence.

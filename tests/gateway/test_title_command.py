@@ -15,12 +15,14 @@ from gateway.session import SessionSource
 
 
 def _make_event(text="/title", platform=Platform.TELEGRAM,
-                user_id="12345", chat_id="67890"):
+                user_id="12345", chat_id="67890", thread_id=None):
     """Build a MessageEvent for testing."""
     source = SessionSource(
         platform=platform,
         user_id=user_id,
         chat_id=chat_id,
+        chat_type="dm",
+        thread_id=thread_id,
         user_name="testuser",
     )
     return MessageEvent(text=text, source=source)
@@ -68,7 +70,7 @@ class TestHandleTitleCommand:
         db.create_session("test_session_123", "telegram")
 
         runner = _make_runner(session_db=db)
-        event = _make_event(text="/title Taken Title")
+        event = _make_event(text="/title Taken Title", platform=Platform.DISCORD)
         result = await runner._handle_title_command(event)
         assert "already in use" in result
         assert "⚠️" in result
@@ -107,6 +109,58 @@ class TestHandleTitleCommand:
         runner._schedule_telegram_topic_title_rename.assert_called_once_with(
             event.source, "test_session_123", "My Topic Name"
         )
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_duplicate_topic_label_uses_internal_lineage_alias(self, tmp_path):
+        """Telegram topics keep the requested label while sessions stay unique."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("other_session", "telegram")
+        db.set_session_title("other_session", "Consolidate Skills")
+        db.create_session("test_session_123", "telegram")
+
+        runner = _make_runner(session_db=db)
+        runner._telegram_topic_mode_enabled = lambda _source: True
+        runner._rename_telegram_topic_for_session_title = AsyncMock(return_value=True)
+        event = _make_event(
+            text="/title Consolidate Skills",
+            thread_id="42",
+        )
+
+        result = await runner._handle_title_command(event)
+
+        assert "Consolidate Skills #2" in result
+        assert db.get_session_title("test_session_123") == "Consolidate Skills #2"
+        runner._rename_telegram_topic_for_session_title.assert_awaited_once_with(
+            event.source, "test_session_123", "Consolidate Skills"
+        )
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_topic_rename_failure_reports_partial_success(self, tmp_path):
+        """A persisted alias is not presented as a fully successful topic rename."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("other_session", "telegram")
+        db.set_session_title("other_session", "Consolidate Skills")
+        db.create_session("test_session_123", "telegram")
+
+        runner = _make_runner(session_db=db)
+        runner._telegram_topic_mode_enabled = lambda _source: True
+        runner._rename_telegram_topic_for_session_title = AsyncMock(return_value=False)
+        event = _make_event(
+            text="/title Consolidate Skills",
+            thread_id="42",
+        )
+
+        result = await runner._handle_title_command(event)
+
+        assert "Consolidate Skills #2" in result
+        assert "topic rename failed" in result.lower()
+        assert db.get_session_title("test_session_123") == "Consolidate Skills #2"
         db.close()
 
     @pytest.mark.asyncio

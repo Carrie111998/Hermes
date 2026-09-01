@@ -4863,26 +4863,63 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.shared.warn_passthrough", error=e)
             if not sanitized:
                 return t("gateway.title.empty_after_clean")
-            # Set the title
+            # Telegram topic labels are display names and may legitimately be
+            # duplicated. Keep the resumable session alias unique by reserving
+            # a lineage title atomically, while every other lane retains the
+            # strict duplicate-title error.
+            telegram_topic_lane = self._is_telegram_topic_lane(source)
             try:
-                if await self._session_db.set_session_title(session_id, sanitized):
+                if telegram_topic_lane:
+                    persisted_title = await self._session_db.set_session_title_in_lineage(
+                        session_id, sanitized
+                    )
+                    title_was_set = persisted_title is not None
+                else:
+                    title_was_set = await self._session_db.set_session_title(
+                        session_id, sanitized
+                    )
+                    persisted_title = sanitized if title_was_set else None
+                if title_was_set:
                     # Propagate the user-chosen title to the visible Telegram
                     # forum topic name too. Auto-generated titles already rename
                     # the topic; without this, /title only updated the DB title
                     # and the topic kept its auto-assigned name. No-ops off
                     # Telegram topic lanes and when auto-rename is disabled.
+                    if telegram_topic_lane:
+                        rename_topic = getattr(
+                            self, "_rename_telegram_topic_for_session_title", None
+                        )
+                        rename_succeeded = (
+                            await rename_topic(source, session_id, sanitized)
+                            if callable(rename_topic)
+                            else None
+                        )
+                        response = t("gateway.title.set_to", title=persisted_title)
+                        if rename_succeeded is False:
+                            warning = t(
+                                "gateway.shared.warn_passthrough",
+                                error=(
+                                    "Telegram topic rename failed; the session title "
+                                    f"was saved as '{persisted_title}'."
+                                ),
+                            )
+                            return f"{response}\n{warning}"
+                        return response
+
                     schedule_rename = getattr(
                         self, "_schedule_telegram_topic_title_rename", None
                     )
                     if callable(schedule_rename):
                         try:
-                            await asyncio.to_thread(schedule_rename, source, session_id, sanitized)
+                            await asyncio.to_thread(
+                                schedule_rename, source, session_id, sanitized
+                            )
                         except Exception:
                             logger.debug(
                                 "Failed to rename Telegram topic from /title",
                                 exc_info=True,
                             )
-                    return t("gateway.title.set_to", title=sanitized)
+                    return t("gateway.title.set_to", title=persisted_title)
                 else:
                     return t("gateway.title.not_found")
             except ValueError as e:

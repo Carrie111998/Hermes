@@ -4,6 +4,7 @@ import sqlite3
 import time
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -2228,6 +2229,33 @@ class TestTitleLineage:
     def test_next_title_no_existing(self, db):
         """With no existing sessions, base title is returned as-is."""
         assert db.get_next_title_in_lineage("my project") == "my project"
+
+    def test_concurrent_lineage_title_reservations_are_distinct(self, tmp_path):
+        """Lineage allocation and title persistence share one write transaction."""
+        db_path = tmp_path / "state.db"
+        setup = SessionDB(db_path=db_path)
+        setup.create_session("original", "telegram")
+        setup.create_session("topic-a", "telegram")
+        setup.create_session("topic-b", "telegram")
+        setup.set_session_title("original", "Consolidate Skills")
+        setup.close()
+
+        barrier = threading.Barrier(2)
+
+        def reserve(session_id):
+            worker = SessionDB(db_path=db_path)
+            try:
+                barrier.wait()
+                return worker.set_session_title_in_lineage(
+                    session_id, "Consolidate Skills"
+                )
+            finally:
+                worker.close()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            aliases = set(pool.map(reserve, ("topic-a", "topic-b")))
+
+        assert aliases == {"Consolidate Skills #2", "Consolidate Skills #3"}
 
 
 
