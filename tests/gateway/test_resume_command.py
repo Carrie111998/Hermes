@@ -58,13 +58,6 @@ def _make_runner(session_db=None, current_session_id="current_session_001",
     mock_store.get_or_create_session.return_value = mock_session_entry
     mock_store.load_transcript.return_value = []
     mock_store.switch_session.return_value = mock_session_entry
-    # Mirror the real store's scope resolution: no adapter registrations in
-    # these tests, so the runner-config defaults govern (read live so tests
-    # that flip runner.config after construction are honored).
-    mock_store.resolve_session_scope.side_effect = lambda source, profile=None: (
-        getattr(runner.config, "group_sessions_per_user", True),
-        getattr(runner.config, "thread_sessions_per_user", False),
-    )
     runner.session_store = mock_store
 
     return runner

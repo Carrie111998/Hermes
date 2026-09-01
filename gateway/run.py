@@ -8164,6 +8164,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 profile=profile,
             )
 
+    def _resolve_session_scope_for(self, source: SessionSource) -> tuple[bool, bool]:
+        """Session scope for a source: store-resolved, config fallback.
+
+        The real store honors adapter-declared overrides; anything else
+        (bare/legacy standalone runners and test doubles) keeps the
+        gateway-config defaults. A live gateway always has a real
+        ``self.session_store``.
+        """
+        store = getattr(self, "session_store", None)
+        if isinstance(store, SessionStore):
+            return store.resolve_session_scope(source)
+        return (
+            getattr(self.config, "group_sessions_per_user", True),
+            getattr(self.config, "thread_sessions_per_user", False),
+        )
+
     def _sync_voice_mode_state_to_adapter(self, adapter) -> None:
         """Restore persisted /voice state into a live platform adapter.
 
@@ -19794,7 +19810,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else event.text
         ) or ""
         _group_sessions_per_user, _thread_sessions_per_user = (
-            self.session_store.resolve_session_scope(source)
+            self._resolve_session_scope_for(source)
         )
         # Prefer the already resolved session key from the caller so this write
         # key matches the consume key at the run_conversation site. Fall back

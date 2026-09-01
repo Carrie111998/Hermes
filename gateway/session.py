@@ -4587,7 +4587,7 @@ def build_session_context(
         if home:
             home_channels[platform] = home
 
-    if session_store is not None:
+    if isinstance(session_store, SessionStore):
         group_per_user, thread_per_user = session_store.resolve_session_scope(source)
     else:
         group_per_user = getattr(config, "group_sessions_per_user", True)

@@ -317,8 +317,6 @@ class TestSenderPrefixWithBackfill:
         r._model = "test-model"
         r._base_url = ""
         r._has_setup_skill = lambda: False
-        # No adapter registrations here — scope resolves to config defaults.
-        r.session_store = SessionStore(sessions_dir=Path("/nonexistent"), config=r.config)
         return r
 
     @pytest.fixture()
