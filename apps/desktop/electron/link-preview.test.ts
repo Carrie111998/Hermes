@@ -1,0 +1,393 @@
+import assert from 'node:assert/strict'
+
+import { afterEach, describe, test, vi } from 'vitest'
+
+import {
+  canonicalPreviewKey,
+  decodeHtmlEntities,
+  HostRateLimiter,
+  isPrivateAddress,
+  isPrivateHostname,
+  type LinkPreviewIo,
+  LinkPreviewStore,
+  parseLinkMeta,
+  resolveLinkPreview,
+  usableTitle
+} from './link-preview'
+
+const PAGE_URL = 'https://example.com/article'
+
+function fakeIo(options: {
+  html?: string
+  addresses?: string[]
+  renderedTitle?: string
+} = {}): LinkPreviewIo & { calls: string[] } {
+  const calls: string[] = []
+
+  return {
+    calls,
+    fetchHtml: async url => {
+      calls.push(`html:${url}`)
+
+      return options.html ?? ''
+    },
+    fetchRenderedTitle: async url => {
+      calls.push(`render:${url}`)
+
+      return options.renderedTitle ?? ''
+    },
+    resolveHost: async () => options.addresses ?? ['93.184.216.34']
+  }
+}
+
+function makeDeps(io: LinkPreviewIo, options: { capacity?: number; ttlMs?: number } = {}) {
+  const store = new LinkPreviewStore(null, { writeDebounceMs: 5, ...options })
+  const limiter = new HostRateLimiter(0, 4)
+
+  return { store, limiter }
+}
+
+afterEach(() => {
+  vi.useRealTimers()
+})
+
+describe('canonicalPreviewKey', () => {
+  test('strips www and trailing slashes, keeps query', () => {
+    assert.equal(canonicalPreviewKey('https://WWW.Example.com/docs/'), 'example.com/docs')
+    assert.equal(canonicalPreviewKey('https://example.com/search?q=1'), 'example.com/search?q=1')
+  })
+
+  test('returns the raw value for garbage input rather than throwing', () => {
+    assert.equal(canonicalPreviewKey('not a url'), 'not a url')
+    assert.equal(canonicalPreviewKey(''), '')
+  })
+})
+
+describe('decodeHtmlEntities', () => {
+  test('named, hex, and decimal entities', () => {
+    assert.equal(decodeHtmlEntities('A &amp; B &#x27; &#39; &nbsp;'), "A & B ' '  ")
+  })
+})
+
+describe('usableTitle', () => {
+  test('scrubs captcha/error walls', () => {
+    assert.equal(usableTitle('Just a moment...'), '')
+    assert.equal(usableTitle('Example – Error'), '')
+    assert.equal(usableTitle('A real title'), 'A real title')
+    assert.equal(usableTitle(''), '')
+  })
+})
+
+describe('parseLinkMeta', () => {
+  test('prefers og over twitter over <title>', () => {
+    const html =
+      '<html><head>' +
+      '<title>Fallback Title</title>' +
+      '<meta property="og:title" content="OG Title">' +
+      '<meta name="twitter:title" content="Twitter Title">' +
+      '<meta property="og:description" content="OG desc">' +
+      '<meta property="og:image" content="https://cdn.example.com/i.png">' +
+      '<meta property="og:site_name" content="Example">' +
+      '</head></html>'
+
+    const meta = parseLinkMeta(html, PAGE_URL)
+
+    assert.equal(meta.title, 'OG Title')
+    assert.equal(meta.description, 'OG desc')
+    assert.equal(meta.imageUrl, 'https://cdn.example.com/i.png')
+    assert.equal(meta.siteName, 'Example')
+    assert.equal(meta.url, PAGE_URL)
+  })
+
+  test('falls back to twitter meta, then description meta, then <title>', () => {
+    const meta = parseLinkMeta('<meta name="twitter:title" content="T"><meta name="description" content="D">', PAGE_URL)
+
+    assert.equal(meta.title, 'T')
+    assert.equal(meta.description, 'D')
+
+    const titled = parseLinkMeta('<title>Only Title</title>', PAGE_URL)
+
+    assert.equal(titled.title, 'Only Title')
+    assert.equal(titled.description, '')
+  })
+
+  test('decodes entities, collapses whitespace, and caps fields', () => {
+    const long = 'x'.repeat(500)
+
+    const meta = parseLinkMeta(
+      `<meta property="og:description" content="  A &amp; B\t C  "><meta property="og:title" content="${long}">`,
+      PAGE_URL
+    )
+
+    assert.equal(meta.description, 'A & B C')
+    assert.equal(meta.title.length, 240)
+  })
+
+  test('resolves relative og:image against the page and drops non-http schemes', () => {
+    const meta = parseLinkMeta('<meta property="og:image" content="/img/thumb.png">', PAGE_URL)
+
+    assert.equal(meta.imageUrl, 'https://example.com/img/thumb.png')
+
+    const data = parseLinkMeta('<meta property="og:image" content="data:image/png;base64,AAAA">', PAGE_URL)
+
+    assert.equal(data.imageUrl, '')
+  })
+
+  test('first declared tag wins over later duplicates', () => {
+    const meta = parseLinkMeta(
+      '<meta property="og:title" content="First"><meta property="og:title" content="Second">',
+      PAGE_URL
+    )
+
+    assert.equal(meta.title, 'First')
+  })
+})
+
+describe('private-address guard', () => {
+  test('rejects loopback, RFC1918, link-local, CGNAT, ULA, and unspecified IPv6', () => {
+    for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.0.9', '172.16.0.1', '172.31.255.255', '169.254.1.1', '100.64.0.1', '0.0.0.0', '224.0.0.1', '::1', '::', 'fe80::1', 'fc00::1', '::ffff:10.0.0.5']) {
+      assert.equal(isPrivateAddress(ip), true, ip)
+    }
+  })
+
+  test('accepts public addresses', () => {
+    for (const ip of ['93.184.216.34', '8.8.8.8', '2606:4700::6810:85e5']) {
+      assert.equal(isPrivateAddress(ip), false, ip)
+    }
+  })
+
+  test('treats unparseable input as private (fail closed)', () => {
+    assert.equal(isPrivateAddress(''), true)
+    assert.equal(isPrivateAddress('999.1.1.1'), true)
+    assert.equal(isPrivateAddress('not-an-ip'), true)
+  })
+
+  test('hostname guard: localhost shapes, bare names, .local/.internal/.home.arpa', () => {
+    for (const host of ['localhost', 'widget.local', 'svc.internal', 'box.home.arpa', 'intranet', '127.0.0.1', '10.0.0.9', '192.168.1.4', '']) {
+      assert.equal(isPrivateHostname(host), true, host)
+    }
+
+    for (const host of ['example.com', 'www.example.co.uk', 'WWW.Example.COM']) {
+      assert.equal(isPrivateHostname(host), false, host)
+    }
+  })
+})
+
+describe('LinkPreviewStore', () => {
+  test('stores, returns by url, and stamps fetchedAt', async () => {
+    const store = new LinkPreviewStore(null, { writeDebounceMs: 5 })
+
+    store.set({ url: PAGE_URL, title: 'T', description: '', siteName: '', imageUrl: '' })
+
+    const got = store.get(PAGE_URL)
+
+    assert.ok(got)
+    assert.equal(got.title, 'T')
+    assert.ok(Number.isFinite(got.fetchedAt))
+  })
+
+  test('expires entries after the TTL', () => {
+    let now = 1_000_000
+    const store = new LinkPreviewStore(null, { ttlMs: 1_000, now: () => now })
+
+    store.set({ url: PAGE_URL, title: 'T', description: '', siteName: '', imageUrl: '' })
+    now += 2_000
+
+    assert.equal(store.get(PAGE_URL), null)
+  })
+
+  test('evicts oldest when full', () => {
+    const store = new LinkPreviewStore(null, { capacity: 2 })
+
+    store.set({ url: 'https://a.com/', title: 'A', description: '', siteName: '', imageUrl: '' })
+    store.set({ url: 'https://b.com/', title: 'B', description: '', siteName: '', imageUrl: '' })
+    store.set({ url: 'https://c.com/', title: 'C', description: '', siteName: '', imageUrl: '' })
+
+    assert.equal(store.get('https://a.com/'), null)
+    assert.ok(store.get('https://b.com/'))
+    assert.ok(store.get('https://c.com/'))
+  })
+
+  test('persists debounced and hydrates fresh entries only', () => {
+    vi.useFakeTimers()
+
+    const backing: Record<string, { url: string; title: string; description: string; siteName: string; imageUrl: string; at: number }> = {}
+    let now = 50_000
+
+    const persisted = new LinkPreviewStore(
+      {
+        read: () => ({}),
+        write: entries => {
+          for (const [k, v] of Object.entries(entries)) {
+            backing[k] = v
+          }
+        }
+      },
+      { writeDebounceMs: 10, now: () => now }
+    )
+
+    persisted.set({ url: PAGE_URL, title: 'T', description: '', siteName: '', imageUrl: '' })
+    vi.advanceTimersByTime(20)
+
+    assert.ok(backing['example.com/article'])
+
+    now = 200_000
+
+    const hydrated = new LinkPreviewStore(
+      { read: () => ({ ...backing }), write: () => undefined },
+      { now: () => now, ttlMs: 1_000 }
+    )
+
+    assert.equal(hydrated.get(PAGE_URL), null, 'stale entry must not hydrate')
+  })
+
+  test('failed fetches are never stored — cache only holds successes', () => {
+    const store = new LinkPreviewStore(null)
+
+    store.set({ url: PAGE_URL, title: '', description: 'desc only', siteName: '', imageUrl: '' })
+
+    assert.ok(store.get(PAGE_URL))
+  })
+})
+
+describe('HostRateLimiter', () => {
+  test('serializes same-host acquisitions', async () => {
+    const limiter = new HostRateLimiter(0, 8)
+    const order: string[] = []
+    let firstRelease: (() => void) | null = null
+
+    const first = limiter.acquire('example.com').then(release => {
+      firstRelease = release
+      order.push('first-in')
+    })
+
+    const second = limiter.acquire('example.com').then(release => {
+      order.push('second-in')
+      release()
+    })
+
+    await Promise.resolve()
+    await Promise.resolve()
+
+    assert.ok(firstRelease === null, 'second must wait for the first gate')
+
+    firstRelease?.()
+    await first
+    await second
+
+    assert.deepEqual(order, ['first-in', 'second-in'])
+  })
+
+  test('different hosts proceed independently', async () => {
+    const limiter = new HostRateLimiter(0, 8)
+
+    const a = limiter.acquire('a.com')
+    const b = limiter.acquire('b.com')
+
+    const [releaseA, releaseB] = await Promise.all([a, b])
+
+    releaseA()
+    releaseB()
+    assert.ok(true)
+  })
+})
+
+describe('resolveLinkPreview', () => {
+  test('happy path: parses, stores, and returns the envelope', async () => {
+    const io = fakeIo({
+      html: '<meta property="og:title" content="Hello"><meta property="og:description" content="World">'
+    })
+
+    const deps = makeDeps(io)
+    const result = await resolveLinkPreview(PAGE_URL, io, deps)
+
+    assert.ok(result.ok)
+    assert.equal(result.meta.title, 'Hello')
+    assert.equal(result.meta.description, 'World')
+    assert.equal(result.meta.url, PAGE_URL)
+    assert.ok(deps.store.get(PAGE_URL), 'successful fetch lands in the cache')
+  })
+
+  test('non-http URL refused', async () => {
+    const io = fakeIo()
+    const result = await resolveLinkPreview('ftp://example.com/x', io, makeDeps(io))
+
+    assert.deepEqual(result, { ok: false, reason: 'private-url' })
+    assert.deepEqual(io.calls, [])
+  })
+
+  test('private hostname refused without any fetch', async () => {
+    const io = fakeIo()
+    const result = await resolveLinkPreview('https://widget.local/secret', io, makeDeps(io))
+
+    assert.deepEqual(result, { ok: false, reason: 'private-url' })
+    assert.deepEqual(io.calls, [])
+  })
+
+  test('public name resolving into private space is refused (SSRF door)', async () => {
+    const io = fakeIo({ addresses: ['10.0.0.5'] })
+    const result = await resolveLinkPreview('https://rebind.example/', io, makeDeps(io))
+
+    assert.deepEqual(result, { ok: false, reason: 'private-url' })
+    assert.deepEqual(io.calls, [])
+  })
+
+  test('failed DNS resolution refuses the fetch', async () => {
+    const io = fakeIo({ addresses: [] })
+    const result = await resolveLinkPreview('https://nx.example/', io, makeDeps(io))
+
+    assert.deepEqual(result, { ok: false, reason: 'private-url' })
+  })
+
+  test('serves from cache without refetching', async () => {
+    const io = fakeIo({ html: '<meta property="og:title" content="Once">' })
+    const deps = makeDeps(io)
+
+    const first = await resolveLinkPreview(PAGE_URL, io, deps)
+
+    assert.ok(first.ok)
+
+    const callsAfterFirst = io.calls.length
+    const second = await resolveLinkPreview(PAGE_URL, io, deps)
+
+    assert.ok(second.ok)
+    assert.equal(second.meta.title, 'Once')
+    assert.equal(io.calls.length, callsAfterFirst, 'cache hit must not touch the network')
+  })
+
+  test('tier 2 backfills title when tier 1 HTML has none', async () => {
+    const io = fakeIo({ html: '<html><body>no meta</body></html>', renderedTitle: 'Rendered Title' })
+    const result = await resolveLinkPreview(PAGE_URL, io, makeDeps(io))
+
+    assert.ok(result.ok)
+    assert.equal(result.meta.title, 'Rendered Title')
+  })
+
+  test('a nothing-readable page is an error miss and is not cached', async () => {
+    const io = fakeIo({ html: '', renderedTitle: '' })
+    const deps = makeDeps(io)
+    const result = await resolveLinkPreview(PAGE_URL, io, deps)
+
+    assert.deepEqual(result, { ok: false, reason: 'error' })
+    assert.equal(deps.store.get(PAGE_URL), null, 'misses must not poison the cache')
+  })
+
+  test('error-scrubbed titles do not count as usable meta', async () => {
+    const io = fakeIo({ html: '<title>Just a moment...</title>', renderedTitle: 'Just a moment...' })
+    const result = await resolveLinkPreview(PAGE_URL, io, makeDeps(io))
+
+    assert.deepEqual(result, { ok: false, reason: 'error' })
+  })
+
+  test('never throws across the bridge envelope', async () => {
+    const io: LinkPreviewIo = {
+      fetchHtml: () => Promise.reject(new Error('boom')),
+      fetchRenderedTitle: () => Promise.reject(new Error('boom')),
+      resolveHost: () => Promise.reject(new Error('boom'))
+    }
+
+    const result = await resolveLinkPreview(PAGE_URL, io, makeDeps(io))
+
+    assert.deepEqual(result, { ok: false, reason: 'private-url' })
+  })
+})

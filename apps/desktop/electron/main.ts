@@ -1,5 +1,6 @@
 import { execFileSync, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
+import dns from 'node:dns'
 import fs from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
@@ -228,6 +229,17 @@ import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
 import { resolveHudWindowing } from './hud-windowing'
+import {
+  HostRateLimiter,
+  type LinkPreviewIo,
+  type LinkPreviewResult,
+  LinkPreviewStore,
+  PREVIEW_HOST_SPACING_MS,
+  PREVIEW_MAX_CONCURRENT,
+  PREVIEW_TTL_MS,
+  type PreviewPersistence,
+  resolveLinkPreview
+} from './link-preview'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
@@ -5611,6 +5623,108 @@ function fetchLinkTitle(rawUrl) {
   titleInflight.set(key, pending)
 
   return pending
+}
+
+// ─── Link previews (D7 click-to-expand unfurl) ───────────────────────────────
+// The policy (SSRF guard, per-host pacing, cache, field caps) lives in
+// link-preview.ts; this is its I/O and its IPC surface, mirroring how the
+// favicon ladder wires resolveFavicon into main.ts. Tier 1 reuses the exact
+// curl request the title fetcher makes, but keeps the whole byte-budgeted
+// document so og/meta tags survive; tier 2 is the existing hidden-window
+// renderer for pages that only render their title with JS.
+
+function fetchLinkHtml(rawUrl: string): Promise<string> {
+  return new Promise(resolve => {
+    const url = String(rawUrl || '').trim()
+
+    if (!url) {
+      return resolve('')
+    }
+
+    const args = [
+      '--silent',
+      '--show-error',
+      '--location',
+      '--max-redirs',
+      String(TITLE_MAX_REDIRECTS),
+      '--max-time',
+      String(Math.max(2, Math.ceil(TITLE_TIMEOUT_MS / 1000))),
+      '--connect-timeout',
+      '4',
+      '--user-agent',
+      TITLE_USER_AGENT,
+      '--header',
+      'Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.5',
+      '--header',
+      'Accept-Language: en-US,en;q=0.7',
+      '--header',
+      'Accept-Encoding: identity',
+      '--raw',
+      url
+    ]
+
+    const child = spawn('curl', args, hiddenWindowsChildOptions({ stdio: ['ignore', 'pipe', 'ignore'] }))
+    const chunks = []
+    let bytes = 0
+
+    child.stdout.on('data', chunk => {
+      if (bytes >= TITLE_BYTE_BUDGET) {
+        return
+      }
+
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      const remaining = TITLE_BYTE_BUDGET - bytes
+      const next = buffer.length > remaining ? buffer.subarray(0, remaining) : buffer
+      chunks.push(next)
+      bytes += next.length
+    })
+
+    child.on('error', () => resolve(''))
+    child.on('close', () => resolve(chunks.length ? Buffer.concat(chunks).toString('utf8') : ''))
+  })
+}
+
+const LINK_PREVIEW_CACHE_PATH = path.join(app.getPath('userData'), 'link-preview-cache.json')
+
+const previewPersistence: PreviewPersistence = {
+  read: () => {
+    try {
+      const raw = JSON.parse(fs.readFileSync(LINK_PREVIEW_CACHE_PATH, 'utf8'))
+
+      return raw?.previews && typeof raw.previews === 'object' ? raw.previews : {}
+    } catch {
+      return {}
+    }
+  },
+  write: entries => {
+    try {
+      fs.writeFileSync(LINK_PREVIEW_CACHE_PATH, JSON.stringify({ previews: entries }), 'utf8')
+    } catch {
+      // Cache is an optimization; failing to persist it costs one refetch.
+    }
+  }
+}
+
+const previewStore = new LinkPreviewStore(previewPersistence, { ttlMs: PREVIEW_TTL_MS })
+const previewLimiter = new HostRateLimiter(PREVIEW_HOST_SPACING_MS, PREVIEW_MAX_CONCURRENT)
+
+const previewIo: LinkPreviewIo = {
+  fetchHtml: fetchLinkHtml,
+  fetchRenderedTitle: fetchHtmlTitleWithRenderer,
+  resolveHost: hostname =>
+    new Promise(resolve => {
+      try {
+        dns.lookup(hostname, { all: true }, (error, addresses) => {
+          resolve(error || !addresses?.length ? [] : addresses.map(address => address.address))
+        })
+      } catch {
+        resolve([])
+      }
+    })
+}
+
+async function fetchLinkPreview(rawUrl: string): Promise<LinkPreviewResult> {
+  return resolveLinkPreview(rawUrl, previewIo, { store: previewStore, limiter: previewLimiter })
 }
 
 // ─── Favicon resolution ──────────────────────────────────────────────────────
@@ -16834,6 +16948,8 @@ ipcMain.handle('hermes:setting:defaultProjectDir:pick', async () => {
 })
 
 ipcMain.handle('hermes:fetchLinkTitle', (_event, url) => fetchLinkTitle(url))
+
+ipcMain.handle('hermes:fetchLinkPreview', (_event, url) => fetchLinkPreview(url))
 
 ipcMain.handle('hermes:resolveFavicon', (_event, url) => resolveFaviconCached(url))
 
