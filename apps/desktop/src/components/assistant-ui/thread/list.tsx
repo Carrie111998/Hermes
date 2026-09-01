@@ -138,6 +138,10 @@ export const resolveThreadScrollTarget: GetTargetScrollTop = (targetScrollTop, {
   return remaining >= 0 && remaining <= SCROLL_TARGET_EPSILON_PX ? currentScrollTop : targetScrollTop
 }
 
+export function shouldEscapeBottomFollow(deltaY: number, scrollHeight: number, clientHeight: number): boolean {
+  return deltaY < 0 && scrollHeight > clientHeight
+}
+
 export function subscribeToThreadForeground(shouldReanchor: () => boolean, onReanchor: () => void): () => void {
   let frameId: number | null = null
   let framePending = false
@@ -410,6 +414,30 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
     resize: 'instant',
     targetScrollTop: resolveThreadScrollTarget
   })
+
+  useEffect(() => {
+    const viewport = scrollRef.current
+
+    if (!viewport) {
+      return
+    }
+
+    const escapeBottomFollow = (event: WheelEvent) => {
+      if (shouldEscapeBottomFollow(event.deltaY, viewport.scrollHeight, viewport.clientHeight)) {
+        stopScroll()
+      }
+    }
+
+    viewport.addEventListener('wheel', escapeBottomFollow, {
+      capture: true,
+      passive: true
+    })
+
+    return () =>
+      viewport.removeEventListener('wheel', escapeBottomFollow, {
+        capture: true
+      })
+  }, [scrollRef, stopScroll])
 
   const { olderAvailable, expandWindow } = useTranscriptWindow()
 
