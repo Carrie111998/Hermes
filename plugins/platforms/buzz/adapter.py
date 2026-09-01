@@ -241,8 +241,30 @@ _DM_DISCOVERY_EVERY = 5
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
-# Buzz presence records expire, so refresh comfortably before the relay TTL.
-_PRESENCE_INTERVAL = 60.0
+# Buzz relays document a 180-second expiry for presence records. Refresh at
+# most once a minute, leaving a two-minute margin even if the relay's clock or
+# delivery is delayed.
+_PRESENCE_EXPIRY = 180.0
+_PRESENCE_REFRESH_MARGIN = 120.0
+_PRESENCE_INTERVAL = min(60.0, _PRESENCE_EXPIRY - _PRESENCE_REFRESH_MARGIN)
+_REACTION_CLEANUP_INTERVAL = 60.0
+_REACTION_CLEANUP_TTL = 300.0
+
+
+def _presence_refresh_interval(refresh: float, expiry: float, margin: float) -> float:
+    """Effective presence-refresh interval for a relay TTL of ``expiry``.
+
+    The relay expires presence records after ``expiry`` seconds; the
+    effective cadence is the configured ``refresh`` clamped so every
+    refresh (including the first, scheduled right after the connect-time
+    ``online`` publish) lands at least ``margin`` seconds before the
+    record would lapse. A degenerate ``margin >= expiry`` falls back to
+    half the expiry rather than a zero/negative sleep.
+    """
+    bounded = expiry - margin
+    if bounded <= 0:
+        bounded = expiry / 2.0
+    return max(0.0, min(refresh, bounded))
 
 # Mention-resolution caches: member lists are cheap to refetch but hit on
 # every publish containing "@", so a short TTL amortizes the CLI round-trip;
@@ -914,6 +936,8 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_ready: Optional[asyncio.Event] = None
         self._presence_task: Optional[asyncio.Task] = None
         self._presence_interval = _PRESENCE_INTERVAL
+        self._presence_expiry = _PRESENCE_EXPIRY
+        self._presence_margin = _PRESENCE_REFRESH_MARGIN
         self._ws_active = False  # True while the WS loop owns inbound delivery
         self._membership_since = 0
         self._lock_key: Optional[str] = None
@@ -966,9 +990,12 @@ class BuzzAdapter(BasePlatformAdapter):
                 )
                 self._reactions_enabled_flag = True
         # (chat_id, message_id) -> {"emoji": str|None, "terminal": bool,
-        # "tail_task": asyncio.Task|None}
+        # "tail_task": asyncio.Task|None, "last_active": float}
         self._reaction_lifecycle: Dict[tuple, dict] = {}
         self._reaction_tasks: set = set()
+        self._reaction_cleanup_task: Optional[asyncio.Task] = None
+        self._reaction_cleanup_interval = _REACTION_CLEANUP_INTERVAL
+        self._reaction_cleanup_ttl = _REACTION_CLEANUP_TTL
 
     @property
     def name(self) -> str:
@@ -1019,10 +1046,22 @@ class BuzzAdapter(BasePlatformAdapter):
         return True
 
     async def _presence_loop(self) -> None:
-        """Refresh online presence until the adapter disconnects."""
+        """Refresh online presence until the adapter disconnects.
+
+        Each sleep uses the effective cadence — the configured interval
+        clamped by :func:`_presence_refresh_interval` — so every refresh
+        lands at least the margin before the relay's presence TTL lapses,
+        including the first refresh after the connect-time publish.
+        """
         try:
             while True:
-                await asyncio.sleep(self._presence_interval)
+                await asyncio.sleep(
+                    _presence_refresh_interval(
+                        self._presence_interval,
+                        self._presence_expiry,
+                        self._presence_margin,
+                    )
+                )
                 await self._set_presence("online")
         except asyncio.CancelledError:
             raise
@@ -1040,8 +1079,11 @@ class BuzzAdapter(BasePlatformAdapter):
         self._presence_task = None
         try:
             await asyncio.wait_for(self._set_presence("offline"), timeout=5)
-        except (asyncio.TimeoutError, TimeoutError, Exception):
-            pass  # best-effort: never let presence block shutdown
+        except Exception:
+            # Best-effort: never let presence block shutdown. (Timeouts are
+            # Exception subclasses on every supported Python, and
+            # CancelledError deliberately propagates.)
+            pass
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
@@ -1214,6 +1256,15 @@ class BuzzAdapter(BasePlatformAdapter):
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        # Stop the abandoned-state sweeper before clearing its state: it only
+        # runs while entries exist and restarts on the next enqueue.
+        if self._reaction_cleanup_task and not self._reaction_cleanup_task.done():
+            self._reaction_cleanup_task.cancel()
+            try:
+                await self._reaction_cleanup_task
+            except asyncio.CancelledError:
+                pass
+        self._reaction_cleanup_task = None
         self._reaction_tasks.clear()
         self._reaction_lifecycle = {}
         self._channel_state = {}
@@ -1261,6 +1312,15 @@ class BuzzAdapter(BasePlatformAdapter):
     # call happens in a background task — never awaited by message
     # processing or response delivery. Best-effort throughout: any failure
     # only means the user sees a stale emoji, never a broken reply.
+    #
+    # Abandoned-state cleanup: the terminal hook is the only normal way an
+    # entry leaves ``_reaction_lifecycle``, so a hung/hard-crashed turn
+    # would otherwise pin its entry until disconnect. A single shared
+    # sweeper task (started lazily with the first entry, self-terminating
+    # when the map empties — never one task per message) drops entries idle
+    # past ``_REACTION_CLEANUP_TTL`` and cancels wedged transitions at the
+    # same bound; sweeps never touch a valid in-flight transition younger
+    # than the TTL.
 
     _RECEIVED_EMOJI = "\N{EYES}"
     _WORKING_EMOJI = "\N{BRAIN}"
@@ -1278,8 +1338,55 @@ class BuzzAdapter(BasePlatformAdapter):
             return
         self._reaction_lifecycle[key] = {
             "emoji": None, "terminal": False, "tail_task": None,
+            "last_active": time.monotonic(),
         }
         self._reaction_transition_enqueue(key, self._RECEIVED_EMOJI)
+        self._ensure_reaction_cleanup()
+
+    def _ensure_reaction_cleanup(self) -> None:
+        """Run the abandoned-state sweeper while any lifecycle entry exists.
+
+        One shared task, (re)started lazily when state is created and ending
+        itself when the map empties — never one background task per message.
+        """
+        if self._reaction_cleanup_task is None or self._reaction_cleanup_task.done():
+            self._reaction_cleanup_task = asyncio.ensure_future(
+                self._reaction_cleanup_loop()
+            )
+
+    async def _reaction_cleanup_loop(self) -> None:
+        """Drop lifecycle entries whose terminal hook never arrives."""
+        try:
+            while self._reaction_lifecycle:
+                await asyncio.sleep(self._reaction_cleanup_interval)
+                await self._reaction_cleanup_once()
+        except asyncio.CancelledError:
+            raise
+
+    async def _reaction_cleanup_once(self) -> None:
+        """One sweep: expire idle entries; time out wedged transitions.
+
+        An entry is idle when its transition chain has been quiescent for
+        ``_reaction_cleanup_ttl`` — the tail task is done AND no new activity
+        happened within the TTL. A wedged (never-completing) transition is
+        cancelled at the TTL and its entry dropped: the tail's ``finally``
+        only pops terminal entries, so cleanup must drop non-terminal state
+        itself, and cancelling the tail stops the chain head from enqueuing
+        more work (each successor re-raises when its predecessor is
+        cancelled). Older links still draining a slow buzz-cli call finish
+        on their own ``_CLI_TIMEOUT`` and find the state gone. In-flight
+        work younger than the TTL is never touched.
+        """
+        now = time.monotonic()
+        stale: List[tuple] = []
+        for key, state in self._reaction_lifecycle.items():
+            tail = state.get("tail_task")
+            if now - state.get("last_active", 0) >= self._reaction_cleanup_ttl:
+                if tail is not None and not tail.done():
+                    tail.cancel()
+                stale.append(key)
+        for key in stale:
+            self._reaction_lifecycle.pop(key, None)
 
     def _reaction_transition_enqueue(
         self, key: tuple, desired: Optional[str], *, terminal: bool = False
@@ -1296,6 +1403,7 @@ class BuzzAdapter(BasePlatformAdapter):
             return
         if terminal:
             state["terminal"] = True
+        state["last_active"] = time.monotonic()
         task = asyncio.create_task(
             self._reaction_transition_run(
                 key, desired, state.get("tail_task"), terminal

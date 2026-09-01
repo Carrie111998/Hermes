@@ -518,6 +518,100 @@ class TestBaseHookIntegration:
 # ── Disconnect hygiene ────────────────────────────────────────────────────
 
 
+class TestAbandonedLifecycleCleanup:
+    @pytest.mark.asyncio
+    async def test_stale_completed_chain_is_removed_without_terminal_hook(self):
+        adapter = _make_adapter()
+        adapter._reaction_cleanup_ttl = 0
+        key = (CHANNEL, "leaked")
+        adapter._reaction_begin(*key)
+        await _drain_reactions(adapter)
+
+        assert key in adapter._reaction_lifecycle
+        await adapter._reaction_cleanup_once()
+
+        assert key not in adapter._reaction_lifecycle
+
+    @pytest.mark.asyncio
+    async def test_cleanup_keeps_live_transition_until_timeout_cancels_it(self):
+        adapter = _make_adapter()
+        adapter._reaction_cleanup_ttl = 0
+        key = (CHANNEL, "in-flight")
+        blocker = asyncio.Event()
+
+        async def stuck(*_args, **_kwargs):
+            await blocker.wait()
+            return 0, "", ""
+
+        adapter._run_cli = stuck
+        adapter._reaction_begin(*key)
+        await asyncio.sleep(0)
+        task = adapter._reaction_lifecycle[key]["tail_task"]
+        assert not task.done()
+
+        await adapter._reaction_cleanup_once()
+        # Cancellation is delivered on the next loop pass; wait for the
+        # task to finish processing it.
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert task.cancelled()
+        assert key not in adapter._reaction_lifecycle
+
+    @pytest.mark.asyncio
+    async def test_cleanup_does_not_touch_young_in_flight_state(self):
+        """A valid transition in flight must survive a sweep."""
+        adapter = _make_adapter()
+        adapter._reaction_cleanup_ttl = 300.0
+        key = (CHANNEL, "young")
+        blocker = asyncio.Event()
+
+        async def slow_but_fine(*_args, **_kwargs):
+            await blocker.wait()
+            return 0, "", ""
+
+        adapter._run_cli = slow_but_fine
+        adapter._reaction_begin(*key)
+        await asyncio.sleep(0)
+        task = adapter._reaction_lifecycle[key]["tail_task"]
+
+        await adapter._reaction_cleanup_once()
+
+        assert key in adapter._reaction_lifecycle
+        assert not task.cancelled()
+        blocker.set()
+        await _drain_reactions(adapter)
+
+    @pytest.mark.asyncio
+    async def test_single_shared_cleanup_task_starts_and_ends_with_state(self):
+        adapter = _make_adapter()
+        adapter._reaction_cleanup_interval = 0.001
+
+        key = (CHANNEL, "sweeper")
+        adapter._reaction_begin(*key)
+        first = adapter._reaction_cleanup_task
+        assert first is not None and not first.done()
+
+        # A second entry reuses the same sweeper task.
+        key2 = (CHANNEL, "sweeper2")
+        adapter._reaction_begin(*key2)
+        assert adapter._reaction_cleanup_task is first
+
+        # Terminal completion empties the map; the sweeper exits on its own.
+        await adapter.on_processing_complete(_evt_with(key2), _outcome_success())
+        await adapter.on_processing_complete(_evt_with(key), _outcome_success())
+        await _drain_reactions(adapter)
+        for _ in range(20):
+            if adapter._reaction_cleanup_task.done():
+                break
+            await asyncio.sleep(0.001)
+        assert adapter._reaction_cleanup_task.done()
+        # A fresh entry restarts it (done task is replaced).
+        adapter._reaction_begin(CHANNEL, "sweeper3")
+        assert adapter._reaction_cleanup_task is not first
+        await adapter.on_processing_complete(_evt_with((CHANNEL, "sweeper3")), _outcome_success())
+        await _drain_reactions(adapter)
+
+
 class TestDisconnectCleanup:
     @pytest.mark.asyncio
     async def test_disconnect_cancels_in_flight_reaction_tasks(self):

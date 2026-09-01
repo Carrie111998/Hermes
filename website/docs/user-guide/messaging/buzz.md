@@ -134,9 +134,11 @@ Buzz has no typing indicator, so the agent marks each conversational turn with e
 
 Only one reaction is shown at a time — each replaces the previous one. Commands (`/status`, `/stop`, …) don't get reactions, and senders who aren't authorized to talk to the agent never see any. Reactions are best-effort: if a reaction fails to update, the reply is unaffected. Set `reactions: false` in the `buzz` `extra` block to turn them off.
 
+If a reply never finishes (the agent crashes or processing hangs), the working reaction could otherwise stay on the message until restart. A periodic sweep retires these abandoned lifecycle reactions a few minutes after the last activity, and a wedged update is cancelled at the same bound — a slow relay that resumes after that simply finds nothing left to update. Normal replies always finish their ✅/❌ first; the sweep only catches turns whose terminal state never arrived.
+
 ## Presence
 
-Buzz presence expires unless republished, so the adapter publishes `online` when it connects and refreshes it every minute; on graceful shutdown it publishes `offline` (best-effort — a slow or unreachable relay never blocks startup or shutdown).
+Buzz relays expire presence records after about 3 minutes unless they are republished. The adapter publishes `online` when it connects, refreshes it every minute — comfortably inside that expiry window — and publishes `offline` on graceful shutdown (best-effort: a slow or unreachable relay never blocks startup or shutdown).
 
 ## Access control
 

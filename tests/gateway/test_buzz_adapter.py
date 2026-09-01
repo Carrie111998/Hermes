@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3234,6 +3235,70 @@ class TestBuzzAdapterLifecycle:
 
         assert calls[0] == "online"
         assert len(calls) >= 2
+
+    def test_refresh_interval_clamps_to_leave_margin_before_expiry(self):
+        """Cadence invariants: never later than expiry-minus-margin, never zero."""
+        assert _buzz_mod._presence_refresh_interval(60.0, 180.0, 120.0) == 60.0
+        # A configured cadence that would brush expiry is pulled earlier.
+        assert _buzz_mod._presence_refresh_interval(90.0, 100.0, 60.0) == 40.0
+        # A degenerate margin that leaves no headroom falls back to half the
+        # expiry as the ceiling; the configured cadence still applies when
+        # it is already tighter.
+        assert _buzz_mod._presence_refresh_interval(60.0, 180.0, 200.0) == 60.0
+        assert _buzz_mod._presence_refresh_interval(120.0, 180.0, 200.0) == 90.0
+        # The default cadence always refreshes before the record lapses.
+        assert (
+            _buzz_mod._presence_refresh_interval(
+                _buzz_mod._PRESENCE_INTERVAL,
+                _buzz_mod._PRESENCE_EXPIRY,
+                _buzz_mod._PRESENCE_REFRESH_MARGIN,
+            )
+            < _buzz_mod._PRESENCE_EXPIRY
+        )
+
+    @pytest.mark.asyncio
+    async def test_presence_first_and_repeat_refresh_lands_before_expiry(self):
+        """First refresh (and repeats) arrive before a short relay TTL lapses."""
+        adapter = _make_adapter()
+        adapter._presence_interval = 0.05  # configured cadence would brush expiry
+        adapter._presence_expiry = 0.06
+        adapter._presence_margin = 0.04
+        stamps = []
+        done = asyncio.Event()
+
+        async def record_presence(status):
+            stamps.append(time.monotonic())
+            if len(stamps) >= 2:
+                done.set()
+            return True
+
+        adapter._set_presence = record_presence
+        start = time.monotonic()
+        task = asyncio.create_task(adapter._presence_loop())
+        try:
+            await asyncio.wait_for(done.wait(), timeout=2)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        # Effective cadence is expiry - margin = 0.02s; the first refresh
+        # must land well before the 0.06s TTL, and the second on cadence.
+        assert stamps[0] - start < adapter._presence_expiry
+        assert 0 < stamps[1] - stamps[0] < 2 * (
+            adapter._presence_expiry - adapter._presence_margin
+        )
+
+    @pytest.mark.asyncio
+    async def test_stop_presence_swallows_timeouts_but_not_cancellation(self):
+        adapter = _make_adapter()
+
+        async def raise_cancelled(status):
+            raise asyncio.CancelledError()
+
+        adapter._presence_task = None
+        adapter._set_presence = raise_cancelled
+        with pytest.raises(asyncio.CancelledError):
+            await adapter._stop_presence()
 
 
 # ── Credentials / requirements ────────────────────────────────────────────
