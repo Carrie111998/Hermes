@@ -7,6 +7,7 @@ hermes_state re-imports every name here for backward compatibility.
 """
 
 import contextlib
+import errno
 import logging
 import os
 import sys
@@ -876,6 +877,11 @@ END;
 # schema surgery runs on an EXCLUSIVE offline connection and can legitimately
 # take minutes in VACUUM, while runtime rebuilds run on live connections. The
 # timeout is sized for a full 'rebuild' of both indexes on a large DB.
+#
+# The *file* remaining on disk after a crash is not the lock. flock/msvcrt
+# attach to the open fd; an empty leftover ``*.lock`` with no live holder
+# must acquire immediately. Treating mtime as ownership (and unlinking the
+# file) would split the inode and let two rebuilds run at once.
 
 logger = logging.getLogger("hermes_state")
 
@@ -883,9 +889,30 @@ _FTS_REBUILD_LOCK_TIMEOUT_SECONDS = 120.0
 _FTS_REBUILD_LOCK_POLL_SECONDS = 0.1
 _IS_WINDOWS = sys.platform == "win32"
 
+# errno set for "someone else holds this advisory lock" — not I/O, NFS
+# ESTALE, ENOTSUP, or permission-to-create-the-file failures. Catching
+# every OSError as contention made a persistent filesystem error look
+# like a live 120s holder (#100108).
+_LOCK_CONTENTION_ERRNOS = {
+    errno.EAGAIN,
+    errno.EACCES,
+    errno.EWOULDBLOCK,
+}
+if hasattr(errno, "EDEADLK"):
+    _LOCK_CONTENTION_ERRNOS.add(errno.EDEADLK)
+
+
+def is_advisory_lock_contention(exc: BaseException) -> bool:
+    """True when *exc* means another process holds the advisory lock."""
+    if isinstance(exc, BlockingIOError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    return exc.errno in _LOCK_CONTENTION_ERRNOS
+
 
 @contextlib.contextmanager
-def fts_rebuild_admission(db_path):
+def fts_rebuild_admission(db_path, *, timeout_seconds=None):
     """Serialize full structural FTS rebuilds on *db_path* across processes.
 
     Yields True when this process holds the rebuild authority, False when the
@@ -897,6 +924,11 @@ def fts_rebuild_admission(db_path):
     ``db_path`` may be a str or Path; None (in-memory DB / tests without a
     file path) yields True — a private in-memory DB has no cross-process
     surface.
+
+    *timeout_seconds* defaults to ``_FTS_REBUILD_LOCK_TIMEOUT_SECONDS``.
+    Opportunistic in-process retries pass ``0`` so a live holder does not
+    stall the caller for two minutes; a leftover empty lock file with no
+    flock still acquires on the first try.
     """
     if db_path is None:
         yield True
@@ -914,9 +946,14 @@ def fts_rebuild_admission(db_path):
         yield True
         return
 
+    timeout = (
+        _FTS_REBUILD_LOCK_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else max(float(timeout_seconds), 0.0)
+    )
     acquired = False
     try:
-        deadline = time.monotonic() + _FTS_REBUILD_LOCK_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout
         while True:
             try:
                 if _IS_WINDOWS:
@@ -930,17 +967,34 @@ def fts_rebuild_admission(db_path):
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 acquired = True
                 break
-            except (BlockingIOError, OSError):
+            except (BlockingIOError, OSError) as exc:
+                if not is_advisory_lock_contention(exc):
+                    logger.warning(
+                        "Could not acquire FTS rebuild lock %s (%s) — "
+                        "deferring this rebuild. An empty leftover lock file "
+                        "is not a holder; only a live flock/msvcrt lock is.",
+                        lock_path, exc,
+                    )
+                    break
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(_FTS_REBUILD_LOCK_POLL_SECONDS)
         if not acquired:
-            logger.warning(
-                "FTS rebuild lock %s held by another process for more than "
-                "%.0fs — deferring this rebuild to avoid racing the holder "
-                "(the stale-FTS breadcrumb keeps it retryable).",
-                lock_path, _FTS_REBUILD_LOCK_TIMEOUT_SECONDS,
-            )
+            if timeout <= 0:
+                logger.warning(
+                    "FTS rebuild lock %s is busy — deferring this rebuild "
+                    "(leftover empty lock files without a live flock do not "
+                    "block; the stale-FTS breadcrumb keeps it retryable).",
+                    lock_path,
+                )
+            else:
+                logger.warning(
+                    "FTS rebuild lock %s held by another process for more than "
+                    "%.0fs — deferring this rebuild to avoid racing the holder "
+                    "(the stale-FTS breadcrumb keeps it retryable; leftover "
+                    "empty lock files without a live flock do not block).",
+                    lock_path, timeout,
+                )
         yield acquired
     finally:
         try:

@@ -43,6 +43,10 @@ logger = logging.getLogger("hermes_state")
 
 _FTS_HOLDER_ESCALATE_ATTEMPTS = 3
 _FTS_HOLDER_ESCALATE_SECONDS = 60.0
+# In-process stale-FTS retry cadence. Startup already waited the admission
+# timeout once; later retries are non-blocking (timeout=0) so a live holder
+# does not stall writers. Leftover empty lock files acquire immediately.
+_FTS_STALE_RETRY_SECONDS = 60.0
 
 # Cache for schema_read_probe_statements() — parsing SCHEMA_SQL spins up an
 # in-memory SQLite database, so derive the statements once per process.
@@ -422,7 +426,9 @@ class SessionSchemaMixin:
             )
             return None
 
-    def _recover_stale_fts(self, cursor: sqlite3.Cursor, *, legacy: bool) -> bool:
+    def _recover_stale_fts(
+        self, cursor: sqlite3.Cursor, *, legacy: bool, timeout_seconds=None
+    ) -> bool:
         """Atomically rebuild stale base/trigram indexes and resume syncing."""
         foreign_holders = self._foreign_state_db_holders()
         if foreign_holders:
@@ -502,7 +508,10 @@ class SessionSchemaMixin:
         # authority (fail closed). Losing the race means another process is
         # already performing this exact recovery; the stale breadcrumb stays
         # set, so this process simply keeps FTS detached and retries later.
-        with fts_rebuild_admission(getattr(self, "db_path", None)) as admitted:
+        with fts_rebuild_admission(
+            getattr(self, "db_path", None),
+            timeout_seconds=timeout_seconds,
+        ) as admitted:
             if not admitted:
                 logger.warning(
                     "Deferred stale state.db FTS rebuild: another process "
@@ -607,6 +616,43 @@ class SessionSchemaMixin:
             "restored sync triggers."
         )
         return True
+
+    def retry_deferred_fts_recovery(self) -> bool:
+        """Retry a deferred stale-FTS rebuild without reopening SessionDB.
+
+        Long-lived processes (gateway, interactive CLI) open state.db once.
+        ``_recover_stale_fts`` at that open fail-closes when foreign holders
+        or the rebuild lock are busy, and live write/search paths must not
+        start a full rebuild (#97940). This is the in-process retry those
+        paths were missing: non-blocking admission (timeout=0), so a leftover
+        empty lock file recovers immediately while a live holder is skipped
+        and tried again later.
+
+        Returns True when the index was rebuilt and sync triggers restored.
+        """
+        if not getattr(self, "_fts_stale", False):
+            return False
+        if getattr(self, "read_only", False) or getattr(self, "_conn", None) is None:
+            return False
+        now = time.monotonic()
+        if now < getattr(self, "_fts_stale_retry_after", 0.0):
+            return False
+        self._fts_stale_retry_after = now + _FTS_STALE_RETRY_SECONDS
+        with self._lock:
+            if self._conn is None or not self._fts_stale:
+                return False
+            cursor = self._conn.cursor()
+            legacy = self._db_has_legacy_inline_fts(cursor)
+            recovered = self._recover_stale_fts(
+                cursor, legacy=legacy, timeout_seconds=0.0
+            )
+            if recovered:
+                self._ensure_fts_cjk_schema(cursor)
+            try:
+                self._conn.commit()
+            except sqlite3.Error:
+                pass
+            return recovered
 
     @staticmethod
     def _parse_schema_columns(schema_sql: str) -> Dict[str, Dict[str, str]]:
@@ -1510,7 +1556,8 @@ class SessionSchemaMixin:
         breadcrumb is persisted, mirroring ``_enter_fts_fail_open``'s
         ordering contract: triggers must never be live over an index with an
         unrebuilt gap. FTS stays detached for this instance; the winner's
-        rebuild — or ``_recover_stale_fts`` at the next startup — restores
+        rebuild — or ``retry_deferred_fts_recovery`` in this process, or
+        ``_recover_stale_fts`` at the next startup — restores
         the index and triggers atomically.
         """
         with fts_rebuild_admission(getattr(self, "db_path", None)) as admitted:

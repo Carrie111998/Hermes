@@ -79,6 +79,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _sql_session_last_active,
     _sql_session_last_active_by_id,
     escape_like as _escape_like,
+    is_advisory_lock_contention,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
     FTS_REBUILD_DEFERRAL_KEY,
@@ -1758,13 +1759,14 @@ def _log_wal_reset_bug_once(
     # for git/pip/system Python installs (#75153).
     repair_hint = _wal_reset_repair_hint()
     logger.warning(
-        "%s: linked SQLite %s is vulnerable to the WAL-reset corruption "
+        "%s: linked SQLite %s in %s is vulnerable to the WAL-reset corruption "
         "bug (https://sqlite.org/wal.html#walresetbug) — %s. "
         "Upgrade to SQLite 3.51.3+ (or backports 3.50.7 / 3.44.6); "
         "%s. See `hermes doctor`. This warning fires once per "
         "process per database.",
         db_label,
         sqlite3.sqlite_version,
+        sys.executable,
         action,
         repair_hint,
     )
@@ -2315,7 +2317,16 @@ def _cross_process_repair_lock(db_path: Path):
                     fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 acquired = True
                 break
-            except (BlockingIOError, OSError):
+            except (BlockingIOError, OSError) as exc:
+                if not is_advisory_lock_contention(exc):
+                    logger.warning(
+                        "Could not acquire state.db repair lock %s (%s) — "
+                        "skipping schema surgery. An empty leftover lock "
+                        "file is not a holder; only a live flock/msvcrt "
+                        "lock is.",
+                        lock_path, exc,
+                    )
+                    break
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(_REPAIR_LOCK_POLL_SECONDS)
@@ -2323,7 +2334,8 @@ def _cross_process_repair_lock(db_path: Path):
             logger.warning(
                 "state.db repair lock %s held by another process for more "
                 "than %.0fs — skipping schema surgery in this process to "
-                "avoid racing the repairer.",
+                "avoid racing the repairer (leftover empty lock files "
+                "without a live flock do not block).",
                 lock_path, _REPAIR_LOCK_TIMEOUT_SECONDS,
             )
         yield acquired

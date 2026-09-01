@@ -2365,7 +2365,7 @@ class SessionSearchMixin:
                     )
         return optimized
 
-    def rebuild_fts(self) -> int:
+    def rebuild_fts(self, *, timeout_seconds=None) -> int:
         """Rebuild FTS5 indexes from the canonical ``messages`` table.
 
         Uses the FTS5 ``'rebuild'`` command, which rewrites the internal
@@ -2382,13 +2382,20 @@ class SessionSearchMixin:
         FAILS CLOSED: if another process holds the rebuild lock beyond the
         bounded wait, this call defers (returns 0) rather than racing it.
         Callers already treat 0 as "rebuild made no progress" and fall back
-        to the stale-FTS breadcrumb path, which retries at next startup.
+        to the stale-FTS breadcrumb path, which retries in-process
+        (``retry_deferred_fts_recovery``) and at next startup.
+
+        *timeout_seconds* is forwarded to admission. Opportunistic callers
+        pass ``0`` so a live holder does not stall the request path.
 
         Safe to call when FTS tables don't exist (skips them).
         Returns the number of FTS indexes that were rebuilt.
         """
         rebuilt = 0
-        with fts_rebuild_admission(getattr(self, "db_path", None)) as admitted:
+        with fts_rebuild_admission(
+            getattr(self, "db_path", None),
+            timeout_seconds=timeout_seconds,
+        ) as admitted:
             if not admitted:
                 logger.warning(
                     "Deferred in-place FTS rebuild: another process holds "

@@ -14,6 +14,7 @@ import logging
 import os
 import json
 import threading
+import time
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -35,6 +36,11 @@ def _now() -> datetime:
 # ``config.yaml`` ``agent.gateway_auto_continue_freshness`` into
 # ``HERMES_AUTO_CONTINUE_FRESHNESS`` at startup.
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
+
+# In-process stale-FTS retry. Live write/search must not rebuild (#97940);
+# the gateway is a long-lived SessionDB opener, so "retry at next startup"
+# never happens until restart. A leftover empty lock file is not a holder.
+_FTS_STALE_RETRY_SECONDS = 60.0
 
 
 def auto_continue_freshness_window() -> float:
@@ -1288,6 +1294,9 @@ class SessionStore:
         self._dirty_transcripts: Dict[str, List[Dict[str, Any]]] = {}
         self._transcript_append_failures: Dict[str, int] = {}
         self._fts_rebuild_attempted = False
+        self._fts_rebuild_retry_after = 0.0
+        self._fts_stale_retry_thread: Optional[threading.Thread] = None
+        self._fts_stale_retry_stop = threading.Event()
         self._has_active_processes_fn = has_active_processes_fn
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
@@ -1348,6 +1357,7 @@ class SessionStore:
         except Exception:
             self._routing_home = None
         self._open_session_db_for_active_scope()
+        self._schedule_stale_fts_retry()
 
     def _open_session_db_for_active_scope(self, db_path: Optional[Path] = None):
         """Return the SessionDB for the profile scope active on this task.
@@ -4143,6 +4153,7 @@ class SessionStore:
                     # clear: replay any cap-dropped messages spooled to disk
                     # for this session (#78182).
                     self._drain_spooled_drops(session_id)
+                    self._schedule_stale_fts_retry()
                     return
                 continue
 
@@ -4237,25 +4248,80 @@ class SessionStore:
             return SessionDB._is_fts_write_corruption_error(exc)
         return False
 
+    def _schedule_stale_fts_retry(self) -> None:
+        """Retry deferred FTS recovery off the live write/search path.
+
+        Live append/search must not start a full rebuild (#97940). A
+        long-lived gateway never reopens SessionDB, so without this loop
+        a deferred startup recovery stays stale until restart (#100108).
+        """
+        db = getattr(self, "_db", None)
+        if db is None or not getattr(db, "_fts_stale", False):
+            return
+        retry = getattr(db, "retry_deferred_fts_recovery", None)
+        if not callable(retry):
+            return
+        thread = getattr(self, "_fts_stale_retry_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        stop = getattr(self, "_fts_stale_retry_stop", None)
+        if stop is None:
+            stop = threading.Event()
+            self._fts_stale_retry_stop = stop
+        if stop.is_set():
+            return
+
+        def _run() -> None:
+            delay = 0.0
+            while not stop.wait(delay):
+                current = getattr(self, "_db", None)
+                if current is None or not getattr(current, "_fts_stale", False):
+                    return
+                recover = getattr(current, "retry_deferred_fts_recovery", None)
+                if not callable(recover):
+                    return
+                try:
+                    if recover():
+                        return
+                except Exception:
+                    logger.warning(
+                        "stale state.db FTS retry failed", exc_info=True
+                    )
+                delay = _FTS_STALE_RETRY_SECONDS
+
+        self._fts_stale_retry_thread = threading.Thread(
+            target=_run,
+            name="hermes-fts-stale-retry",
+            daemon=True,
+        )
+        self._fts_stale_retry_thread.start()
+
     def _rebuild_fts_once(self) -> bool:
-        """Attempt FTS5 ``rebuild`` command once per store lifetime.
+        """Attempt FTS5 ``rebuild`` without burning the one-shot on deferral.
 
         Delegates to ``SessionDB.rebuild_fts()`` which handles locking and
         table-existence checks internally. Returns ``True`` when at least
-        one index was rebuilt.
+        one index was rebuilt. A foreign-holder skip or admission timeout
+        does not consume the attempt — the gateway stays up for days
+        (#100108).
         """
         if self._fts_rebuild_attempted:
             return False
-        self._fts_rebuild_attempted = True
+        now = time.monotonic()
+        if now < getattr(self, "_fts_rebuild_retry_after", 0.0):
+            return False
         db = self._db
         if db is None or not hasattr(db, "rebuild_fts"):
+            self._fts_rebuild_attempted = True
             return False
+        self._schedule_stale_fts_retry()
         # Guard against the same WAL split-brain risk as the automatic
         # rebuild paths: skip when a foreign process holds state.db or
         # its WAL sidecars open.
         if hasattr(db, "_foreign_state_db_holders"):
             foreign_holders = db._foreign_state_db_holders()
             if foreign_holders:
+                self._fts_rebuild_retry_after = now + _FTS_STALE_RETRY_SECONDS
                 logger.warning(
                     "Skipping Session DB FTS rebuild while foreign processes "
                     "hold the database or WAL sidecars (%s); canonical "
@@ -4264,16 +4330,22 @@ class SessionStore:
                 )
                 return False
         try:
+            rebuilt = db.rebuild_fts(timeout_seconds=0.0)
+        except TypeError:
             rebuilt = db.rebuild_fts()
         except Exception as exc:
+            self._fts_rebuild_attempted = True
             logger.warning("Session DB FTS rebuild failed: %s", exc)
             return False
         if rebuilt:
+            self._fts_rebuild_attempted = True
             logger.warning(
                 "Rebuilt %d Session DB FTS index(es) after append corruption",
                 rebuilt,
             )
-        return rebuilt > 0
+            return True
+        self._fts_rebuild_retry_after = now + _FTS_STALE_RETRY_SECONDS
+        return False
 
     def _clear_dirty_transcript(self, session_id: str) -> None:
         """Drop queued pending messages for a session.
