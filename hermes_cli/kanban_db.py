@@ -13727,12 +13727,21 @@ def gc_events(
     """Delete task_events rows older than ``older_than_seconds`` for tasks
     in a terminal state (``done`` or ``archived``). Returns the number of
     rows deleted. Running / ready / blocked tasks keep their full event
-    history."""
+    history. Terminal events are retained while any notification subscriber's
+    cursor still trails the event, so an offline watcher cannot lose an
+    unacknowledged completion/block notification merely because retention time
+    elapsed."""
     cutoff = int(time.time()) - int(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
+            "DELETE FROM task_events AS e "
+            "WHERE e.created_at < ? AND e.task_id IN "
+            "(SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM kanban_notify_subs AS s "
+            "WHERE s.task_id = e.task_id "
+            "AND COALESCE(s.last_event_id, 0) < e.id"
+            ")",
             (cutoff,),
         )
     return int(cur.rowcount or 0)
