@@ -21,25 +21,17 @@ describe('PlatformAvatar brand glyphs', () => {
     ['yuanbao', 'Yuanbao'],
     ['feishu', 'Feishu / Lark'],
     ['slack', 'Slack'],
-    ['whatsapp_cloud', 'WhatsApp Cloud']
+    ['whatsapp_cloud', 'WhatsApp Cloud'],
+    ['irc', 'IRC'],
+    ['a2a', 'A2A'],
+    ['buzz', 'Buzz'],
+    ['relay', 'Relay'],
+    ['msgraph_webhook', 'Microsoft Graph webhook']
   ])('renders a real mark for %s', (platformId, platformName) => {
     const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
 
     expect(container.querySelector('svg, img, [data-dingtalk-wing]')).toBeTruthy()
     expect(screen.queryByText(platformName.charAt(0))).toBeNull()
-  })
-
-  it.each([
-    ['irc', 'IRC', 'IRC'],
-    ['a2a', 'A2A', 'A2A'],
-    ['buzz', 'Buzz', 'B'],
-    ['relay', 'Relay', 'R'],
-    ['msgraph_webhook', 'Microsoft Graph webhook', 'M']
-  ])('renders a stable monogram for %s', (platformId, platformName, monogram) => {
-    const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
-
-    expect(container.querySelector('svg, img')).toBeNull()
-    expect(screen.getByText(monogram)).toBeTruthy()
   })
 
   it('keeps the initial fallback for an unknown platform', () => {
