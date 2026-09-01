@@ -8471,6 +8471,10 @@ _PROVIDER_EGRESS_BLOCK_RE = re.compile(
     r"LLM\s+egress\s+blocked\s*:\s*([A-Za-z0-9_.-]+)",
     re.IGNORECASE,
 )
+_PROVIDER_UNSUPPORTED_THINKING_RE = re.compile(
+    r"(?:does\s+not\s+support\s+thinking|thinking\s+is\s+not\s+supported|unsupported\s+thinking)",
+    re.IGNORECASE,
+)
 
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
@@ -9413,6 +9417,31 @@ def _provider_egress_error_text(task_id: str) -> str | None:
     return "provider egress blocked: LLM egress blocked: base64_payload"
 
 
+def _provider_terminal_error_text(task_id: str) -> tuple[str, str] | None:
+    """Return a deterministic provider failure requiring a handoff."""
+
+    try:
+        log_path = worker_log_path(task_id)
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 16_384))
+            tail = handle.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return None
+    match = _PROVIDER_EGRESS_BLOCK_RE.search(tail)
+    if match is not None and match.group(1).casefold() == "base64_payload":
+        return (
+            "provider egress blocked: LLM egress blocked: base64_payload",
+            "provider_egress_blocked",
+        )
+    if _PROVIDER_UNSUPPORTED_THINKING_RE.search(tail):
+        return (
+            "provider rejected reasoning: selected model does not support thinking",
+            "unsupported_thinking",
+        )
+    return None
+
+
 # Empirically ~96% of "clean exit without a terminal tool call" tasks complete
 # on a later run (a goal-mode finalize nudge, or the model simply emitting the
 # tool call next time), so a protocol violation is NOT deterministic — give it a
@@ -9551,16 +9580,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
-            provider_egress_error = _provider_egress_error_text(row["id"])
-            if provider_egress_error is not None:
+            provider_terminal_error = _provider_terminal_error_text(row["id"])
+            if provider_terminal_error is not None:
+                provider_terminal_error_text, provider_failure_class = provider_terminal_error
                 protocol_violation = False
-                error_text = provider_egress_error
+                error_text = provider_terminal_error_text
                 event_kind = "needs_attention"
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
-                    "failure_class": "provider_egress_blocked",
+                    "failure_class": provider_failure_class,
                     "terminal": True,
                 }
             elif kind == "clean_exit":
@@ -9634,7 +9664,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
-            terminal_blocker = provider_egress_error is not None
+            terminal_blocker = provider_terminal_error is not None
             retry_status = _retry_status_for_run(conn, row["id"])
             event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -9738,8 +9768,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload_extra={
                         "pid": pid,
                         "claimer": claimer,
-                        "failure_class": "provider_egress_blocked",
-                        "next_action": "configure a permitted provider or governed fallback",
+                        "failure_class": provider_failure_class,
+                        "next_action": (
+                            "configure a permitted provider or governed fallback"
+                            if provider_failure_class == "provider_egress_blocked"
+                            else "repair local model capability/configuration before retrying"
+                        ),
                     },
                 )
                 if tripped:

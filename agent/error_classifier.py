@@ -72,6 +72,7 @@ class FailoverReason(enum.Enum):
 
     # Provider-specific
     thinking_signature = "thinking_signature"  # Anthropic thinking block sig invalid
+    unsupported_thinking = "unsupported_thinking"  # Selected model has no thinking capability
     long_context_tier = "long_context_tier"    # Anthropic "extra usage" tier gate
     oauth_long_context_beta_forbidden = "oauth_long_context_beta_forbidden"  # Anthropic OAuth subscription rejects 1M context beta — disable beta and retry
     llama_cpp_grammar_pattern = "llama_cpp_grammar_pattern"  # llama.cpp json-schema-to-grammar rejects regex escapes in `pattern` / `format` — strip from tools and retry
@@ -647,6 +648,15 @@ _THINKING_SIG_PATTERNS = [
     "signature",  # Combined with "thinking" check
 ]
 
+# Local inference servers can reject a request that still carries reasoning
+# controls when the model has no thinking capability. This is deterministic
+# model/configuration drift and must not trigger a remote fallback.
+_UNSUPPORTED_THINKING_PATTERNS = [
+    "does not support thinking",
+    "thinking is not supported",
+    "unsupported thinking",
+]
+
 # Message-string patterns that indicate a provider-side timeout even when
 # the exception type is generic (e.g. RuntimeError from a local shim that
 # wraps a subprocess timeout).  Checked before the type-based transport
@@ -954,6 +964,17 @@ def classify_api_error(
         return _result(reason, **plugin_classification)
 
     # ── 1. Provider-specific patterns (highest priority) ────────────
+
+    # A model that explicitly rejects thinking cannot be repaired by a retry,
+    # and this signal must never activate a remote fallback. The local
+    # capability probe normally prevents the request, so reaching this branch
+    # is actionable deployment/configuration drift.
+    if any(p in error_msg for p in _UNSUPPORTED_THINKING_PATTERNS):
+        return _result(
+            FailoverReason.unsupported_thinking,
+            retryable=False,
+            should_fallback=False,
+        )
 
     # Provider content-policy / safety-filter block. The provider has made a
     # deterministic refusal decision about THIS prompt — retrying unchanged

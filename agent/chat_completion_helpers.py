@@ -2590,6 +2590,7 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
         FailoverReason.invalid_encrypted_content: "encrypted reasoning state rejected",
         FailoverReason.multimodal_tool_content_unsupported: "multimodal tool content unsupported",
         FailoverReason.thinking_signature: "thinking signature rejected",
+        FailoverReason.unsupported_thinking: "model does not support thinking",
         FailoverReason.long_context_tier: "long-context tier unavailable",
         FailoverReason.oauth_long_context_beta_forbidden: "OAuth long-context beta unavailable",
         FailoverReason.llama_cpp_grammar_pattern: "grammar pattern rejected",
@@ -2614,6 +2615,14 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if reason == FailoverReason.unsupported_thinking:
+        # Deterministic local model capability/configuration drift. Never hide
+        # it by routing a protected local request to a remote fallback.
+        logger.warning(
+            "Fallback suppressed: selected model does not support thinking"
+        )
+        return False
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
