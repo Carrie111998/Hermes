@@ -1228,7 +1228,7 @@ def _reload_process_scan_modules() -> None:
 
 def _finish_dashboard_update_cleanup(
     node_failures: list[str], already_restarted_units: "set[str] | None" = None
-) -> None:
+) -> dict[str, list]:
     """Refresh managed dashboards or stop stale manual ones after an update.
 
     *already_restarted_units* forwards the systemd unit names (no
@@ -1240,7 +1240,7 @@ def _finish_dashboard_update_cleanup(
         print()
         print("  ℹ Leaving running dashboard process(es) untouched because the")
         print("    Node.js dependency refresh did not complete.")
-        return
+        return {"matched": [], "killed": [], "failed": [], "unrecovered": []}
 
     # The scan path lazy-imports symbols from _subprocess_compat; make sure
     # both modules reflect the freshly-updated source before touching them.
@@ -1249,16 +1249,16 @@ def _finish_dashboard_update_cleanup(
     stop_result = _m()._kill_stale_dashboard_processes(
         restart_managed=True, already_restarted_units=already_restarted_units
     )
-    if not stop_result.get("unrecovered"):
-        return
+    if stop_result.get("unrecovered"):
+        print()
+        print(
+            "⚠ A web dashboard/serve process was stopped during update and could "
+            "not be auto-restarted."
+        )
+        print("  Re-launch it when you want the web UI back:")
+        print("    hermes dashboard --port <port>")
+    return stop_result
 
-    print()
-    print(
-        "⚠ A web dashboard/serve process was stopped during update and could "
-        "not be auto-restarted."
-    )
-    print("  Re-launch it when you want the web UI back:")
-    print("    hermes dashboard --port <port>")
 
 def _atomic_replace_dir(src: str, dst: str) -> None:
     """Replace directory *dst* with *src* without leaving *dst* half-deleted.
@@ -10632,8 +10632,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Forward the systemd units restarted above (includes hermes-serve*,
         # #83438) so a Serve-only install's freshly restarted process isn't
         # found and restarted again below (review on #83595).
-        _finish_dashboard_update_cleanup(
+        _dashboard_cleanup = _finish_dashboard_update_cleanup(
             node_failures, already_restarted_units=set(restarted_services)
+        ) or {}
+        _dashboard_restarted_pids = set(_dashboard_cleanup.get("killed") or [])
+        _dashboard_restarted_pids.difference_update(
+            _dashboard_cleanup.get("unrecovered") or []
         )
 
         print()
@@ -10662,6 +10666,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 restarted_services,
                 killed_pids,
             )
+            _expected_fleet_profiles = _planned_gateway_profiles(_pre_update_plan)
             # A brief settle window: freshly restarted/resumed gateways need
             # a moment to rewrite gateway_state.json with their new identity.
             # Skipped when the restart phase touched nothing (no gateways
@@ -10693,8 +10698,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # resumed gateway has published (no "down" rows remain)
                     # or the deadline passes, so a slow second gateway can't
                     # be misread as down and re-trigger the retry loop.
-                    if _fleet_snapshot and not any(
-                        row.get("state") == "down" for row in _fleet_snapshot
+                    _seen_fleet_profiles = {
+                        str(row.get("profile"))
+                        for row in _fleet_snapshot
+                        if row.get("profile")
+                    }
+                    if (
+                        _fleet_snapshot
+                        and not any(
+                            row.get("state") == "down" for row in _fleet_snapshot
+                        )
+                        and _expected_fleet_profiles <= _seen_fleet_profiles
                     ):
                         break
                     if _time.monotonic() >= _fleet_deadline:
@@ -10703,7 +10717,21 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _fleet_snapshot = collect_fleet_versions(
                     pre_restart_pids=_pre_restart_gateway_pids
                 )
+            _seen_fleet_profiles = {
+                str(row.get("profile"))
+                for row in _fleet_snapshot
+                if row.get("profile")
+            }
+            _missing_fleet_profiles = (
+                _expected_fleet_profiles - _seen_fleet_profiles
+            )
             if print_fleet_version_matrix(_fleet_snapshot):
+                gateway_fleet_restart_incomplete = True
+            elif _missing_fleet_profiles:
+                print(
+                    "\n⚠ Fleet version check missed planned gateway profile(s): "
+                    + ", ".join(sorted(_missing_fleet_profiles))
+                )
                 gateway_fleet_restart_incomplete = True
             elif not _fleet_snapshot and _fleet_rows_expected:
                 # Fleet probe returned zero rows even though at least one
@@ -10745,6 +10773,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     externally_supervised_profiles=externally_supervised_profiles,
                     killed_pids=killed_pids,
                     failed_units=failed_or_stale_units,
+                    restarted_runtime_pids=_dashboard_restarted_pids,
                 )
                 if report_unaccounted_runtimes(_runtime_outcomes):
                     gateway_fleet_restart_incomplete = True
@@ -10867,7 +10896,7 @@ def _fleet_probe_expected_runtimes(
     * ``pre_restart_pids`` non-empty, or ``None`` (pre-state unreadable —
       cannot prove nothing was running; same contract as
       ``_restart_phase_failure_is_incomplete``, #78574).
-    * the pre-update plan inventoried ≥1 runtime.
+    * the pre-update plan inventoried ≥1 gateway runtime.
 
     ``windows_resume_token`` is deliberately EXCLUDED (#93406 residual). The
     pause/resume token is bookkeeping for ``_pause_windows_gateways_for_update``
@@ -10902,12 +10931,20 @@ def _fleet_probe_expected_runtimes(
         return True
     if pre_restart_pids is None or pre_restart_pids:
         return True
+    return bool(_planned_gateway_profiles(pre_update_plan))
+
+
+def _planned_gateway_profiles(pre_update_plan) -> set[str]:
+    """Profiles whose pre-update gateways must appear in the fleet proof."""
     try:
-        if pre_update_plan is not None and pre_update_plan.runtimes:
-            return True
+        return {
+            str(runtime.profile)
+            for runtime in pre_update_plan.runtimes
+            if getattr(runtime, "kind", None) == "gateway"
+            and getattr(runtime, "profile", None)
+        }
     except Exception:
-        pass
-    return False
+        return set()
 
 
 def _print_items(items, label, key, fallback_key=None):
