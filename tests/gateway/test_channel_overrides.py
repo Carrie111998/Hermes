@@ -105,6 +105,29 @@ class TestGetSystemPromptForChannel:
         prompt = runner._get_system_prompt_for_channel(Platform.DISCORD, "chan_1")
         assert prompt == "You are a coding assistant."
 
+    def test_reloads_global_personality_after_config_change(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            "display:\n  personality: kawaii\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig()
+        runner._ephemeral_system_prompt = runner._load_ephemeral_system_prompt()
+        assert runner._ephemeral_system_prompt
+
+        config_path.write_text(
+            "display:\n  personality: neutral\n",
+            encoding="utf-8",
+        )
+
+        prompt = runner._get_system_prompt_for_channel(Platform.SLACK, "chan_1")
+
+        assert prompt == ""
+        assert runner._ephemeral_system_prompt == ""
+
 
 class TestResolveSessionAgentRuntimePriority:
     """Model/runtime priority: session /model → channel_overrides → global."""
