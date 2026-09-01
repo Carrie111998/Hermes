@@ -274,7 +274,7 @@ def _run_scan_with_primary_result(
     return returncode, order, payload
 
 
-def test_scan_defers_secondary_fanout_for_required_ci_backlog_below_read_cap(
+def test_scan_keeps_merge_maintainer_moving_during_required_ci_backlog(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -290,9 +290,10 @@ def test_scan_defers_secondary_fanout_for_required_ci_backlog_below_read_cap(
     )
 
     assert returncode == 0
-    assert order == ["primary"]
+    assert order == ["primary", "merge"]
     assert payload["required_local_ci_backlog"] == 2
-    assert payload["deferred"] == ["repair", "merge", "release_maintenance"]
+    assert payload["deferred"] == ["repair", "release_maintenance"]
+    assert payload["merge"]["status"] == "ok"
 
 
 def test_scan_does_not_defer_secondary_fanout_for_read_cap_without_ci_backlog(

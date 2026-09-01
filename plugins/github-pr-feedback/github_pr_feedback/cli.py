@@ -622,10 +622,11 @@ def _scan(ctx: Any) -> int:
                 # leased simply falls back to its lease timeout.
                 pass
             result = _controller(policy, ledger).scan()
-            # Required exact-head CI is a strict oldest-first merge train. Do
-            # not fan out repair, merge, and release reads while any admitted
-            # head still lacks its current passing receipt; doing so can spend
-            # the API budget before the selected audit starts.
+            # Required exact-head CI still gates repair and release fan-out, but
+            # it must not hold already-authoritative-ready PRs hostage. The
+            # merge maintainer independently checks each exact-head receipt and
+            # may advance any eligible PR in the catalogue, regardless of
+            # where it falls relative to the local-CI admission window.
             required_ci_backlog = result.required_local_ci_backlog > 0
             if policy.repair_steward is not None and not required_ci_backlog:
                 repair = RepairController(
@@ -636,7 +637,7 @@ def _scan(ctx: Any) -> int:
                     control_home=get_default_hermes_root(),
                 ).scan()
                 repair_payload = _scan_payload(repair)
-            if policy.merge_maintainer is not None and not required_ci_backlog:
+            if policy.merge_maintainer is not None:
                 merge_payload = _run_merge_scan(policy, ledger)
             if policy.release_maintenance is not None and not required_ci_backlog:
                 maintenance_payload = _run_release_maintenance_scan(policy, ledger)
@@ -644,7 +645,7 @@ def _scan(ctx: Any) -> int:
             ledger.close()
     payload = _scan_payload(result)
     if result.required_local_ci_backlog > 0:
-        payload["deferred"] = ["repair", "merge", "release_maintenance"]
+        payload["deferred"] = ["repair", "release_maintenance"]
     if merge_payload is not None:
         payload["merge"] = merge_payload
     if repair_payload is not None:
