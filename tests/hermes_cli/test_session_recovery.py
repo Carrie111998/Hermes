@@ -17,6 +17,7 @@ from hermes_cli import session_recovery
 from hermes_cli.session_recovery import (
     SessionRecoverySafetyError,
     SessionRecoverySourceError,
+    _salvage_rowid_bounds,
     inspect_session_database,
     recover_session_database,
 )
@@ -648,4 +649,114 @@ def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
         conn.close()
 
 
+def _damage_btree_root_header(path: Path, root_page: int) -> None:
+    """Flip the cell-count bytes of a b-tree page header.
 
+    Both ordered rowid-edge probes and any table-b-tree scan of pages below
+    the damaged header raise ``database disk image is malformed``, while a
+    covering index rooted on a different page keeps answering queries.
+    """
+    data = bytearray(path.read_bytes())
+    page_size = int.from_bytes(data[16:18], "big") or 65_536
+    offset = (root_page - 1) * page_size + (100 if root_page == 1 else 0)
+    assert data[offset] in {0x05, 0x0A, 0x0D}
+    data[offset + 3 : offset + 5] = b"\xff\xff"
+    path.write_bytes(bytes(data))
+
+
+def test_rowid_bounds_aggregate_recovers_edges_when_table_btree_probes_fail(
+    tmp_path: Path,
+) -> None:
+    """#98050: the min/max aggregates are an independent path to the bounds.
+
+    The ordered rowid-edge probes walk the table b-tree, but a
+    ``min(rowid), max(rowid)`` aggregate satisfies itself from any covering
+    index. When table-b-tree damage eats both ordered probes, the aggregate
+    must answer with the true bounds in one query instead of leaving the
+    missing edges on the 64-bit domain fallback that range bisection
+    exhausts its whole query budget subdividing.
+    """
+    source = tmp_path / "indexed.db"
+    conn = sqlite3.connect(str(source), isolation_level=None)
+    try:
+        conn.execute(
+            "CREATE TABLE gateway_routing ("
+            "scope TEXT NOT NULL, session_key TEXT NOT NULL, "
+            "entry_json TEXT NOT NULL, "
+            "PRIMARY KEY (scope, session_key))"
+        )
+        conn.executemany(
+            "INSERT INTO gateway_routing (scope, session_key, entry_json) "
+            "VALUES (?, ?, ?)",
+            [
+                (f"scope-{i % 5}", f"key-{i:05d}", "x" * 64)
+                for i in range(1, 41)
+            ],
+        )
+    finally:
+        conn.close()
+
+    conn = sqlite3.connect(str(source))
+    try:
+        root_page = conn.execute(
+            "SELECT rootpage FROM sqlite_master WHERE name = 'gateway_routing'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    _damage_btree_root_header(source, root_page)
+
+    conn = sqlite3.connect(str(source))
+    try:
+        # Premise check: both ordered probes fail on the damaged table
+        # b-tree while the covering-index aggregate still answers.
+        for direction in ("ASC", "DESC"):
+            with pytest.raises(sqlite3.DatabaseError):
+                conn.execute(
+                    'SELECT rowid FROM "gateway_routing" '
+                    f"ORDER BY rowid {direction} LIMIT 1"
+                ).fetchone()
+        assert conn.execute(
+            'SELECT min(rowid), max(rowid) FROM "gateway_routing"'
+        ).fetchone() == (1, 40)
+
+        bounds = _salvage_rowid_bounds(conn, "gateway_routing")
+    finally:
+        conn.close()
+
+    assert bounds["low"] == 1
+    assert bounds["high"] == 40
+    assert bounds["fallback_edges"] == []
+    assert bounds["aggregate_recovered"] == ["low", "high"]
+    assert len(bounds["errors"]) == 2
+
+
+def test_rowid_bounds_unavailable_when_aggregate_also_fails(
+    tmp_path: Path,
+) -> None:
+    """Without a covering index the aggregate scans the same damaged table
+    b-tree and fails too; both edges stay unknown and the table is reported
+    as unavailable instead of inventing bounds."""
+    source = tmp_path / "unindexed.db"
+    conn = sqlite3.connect(str(source), isolation_level=None)
+    try:
+        conn.execute("CREATE TABLE t (v TEXT)")
+        conn.executemany("INSERT INTO t (v) VALUES (?)", [("x",)] * 10)
+    finally:
+        conn.close()
+
+    _damage_btree_root_header(source, 2)
+
+    conn = sqlite3.connect(str(source))
+    try:
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute('SELECT rowid FROM "t" ORDER BY rowid ASC LIMIT 1').fetchone()
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute('SELECT min(rowid), max(rowid) FROM "t"').fetchone()
+
+        bounds = _salvage_rowid_bounds(conn, "t")
+    finally:
+        conn.close()
+
+    assert bounds.get("unavailable") is True
+    assert "low" not in bounds
+    assert "high" not in bounds

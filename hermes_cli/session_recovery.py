@@ -493,6 +493,29 @@ def _salvage_rowid_bounds(
     if rows["low"] is None and rows["high"] is None and not result["errors"]:
         result["empty"] = True
         return result
+
+    # Issue #98050: an ordered edge probe walks the table b-tree, but the
+    # min/max aggregates can satisfy themselves from any covering index —
+    # an independent physical path through the file. When damage eats the
+    # table b-tree edge the aggregate answers with the true bounds in one
+    # query, instead of leaving the missing side on the 64-bit domain
+    # fallback that range bisection spends its whole budget subdividing.
+    if rows["low"] is None or rows["high"] is None:
+        try:
+            agg = source.execute(
+                f'SELECT min(rowid), max(rowid) FROM "{table}"'
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            result["errors"].append(f"min/max rowid aggregate: {exc}")
+            agg = None
+        if agg is not None:
+            if rows["low"] is None and agg[0] is not None:
+                rows["low"] = int(agg[0])
+                result.setdefault("aggregate_recovered", []).append("low")
+            if rows["high"] is None and agg[1] is not None:
+                rows["high"] = int(agg[1])
+                result.setdefault("aggregate_recovered", []).append("high")
+
     if rows["low"] is None and rows["high"] is None:
         result["unavailable"] = True
         return result
