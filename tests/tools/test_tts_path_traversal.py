@@ -48,7 +48,7 @@ def test_output_path_rejects_hermes_oauth_store(tmp_path, monkeypatch):
     ))
 
     assert result["success"] is False
-    assert "protected" in result["error"]
+    assert "protected system/credential" in result["error"]
     assert not target.exists()
 
 
@@ -69,7 +69,7 @@ def test_output_path_rejects_mcp_token_directory(tmp_path, monkeypatch):
     ))
 
     assert result["success"] is False
-    assert "protected" in result["error"]
+    assert "protected system/credential" in result["error"]
     assert not target.exists()
 
 
