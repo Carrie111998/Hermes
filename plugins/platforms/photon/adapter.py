@@ -105,6 +105,73 @@ _DEFAULT_SIDECAR_BIND = "127.0.0.1"
 _MAX_MESSAGE_LENGTH = 8000
 
 # ---------------------------------------------------------------------------
+# Sidecar dedup persistence
+
+# Photon dedup persistence file — stores seen/sent message IDs so a gateway
+# restart doesn't lose the dedup state and double-dispatch inbound messages
+# (#100032). Stored in the profile data dir so it survives restarts.
+_DEDUP_STATE_NAME = "photon-dedup.json"
+_DEDUP_STATE_MAX_IDS = 5000  # bound the on-disk state
+
+
+def _dedup_state_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "runtime" / _DEDUP_STATE_NAME
+
+
+def _load_dedup_state() -> tuple[Dict[str, float], Dict[str, float]]:
+    """Load persisted dedup state from disk. Returns (seen, sent) dicts."""
+    path = _dedup_state_path()
+    if not path.exists():
+        return {}, {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        seen = raw.get("seen", {}) if isinstance(raw, dict) else {}
+        sent = raw.get("sent", {}) if isinstance(raw, dict) else {}
+        # Validate: must be dict[str, float]
+        if not isinstance(seen, dict) or not isinstance(sent, dict):
+            return {}, {}
+        return (
+            # Reverse to oldest-first so runtime eviction (which deletes from
+            # the front of the dict) correctly keeps the most recent IDs.
+            {k: float(v) for k, v in sorted(seen.items(), key=lambda x: x[1]) if isinstance(v, (int, float))},
+            {k: float(v) for k, v in sorted(sent.items(), key=lambda x: x[1]) if isinstance(v, (int, float))},
+        )
+    except (OSError, ValueError, TypeError):
+        return {}, {}
+
+
+def _save_dedup_state(seen: Dict[str, float], sent: Dict[str, float]) -> None:
+    """Persist dedup state to disk atomically."""
+    import tempfile
+
+    path = _dedup_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Bound the state: keep only the most recent entries
+        seen_items = sorted(seen.items(), key=lambda x: x[1], reverse=True)[:_DEDUP_STATE_MAX_IDS]
+        sent_items = sorted(sent.items(), key=lambda x: x[1], reverse=True)[:_DEDUP_STATE_MAX_IDS]
+        fd, tmp = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".photon-dedup.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"seen": dict(seen_items), "sent": dict(sent_items)},
+                    fh,
+                )
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        pass  # best-effort persistence
+
+# ---------------------------------------------------------------------------
 # Sidecar runtime record
 #
 # Out-of-process senders (cron subprocesses, `hermes send`, the dashboard)
@@ -820,11 +887,12 @@ class PhotonAdapter(BasePlatformAdapter):
         self._respawn_lock: Optional[asyncio.Lock] = None
         # Lightweight in-memory dedup. The gRPC stream is at-least-once, so we
         # may see the same messageId more than once (e.g. after a reconnect).
+        # Persisted to disk so a gateway restart doesn't lose the dedup state
+        # and double-dispatch inbound messages (#100032).
         self._seen_messages: Dict[str, float] = {}
-        # Ids of messages WE sent (bounded, insertion-order eviction). Inbound
-        # reaction events are only routed to the agent when they target one of
-        # these — a tapback on a human↔human message is not addressed to us.
         self._sent_message_ids: Dict[str, float] = {}
+        # Load persisted dedup state on init
+        self._seen_messages, self._sent_message_ids = _load_dedup_state()
         # Latest inbound message id per chat (bounded). Lets the agent-facing
         # react action default to "the message that triggered me" without
         # requiring the model to thread message ids through tool calls.
@@ -1012,6 +1080,8 @@ class PhotonAdapter(BasePlatformAdapter):
                 pass
             self._http_client = None
         self._mark_disconnected()
+        # Persist dedup state on disconnect (#100032)
+        _save_dedup_state(self._seen_messages, self._sent_message_ids)
 
     def _dispatch_fatal_notification(self) -> None:
         """Notify the gateway of a fatal error from a detached task.
@@ -1190,6 +1260,8 @@ class PhotonAdapter(BasePlatformAdapter):
         if len(seen) > _DEDUP_MAX_SIZE:
             for old in list(seen.keys())[: len(seen) - _DEDUP_MAX_SIZE]:
                 del seen[old]
+        # Persist dedup state (#100032)
+        _save_dedup_state(self._seen_messages, self._sent_message_ids)
         return False
 
     async def _fffc_timeout_handler(self, chat_key: str, message_id: str) -> None:
@@ -2176,7 +2248,14 @@ class PhotonAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             return SendResult(success=False, error=f"{type(e).__name__}: {e}")
-        return SendResult(success=True, message_id=data.get("messageId"))
+        msg_id = data.get("messageId")
+        self._record_sent_message(msg_id)
+        logger.info(
+            "[photon] outbound sent (effect=%s): message_id=%s",
+            effect,
+            msg_id or "none",
+        )
+        return SendResult(success=True, message_id=msg_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         now = time.time()
@@ -2218,6 +2297,8 @@ class PhotonAdapter(BasePlatformAdapter):
         if len(sent) > self._SENT_IDS_MAX:
             for old in list(sent.keys())[: len(sent) - self._SENT_IDS_MAX]:
                 del sent[old]
+        # Persist dedup state (#100032)
+        _save_dedup_state(self._seen_messages, self._sent_message_ids)
 
     # A DM space is addressable two ways — the chat GUID (`any;-;+1555...`)
     # that inbound events carry, and the bare E.164 phone that home-channel
@@ -2515,7 +2596,11 @@ class PhotonAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        msg_id = data.get("messageId")
+        logger.info(
+            "[photon] outbound sent: message_id=%s", msg_id or "none"
+        )
+        return SendResult(success=True, message_id=msg_id)
 
     async def _sidecar_send(
         self,
@@ -2561,7 +2646,11 @@ class PhotonAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        msg_id = data.get("messageId")
+        logger.info(
+            "[photon] outbound sent: message_id=%s", msg_id or "none"
+        )
+        return SendResult(success=True, message_id=msg_id)
 
     async def _sidecar_send_poll(
         self, space_id: str, title: str, options: list,
@@ -2587,7 +2676,11 @@ class PhotonAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        msg_id = data.get("messageId")
+        logger.info(
+            "[photon] outbound sent: message_id=%s", msg_id or "none"
+        )
+        return SendResult(success=True, message_id=msg_id)
 
     async def _sidecar_send_attachment(
         self,
@@ -2646,7 +2739,11 @@ class PhotonAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        msg_id = data.get("messageId")
+        logger.info(
+            "[photon] outbound sent: message_id=%s", msg_id or "none"
+        )
+        return SendResult(success=True, message_id=msg_id)
 
     async def _sidecar_call(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
         # Guard: adapter not yet connected (no sidecar address known).
