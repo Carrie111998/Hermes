@@ -44,6 +44,13 @@ describe('PlatformAvatar brand glyphs', () => {
     expect(icon?.querySelectorAll('[fill="#FFFAEF"]')).toHaveLength(2)
   })
 
+  it('preserves Slack as a muted four-color mark', () => {
+    const { container } = render(<PlatformAvatar platformId="slack" platformName="Slack" />)
+    const fills = Array.from(container.querySelectorAll('svg path')).map(path => path.getAttribute('fill'))
+
+    expect(fills).toEqual(['#B56A7A', '#B56A7A', '#6E9FB5', '#6E9FB5', '#6E9A82', '#6E9A82', '#B59A5C', '#B59A5C'])
+  })
+
   it('keeps the initial fallback for an unknown platform', () => {
     const { container } = render(<PlatformAvatar platformId="custom_chat" platformName="Custom Chat" />)
 
@@ -63,8 +70,10 @@ describe('PlatformAvatar brand glyphs', () => {
   it('uses a pale field and black Matrix mark', () => {
     const { container } = render(<PlatformAvatar platformId="matrix" platformName="Matrix" />)
     const chip = container.querySelector('span')
+    const icon = chip?.querySelector('svg')
 
     expect(chip?.getAttribute('style')).toContain('background-color: rgb(247, 247, 245)')
-    expect(chip?.querySelector('[data-platform-glyph="mask"]')).toBeTruthy()
+    expect(icon).toBeTruthy()
+    expect(icon?.getAttribute('fill')).toBe('currentColor')
   })
 })
