@@ -3748,12 +3748,14 @@ class GatewaySlashCommandsMixin:
 
         return t("gateway.btw.started", preview=preview)
 
-    def _save_gateway_config_key(self, key_path: str, value) -> bool:
+    def _save_gateway_config_key(
+        self, key_path: str, value, *, config_home: Optional[Path] = None
+    ) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast
         and their interactive pickers)."""
         from gateway.run import _hermes_home
         from hermes_cli.config import read_user_config_raw
-        config_path = _hermes_home / "config.yaml"
+        config_path = (config_home or _hermes_home) / "config.yaml"
         try:
             # Write-back round-trip: raw read is correct (merged defaults must
             # not be persisted back to the user's file).
@@ -4102,6 +4104,11 @@ class GatewaySlashCommandsMixin:
         # Reuse the /reasoning arg parser: strips --global (any position),
         # normalizes unicode dashes.
         args, persist_global = self._parse_reasoning_command_args(raw_args)
+        _command_profile_home = None
+        if persist_global and getattr(
+            getattr(self, "config", None), "multiplex_profiles", False
+        ):
+            _command_profile_home = self._resolve_profile_home_for_source(event.source)
         session_key = self._session_key_for_source(event.source)
         self._service_tier = self._resolve_session_service_tier(
             session_key=session_key
@@ -4126,7 +4133,11 @@ class GatewaySlashCommandsMixin:
                 return t("gateway.fast.unknown_arg", arg=value)
             self._service_tier = tier
             if persist:
-                if self._save_gateway_config_key("agent.service_tier", saved_value):
+                if self._save_gateway_config_key(
+                    "agent.service_tier",
+                    saved_value,
+                    config_home=_command_profile_home,
+                ):
                     # Global write supersedes any session override.
                     self._set_session_service_tier_override(
                         session_key, None, clear=True
@@ -4145,9 +4156,15 @@ class GatewaySlashCommandsMixin:
         if not args or args == "status":
             is_fast = self._service_tier == "priority"
             status = t("gateway.fast.status_fast") if is_fast else t("gateway.fast.status_normal")
+            _picker_profile_home = _command_profile_home
 
             async def _on_fast_choice(_chat_id: str, value: str) -> str:
-                return _apply_fast_selection(value, persist=persist_global)
+                if _picker_profile_home is None:
+                    return _apply_fast_selection(value, persist=persist_global)
+                from gateway.run import _profile_runtime_scope
+
+                with _profile_runtime_scope(_picker_profile_home):
+                    return _apply_fast_selection(value, persist=persist_global)
 
             picker_sent = await self._try_send_choice_picker(
                 event,
