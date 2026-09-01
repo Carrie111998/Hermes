@@ -371,6 +371,7 @@ import {
   resolveBehindCount,
   resolveCommitLogSelection,
   resolveSshBehindCount,
+  resolveSshUpdateAvailable,
   shouldCountCommits
 } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
@@ -2983,7 +2984,7 @@ async function checkUpdates() {
       branch,
       currentBranch,
       behind: upToDate ? 0 : sshBehind,
-      updateAvailable: !upToDate,
+      updateAvailable: resolveSshUpdateAvailable(sshBehind),
       currentSha,
       targetSha,
       commits: [],

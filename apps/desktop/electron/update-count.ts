@@ -70,6 +70,13 @@ function resolveSshBehindCount({
   return compareBehind
 }
 
+// The passive SSH path may know neither direction nor count. `null` keeps that
+// uncertainty explicit; it must not turn into an update prompt until Git or the
+// compare API proves that the remote has commits this checkout lacks.
+function resolveSshUpdateAvailable(behind: number | null): boolean {
+  return typeof behind === 'number' && behind > 0
+}
+
 // Resolve how many commits the local checkout is behind origin for the desktop
 // update indicator. Shallow checkouts use SHA equality plus any positively
 // proven local-ahead ancestry; exact counts remain exclusive to full clones.
@@ -150,4 +157,13 @@ function parseCompareBehindCount(payload) {
   return ahead
 }
 
-export { compareApiUrl, parseCompareBehindCount, resolveAncestry, resolveBehindCount, resolveCommitLogSelection, resolveSshBehindCount, shouldCountCommits }
+export {
+  compareApiUrl,
+  parseCompareBehindCount,
+  resolveAncestry,
+  resolveBehindCount,
+  resolveCommitLogSelection,
+  resolveSshBehindCount,
+  resolveSshUpdateAvailable,
+  shouldCountCommits
+}

@@ -13,6 +13,7 @@ import {
   resolveBehindCount,
   resolveCommitLogSelection,
   resolveSshBehindCount,
+  resolveSshUpdateAvailable,
   shouldCountCommits
 } from './update-count'
 
@@ -357,6 +358,11 @@ test('ssh check keeps the unknown-count signal when the API cannot answer', () =
   )
 })
 
+test('ssh check requires evidence before advertising an update', () => {
+  assert.equal(resolveSshUpdateAvailable(null), false)
+  assert.equal(resolveSshUpdateAvailable(0), false)
+  assert.equal(resolveSshUpdateAvailable(3), true)
+})
 
 // FAIL-BEFORE: the ancestry probe was `(await runGit(...)).code === 0` with no
 // catch. `runGit` rejects on spawn failure (`child.once('error', reject)`), so
