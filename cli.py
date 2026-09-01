@@ -6514,6 +6514,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "model_short": model_short,
             "duration": format_duration_compact(elapsed_seconds),
             "session_title": self._get_status_bar_session_title(),
+            "session_id": str(getattr(self, "session_id", "") or ""),
+            "session_label": self._format_status_bar_session_id(
+                str(getattr(self, "session_id", "") or "")
+            ),
             "prompt_elapsed": self._format_prompt_elapsed(
                 getattr(self, "_prompt_start_time", None),
                 getattr(self, "_prompt_duration", 0.0),
@@ -6768,6 +6772,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._status_bar_title_cache = title
         self._status_bar_title_checked_at = now
         return title
+
+    @staticmethod
+    def _format_status_bar_session_id(session_id: str) -> str:
+        """Return a compact session id label for the one-line status bar."""
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return ""
+        suffix = session_id.rsplit("_", 1)[-1] or session_id
+        if len(suffix) > 6:
+            suffix = suffix[-6:]
+        return f"sid {suffix}"
 
     @staticmethod
     def _status_bar_display_width(text: str) -> int:
@@ -7447,7 +7462,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         Available fields: model, context_detail, context_pct, cache_hit,
         latency, tps, compressions, bg_tasks, bg_processes, bg_subagents,
-        goal, duration, prompt_elapsed, idle_since, focus, yolo, stash,
+        goal, duration, session, prompt_elapsed, idle_since, focus, yolo, stash,
         battery, title, total_tokens.
         ``total_tokens`` is opt-in only (never shown by default).
         The field order is fixed; the config controls visibility only.
@@ -7479,6 +7494,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_prefix = f"{battery_label} │ " if battery_label else ""
             focus_label = snapshot.get("focus_label") or ""
             session_title = snapshot.get("session_title") or ""
+            session_label = snapshot.get("session_label") or ""
 
             yolo_active = self._is_session_yolo_active()
             goal_segment = self._status_bar_goal_segment(snapshot)
@@ -7486,6 +7502,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             def _ok(name: str) -> bool:
                 return field_set is None or name in field_set
+
+            def _ok_session() -> bool:
+                return field_set is None or "session" in field_set or "session_id" in field_set
 
             if not _ok("title"):
                 session_title = ""
@@ -7506,6 +7525,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     segs.append(focus_label)
                 if yolo_active and _ok("yolo"):
                     segs.append("⚠ YOLO")
+                if session_label and _ok_session():
+                    segs.append(session_label)
                 text = battery_prefix + " · ".join(segs) if segs else f"{battery_prefix}⚕ {snapshot['model_short']}"
                 return self._right_align_status_title(text, session_title, width)
             if width < 76:
@@ -7539,6 +7560,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     parts.append(focus_label)
                 if yolo_active and _ok("yolo"):
                     parts.append("⚠ YOLO")
+                if session_label and _ok_session():
+                    parts.append(session_label)
                 if not parts:
                     parts = [f"⚕ {snapshot['model_short']}"]
                 return self._right_align_status_title(" · ".join(parts), session_title, width)
@@ -7583,6 +7606,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 parts.append(goal_segment)
             if _ok("duration"):
                 parts.append(duration_label)
+            if session_label and _ok_session():
+                parts.append(session_label)
             prompt_elapsed = snapshot.get("prompt_elapsed")
             if prompt_elapsed and _ok("prompt_elapsed"):
                 parts.append(prompt_elapsed)
@@ -7622,10 +7647,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             battery_style = self._battery_status_style(snapshot.get("battery_category", "dim"))
             focus_label = snapshot.get("focus_label") or ""
             session_title = snapshot.get("session_title") or ""
+            session_label = snapshot.get("session_label") or ""
             field_set = self._get_status_bar_field_set()
 
             def _ok(name: str) -> bool:
                 return field_set is None or name in field_set
+
+            def _ok_session() -> bool:
+                return field_set is None or "session" in field_set or "session_id" in field_set
 
             if not _ok("title"):
                 session_title = ""
@@ -7653,6 +7682,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _append(frags, " · ", ("class:status-bar-strong", focus_label))
                 if yolo_active and _ok("yolo"):
                     _append(frags, " · ", ("class:status-bar-yolo", "⚠ YOLO"))
+                if session_label and _ok_session():
+                    _append(frags, " · ", ("class:status-bar-dim", session_label))
                 if not frags:
                     frags = [
                         ("class:status-bar", " ⚕ "),
@@ -7692,6 +7723,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         _append(frags, " · ", ("class:status-bar-strong", focus_label))
                     if yolo_active and _ok("yolo"):
                         _append(frags, " · ", ("class:status-bar-yolo", "⚠ YOLO"))
+                    if session_label and _ok_session():
+                        _append(frags, " · ", ("class:status-bar-dim", session_label))
                     if not frags:
                         frags = [
                             ("class:status-bar", " ⚕ "),
@@ -7745,6 +7778,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         _append(frags, " │ ", ("class:status-bar-strong", goal_segment))
                     if _ok("duration"):
                         _append(frags, " │ ", ("class:status-bar-dim", duration_label))
+                    if session_label and _ok_session():
+                        _append(frags, " │ ", ("class:status-bar-dim", session_label))
                     # Position 7: per-prompt elapsed timer (live or frozen)
                     prompt_elapsed = snapshot.get("prompt_elapsed")
                     if prompt_elapsed and _ok("prompt_elapsed"):
