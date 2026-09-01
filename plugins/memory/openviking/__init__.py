@@ -3903,7 +3903,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
         ).lstrip()
         return f"{head}{marker}{tail}" if tail else _head_only()
 
-    def _user_space(self, client=None, *, timeout: Optional[float] = None) -> str:
+    def _user_space(
+        self,
+        client=None,
+        *,
+        timeout: Optional[float] = None,
+        require_confirmed: bool = False,
+    ) -> str:
         """Resolve the user space, caching only a confirmed connection identity."""
         active = client if client is not None else getattr(self, "_client", None)
         # Key the cache on the connection snapshot, not the client object.
@@ -3924,6 +3930,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 if snapshot is not None and snapshot is current_snapshot:
                     self._user_space_cache = (snapshot, resolved)
                 return resolved
+
+        if require_confirmed:
+            raise RuntimeError(
+                "OpenViking server did not confirm the current user identity; "
+                "leaving OpenViking unchanged"
+            )
 
         configured = str(
             getattr(active, "_user", "")
@@ -4865,7 +4877,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
             old_session_id, new_id, parent_session_id, reset,
         )
 
-    def _build_memory_uri(self, subdir: str, *, client=None, timeout: Optional[float] = None) -> str:
+    def _build_memory_uri(
+        self,
+        subdir: str,
+        *,
+        client=None,
+        timeout: Optional[float] = None,
+        require_confirmed_user: bool = False,
+    ) -> str:
         """Build a user memory URI, optionally under the configured peer."""
         slug = uuid.uuid4().hex[:12]
         # Explicit-uid URIs are canonical under every auth mode; the uid-less
@@ -4878,8 +4897,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
             getattr(active_client, "_agent", getattr(self, "_agent", "")) or ""
         ).strip()
         peer_prefix = f"peers/{agent}/" if agent else ""
+        identity_timeout = timeout
+        if require_confirmed_user and identity_timeout is None:
+            identity_timeout = _DEFAULT_RECALL_REQUEST_TIMEOUT_SECONDS
         return _user_scoped_uri(
-            self._user_space(active_client, timeout=timeout),
+            self._user_space(
+                active_client,
+                timeout=identity_timeout,
+                require_confirmed=require_confirmed_user,
+            ),
             f"{peer_prefix}memories/{subdir}/mem_{slug}.md",
         )
 
