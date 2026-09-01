@@ -847,7 +847,7 @@ def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
     _reasoning_floor = get_reasoning_stale_timeout_floor(_model_id)
     if _reasoning_floor is None and api_kwargs.get("modelId"):
         _reasoning_floor = _bedrock_reasoning_stale_floor(api_kwargs["modelId"])
-    if _reasoning_floor is not None:
+    if _reasoning_floor is not None and _cfg_stale is None:
         _timeout = max(_timeout, _reasoning_floor)
     return _timeout
 
@@ -5311,11 +5311,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # xAI Grok reasoning, etc.) routinely exceed the default 180s chat-
         # model threshold during their thinking phase.  The cloud gateway
         # upstream kills the socket first, surfacing as BrokenPipeError.
-        # Raises the floor only — never overrides explicit user config
-        # (handled by get_provider_stale_timeout above).
+        # Apply the floor only when the user has NOT set an explicit
+        # per-model stale_timeout_seconds (#99707) — explicit config
+        # must take precedence over the heuristic floor.
         from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
         _reasoning_floor = get_reasoning_stale_timeout_floor(api_kwargs.get("model"))
-        if _reasoning_floor is not None:
+        if _reasoning_floor is not None and _cfg_stale is None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
     t = threading.Thread(target=_context_thread_target(_call), daemon=True)
