@@ -4052,3 +4052,49 @@ def test_no_command_is_offered_for_a_code_the_repair_cli_refuses() -> None:
             "command": None,
         }
     ]
+
+
+def test_hydration_broker_job_decodes_pre_rotation_marker_via_retired_keys() -> None:
+    from session_bridge.mcp_server import _build_sidebar_hydration_broker_job
+
+    retired_key = b"mcp-hydration-retired-key"
+    thread_id = "hydration-rotation-thread"
+    source_id = "claude:hydration-rotation-source"
+    from session_bridge.sidebar import sidebar_bridge_id
+
+    bridge_id = sidebar_bridge_id(source_id)
+    payload = HydrationMarkerPayload(
+        bridge_id=bridge_id,
+        codex_thread_id=thread_id,
+        preview_digest="a" * 64,
+        preview_version=1,
+        source_cursor="cursor-1",
+        source_hash="hash-1",
+        source_session_id=source_id,
+    )
+    old_marker = encode_hydration_marker(payload, retired_key)
+    assert old_marker != encode_hydration_marker(payload, MARKER_KEY)
+    claim = SidebarHydrationClaim(
+        lease_token="rotation-lease",
+        source_session_id=source_id,
+        bridge_id=bridge_id,
+        codex_thread_id=thread_id,
+        source_cursor="cursor-1",
+        source_hash="hash-1",
+        preview_version=1,
+        preview_digest="a" * 64,
+        hydration_marker=old_marker,
+        hydration_message=f"# Hydration\n{old_marker}\n",
+        cwd="C:/workspace",
+        git_root="C:/workspace",
+        send_reserved=False,
+    )
+
+    with pytest.raises(ValueError, match="malformed or unauthenticated"):
+        _build_sidebar_hydration_broker_job(claim, MARKER_KEY)
+
+    job = _build_sidebar_hydration_broker_job(
+        claim, MARKER_KEY, retired_marker_keys=(retired_key,)
+    )
+    assert job["hydration_marker"] == old_marker
+    assert job["codex_thread_id"] == thread_id

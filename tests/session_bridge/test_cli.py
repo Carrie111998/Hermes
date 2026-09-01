@@ -6598,6 +6598,7 @@ def test_characterization_record_sync_is_authenticated_bounded_and_phase_aware(
             _identity,
             _marker_secret,
             *,
+            retired_marker_secrets=(),
             operation_id,
             evidence_digest,
         ):
@@ -10019,3 +10020,71 @@ def test_status_withholds_a_command_it_cannot_build_safely(monkeypatch) -> None:
             "command": None,
         }
     ]
+
+
+def test_characterization_record_sync_accepts_pre_rotation_records_via_retired_keys(
+    tmp_path: Path,
+) -> None:
+    current_secret = b"c" * 32
+    retired_secret = b"r" * 32
+    root = tmp_path / "claude-visibility-sources"
+    root.mkdir()
+    completed = root / ".cleanup-completed"
+    completed.mkdir()
+    completed_id = "33333333-3333-4333-8333-333333333333"
+    state = _characterization_state(
+        completed_id, phase="completed", source_root=root
+    )
+    # Pre-rotation records were both signed AND identity-bound under the
+    # then-current (now retired) key.
+    old_identity = derive_claude_visibility_identity(
+        ClaudeVisibilityCandidate(
+            source_session_id=str(state["source_session_id"]),
+            source_provider=Provider.CODEX,
+            native_name=str(state["native_name"]),
+            source_cwd=str(state["source_cwd"]),
+            git_root=None,
+            git_branch=None,
+            git_head=None,
+            worktree_id=None,
+            eligible_at=float(state.get("created_at", 0.0)),
+        ),
+        retired_secret,
+    )
+    state["job_id"] = old_identity.job_id
+    state["bridge_id"] = old_identity.bridge_id
+    state["reserved_claude_uuid"] = old_identity.claude_uuid
+    state["signed_marker"] = old_identity.signed_marker
+    _write_characterization_record(
+        completed / f"{completed_id}.json", state, retired_secret
+    )
+
+    class Store:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def record_claude_visibility_characterization(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"status": "recorded"}
+
+    store = Store()
+    with pytest.raises(ConfigurationFailure):
+        _sync_claude_characterization_records(
+            store=store,
+            source_root=root,
+            marker_secret=current_secret,
+            include_active=False,
+            include_completed=True,
+        )
+
+    result = _sync_claude_characterization_records(
+        store=store,
+        source_root=root,
+        marker_secret=current_secret,
+        retired_marker_secrets=(retired_secret,),
+        include_active=False,
+        include_completed=True,
+    )
+    assert result == {"registered": 1, "cleanup_completed": 1}
+    assert store.calls[-1]["signed_marker"] == old_identity.signed_marker
+    assert store.calls[-1]["retired_marker_secrets"] == (retired_secret,)

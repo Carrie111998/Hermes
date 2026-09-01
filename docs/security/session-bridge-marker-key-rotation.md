@@ -1,7 +1,9 @@
 # Session-Bridge Marker-Key Rotation
 
 **Status:** implemented 2026-08-31 (keyring for the sidebar reservation ledger
-and terminal-resolution lanes). **Audience:** whoever rotates
+and terminal-resolution lanes; extended the same day to origin detection,
+hydration markers, Claude visibility bindings, lineage cursors, and durable
+characterization records). **Audience:** whoever rotates
 `~/.hermes/session-bridge/marker-key`.
 
 ## Why this exists
@@ -72,6 +74,11 @@ proof digests always come from `marker-key`. Retired keys are used only to
 | `SidebarThreadVerifier` / `_verified_sidebar_projection` (reconcile, terminal probes) | authenticates thread markers against current then retired keys; unauthenticated claims of the probed identity still block |
 | Executor bind lane (`decode_sidebar_registration_identity` on the initial prompt) | tries current then retired keys |
 | Store acknowledge resolutions (precreate / unbound / v2 attempt-zero) and the cutover replay validator | recovery-key equality is any-epoch; the v2 lane matches marker digest **and** recovery key pairwise per epoch, never mix-and-match |
+| Origin detection (`_detect_origin` and `projection_has_marker_payload` in the Codex **and** Claude source adapters) | decodes embedded thread/transcript markers against current then retired keys, so a pre-rotation bridge-created thread never reclassifies as NATIVE origin (which would have made it sidebar-eligible) |
+| Hydration lanes (`SidebarHydrationExecutor`, the `session_sidebar_hydration_pending` broker verb, the seed backfill classifier) | decodes stored `HERMES_SESSION_HYDRATION_V1` markers and classifies legacy placeholder prompts through the keyring; fresh hydration markers are always minted with the current key |
+| Claude visibility identity bindings (`validate_claude_visibility_identity_binding`, the registrar claim/launch/reconcile lanes, `_insert_claude_visibility_job`) | a stored `signed_marker` authenticates under any keyring epoch; freshly derived identities still sign with the current key |
+| Claude lineage reconciliation cursors | a cursor minted just before a rotation stays honored through retired epochs; new cursors sign with the current key |
+| Durable characterization records (`_read_characterization_record` for the boot/lineage sync and completed evidence, Codex origin guards via `load_codex_characterization_origins`, `record_claude_visibility_characterization`) | signature verification is any-epoch (the stored signed marker binds pairwise per epoch, never mix-and-match); every write re-signs with the current key |
 
 The recovery-key *string* stored in the reservation is what probes native
 inventory (`thread_source` equality), so once validation accepts the old
@@ -140,17 +147,27 @@ flight. Delete `marker-key-retired/<stamp>-marker-key` when **all** of:
 Pre-rotation *bound* threads need no key at all for delivery; only marker
 re-probing of them does, which ends once their jobs are terminal.
 
-## Known residual surfaces (not keyring-aware yet)
+## Deliberately epoch-pinned surfaces (do NOT extend the keyring here)
 
-These still authenticate with the current key only and hard-fail across any
-rotation; they are outside the reservation ledger and carry their own
-semantics:
+The 2026-08-31 extension closed the previously listed residual surfaces
+(origin detection, hydration markers, visibility bindings, lineage cursors,
+durable characterization records — see the table above). What remains
+current-key-only is *pinned on purpose*:
 
-- `codex_adapter._detect_origin` / `projection_has_marker_payload`: a
-  pre-rotation bridge-created thread silently reclassifies as NATIVE origin.
-- Hydration markers (`HERMES_SESSION_HYDRATION_V1`) recorded in threads.
-- Claude visibility identity bindings and lineage cursor signatures
-  (store.py), and characterization records/origins.
-
-If a rotation makes any of those matter operationally, extend the same
-keyring pattern there — validation any-epoch, signing current-only.
+- **In-flight characterization operations.** A live Claude-visibility
+  characterization (the active operation record's resume/abort/cleanup
+  machinery in `characterize.py`, including cleanup capability tokens and the
+  abort claim/retire lanes) characterizes the *current* configuration; a
+  rotation mid-operation invalidates the probe by design. Do not rotate while
+  `.claude-visibility-operation.json` or `.abort-claims/` entries exist —
+  finish or abort the operation first. A pre-rotation record wedged there is
+  cleaned up manually (quarantine the file), not by retiring keys into its
+  validators. The *evidence* sync of such records (boot/lineage sync,
+  `.cleanup-completed/`) does accept retired keys, so provenance survives.
+- **The Codex characterization probe key.** `_characterize_codex` mints an
+  ephemeral per-run key (`secrets.token_bytes(32)`); it never touches the
+  production keyring. The durable provenance for those threads is the
+  origin guard, which is production-signed and keyring-aware.
+- **Every signing path.** Fresh markers, recovery keys, hydration markers,
+  registration prompts, cursors, and record writes always use the live
+  `marker-key`; retired keys validate only.

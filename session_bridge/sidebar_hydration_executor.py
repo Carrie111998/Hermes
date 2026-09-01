@@ -60,6 +60,7 @@ class SidebarHydrationExecutor:
         store: SessionBridgeStore,
         native: NativeSidebarHydrationDelivery,
         marker_secret: bytes,
+        retired_marker_secrets: tuple[bytes, ...] = (),
         clock=time.time,
         monotonic=time.monotonic,
         operation_budget_seconds: float = 240.0,
@@ -68,6 +69,11 @@ class SidebarHydrationExecutor:
             raise TypeError("hydration claim callback must be callable")
         if type(marker_secret) is not bytes or not marker_secret:
             raise ValueError("hydration marker secret is unavailable")
+        if type(retired_marker_secrets) is not tuple or any(
+            type(value) is not bytes or not value
+            for value in retired_marker_secrets
+        ):
+            raise ValueError("hydration retired marker secrets are malformed")
         if (
             isinstance(operation_budget_seconds, bool)
             or not isinstance(operation_budget_seconds, (int, float))
@@ -81,6 +87,7 @@ class SidebarHydrationExecutor:
         self._store = store
         self._native = native
         self._marker_secret = marker_secret
+        self._retired_marker_secrets = retired_marker_secrets
         self._clock = clock
         self._monotonic = monotonic
         self._operation_budget_seconds = float(operation_budget_seconds)
@@ -123,7 +130,14 @@ class SidebarHydrationExecutor:
                 thread_id=claim.codex_thread_id,
                 deadline=deadline,
             )
-            kind = classify_sidebar_initial_prompt(prompt, self._marker_secret)
+            # A hydration target is by construction an older placeholder, so
+            # its registration marker may predate a key rotation; classify
+            # through the keyring, current epoch first.
+            kind = SidebarInitialPromptKind.UNRELATED
+            for secret in (self._marker_secret, *self._retired_marker_secrets):
+                kind = classify_sidebar_initial_prompt(prompt, secret)
+                if kind is not SidebarInitialPromptKind.UNRELATED:
+                    break
             expected_source_line = (
                 "Source session ID: "
                 + json.dumps(
@@ -191,10 +205,17 @@ class SidebarHydrationExecutor:
             return self._fail(claim, "hydration_send_ambiguous")
 
     def _validate_claim(self, claim: SidebarHydrationClaim) -> None:
-        payload = decode_hydration_marker(
-            claim.hydration_marker,
-            self._marker_secret,
-        )
+        # The stored hydration marker was minted at claim time and may
+        # predate a key rotation; decode through the keyring, current first.
+        payload = None
+        for secret in (self._marker_secret, *self._retired_marker_secrets):
+            try:
+                payload = decode_hydration_marker(claim.hydration_marker, secret)
+            except ValueError:
+                continue
+            break
+        if payload is None:
+            raise ValueError("hydration claim identity mismatch")
         expected = HydrationMarkerPayload(
             bridge_id=claim.bridge_id,
             codex_thread_id=claim.codex_thread_id,

@@ -187,9 +187,21 @@ _DISCOVER_TTL_SECONDS = 60.0
 
 
 class ClaudeSourceAdapter:
-    def __init__(self, projects_root: Path, *, marker_secret: bytes) -> None:
+    def __init__(
+        self,
+        projects_root: Path,
+        *,
+        marker_secret: bytes,
+        retired_marker_secrets: tuple[bytes, ...] = (),
+    ) -> None:
+        if type(retired_marker_secrets) is not tuple or any(
+            type(value) is not bytes or not value
+            for value in retired_marker_secrets
+        ):
+            raise ValueError("Claude source retired marker secrets are malformed")
         self._projects_root = Path(projects_root)
         self._marker_secret = marker_secret
+        self._retired_marker_secrets = retired_marker_secrets
         self._cache: dict[str, _CacheEntry] = {}
         self._discover_cache: list[Path] | None = None
         self._discover_at: float = 0.0
@@ -355,6 +367,7 @@ class ClaudeSourceAdapter:
         origin_kind, origin_bridge_id = _detect_origin(
             records,
             self._marker_secret,
+            retired_marker_secrets=self._retired_marker_secrets,
             prior_kind=prior_origin_kind,
             prior_bridge_id=prior_origin_bridge_id,
         )
@@ -471,8 +484,15 @@ class ClaudeSourceAdapter:
     def projection_has_marker_payload(
         self, projection: SessionProjection, payload: BridgeMarkerPayload
     ) -> bool:
-        marker = encode_bridge_marker(payload, self._marker_secret)
-        return self.projection_has_exact_marker(projection, marker)
+        # A pre-rotation transcript embeds a marker whose signature half is
+        # keyed to the retired epoch; re-encode the expected payload under
+        # each keyring epoch so the exact match still lands.
+        return any(
+            self.projection_has_exact_marker(
+                projection, encode_bridge_marker(payload, secret)
+            )
+            for secret in (self._marker_secret, *self._retired_marker_secrets)
+        )
 
 
 class ClaudeTargetAdapter:
@@ -1468,6 +1488,7 @@ def _detect_origin(
     records: list[dict[str, Any]],
     marker_secret: bytes,
     *,
+    retired_marker_secrets: tuple[bytes, ...] = (),
     prior_kind: OriginKind,
     prior_bridge_id: str | None,
 ) -> tuple[OriginKind, str | None]:
@@ -1480,9 +1501,17 @@ def _detect_origin(
             continue
         for text in _record_text_blocks(record):
             for match in _MARKER_CANDIDATE_RE.finditer(text):
-                try:
-                    payload = decode_bridge_marker(match.group(0), marker_secret)
-                except InvalidBridgeMarker:
+                # Markers minted before a key rotation authenticate through
+                # the retired epochs, so a pre-rotation bridge transcript
+                # never reclassifies as NATIVE origin.
+                payload = None
+                for secret in (marker_secret, *retired_marker_secrets):
+                    try:
+                        payload = decode_bridge_marker(match.group(0), secret)
+                    except InvalidBridgeMarker:
+                        continue
+                    break
+                if payload is None:
                     continue
                 if payload.target_provider is Provider.CLAUDE:
                     marker_records.add(index)

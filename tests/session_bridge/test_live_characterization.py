@@ -1619,3 +1619,42 @@ def test_scoped_refresh_is_not_offered_against_a_version_1_report(
 
     assert "--provider all" in message
     assert "--provider codex" not in message
+
+
+def test_pre_rotation_codex_origin_guard_loads_via_retired_keys(
+    tmp_path: Path,
+) -> None:
+    current_secret = b"c" * 32
+    retired_secret = b"r" * 32
+    native_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    _write_v2(
+        tmp_path,
+        _ID_A,
+        codex_native_id=native_id,
+        created_at="2026-07-14T12:00:00+00:00",
+    )
+    guard = session_bridge.characterize._prepare_codex_origin_guard(
+        tmp_path,
+        characterization_id=_ID_A,
+        marker_secret=retired_secret,
+    )
+    session_bridge.characterize._bind_codex_origin_guard(
+        guard,
+        native_id=native_id,
+        marker_secret=retired_secret,
+    )
+
+    with pytest.raises(
+        CharacterizationGateError,
+        match="characterization_codex_origin_guard_invalid",
+    ):
+        load_codex_characterization_origins(
+            report_root=tmp_path,
+            marker_secret=current_secret,
+        )
+
+    assert load_codex_characterization_origins(
+        report_root=tmp_path,
+        marker_secret=current_secret,
+        retired_marker_secrets=(retired_secret,),
+    ) == {native_id: f"characterization-{_ID_A}-codex"}

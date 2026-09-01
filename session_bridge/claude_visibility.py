@@ -329,8 +329,15 @@ def build_claude_registration_prompt(
     candidate: ClaudeVisibilityCandidate,
     identity: ClaudeVisibilityIdentity,
     marker_secret: bytes,
+    *,
+    retired_marker_secrets: tuple[bytes, ...] = (),
 ) -> str:
-    validate_claude_visibility_identity_binding(candidate, identity, marker_secret)
+    validate_claude_visibility_identity_binding(
+        candidate,
+        identity,
+        marker_secret,
+        retired_marker_secrets=retired_marker_secrets,
+    )
     if (
         redact_sensitive_text(candidate.source_session_id)
         != candidate.source_session_id
@@ -464,10 +471,17 @@ def validate_claude_visibility_identity_binding(
     candidate: ClaudeVisibilityCandidate,
     identity: ClaudeVisibilityIdentity,
     marker_secret: bytes,
+    *,
+    retired_marker_secrets: tuple[bytes, ...] = (),
 ) -> None:
     _validate_candidate(candidate)
     if not isinstance(identity, ClaudeVisibilityIdentity):
         raise ValueError("Claude visibility identity is malformed")
+    if type(retired_marker_secrets) is not tuple or any(
+        type(value) is not bytes or not value
+        for value in retired_marker_secrets
+    ):
+        raise ValueError("Claude visibility retired marker secrets are malformed")
     if (
         identity.job_id,
         identity.bridge_id,
@@ -475,10 +489,20 @@ def validate_claude_visibility_identity_binding(
         identity.claude_uuid,
     ) != _identity_values(candidate):
         raise ValueError("Claude visibility identity does not match candidate")
-    try:
-        payload = decode_bridge_marker(identity.signed_marker, marker_secret)
-    except ValueError as exc:
-        raise ValueError("Claude visibility signed marker is malformed") from exc
+    # A stored signed marker may predate a key rotation; authenticate through
+    # the keyring, current epoch first. Fresh identities always validate under
+    # the current key because derive_claude_visibility_identity signs with it.
+    payload = None
+    error: ValueError | None = None
+    for secret in (marker_secret, *retired_marker_secrets):
+        try:
+            payload = decode_bridge_marker(identity.signed_marker, secret)
+        except ValueError as exc:
+            error = exc
+            continue
+        break
+    if payload is None:
+        raise ValueError("Claude visibility signed marker is malformed") from error
     if payload != BridgeMarkerPayload(
         bridge_id=identity.bridge_id,
         policy_generation=1,

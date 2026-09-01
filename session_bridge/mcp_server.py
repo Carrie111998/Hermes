@@ -620,8 +620,12 @@ def create_app(
         claimed_tokens: list[tuple[str, str]] = []
         try:
             secret = marker_key
+            retired_secrets: tuple[bytes, ...] = ()
             if secret is None:
                 secret = await asyncio.to_thread(resolve_marker_key)
+                retired_secrets = await asyncio.to_thread(
+                    lambda: resolve_retired_marker_keys(current_key=secret)
+                )
             claims = await claim_method(limit=1)
             if not isinstance(claims, tuple) or len(claims) > 1:
                 raise ValueError("malformed sidebar hydration lease batch")
@@ -636,7 +640,11 @@ def create_app(
                     "hydration Codex thread ID",
                 )
                 claimed_tokens.append((lease_token, thread_id))
-                jobs.append(_build_sidebar_hydration_broker_job(claim, secret))
+                jobs.append(
+                    _build_sidebar_hydration_broker_job(
+                        claim, secret, retired_marker_keys=retired_secrets
+                    )
+                )
             return {"jobs": jobs}
         except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
             raise
@@ -2148,6 +2156,8 @@ def _build_sidebar_broker_job(
 def _build_sidebar_hydration_broker_job(
     claim: object,
     marker_key: bytes,
+    *,
+    retired_marker_keys: tuple[bytes, ...] = (),
 ) -> dict[str, Any]:
     lease_token = _exact_sidebar_text(
         getattr(claim, "lease_token", None),
@@ -2184,7 +2194,17 @@ def _build_sidebar_hydration_broker_job(
         getattr(claim, "hydration_marker", None),
         "hydration marker",
     )
-    decoded = decode_hydration_marker(marker, marker_key)
+    # The stored hydration marker may predate a key rotation; decode through
+    # the keyring, current epoch first.
+    decoded = None
+    for secret in (marker_key, *retired_marker_keys):
+        try:
+            decoded = decode_hydration_marker(marker, secret)
+        except ValueError:
+            continue
+        break
+    if decoded is None:
+        raise ValueError("hydration marker is malformed or unauthenticated")
     if decoded != HydrationMarkerPayload(
         bridge_id=bridge_id,
         codex_thread_id=thread_id,

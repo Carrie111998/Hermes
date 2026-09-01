@@ -3375,3 +3375,89 @@ def test_visibility_inventory_cache_invalidated_by_summary_revision_change() -> 
     assert first[0].projection.last_active == 300.0
     assert second[0].projection.last_active == 400.0
     assert [call[0] for call in client.calls].count("thread/read") == 2
+
+
+class TestMarkerKeyRotationOriginDetection:
+    def test_detect_origin_authenticates_pre_rotation_marker_via_retired_keys(
+        self,
+    ) -> None:
+        retired_secret = b"codex-adapter-retired-secret"
+        payload = BridgeMarkerPayload(
+            bridge_id="bridge-rotation-1",
+            source_session_id="claude:rotation-source",
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        )
+        old_marker = encode_bridge_marker(payload, retired_secret)
+        assert old_marker != encode_bridge_marker(payload, SECRET)
+        messages = [
+            ProjectedMessage(
+                native_event_id="event-1",
+                ordinal=0,
+                role="user",
+                content=old_marker,
+                timestamp=1.0,
+            )
+        ]
+
+        reclassified = codex_adapter_module._detect_origin(
+            messages, marker_secret=SECRET
+        )
+        assert reclassified == (OriginKind.NATIVE, None)
+
+        kind, bridge_id = codex_adapter_module._detect_origin(
+            messages,
+            marker_secret=SECRET,
+            retired_marker_secrets=(retired_secret,),
+        )
+        assert kind is OriginKind.BRIDGE_PLACEHOLDER
+        assert bridge_id == "bridge-rotation-1"
+
+    def test_projection_has_marker_payload_accepts_pre_rotation_marker(self) -> None:
+        retired_secret = b"codex-adapter-retired-secret"
+        payload = BridgeMarkerPayload(
+            bridge_id="bridge-rotation-2",
+            source_session_id="claude:rotation-source",
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        )
+        old_marker = encode_bridge_marker(payload, retired_secret)
+        projection = SessionProjection(
+            provider=Provider.CODEX,
+            native_id="rotation-thread",
+            title="Rotation thread",
+            cwd="C:/work/rotation",
+            started_at=100.0,
+            last_active=200.0,
+            messages=(
+                ProjectedMessage(
+                    native_event_id="event-1",
+                    ordinal=0,
+                    role="user",
+                    content=old_marker,
+                    timestamp=110.0,
+                ),
+            ),
+            native_path="C:/codex/sessions/rotation-thread.jsonl",
+            native_status="active",
+        )
+
+        without_retired = CodexSourceAdapter(
+            FakeRequestClient({}), marker_secret=SECRET
+        )
+        assert not without_retired.projection_has_marker_payload(projection, payload)
+
+        with_retired = CodexSourceAdapter(
+            FakeRequestClient({}),
+            marker_secret=SECRET,
+            retired_marker_secrets=(retired_secret,),
+        )
+        assert with_retired.projection_has_marker_payload(projection, payload)
+
+    def test_source_adapter_rejects_malformed_retired_secrets(self) -> None:
+        with pytest.raises(ValueError):
+            CodexSourceAdapter(
+                FakeRequestClient({}),
+                marker_secret=SECRET,
+                retired_marker_secrets=(b"",),
+            )

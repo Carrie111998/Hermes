@@ -739,6 +739,7 @@ def _record_claude_characterization_payload(
     store: Any,
     payload: Mapping[str, Any],
     marker_secret: bytes,
+    retired_marker_secrets: tuple[bytes, ...] = (),
     cleanup_completed: bool,
     launch_aborted: bool = False,
     ensure_registered: bool = False,
@@ -781,12 +782,20 @@ def _record_claude_characterization_payload(
         worktree_id=None,
         eligible_at=float(payload.get("created_at", 0.0)),
     )
-    identity = derive_claude_visibility_identity(candidate, marker_secret)
+    # The record's signed marker may predate a key rotation; bind it under the
+    # keyring epoch that minted it (the other identity fields are
+    # key-independent, so any epoch derives them identically).
+    identity = None
+    for epoch_secret in (marker_secret, *retired_marker_secrets):
+        derived = derive_claude_visibility_identity(candidate, epoch_secret)
+        if derived.signed_marker == payload["signed_marker"]:
+            identity = derived
+            break
     if (
-        identity.job_id != payload["job_id"]
+        identity is None
+        or identity.job_id != payload["job_id"]
         or identity.bridge_id != payload["bridge_id"]
         or identity.claude_uuid != payload["reserved_claude_uuid"]
-        or identity.signed_marker != payload["signed_marker"]
     ):
         raise ConfigurationFailure("characterization_record_invalid")
     evidence_digest = _claude_characterization_evidence(payload)
@@ -796,6 +805,7 @@ def _record_claude_characterization_payload(
                 candidate,
                 identity,
                 marker_secret,
+                retired_marker_secrets=retired_marker_secrets,
                 operation_id=operation_id,
                 evidence_digest=evidence_digest,
             )
@@ -812,6 +822,7 @@ def _record_claude_characterization_payload(
                 signed_marker=identity.signed_marker,
                 evidence_digest=evidence_digest,
                 marker_secret=marker_secret,
+                retired_marker_secrets=retired_marker_secrets,
                 cleanup_completed=cleanup_completed,
                 launch_aborted=launch_aborted,
             )
@@ -827,6 +838,7 @@ def _sync_claude_characterization_records(
     store: Any,
     source_root: Path,
     marker_secret: bytes,
+    retired_marker_secrets: tuple[bytes, ...] = (),
     include_active: bool,
     include_completed: bool,
 ) -> dict[str, int]:
@@ -859,7 +871,9 @@ def _sync_claude_characterization_records(
     result = {"registered": 0, "cleanup_completed": 0}
     for path, completed in paths:
         try:
-            payload = _read_characterization_record(path, marker_secret)
+            payload = _read_characterization_record(
+                path, marker_secret, retired_secrets=retired_marker_secrets
+            )
         except RuntimeError:
             raise ConfigurationFailure("characterization_record_invalid") from None
         phase = payload.get("phase")
@@ -875,6 +889,7 @@ def _sync_claude_characterization_records(
             store=store,
             payload=payload,
             marker_secret=marker_secret,
+            retired_marker_secrets=retired_marker_secrets,
             cleanup_completed=completed,
             ensure_registered=not completed,
         )
@@ -1640,6 +1655,9 @@ class ProductionBackend:
         )
 
         marker_secret = resolve_marker_key()
+        retired_marker_secrets = resolve_retired_marker_keys(
+            current_key=marker_secret
+        )
         native = self._require_sidebar_terminal_delivery()
         eligible: list[dict[str, Any]] = []
         already_readable = 0
@@ -1660,7 +1678,14 @@ class ProductionBackend:
                     thread_id=thread_id,
                     deadline=time.monotonic() + 60.0,
                 )
-                kind = classify_sidebar_initial_prompt(prompt, marker_secret)
+                # Backfill targets are older placeholders whose registration
+                # markers may predate a key rotation; classify through the
+                # keyring, current epoch first.
+                kind = SidebarInitialPromptKind.UNRELATED
+                for epoch_secret in (marker_secret, *retired_marker_secrets):
+                    kind = classify_sidebar_initial_prompt(prompt, epoch_secret)
+                    if kind is not SidebarInitialPromptKind.UNRELATED:
+                        break
                 expected_source_line = (
                     "Source session ID: "
                     + json.dumps(
@@ -2550,6 +2575,9 @@ class ProductionBackend:
         cursor: Mapping[str, Any] | None = None,
     ) -> Mapping[str, Any]:
         marker_secret = resolve_marker_key()
+        retired_marker_secrets = resolve_retired_marker_keys(
+            current_key=marker_secret
+        )
         store = self._require_store()
         if apply:
             source_root = characterization_source_root()
@@ -2557,12 +2585,14 @@ class ProductionBackend:
                 store=store,
                 source_root=source_root,
                 marker_secret=marker_secret,
+                retired_marker_secrets=retired_marker_secrets,
                 include_active=False,
                 include_completed=True,
             )
         result = store.reconcile_claude_visibility_lineage(
             limit=limit,
             marker_secret=marker_secret,
+            retired_marker_secrets=retired_marker_secrets,
             apply=apply,
             cursor=cursor,
         )
@@ -2715,11 +2745,19 @@ class ProductionBackend:
         ):
             raise RolloutGateBlocked("visibility_repair_authority_mismatch")
         marker_secret = resolve_marker_key()
-        source = ClaudeSourceAdapter(_CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret)
+        retired_marker_secrets = resolve_retired_marker_keys(
+            current_key=marker_secret
+        )
+        source = ClaudeSourceAdapter(
+            _CLAUDE_PROJECTS_ROOT,
+            marker_secret=marker_secret,
+            retired_marker_secrets=retired_marker_secrets,
+        )
         registrar = ClaudeNativeRegistrar(
             store,
             source,
             marker_secret=marker_secret,
+            retired_marker_secrets=retired_marker_secrets,
             startup_theme="light",
             claude_command=(),
             process_timeout=policy.process_timeout_seconds,
@@ -3374,14 +3412,20 @@ class ProductionBackend:
             return self._claude_visibility_coordinator
         try:
             marker_secret = resolve_marker_key()
+            retired_marker_secrets = resolve_retired_marker_keys(
+                current_key=marker_secret
+            )
             source = ClaudeSourceAdapter(
-                _CLAUDE_PROJECTS_ROOT, marker_secret=marker_secret
+                _CLAUDE_PROJECTS_ROOT,
+                marker_secret=marker_secret,
+                retired_marker_secrets=retired_marker_secrets,
             )
             store = self._require_store()
             registrar = ClaudeNativeRegistrar(
                 store,
                 source,
                 marker_secret=marker_secret,
+                retired_marker_secrets=retired_marker_secrets,
                 startup_theme=startup["theme"],
                 claude_command=claude_command,
                 process_timeout=self.config.claude_visibility.process_timeout_seconds,
@@ -3394,11 +3438,13 @@ class ProductionBackend:
                 inventory=lambda after, **_kwargs: self._claude_visibility_inventory(
                     after,
                     marker_secret=marker_secret,
+                    retired_marker_secrets=retired_marker_secrets,
                     state_db_only=True,
                 ),
                 continuous_inventory=lambda after, **kwargs: self._claude_visibility_inventory(
                     after,
                     marker_secret=marker_secret,
+                    retired_marker_secrets=retired_marker_secrets,
                     state_db_only=True,
                     stop=kwargs.get("stop"),
                 ),
@@ -3419,6 +3465,7 @@ class ProductionBackend:
         after: float,
         *,
         marker_secret: bytes,
+        retired_marker_secrets: tuple[bytes, ...] = (),
         state_db_only: bool = False,
         stop: Any = None,
     ) -> Sequence[SidebarSource]:
@@ -3457,8 +3504,10 @@ class ProductionBackend:
             codex = CodexSourceAdapter(
                 self._codex_client,
                 marker_secret=marker_secret,
+                retired_marker_secrets=retired_marker_secrets,
                 trusted_origins=lambda: load_codex_characterization_origins(
-                    marker_secret=marker_secret
+                    marker_secret=marker_secret,
+                    retired_marker_secrets=retired_marker_secrets,
                 ),
             )
             self._claude_visibility_codex_adapter = codex
@@ -3776,7 +3825,9 @@ class ProductionBackend:
             codex_source: CodexSourceAdapter | None = None
             if Provider.CLAUDE in selected:
                 claude_source = ClaudeSourceAdapter(
-                    _CLAUDE_PROJECTS_ROOT, marker_secret=marker_key
+                    _CLAUDE_PROJECTS_ROOT,
+                    marker_secret=marker_key,
+                    retired_marker_secrets=retired_marker_keys,
                 )
                 source_adapters[Provider.CLAUDE] = claude_source
             if Provider.CODEX in selected:
@@ -3790,8 +3841,10 @@ class ProductionBackend:
                 codex_source = CodexSourceAdapter(
                     self._codex_client,
                     marker_secret=marker_key,
+                    retired_marker_secrets=retired_marker_keys,
                     trusted_origins=lambda: load_codex_characterization_origins(
-                        marker_secret=marker_key
+                        marker_secret=marker_key,
+                        retired_marker_secrets=retired_marker_keys,
                     ),
                 )
                 source_adapters[Provider.CODEX] = codex_source
@@ -3918,6 +3971,9 @@ class ProductionBackend:
             return self._sidebar_hydration_executor
         try:
             marker_key = resolve_marker_key()
+            retired_marker_keys = resolve_retired_marker_keys(
+                current_key=marker_key
+            )
             store = self._require_store()
             coordinator = SessionBridgeCoordinator(
                 config=self.config,
@@ -3937,6 +3993,7 @@ class ProductionBackend:
                 store=store,
                 native=native,
                 marker_secret=marker_key,
+                retired_marker_secrets=retired_marker_keys,
             )
             return self._sidebar_hydration_executor
         except ConfigurationFailure:
@@ -3985,6 +4042,7 @@ class ProductionBackend:
             source = CodexSourceAdapter(
                 self._sidebar_codex_client,
                 marker_secret=marker_secret,
+                retired_marker_secrets=retired_marker_secrets,
             )
             return SidebarThreadVerifier(
                 source,

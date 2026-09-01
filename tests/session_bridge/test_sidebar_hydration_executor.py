@@ -290,3 +290,125 @@ def test_hydration_executor_rejects_mismatched_authenticated_task() -> None:
     assert result.error_code == "source_identity_mismatch"
     assert store.failed_code == "source_identity_mismatch"
     assert native.send_calls == 0
+
+
+def test_hydration_executor_delivers_pre_rotation_claim_via_retired_keys() -> None:
+    retired_secret = b"hydration-executor-retired-secret"
+    old_hydration_marker = encode_hydration_marker(
+        HydrationMarkerPayload(
+            bridge_id=BRIDGE_ID,
+            codex_thread_id=THREAD_ID,
+            preview_digest="a" * 64,
+            preview_version=1,
+            source_cursor="cursor-1",
+            source_hash="hash-1",
+            source_session_id=SOURCE_ID,
+        ),
+        retired_secret,
+    )
+    assert old_hydration_marker != HYDRATION_MARKER
+    old_registration_marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=BRIDGE_ID,
+            source_session_id=SOURCE_ID,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        retired_secret,
+    )
+    old_prompt = build_registration_prompt(
+        SidebarCandidate(
+            source_session_id=SOURCE_ID,
+            provider=Provider.CLAUDE,
+            bridge_id=BRIDGE_ID,
+            title="[Claude] Hydration source",
+            cwd="C:/workspace",
+            git_root="C:/workspace",
+            git_branch="main",
+            git_head="a" * 40,
+            worktree_id="worktree-1",
+            eligible_at=100.0,
+        ),
+        old_registration_marker,
+    )
+    base = _claim()
+    claim = SidebarHydrationClaim(
+        **{
+            **base.__dict__,
+            "hydration_marker": old_hydration_marker,
+            "hydration_message": build_hydration_message(
+                preview_rendered=(
+                    "# Imported Claude Code Session\n\n"
+                    "## Continuation Brief\n\n"
+                    "Preserve the exact native task.\n"
+                ),
+                source_session_id=SOURCE_ID,
+                hydration_marker=old_hydration_marker,
+                send_reserved=False,
+            ),
+        }
+    )
+
+    class OldEpochNative:
+        def __init__(self) -> None:
+            self.send_calls = 0
+            self.marker_present = False
+
+        def read_thread_initial_prompt(
+            self, *, thread_id: str, deadline: float
+        ) -> str:
+            assert thread_id == THREAD_ID
+            return old_prompt
+
+        def thread_has_exact_marker(
+            self, *, thread_id: str, marker: str, deadline: float
+        ) -> bool:
+            assert marker == old_hydration_marker
+            return self.marker_present
+
+        def start_text_turn_and_verify_marker(
+            self, *, thread_id: str, message: str, marker: str, deadline: float
+        ) -> None:
+            assert marker == old_hydration_marker
+            self.send_calls += 1
+            self.marker_present = True
+
+    class OldEpochStore(FakeStore):
+        def commit_sidebar_hydration_job(
+            self,
+            *,
+            lease_token: str,
+            codex_thread_id: str,
+            hydration_marker: str,
+            now: float,
+        ):
+            assert hydration_marker == old_hydration_marker
+            self.committed += 1
+            return {"state": "hydration_visible"}
+
+    store = OldEpochStore()
+    blocked = SidebarHydrationExecutor(
+        claim_once=lambda: (claim,),
+        store=store,  # type: ignore[arg-type]
+        native=OldEpochNative(),
+        marker_secret=MARKER_SECRET,
+        clock=lambda: 100.0,
+        monotonic=lambda: 200.0,
+    ).run_once()
+    assert blocked.status == "failed"
+    assert blocked.error_code == "source_identity_mismatch"
+
+    store = OldEpochStore()
+    native = OldEpochNative()
+    recovered = SidebarHydrationExecutor(
+        claim_once=lambda: (claim,),
+        store=store,  # type: ignore[arg-type]
+        native=native,
+        marker_secret=MARKER_SECRET,
+        retired_marker_secrets=(retired_secret,),
+        clock=lambda: 100.0,
+        monotonic=lambda: 200.0,
+    ).run_once()
+    assert recovered.status == "visible"
+    assert store.committed == 1
+    assert native.send_calls == 1
