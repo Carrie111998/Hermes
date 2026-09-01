@@ -12976,18 +12976,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # text and marked the obligation delivered without ever uploading
             # the attachment (#99846).
             try:
-                from gateway.platforms.base import BasePlatformAdapter
-
                 media_files, content = adapter.extract_media(content)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(
                     media_files
                 )
             except Exception:
-                logger.debug(
-                    "obligation %s: media extraction failed; delivering text only",
+                # Fail closed: if extraction raises we cannot split the text
+                # from the MEDIA directives, and sending the raw content would
+                # reintroduce #99846 (literal "MEDIA:/path" delivered as text).
+                # Skip the send entirely and keep the obligation retryable.
+                logger.warning(
+                    "obligation %s: media extraction failed; keeping retryable",
                     row["obligation_id"], exc_info=True,
                 )
-                media_files = []
+                try:
+                    await asyncio.to_thread(
+                        mark_failed, row["obligation_id"], "media extraction failed",
+                    )
+                except Exception:
+                    logger.debug(
+                        "delivery ledger update failed", exc_info=True,
+                    )
+                continue
 
             text_ok = True
             result = None
@@ -13016,6 +13026,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
             _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
             media_ok = True
+            # One failed upload does not stop the remaining files, but the
+            # obligation stays retryable — so a later retry re-sends files
+            # that already uploaded successfully on this attempt.
             for media_path, is_voice in media_files or []:
                 ext = os.path.splitext(str(media_path))[1].lower()
                 try:

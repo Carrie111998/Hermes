@@ -370,10 +370,16 @@ class TestGatewayRedeliverySweep:
 
     @staticmethod
     def _adapter(success=True):
+        from gateway.platforms.base import BasePlatformAdapter
+
         adapter = MagicMock()
         adapter.send = AsyncMock(
             return_value=MagicMock(success=success, error="" if success else "nope")
         )
+        # Bind the real staticmethod: a bare MagicMock is not unpackable, and
+        # since extraction failures now keep the obligation retryable, the
+        # mock must behave like a real adapter for MEDIA-free content.
+        adapter.extract_media = BasePlatformAdapter.extract_media
         return adapter
 
     @pytest.mark.asyncio
@@ -571,6 +577,9 @@ class TestGatewayRedeliverySweep:
 
         adapter = MagicMock()
         adapter.send = hanging_send
+        from gateway.platforms.base import BasePlatformAdapter
+
+        adapter.extract_media = BasePlatformAdapter.extract_media
         runner = self._runner(adapter)
         task = asyncio.create_task(runner._redeliver_pending_obligations())
 
@@ -650,6 +659,33 @@ class TestGatewayRedeliverySweep:
         # delivered — the attachment never uploaded, so it stays retryable.
         assert n == 0
         assert adapter.send.await_count == 1
+        assert _row("ob-1")["state"] == "failed"
+        assert _row("ob-1")["attempts"] == 1
+
+    @pytest.mark.asyncio
+    async def test_pending_media_extraction_failure_sends_nothing(
+        self, tmp_path,
+    ):
+        # A raising extract_media must not fall back to sending the raw
+        # content as text (the literal "MEDIA:/path" line) — the obligation
+        # stays retryable instead of half-delivering.
+        proof = tmp_path / "proof.jpg"
+        proof.write_bytes(b"\xff\xd8jpeg")
+        _record(content=f"proof attached\nMEDIA:{proof}")
+        _orphan("ob-1")
+        adapter = self._media_adapter(
+            extract=MagicMock(side_effect=RuntimeError("parser exploded"))
+        )
+        runner = self._runner(adapter)
+
+        n = await runner._redeliver_pending_obligations()
+
+        assert n == 0
+        adapter.send.assert_not_awaited()
+        for media_send in (
+            "send_image_file", "send_voice", "send_video", "send_document",
+        ):
+            getattr(adapter, media_send).assert_not_awaited()
         assert _row("ob-1")["state"] == "failed"
         assert _row("ob-1")["attempts"] == 1
 
