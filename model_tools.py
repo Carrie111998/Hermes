@@ -867,7 +867,8 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     if not schema:
         return args
 
-    properties = (schema.get("parameters") or {}).get("properties")
+    parameters = schema.get("parameters") or {}
+    properties = parameters.get("properties")
     if not properties:
         return args
 
@@ -877,7 +878,7 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     # wire names before schema lookup / dispatch.
     try:
         from tools.schema_sanitizer import unrename_tool_args
-        args = unrename_tool_args(schema.get("parameters"), args)
+        args = unrename_tool_args(parameters, args)
     except Exception:  # pragma: no cover — never break dispatch
         pass
 
@@ -885,6 +886,7 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         prop_schema = properties.get(key)
         if not prop_schema:
             continue
+        prop_schema = _resolve_local_schema_ref(prop_schema, parameters)
         expected = prop_schema.get("type")
 
         # Wrap bare non-list values when the schema declares ``array``.
@@ -933,9 +935,13 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             # a JSON string. The top-level coercion above only repairs the
             # outermost value.
             if expected == "array" and isinstance(value, (list, tuple)):
-                args[key] = _normalize_json_strings_for_schema(value, prop_schema)
+                args[key] = _normalize_json_strings_for_schema(
+                    value, prop_schema, root_schema=parameters
+                )
             elif expected == "object" and isinstance(value, dict):
-                args[key] = _normalize_json_strings_for_schema(value, prop_schema)
+                args[key] = _normalize_json_strings_for_schema(
+                    value, prop_schema, root_schema=parameters
+                )
             continue
         if not expected and not _schema_allows_null(prop_schema):
             continue
@@ -945,12 +951,67 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             # If we just JSON-parsed a string into a container, recurse so
             # nested JSON-encoded elements/fields get normalized as well.
             if isinstance(coerced, (list, tuple, dict)):
-                args[key] = _normalize_json_strings_for_schema(coerced, prop_schema)
+                args[key] = _normalize_json_strings_for_schema(
+                    coerced, prop_schema, root_schema=parameters
+                )
 
     return args
 
 
-def _schema_accepts_kind(schema: Any, kind: str) -> bool:
+def _resolve_local_schema_ref(
+    schema: Any,
+    root_schema: Any,
+    seen_refs: set[str] | None = None,
+) -> Any:
+    """Resolve a local JSON-Schema ``$ref`` for coercion decisions.
+
+    Only document-local JSON Pointers are followed. Unresolved, external, and
+    cyclic references are left untouched so argument coercion remains
+    fail-safe. Sibling keywords are retained without overriding the referenced
+    schema's type information.
+    """
+    if not isinstance(schema, dict) or not isinstance(root_schema, dict):
+        return schema
+
+    ref = schema.get("$ref")
+    if not isinstance(ref, str):
+        return schema
+    if ref == "#":
+        tokens = []
+    elif ref.startswith("#/"):
+        tokens = ref[2:].split("/")
+    else:
+        return schema
+
+    seen = seen_refs or set()
+    if ref in seen:
+        return schema
+
+    target: Any = root_schema
+    for raw_token in tokens:
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        if not isinstance(target, dict) or token not in target:
+            return schema
+        target = target[token]
+    if not isinstance(target, dict):
+        return schema
+
+    resolved = _resolve_local_schema_ref(target, root_schema, seen | {ref})
+    siblings = {key: value for key, value in schema.items() if key != "$ref"}
+    if not siblings or not isinstance(resolved, dict):
+        return resolved
+
+    combined = dict(resolved)
+    for key, value in siblings.items():
+        combined.setdefault(key, value)
+    return combined
+
+
+def _schema_accepts_kind(
+    schema: Any,
+    kind: str,
+    root_schema: Any = None,
+) -> bool:
     """Return True when *schema* permits a value of JSON type *kind*.
 
     Looks at ``type`` (string or list) and recurses through
@@ -959,19 +1020,26 @@ def _schema_accepts_kind(schema: Any, kind: str) -> bool:
     """
     if not isinstance(schema, dict):
         return False
+    if root_schema is None:
+        root_schema = schema
+    schema = _resolve_local_schema_ref(schema, root_schema)
     t = schema.get("type")
     if t == kind or (isinstance(t, list) and kind in t):
         return True
     for union_key in ("anyOf", "oneOf", "allOf"):
         branches = schema.get(union_key)
         if isinstance(branches, list) and any(
-            _schema_accepts_kind(b, kind) for b in branches
+            _schema_accepts_kind(b, kind, root_schema) for b in branches
         ):
             return True
     return False
 
 
-def _normalize_json_strings_for_schema(value: Any, schema: Any) -> Any:
+def _normalize_json_strings_for_schema(
+    value: Any,
+    schema: Any,
+    root_schema: Any = None,
+) -> Any:
     """Recursively parse JSON-encoded string values that a schema expects to
     be arrays or objects, including nested array items and object properties.
 
@@ -994,12 +1062,15 @@ def _normalize_json_strings_for_schema(value: Any, schema: Any) -> Any:
     """
     if not isinstance(schema, dict):
         return value
+    if root_schema is None:
+        root_schema = schema
+    schema = _resolve_local_schema_ref(schema, root_schema)
 
     # Parse a JSON-encoded string into the container the schema expects.
     if isinstance(value, str):
         trimmed = value.strip()
-        expects_array = _schema_accepts_kind(schema, "array")
-        expects_object = _schema_accepts_kind(schema, "object")
+        expects_array = _schema_accepts_kind(schema, "array", root_schema)
+        expects_object = _schema_accepts_kind(schema, "object", root_schema)
         if (expects_array and trimmed.startswith("[")) or (
             expects_object and trimmed.startswith("{")
         ):
@@ -1024,7 +1095,9 @@ def _normalize_json_strings_for_schema(value: Any, schema: Any) -> Any:
         changed = False
         out = []
         for item in value:
-            nxt = _normalize_json_strings_for_schema(item, items_schema)
+            nxt = _normalize_json_strings_for_schema(
+                item, items_schema, root_schema=root_schema
+            )
             changed = changed or (nxt is not item)
             out.append(nxt)
         return out if changed else value
@@ -1039,7 +1112,9 @@ def _normalize_json_strings_for_schema(value: Any, schema: Any) -> Any:
         for k, prop_schema in props.items():
             if k not in value or not isinstance(prop_schema, dict):
                 continue
-            nxt = _normalize_json_strings_for_schema(value[k], prop_schema)
+            nxt = _normalize_json_strings_for_schema(
+                value[k], prop_schema, root_schema=root_schema
+            )
             if nxt is not value[k]:
                 out[k] = nxt
                 changed = True
