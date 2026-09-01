@@ -315,6 +315,20 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     first_line = text.splitlines()[0] if text else ""
     first_lower = first_line.lower()
 
+    # An OSError's ``str()`` embeds the filename repr with newlines escaped
+    # to a literal ``\n``, so the whole payload rides on a SINGLE line and
+    # the first-line bound above cannot keep it out of the scan: the
+    # agent-path capture is ``f"{type(e).__name__}: {str(e)}"`` and
+    # ``str(OSError(63, "File name too long", script_source))`` is one line
+    # carrying every word of the embedded script, "Authorization" included
+    # (#99988 review). Provider errors come from the HTTP stack
+    # (``httpx.ReadTimeout: ...``, ``Error code: 401 - ...``), never as
+    # ``[Errno N]``, so an OSError signature line is system-level by
+    # construction — the provider branches below must not scan it.
+    oserror_signature = re.match(
+        r"^(?:[A-Za-z_][\w.]*: )?\[Errno \d+\]", first_line
+    )
+
     if "skipped to prevent unintended spend: global inference config drifted" in lower:
         if "finite one-shot job is consumed" in lower:
             remediation = (
@@ -370,8 +384,11 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # Match 429 as a whole token (#83188 @cation98): bare substring matching
     # let identifiers containing those digits (job ids, ports, hashes) trip
     # a false "provider rate limit" alert. First-line-only for the same
-    # reason as the timeout/auth branches below (#99988).
-    if provider_reachable and (
+    # reason as the timeout/auth branches below (#99988). Skipped for
+    # OSError signature lines: their single-line filename repr IS the
+    # payload, and a bare "\n429\n" inside a script's embedded source is
+    # content, not a provider status.
+    if provider_reachable and not oserror_signature and (
         re.search(r"\b429\b", first_line)
         or "rate limit" in first_lower
         or "usage limit" in first_lower
@@ -411,7 +428,11 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "quiet. Full details saved in cron output."
         )
 
-    if provider_reachable and (
+    # OSError signature lines are exempt even here: an OS-level connect
+    # timeout ("[Errno 110] Connection timed out") names the socket layer,
+    # not a provider response, so it falls through to the verbatim cleaner
+    # instead of claiming a fallback chain was exhausted.
+    if provider_reachable and not oserror_signature and (
         "readtimeout" in first_lower
         or "timed out" in first_lower
         or "timeout" in first_lower
@@ -426,8 +447,10 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # 401/403 status codes as whole tokens, so "oauth", "4015" and similar do
     # not trip a misleading auth message. First line only: an embedded
     # payload word like a curl "Authorization" header inside a long OSError
-    # filename is script content, not a provider signature (#99988).
-    if provider_reachable and (
+    # filename is script content, not a provider signature (#99988) — and
+    # because OSError's filename repr keeps everything on one line, OSError
+    # signature lines are exempt from the scan entirely.
+    if provider_reachable and not oserror_signature and (
         re.search(r"authenticat|authoriz", first_lower)
         or re.search(r"\b(401|403)\b", first_line)
     ):

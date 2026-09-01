@@ -20,6 +20,17 @@ captured subprocess output, tool payloads in tracebacks), so the provider
 branches match the FIRST line only: provider errors arrive as single-line
 ``str(exc)`` ("Error code: 401 - ...", "httpx.ReadTimeout: ..."), while
 anything on later lines is payload, not signature.
+
+One escape hatch remains for a first-line bound: ``str(OSError)`` embeds the
+filename repr with newlines escaped to a literal ``\\n``, so the ENTIRE
+payload stays on one line — ``str(OSError(63, "File name too long",
+script_source))`` is a single line carrying every word of the embedded
+script. The scheduler's capture is ``f"{type(e).__name__}: {str(e)}"``, so
+the delivered error text is that single line. OSError signature lines
+(``[Errno N]``, with or without a type-name prefix) are therefore exempt
+from the provider scan altogether: provider errors come from the HTTP
+stack and never carry ``[Errno N]``, while an OSError names the
+system/IO layer by construction (#99988 review).
 """
 
 from cron.scheduler import _summarize_cron_failure_for_delivery
@@ -89,3 +100,53 @@ def test_first_line_401_still_classifies_as_provider_auth():
     error = "Error code: 401 - {'error': {'message': 'Invalid API key'}}"
     msg = _summarize_cron_failure_for_delivery(_agent_job(), error)
     assert "provider authentication error" in msg
+
+
+def _script_source():
+    return (
+        "#!/bin/bash\n"
+        'TOKEN=$(curl -s "https://auth.example/token")\n'
+        'MANIFEST=$(curl -s -H "Authorization: Bearer $TOKEN" '
+        "https://registry.example/manifests/latest)"
+    )
+
+
+def test_oserror_str_repr_single_line_not_provider_auth():
+    """Real ``str(OSError)`` replay: the filename repr keeps newlines
+    escaped on ONE line, so the first-line bound alone cannot keep the
+    embedded "Authorization" out of the scan — OSError signature lines are
+    exempt from the provider branches (#99988 review)."""
+    # Built from a real OSError, not hand-typed text: str(OSError) embeds
+    # the filename repr, which escapes newlines to a literal "\n".
+    error = f"OSError: {OSError(63, 'File name too long', _script_source())}"
+    # Pin the premise: this is the single-line repr form. If this ever
+    # becomes a multi-line string, the fixture stopped reproducing the
+    # reported shape and the regression it guards is gone.
+    assert len(error.splitlines()) == 1
+    assert "Authorization" in error
+    msg = _summarize_cron_failure_for_delivery(_agent_job(), error)
+    assert "provider authentication error" not in msg
+    assert "provider" not in msg.lower()
+    assert "File name too long" in msg
+
+
+def test_oserror_str_without_type_prefix_same_treatment():
+    """A caller storing bare ``str(e)`` (no type-name prefix) gets the same
+    exemption: the signature is the leading ``[Errno N]`` token."""
+    error = str(OSError(63, "File name too long", _script_source()))
+    assert len(error.splitlines()) == 1
+    assert "Authorization" in error
+    msg = _summarize_cron_failure_for_delivery(_agent_job(), error)
+    assert "provider" not in msg.lower()
+    assert "File name too long" in msg
+
+
+def test_oserror_connect_timeout_verbatim_not_provider_timeout():
+    """An OS-level connect timeout names the socket layer, not a provider
+    response: no "provider timeout / fallback chain exhausted" claim, the
+    verbatim error text carries the signal instead."""
+    error = "TimeoutError: [Errno 110] Connection timed out"
+    msg = _summarize_cron_failure_for_delivery(_agent_job(), error)
+    assert "provider timeout" not in msg
+    assert "fallback chain" not in msg.lower()
+    assert "Connection timed out" in msg
