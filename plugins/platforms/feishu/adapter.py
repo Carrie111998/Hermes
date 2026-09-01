@@ -436,6 +436,7 @@ class FeishuAdapterSettings:
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    ignore_at_all: bool = False
 
 
 @dataclass
@@ -1661,6 +1662,12 @@ class FeishuAdapter(BasePlatformAdapter):
             require_mention=_to_boolean(
                 extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
             ),
+            # Env wins over extra-config (matches the _apply_yaml_config
+            # bridge contract: "Env vars take precedence over YAML").
+            ignore_at_all=_to_boolean(
+                os.getenv("FEISHU_IGNORE_AT_ALL")
+                or str(extra.get("ignore_at_all", "false")).lower()
+            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1693,6 +1700,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._ignore_at_all = settings.ignore_at_all
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -4466,8 +4474,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _mentions_self(self, message: Any) -> bool:
         # @_all is Feishu's @everyone placeholder.
+        # When the ignore_at_all setting is enabled, @_all alone does not
+        # trigger the bot; an explicit bot mention is still required.
         raw_content = getattr(message, "content", "") or ""
-        if "@_all" in raw_content:
+        if not self._ignore_at_all and "@_all" in raw_content:
             return True
         mentions = getattr(message, "mentions", None) or []
         if mentions and self._message_mentions_bot(mentions):
@@ -5876,6 +5886,8 @@ def _apply_yaml_config(yaml_cfg: dict, feishu_cfg: dict) -> dict | None:
     """
     if "allow_bots" in feishu_cfg and not os.getenv("FEISHU_ALLOW_BOTS"):
         os.environ["FEISHU_ALLOW_BOTS"] = str(feishu_cfg["allow_bots"]).lower()
+    if "ignore_at_all" in feishu_cfg and not os.getenv("FEISHU_IGNORE_AT_ALL"):
+        os.environ["FEISHU_IGNORE_AT_ALL"] = str(feishu_cfg["ignore_at_all"]).lower()
     return None
 
 
