@@ -1233,6 +1233,28 @@ def check_macos_full_disk_access() -> None:
     )
 
 
+def _read_configured_memory_provider(hermes_home: Path) -> str:
+    """Return the configured ``memory.provider`` value, or "" for the
+    built-in (file-based MEMORY.md/USER.md) store. Best-effort: any read or
+    parse failure is swallowed and treated as "no external provider
+    configured" -- callers only use this to decide whether the built-in
+    memory files are the canonical store, never to gate a hard failure."""
+    try:
+        from hermes_cli.config import read_user_config_raw
+        cfg_path = hermes_home / "config.yaml"
+        if not cfg_path.exists():
+            return ""
+        raw_cfg = read_user_config_raw(cfg_path)
+        try:
+            from hermes_cli import managed_scope
+            raw_cfg = managed_scope.apply_managed_overlay(raw_cfg)
+        except Exception:
+            pass
+        return (raw_cfg.get("memory") or {}).get("provider", "")
+    except Exception:
+        return ""
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
@@ -2020,18 +2042,33 @@ def run_doctor(args):
     memories_dir = hermes_home / "memories"
     if memories_dir.exists():
         check_ok(f"{_DHH}/memories/ directory exists")
-        memory_file = memories_dir / "MEMORY.md"
-        user_file = memories_dir / "USER.md"
-        if memory_file.exists():
-            size = len(memory_file.read_text(encoding="utf-8").strip())
-            check_ok(f"MEMORY.md exists ({size} chars)")
+
+        # MEMORY.md/USER.md are only the canonical memory store for the
+        # built-in provider. When an external provider (Honcho, Mem0, or a
+        # third-party plugin) is configured, these files may be absent,
+        # stale leftovers from before migration, or a provider-specific
+        # mirror -- reporting on them unqualified misleadingly implies
+        # they're what's actually in use. The Memory Provider section below
+        # reports on whichever provider is actually active.
+        _dir_memory_provider = _read_configured_memory_provider(hermes_home)
+        if _dir_memory_provider:
+            check_info(
+                f"MEMORY.md/USER.md check skipped -- '{_dir_memory_provider}' is the active memory "
+                "provider, not the built-in store (see Memory Provider section below)"
+            )
         else:
-            check_info("MEMORY.md not created yet (will be created when the agent first writes a memory)")
-        if user_file.exists():
-            size = len(user_file.read_text(encoding="utf-8").strip())
-            check_ok(f"USER.md exists ({size} chars)")
-        else:
-            check_info("USER.md not created yet (will be created when the agent first writes a memory)")
+            memory_file = memories_dir / "MEMORY.md"
+            user_file = memories_dir / "USER.md"
+            if memory_file.exists():
+                size = len(memory_file.read_text(encoding="utf-8").strip())
+                check_ok(f"MEMORY.md exists ({size} chars)")
+            else:
+                check_info("MEMORY.md not created yet (will be created when the agent first writes a memory)")
+            if user_file.exists():
+                size = len(user_file.read_text(encoding="utf-8").strip())
+                check_ok(f"USER.md exists ({size} chars)")
+            else:
+                check_info("USER.md not created yet (will be created when the agent first writes a memory)")
     else:
         check_warn(f"{_DHH}/memories/ not found", "(will be created on first use)")
         if should_fix:

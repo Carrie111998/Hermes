@@ -341,6 +341,97 @@ class TestDoctorMemoryProviderSection:
         assert "Built-in memory active" not in out
 
 
+# ── Directory Structure memory-file check (#100668) ──
+#
+# hermes doctor's "Directory Structure" section unconditionally reported
+# memories/MEMORY.md and memories/USER.md as the canonical memory store, even
+# when an external memory.provider was configured. When migrating to a
+# provider such as Honcho, Mem0, or a third-party plugin, those files may be
+# absent, stale leftovers, or a provider-specific mirror -- reporting on them
+# unqualified misled users about which store is actually in use. The check
+# must now be skipped (in favor of the Memory Provider section, which already
+# reports on whichever provider is active) whenever an external provider is
+# configured.
+
+
+def _run_doctor_with_memory_files(monkeypatch, tmp_path, *, provider, memory_files):
+    """Set up a HERMES_HOME with config.yaml + memories/*.md and run doctor,
+    returning captured stdout. `memory_files` maps filename -> content."""
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True, exist_ok=True)
+
+    import yaml
+    (home / "config.yaml").write_text(yaml.dump({"memory": {"provider": provider}} if provider else {"memory": {}}))
+
+    memories_dir = home / "memories"
+    memories_dir.mkdir(parents=True, exist_ok=True)
+    for name, content in memory_files.items():
+        (memories_dir / name).write_text(content)
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    (tmp_path / "project").mkdir(exist_ok=True)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status_local", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+    return buf.getvalue()
+
+
+def test_read_configured_memory_provider_defaults_to_empty(tmp_path):
+    assert doctor_mod._read_configured_memory_provider(tmp_path) == ""
+
+
+def test_read_configured_memory_provider_reads_config(tmp_path):
+    import yaml
+    (tmp_path / "config.yaml").write_text(yaml.dump({"memory": {"provider": "mnemosyne"}}))
+
+    assert doctor_mod._read_configured_memory_provider(tmp_path) == "mnemosyne"
+
+
+def test_run_doctor_builtin_provider_still_reports_memory_files(monkeypatch, tmp_path):
+    """No memory.provider configured -> unchanged behavior."""
+    out = _run_doctor_with_memory_files(
+        monkeypatch, tmp_path, provider="", memory_files={"MEMORY.md": "x" * 11}
+    )
+
+    assert "MEMORY.md exists (11 chars)" in out
+    assert "USER.md not created yet" in out
+    assert "check skipped" not in out
+
+
+def test_run_doctor_external_provider_skips_stale_memory_file_check(monkeypatch, tmp_path):
+    """#100668: an external/third-party memory provider must not have
+    leftover or mirrored MEMORY.md/USER.md files reported as the canonical
+    store."""
+    out = _run_doctor_with_memory_files(
+        monkeypatch,
+        tmp_path,
+        provider="mnemosyne",
+        memory_files={"MEMORY.md": "x" * 1823, "USER.md": "x" * 1151},
+    )
+
+    assert "MEMORY.md/USER.md check skipped" in out
+    assert "'mnemosyne' is the active memory provider" in out
+    assert "MEMORY.md exists (1823 chars)" not in out
+    assert "USER.md exists (1151 chars)" not in out
+
+
 def test_run_doctor_termux_treats_docker_and_browser_warnings_as_expected(monkeypatch, tmp_path):
     helper = TestDoctorMemoryProviderSection()
     monkeypatch.setenv("TERMUX_VERSION", "0.118.3")
