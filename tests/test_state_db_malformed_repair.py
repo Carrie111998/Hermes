@@ -322,6 +322,100 @@ def test_fts_write_corruption_repaired_in_place(tmp_path):
         db.close()
 
 
+# ── Segment-dependent trigram corruption (#100227) ─────────────────────
+#
+# The trigram index rejects an insert with IntegrityError ("constraint
+# failed" on messages_fts_trigram_idx's (segid, term) PRIMARY KEY) only when
+# the row's terms land in the damaged segment. A single fixed probe string
+# whose trigrams miss that segment writes cleanly, so the probe reported
+# healthy while every real append failed with session_persistence_failed.
+
+
+def _integrity_error_on_specific_content(db_path, poisoned_substring):
+    """Install a trigger that raises IntegrityError only for some content.
+
+    Faithful to the reported failure MODE (content-dependent constraint
+    violation from an FTS shadow-table insert) without needing a genuinely
+    damaged segment, which cannot be synthesized portably.
+    """
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    conn.executescript(
+        f"""
+        CREATE TABLE IF NOT EXISTS _seg_guard (term TEXT PRIMARY KEY);
+        INSERT OR IGNORE INTO _seg_guard (term) VALUES ('{poisoned_substring}');
+        CREATE TRIGGER IF NOT EXISTS _seg_corrupt
+        AFTER INSERT ON messages
+        WHEN new.content LIKE '%{poisoned_substring}%'
+        BEGIN
+            INSERT INTO _seg_guard (term) VALUES ('{poisoned_substring}');
+        END;
+        """
+    )
+    conn.close()
+
+
+def test_probe_catches_corruption_that_only_some_content_triggers(tmp_path):
+    """#100227: a segment that only rejects SOME contents must still be
+    detected. The old single-string probe returned healthy here."""
+    from hermes_state import _db_opens_cleanly
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    assert _db_opens_cleanly(db_path) is None  # healthy before
+
+    # Poison a token that the ORIGINAL fixed probe string does not contain,
+    # but that one of the varied probe contents does.
+    _integrity_error_on_specific_content(db_path, "cafebabe")
+
+    reason = _db_opens_cleanly(db_path)
+    assert reason is not None, (
+        "content-dependent index corruption must not be reported as healthy"
+    )
+    assert "constraint" in reason.lower()
+
+
+def test_integrity_error_is_a_corruption_verdict_not_an_exception(tmp_path):
+    """The probe must RETURN a reason for IntegrityError, not raise it.
+
+    Before #100227 only OperationalError/DatabaseError were handled, so a
+    constraint violation escaped _db_opens_cleanly and callers
+    (hermes doctor, sessions repair --check-only) saw a traceback instead
+    of a corruption verdict.
+    """
+    from hermes_state import _db_opens_cleanly
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    # Poison a token present in the FIRST probe content, so the very first
+    # insert raises.
+    _integrity_error_on_specific_content(db_path, "_fts_health_probe")
+
+    reason = _db_opens_cleanly(db_path)  # must not raise
+    assert reason is not None
+    assert "constraint" in reason.lower()
+
+
+def test_healthy_db_still_passes_the_multi_content_probe(tmp_path):
+    """The extra probe contents must not create false positives — a healthy
+    DB (unicode/digit/punctuation trigrams included) stays healthy."""
+    from hermes_state import _db_opens_cleanly
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+
+    assert _db_opens_cleanly(db_path) is None
+    # And the probe leaves nothing behind (every insert is rolled back).
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        leaked = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE source = '_health_probe'"
+        ).fetchone()[0]
+        assert leaked == 0
+        assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 10
+    finally:
+        conn.close()
+
+
 
 
 def _corrupt_btree_index(db_path: Path, index_name: str) -> None:

@@ -3374,25 +3374,60 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # while reads of the FTS5 table itself parse fine.
                 return f"fts5 read probe failed on {fts_table}: {exc}"
 
-        # FTS write probe: drive a row through the messages_fts* triggers in a
+        # FTS write probe: drive rows through the messages_fts* triggers in a
         # transaction that is always rolled back, so a corrupt FTS index that
         # rejects writes is caught even though reads look healthy. The probe is
         # best-effort — if the messages/sessions tables don't exist yet (brand
         # new file mid-init) the OperationalError is treated as "not yet a
         # populated DB", not corruption.
+        #
+        # Trigram-segment corruption is CONTENT-DEPENDENT (#100227): the
+        # trigram index rejects an insert with IntegrityError
+        # ("constraint failed" on messages_fts_trigram_idx's (segid, term)
+        # PRIMARY KEY) only when the row's terms land in the damaged segment.
+        # A single fixed probe string whose trigrams miss that segment writes
+        # cleanly, so the probe reported healthy, `hermes doctor` passed, and
+        # `sessions repair --check-only` said "no repair needed" while every
+        # real append failed with session_persistence_failed. Drive SEVERAL
+        # distinct contents spanning different trigram token sets so a damaged
+        # segment is hit regardless of which terms it holds.
         probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
+        _probe_contents = (
+            "_fts_health_probe",
+            # Distinct trigram token sets: digits, punctuation-delimited
+            # ASCII, mixed case, hex-ish and unicode runs. Each produces a
+            # different set of 3-char windows in the trigram index, so the
+            # probe is no longer hostage to one string's token placement.
+            "0123456789 4815162342 90210 314159",
+            "alpha-bravo_charlie.delta/echo:foxtrot",
+            "QwErTyUiOp ZxCvBnM AsDfGhJkL",
+            "deadbeef cafebabe f00dfeed 0xdeadc0de",
+            "café naïve résumé — 日本語 テスト 中文 测试",
+        )
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
                 (probe_session_id, "_health_probe", time.time()),
             )
-            conn.execute(
-                "INSERT INTO messages (session_id, role, content, timestamp) "
-                "VALUES (?, ?, ?, ?)",
-                (probe_session_id, "user", "_fts_health_probe", time.time()),
-            )
+            for _probe_content in _probe_contents:
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content, timestamp) "
+                    "VALUES (?, ?, ?, ?)",
+                    (probe_session_id, "user", _probe_content, time.time()),
+                )
             conn.execute("ROLLBACK")
+        except sqlite3.IntegrityError as exc:
+            # Segment-dependent FTS corruption surfaces here, NOT as an
+            # OperationalError: the shadow-table insert violates the index's
+            # own PRIMARY KEY. Before #100227 this escaped _db_opens_cleanly
+            # entirely (only OperationalError/DatabaseError were handled), so
+            # callers saw an exception instead of a corruption verdict.
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            return f"fts write probe failed (index constraint violated): {exc}"
         except sqlite3.OperationalError as exc:
             # Missing tables / FTS disabled — not the corruption class we probe.
             try:
