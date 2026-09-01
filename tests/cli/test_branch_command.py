@@ -128,6 +128,13 @@ class TestBranchCommandCLI:
         assert title == "alt path"
         assert cli_instance.session_id != "20260403_120000_abc123"
 
+    def test_branch_here_without_dashes_remains_a_title(self, cli_instance, session_db):
+        from cli import HermesCLI
+
+        HermesCLI._handle_branch_command(cli_instance, "/branch here")
+
+        assert session_db.get_session_title(cli_instance.session_id) == "here"
+
     def test_branch_rotates_hermes_session_id_env_and_context(self, cli_instance, session_db):
         """Branching must update process-local session-id readers too."""
         from cli import HermesCLI

@@ -26,8 +26,7 @@ def test_parse_branch_command_args_plain_name():
 def test_parse_branch_command_args_here_flags():
     assert _parse_branch_command_args("--here") == (True, "")
     assert _parse_branch_command_args("--here alt path") == (True, "alt path")
-    assert _parse_branch_command_args("here alt path") == (True, "alt path")
-    assert _parse_branch_command_args("HERE name") == (True, "name")
+    assert _parse_branch_command_args("here alt path") == (False, "here alt path")
 
 
 def test_branch_thread_parent_id_resolution():
@@ -57,6 +56,14 @@ def test_branch_thread_parent_id_resolution():
         thread_id="thr-9",
     )
     assert _branch_thread_parent_id(orphan) is None
+
+    dm = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="dm-1",
+        chat_type="dm",
+        user_id="u1",
+    )
+    assert _branch_thread_parent_id(dm) is None
 
 
 def test_branch_dest_source_matches_discord_inbound_shape():
@@ -263,3 +270,63 @@ async def test_branch_missing_adapter_falls_back_in_place():
     assert "Branched to" in result
     assert "new thread" not in result
     assert runner.session_store.switch_session.call_args.args[0] == origin_key
+
+
+@pytest.mark.asyncio
+async def test_branch_discord_dm_falls_back_in_place():
+    runner, _, adapter = _make_branch_thread_runner()
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        user_id="u1",
+        chat_id="dm-1",
+        chat_type="dm",
+    )
+    runner.session_store.get_or_create_session.return_value = _make_entry("current-session", source)
+    runner.session_store.switch_session.return_value = _make_entry("branched-session", source)
+
+    result = await runner._handle_branch_command(
+        MessageEvent(text="/branch", source=source, message_id="m1")
+    )
+
+    assert "Branched to" in result
+    assert "new thread" not in result
+    adapter.create_handoff_thread.assert_not_awaited()
+    assert runner.session_store.switch_session.call_args.args[0] == build_session_key(source)
+
+
+@pytest.mark.parametrize(
+    ("platform", "parent_chat_id", "new_thread_id", "expected_key"),
+    [
+        (Platform.SLACK, "C123", "1710000.0001", "agent:main:slack:group:C123:1710000.0001"),
+        (Platform.TELEGRAM, "-100123", "17585", "agent:main:telegram:group:-100123:17585"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_branch_default_opens_new_thread_on_slack_and_telegram(
+    platform, parent_chat_id, new_thread_id, expected_key
+):
+    runner, _, adapter = _make_branch_thread_runner()
+    source = SessionSource(
+        platform=platform,
+        user_id="u1",
+        chat_id=parent_chat_id,
+        chat_type="group",
+    )
+    adapter.create_handoff_thread.return_value = new_thread_id
+    runner.adapters = {platform: adapter}
+    runner.session_store.get_or_create_session.return_value = _make_entry("current-session", source)
+    dest_source = _branch_dest_source(
+        source,
+        parent_chat_id=parent_chat_id,
+        new_thread_id=new_thread_id,
+        title="alt path",
+    )
+    runner.session_store.switch_session.return_value = _make_entry("branched-session", dest_source)
+
+    result = await runner._handle_branch_command(
+        MessageEvent(text="/branch alt path", source=source, message_id="m1")
+    )
+
+    assert "new thread" in result
+    adapter.create_handoff_thread.assert_awaited_once_with(parent_chat_id, "alt path")
+    assert runner.session_store.switch_session.call_args.args[0] == expected_key

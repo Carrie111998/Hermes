@@ -55,8 +55,8 @@ logger = logging.getLogger("gateway.run")
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
 
-# /branch --here flags (first token). Default on Discord/Telegram/Slack is a new thread.
-_BRANCH_HERE_FLAGS = frozenset({"--here", "here"})
+# /branch --here flag (first token). Default on Discord/Telegram/Slack is a new thread.
+_BRANCH_HERE_FLAGS = frozenset({"--here"})
 # Platforms that actually override create_handoff_thread (base always returns None).
 _BRANCH_THREAD_PLATFORMS = frozenset({Platform.DISCORD, Platform.TELEGRAM, Platform.SLACK})
 
@@ -64,7 +64,7 @@ _BRANCH_THREAD_PLATFORMS = frozenset({Platform.DISCORD, Platform.TELEGRAM, Platf
 def _parse_branch_command_args(raw: str) -> tuple[bool, str]:
     """Parse ``/branch`` args into ``(stay_here, branch_name)``.
 
-    ``--here`` / ``here`` as the first token keeps the branch on the current
+    ``--here`` as the first token keeps the branch on the current
     surface. Anything after the flag is the optional title; without a flag the
     whole string is the title. On thread-capable platforms the default (no
     flag) is to open a new thread.
@@ -80,6 +80,8 @@ def _parse_branch_command_args(raw: str) -> tuple[bool, str]:
 
 def _branch_thread_parent_id(source: SessionSource) -> Optional[str]:
     """Parent channel/chat id that can host a new thread for this source."""
+    if source.chat_type == "dm":
+        return None
     if source.parent_chat_id:
         return str(source.parent_chat_id)
     # Discord inbound threads set chat_id == thread_id; without parent_chat_id
@@ -5509,7 +5511,7 @@ class GatewaySlashCommandsMixin:
 
         On Discord / Telegram / Slack: default opens a **new** thread for the
         branch and leaves this chat on the original session. Pass ``--here``
-        (or ``here``) to keep the branch on the current surface instead.
+        to keep the branch on the current surface instead.
 
         Other platforms and CLI always branch in-place (same surface).
         """
