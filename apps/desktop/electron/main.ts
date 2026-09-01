@@ -5430,8 +5430,19 @@ function splitHopResponse(raw: string): HttpHopResponse {
   return { status, location, body: raw.slice(separator + 4) }
 }
 
-function curlOneHop(url: string, timeoutMs: number): Promise<HttpHopResponse> {
+function curlOneHop(url: string, timeoutMs: number, pinnedAddresses: string[] = []): Promise<HttpHopResponse> {
   return new Promise(resolve => {
+    // DNS pinning (shape from upstream #63171's fetchPinnedLinkTitle): the
+    // connection is bound to the addresses the guard just vetted via
+    // --resolve, so curl never resolves the hostname itself and an attacker
+    // controlling DNS cannot swap the answer between the verdict and the
+    // request. Every vetted address is pinned; curl fails over among them
+    // without a fresh lookup. When the hop is a literal-IP URL there is no
+    // name to pin and the list is empty.
+    const port = new URL(url).port || (new URL(url).protocol === 'https:' ? '443' : '80')
+    const hostname = new URL(url).hostname.replace(/^\[|\]$/g, '')
+    const resolveArgs = pinnedAddresses.flatMap(address => ['--resolve', `${hostname}:${port}:${address}`])
+
     const args = [
       '--silent',
       '--show-error',
@@ -5440,6 +5451,7 @@ function curlOneHop(url: string, timeoutMs: number): Promise<HttpHopResponse> {
       String(Math.max(1, Math.ceil(timeoutMs / 1000))),
       '--connect-timeout',
       '4',
+      ...resolveArgs,
       '--user-agent',
       TITLE_USER_AGENT,
       '--header',
@@ -5497,7 +5509,7 @@ async function fetchPageHtmlWithCurl(rawUrl: string): Promise<string> {
   const result = await fetchWithGuardedRedirects(
     url,
     {
-      fetchOnce: hopUrl => curlOneHop(hopUrl, deadline - Date.now()),
+      fetchOnce: (hopUrl, addresses) => curlOneHop(hopUrl, deadline - Date.now(), addresses),
       resolveHost: resolveHostAddresses
     },
     { maxRedirects: PREVIEW_MAX_REDIRECTS }

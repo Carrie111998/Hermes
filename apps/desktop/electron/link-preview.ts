@@ -209,7 +209,12 @@ export function isPrivateAddress(ip: string): boolean {
       bare === '::1' ||
       bare === '::' ||
       /^f[cd][0-9a-f]{2}:/.test(bare) ||
+      // Site-local (fec0::/10) joins link-local (fe80::/10): the fec0 range
+      // is deprecated but still routable in some estates, and a name that
+      // answers with one is no more public than one answering with fe80 —
+      // both refuse. (Classification parity with upstream #63171/65bfbeddaf.)
       /^fe[89ab][0-9a-f]:/.test(bare) ||
+      /^fe[c-f][0-9a-f]?[0-9a-f]?:/.test(bare) ||
       /^::ffff:(?!172\.(?:3[01]|[12]\d|1[6-9])\.)(?:10\.|192\.168\.|169\.254\.|127\.)/.test(bare) ||
       /^::ffff:172\.(?:1[6-9]|2\d|3[01])\./.test(bare)
     )
@@ -282,7 +287,7 @@ export interface HttpHopResponse {
 
 export interface GuardedRedirectIo {
   /** Exactly one HTTP request; must never follow redirects on its own. */
-  fetchOnce: (url: string) => Promise<HttpHopResponse>
+  fetchOnce: (url: string, addresses: string[]) => Promise<HttpHopResponse>
   /** Resolved addresses for a hostname; [] when resolution fails. */
   resolveHost: (hostname: string) => Promise<string[]>
 }
@@ -296,15 +301,18 @@ export type GuardedRedirectResult =
  * actually resolves. The DNS half is the point — a redirect to a fresh
  * attacker-controlled name that answers with an RFC1918/loopback address is
  * exactly the doorway the initial-URL guard closes; without per-hop
- * re-validation it stays wide open.
+ * re-validation it stays wide open. Returns the vetted addresses so the
+ * caller can PIN the connection to one of them (curl --resolve): letting the
+ * transport resolve the name again would reopen a rebinding window between
+ * this verdict and the actual request. (Shape adopted from upstream #63171.)
  */
-async function guardHop(url: URL, io: GuardedRedirectIo): Promise<LinkPreviewFailureReason | null> {
+async function guardHop(url: URL, io: GuardedRedirectIo): Promise<{ refusal: LinkPreviewFailureReason | null; addresses: string[] }> {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    return 'private-url'
+    return { refusal: 'private-url', addresses: [] }
   }
 
   if (isPrivateHostname(url.hostname)) {
-    return 'private-url'
+    return { refusal: 'private-url', addresses: [] }
   }
 
   let addresses: string[] = []
@@ -316,10 +324,10 @@ async function guardHop(url: URL, io: GuardedRedirectIo): Promise<LinkPreviewFai
   }
 
   if (!addresses.length || addresses.some(isPrivateAddress)) {
-    return 'private-url'
+    return { refusal: 'private-url', addresses: [] }
   }
 
-  return null
+  return { refusal: null, addresses }
 }
 
 /**
@@ -349,19 +357,20 @@ export async function fetchWithGuardedRedirects(
     return { ok: false, reason: 'error' }
   }
 
-  const firstRefusal = await guardHop(current, io)
+  const firstHop = await guardHop(current, io)
 
-  if (firstRefusal) {
-    return { ok: false, reason: firstRefusal }
+  if (firstHop.refusal) {
+    return { ok: false, reason: firstHop.refusal }
   }
 
+  let addresses = firstHop.addresses
   let redirectsFollowed = 0
 
   for (;;) {
     let response: HttpHopResponse
 
     try {
-      response = await io.fetchOnce(current.toString())
+      response = await io.fetchOnce(current.toString(), addresses)
     } catch {
       // Transport failure ends the walk; the empty body is the caller's miss signal.
       return { ok: true, url: current.toString(), html: '' }
@@ -386,14 +395,17 @@ export async function fetchWithGuardedRedirects(
       return { ok: false, reason: 'error' }
     }
 
-    const nextRefusal = await guardHop(next, io)
+    const nextHop = await guardHop(next, io)
 
-    if (nextRefusal) {
-      return { ok: false, reason: nextRefusal }
+    if (nextHop.refusal) {
+      return { ok: false, reason: nextHop.refusal }
     }
 
     current = next
     redirectsFollowed += 1
+    // The vetted addresses ride along for THIS hop's request, replacing the
+    // pre-guard flow where fetchOnce re-resolved the (already vetted) name.
+    addresses = nextHop.addresses
   }
 }
 

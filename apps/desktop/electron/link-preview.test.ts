@@ -145,8 +145,8 @@ describe('parseLinkMeta', () => {
 })
 
 describe('private-address guard', () => {
-  test('rejects loopback, RFC1918, link-local, CGNAT, ULA, and unspecified IPv6', () => {
-    for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.0.9', '172.16.0.1', '172.31.255.255', '169.254.1.1', '100.64.0.1', '0.0.0.0', '224.0.0.1', '::1', '::', 'fe80::1', 'fc00::1', '::ffff:10.0.0.5']) {
+  test('rejects loopback, RFC1918, link-local, CGNAT, ULA, site-local, and unspecified IPv6', () => {
+    for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.0.9', '172.16.0.1', '172.31.255.255', '169.254.1.1', '100.64.0.1', '0.0.0.0', '224.0.0.1', '::1', '::', 'fe80::1', 'fec0::1', 'feff::9', 'fc00::1', '::ffff:10.0.0.5']) {
       assert.equal(isPrivateAddress(ip), true, ip)
     }
   })
@@ -404,7 +404,7 @@ describe('fetchWithGuardedRedirects', () => {
 
     return {
       requested,
-      fetchOnce: async (url: string) => {
+      fetchOnce: async (url: string, _addresses: string[]) => {
         requested.push(url)
         const hop = hops[url]
 
@@ -543,7 +543,7 @@ describe('fetchWithGuardedRedirects', () => {
       'https://example.com/a': { status: 302, location: 'https://example.com/b' }
     })
 
-    io.fetchOnce = async (url: string) => {
+    io.fetchOnce = async (url: string, _addresses: string[]) => {
       if (url === 'https://example.com/b') {
         throw new Error('curl died')
       }
@@ -555,5 +555,45 @@ describe('fetchWithGuardedRedirects', () => {
 
     assert.ok(result.ok)
     assert.equal(result.html, '')
+  })
+
+  test('every hop request receives the addresses vetted for THAT hop (pinning contract)', async () => {
+    // The reviewer's rebinding scenario, upstream #63171's shape: each hop's
+    // request must be bound to the addresses the guard just vetted, so a DNS
+    // answer swap between verdict and request cannot reach the transport.
+    const requested: { addresses: string[]; url: string }[] = []
+
+    const io = {
+      requested,
+      fetchOnce: async (url: string, addresses: string[]) => {
+        requested.push({ addresses, url })
+
+        if (url === 'https://example.com/a') {
+          return { status: 302, location: 'https://cdn.example.org/b', body: '' }
+        }
+
+        return { status: 200, location: '', body: HTML }
+      },
+      resolveHost: async (hostname: string) => (hostname === 'example.com' ? ['93.184.216.34'] : ['203.0.113.7'])
+    }
+
+    const result = await fetchWithGuardedRedirects('https://example.com/a', io)
+
+    assert.ok(result.ok)
+    assert.deepEqual(requested, [
+      { url: 'https://example.com/a', addresses: ['93.184.216.34'] },
+      { url: 'https://cdn.example.org/b', addresses: ['203.0.113.7'] }
+    ])
+  })
+
+  test('a hostname whose only answers are site-local (fec0::/10) is refused before any request', async () => {
+    const io = hopIo({})
+
+    io.resolveHost = async () => ['fec0::5']
+
+    const result = await fetchWithGuardedRedirects('https://site-local.example.net/page', io)
+
+    assert.deepEqual(result, { ok: false, reason: 'private-url' })
+    assert.deepEqual(io.requested, [])
   })
 })
