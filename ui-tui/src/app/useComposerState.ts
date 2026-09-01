@@ -20,6 +20,7 @@ import { isRemoteShellSession } from '../lib/terminalSetup.js'
 import { pasteTokenLabel, stripTrailingPasteNewlines } from '../lib/text.js'
 
 import type {
+  AttachmentDraftScope,
   ComposerPasteResult,
   ComposerToken,
   MaybePromise,
@@ -32,6 +33,54 @@ import { getUiState } from './uiStore.js'
 
 const TOKEN_MAX_COUNT = 32
 const TOKEN_MAX_TOTAL_BYTES = 4 * 1024 * 1024
+
+type ResolvedImageAttachment = (ClipboardPasteResponse | ImageAttachResponse) & { path: string }
+
+interface ComposerSnapshot {
+  draftVersion: number
+  sid: null | string
+  value: string
+}
+
+export const advanceDraftVersion = (current: number, preserveCurrentDraft: boolean): number =>
+  preserveCurrentDraft ? current : current + 1
+
+export const isAttachmentScopeCurrent = (
+  scope: AttachmentDraftScope | undefined,
+  draftVersion: number,
+  sid: string
+): boolean => !scope || (scope.draftVersion === draftVersion && scope.sid === sid)
+
+export const createSlashClearTracker = () => {
+  let pendingScope: AttachmentDraftScope | null = null
+  let preserve = false
+
+  return {
+    begin: (draftVersion: number, sid: string): AttachmentDraftScope => {
+      pendingScope = { draftVersion, sid }
+      preserve = false
+
+      return pendingScope
+    },
+    clear: (draftVersion: number) => {
+      const next = advanceDraftVersion(draftVersion, pendingScope !== null && preserve)
+
+      if (pendingScope) {
+        pendingScope.draftVersion = next
+      }
+
+      pendingScope = null
+      preserve = false
+
+      return next
+    },
+    markAttachment: (scope: AttachmentDraftScope) => {
+      if (pendingScope === scope) {
+        preserve = true
+      }
+    }
+  }
+}
 
 const trimTokens = (tokens: ComposerToken[]): ComposerToken[] => {
   let total = 0
@@ -105,6 +154,44 @@ export function looksLikeDroppedPath(text: string): boolean {
   return false
 }
 
+/** Resolve a slash-command attachment only while its originating draft remains active. */
+export async function resolveSlashAttachment<T extends ResolvedImageAttachment>(
+  request: () => Promise<T | null>,
+  readCurrentComposer: () => ComposerSnapshot,
+  expectedDraftVersion: number,
+  expectedSid: string,
+  attach: (
+    attached: T,
+    value: string,
+    cursor: number
+  ) => ComposerPasteResult,
+  discard: (attached: T) => void,
+  apply: (value: string) => void
+): Promise<ComposerPasteResult | null> {
+  const attached = await request()
+
+  if (!attached) {
+    return null
+  }
+
+  const current = readCurrentComposer()
+
+  if (current.draftVersion !== expectedDraftVersion || current.sid !== expectedSid) {
+    discard(attached)
+
+    return null
+  }
+
+  const next = attach(attached, current.value, current.value.length)
+
+  // Keep this write in the same request-resolution continuation as the live
+  // composer read above. A later microtask may resolve another attachment and
+  // must observe this value instead of computing from the same stale draft.
+  apply(next.value)
+
+  return next
+}
+
 export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions): UseComposerStateResult {
   const [input, setInputState] = useState('')
   const [inputBuf, setInputBuf] = useState<string[]>([])
@@ -114,6 +201,12 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   // of truth for "what is in the composer right now".
   const inputRef = useRef('')
   const tokensRef = useRef<ComposerToken[]>([])
+  const draftVersionRef = useRef(0)
+  const slashClearTrackerRef = useRef<ReturnType<typeof createSlashClearTracker> | null>(null)
+
+  if (!slashClearTrackerRef.current) {
+    slashClearTrackerRef.current = createSlashClearTracker()
+  }
 
   const setInput = useCallback<StateSetter<string>>(next => {
     inputRef.current = typeof next === 'function' ? next(inputRef.current) : next
@@ -144,7 +237,15 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   const { historyRef, historyIdx, setHistoryIdx, historyDraftRef, pushHistory } = useInputHistory()
   const { completions, compIdx, setCompIdx, compReplace } = useCompletion(input, isBlocked, gw)
 
+  const beginSlashClear = useCallback(() => {
+    const sid = getUiState().sid
+
+    return sid ? slashClearTrackerRef.current!.begin(draftVersionRef.current, sid) : null
+  }, [])
+
   const clearIn = useCallback(() => {
+    draftVersionRef.current = slashClearTrackerRef.current!.clear(draftVersionRef.current)
+
     setInput('')
     setInputBuf([])
     setComposerTokens([])
@@ -345,47 +446,93 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
   )
 
   /**
-   * `/paste` and `/image` attach without a cursor of their own — the token
-   * lands at the end of whatever is currently typed.
+   * `/paste` and `/image` clear their slash text without advancing the draft
+   * generation, so a multi-image batch and text typed while RPCs are in flight
+   * stay together. A later submit/cancel does advance the generation; detach
+   * any result that resolves after that boundary instead of silently moving it
+   * into an unrelated draft.
    */
-  const appendAttachment = useCallback(
-    (attach: (value: string, cursor: number) => Promise<ComposerPasteResult | null>) => {
-      const current = inputRef.current
+  const appendSlashAttachment = useCallback(
+    (
+      sid: string,
+      request: () => Promise<ResolvedImageAttachment | null>,
+      scope?: AttachmentDraftScope
+    ) => {
+      const expectedDraftVersion = scope?.draftVersion ?? draftVersionRef.current
+      const expectedSid = scope?.sid ?? sid
 
-      void attach(current, current.length).then(next => {
-        if (next) {
-          setInput(next.value)
-        }
-      })
+      void resolveSlashAttachment(
+        request,
+        () => ({ draftVersion: draftVersionRef.current, sid: getUiState().sid, value: inputRef.current }),
+        expectedDraftVersion,
+        expectedSid,
+        attachImageToken,
+        attached => {
+          void gw.request('image.detach', { path: attached.path, session_id: sid }).catch(() => {})
+        },
+        value => setInput(value)
+      )
+        .catch((e: Error) => sys(`error: ${e.message}`))
     },
-    [setInput]
+    [attachImageToken, gw, setInput, sys]
   )
 
-  const attachClipboardImage = useCallback(
-    () => appendAttachment((value, cursor) => pasteClipboardImage(value, cursor, false)),
-    [appendAttachment, pasteClipboardImage]
-  )
+  const attachClipboardImage = useCallback((scope?: AttachmentDraftScope) => {
+    const sid = getUiState().sid
+
+    if (!sid) {
+      return
+    }
+
+    if (!isAttachmentScopeCurrent(scope, draftVersionRef.current, sid)) {
+      return
+    }
+
+    if (scope) {
+      slashClearTrackerRef.current!.markAttachment(scope)
+    }
+
+    appendSlashAttachment(sid, async () => {
+      const attached = await gw
+        .request<ClipboardPasteResponse & { path?: string }>('clipboard.paste', { session_id: sid })
+        .catch(() => null)
+
+      if (!attached?.attached || !attached.path) {
+        sys(attached?.message || 'No image found in clipboard')
+
+        return null
+      }
+
+      return { ...attached, path: attached.path }
+    }, scope)
+  }, [appendSlashAttachment, gw, sys])
 
   const attachImagePath = useCallback(
-    (path: string) =>
-      appendAttachment(async (value, cursor) => {
-        const sid = getUiState().sid
+    (path: string, scope?: AttachmentDraftScope) => {
+      const sid = getUiState().sid
 
-        if (!sid || !path.trim()) {
-          return null
-        }
+      if (!sid || !path.trim()) {
+        return
+      }
 
-        const attached = await gw
-          .request<ImageAttachResponse & { path?: string }>('image.attach', { path, session_id: sid })
-          .catch((e: Error) => {
-            sys(`error: ${e.message}`)
+      if (!isAttachmentScopeCurrent(scope, draftVersionRef.current, sid)) {
+        return
+      }
 
-            return null
-          })
+      if (scope) {
+        slashClearTrackerRef.current!.markAttachment(scope)
+      }
 
-        return attached?.name ? attachImageToken(attached, value, cursor) : null
-      }),
-    [appendAttachment, attachImageToken, gw, sys]
+      appendSlashAttachment(sid, async () => {
+        const attached = await gw.request<ImageAttachResponse & { path?: string }>('image.attach', {
+          path,
+          session_id: sid
+        })
+
+        return attached?.name && attached.path ? { ...attached, path: attached.path } : null
+      }, scope)
+    },
+    [appendSlashAttachment, gw]
   )
 
   const openEditor = useCallback(async () => {
@@ -424,6 +571,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
     () => ({
       attachClipboardImage,
       attachImagePath,
+      beginSlashClear,
       clearIn,
       dequeue,
       enqueue,
@@ -444,6 +592,7 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
     [
       attachClipboardImage,
       attachImagePath,
+      beginSlashClear,
       clearIn,
       dequeue,
       enqueue,
