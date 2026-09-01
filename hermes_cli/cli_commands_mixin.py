@@ -2373,6 +2373,7 @@ class CLICommandsMixin:
                     verbose_logging=False,
                     session_id=task_id,
                     platform="cli",
+                    runtime_policy_origin="internal",
                     session_db=self._session_db,
                     reasoning_config=self.reasoning_config,
                     service_tier=self.service_tier,

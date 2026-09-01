@@ -128,6 +128,20 @@ RUN_BUDGET_WRAPUP_NOTICE = (
     "the state you already have, completing only mandatory writes."
 )
 
+def _runtime_policy_event_origin(agent: Any) -> str:
+    """Return trusted constructor provenance; unknown callers fail closed."""
+    origin = str(getattr(agent, "_runtime_policy_origin", "internal") or "internal")
+    return origin if origin in {"client", "internal"} else "internal"
+
+
+def _is_active_primary_provider(agent: Any, provider: str) -> bool:
+    """Whether ``provider`` is the active configured primary, not a fallback."""
+    if bool(getattr(agent, "_fallback_activated", False)):
+        return False
+    primary = getattr(agent, "_primary_runtime", None) or {}
+    primary_provider = str(primary.get("provider") or getattr(agent, "provider", ""))
+    return str(provider or "").strip().lower() == primary_provider.strip().lower()
+
 
 def _midturn_request_pressure_tokens(
     agent: Any,
@@ -2069,6 +2083,11 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    # Compute this for every turn before any fallback can be selected.  The
+    # selector deliberately trusts only this core-derived value and defaults
+    # to internal when invoked outside an authenticated turn.
+    agent._runtime_policy_event_origin = _runtime_policy_event_origin(agent)
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
@@ -3121,7 +3140,10 @@ def run_conversation(
                             f"⏳ {_nous_msg} Trying fallback..."
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
-                        if agent._try_activate_fallback():
+                        if agent._try_activate_fallback(
+                            FailoverReason.rate_limit,
+                            _arm_cooldown=False,
+                        ):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -3608,7 +3630,7 @@ def run_conversation(
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(FailoverReason.unknown):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3682,7 +3704,7 @@ def run_conversation(
                         # Try fallback before giving up
                         if agent._has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-                        if agent._try_activate_fallback():
+                        if agent._try_activate_fallback(FailoverReason.unknown):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -3860,7 +3882,9 @@ def run_conversation(
                         agent._buffer_status(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(
+                        FailoverReason.content_policy_blocked
+                    ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -4084,7 +4108,9 @@ def run_conversation(
                             agent._emit_status(
                                 "Content filter terminated stream; switching to fallback..."
                             )
-                            if agent._try_activate_fallback():
+                            if agent._try_activate_fallback(
+                                FailoverReason.content_policy_blocked
+                            ):
                                 # Roll the partial content (if any was already
                                 # appended in a prior continuation pass) back to
                                 # the last clean turn so the fallback provider
@@ -5755,6 +5781,27 @@ def run_conversation(
                 # + provider-specific troubleshooting guidance unchanged.
                 if (
                     classified.is_auth
+                    and agent.provider == "openai-codex"
+                    and _is_active_primary_provider(agent, agent.provider)
+                    and status_code in {401, 403}
+                    and api_request_id == getattr(agent, "_current_api_request_id", None)
+                    and str(api_request_id).startswith(f"{turn_id}:api:")
+                ):
+                    try:
+                        from hermes_cli.plugins import notify_primary_auth_failure
+
+                        notify_primary_auth_failure(
+                            provider=agent.provider,
+                            status_code=status_code,
+                            detail=str(api_error),
+                            turn_id=turn_id,
+                            session_id=agent.session_id or "",
+                            event_origin=agent._runtime_policy_event_origin,
+                        )
+                    except Exception as exc:
+                        logger.warning("Primary auth-failure policy notification failed: %s", exc)
+                if (
+                    classified.is_auth
                     and not _retry.auth_failover_attempted
                     and agent._fallback_index < len(agent._fallback_chain)
                 ):
@@ -6454,7 +6501,7 @@ def run_conversation(
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6476,6 +6523,36 @@ def run_conversation(
                     # it verbatim (e.g. a cron failure notification dumped a
                     # ~60KB Cloudflare challenge page as 31 Discord messages).
                     _nonretryable_summary = agent._summarize_api_error(api_error)
+                    if (
+                        classified.is_auth
+                        and _provider == "openai-codex"
+                        and _is_active_primary_provider(agent, _provider)
+                    ):
+                        try:
+                            from hermes_cli.plugins import transform_client_auth_failure
+
+                            _nonretryable_summary = transform_client_auth_failure(
+                                default_message=(
+                                    "Authentication failed. Reconnect the primary model "
+                                    "and retry this request."
+                                ),
+                                provider=_provider,
+                                status_code=status_code,
+                                turn_id=turn_id,
+                                session_id=agent.session_id or "",
+                                event_origin=str(
+                                    getattr(
+                                        agent,
+                                        "_runtime_policy_event_origin",
+                                        "internal",
+                                    )
+                                ),
+                            )
+                        except Exception:
+                            _nonretryable_summary = (
+                                "Authentication failed. Reconnect the primary model "
+                                "and retry this request."
+                            )
                     if classified.reason == FailoverReason.content_policy_blocked:
                         agent._emit_status(
                             f"❌ Provider safety filter blocked this request: "
@@ -6668,7 +6745,7 @@ def run_conversation(
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -8307,7 +8384,7 @@ def run_conversation(
                             "⚠️ Model returning empty responses — "
                             "switching to fallback provider..."
                         )
-                        if agent._try_activate_fallback():
+                        if agent._try_activate_fallback(FailoverReason.unknown):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             agent._empty_content_retries = 0

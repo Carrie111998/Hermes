@@ -242,6 +242,186 @@ def file_ops(mock_env):
     return ShellFileOperations(mock_env)
 
 
+class TestFileSearchPolicyHook:
+    def _install_hook(self, monkeypatch, callback):
+        import hermes_cli.plugins as plugins
+
+        manager = plugins.PluginManager()
+        manager._discovered = True
+        manager._hooks["effective_file_search_context"] = [callback]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+    def test_receives_live_backend_context_before_search_subprocess(self, monkeypatch):
+        seen = {}
+
+        def policy(**kwargs):
+            seen.update(kwargs)
+            return {"action": "block", "message": "blocked by test policy"}
+
+        self._install_hook(monkeypatch, policy)
+        env = MagicMock()
+        env.cwd = "/workspace/live"
+        env.is_local = True
+        env.execute.return_value = {
+            "output": "/workspace/live/relative\n",
+            "returncode": 0,
+        }
+        ops = ShellFileOperations(env, cwd="/workspace/stale")
+
+        result = ops.search("needle", path="relative")
+
+        assert result.error == "blocked by test policy"
+        assert seen["path"] == "/workspace/live/relative"
+        assert seen["cwd"] == "/workspace/live"
+        assert seen["backend"] == type(env).__name__
+        assert seen["is_local"] is True
+        env.execute.assert_called_once()
+        assert "realpath" in env.execute.call_args.args[0]
+        assert "rg " not in env.execute.call_args.args[0]
+
+    def test_registered_policy_without_decision_fails_closed(self, monkeypatch):
+        self._install_hook(monkeypatch, lambda **kwargs: None)
+        env = MagicMock()
+        env.cwd = "/workspace"
+        env.is_local = True
+        env.execute.return_value = {"output": "/workspace\n", "returncode": 0}
+
+        result = ShellFileOperations(env).search("needle", path=".")
+
+        assert "returned no decision" in result.error
+        env.execute.assert_called_once()
+
+    def test_message_less_block_wins_over_an_allow(self, monkeypatch):
+        import hermes_cli.plugins as plugins
+
+        manager = plugins.PluginManager()
+        manager._discovered = True
+        manager._hooks["effective_file_search_context"] = [
+            lambda **kwargs: {"action": "block"},
+            lambda **kwargs: {"action": "allow"},
+        ]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        env = MagicMock()
+        env.cwd = "/workspace"
+        env.is_local = True
+        env.execute.return_value = {"output": "/workspace\n", "returncode": 0}
+
+        result = ShellFileOperations(env).search("needle", path=".")
+
+        assert result.error == "File search blocked by runtime policy."
+        env.execute.assert_called_once()
+
+    def test_one_missing_decision_cannot_be_overridden_by_an_allow(self, monkeypatch):
+        import hermes_cli.plugins as plugins
+
+        manager = plugins.PluginManager()
+        manager._discovered = True
+        manager._hooks["effective_file_search_context"] = [
+            lambda **kwargs: None,
+            lambda **kwargs: {"action": "allow"},
+        ]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        env = MagicMock()
+        env.cwd = "/workspace"
+        env.is_local = True
+        env.execute.return_value = {"output": "/workspace\n", "returncode": 0}
+
+        result = ShellFileOperations(env).search("needle", path=".")
+
+        assert "returned no decision" in result.error
+        env.execute.assert_called_once()
+
+    def test_policy_path_rewrites_fail_closed(self, monkeypatch):
+        import hermes_cli.plugins as plugins
+
+        manager = plugins.PluginManager()
+        manager._discovered = True
+        manager._hooks["effective_file_search_context"] = [
+            lambda **kwargs: {"action": "allow", "path": "/approved/one"},
+        ]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        env = MagicMock()
+        env.cwd = "/workspace"
+        env.is_local = True
+        env.execute.return_value = {"output": "/workspace\n", "returncode": 0}
+
+        result = ShellFileOperations(env).search("needle", path=".")
+
+        assert "cannot rewrite paths" in result.error
+
+    def test_explicit_multi_root_block_is_not_retried_by_component(self, monkeypatch):
+        seen = []
+
+        def policy(**kwargs):
+            seen.append(kwargs["path"])
+            if " " in kwargs["path"]:
+                return {"action": "block", "message": "combined roots blocked"}
+            return {"action": "allow"}
+
+        self._install_hook(monkeypatch, policy)
+        env = MagicMock()
+        env.cwd = "/workspace"
+        env.is_local = True
+        env.execute.return_value = {
+            "output": "/workspace/one /workspace/two\n",
+            "returncode": 0,
+        }
+
+        result = ShellFileOperations(env).search(
+            "needle", path="/workspace/one /workspace/two"
+        )
+
+        assert result.error == "combined roots blocked"
+        assert seen == ["/workspace/one /workspace/two"]
+        env.execute.assert_called_once()
+
+    def test_policy_receives_backend_resolved_path(self, monkeypatch):
+        seen = {}
+
+        def policy(**kwargs):
+            seen.update(kwargs)
+            return {"action": "block", "message": "resolved path checked"}
+
+        self._install_hook(monkeypatch, policy)
+        env = MagicMock()
+        env.cwd = "/workspace"
+        env.is_local = True
+        env.execute.return_value = {
+            "output": "/restricted/target\n",
+            "returncode": 0,
+        }
+
+        result = ShellFileOperations(env).search(
+            "needle", path="/approved/link/../target"
+        )
+
+        assert result.error == "resolved path checked"
+        assert seen["path"] == "/restricted/target"
+
+    def test_real_backend_symlink_is_resolved_before_policy(
+        self, monkeypatch, tmp_path
+    ):
+        allowed = tmp_path / "allowed"
+        restricted = tmp_path / "restricted"
+        allowed.mkdir()
+        restricted.mkdir()
+        (allowed / "link").symlink_to(restricted, target_is_directory=True)
+        seen = {}
+
+        def policy(**kwargs):
+            seen.update(kwargs)
+            return {"action": "block", "message": "canonical target denied"}
+
+        self._install_hook(monkeypatch, policy)
+        env = make_real_subprocess_env(str(tmp_path))
+        env.is_local = True
+
+        result = ShellFileOperations(env).search("needle", path=str(allowed / "link"))
+
+        assert result.error == "canonical target denied"
+        assert seen["path"] == str(restricted.resolve())
+
+
 def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMock:
     """Mock env whose execute() runs the command in a real subprocess.
 

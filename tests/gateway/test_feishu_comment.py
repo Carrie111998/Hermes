@@ -117,6 +117,33 @@ class TestSanitizeCommentText(unittest.TestCase):
         self.assertNotIn("&amp;gt;", result)
 
 
+class TestCommentAgentProvenance(unittest.TestCase):
+    def test_inbound_comment_agent_is_client_originated(self):
+        from plugins.platforms.feishu import feishu_comment
+
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_conversation(self, *_args, **_kwargs):
+                return {"final_response": "ok", "api_calls": 1, "messages": []}
+
+        with (
+            patch("run_agent.AIAgent", FakeAgent),
+            patch.object(
+                feishu_comment,
+                "_resolve_model_and_runtime",
+                return_value=("test-model", {"provider": "test"}),
+            ),
+        ):
+            result = feishu_comment._run_comment_agent("hello", Mock())
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(captured["runtime_policy_origin"], "client")
+
+
 class TestWikiReverseLookup(unittest.TestCase):
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)

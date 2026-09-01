@@ -932,6 +932,10 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 | `pre_api_request` | Before each raw provider API request (several per turn when the model calls tools) | `session_id: str, model: str, provider: str, base_url: str, api_mode: str, api_call_count: int, message_count: int, tool_count: int, approx_input_tokens: int, max_tokens: int, request: dict` | ignored |
 | `post_api_request` | After each raw provider API request returns | `pre_api_request` fields plus `api_duration: float, finish_reason: str, response_model: str \| None, usage: dict, response: dict, assistant_content_chars: int, assistant_tool_call_count: int` | ignored |
 | `api_request_error` | A provider API call raised | correlation fields plus `status_code: int \| None, retry_count: int \| None, max_retries: int \| None, retryable: bool \| None, reason: str \| None, error: dict, request: dict` | ignored |
+| `effective_file_search_context` | Before any file-search existence/search subprocess, after canonical backend path and cwd resolution | `path: str, cwd: str, backend: str, is_local: bool` | required `allow`/`block` policy decision when registered; path rewrites rejected |
+| `primary_auth_failure_context` | Verified primary Codex 401/403 | `provider, status_code, detail, failure_scope, turn_id, session_id, event_origin` | ignored |
+| `fallback_candidate_decision` | Before fallback client construction/network dispatch | `entry: dict` (non-secret route fields only; `base_url` is reduced to scheme/host/port), `reason: str, turn_id, session_id, event_origin` | required `allow`/`block` policy decision when registered |
+| `client_safe_auth_failure` | Terminal primary Codex auth failure | `default_message, provider, status_code, turn_id, session_id, event_origin` | optional safe replacement string/message |
 | [`on_session_start`](/user-guide/features/hooks#on_session_start) | New session created (first turn only) | `session_id: str, model: str, platform: str` | ignored |
 | [`on_session_end`](/user-guide/features/hooks#on_session_end) | End of every `run_conversation` call + CLI exit | `session_id: str, completed: bool, interrupted: bool, model: str, platform: str` | ignored |
 | [`on_session_finalize`](/user-guide/features/hooks#on_session_finalize) | CLI/gateway tears down an active session | `session_id: str \| None, platform: str` | ignored |
@@ -941,7 +945,7 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 | `kanban_task_completed` | A kanban task completes (worker process) | `task_id, board, assignee, run_id, profile_name, summary: str \| None` | ignored |
 | `kanban_task_blocked` | A kanban task is blocked (worker process) | `task_id, board, assignee, run_id, profile_name, reason: str \| None` | ignored |
 
-Most hooks are fire-and-forget observers — their return values are ignored. The exceptions are `pre_llm_call`, which can inject context into the conversation, and `pre_tool_call`, which can return a block/approve directive.
+Most hooks are fire-and-forget observers — their return values are ignored. The directive/transform hooks above have explicit return contracts; notably `effective_file_search_context` and `fallback_candidate_decision` fail closed once a policy registers for them.
 
 All callbacks should accept `**kwargs` for forward compatibility. If a hook callback crashes, it's logged and skipped. Other hooks and the agent continue normally.
 

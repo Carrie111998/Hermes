@@ -90,6 +90,13 @@ def test_fallback_reason_text_is_operator_friendly(reason, expected):
     assert chat_completion_helpers._fallback_reason_text(reason) == expected
 
 
+def test_legacy_query_entrypoint_is_client_originated():
+    import inspect
+    import run_agent
+
+    assert 'runtime_policy_origin="client"' in inspect.getsource(run_agent.main)
+
+
 def test_fallback_reason_text_defaults_when_reason_is_missing():
     assert chat_completion_helpers._fallback_reason_text(None) == "provider failure"
 
@@ -112,6 +119,185 @@ class TestFallbackChainAdvancement:
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
 
+    def test_runtime_policy_blocks_candidate_before_client_resolution(self, monkeypatch):
+        import hermes_cli.plugins as plugins
+
+        manager = plugins.PluginManager()
+        manager._discovered = True
+
+        def decide(entry, **kwargs):
+            if entry.get("provider") == "openrouter":
+                return {"action": "block", "message": "paid route denied"}
+            return {"action": "allow"}
+
+        manager._hooks["fallback_candidate_decision"] = [decide]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "openrouter", "model": "paid/model"},
+                {"provider": "zai", "model": "glm-5.2"},
+            ]
+        )
+        agent._runtime_policy_event_origin = "client"
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(base_url="https://api.z.ai/v1"), "glm-5.2"),
+        ) as resolve:
+            assert agent._try_activate_fallback(FailoverReason.auth) is True
+
+        assert agent._fallback_index == 2
+        assert agent.model == "glm-5.2"
+        resolve.assert_called_once()
+        assert agent._runtime_policy_event_origin == "client"
+
+    def test_runtime_policy_origin_uses_explicit_constructor_provenance(self):
+        from agent.conversation_loop import _runtime_policy_event_origin
+
+        agent = _make_agent(fallback_model=None)
+        agent._runtime_policy_origin = "internal"
+        agent.platform = "telegram"
+        assert _runtime_policy_event_origin(agent) == "internal"
+
+        agent._runtime_policy_origin = "client"
+        agent.platform = "cron"
+        assert _runtime_policy_event_origin(agent) == "client"
+        agent._parent_session_id = "parent-session"
+        assert _runtime_policy_event_origin(agent) == "client"
+
+        agent._runtime_policy_origin = "untrusted"
+        assert _runtime_policy_event_origin(agent) == "internal"
+
+    def test_one_broken_policy_cannot_be_overridden_by_an_allow(self, monkeypatch):
+        import hermes_cli.plugins as plugins
+
+        manager = plugins.PluginManager()
+        manager._discovered = True
+        manager._hooks["fallback_candidate_decision"] = [
+            lambda **kwargs: None,
+            lambda **kwargs: {"action": "allow"},
+        ]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "paid/model"}
+        )
+        with patch("agent.auxiliary_client.resolve_provider_client") as resolve:
+            assert agent._try_activate_fallback(FailoverReason.auth) is False
+        resolve.assert_not_called()
+
+    def test_policy_denials_arm_rate_limit_cooldown_only_once(self, monkeypatch):
+        import hermes_cli.plugins as plugins
+
+        manager = plugins.PluginManager()
+        manager._discovered = True
+        manager._hooks["fallback_candidate_decision"] = [
+            lambda **kwargs: {"action": "block"}
+        ]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        agent = _make_agent(
+            fallback_model=[
+                {"provider": "openrouter", "model": "paid/one"},
+                {"provider": "openrouter", "model": "paid/two"},
+            ]
+        )
+        agent._rate_limit_backoff_count = 0
+
+        assert agent._try_activate_fallback(FailoverReason.rate_limit) is False
+
+        assert agent._rate_limit_backoff_count == 1
+
+    def test_runtime_policy_callback_never_receives_inline_credentials(
+        self, monkeypatch
+    ):
+        import hermes_cli.plugins as plugins
+
+        seen = {}
+        manager = plugins.PluginManager()
+        manager._discovered = True
+
+        def decide(entry, **kwargs):
+            seen.update(entry)
+            return {"action": "block"}
+
+        manager._hooks["fallback_candidate_decision"] = [decide]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        agent = _make_agent(
+            fallback_model={
+                "provider": "openrouter",
+                "model": "paid/model",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "must-not-reach-policy",
+            }
+        )
+        with patch("agent.auxiliary_client.resolve_provider_client") as resolve:
+            assert agent._try_activate_fallback(FailoverReason.auth) is False
+
+        assert seen == {
+            "provider": "openrouter",
+            "model": "paid/model",
+            "base_url": "https://openrouter.ai",
+        }
+        resolve.assert_not_called()
+
+    def test_runtime_policy_redacts_credentials_embedded_in_base_url(
+        self, monkeypatch
+    ):
+        import hermes_cli.plugins as plugins
+
+        seen = {}
+        manager = plugins.PluginManager()
+        manager._discovered = True
+
+        def decide(entry, **kwargs):
+            seen.update(entry)
+            return {"action": "block"}
+
+        manager._hooks["fallback_candidate_decision"] = [decide]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        agent = _make_agent(
+            fallback_model={
+                "provider": "custom",
+                "model": "paid/model",
+                "base_url": (
+                    "https://user:password@example.test:8443/tenant-secret"
+                    "?token=query-secret#fragment-secret"
+                ),
+            }
+        )
+        with patch("agent.auxiliary_client.resolve_provider_client") as resolve:
+            assert agent._try_activate_fallback(FailoverReason.auth) is False
+
+        assert seen["base_url"] == "https://example.test:8443"
+        assert "secret" not in repr(seen)
+        assert "password" not in repr(seen)
+        resolve.assert_not_called()
+
+    def test_primary_provider_check_rejects_active_fallback(self):
+        from agent.conversation_loop import _is_active_primary_provider
+
+        agent = _make_agent(fallback_model=None)
+        agent.provider = "openai-codex"
+        agent._primary_runtime = {"provider": "zai"}
+        agent._fallback_activated = True
+        assert _is_active_primary_provider(agent, "openai-codex") is False
+
+        agent.provider = "zai"
+        agent._fallback_activated = False
+        assert _is_active_primary_provider(agent, "zai") is True
+
+    def test_registered_policy_without_decision_blocks_all_candidates(self, monkeypatch):
+        import hermes_cli.plugins as plugins
+
+        manager = plugins.PluginManager()
+        manager._discovered = True
+        manager._hooks["fallback_candidate_decision"] = [lambda **kwargs: None]
+        monkeypatch.setattr(plugins, "_plugin_manager", manager)
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "paid/model"}
+        )
+        with patch("agent.auxiliary_client.resolve_provider_client") as resolve:
+            assert agent._try_activate_fallback(FailoverReason.auth) is False
+        resolve.assert_not_called()
+
     def test_records_user_visible_switch_with_reason(self):
         agent = _make_agent(
             fallback_model={"provider": "zai", "model": "glm-5.2"},
@@ -130,6 +316,24 @@ class TestFallbackChainAdvancement:
         )
         assert agent._pending_fallback_notice == [expected]
         assert agent._retry_status_buffer[-1] == ("status", expected)
+
+    def test_known_rate_limit_marker_does_not_arm_a_new_cooldown(self):
+        agent = _make_agent(
+            fallback_model={"provider": "zai", "model": "glm-5.2"},
+        )
+        agent._rate_limit_backoff_count = 3
+        agent._rate_limited_until = 123.0
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(base_url="https://api.z.ai/v1"), "glm-5.2"),
+        ):
+            assert agent._try_activate_fallback(
+                FailoverReason.rate_limit,
+                _arm_cooldown=False,
+            ) is True
+
+        assert agent._rate_limit_backoff_count == 3
+        assert agent._rate_limited_until == 123.0
 
     def test_records_sequential_switches_in_order(self):
         agent = _make_agent(

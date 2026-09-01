@@ -3422,6 +3422,18 @@ def _try_resolve_fallback_provider() -> dict | None:
         if not fb_list:
             return None
         for entry in fb_list:
+            from hermes_cli.plugins import get_fallback_candidate_block_reason
+
+            block = get_fallback_candidate_block_reason(
+                entry=entry,
+                reason="auth",
+                turn_id="",
+                session_id="",
+                event_origin="internal",
+            )
+            if block:
+                logger.warning("Gateway startup fallback denied: %s", block)
+                continue
             try:
                 from hermes_cli.fallback_config import resolve_entry_api_key
 
@@ -6203,6 +6215,7 @@ class TurnRunner:
                 provider_require_parameters=pr.get("require_parameters", False),
                 provider_data_collection=pr.get("data_collection"),
                 session_id=ctx.session_id,
+                runtime_policy_origin="client",
                 platform=platform_key,
                 user_id=ctx.source.user_id,
                 user_id_alt=ctx.source.user_id_alt,
@@ -21230,6 +21243,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
                                     session_db=_hyg_session_db,
+                                    runtime_policy_origin="internal",
                                 )
                                 _seed_hygiene_system_prompt(
                                     _hyg_agent,
@@ -24559,6 +24573,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider_require_parameters=pr.get("require_parameters", False),
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
+                    runtime_policy_origin="internal",
                     platform=platform_key,
                     user_id=source.user_id,
                     user_id_alt=source.user_id_alt,

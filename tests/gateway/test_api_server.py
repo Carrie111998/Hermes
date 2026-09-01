@@ -225,6 +225,7 @@ class TestAdapterInit:
         assert captured["checkpoint_max_snapshots"] == 7
         assert captured["checkpoint_max_total_size_mb"] == 321
         assert captured["checkpoint_max_file_size_mb"] == 4
+        assert captured["runtime_policy_origin"] == "client"
 
 
 # ---------------------------------------------------------------------------

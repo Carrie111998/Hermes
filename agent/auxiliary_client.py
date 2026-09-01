@@ -6062,7 +6062,11 @@ def _try_configured_fallback_chain(
         label = f"fallback_chain[{i}]({fb_provider})"
 
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            fb_client, resolved_model = _resolve_fallback_entry(
+                entry,
+                reason=reason,
+                task=task,
+            )
         except Exception:
             fb_client, resolved_model = None, None
 
@@ -6130,11 +6134,28 @@ def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
     return resolve_entry_api_key(entry)
 
 
-def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
+def _resolve_fallback_entry(
+    entry: Dict[str, Any],
+    *,
+    reason: str = "error",
+    task: Optional[str] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
     """Resolve one fallback entry through the central provider router."""
     provider = str(entry.get("provider") or "").strip()
     model = str(entry.get("model") or "").strip() or None
     if not provider or not model:
+        return None, None
+    from hermes_cli.plugins import get_fallback_candidate_block_reason
+
+    block = get_fallback_candidate_block_reason(
+        entry=entry,
+        reason=reason,
+        turn_id=str(task or ""),
+        session_id="",
+        event_origin="internal",
+    )
+    if block:
+        logger.warning("Auxiliary %s fallback denied: %s", task or "call", block)
         return None, None
     base_url = str(entry.get("base_url") or "").strip() or None
     api_key = _fallback_entry_api_key(entry)
@@ -6204,7 +6225,11 @@ def _try_main_fallback_chain(
             tried.append(f"{label} (unhealthy)")
             continue
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            fb_client, resolved_model = _resolve_fallback_entry(
+                entry,
+                reason=reason,
+                task=task,
+            )
         except Exception as exc:
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None

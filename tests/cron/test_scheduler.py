@@ -1221,6 +1221,44 @@ class TestRunJobConfigEnvVarExpansion:
         assert kwargs["provider"] == "openrouter"
         assert kwargs["model"] == "z-ai/glm-5.2"
 
+    def test_auth_fallback_policy_denial_precedes_cron_resolution(self, tmp_path):
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  default: gpt-5.6-sol\n  provider: openai-codex\n"
+            "fallback_providers:\n"
+            "  - provider: openrouter\n    model: paid/model\n",
+            encoding="utf-8",
+        )
+        job = {"id": "policy-denied", "name": "policy denied", "prompt": "hi"}
+        requested = []
+
+        def resolve_runtime(**kwargs):
+            requested.append(kwargs.get("requested"))
+            if len(requested) > 1:
+                raise AssertionError("denied cron fallback must not resolve")
+            raise AuthError("primary unavailable")
+
+        with (
+            patch("cron.scheduler._hermes_home", tmp_path),
+            patch("cron.scheduler._resolve_origin", return_value=None),
+            patch("hermes_cli.env_loader.load_hermes_dotenv"),
+            patch("hermes_cli.env_loader.reset_secret_source_cache"),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=resolve_runtime,
+            ),
+            patch(
+                "hermes_cli.plugins.get_fallback_candidate_block_reason",
+                return_value="denied cron fallback",
+            ),
+        ):
+            success, _, _, error = run_job(job)
+
+        assert success is False
+        assert error
+        assert requested == [None]
+
 
     def test_unexpanded_ref_passthrough_when_var_unset(self, tmp_path, monkeypatch):
         """When the env var is not set, the literal ${VAR} is kept verbatim (not crashed)."""

@@ -6200,6 +6200,23 @@ def run_job(
                 fb_model = str(entry.get("model") or "").strip()
                 if not fb_provider or not fb_model:
                     continue
+                from hermes_cli.plugins import get_fallback_candidate_block_reason
+
+                fb_block = get_fallback_candidate_block_reason(
+                    entry=entry,
+                    reason="auth" if is_auth else "connection",
+                    turn_id="",
+                    session_id=_cron_session_id,
+                    event_origin="internal",
+                )
+                if fb_block:
+                    logger.warning(
+                        "Job '%s': fallback %s denied: %s",
+                        job_id,
+                        fb_provider,
+                        fb_block,
+                    )
+                    continue
                 try:
                     from hermes_cli.fallback_config import resolve_entry_api_key
 
@@ -6460,6 +6477,7 @@ def run_job(
             skip_memory=False,
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
+            runtime_policy_origin="internal",
             session_id=_cron_session_id,
             session_db=_session_db,
         )

@@ -54,4 +54,35 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
         # Should have been called at least twice (primary + fallback)
         assert call_count["n"] >= 2
 
+    def test_auth_error_does_not_resolve_policy_denied_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli.auth import AuthError
+        from gateway.run import _resolve_runtime_agent_kwargs
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  provider: openai-codex\n"
+            "fallback_model:\n  provider: openrouter\n  model: paid/model\n"
+        )
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        calls = []
+
+        def resolve(**kwargs):
+            calls.append(kwargs.get("requested"))
+            raise AuthError("primary unavailable")
+
+        with (
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                side_effect=resolve,
+            ),
+            patch(
+                "hermes_cli.plugins.get_fallback_candidate_block_reason",
+                return_value="denied at gateway startup",
+            ),
+            pytest.raises(RuntimeError),
+        ):
+            _resolve_runtime_agent_kwargs()
+
+        assert calls == [None]
 

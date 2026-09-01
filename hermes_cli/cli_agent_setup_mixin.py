@@ -86,6 +86,18 @@ class CLIAgentSetupMixin:
                     _fb_model = (_fb.get("model") or "").strip()
                     if not _fb_provider or not _fb_model:
                         continue
+                    from hermes_cli.plugins import get_fallback_candidate_block_reason
+
+                    _fb_block = get_fallback_candidate_block_reason(
+                        entry=_fb,
+                        reason="auth",
+                        turn_id="",
+                        session_id=str(self.session_id or ""),
+                        event_origin="client",
+                    )
+                    if _fb_block:
+                        logger.warning("CLI startup fallback denied: %s", _fb_block)
+                        continue
                     try:
                         from hermes_cli.fallback_config import resolve_entry_api_key
 
@@ -548,6 +560,7 @@ class CLIAgentSetupMixin:
                 openrouter_min_coding_score=self._openrouter_min_coding_score,
                 session_id=self.session_id,
                 platform="cli",
+                runtime_policy_origin="client",
                 session_db=self._session_db,
                 # A -q turn never builds the prompt_toolkit application, so
                 # the interactive modal can never be painted or answered —

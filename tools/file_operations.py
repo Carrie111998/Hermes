@@ -64,6 +64,10 @@ _MACOS_TCC_PROTECTED_HOME_DIRS = (
     "Pictures",
 )
 
+_SEARCH_POLICY_RESOLUTION_ERROR = (
+    "File search blocked because its effective backend path could not be resolved."
+)
+
 
 def _macos_protected_search_exclusions(
     path: str,
@@ -2806,6 +2810,60 @@ class ShellFileOperations(FileOperations):
     # =========================================================================
     # SEARCH Implementation
     # =========================================================================
+
+    def _apply_file_search_policy(self, path: str) -> tuple[Optional[str], str]:
+        """Evaluate plugin policy with the effective execution context.
+
+        This is deliberately inside ``ShellFileOperations``: only this module
+        knows the backend that will execute the search and its live cwd.  A
+        bounded backend probe resolves home, ``..``, and symlinks before the
+        hook; the hook then fires before any search or existence-check process.
+        """
+        env = getattr(self, "env", None)
+        cwd = getattr(env, "cwd", None) or self.cwd
+        backend = type(env).__name__ if env is not None else "unknown"
+        is_local = bool(getattr(env, "is_local", True))
+        try:
+            from hermes_cli.plugins import (
+                get_file_search_policy_decision,
+                has_hook,
+            )
+
+            if not has_hook("effective_file_search_context"):
+                return None, path
+
+            expanded = self._expand_path(path)
+            quoted = self._escape_shell_arg(expanded)
+            resolved = self._exec(
+                "p="
+                + quoted
+                + "; "
+                + 'r="$(realpath "$p" 2>/dev/null || readlink -f "$p" 2>/dev/null || true)"; '
+                + 'if [ -z "$r" ]; then '
+                + '  [ -L "$p" ] && exit 1; '
+                + '  d="$(dirname "$p")"; b="$(basename "$p")"; '
+                + '  d="$(cd "$d" 2>/dev/null && pwd -P)" || exit 1; '
+                + '  r="${d%/}/$b"; '
+                + "fi; printf '%s\\n' \"$r\""
+            )
+            effective_path = resolved.stdout.strip()
+            if resolved.exit_code != 0 or not effective_path:
+                return (_SEARCH_POLICY_RESOLUTION_ERROR, path)
+
+            return get_file_search_policy_decision(
+                path=effective_path,
+                cwd=str(cwd),
+                backend=backend,
+                is_local=is_local,
+            )
+        except Exception:
+            # Plugin discovery/dispatch failures must not bypass a registered
+            # search policy.  The helper itself distinguishes "no hook" from
+            # a broken hook; an import failure cannot make that distinction.
+            return (
+                "File search blocked because its runtime policy could not be evaluated.",
+                path,
+            )
     
     def search(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
@@ -2828,6 +2886,35 @@ class ShellFileOperations(FileOperations):
         """
         offset, limit = normalize_search_pagination(offset, limit)
 
+        policy_error, path = self._apply_file_search_policy(path)
+        if policy_error:
+            # Legacy multi-path recovery is only safe when the combined input
+            # could not be resolved as one backend path.  An explicit policy
+            # block applies to the original request and must never be retried
+            # as independently authorized components.
+            if policy_error != _SEARCH_POLICY_RESOLUTION_ERROR:
+                return SearchResult(error=policy_error, total_count=0)
+            parts = [
+                part
+                for chunk in path.split(",")
+                for part in chunk.split()
+                if part.strip()
+            ]
+            if len(parts) >= 2:
+                multi = self._try_multi_path_search(
+                    pattern,
+                    path,
+                    target,
+                    file_glob,
+                    limit,
+                    offset,
+                    output_mode,
+                    context,
+                )
+                if multi is not None:
+                    return multi
+            return SearchResult(error=policy_error, total_count=0)
+
         # Expand ~ and other shell paths
         path = self._expand_path(path)
         
@@ -2845,6 +2932,9 @@ class ShellFileOperations(FileOperations):
                 return multi
             # Try to suggest nearby paths
             parent = os.path.dirname(path) or "."
+            parent_policy_error, parent = self._apply_file_search_policy(parent)
+            if parent_policy_error:
+                return SearchResult(error=parent_policy_error, total_count=0)
             basename_query = os.path.basename(path)
             hint_parts = [f"Path not found: {path}"]
             # Check if parent directory exists and list similar entries
@@ -2925,6 +3015,9 @@ class ShellFileOperations(FileOperations):
             return None
         existing, missing = [], []
         for p in parts:
+            policy_error, p = self._apply_file_search_policy(p)
+            if policy_error:
+                return SearchResult(error=policy_error, total_count=0)
             expanded = self._expand_path(p)
             chk = self._exec(
                 f"test -e {self._escape_shell_arg(expanded)} && echo exists || echo not_found"

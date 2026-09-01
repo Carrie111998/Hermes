@@ -67,3 +67,38 @@ def test_init_raises_when_no_fallback_configured():
                 skip_memory=True,
                 fallback_model=None,
             )
+
+
+def test_init_does_not_resolve_policy_denied_fallback(monkeypatch):
+    import hermes_cli.plugins as plugins
+
+    manager = plugins.PluginManager()
+    manager._discovered = True
+    manager._hooks["fallback_candidate_decision"] = [
+        lambda **kwargs: {"action": "block", "message": "denied at init"}
+    ]
+    monkeypatch.setattr(plugins, "_plugin_manager", manager)
+
+    def fake_resolve(provider, **kwargs):
+        if provider == "tencent-token-plan":
+            raise AssertionError("denied fallback must not resolve credentials")
+        return None, None
+
+    with (
+        patch("agent.auxiliary_client.resolve_provider_client", side_effect=fake_resolve),
+        patch("run_agent.get_tool_definitions", return_value=_make_tool_defs()),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI", return_value=MagicMock()),
+        pytest.raises(RuntimeError, match="no API key was found"),
+    ):
+        AIAgent(
+            provider="alibaba-coding-plan",
+            model="qwen3.6-plus",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            runtime_policy_origin="client",
+            fallback_model=[
+                {"provider": "tencent-token-plan", "model": "kimi2.5"}
+            ],
+        )

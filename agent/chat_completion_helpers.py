@@ -2504,7 +2504,12 @@ def _fallback_reason_text(reason: "FailoverReason | None") -> str:
     return str(value or reason or "provider failure").replace("_", " ")
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(
+    agent,
+    reason: "FailoverReason | None" = None,
+    *,
+    _arm_cooldown: bool = True,
+) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -2516,7 +2521,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+    if _arm_cooldown and reason in {
+        FailoverReason.rate_limit,
+        FailoverReason.billing,
+        FailoverReason.upstream_rate_limit,
+    }:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.
@@ -2564,11 +2573,40 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent._unavailable_fallback_keys = unavailable
     if fb_key in unavailable:
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _arm_cooldown=False)
     fb_provider = (fb.get("provider") or "").strip().lower()
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
-        return agent._try_activate_fallback(reason)  # skip invalid, try next
+        return try_activate_fallback(
+            agent, reason, _arm_cooldown=False
+        )  # skip invalid, try next
+
+    try:
+        from hermes_cli.plugins import get_fallback_candidate_block_reason
+
+        policy_block = get_fallback_candidate_block_reason(
+            entry=fb,
+            reason=str(getattr(reason, "value", reason) or ""),
+            turn_id=str(getattr(agent, "_current_turn_id", "") or ""),
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            # The primary-failure seam derives this from the authenticated
+            # turn context.  Missing context is internal so paid routes fail
+            # closed instead of trusting a selector-local guess.
+            event_origin=str(
+                getattr(agent, "_runtime_policy_event_origin", "internal")
+            ),
+        )
+    except Exception as exc:
+        logger.warning("Fallback candidate policy unavailable: %s", exc)
+        policy_block = "Fallback blocked because its runtime policy could not be evaluated."
+    if policy_block:
+        logger.warning(
+            "Fallback candidate %s/%s denied by runtime policy: %s",
+            fb_provider,
+            fb_model,
+            policy_block,
+        )
+        return try_activate_fallback(agent, reason, _arm_cooldown=False)
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2579,7 +2617,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             local_skip_reason,
         )
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _arm_cooldown=False)
 
     # Skip entries that resolve to the same backend that just failed —
     # falling back to it loops the failure. Identity semantics (which axes
@@ -2604,7 +2642,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             "as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider,
         )
-        return agent._try_activate_fallback(reason)
+        return try_activate_fallback(agent, reason, _arm_cooldown=False)
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
@@ -2661,7 +2699,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback to %s failed: provider not configured",
                 fb_provider)
             unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+            return try_activate_fallback(
+                agent, reason, _arm_cooldown=False
+            )  # try next in chain
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2992,7 +3032,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)
-        return agent._try_activate_fallback(reason)  # try next in chain
+        return try_activate_fallback(
+            agent, reason, _arm_cooldown=False
+        )  # try next in chain
 
 
 
