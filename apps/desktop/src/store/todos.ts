@@ -147,9 +147,19 @@ export function clearActiveSessionTodos(sid: string) {
   dropSessionTodos(sid, false)
 }
 
-/** Apply a session.resume/activate or todo.updated full snapshot. Idle
- * sessions keep the existing stale-active guard; running sessions restore the
- * active plan because the backend has proved that turn is still live. */
+/** Apply a session.resume/activate or todo.updated full snapshot.
+ *
+ * `running` reflects whether the backend reports this turn as still live —
+ * not whether the list itself looks finished. A snapshot restored while idle
+ * is always historical presentation state (the thread's last known plan, not
+ * something that just happened), so it must never be published: doing so
+ * would start the finished-list linger timer from the moment the thread was
+ * *opened* rather than from when the work actually completed, replaying an
+ * old completed plan as if it had just finished. Only a running session
+ * restores its snapshot, because the backend has proved that turn is still
+ * live. The linger for a genuinely fresh completion is preserved separately,
+ * via live `todo.updated` events and post-turn hydration (see
+ * `todosForHydration`), neither of which goes through this function. */
 export function restoreSessionTodosFromSnapshot(sid: string, snapshot: unknown, running: boolean) {
   const todos = parseTodos(snapshot)
 
@@ -166,10 +176,8 @@ export function restoreSessionTodosFromSnapshot(sid: string, snapshot: unknown, 
     return
   }
 
-  const visible = running ? todos : todosForHydration(todos)
-
-  if (visible !== null) {
-    setSessionTodos(sid, visible, revision)
+  if (running) {
+    setSessionTodos(sid, todos, revision)
   } else if (acceptRevision(sid, revision)) {
     dropSessionTodos(sid, false)
   }

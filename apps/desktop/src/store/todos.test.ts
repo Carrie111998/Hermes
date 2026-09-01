@@ -135,6 +135,25 @@ describe('revisioned snapshots', () => {
     expect($todosBySession.get().s1?.[0]?.id).toBe('active')
   })
 
+  it('does not replay a finished snapshot when idle-restoring a session (no flash on reopen)', () => {
+    const snapshot = { revision: 3, todos: [todo('a', 'completed'), todo('b', 'cancelled')] }
+
+    restoreSessionTodosFromSnapshot('s1', snapshot, false)
+
+    expect($todosBySession.get().s1).toBeUndefined()
+
+    vi.advanceTimersByTime(10_000)
+    expect($todosBySession.get().s1).toBeUndefined()
+  })
+
+  it('restores a finished snapshot when the session is reported running', () => {
+    const snapshot = { revision: 3, todos: [todo('a', 'completed'), todo('b', 'cancelled')] }
+
+    restoreSessionTodosFromSnapshot('s1', snapshot, true)
+
+    expect($todosBySession.get().s1).toHaveLength(2)
+  })
+
   it('applies an unversioned update after a revisioned snapshot (tool.start merge)', () => {
     setSessionTodos('s1', [todo('a', 'pending'), todo('b', 'pending')], 5)
     setSessionTodos('s1', [todo('a', 'completed'), todo('b', 'pending')])
