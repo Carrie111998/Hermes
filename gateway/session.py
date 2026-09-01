@@ -3648,6 +3648,15 @@ class SessionStore:
             old_entry = self._entries[session_key]
             db_end_session_id = old_entry.session_id
 
+            # Preserve the durable route, not the inbound event that happened
+            # to establish it. Leaving message_id on the copied origin lets a
+            # later synthetic event reply to the ended session (#100717).
+            reset_origin = (
+                replace(old_entry.origin, message_id=None)
+                if old_entry.origin is not None
+                else None
+            )
+
             now = _now()
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
@@ -3656,7 +3665,7 @@ class SessionStore:
                 session_id=session_id,
                 created_at=now,
                 updated_at=now,
-                origin=old_entry.origin,
+                origin=reset_origin,
                 display_name=display_name if display_name is not None else old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
@@ -3666,20 +3675,20 @@ class SessionStore:
             self._entries[session_key] = new_entry
             self._save()
             _reset_origin_json = None
-            if old_entry.origin is not None:
+            if reset_origin is not None:
                 try:
-                    _reset_origin_json = json.dumps(old_entry.origin.to_dict())
+                    _reset_origin_json = json.dumps(reset_origin.to_dict())
                 except Exception:
                     _reset_origin_json = None
             db_create_kwargs = {
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
-                "user_id": old_entry.origin.user_id if old_entry.origin else None,
+                "user_id": reset_origin.user_id if reset_origin else None,
                 "session_key": session_key,
-                "chat_id": old_entry.origin.chat_id if old_entry.origin else None,
-                "chat_type": old_entry.origin.chat_type if old_entry.origin else None,
-                "thread_id": old_entry.origin.thread_id if old_entry.origin else None,
-                "profile_name": old_entry.origin.profile if old_entry.origin else None,
+                "chat_id": reset_origin.chat_id if reset_origin else None,
+                "chat_type": reset_origin.chat_type if reset_origin else None,
+                "thread_id": reset_origin.thread_id if reset_origin else None,
+                "profile_name": reset_origin.profile if reset_origin else None,
                 # Identity + lineage land atomically in the INSERT (#82616,
                 # #12857) — see the get_or_create twin path.
                 "origin_json": _reset_origin_json,
@@ -3714,7 +3723,7 @@ class SessionStore:
                 self._record_gateway_session_peer(
                     session_id,
                     session_key,
-                    old_entry.origin,
+                    reset_origin,
                     display_name=new_entry.display_name if new_entry else None,
                 )
             except Exception as e:
