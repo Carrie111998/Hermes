@@ -538,7 +538,10 @@ def has_compaction_checkpoint(items: Any) -> bool:
     request that loses it loses the compacted history with it.
     """
     return any(
-        isinstance(item, dict) and item.get("type") == "compaction"
+        isinstance(item, dict)
+        and item.get("type") == "compaction"
+        and isinstance(item.get("encrypted_content"), str)
+        and bool(item["encrypted_content"].strip())
         for item in (items if isinstance(items, list) else ())
     )
 
