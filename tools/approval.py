@@ -10,7 +10,6 @@ This module is the single source of truth for the dangerous command system:
 
 import contextlib
 import contextvars
-import ast
 import fnmatch
 import functools
 import hashlib
