@@ -108,6 +108,57 @@ describe("PtyResumeSanitizer — stateful frame handling", () => {
     expect(s.next("2Ky")).toBe("y");
   });
 
+  it("buffers a private-mode CSI split across frames (DECRST ends in 'l')", () => {
+    // Regression: PARTIAL_ESC used to match only \d*, so "\x1b[?25" was not
+    // recognised as incomplete. It was emitted, leaving xterm mid-escape, and
+    // the terminating "l" arrived alone as literal text — the stray "l"
+    // characters seen next to the cursor during session resume.
+    const s = new PtyResumeSanitizer();
+    expect(s.next("x\x1b[?25")).toBe("x");
+    expect(s.next("ly")).toBe("\x1b[?25ly");
+  });
+
+  it("never emits a frame ending mid-escape, at any split point", () => {
+    // The invariant that matters is per-emission, not concatenated: xterm
+    // receives each returned string as its own write(). A piece ending in an
+    // unterminated CSI leaves the parser in an "in-escape" state (see the
+    // flush() docstring), which strands the sequence's final byte. Asserting
+    // on the joined output would hide this — the bytes do reassemble there.
+    const endsMidEscape = (piece: string): boolean => {
+      const esc = piece.lastIndexOf("\x1b");
+      if (esc === -1) return false;
+      // Complete iff a CSI final byte (0x40-0x7e) appears after the params.
+      // eslint-disable-next-line no-control-regex -- intentional ESC byte in ANSI sequence parser
+      return !/^\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]/.test(piece.slice(esc));
+    };
+
+    const seq = "\x1b[?25l";
+    for (let cut = 1; cut < seq.length; cut++) {
+      const s = new PtyResumeSanitizer();
+      const pieces = [s.next("A" + seq.slice(0, cut)), s.next(seq.slice(cut) + "B")];
+      for (const piece of pieces) {
+        expect(endsMidEscape(piece), `cut=${cut} piece=${JSON.stringify(piece)}`).toBe(false);
+      }
+      expect(pieces.join("") + s.flush()).toBe("A" + seq + "B");
+    }
+  });
+
+  it("buffers multi-parameter and intermediate-byte CSI tails", () => {
+    const s = new PtyResumeSanitizer();
+    expect(s.next("a\x1b[38;5")).toBe("a");
+    expect(s.next(";9mb")).toBe("\x1b[38;5;9mb");
+
+    const t = new PtyResumeSanitizer();
+    expect(t.next("c\x1b[1;2")).toBe("c");
+    expect(t.next("Hd")).toBe("\x1b[1;2Hd");
+  });
+
+  it("still collapses a split erase code (numeric path unchanged)", () => {
+    const s = new PtyResumeSanitizer();
+    expect(s.next("p\x1b[2")).toBe("p");
+    expect(s.next("Kq")).toBe("q");
+  });
+
   it("passes through when no partial escape is buffered", () => {
     const s = new PtyResumeSanitizer();
     expect(s.next("chunk1 ")).toBe("chunk1 ");

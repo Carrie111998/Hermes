@@ -30,9 +30,26 @@ const ERASE_LINE = /\x1b\[\d*K/g;
 // eslint-disable-next-line no-control-regex -- intentional ESC byte in ANSI sequence parser
 const ERASE_CHAR = /\x1b\[\d*X/g;
 
-/** Still-incomplete trailing escape: "\x1b", "\x1b[", "\x1b[\d*". */
+/**
+ * Still-incomplete trailing escape: "\x1b", "\x1b[", or "\x1b[" followed by any
+ * run of CSI parameter and intermediate bytes.
+ *
+ * Per ECMA-48 a CSI sequence is `ESC [` , parameter bytes `0x30-0x3f`
+ * (digits plus `:;<=>?`), intermediate bytes `0x20-0x2f`, then a final byte
+ * `0x40-0x7e`. Only the final byte terminates it, so anything short of one is
+ * still incomplete and must be held back.
+ *
+ * Matching only `\d*` missed every private-mode sequence (`ESC[?25l`,
+ * `ESC[?2004l`, `ESC[?1049l`) and every multi-parameter one (`ESC[1;2H`,
+ * `ESC[38;5;9m`), because `?` and `;` are not digits. Those fragments were
+ * emitted instead of buffered, which is precisely what `flush()` documents as
+ * unsafe: it leaves xterm's parser mid-escape, swallowing subsequent output,
+ * and strands the sequence's final byte as literal text. Since DECRST
+ * sequences all end in `l`, the visible symptom was stray `l` characters
+ * during resume replay.
+ */
 // eslint-disable-next-line no-control-regex -- intentional ESC byte in ANSI sequence parser
-const PARTIAL_ESC = /^\x1b(?:\[\d*)?$/;
+const PARTIAL_ESC = /^\x1b(?:\[[\x30-\x3f]*[\x20-\x2f]*)?$/;
 
 /**
  * A trailing run of newlines that may continue into the next frame. Held back
