@@ -2602,7 +2602,6 @@ def _run_single_child(
     parent-visible truncation flag stays truthful for all of the above.
     """
     child_start = time.monotonic()
-
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
 
@@ -2788,6 +2787,52 @@ def _run_single_child(
     # Worktree-isolation state: populated inside the try once the child's
     # task id is known; the default no-op keeps every early error path safe.
     _worktree_info: Optional[Dict[str, str]] = None
+    _defer_child_cleanup_to_worker = False
+    _child_cleanup_lock = threading.Lock()
+    _child_cleanup_done = False
+
+    def _cleanup_child_lifetime() -> None:
+        """Retire child ownership exactly once after its worker lifetime ends."""
+        nonlocal _child_cleanup_done
+        with _child_cleanup_lock:
+            if _child_cleanup_done:
+                return
+            _child_cleanup_done = True
+
+        # Keep the child visible to list/steer/stop and interrupt propagation
+        # until its worker has actually stopped. Each cleanup is isolated so a
+        # close failure cannot strand the credential lease or live registries.
+        if _subagent_id:
+            try:
+                _unregister_subagent(_subagent_id, agent=child)
+            except Exception:
+                logger.debug("Failed to unregister child after delegation", exc_info=True)
+
+        if hasattr(parent_agent, "_active_children"):
+            try:
+                lock = getattr(parent_agent, "_active_children_lock", None)
+                if lock:
+                    with lock:
+                        parent_agent._active_children.remove(child)
+                else:
+                    parent_agent._active_children.remove(child)
+            except Exception:
+                logger.debug(
+                    "Failed to remove child from active_children", exc_info=True
+                )
+
+        try:
+            close = getattr(child, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            logger.debug("Failed to close child agent after delegation", exc_info=True)
+
+        if child_pool is not None and leased_cred_id is not None:
+            try:
+                child_pool.release_lease(leased_cred_id)
+            except Exception:
+                logger.debug("Failed to release credential lease", exc_info=True)
 
     def _attach_worktree(entry_dict: Dict[str, Any]) -> None:
         """Inspect + prune the child worktree, reporting into the entry."""
@@ -2980,6 +3025,19 @@ def _run_single_child(
                 pass
 
             is_timeout = isinstance(_timeout_exc, (FuturesTimeoutError, TimeoutError))
+            if is_timeout and not _child_future.done():
+                # The timeout owner abandons this daemon worker by design, but
+                # closing the child here also closes its dedicated SessionDB
+                # while run_conversation may still be flushing on that worker.
+                # Keep ownership with the worker until it actually exits; a
+                # future callback is race-safe even if completion happens
+                # between done() and add_done_callback().
+                _defer_child_cleanup_to_worker = True
+
+                def _cleanup_detached_child(_future) -> None:
+                    _cleanup_child_lifetime()
+
+                _child_future.add_done_callback(_cleanup_detached_child)
             duration = round(time.monotonic() - child_start, 2)
             logger.warning(
                 "Subagent %d %s after %.1fs",
@@ -3517,17 +3575,6 @@ def _run_single_child(
         if _heartbeat_thread.ident is not None:
             _heartbeat_thread.join(timeout=5)
 
-        # Drop the TUI-facing registry entry.  Safe to call even if the
-        # child was never registered (e.g. ID missing on test doubles).
-        if _subagent_id:
-            _unregister_subagent(_subagent_id, agent=child)
-
-        if child_pool is not None and leased_cred_id is not None:
-            try:
-                child_pool.release_lease(leased_cred_id)
-            except Exception as exc:
-                logger.debug("Failed to release credential lease: %s", exc)
-
         # Restore the parent's tool names so the process-global is correct
         # for any subsequent execute_code calls or other consumers.
         import model_tools
@@ -3536,28 +3583,11 @@ def _run_single_child(
         if isinstance(saved_tool_names, list):
             model_tools._last_resolved_tool_names = list(saved_tool_names)
 
-        # Remove child from active tracking
-
-        # Unregister child from interrupt propagation
-        if hasattr(parent_agent, "_active_children"):
-            try:
-                lock = getattr(parent_agent, "_active_children_lock", None)
-                if lock:
-                    with lock:
-                        parent_agent._active_children.remove(child)
-                else:
-                    parent_agent._active_children.remove(child)
-            except (ValueError, UnboundLocalError) as e:
-                logger.debug("Could not remove child from active_children: %s", e)
-
-        # Close tool resources (terminal sandboxes, browser daemons,
-        # background processes, httpx clients) so subagent subprocesses
-        # don't outlive the delegation.
-        try:
-            if hasattr(child, "close"):
-                child.close()
-        except Exception:
-            logger.debug("Failed to close child agent after delegation")
+        # Retire every child-lifetime owner at one boundary. A timed-out worker
+        # retains its live registries, tool resources, and credential lease
+        # until its Future reports completion.
+        if not _defer_child_cleanup_to_worker:
+            _cleanup_child_lifetime()
 
         # The AIAgent turn boundary normally closes the child scope itself. This
         # fallback covers failures before that boundary starts, but must not pop

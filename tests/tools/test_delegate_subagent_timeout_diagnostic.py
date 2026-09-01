@@ -179,15 +179,16 @@ class TestRunSingleChildTimeoutDump:
     """The timeout branch in _run_single_child must emit the diagnostic
     dump when api_calls == 0, and must NOT emit it when api_calls > 0."""
 
-    def _invoke_with_short_timeout(self, child, monkeypatch):
+    def _invoke_with_short_timeout(self, child, monkeypatch, *, parent=None):
         """Run _run_single_child with a tiny timeout to force the timeout branch."""
         from tools import delegate_tool
         # Force a 0.3s timeout so the test is fast
         monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.3)
 
-        parent = MagicMock()
-        parent._touch_activity = MagicMock()
-        parent._current_task_id = None
+        if parent is None:
+            parent = MagicMock()
+            parent._touch_activity = MagicMock()
+            parent._current_task_id = None
         return delegate_tool._run_single_child(
             task_index=0,
             goal="test goal",
@@ -210,6 +211,71 @@ class TestRunSingleChildTimeoutDump:
         assert "without making any API call" in result["error"]
         assert "Diagnostic:" in result["error"]
         assert str(dump_path) in result["error"]
+
+    def test_timeout_defers_child_close_until_worker_exits(self, hermes_home, monkeypatch):
+        """A detached worker retains its persistence handle and credential lease."""
+        child = _StubChild(api_call_count=1, hang_seconds=10.0)
+        child.interrupt = lambda *args, **kwargs: None
+        child.close = MagicMock()
+        child._credential_pool = MagicMock()
+        child._credential_pool.acquire_lease.return_value = "cred-a"
+        child._credential_pool.current.return_value = MagicMock(id="cred-a")
+        parent = MagicMock()
+        parent._touch_activity = MagicMock()
+        parent._current_task_id = None
+        parent._active_children = [child]
+        parent._active_children_lock = threading.Lock()
+
+        from tools import delegate_tool
+
+        result = self._invoke_with_short_timeout(child, monkeypatch, parent=parent)
+
+        assert result["status"] == "timeout"
+        assert not child.close.called
+        assert not child._credential_pool.release_lease.called
+        assert child in parent._active_children
+        assert any(
+            entry["subagent_id"] == child._subagent_id
+            for entry in delegate_tool.list_active_subagents()
+        )
+
+        child._hang.set()
+        deadline = time.monotonic() + 2.0
+        while (
+            not child._credential_pool.release_lease.called
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert child.close.call_count == 1
+        child._credential_pool.release_lease.assert_called_once_with("cred-a")
+        assert child not in parent._active_children
+        assert all(
+            entry["subagent_id"] != child._subagent_id
+            for entry in delegate_tool.list_active_subagents()
+        )
+
+    def test_timeout_cleanup_failure_preserves_result_and_retires_lease(
+        self, hermes_home, monkeypatch
+    ):
+        child = _StubChild(api_call_count=1, hang_seconds=10.0)
+        child.interrupt = lambda *args, **kwargs: None
+        child.close = MagicMock(side_effect=RuntimeError("close failed"))
+        child._credential_pool = MagicMock()
+        child._credential_pool.acquire_lease.return_value = "cred-a"
+        child._credential_pool.current.return_value = MagicMock(id="cred-a")
+
+        result = self._invoke_with_short_timeout(child, monkeypatch)
+        assert result["status"] == "timeout"
+
+        child._hang.set()
+        deadline = time.monotonic() + 2.0
+        while (
+            not child._credential_pool.release_lease.called
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        assert child.close.call_count == 1
+        child._credential_pool.release_lease.assert_called_once_with("cred-a")
 
 
     # ── explicit timeout metadata (#51690, salvaged from PR #60378) ────

@@ -340,8 +340,71 @@ def _note_delivery_attempt(delegation_id: str) -> None:
         )
 
 
+def _classify_owner_process(
+    pid: Optional[int],
+    started_at: Optional[int],
+    *,
+    pid_exists: Callable[[int], bool],
+    process_start_time: Callable[[int], Optional[int]],
+) -> Optional[Dict[str, Any]]:
+    """Return durable owner-exit evidence, or ``None`` while owner may be live.
+
+    Recovery runs in a different process, so it cannot obtain the dead
+    process's wait status.  Report only process-table facts and leave signal /
+    exit code explicitly unknown rather than guessing that every disappearance
+    was a graceful exit.  A live PID whose start time cannot be inspected is
+    treated as indeterminate/live; recovering it would steal work from a slow
+    owner merely because the identity probe failed.
+    """
+    evidence: Dict[str, Any] = {
+        "reason": "owner_identity_missing",
+        "pid": int(pid) if pid else None,
+        "started_at": int(started_at) if started_at is not None else None,
+        "observed_started_at": None,
+        "exit_code": None,
+        "signal": None,
+        "evidence": "process_table",
+    }
+    if not pid:
+        return evidence
+
+    owner_pid = int(pid)
+    if not pid_exists(owner_pid):
+        evidence["reason"] = "owner_process_missing"
+        return evidence
+
+    if started_at is None:
+        return None
+    observed_started_at = process_start_time(owner_pid)
+    if observed_started_at is None:
+        return None
+    evidence["observed_started_at"] = int(observed_started_at)
+    if int(observed_started_at) == int(started_at):
+        return None
+    evidence["reason"] = "owner_pid_reused"
+    return evidence
+
+
+def _owner_exit_error(evidence: Dict[str, Any]) -> str:
+    reason = evidence["reason"]
+    pid = evidence.get("pid")
+    if reason == "owner_pid_reused":
+        detail = (
+            f"owner PID {pid} was reused by a different process generation"
+        )
+    elif reason == "owner_process_missing":
+        detail = f"owner process {pid} disappeared"
+    else:
+        detail = "owner process identity was not recorded"
+    return (
+        f"Delegation {detail} before recording a terminal result; outcome unknown. "
+        "Exit status and signal are unavailable to this recovery process; "
+        "check the process supervisor or OS crash report."
+    )
+
+
 def recover_abandoned_delegations() -> int:
-    """Classify records whose owning process disappeared as outcome unknown."""
+    """Recover dead-owner rows with explicit process-identity evidence."""
     try:
         from gateway.status import _pid_exists, get_process_start_time
     except Exception:
@@ -358,14 +421,16 @@ def recover_abandoned_delegations() -> int:
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
              pid, started, task_json, origin_session_id) = row
-            live = False
-            if pid:
-                live = _pid_exists(int(pid))
-                if live and started is not None:
-                    live = get_process_start_time(int(pid)) == int(started)
-            if live:
+            owner_exit = _classify_owner_process(
+                pid,
+                started,
+                pid_exists=_pid_exists,
+                process_start_time=get_process_start_time,
+            )
+            if owner_exit is None:
                 continue
             task = json.loads(task_json or "{}")
+            owner_error = _owner_exit_error(owner_exit)
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
@@ -377,7 +442,7 @@ def recover_abandoned_delegations() -> int:
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
                 "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
                 "status": "unknown", "summary": None,
-                "error": "Delegation owner exited before recording a terminal result; outcome unknown.",
+                "error": owner_error, "owner_exit": owner_exit,
                 "dispatched_at": dispatched_at, "completed_at": now,
             }
             # Routing origin persisted at dispatch (see _capture_routing_origin):
@@ -386,7 +451,12 @@ def recover_abandoned_delegations() -> int:
             for _k in ("scope_id", "user_id", "user_name"):
                 if task.get(_k):
                     event[_k] = task[_k]
-            result = {"status": "unknown", "summary": None, "error": event["error"]}
+            result = {
+                "status": "unknown",
+                "summary": None,
+                "error": event["error"],
+                "owner_exit": owner_exit,
+            }
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
                    updated_at=?, event_json=?, result_json=?, delivery_state='pending'
