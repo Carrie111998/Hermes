@@ -4,7 +4,8 @@ Slow summary models must not be punished like hung ones (#see PR): when a
 forward-progress hook is installed (context compression), the primary
 auxiliary call streams and ticks the hook only for substantive payloads, so
 outer watchdogs (gateway session hygiene) can extend their deadline on
-liveness. Without a hook, behavior is byte-for-byte the old non-streaming call.
+liveness. Without a hook, behavior stays non-streaming unless the provider
+explicitly requires the streamed path.
 """
 
 import threading
@@ -370,6 +371,40 @@ class TestAggregateChatStream:
         result = _aggregate_chat_stream(
             _SlowHealthyStream(), request_client=object(), total_ceiling=1.0
         )
+        assert result.choices[0].message.content == "abc"
+
+    def test_force_stream_without_hook_rearms_request_local_watchdog(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.auxiliary_client._AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS", 0.04
+        )
+
+        class _SlowLocalClient(_FakeClient):
+            def _create(self, **kwargs):
+                self.calls.append(kwargs)
+
+                def _chunks():
+                    for text in ("a", "b", "c"):
+                        time.sleep(0.025)
+                        yield _chunk(content=text)
+
+                return _chunks()
+
+        cached_client = _FakeClient(stream_chunks=[])
+        local_client = _SlowLocalClient()
+        local_client.close = lambda: None
+        monkeypatch.setattr(
+            "agent.auxiliary_client._copy_request_local_streaming_client",
+            lambda client: (local_client, True),
+        )
+
+        result = _create_with_progress(
+            cached_client,
+            {"model": "m1", "messages": [], "timeout": 1.0},
+            force_stream=True,
+        )
+
+        assert cached_client.calls == []
+        assert local_client.calls[0]["stream"] is True
         assert result.choices[0].message.content == "abc"
 
     def test_stream_attempt_uses_and_closes_request_local_client(self, monkeypatch):

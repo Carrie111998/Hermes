@@ -9782,8 +9782,7 @@ def _consume_request_local_stream(
             progress_hook()
 
     def _run() -> None:
-        if progress_hook is not None:
-            _aux_progress.hook = _progress
+        _aux_progress.hook = _progress
         if response_hook is not None:
             _aux_provider_response.hook = response_hook
         try:
