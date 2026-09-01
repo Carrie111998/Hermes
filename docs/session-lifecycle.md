@@ -547,7 +547,7 @@ The `_session_expiry_watcher` task runs in the gateway event loop every 300 seco
    - Invoke `on_session_finalize` plugin hooks (cleanup, notifications).
    - Clean up cached AIAgent resources (close tool resources, shut down memory provider).
    - Evict the cached agent entry.
-   - Clear per-session overrides (`_session_model_overrides`, reasoning overrides, etc.).
+   - Clear per-session runtime options (live `SessionState.conversation` model / reasoning / service-tier overrides and the persisted `SessionEntry` snapshot, see `gateway/session_options.py`).
    - Mark `expiry_finalized=True` and persist (sessions.json + state.db).
    - Promote the state.db session row to `end_reason='session_reset'` via
      `promote_to_session_reset()` — conditional: only live rows or rows ended with a

@@ -9,6 +9,8 @@ Handles:
 """
 
 import asyncio
+import contextvars
+import functools
 import hashlib
 import logging
 import os
@@ -19,6 +21,8 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Any
+
+from hermes_constants import VALID_REASONING_EFFORTS
 
 logger = logging.getLogger(__name__)
 
@@ -754,6 +758,7 @@ def build_session_context_prompt(
 # written to sessions.json.  On rehydration after a gateway restart the
 # runner re-resolves credentials via the normal runtime provider resolution.
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
+PERSISTABLE_REASONING_OVERRIDE_KEYS = ("enabled", "effort")
 
 
 def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
@@ -771,6 +776,28 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
     return cleaned or None
+
+
+def sanitize_reasoning_override(
+    override: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Return the credential-free canonical shape for a /reasoning override."""
+    if not isinstance(override, dict):
+        return None
+    enabled = override.get("enabled")
+    if not isinstance(enabled, bool):
+        return None
+    cleaned: Dict[str, Any] = {"enabled": enabled}
+    if enabled:
+        effort = override.get("effort")
+        if effort not in VALID_REASONING_EFFORTS:
+            return None
+        cleaned["effort"] = str(effort)
+    return {
+        key: cleaned[key]
+        for key in PERSISTABLE_REASONING_OVERRIDE_KEYS
+        if key in cleaned
+    }
 
 
 @dataclass
@@ -870,6 +897,15 @@ class SessionEntry:
     # override is rehydrated after a restart and are never written to disk
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
+    # Session-scoped /reasoning override. Only ``enabled`` and a canonical
+    # effort are persisted; arbitrary runtime/provider fields are discarded.
+    reasoning_override: Optional[Dict[str, Any]] = None
+
+    # Structured session controls set by a host UI. Unlike the process-local
+    # conversation fields on GatewayRunner, these survive a gateway restart.
+    # ``service_tier_override`` uses "priority" / "normal" so explicit normal
+    # remains distinguishable from an omitted (inherit-profile) value.
+    service_tier_override: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -914,6 +950,12 @@ class SessionEntry:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
             result["model_override"] = sanitize_model_override(self.model_override)
+        if self.reasoning_override is not None:
+            result["reasoning_override"] = sanitize_reasoning_override(
+                self.reasoning_override
+            )
+        if self.service_tier_override in {"priority", "normal"}:
+            result["service_tier_override"] = self.service_tier_override
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -1003,6 +1045,14 @@ class SessionEntry:
             reset_had_activity=data.get("reset_had_activity", False),
             prev_session_id=data.get("prev_session_id"),
             model_override=sanitize_model_override(data.get("model_override")),
+            reasoning_override=sanitize_reasoning_override(
+                data.get("reasoning_override")
+            ),
+            service_tier_override=(
+                data.get("service_tier_override")
+                if data.get("service_tier_override") in {"priority", "normal"}
+                else None
+            ),
         )
 
 
@@ -1233,6 +1283,18 @@ class AsyncSessionStore:
             return await asyncio.to_thread(attr, *args, **kwargs)
 
         return _offloaded
+
+    def submit(self, name: str, *args, **kwargs) -> "asyncio.Future[Any]":
+        """Offload ``store.<name>`` like attribute access, but return the loop
+        Future for the worker instead of a coroutine.
+
+        The Future is not a Task, so no task cancellation -- including
+        ``asyncio.run`` teardown's cancel-all-tasks -- can detach a
+        done-callback from the worker's completion.
+        """
+        call = functools.partial(getattr(self._store, name), *args, **kwargs)
+        ctx = contextvars.copy_context()  # same propagation as to_thread
+        return asyncio.get_running_loop().run_in_executor(None, ctx.run, call)
 
 
 # Sentinel for "no explicit SessionDB has been pinned on this store", so the
@@ -2580,10 +2642,12 @@ class SessionStore:
         with self._lock:
             entry.expiry_finalized = True
             if clear_model_override:
-                # Session finalization is a conversation boundary — drop the
-                # persisted /model override too so a later message doesn't
-                # rehydrate it after the in-memory override was popped.
+                # Session finalization is a conversation boundary — drop both
+                # persisted runtime overrides so a later message cannot
+                # rehydrate state already cleared from SessionState.
                 entry.model_override = None
+                entry.reasoning_override = None
+                entry.service_tier_override = None
             self._save()
         # The expiry watcher calls this from a background task that never
         # entered ``_profile_runtime_scope``, so resolve the store from the
@@ -3346,6 +3410,119 @@ class SessionStore:
             if entry is None:
                 return None
             return dict(entry.model_override) if entry.model_override else None
+
+    def set_reasoning_override(
+        self, session_key: str, override: Optional[Dict[str, Any]]
+    ) -> None:
+        """Persist or clear the sanitized session-scoped /reasoning override.
+
+        Single-field convenience over :meth:`set_runtime_options`: the model
+        and service-tier snapshot are carried through unchanged and the
+        write gets the same rollback-on-failed-save guarantee.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return
+            self._set_runtime_options_locked(
+                entry,
+                model_override=entry.model_override,
+                reasoning_override=override,
+                service_tier_override=entry.service_tier_override,
+            )
+
+    def get_reasoning_override(self, session_key: str) -> Optional[Dict[str, Any]]:
+        """Return the persisted /reasoning override for *session_key*."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.reasoning_override is None:
+                return None
+            return dict(entry.reasoning_override)
+
+    def set_runtime_options(
+        self,
+        session_key: str,
+        *,
+        model_override: Optional[Dict[str, Any]],
+        reasoning_override: Optional[Dict[str, Any]],
+        service_tier_override: Optional[str],
+    ) -> bool:
+        """Atomically persist host-selected per-session runtime options.
+
+        All three values are complete snapshots. ``None`` clears/inherits;
+        service tier additionally accepts ``"normal"`` for explicit normal.
+        Credentials are stripped from the model override before persistence.
+        """
+        if service_tier_override not in {None, "priority", "normal"}:
+            raise ValueError("service_tier_override must be priority|normal|None")
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            self._set_runtime_options_locked(
+                entry,
+                model_override=model_override,
+                reasoning_override=reasoning_override,
+                service_tier_override=service_tier_override,
+            )
+            return True
+
+    def _set_runtime_options_locked(
+        self,
+        entry: SessionEntry,
+        *,
+        model_override: Optional[Dict[str, Any]],
+        reasoning_override: Optional[Dict[str, Any]],
+        service_tier_override: Optional[str],
+    ) -> None:
+        """Write the sanitized triple onto *entry* and save; caller holds the lock."""
+        cleaned_model = sanitize_model_override(model_override)
+        cleaned_reasoning = sanitize_reasoning_override(reasoning_override)
+        changed = (
+            entry.model_override != cleaned_model
+            or entry.reasoning_override != cleaned_reasoning
+            or entry.service_tier_override != service_tier_override
+        )
+        if not changed:
+            return
+        previous_model = entry.model_override
+        previous_reasoning = entry.reasoning_override
+        previous_tier = entry.service_tier_override
+        entry.model_override = cleaned_model
+        entry.reasoning_override = cleaned_reasoning
+        entry.service_tier_override = service_tier_override
+        try:
+            self._save()
+        except Exception:
+            # Keep the in-memory store transactional with the durable
+            # write. A failed save must not leave this process using a
+            # configuration that a restart would silently discard.
+            entry.model_override = previous_model
+            entry.reasoning_override = previous_reasoning
+            entry.service_tier_override = previous_tier
+            raise
+
+    def get_runtime_options(self, session_key: str) -> Optional[Dict[str, Any]]:
+        """Return the durable host-selected options for ``session_key``."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            return {
+                "model_override": (
+                    dict(entry.model_override) if entry.model_override else None
+                ),
+                "reasoning_override": (
+                    dict(entry.reasoning_override)
+                    if entry.reasoning_override is not None
+                    else None
+                ),
+                "service_tier_override": entry.service_tier_override,
+            }
 
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session as suspended so it auto-resets on next access.

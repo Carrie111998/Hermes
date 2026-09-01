@@ -1840,6 +1840,9 @@ class GatewaySlashCommandsMixin:
         # (#30479).
         source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
         session_key = self._session_key_for_source(source)
+        # Rehydrate first so "switched from X" and the --once restore snapshot
+        # reflect the persisted override after a gateway restart.
+        self._rehydrate_session_runtime_options(session_key)
         override = self._session_model_overrides.get(session_key, {})
         restore_snapshot = (
             self._snapshot_session_model_override(session_key) if one_turn else None
@@ -1975,6 +1978,30 @@ class GatewaySlashCommandsMixin:
                                     ),
                                 )
 
+                        # Session override through the single durable-first
+                        # write-through (persist first, then live; a failed
+                        # save propagates with live state untouched).
+                        try:
+                            await _self._commit_session_runtime_options(
+                                _session_key,
+                                model_override={
+                                    "model": result.new_model,
+                                    "provider": result.target_provider,
+                                    "api_key": result.api_key,
+                                    "base_url": result.base_url,
+                                    "api_mode": result.api_mode,
+                                    "request_overrides": dict(
+                                        result.request_overrides or {}
+                                    ),
+                                    "capabilities": dict(
+                                        result.runtime_capabilities or {}
+                                    ),
+                                },
+                            )
+                        except Exception:
+                            _self._evict_cached_agent(_session_key)
+                            raise
+
                         # Persist the new model to the session DB so the
                         # dashboard shows the updated model (#34850).
                         _sess_db = getattr(_self, "_session_db", None)
@@ -2006,30 +2033,6 @@ class GatewaySlashCommandsMixin:
                             f"via {result.provider_label or result.target_provider}. "
                             f"Adjust your self-identification accordingly.]"
                         )
-                        _self._session_model_overrides[_session_key] = {
-                            "model": result.new_model,
-                            "provider": result.target_provider,
-                            "api_key": result.api_key,
-                            "base_url": result.base_url,
-                            "api_mode": result.api_mode,
-                            "request_overrides": dict(result.request_overrides or {}),
-                            "capabilities": dict(result.runtime_capabilities or {}),
-                        }
-
-                        # Write-through the non-secret parts to the session
-                        # store so the picked model survives a gateway restart
-                        # (api_key is never persisted).
-                        try:
-                            await _self.async_session_store.set_model_override(
-                                _session_key,
-                                _self._session_model_overrides[_session_key],
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Failed to persist session model override",
-                                exc_info=True,
-                            )
-
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
                         # stale cache signature to trigger a rebuild.
@@ -2286,6 +2289,43 @@ class GatewaySlashCommandsMixin:
                         ),
                     )
 
+            # Session override for the next agent build, through the single
+            # durable-first write-through shared with /reasoning, /fast and the
+            # structured host API: the non-secret parts (model/provider/
+            # base_url) are persisted FIRST, then live state moves, so the
+            # reply below is never sent for a switch a restart would discard.
+            # A failed durable write propagates with live state untouched.
+            #
+            # /model --once is live-only by contract (#29923): a one-turn
+            # override must never survive a restart, and while it is live any
+            # sibling durable write persists the pre-once snapshot instead.
+            new_override = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "api_key": result.api_key,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+                "request_overrides": dict(result.request_overrides or {}),
+                "capabilities": dict(result.runtime_capabilities or {}),
+            }
+            if one_turn:
+                if not hasattr(self, "_pending_one_turn_model_restores"):
+                    self._pending_one_turn_model_restores = {}
+                self._pending_one_turn_model_restores[session_key] = (
+                    restore_snapshot or {"had_override": False, "override": None}
+                )
+            try:
+                await self._commit_session_runtime_options(
+                    session_key,
+                    model_override=new_override,
+                    durable=not one_turn,
+                )
+            except Exception:
+                # The cached agent may already have switched in place above;
+                # drop it so the next turn rebuilds from the unchanged override.
+                self._evict_cached_agent(session_key)
+                raise
+
             # Persist the new model to the session DB so the dashboard
             # shows the updated model (#34850).
             _sess_db = getattr(self, "_session_db", None)
@@ -2319,48 +2359,6 @@ class GatewaySlashCommandsMixin:
                 f"{'This override applies to the next turn only. ' if one_turn else ''}"
                 f"Adjust your self-identification accordingly.]"
             )
-
-            # Store session override so next agent creation uses the new model
-            self._session_model_overrides[session_key] = {
-                "model": result.new_model,
-                "provider": result.target_provider,
-                "api_key": result.api_key,
-                "base_url": result.base_url,
-                "api_mode": result.api_mode,
-                "request_overrides": dict(result.request_overrides or {}),
-                "capabilities": dict(result.runtime_capabilities or {}),
-            }
-            if one_turn:
-                if not hasattr(self, "_pending_one_turn_model_restores"):
-                    self._pending_one_turn_model_restores = {}
-                self._pending_one_turn_model_restores[session_key] = (
-                    restore_snapshot or {"had_override": False, "override": None}
-                )
-            elif hasattr(self, "_pending_one_turn_model_restores"):
-                self._pending_one_turn_model_restores.pop(session_key, None)
-
-            # Write-through the non-secret parts (model/provider/base_url) to
-            # the session store so the override survives a gateway restart.
-            # api_key/api_mode are never persisted — they are re-resolved via
-            # runtime provider resolution on rehydration.
-            #
-            # /model --once is intentionally EXCLUDED from the write-through:
-            # a one-turn override must never survive a restart. The persisted
-            # value stays at the pre-once state (the prior session override,
-            # or nothing), which is exactly what the finally-restore reverts
-            # the in-memory dict to. (#29923 review defect: the original
-            # implementation wrote through, so a crash before the restore
-            # rehydrated the once-model permanently.)
-            if not one_turn:
-                try:
-                    await self.async_session_store.set_model_override(
-                        session_key,
-                        self._session_model_overrides[session_key],
-                    )
-                except Exception:
-                    logger.debug(
-                        "Failed to persist session model override", exc_info=True
-                    )
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
@@ -3771,7 +3769,7 @@ class GatewaySlashCommandsMixin:
             logger.error("Failed to save config key %s: %s", key_path, e)
             return False
 
-    def _apply_reasoning_selection(
+    async def _apply_reasoning_selection(
         self,
         session_key: str,
         platform_key: str,
@@ -3805,7 +3803,7 @@ class GatewaySlashCommandsMixin:
         if value == "reset":
             if persist_global:
                 return t("gateway.reasoning.reset_global_unsupported")
-            self._set_session_reasoning_override(session_key, None)
+            await self._set_session_reasoning_override(session_key, None)
             self._reasoning_config = self._load_reasoning_config()
             self._evict_cached_agent(session_key)
             return t("gateway.reasoning.reset_done")
@@ -3817,14 +3815,14 @@ class GatewaySlashCommandsMixin:
         self._reasoning_config = parsed
         if persist_global:
             if self._save_gateway_config_key("agent.reasoning_effort", value):
-                self._set_session_reasoning_override(session_key, None)
+                await self._set_session_reasoning_override(session_key, None)
                 self._evict_cached_agent(session_key)
                 return t("gateway.reasoning.set_global", effort=value)
-            self._set_session_reasoning_override(session_key, parsed)
+            await self._set_session_reasoning_override(session_key, parsed)
             self._evict_cached_agent(session_key)
             return t("gateway.reasoning.set_global_save_failed", effort=value)
 
-        self._set_session_reasoning_override(session_key, parsed)
+        await self._set_session_reasoning_override(session_key, parsed)
         self._evict_cached_agent(session_key)
         return t("gateway.reasoning.set_session", effort=value)
 
@@ -3955,7 +3953,7 @@ class GatewaySlashCommandsMixin:
             _picker_platform_key = _platform_config_key(event.source.platform)
 
             async def _on_reasoning_choice(_chat_id: str, value: str) -> str:
-                return self._apply_reasoning_selection(
+                return await self._apply_reasoning_selection(
                     session_key, _picker_platform_key, value
                 )
 
@@ -3983,7 +3981,7 @@ class GatewaySlashCommandsMixin:
 
         # Typed argument path — same applier the picker uses.
         platform_key = _platform_config_key(event.source.platform)
-        return self._apply_reasoning_selection(
+        return await self._apply_reasoning_selection(
             session_key, platform_key, args, persist_global=persist_global
         )
 
@@ -4112,7 +4110,7 @@ class GatewaySlashCommandsMixin:
         if not model_supports_fast_mode(model):
             return t("gateway.fast.not_supported")
 
-        def _apply_fast_selection(value: str, persist: bool = False) -> str:
+        async def _apply_fast_selection(value: str, persist: bool = False) -> str:
             """Apply a /fast argument (typed or picked) and return the reply."""
             if value in {"fast", "on"}:
                 tier = "priority"
@@ -4128,17 +4126,17 @@ class GatewaySlashCommandsMixin:
             if persist:
                 if self._save_gateway_config_key("agent.service_tier", saved_value):
                     # Global write supersedes any session override.
-                    self._set_session_service_tier_override(
+                    await self._set_session_service_tier_override(
                         session_key, None, clear=True
                     )
                     self._evict_cached_agent(session_key)
                     return t("gateway.fast.saved", label=label)
                 # Config write failed — fall back to a session override so the
                 # user's choice still applies (mirrors /reasoning --global).
-                self._set_session_service_tier_override(session_key, tier)
+                await self._set_session_service_tier_override(session_key, tier)
                 self._evict_cached_agent(session_key)
                 return t("gateway.fast.session_only", label=label)
-            self._set_session_service_tier_override(session_key, tier)
+            await self._set_session_service_tier_override(session_key, tier)
             self._evict_cached_agent(session_key)
             return t("gateway.fast.session_only", label=label)
 
@@ -4147,7 +4145,7 @@ class GatewaySlashCommandsMixin:
             status = t("gateway.fast.status_fast") if is_fast else t("gateway.fast.status_normal")
 
             async def _on_fast_choice(_chat_id: str, value: str) -> str:
-                return _apply_fast_selection(value, persist=persist_global)
+                return await _apply_fast_selection(value, persist=persist_global)
 
             picker_sent = await self._try_send_choice_picker(
                 event,
@@ -4172,7 +4170,7 @@ class GatewaySlashCommandsMixin:
 
             return t("gateway.fast.status", mode=status)
 
-        return _apply_fast_selection(args, persist=persist_global)
+        return await _apply_fast_selection(args, persist=persist_global)
 
     async def _handle_approvals_command(self, event: MessageEvent) -> str:
         """Show or persist the profile-wide dangerous-command approval mode."""

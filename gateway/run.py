@@ -45,7 +45,7 @@ from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import Awaitable, Callable, Dict, Mapping, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -3005,6 +3005,10 @@ from gateway.session_state import (
     legacy_dict_property,
     legacy_lease_token_property,
 )
+from gateway.session_options import (
+    session_admission_lock as _session_admission_lock,
+    session_admission_lock_held as _session_admission_lock_held,
+)
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
@@ -3102,7 +3106,10 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 # Sentinel placed into _running_agents immediately when a session starts
 # processing, *before* any await.  Prevents a second message for the same
 # session from bypassing the "already running" guard during the async gap
-# between the guard check and actual agent creation.
+# between the guard check and actual agent creation.  The claim itself runs
+# under gateway.session_options.session_admission_lock, shared with the
+# runtime-options write-through, so an options commit cannot slip in between
+# a host observing "idle" and this sentinel being placed.
 _AGENT_PENDING_SENTINEL = object()
 
 # Conversation-scoped per-session state registry (legacy contract).
@@ -7489,6 +7496,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Sync helpers keep using ``session_store`` directly; async gateway
         # handlers call this facade and await every operation.
         self._async_session_store = AsyncSessionStore(self.session_store)
+        # Per-session admission lock: shared by the runtime-options write-through
+        # (gateway/session_options.py) and _handle_message's idle->running claim.
+        # Locks are process-local; accepted values are persisted by SessionStore.
+        self._session_options_locks: Dict[str, asyncio.Lock] = {}
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -8679,7 +8690,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         model = _resolve_gateway_model(user_config)
         if resolved_session_key:
-            self._rehydrate_session_model_override(resolved_session_key)
+            self._rehydrate_session_runtime_options(resolved_session_key)
         _override_state = (
             self._peek_session_state(resolved_session_key)
             if resolved_session_key
@@ -10173,24 +10184,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolved_session_key = None
 
         if resolved_session_key:
+            self._rehydrate_session_runtime_options(resolved_session_key)
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
         return self._load_reasoning_config(model)
 
-    def _set_session_reasoning_override(
+    async def _set_session_reasoning_override(
         self,
         session_key: str,
         reasoning_config: Optional[dict],
     ) -> None:
-        """Set or clear the session-scoped reasoning override."""
+        """Set or clear the session-scoped reasoning override (durable-first)."""
         if not session_key:
             return
         # Per-session field write — the old lazy ``self._session_reasoning_overrides
         # = {}`` init replaced the WHOLE dict, racing concurrent sessions'
         # overrides; a SessionState field reset cannot cross sessions.
-        self._session_state(session_key).conversation.reasoning_override = (
-            None if reasoning_config is None else dict(reasoning_config)
+        await self._commit_session_runtime_options(
+            session_key,
+            reasoning_override=(
+                None if reasoning_config is None else dict(reasoning_config)
+            ),
         )
 
     def _resolve_session_service_tier(
@@ -10212,6 +10227,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolved_session_key = None
 
         if resolved_session_key:
+            self._rehydrate_session_runtime_options(resolved_session_key)
             _t_state = self._peek_session_state(resolved_session_key)
             if (
                 _t_state is not None
@@ -10221,13 +10237,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return _t_state.conversation.service_tier_override
         return self._load_service_tier()
 
-    def _set_session_service_tier_override(
+    async def _set_session_service_tier_override(
         self,
         session_key: str,
         service_tier,
         clear: bool = False,
     ) -> None:
-        """Set or clear the session-scoped /fast override.
+        """Set or clear the session-scoped /fast override (durable-first).
 
         ``service_tier`` is "priority" or None (explicit normal). Pass
         ``clear=True`` to remove the override entirely (fall back to config).
@@ -10238,8 +10254,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # as an override; the sentinel means "no override".  Old code
         # wholesale-replaced the dict on lazy init (cross-session race) —
         # per-session field writes eliminate that class of bug.
-        self._session_state(session_key).conversation.service_tier_override = (
-            _SERVICE_TIER_UNSET if clear else service_tier
+        await self._commit_session_runtime_options(
+            session_key,
+            service_tier_override=_SERVICE_TIER_UNSET if clear else service_tier,
         )
 
     @staticmethod
@@ -13152,6 +13169,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Already being resumed (e.g. scheduled at startup and still
             # in-flight) — don't synthesize a second continuation turn.
             if self._is_session_running(entry.session_key):
+                continue
+            # A runtime-options commit owns this session's admission lock
+            # (gateway/session_options.py). This pre-claim cannot await it, so
+            # leave the session resume_pending for this pass; the next real
+            # user message (whose claim does await the lock) resumes it.
+            if _session_admission_lock_held(self, entry.session_key):
                 continue
 
             source = entry.origin
@@ -19340,21 +19363,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 moa_cfg = normalize_moa_config({})
             preset = moa_cfg["default_preset"]
-            try:
-                event.text = moa_payload
-                _moa_state = self._session_state(_quick_key)
-                event._moa_restore_override = _moa_state.conversation.model_override
-                _moa_state.conversation.model_override = {
-                    "provider": "moa",
-                    "model": preset,
-                    "base_url": "moa://local",
-                    "api_key": "moa-virtual-provider",
-                    "api_mode": "chat_completions",
-                }
-                self._evict_cached_agent(_quick_key)
-                event._moa_disable_after_turn = True
-            except Exception:
-                return "Failed to prepare MoA turn."
+            event.text = moa_payload
+            # Only stage the preset here. The live model_override is installed
+            # by _install_moa_one_shot AFTER this turn's idle->running claim
+            # below, so a host apply_session_options() (which persists the
+            # live model) cannot land between the install and the claim and
+            # write provider "moa" to disk.
+            event._moa_pending_preset = preset
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
@@ -19629,25 +19644,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # message arriving during any of those yields would pass the
         # "already running" guard and spin up a duplicate agent for the
         # same session — corrupting the transcript.
-        _active_session_lease, _limit_message = self._claim_active_session_slot(
-            _quick_key,
-            source,
-        )
-        if _limit_message is not None:
-            logger.info(
-                "Rejecting new active session %s: max_concurrent_sessions reached",
+        #
+        # The claim shares one per-session lock with the runtime-options
+        # write-through (gateway/session_options.py), so a host UI cannot
+        # observe "idle", yield, and commit new options under a turn admitted
+        # in between. Uncontended acquire never yields, so the discipline
+        # above still holds; the only wait is for an in-flight commit on this
+        # exact session, after which this turn resolves the committed values.
+        async with _session_admission_lock(self, _quick_key):
+            _active_session_lease, _limit_message = self._claim_active_session_slot(
                 _quick_key,
+                source,
             )
-            return _limit_message
-        _claim_state = self._session_state(_quick_key)
-        if _active_session_lease is not None:
-            _claim_state.turn.lease = _active_session_lease
-        _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
-        _claim_state.turn.started_ts = time.time()
-        self._persist_active_agents()
-        _run_generation = self._begin_session_run_generation(_quick_key)
+            if _limit_message is not None:
+                logger.info(
+                    "Rejecting new active session %s: max_concurrent_sessions reached",
+                    _quick_key,
+                )
+                return _limit_message
+            _claim_state = self._session_state(_quick_key)
+            if _active_session_lease is not None:
+                _claim_state.turn.lease = _active_session_lease
+            _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
+            _claim_state.turn.started_ts = time.time()
+            self._persist_active_agents()
+            _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
+            # The session is claimed (turn.agent sentinel set, no await since),
+            # so apply_session_options() now sees it busy. Returning from here
+            # still runs the finally below, which unwinds the claim.
+            if getattr(event, "_moa_pending_preset", None) is not None:
+                if not self._install_moa_one_shot(event, _quick_key):
+                    return "Failed to prepare MoA turn."
             try:
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
@@ -19679,15 +19708,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("post-turn hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            # MoA one-shot restore must run on EVERY exit path, not just
-            # success. The restore data lives on the per-turn event object
-            # (_moa_restore_override), which is discarded once the event goes
-            # out of scope — so if _handle_message_with_agent raises, a restore
-            # in the try block would be skipped and the MoA override would leak
-            # permanently (every later message silently fans out through MoA).
-            # Putting it in finally guarantees the revert on success, exception,
-            # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
+            # One-turn model restore (/model --once and the /moa one-shot share
+            # conversation.one_turn_restore) must run on EVERY exit path, not
+            # just success: if _handle_message_with_agent raises, a restore in
+            # the try block would be skipped and the one-turn override would
+            # leak permanently (every later message silently fanning out
+            # through MoA). Putting it in finally guarantees the revert on
+            # success, exception, and interrupt alike.
             self._restore_pending_one_turn_model_override(_quick_key)
             # Normal completion/exception/interrupt owns and clears this exact
             # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
@@ -19706,26 +19733,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the lease its own turn acquired, never a newer turn's.
             self._release_turn_lease(_quick_key, _run_generation)
 
-    def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
-        """Revert a ``/moa <prompt>`` one-shot model override after its turn.
+    def _install_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> bool:
+        """Install the ``/moa <prompt>`` one-shot model override for this turn.
 
-        Called from the ``finally`` of the message-handling path so the revert
-        fires whether the turn succeeded, raised, or was interrupted. A no-op
-        unless ``event._moa_disable_after_turn`` is set. ``_moa_restore_override``
-        carries the prior per-session override (``None`` means the user had no
-        override, so the MoA override is cleared outright).
+        Must be called after the idle->running claim in ``_handle_message`` and
+        before ``_handle_message_with_agent``, so the MoA turn itself always
+        runs on MoA and a ``/moa`` refused before the claim never leaves the
+        override live. The virtual ``moa`` provider is live-only: the prior
+        override is parked in ``conversation.one_turn_restore`` (the slot
+        ``/model --once`` uses) BEFORE the live swap, so a durable commit that
+        lands while the override is live -- the post-turn window after
+        ``_run_agent_inner`` releases the running slot included -- persists
+        the parked snapshot, never provider ``moa``, and the ``finally`` in
+        ``_handle_message`` (``_restore_pending_one_turn_model_override``)
+        reverts even a partially applied install. Returns ``False`` when the
+        install failed.
         """
-        if not getattr(event, "_moa_disable_after_turn", False):
-            return
+        preset = getattr(event, "_moa_pending_preset", None)
+        event._moa_pending_preset = None
         try:
-            _restore = getattr(event, "_moa_restore_override", None)
-            self._session_state(quick_key).conversation.model_override = _restore
+            # Rehydrate first so the post-turn restore puts back the
+            # persisted override, not a pre-rehydrate None.
+            self._rehydrate_session_runtime_options(quick_key)
+            _moa_state = self._session_state(quick_key)
+            # Park the prior override in the same slot /model --once uses so
+            # the durable-first primitive persists the pre-MoA model (never
+            # provider "moa") for any commit that lands while the virtual
+            # override is live -- including the post-turn window after
+            # _run_agent_inner releases the running slot and before this
+            # turn's finally restores. An older pending /model --once
+            # snapshot wins. _restore_pending_one_turn_model_override in the
+            # finally puts it back; a durable model commit in between clears
+            # the slot and supersedes the restore.
+            if _moa_state.conversation.one_turn_restore is None:
+                _moa_state.conversation.one_turn_restore = (
+                    self._snapshot_session_model_override(quick_key)
+                )
+            _moa_state.conversation.model_override = {
+                "provider": "moa",
+                "model": preset,
+                "base_url": "moa://local",
+                "api_key": "moa-virtual-provider",
+                "api_mode": "chat_completions",
+            }
             self._evict_cached_agent(quick_key)
+            return True
         except Exception:
-            pass
+            logger.debug("Failed to install MoA one-shot override", exc_info=True)
+            return False
 
     def _restore_pending_one_turn_model_override(self, session_key: str) -> None:
-        """Restore a per-session model override after ``/model --once`` runs."""
+        """Restore a per-session model override after a one-turn switch.
+
+        Both ``/model --once`` and the ``/moa <prompt>`` one-shot park the prior
+        override in ``conversation.one_turn_restore``; the message-handling
+        ``finally`` calls this on every exit path. A durable model commit made
+        while the one-turn override was live has already cleared the slot, so
+        this is then a no-op and live stays equal to disk.
+        """
         if not session_key:
             return
         try:
@@ -20542,6 +20607,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if resolved_entry is None:
                 return
             session_entry = resolved_entry
+            session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
@@ -28383,45 +28449,59 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
-    def _rehydrate_session_model_override(self, session_key: str) -> None:
-        """Lazily restore a persisted /model override after a gateway restart.
+    async def apply_session_options(
+        self,
+        source: SessionSource,
+        options: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Apply silent, structured runtime options to a messaging session.
 
-        ``_session_model_overrides`` is in-memory only, so before persistence
-        a restart silently reverted every session to the global default model.
-        The non-secret parts (model/provider/base_url) are written through to
-        the session store when /model runs (and cleared on /new); here we read
-        them back on first use and re-resolve credentials via the normal
-        runtime provider resolution — api_key is never persisted to disk.
-
-        No-op when an in-memory override already exists (live state wins) or
-        when the store has nothing persisted (e.g. the user ran /new, which
-        clears both the in-memory dict and the persisted field).
+        Messaging adapters and host UIs should use this public boundary instead
+        of injecting visible slash-command turns. Values are validated before
+        any state is created or changed, then persisted atomically per session.
+        Returns a structured result; an I/O failure on the durable write is
+        ``rejected``/``durable_write_failed``. Persist and live assignment are
+        one unit under the session lock, completed even if the caller is
+        cancelled.
         """
-        _rehydrate_state = self._peek_session_state(session_key)
-        if (
-            _rehydrate_state is not None
-            and _rehydrate_state.conversation.model_override is not None
-        ):
+        from gateway.session_options import apply_gateway_session_options
+
+        return await apply_gateway_session_options(self, source, options)
+
+    def _rehydrate_session_runtime_options(self, session_key: str) -> None:
+        """Lazily restore persisted runtime options after a gateway restart.
+
+        The model, reasoning effort, and fast tier belong to the existing
+        messaging session. Model credentials are re-resolved from live config;
+        they are never stored in sessions.json.
+        """
+        state = self._session_state(session_key)
+        if state.persistent.runtime_options_rehydrated:
             return
         store = getattr(self, "session_store", None)
         if store is None:
             return
         try:
-            persisted = store.get_model_override(session_key)
+            persisted = store.get_runtime_options(session_key)
         except Exception:
             logger.debug(
-                "Failed to read persisted session model override", exc_info=True
+                "Failed to read persisted session runtime options", exc_info=True
             )
             return
+        state.persistent.runtime_options_rehydrated = True
         if not persisted:
             return
-        override: Dict[str, Any] = {
-            "model": persisted.get("model"),
-            "provider": persisted.get("provider"),
-            "base_url": persisted.get("base_url"),
-        }
-        provider = persisted.get("provider")
-        if provider:
+        # Live state wins per field: a one-turn override already installed in
+        # this process (/model --once, /moa) must not be clobbered by the
+        # first rehydrate touch; only fields still at their default are filled.
+        model_persisted = persisted.get("model_override")
+        if model_persisted and state.conversation.model_override is None:
+            override: Dict[str, Any] = {
+                "model": model_persisted.get("model"),
+                "provider": model_persisted.get("provider"),
+                "base_url": model_persisted.get("base_url"),
+            }
+            provider = model_persisted.get("provider")
             # Re-resolve credentials for the persisted provider. On failure
             # (e.g. credentials were removed since the switch) keep the
             # credential-less override — _resolve_session_agent_runtime falls
@@ -28445,11 +28525,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "(provider=%s); using credential-less override",
                     provider, exc_info=True,
                 )
-        self._session_state(session_key).conversation.model_override = override
-        logger.info(
-            "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
-            session_key, override.get("model"), provider or "",
-        )
+            state.conversation.model_override = override
+            logger.info(
+                "Rehydrated persisted /model override for session=%s: "
+                "model=%s provider=%s",
+                session_key,
+                override.get("model"),
+                provider or "",
+            )
+
+        reasoning = persisted.get("reasoning_override")
+        if state.conversation.reasoning_override is None and isinstance(reasoning, dict):
+            state.conversation.reasoning_override = dict(reasoning)
+        tier = persisted.get("service_tier_override")
+        if state.conversation.service_tier_override is _SERVICE_TIER_UNSET:
+            if tier == "priority":
+                state.conversation.service_tier_override = "priority"
+            elif tier == "normal":
+                state.conversation.service_tier_override = None
+
+    def _rehydrate_session_model_override(self, session_key: str) -> None:
+        """Compatibility alias for callers that predate structured options."""
+        self._rehydrate_session_runtime_options(session_key)
+
+    async def _commit_session_runtime_options(self, session_key: str, **options) -> bool:
+        """Single durable-first write-through for per-session runtime options.
+
+        Shared by ``/model``, ``/reasoning``, ``/fast`` and the structured host
+        API: persist the complete snapshot first, then move live state; a
+        failed durable write raises with live state untouched. Runs under the
+        per-session admission lock. See
+        ``gateway.session_options.commit_session_runtime_options``.
+        """
+        from gateway.session_options import commit_session_runtime_options
+
+        return await commit_session_runtime_options(self, session_key, **options)
 
     def _apply_session_model_override(
         self, session_key: str, model: str, runtime_kwargs: dict

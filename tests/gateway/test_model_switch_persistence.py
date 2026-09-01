@@ -222,11 +222,16 @@ class TestOneTurnNeverPersisted:
         runner._pending_one_turn_model_restores = {}
         runner._running_agents = {}
         # async_session_store is a property over session_store; install the
-        # mock behind the private cache attribute it reads.
+        # mock behind the private cache attribute it reads. The sync store
+        # must expose the write-through primitive so the once-path's refusal
+        # to call it is observable (not merely skipped for lack of a store).
+        _sync_store = MagicMock()
+        _sync_store.get_runtime_options.return_value = None
         _store = MagicMock()
         _store.set_model_override = AsyncMock()
-        _store._store = None
-        runner.session_store = None
+        _store.set_runtime_options = AsyncMock(return_value=True)
+        _store._store = _sync_store
+        runner.session_store = _sync_store
         runner._async_session_store = _store
         return runner
 
@@ -260,4 +265,5 @@ class TestOneTurnNeverPersisted:
         assert sk in runner._pending_one_turn_model_restores
         # ...but NEVER written through to the persistent session store.
         runner.async_session_store.set_model_override.assert_not_awaited()
+        runner.async_session_store.set_runtime_options.assert_not_awaited()
 
