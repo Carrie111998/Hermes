@@ -905,7 +905,12 @@ def _managed_node_tree_outdated(home: Path | None = None) -> bool:
                     timeout=10,
                     creationflags=windows_hide_flags(),
                 )
-                version = result.stdout.decode().strip().lstrip("v")
+                raw = result.stdout
+                if isinstance(raw, bytes):
+                    raw = raw.decode()
+                elif raw is None:
+                    raw = ""
+                version = str(raw).strip().lstrip("v")
                 major = int(version.split(".")[0])
             except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
                 return False  # broken, not outdated — the runnable probe handles it
