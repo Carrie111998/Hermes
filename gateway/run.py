@@ -11567,6 +11567,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform_str = source.platform.value
                 chat_id = str(source.chat_id)
                 thread_id = source.thread_id
+                chat_type = str(source.chat_type or "").lower()
             else:
                 # Fall back to parsing the session key when no persisted
                 # origin is available (legacy sessions/tests).
@@ -11576,6 +11577,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 platform_str = _parsed["platform"]
                 chat_id = _parsed["chat_id"]
                 thread_id = _parsed.get("thread_id")
+                chat_type = str(_parsed.get("chat_type") or "").lower()
 
             # Deduplicate only identical delivery targets. Thread/topic-aware
             # platforms can share a parent chat while still routing to distinct
@@ -11594,6 +11596,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                     logger.info(
                         "Shutdown notification suppressed for active session: %s has gateway_restart_notification=false",
+                        platform_str,
+                    )
+                    continue
+                if (
+                    platform_cfg is not None
+                    and not platform_cfg.home_channel_startup_notification
+                    and chat_type not in {"dm", "direct", "private"}
+                ):
+                    logger.info(
+                        "Shutdown notification suppressed for non-DM active session: "
+                        "%s has home_channel_startup_notification=false",
                         platform_str,
                     )
                     continue

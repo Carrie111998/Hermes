@@ -914,7 +914,69 @@ async def test_home_channel_setting_keeps_active_direct_shutdown_notice():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert [call[0] for call in adapter.sent_calls] == ["direct-chat"]
+    assert [call[0] for call in getattr(adapter, "sent_calls", [])] == ["direct-chat"]
+
+
+@pytest.mark.asyncio
+async def test_home_channel_setting_suppresses_active_group_shutdown_notice():
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    platform_cfg = runner.config.platforms[Platform.TELEGRAM]
+    platform_cfg.home_channel_startup_notification = False
+    platform_cfg.gateway_restart_notification = True
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="group-home",
+        chat_type="group",
+        user_id="user-42",
+    )
+    session_key = "agent:main:telegram:group:group-home:user-42"
+    runner._running_agents[session_key] = MagicMock()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert getattr(adapter, "sent_calls", []) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_type", ["direct", "private"])
+async def test_home_channel_setting_keeps_persisted_alias_dm_shutdown_notice(chat_type):
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    platform_cfg = runner.config.platforms[Platform.TELEGRAM]
+    platform_cfg.home_channel_startup_notification = False
+    platform_cfg.gateway_restart_notification = True
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="direct-chat",
+        chat_type=chat_type,
+        user_id="user-42",
+    )
+    session_key = f"agent:main:telegram:{chat_type}:direct-chat"
+    runner._running_agents[session_key] = MagicMock()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert [call[0] for call in getattr(adapter, "sent_calls", [])] == ["direct-chat"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_type", ["direct", "private"])
+async def test_home_channel_setting_keeps_parsed_alias_dm_shutdown_notice(chat_type):
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    platform_cfg = runner.config.platforms[Platform.TELEGRAM]
+    platform_cfg.home_channel_startup_notification = False
+    platform_cfg.gateway_restart_notification = True
+    session_key = f"agent:main:telegram:{chat_type}:direct-chat"
+    runner._running_agents[session_key] = MagicMock()
+    runner.session_store._entries[session_key] = MagicMock(origin=None)
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert [call[0] for call in getattr(adapter, "sent_calls", [])] == ["direct-chat"]
 
 
 @pytest.mark.asyncio
