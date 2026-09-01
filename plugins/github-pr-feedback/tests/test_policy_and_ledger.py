@@ -1147,20 +1147,27 @@ def test_ledger_retries_transient_wal_open_failure(monkeypatch) -> None:
     import github_pr_feedback.ledger as ledger_module
 
     class Cursor:
+        def __init__(self, value):
+            self.value = value
+
         def fetchone(self):
-            return ("wal",)
+            return (self.value,)
 
     class Connection:
         def __init__(self):
             self.wal_attempts = 0
+            self.current_mode = "delete"
 
         def execute(self, sql):
+            if sql == "PRAGMA journal_mode":
+                return Cursor(self.current_mode)
             if sql == "PRAGMA journal_mode=WAL":
                 self.wal_attempts += 1
                 if self.wal_attempts == 1:
                     raise sqlite3.OperationalError("unable to open database file")
-                return Cursor()
-            return Cursor()
+                self.current_mode = "wal"
+                return Cursor("wal")
+            return Cursor(None)
 
     connection = Connection()
     monkeypatch.setattr(ledger_module.time, "sleep", lambda _delay: None)
@@ -1168,6 +1175,9 @@ def test_ledger_retries_transient_wal_open_failure(monkeypatch) -> None:
     ledger_module._enable_wal_with_bounded_retry(connection)
 
     assert connection.wal_attempts == 2
+    connection.wal_attempts = 0
+    ledger_module._enable_wal_with_bounded_retry(connection)
+    assert connection.wal_attempts == 0
 
 
 def test_worktree_policy_allows_ten_seconds_for_local_git_probe(

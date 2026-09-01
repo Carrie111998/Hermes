@@ -36,6 +36,9 @@ def _enable_wal_with_bounded_retry(connection: sqlite3.Connection) -> None:
         if delay:
             time.sleep(delay)
         try:
+            current_mode = connection.execute("PRAGMA journal_mode").fetchone()
+            if current_mode and str(current_mode[0]).casefold() == "wal":
+                return
             mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()
         except sqlite3.OperationalError as error:
             if "unable to open database file" not in str(error).casefold():
