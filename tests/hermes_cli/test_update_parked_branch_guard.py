@@ -11,9 +11,12 @@ stale branch with none of main's new code. Two sessions burned time on
 The guard (``_assess_parked_branch_switch``):
 - clean tree + branch fully merged into origin/<target>  → safe to
   auto-switch back to the target (and STAY there — no switch-back).
-- dirty tree, unmerged commits, git failure, or the
-  ``updates.auto_switch_parked_branch: false`` opt-out → do NOT touch the
-  branch; warn loudly and mark the code update SKIPPED.
+- clean tree + unmerged commits → either switch while preserving the branch,
+  or rebase in place when ``updates.parked_branch_strategy`` requests it.
+- dirty maintained branch + unmerged commits → stash tracked/untracked edits,
+  rebase in place, then restore them under the normal update policy.
+- dirty branch without a committed overlay, unfinished Git state, config opt-out,
+  or unverifiable history → do NOT switch; warn and fail closed.
 
 These tests run the guard against REAL git repositories (init, commit,
 branch, clone) — not mocked subprocess.run — so they exercise the actual
