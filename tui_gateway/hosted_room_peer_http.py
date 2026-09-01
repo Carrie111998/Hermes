@@ -218,6 +218,7 @@ class PeerRunsHTTPClient:
         *,
         base_url: str,
         api_key: str,
+        target_profile: str | None = None,
         timeout_seconds: float = 30,
         receipt_db_path: Path | str | None = None,
         poll_min_seconds: float = 0.1,
@@ -229,6 +230,12 @@ class PeerRunsHTTPClient:
             raise ValueError("peer API key is missing or too short")
         self.base_url = base_url
         self.api_key = api_key
+        profile = str(target_profile or "").strip()
+        if profile and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", profile) is None:
+            raise ValueError("peer target profile is invalid")
+        self._profile_prefix = (
+            f"/p/{urllib.parse.quote(profile, safe='')}" if profile else ""
+        )
         self.timeout_seconds = float(timeout_seconds)
         self.receipt_db_path = Path(receipt_db_path) if receipt_db_path else None
         if poll_min_seconds <= 0 or poll_max_seconds < poll_min_seconds:
@@ -346,7 +353,7 @@ class PeerRunsHTTPClient:
         if headers:
             request_headers.update(headers)
         request = urllib.request.Request(
-            f"{self.base_url}{path}",
+            f"{self.base_url}{self._profile_prefix}{path}",
             data=(
                 json.dumps(body, separators=(",", ":")).encode("utf-8")
                 if body is not None
