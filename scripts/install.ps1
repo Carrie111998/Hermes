@@ -1165,6 +1165,8 @@ function Resolve-UvCmd {
 }
 
 function Resolve-AvailablePythonVersion {
+    param([switch]$SupportedFallbackOnly)
+
     # Return the first Python minor version uv can actually find, preferring the
     # requested $PythonVersion and then $PythonFallbackVersions.  Returns $null
     # when none are available.
@@ -1176,7 +1178,17 @@ function Resolve-AvailablePythonVersion {
     # survive into the ``venv`` stage's process -- there $PythonVersion is back
     # at its "3.11" default.  Consumers re-resolve here instead of trusting that
     # default, which is exactly the propagation gap behind issue #50769.
-    $candidates = @($PythonVersion) + $PythonFallbackVersions
+    # Test-Python uses the restricted form before downloading 3.11.  Keep the
+    # legacy 3.10 recovery candidate out of that path because pyproject.toml
+    # supports only >=3.11,<3.14; it remains available to the existing
+    # post-install-failure recovery path below.
+    $candidates = if ($SupportedFallbackOnly) {
+        @($PythonFallbackVersions | Where-Object {
+            ([version]$_) -ge ([version]$PythonVersion)
+        })
+    } else {
+        @($PythonVersion) + $PythonFallbackVersions
+    }
     $seen = @{}
     foreach ($ver in $candidates) {
         if (-not $ver -or $seen.ContainsKey($ver)) { continue }
@@ -1201,6 +1213,23 @@ function Test-Python {
             return $true
         }
     } catch { }
+
+    # Reuse an already-installed supported Python before making a network
+    # request for the preferred 3.11 runtime.  This mirrors install.sh while
+    # retaining the minor-version token that later PowerShell stages re-resolve
+    # in their own process.
+    $compatibleVersion = Resolve-AvailablePythonVersion -SupportedFallbackOnly
+    if ($compatibleVersion) {
+        try {
+            $pythonPath = & $UvCmd python find $compatibleVersion 2>$null
+            if ($pythonPath) {
+                $ver = & $pythonPath --version 2>$null
+                Write-Success "Compatible Python found: $ver"
+                $script:PythonVersion = $compatibleVersion
+                return $true
+            }
+        } catch { }
+    }
     
     # Python not found -- use uv to install it (no admin needed!)
     Write-Info "Python $PythonVersion not found, installing via uv..."
