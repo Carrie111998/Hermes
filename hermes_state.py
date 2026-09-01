@@ -374,6 +374,20 @@ DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 # query; short enough that transient fd pressure doesn't strand the read pool.
 _READ_OPEN_RETRY_SECONDS = 60.0
 
+# Transient SQLITE_IOERR retry budget for READ-ONLY opens (#100436). A WAL
+# database being actively written (checkpoint, WAL reset/truncate, frame
+# flush) can surface "disk I/O error" to a concurrent ``mode=ro`` reader in
+# a millisecond-wide transition window: the read-only connection cannot
+# perform the WAL recovery a read through a stale or mid-update -shm file
+# needs, because recovery requires writing the -shm index, which mode=ro
+# refuses. The window closes on its own (the writer finishes the transition),
+# so a bounded number of short retries makes the open succeed instead of
+# 500-ing the whole /api/sessions poll (or any other read-only opener).
+# Deliberately NOT attempted on writable opens: a writer owns the
+# transition, so an IOERR there means a real storage/fd problem.
+_READ_ONLY_IOERR_RETRY_ATTEMPTS = 3
+_READ_ONLY_IOERR_RETRY_BACKOFF_S = 0.05
+
 # Hard ceiling on read-only connections ALIVE at once against one database
 # FILE — pooled idle ones and checked-out ones together, summed over every
 # SessionDB in this process that points at that file. See _PathReadBudget.
@@ -2080,6 +2094,30 @@ def is_malformed_db_error(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.DatabaseError):
         return False
     return any(marker in str(exc).lower() for marker in _MALFORMED_DB_MARKERS)
+
+
+# SQLite error-message markers for a WAL-transition IOERR on a read-only
+# open. Kept as plain substrings so wrapped error strings match too.
+_READ_ONLY_IOERR_MARKERS = (
+    "disk i/o error",  # SQLITE_IOERR — WAL recovery/read through a stale -shm
+)
+
+
+def _is_transient_read_only_ioerr(exc: sqlite3.OperationalError, *, attempt: int) -> bool:
+    """True when a read-only open should be retried rather than raised.
+
+    A ``mode=ro`` connection cannot perform WAL recovery (recovery needs to
+    write the -shm index, which read-only mode refuses), so a concurrent WAL
+    checkpoint / reset / frame-flush can surface ``SQLITE_IOERR`` ("disk I/O
+    error") to a reader on an otherwise healthy database (#100436). The
+    transition is millisecond-scale, so a bounded number of short retries
+    clears it without changing classification for genuine storage failures —
+    a persistent IOERR still exhausts the budget and propagates.
+    """
+    if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS:
+        return False
+    message = str(exc).lower()
+    return any(marker in message for marker in _READ_ONLY_IOERR_MARKERS)
 
 
 def is_malformed_schema_error(exc: BaseException) -> bool:
@@ -5123,46 +5161,67 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # must already exist + be initialised (callers guard on
                 # db_path.exists()); a SELECT against an empty file raises and
                 # the caller degrades per-profile.
-                self._conn = _connect_tracked_db(
-                    f"file:{self.db_path}?mode=ro",
-                    tracking_path=self.db_path,
-                    uri=True,
-                    check_same_thread=False,
-                    timeout=1.0,
-                    isolation_level=None,
-                )
-                self._conn.row_factory = sqlite3.Row
-                # FTS capability flags normally come from writable schema
-                # initialisation. Probe existing virtual tables with SELECTs
-                # only so read-only search keeps its FTS and trigram paths.
-                # Close the connection on ANY probe failure (e.g. malformed
-                # schema raises DatabaseError, not the OperationalError the
-                # probe handles). The constructor's outer finally also covers
-                # failures before this probe and BaseException paths, so a
-                # leaked tracked connection cannot block _backup_db_file's
-                # raw-copy for the rest of the process — the writable heal
-                # that follows would then repair WITHOUT its forensic backup.
-                try:
-                    apply_database_pragmas(self._conn, db_label="state.db")
-                    cursor = self._conn.cursor()
-                    self._fts_enabled = (
-                        self._fts_table_probe(cursor, "messages_fts") is True
-                    )
-                    if self._fts_enabled:
-                        self._trigram_available = (
-                            self._fts_table_probe(
-                                cursor,
-                                "messages_fts_trigram",
-                            )
-                            is True
-                        )
-                except BaseException:
-                    conn, self._conn = self._conn, None
+                open_attempt = 0
+                while True:
                     try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    raise
+                        self._conn = _connect_tracked_db(
+                            f"file:{self.db_path}?mode=ro",
+                            tracking_path=self.db_path,
+                            uri=True,
+                            check_same_thread=False,
+                            timeout=1.0,
+                            isolation_level=None,
+                        )
+                        self._conn.row_factory = sqlite3.Row
+                        # FTS capability flags normally come from writable schema
+                        # initialisation. Probe existing virtual tables with
+                        # SELECTs only so read-only search keeps its FTS and
+                        # trigram paths. Close the connection on ANY probe
+                        # failure (e.g. malformed schema raises DatabaseError,
+                        # not the OperationalError the probe handles). The
+                        # constructor's outer finally also covers failures
+                        # before this probe and BaseException paths, so a
+                        # leaked tracked connection cannot block
+                        # _backup_db_file's raw-copy for the rest of the
+                        # process — the writable heal that follows would then
+                        # repair WITHOUT its forensic backup.
+                        try:
+                            apply_database_pragmas(self._conn, db_label="state.db")
+                            cursor = self._conn.cursor()
+                            self._fts_enabled = (
+                                self._fts_table_probe(cursor, "messages_fts")
+                                is True
+                            )
+                            if self._fts_enabled:
+                                self._trigram_available = (
+                                    self._fts_table_probe(
+                                        cursor,
+                                        "messages_fts_trigram",
+                                    )
+                                    is True
+                                )
+                        except BaseException:
+                            conn, self._conn = self._conn, None
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                            raise
+                        break
+                    except sqlite3.OperationalError as ioerr:
+                        # A WAL checkpoint / reset / frame-flush in flight on
+                        # the writer side can surface SQLITE_IOERR to a
+                        # concurrent mode=ro reader (it cannot perform the
+                        # recovery the read needs — recovery writes the -shm
+                        # index, which mode=ro refuses). The transition closes
+                        # in milliseconds, so retry a bounded number of times
+                        # before classifying the store as failed (#100436).
+                        if not _is_transient_read_only_ioerr(
+                            ioerr, attempt=open_attempt
+                        ):
+                            raise
+                        open_attempt += 1
+                        time.sleep(_READ_ONLY_IOERR_RETRY_BACKOFF_S)
                 self._record_db_file_identity()
                 initialization_complete = True
                 return
