@@ -8,6 +8,7 @@ import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
 import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
 import { useContextBreakdown } from '@/app/shell/hooks/use-context-breakdown'
+import { useModelUsageStatusbarItem } from '@/app/shell/model-usage-statusbar'
 import { $paneVisible, togglePaneVisible } from '@/components/pane-shell/tree/store'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
@@ -28,6 +29,8 @@ import {
   $busy,
   $connection,
   $currentCwd,
+  $currentModel,
+  $currentProvider,
   $currentUsage,
   $selectedStoredSessionId,
   $sessions,
@@ -102,6 +105,8 @@ export function useStatusbarItems({
   // own cwd in `$sessionStates` and must not paint the primary's workspace.
   const primaryCwd = useStore($currentCwd)
   const primaryUsage = useStore($currentUsage)
+  const currentModel = useStore($currentModel)
+  const currentProvider = useStore($currentProvider)
   const gatewayRestarting = useStore($gatewayRestarting)
   const primarySessionStartedAt = useStore($sessionStartedAt)
   const primaryTurnStartedAt = useStore($turnStartedAt)
@@ -268,6 +273,14 @@ export function useStatusbarItems({
   const contextBar = useMemo(() => contextBarLabel(gaugeUsage), [gaugeUsage])
 
   const approvalModeItem = useApprovalModeStatusbarItem(activeGatewayProfile, requestGateway)
+
+  const modelUsageItem = useModelUsageStatusbarItem({
+    activeSessionId,
+    currentModel,
+    currentProvider,
+    currentUsage,
+    requestGateway
+  })
 
   const gatewayMenuContent = useMemo(
     () => (close: () => void) => (
@@ -544,6 +557,7 @@ export function useStatusbarItems({
         toggleLabel: copy.toggleRunningTimer,
         variant: 'text'
       },
+      modelUsageItem,
       {
         detail: contextBar || undefined,
         hidden: !contextUsage,
@@ -596,6 +610,7 @@ export function useStatusbarItems({
       contextUsage,
       copy,
       gaugeUsage,
+      modelUsageItem,
       sessionStartedAt,
       gatewayState,
       terminalShowing,
