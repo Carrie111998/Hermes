@@ -1668,6 +1668,70 @@ def test_extra_args_set_shm_size_helper():
     assert docker_env._extra_args_set_shm_size([42, None, "--shm-size=1g"]) is True
 
 
+# ── docker_network: false + --network in docker_extra_args (issue #100248) ────
+
+
+def _network_spec_count(run_args):
+    """Count network specifications the way docker parses them."""
+    return sum(
+        1
+        for a in run_args
+        if a in docker_env._NETWORK_FLAGS
+        or any(a.startswith(f"{flag}=") for flag in docker_env._NETWORK_FLAGS)
+    )
+
+
+def test_extra_args_specify_network_helper():
+    assert docker_env._extra_args_specify_network(["--network", "none"]) is True
+    assert docker_env._extra_args_specify_network(["--network=none"]) is True
+    assert docker_env._extra_args_specify_network(["--net", "bridge"]) is True
+    assert docker_env._extra_args_specify_network(["--net=host"]) is True
+    assert docker_env._extra_args_specify_network(["--memory", "512m"]) is False
+    assert docker_env._extra_args_specify_network([]) is False
+    assert docker_env._extra_args_specify_network(None) is False
+    # non-string entries must not crash (config.yaml can be malformed)
+    assert docker_env._extra_args_specify_network([42, None, "--network=none"]) is True
+
+
+def test_network_lockdown_still_applied_without_user_flag(monkeypatch):
+    """docker_network: false with no --network in docker_extra_args keeps the
+    implicit flag — the lockdown behavior itself must not regress."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(network=False, extra_args=["--user", "1009:1009"])
+
+    run_args = _shm_run_args(calls)
+    assert "--network=none" in run_args
+    assert _network_spec_count(run_args) == 1
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--network=none", "--user", "1009:1009"],
+        ["--network", "none"],
+        ["--net=none"],
+        ["--net", "none"],
+    ],
+)
+def test_implicit_network_none_skipped_when_user_sets_network(monkeypatch, extra):
+    """Regression #100248: docker rejects a repeated --network with exit 125
+    (unlike --user, where last-wins applies), so the implicit --network=none
+    from docker_network: false must be suppressed when docker_extra_args
+    already supplies one."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(network=False, extra_args=list(extra))
+
+    run_args = _shm_run_args(calls)
+    # exactly one network spec survives — the operator's own
+    assert _network_spec_count(run_args) == 1, " ".join(run_args)
+    # unrelated user args are still forwarded verbatim
+    assert all(a in run_args for a in extra if not str(a).startswith(("--network", "--net")))
+
+
 # ── issue #96268: secrets must never appear in docker argv ────────────
 
 

@@ -408,6 +408,28 @@ def _extra_args_set_shm_size(extra_args: list) -> bool:
         for a in (extra_args or [])
     )
 
+
+# Network flag aliases understood by `docker run`; shared by the implicit
+# --network=none suppression below and the egress-args collision scan.
+_NETWORK_FLAGS = ("--network", "--net")
+
+
+def _extra_args_specify_network(extra_args: list) -> bool:
+    """True when user-supplied docker_extra_args already set a network.
+
+    Unlike ``--user`` (where Docker applies last-wins), a repeated
+    ``--network`` makes ``docker run`` fail outright with exit 125, so the
+    implicit ``--network=none`` from ``docker_network: false`` must be
+    suppressed whenever the operator supplied one explicitly.
+    """
+    return any(
+        isinstance(a, str) and (
+            a in _NETWORK_FLAGS
+            or any(a.startswith(f"{flag}=") for flag in _NETWORK_FLAGS)
+        )
+        for a in (extra_args or [])
+    )
+
 # /run is split out from _BASE_SECURITY_ARGS because s6-overlay images need it
 # mounted ``exec``: s6 stage0 later runs ``exec /run/s6/basedir/bin/init``, which
 # fails with "Permission denied" (exit 126) on a ``noexec`` mount. For all other
@@ -639,7 +661,7 @@ def _extra_args_egress_collisions(
     """Return docker_extra_args entries that can override egress controls."""
     collisions: list[str] = []
     env_flags = {"-e", "--env", "--env-file"}
-    network_flags = {"--network", "--net"}
+    network_flags = set(_NETWORK_FLAGS)
     i = 0
     while i < len(extra_args):
         arg = extra_args[i]
@@ -976,7 +998,17 @@ class DockerEnvironment(BaseEnvironment):
                     "(requires overlay2 on XFS with pquota). Container will run without disk quota."
                 )
         if not network:
-            resource_args.append("--network=none")
+            # Docker rejects a repeated --network (exit 125) instead of
+            # applying last-wins like it does for --user, so never emit the
+            # implicit --network=none alongside an explicit one.
+            if _extra_args_specify_network(extra_args):
+                logger.info(
+                    "docker_network is disabled but docker_extra_args already "
+                    "specifies a network; keeping the explicit arg and skipping "
+                    "the implicit --network=none."
+                )
+            else:
+                resource_args.append("--network=none")
 
         # Persistent workspace via bind mounts from a configurable host directory
         # (TERMINAL_SANDBOX_DIR, default ~/.hermes/sandboxes/). Non-persistent
