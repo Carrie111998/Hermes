@@ -788,8 +788,7 @@ class SimplexAdapter(BasePlatformAdapter):
                         file_id,
                     )
                     return
-                pending = self._pending_file_transfers.pop(file_id, None) or chat_item
-                self._cancel_file_timeout(file_id)
+                pending = self._pending_file_transfers.get(file_id) or chat_item
                 if not self._file_sender_is_authorized(pending):
                     self._diagnostics["file_rejections"] += 1
                     return
@@ -800,6 +799,8 @@ class SimplexAdapter(BasePlatformAdapter):
                     else None
                 )
                 if file_path:
+                    self._pending_file_transfers.pop(file_id, None)
+                    self._cancel_file_timeout(file_id)
                     file_path = self._resolve_file_path(file_path)
                     pending_item_data = pending.get("chatItem", {}) or {}
                     pending_file = pending_item_data.setdefault("file", {})
@@ -812,8 +813,13 @@ class SimplexAdapter(BasePlatformAdapter):
                         logger.exception(
                             "SimpleX: error processing deferred file message"
                         )
-                elif file_id not in self._terminal_file_transfers:
-                    self._mark_file_terminal(file_id, "completed-without-path")
+                elif pending:
+                    # Some daemon orderings announce completion before the
+                    # AChatItem acquires fileSource.filePath.  Keep the
+                    # authorized wrapper pending until the file-bearing
+                    # newChatItems event arrives (or the bounded timeout emits
+                    # the caption fallback); never terminalize pathless data.
+                    self._track_pending_file(file_id, pending)
             return
 
         if resp_type in {"chatError", "chatErrors", "messageError"}:
@@ -1195,6 +1201,33 @@ class SimplexAdapter(BasePlatformAdapter):
         completed_file_id: Optional[int] = None
 
         if file_info and isinstance(file_info, dict):
+            raw_file_id = file_info.get("fileId")
+            try:
+                guarded_file_id = (
+                    int(raw_file_id) if raw_file_id is not None else None
+                )
+            except (TypeError, ValueError):
+                guarded_file_id = None
+            terminal = (
+                self._terminal_file_transfers.get(guarded_file_id)
+                if guarded_file_id is not None
+                else None
+            )
+            if terminal:
+                if is_edit and terminal.get("reason") == "completed":
+                    # A caption edit retains the chat-item correlation but is
+                    # text-only: the attachment was already consumed and its
+                    # cleanup ownership must not be armed a second time.
+                    file_info = None
+                else:
+                    self._diagnostics["late_file_completions"] += 1
+                    logger.info(
+                        "SimpleX: ignored duplicate completed chat item for fileId=%s",
+                        guarded_file_id,
+                    )
+                    return
+
+        if file_info and isinstance(file_info, dict):
             file_source = file_info.get("fileSource", {}) or {}
             file_path = (
                 file_source.get("filePath")
@@ -1211,16 +1244,6 @@ class SimplexAdapter(BasePlatformAdapter):
                 normalized_file_id = int(file_id) if file_id is not None else None
             except (TypeError, ValueError):
                 normalized_file_id = None
-            if (
-                normalized_file_id is not None
-                and normalized_file_id in self._terminal_file_transfers
-            ):
-                self._diagnostics["late_file_completions"] += 1
-                logger.info(
-                    "SimpleX: ignored duplicate completed chat item for fileId=%s",
-                    normalized_file_id,
-                )
-                return
             if file_path:
                 file_path = self._resolve_file_path(file_path)
 
@@ -1255,6 +1278,9 @@ class SimplexAdapter(BasePlatformAdapter):
                     return
 
             if file_info and file_path:
+                if normalized_file_id is not None:
+                    self._pending_file_transfers.pop(normalized_file_id, None)
+                    self._cancel_file_timeout(normalized_file_id)
                 completed_file_id = normalized_file_id
                 receive_target = (
                     self._terminal_file_target(normalized_file_id)
@@ -2610,12 +2636,26 @@ async def _standalone_send(
     if not ws_url:
         return {"error": "SimpleX standalone send: SIMPLEX_WS_URL is required"}
 
-    async def _send_confirmed(ws, command: str, corr_id: str) -> dict:
+    async def _send_confirmed(
+        ws,
+        command: str,
+        corr_id: str,
+        *,
+        await_file_complete: bool = False,
+    ) -> dict:
         await ws.send(json.dumps({"corrId": corr_id, "cmd": command}))
+        deferred: List[dict] = []
         while True:
             raw = await asyncio.wait_for(ws.recv(), timeout=30.0)
             event = json.loads(raw)
             if event.get("corrId") != corr_id:
+                resp = (
+                    event.get("resp")
+                    if isinstance(event.get("resp"), dict)
+                    else event
+                )
+                if isinstance(resp, dict):
+                    deferred.append(resp)
                 continue
             resp = event.get("resp") if isinstance(event.get("resp"), dict) else event
             error = _response_error(resp)
@@ -2625,12 +2665,58 @@ async def _standalone_send(
                 raise RuntimeError(
                     f"unexpected SimpleX response: {_response_type(resp) or '<missing>'}"
                 )
+            break
+
+        if not await_file_complete:
             return resp
 
-    owned_temp_paths: List[str] = []
+        ack_ids = set(_response_item_ids(resp))
+
+        def _matches_file_terminal(candidate: dict) -> Optional[bool]:
+            candidate_type = _response_type(candidate)
+            if candidate_type not in {
+                "sndFileComplete",
+                "sndFileCompleteXFTP",
+                "sndFileError",
+                "sndFileWarning",
+            }:
+                return None
+            wrapper = SimplexAdapter._normalize_chat_item_wrapper(
+                candidate.get("chatItem") or candidate.get("chatItem_") or {}
+            )
+            item_id = SimplexAdapter._item_id_from_wrapper(wrapper)
+            if ack_ids:
+                if item_id is None or item_id not in ack_ids:
+                    return None
+            return candidate_type in {"sndFileComplete", "sndFileCompleteXFTP"}
+
+        for candidate in deferred:
+            terminal = _matches_file_terminal(candidate)
+            if terminal is True:
+                return resp
+            if terminal is False:
+                raise RuntimeError("SimpleX standalone file transfer failed")
+
+        while True:
+            raw = await asyncio.wait_for(ws.recv(), timeout=300.0)
+            event = json.loads(raw)
+            candidate = (
+                event.get("resp")
+                if isinstance(event.get("resp"), dict)
+                else event
+            )
+            if not isinstance(candidate, dict):
+                continue
+            terminal = _matches_file_terminal(candidate)
+            if terminal is True:
+                return resp
+            if terminal is False:
+                raise RuntimeError("SimpleX standalone file transfer failed")
+
+    cleanup_temp_paths: set[str] = set()
     try:
         chat_ref = SimplexAdapter._chat_ref(chat_id)
-        commands: List[str] = []
+        commands: List[tuple[str, Optional[str]]] = []
         if message:
             for chunk in BasePlatformAdapter.truncate_message(
                 message, MAX_MESSAGE_LENGTH, len_fn=_simplex_payload_len
@@ -2640,8 +2726,11 @@ async def _standalone_send(
                     "mentions": {},
                 }]
                 commands.append(
-                    f"/_send {chat_ref} json "
-                    f"{json.dumps(composed, ensure_ascii=False)}"
+                    (
+                        f"/_send {chat_ref} json "
+                        f"{json.dumps(composed, ensure_ascii=False)}",
+                        None,
+                    )
                 )
 
         for media in media_files or []:
@@ -2659,8 +2748,6 @@ async def _standalone_send(
                 file_path = path
             elif not force_document and _is_image_ext(ext):
                 file_path, thumb = SimplexAdapter._prepare_image(path)
-                if os.path.abspath(file_path) != os.path.abspath(path):
-                    owned_temp_paths.append(file_path)
                 msg_content = {"type": "image", "image": thumb, "text": ""}
             else:
                 msg_content = {"type": "file", "text": ""}
@@ -2670,16 +2757,41 @@ async def _standalone_send(
                 "msgContent": msg_content,
                 "mentions": {},
             }]
+            owned_conversion = (
+                file_path
+                if os.path.abspath(file_path) != os.path.abspath(path)
+                else None
+            )
             commands.append(
-                f"/_send {chat_ref} json "
-                f"{json.dumps(composed, ensure_ascii=False)}"
+                (
+                    f"/_send {chat_ref} json "
+                    f"{json.dumps(composed, ensure_ascii=False)}",
+                    owned_conversion,
+                )
             )
 
         item_ids: List[str] = []
         async with _wsclient.connect(ws_url, open_timeout=10, close_timeout=5) as ws:
-            for index, command in enumerate(commands):
+            for index, (command, owned_conversion) in enumerate(commands):
                 corr_id = f"{_CORR_PREFIX}snd-{uuid.uuid4().hex}-{index}"
-                resp = await _send_confirmed(ws, command, corr_id)
+                try:
+                    resp = await _send_confirmed(
+                        ws,
+                        command,
+                        corr_id,
+                        await_file_complete=owned_conversion is not None,
+                    )
+                except asyncio.TimeoutError:
+                    # The daemon may still be reading the file after its chat
+                    # acknowledgement. Preserve the only conversion on an
+                    # ambiguous timeout rather than corrupting delivery.
+                    raise
+                except RuntimeError:
+                    if owned_conversion:
+                        cleanup_temp_paths.add(owned_conversion)
+                    raise
+                if owned_conversion:
+                    cleanup_temp_paths.add(owned_conversion)
                 item_ids.extend(_response_item_ids(resp))
 
         return {
@@ -2691,7 +2803,7 @@ async def _standalone_send(
     except Exception as e:
         return {"error": f"SimpleX send failed: {e}"}
     finally:
-        for temp_path in owned_temp_paths:
+        for temp_path in cleanup_temp_paths:
             try:
                 if os.path.isfile(temp_path) or os.path.islink(temp_path):
                     os.remove(temp_path)

@@ -458,6 +458,9 @@ async def test_standalone_send_removes_owned_image_conversion(monkeypatch, tmp_p
     sent_payloads = []
 
     class DummyWs:
+        def __init__(self):
+            self.receives = 0
+
         async def __aenter__(self):
             return self
 
@@ -468,8 +471,21 @@ async def test_standalone_send_removes_owned_image_conversion(monkeypatch, tmp_p
             sent_payloads.append(json.loads(payload))
 
         async def recv(self):
+            self.receives += 1
+            if self.receives == 1:
+                return json.dumps(
+                    {"corrId": sent_payloads[-1]["corrId"], "resp": _send_ack(91)}
+                )
             return json.dumps(
-                {"corrId": sent_payloads[-1]["corrId"], "resp": _send_ack(91)}
+                {
+                    "resp": {
+                        "type": "sndFileCompleteXFTP",
+                        "chatItem": {
+                            "chatInfo": {"type": "direct"},
+                            "chatItem": {"meta": {"itemId": 91}},
+                        },
+                    }
+                }
             )
 
     import websockets
@@ -1709,6 +1725,97 @@ async def test_duplicate_success_completion_does_not_delete_active_media(tmp_pat
     assert adapter.get_runtime_diagnostics()["late_file_completions"] == 1
 
     captured[0]._post_turn_cleanup_callbacks[0]()
+
+
+@pytest.mark.asyncio
+async def test_pathless_completion_waits_for_later_file_bearing_item(tmp_path):
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"ws_url": "ws://localhost:5225", "files_folder": str(tmp_path)},
+        )
+    )
+    adapter.set_authorization_check(lambda *_args: True)
+    adapter._receive_file = AsyncMock()
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    invitation = _make_file_chat_item("", "ordered.pdf")
+    invitation["chatItem"]["file"].pop("fileSource")
+    invitation["chatItem"]["file"]["fileStatus"] = {"type": "rcvInvitation"}
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "rcvFileDescrReady",
+                "rcvFileTransfer": {"fileId": 7, "fileName": "ordered.pdf"},
+                "chatItem": invitation,
+            }
+        }
+    )
+    await asyncio.sleep(0)
+    target = Path(adapter._receive_file.await_args.args[1])
+
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "rcvFileComplete",
+                "chatItem": {"chatItem": {"file": {"fileId": 7}}},
+            }
+        }
+    )
+    assert 7 in adapter._pending_file_transfers
+    assert 7 not in adapter._terminal_file_transfers
+
+    target.write_bytes(b"%PDF")
+    completed = _make_file_chat_item(str(target), "ordered.pdf")
+    await adapter._handle_event(
+        {"resp": {"type": "newChatItems", "chatItems": [completed]}}
+    )
+    await _drain_dispatches(adapter)
+
+    assert len(captured) == 1
+    assert captured[0].media_urls == [str(target)]
+    assert 7 not in adapter._pending_file_transfers
+    captured[0]._post_turn_cleanup_callbacks[0]()
+
+
+@pytest.mark.asyncio
+async def test_completed_media_caption_edit_remains_correlated_text_only(tmp_path):
+    from gateway.config import PlatformConfig
+
+    media = tmp_path / "photo.jpg"
+    media.write_bytes(b"\xff\xd8")
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter.set_authorization_check(lambda *_args: True)
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    original = _make_file_chat_item(str(media), "photo.jpg")
+    original["chatItem"]["meta"]["itemId"] = 700
+    await adapter._handle_chat_item(original)
+    await _drain_dispatches(adapter)
+
+    edited = json.loads(json.dumps(original))
+    edited["chatItem"]["content"]["msgContent"]["text"] = "corrected caption"
+    await adapter._handle_event(
+        {"resp": {"type": "chatItemUpdated", "chatItem": edited}}
+    )
+    await _drain_dispatches(adapter)
+
+    assert len(captured) == 2
+    assert captured[1].text == "corrected caption"
+    assert captured[1].media_urls == []
+    assert captured[1].metadata == {"is_edit": True}
 
 
 @pytest.mark.asyncio
