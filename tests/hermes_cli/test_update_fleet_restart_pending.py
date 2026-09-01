@@ -97,10 +97,19 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     monkeypatch.setattr(
         hermes_main, "_resume_windows_gateways_after_update", lambda *a, **k: None
     )
+    # This fixture validates fleet-restart bookkeeping, not updater
+    # module-generation refresh. Keep gateway mocks attached to the configured
+    # module object so the test cannot rediscover live gateway processes.
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(hermes_main, "_write_update_incomplete_marker", lambda: None)
     monkeypatch.setattr(hermes_main, "_clear_update_incomplete_marker", lambda: None)
+    # These restart helpers are bare globals in hermes_cli.update_cmd, so
+    # patch that namespace rather than the hermes_cli.main re-export surface.
     monkeypatch.setattr(
-        hermes_main, "_finish_dashboard_update_cleanup", lambda *a, **k: None
+        update_cmd, "_finish_dashboard_update_cleanup", lambda *a, **k: None
+    )
+    monkeypatch.setattr(
+        update_cmd, "_restart_macos_launchd_gateways", lambda *a, **k: None
     )
     monkeypatch.setattr(hermes_main, "_build_web_ui", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -111,7 +120,7 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     import hermes_cli.gateway as hermes_gateway
 
     monkeypatch.setattr(
-        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
+        hermes_gateway, "find_gateway_pids", lambda *a, **k: []
     )
     monkeypatch.setattr(hermes_gateway, "supports_systemd_services", lambda: False)
     monkeypatch.setattr(
