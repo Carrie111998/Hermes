@@ -77,6 +77,32 @@ class TestIsTimeoutError:
 
 
 # ---------------------------------------------------------------------------
+# _is_rate_limited_error
+# ---------------------------------------------------------------------------
+
+class TestIsRateLimitedError:
+    def test_none_is_not_rate_limited(self):
+        assert not _StubAdapter._is_rate_limited_error(None)
+
+    def test_empty_is_not_rate_limited(self):
+        assert not _StubAdapter._is_rate_limited_error("")
+
+    def test_flood_is_rate_limited(self):
+        assert _StubAdapter._is_rate_limited_error("flood control exceeded, retry in 60 seconds")
+
+    def test_too_many_requests_is_rate_limited(self):
+        assert _StubAdapter._is_rate_limited_error("Too Many Requests: rate limit reached")
+
+    def test_weixin_rate_limit_text_is_rate_limited(self):
+        assert _StubAdapter._is_rate_limited_error(
+            "iLink sendmessage rate limited; cooldown active for 42.0s"
+        )
+
+    def test_formatting_error_not_rate_limited(self):
+        assert not _StubAdapter._is_rate_limited_error("Bad Request: can't parse entities")
+
+
+# ---------------------------------------------------------------------------
 # _send_with_retry — success on first attempt
 # ---------------------------------------------------------------------------
 

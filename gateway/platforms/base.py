@@ -5669,6 +5669,16 @@ class BasePlatformAdapter(ABC):
         return any(pat in lowered for pat in _RETRYABLE_ERROR_PATTERNS)
 
     @staticmethod
+    def _is_rate_limited_error(error: Optional[str]) -> bool:
+        """Return True if the error string classifies as a rate limit / flood cap.
+
+        Single wrapper around :func:`classify_send_error` so the three call
+        sites in :meth:`_send_with_retry` share one notion of "is this a rate
+        limit" instead of three inline copies that could drift.
+        """
+        return classify_send_error(None, error or "") == "rate_limited"
+
+    @staticmethod
     def _is_timeout_error(error: Optional[str]) -> bool:
         """Return True if the error string indicates a read/write timeout.
 
@@ -5765,7 +5775,7 @@ class BasePlatformAdapter(ABC):
         # truncate content.  Gate on the platform-neutral classifier as well so
         # platforms that surface a rate limit without a retry_after field
         # (e.g. Weixin raising a bare RuntimeError) get the same treatment.
-        is_rate_limited = classify_send_error(None, error_str) == "rate_limited"
+        is_rate_limited = self._is_rate_limited_error(error_str)
         is_network = (
             result.retryable
             or is_rate_limited
@@ -5813,7 +5823,7 @@ class BasePlatformAdapter(ABC):
                 # retry instead of reusing the first attempt's classification,
                 # so the break/continue decision below reflects the current
                 # attempt — not a stale value.
-                is_rate_limited = classify_send_error(None, error_str) == "rate_limited"
+                is_rate_limited = self._is_rate_limited_error(error_str)
                 if not (
                     result.retryable
                     or is_rate_limited
@@ -5839,7 +5849,7 @@ class BasePlatformAdapter(ABC):
         # flood-capped send: it re-enters the server ban and would drop the tail
         # of the message.  Return the typed failure so the delivery ledger owns
         # redelivery after the cooldown instead.
-        if classify_send_error(None, error_str) == "rate_limited":
+        if self._is_rate_limited_error(error_str):
             logger.error(
                 "[%s] Rate-limited send not retried via plain-text fallback; "
                 "returning typed failure for redelivery: %s",
