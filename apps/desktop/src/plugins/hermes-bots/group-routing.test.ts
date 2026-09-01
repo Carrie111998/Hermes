@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
 import { resolveGroupResponders } from './group-rounds'
-
 import type { GroupMember, GroupMessage } from './types'
 
 const MEMBERS: GroupMember[] = [
