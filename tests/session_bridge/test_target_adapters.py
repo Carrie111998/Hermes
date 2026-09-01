@@ -1486,6 +1486,116 @@ def test_sidebar_reconcile_marker_returns_complete_absence_evidence() -> None:
     ]
 
 
+def test_sidebar_reconcile_reserved_thread_recovers_search_blind_bound_thread() -> (
+    None
+):
+    """Regression, measured 2026-08-31: a marker-prefix search returned zero
+    matches for a live bound thread (never renamed / content-index lag). The
+    targeted twin must authenticate the exact reserved thread and return
+    authoritative RECOVERED evidence over that single projection."""
+
+    expected = _sidebar_expected()
+    marker = encode_bridge_marker(expected, SECRET)
+    direct = _codex_signed_read()
+    direct["thread"]["createdAt"] = 100.0
+    direct["thread"]["updatedAt"] = 101.0
+    client = FakeRequestClient({"thread/read": [direct, direct]})
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    evidence = verifier.reconcile_reserved_thread(
+        expected,
+        thread_id=CODEX_ID,
+        now=100.0,
+        ttl_seconds=30.0,
+    )
+
+    assert evidence.state is SidebarReconciliationState.RECOVERED
+    assert evidence.match_count == 1
+    assert evidence.recovered_thread_id == CODEX_ID
+    assert evidence.completed_at == 100.0
+    assert evidence.expires_at == 130.0
+    assert evidence.fixed_reason is None
+    assert evidence.marker_digest == hashlib.sha256(marker.encode()).hexdigest()
+    assert evidence.generation == (
+        f"codex:{int(100.0 * 1_000_000)}:{evidence.inventory_digest}"
+    )
+    assert [method for method, _, _ in client.calls] == [
+        "thread/read",
+        "thread/read",
+    ]
+    assert all(
+        method not in {"thread/search", "thread/list", "thread/start"}
+        for method, _, _ in client.calls
+    )
+
+
+def test_sidebar_reconcile_reserved_thread_missing_raises_not_indexed() -> None:
+    client = FakeRequestClient({
+        "thread/list": [{"data": []}, {"data": []}],
+    })
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.reconcile_reserved_thread(
+            _sidebar_expected(),
+            thread_id=CODEX_ID,
+            now=100.0,
+            ttl_seconds=30.0,
+        )
+
+    assert raised.value.code == "native_task_not_indexed"
+
+
+def test_sidebar_reconcile_reserved_thread_never_blesses_markerless_thread() -> None:
+    direct = _codex_read()
+    direct["thread"]["createdAt"] = 100.0
+    direct["thread"]["updatedAt"] = 101.0
+    client = FakeRequestClient({"thread/read": [direct, direct]})
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    with pytest.raises(SidebarVerificationError) as raised:
+        verifier.reconcile_reserved_thread(
+            _sidebar_expected(),
+            thread_id=CODEX_ID,
+            now=100.0,
+            ttl_seconds=30.0,
+        )
+
+    assert raised.value.code == "source_identity_mismatch"
+
+
+def test_sidebar_reconcile_reserved_thread_validates_reconciliation_window() -> None:
+    client = FakeRequestClient({})
+    verifier = SidebarThreadVerifier(
+        CodexSourceAdapter(client, marker_secret=SECRET),
+        marker_secret=SECRET,
+        reconciliation_interval=0,
+    )
+
+    with pytest.raises(ValueError, match="TTL must be positive"):
+        verifier.reconcile_reserved_thread(
+            _sidebar_expected(),
+            thread_id=CODEX_ID,
+            now=100.0,
+            ttl_seconds=0.0,
+        )
+
+    assert client.calls == []
+
+
 def test_sidebar_reconcile_marker_paginates_active_and_archived_before_recovery() -> (
     None
 ):

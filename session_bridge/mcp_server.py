@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from decimal import Decimal, InvalidOperation
 import ipaddress
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -62,6 +63,8 @@ from .store import (
     redact_codex_thread_id,
 )
 
+
+_LOG = logging.getLogger(__name__)
 
 EXPECTED_TOOLS = {
     "session_search",
@@ -589,10 +592,20 @@ def create_app(
                 except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                     raise
                 except Exception:
+                    # The claim passed a fresh reconciliation re-proof moments
+                    # ago, so a payload-build failure here is infrastructure,
+                    # not identity evidence: settle retryable and keep the real
+                    # exception in the log. Persistent failures still
+                    # terminalize through the bounded retry ladder.
+                    _LOG.exception(
+                        "sidebar broker job build failed for source %s; "
+                        "releasing the claim as retryable",
+                        getattr(claim, "source_session_id", "<unknown>"),
+                    )
                     await _settle_sidebar_claim(
                         store,
                         token_text,
-                        "source_identity_mismatch",
+                        "bridge_temporarily_unavailable",
                     )
                     continue
                 jobs.append(job)

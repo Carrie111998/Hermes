@@ -4,6 +4,7 @@ from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -1587,8 +1588,10 @@ def test_session_sidebar_pending_settles_legacy_job_missing_delivery_candidate(
     assert response == {"jobs": []}
     job = store.get_sidebar_job_for_source(candidate.source_session_id)
     assert job is not None
-    assert job["state"] == SidebarJobState.FAILED.value
-    assert job["error_code"] == "source_identity_mismatch"
+    # A build failure is not identity evidence: the claim is released
+    # retryable instead of being buried terminally.
+    assert job["state"] == SidebarJobState.RETRY.value
+    assert job["error_code"] == "bridge_temporarily_unavailable"
 
 
 @pytest.mark.parametrize("malformed", [None, True, 1.5, "5", [], {}])
@@ -1621,6 +1624,7 @@ def test_session_sidebar_pending_rejects_malformed_limits_without_leasing(
 def test_session_sidebar_pending_settles_one_bad_claim_and_returns_no_job(
     db: SessionDB,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     failed_index: int,
 ) -> None:
     store, claims = _seed_claimed_sidebar_pair(db)
@@ -1640,13 +1644,16 @@ def test_session_sidebar_pending_settles_one_bad_claim_and_returns_no_job(
 
     monkeypatch.setattr(store, "get_sidebar_candidate_for_delivery", selective_get)
     with _test_client(_create_test_app(db, store, coordinator)) as client:
-        response = _call_tool(client, "session_sidebar_pending", {"limit": 1})
+        with caplog.at_level(logging.ERROR, logger="session_bridge.mcp_server"):
+            response = _call_tool(client, "session_sidebar_pending", {"limit": 1})
 
     assert response == {"jobs": []}
     failed = store.get_sidebar_job_for_source(failed_source)
     assert failed is not None
-    assert failed["state"] == "sidebar_failed"
-    assert failed["error_code"] == "source_identity_mismatch"
+    assert failed["state"] == "sidebar_retry"
+    assert failed["error_code"] == "bridge_temporarily_unavailable"
+    # The real exception is preserved in the local log, never in the response.
+    assert "must-not-leak" in caplog.text
 
 
 def test_session_sidebar_pending_marker_preflight_failure_never_claims(

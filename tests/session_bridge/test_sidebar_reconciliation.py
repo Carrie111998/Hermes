@@ -292,11 +292,17 @@ class FakeVerifier:
             | None
             | Exception
         ),
+        *,
+        reserved_result: SidebarReconciliationEvidence | Exception | None = None,
     ) -> None:
         self.result = result
+        self.reserved_result = reserved_result
         self.find_calls: list[BridgeMarkerPayload] = []
         self.reconcile_calls: list[tuple[BridgeMarkerPayload, float, float]] = []
         self.verify_calls: list[tuple[str, BridgeMarkerPayload]] = []
+        self.reserved_reconcile_calls: list[
+            tuple[str, BridgeMarkerPayload, float, float]
+        ] = []
 
     def find_by_marker(
         self, expected: BridgeMarkerPayload
@@ -331,6 +337,21 @@ class FakeVerifier:
         if self.result is None or self.result.thread_id != thread_id:
             raise SidebarVerificationError("source_identity_mismatch")
         return self.result
+
+    def reconcile_reserved_thread(
+        self,
+        expected: BridgeMarkerPayload,
+        *,
+        thread_id: str,
+        now: float,
+        ttl_seconds: float,
+    ) -> SidebarReconciliationEvidence:
+        self.reserved_reconcile_calls.append((thread_id, expected, now, ttl_seconds))
+        if isinstance(self.reserved_result, Exception):
+            raise self.reserved_result
+        if self.reserved_result is None:
+            raise SidebarVerificationError("native_task_not_indexed")
+        return self.reserved_result
 
 
 class BlockingVerifier(FakeVerifier):
@@ -681,6 +702,127 @@ async def test_reserved_thread_id_requires_matching_authoritative_recovery() -> 
 
 
 @pytest.mark.asyncio
+async def test_bound_claim_survives_search_blind_absence_via_targeted_recovery() -> (
+    None
+):
+    """Regression, measured 2026-08-31: a live bound thread the marker-prefix
+    search missed (never renamed / content-index lag) was terminally settled
+    source_identity_mismatch on absence evidence while a targeted read of the
+    reserved thread succeeded in seconds."""
+
+    store = FakeSidebarStore(reserved_thread_id=THREAD)
+    verifier = FakeVerifier(
+        _absence_evidence(),
+        reserved_result=_recovered_evidence(),
+    )
+    coordinator = _coordinator(store, verifier)
+
+    claims = await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1)
+
+    assert len(claims) == 1
+    assert claims[0].reconciliation_state is SidebarReconciliationState.RECOVERED
+    assert claims[0].recovered_thread_id == THREAD
+    assert claims[0].create_eligible is False
+    assert claims[0].rename_required is True
+    assert claims[0].reconciliation_proof_digest == store.current_proof_digest
+    assert verifier.reserved_reconcile_calls == [
+        (THREAD, BridgeMarkerPayload(BRIDGE, SOURCE, Provider.CODEX, 1), 100.0, 30.0)
+    ]
+    assert store.binds == [("opaque-lease-token", THREAD, 100.0)]
+    assert store.failures == []
+    # Only the authoritative corrected evidence becomes a durable proof; the
+    # search-blind absence scan is never recorded.
+    assert [proof.state for proof in store.proofs] == [
+        SidebarReconciliationState.RECOVERED
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bound_claim_unindexed_on_targeted_read_stays_retryable() -> None:
+    store = FakeSidebarStore(reserved_thread_id=THREAD)
+    verifier = FakeVerifier(_absence_evidence())
+    coordinator = _coordinator(store, verifier)
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
+    assert verifier.reserved_reconcile_calls == [
+        (THREAD, BridgeMarkerPayload(BRIDGE, SOURCE, Provider.CODEX, 1), 100.0, 30.0)
+    ]
+    assert store.failures == [
+        ("opaque-lease-token", "bridge_temporarily_unavailable", 100.0)
+    ]
+    assert store.failure_thread_ids == [THREAD]
+    assert store.binds == []
+    assert store.proofs == []
+
+
+@pytest.mark.asyncio
+async def test_bound_claim_targeted_marker_conflict_settles_fatal() -> None:
+    store = FakeSidebarStore(reserved_thread_id=THREAD)
+    verifier = FakeVerifier(
+        _absence_evidence(),
+        reserved_result=SidebarVerificationError("marker_conflict"),
+    )
+    coordinator = _coordinator(store, verifier)
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
+    assert store.failures == [("opaque-lease-token", "marker_conflict", 100.0)]
+    assert store.failure_thread_ids == [THREAD]
+    assert store.binds == []
+
+
+@pytest.mark.asyncio
+async def test_bound_claim_transient_targeted_read_failure_stays_retryable() -> None:
+    store = FakeSidebarStore(reserved_thread_id=THREAD)
+    verifier = FakeVerifier(
+        _absence_evidence(),
+        reserved_result=RuntimeError("codex app-server unreachable"),
+    )
+    coordinator = _coordinator(store, verifier)
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
+    assert store.failures == [
+        ("opaque-lease-token", "bridge_temporarily_unavailable", 100.0)
+    ]
+    assert store.failure_thread_ids == [THREAD]
+    assert store.binds == []
+
+
+@pytest.mark.asyncio
+async def test_bound_claim_targeted_recovery_of_foreign_thread_never_binds() -> None:
+    store = FakeSidebarStore(reserved_thread_id=THREAD)
+    verifier = FakeVerifier(
+        _absence_evidence(),
+        reserved_result=_recovered_evidence(
+            "33333333-3333-4333-8333-333333333333"
+        ),
+    )
+    coordinator = _coordinator(store, verifier)
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
+    assert store.failures == [
+        ("opaque-lease-token", "source_identity_mismatch", 100.0)
+    ]
+    assert store.binds == []
+
+
+@pytest.mark.asyncio
+async def test_bound_claim_without_reserved_reconciler_fails_closed_retryable() -> (
+    None
+):
+    store = FakeSidebarStore(reserved_thread_id=THREAD)
+    verifier = FakeVerifier(_absence_evidence())
+    verifier.reconcile_reserved_thread = None  # type: ignore[method-assign]
+    coordinator = _coordinator(store, verifier)
+
+    assert await coordinator.claim_sidebar_jobs_for_delivery(now=100.0, limit=1) == ()
+    assert store.failures == [
+        ("opaque-lease-token", "bridge_temporarily_unavailable", 100.0)
+    ]
+    assert store.binds == []
+    assert store.proofs == []
+
+
+@pytest.mark.asyncio
 async def test_zero_match_permits_retry_only_after_previous_lease_expiry() -> None:
     store = FakeSidebarStore(claim_after=300.0)
     verifier = FakeVerifier(None)
@@ -696,6 +838,7 @@ async def test_zero_match_permits_retry_only_after_previous_lease_expiry() -> No
     assert claims[0].create_eligible is True
     assert claims[0].reconciliation_proof_digest == store.current_proof_digest
     assert claims[0].rename_required is False
+    assert verifier.reserved_reconcile_calls == []
 
 
 @pytest.mark.asyncio

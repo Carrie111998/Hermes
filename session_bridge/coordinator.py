@@ -1472,6 +1472,37 @@ class SessionBridgeCoordinator:
                     )
                     if not isinstance(evidence, SidebarReconciliationEvidence):
                         raise TypeError("sidebar reconciliation evidence is malformed")
+                    if (
+                        evidence.state is SidebarReconciliationState.ABSENCE_PROVEN
+                        and reserved_thread_id is not None
+                    ):
+                        # A marker-prefix search proves absence only of indexed
+                        # content; the bound thread can exist unindexed (never
+                        # renamed, content-index lag). Re-prove the exact
+                        # reserved thread before condemning the binding, and
+                        # record only the authoritative outcome as the proof.
+                        rescue_method = getattr(
+                            verifier,
+                            "reconcile_reserved_thread",
+                            None,
+                        )
+                        if not callable(rescue_method):
+                            raise TypeError(
+                                "sidebar reserved-thread reconciler is unavailable"
+                            )
+                        evidence = await asyncio.to_thread(
+                            rescue_method,
+                            expected,
+                            thread_id=reserved_thread_id,
+                            now=claim_time,
+                            ttl_seconds=_sidebar_reconciliation_proof_ttl_seconds(
+                                self._config.service.reconcile_seconds
+                            ),
+                        )
+                        if not isinstance(evidence, SidebarReconciliationEvidence):
+                            raise TypeError(
+                                "sidebar reconciliation evidence is malformed"
+                            )
                     proof = await asyncio.to_thread(
                         _call,
                         self._store,

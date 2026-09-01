@@ -326,23 +326,7 @@ class SidebarThreadVerifier:
         """Produce fresh, complete, authenticated native-inventory evidence."""
 
         expected = _validated_sidebar_marker_payload(expected)
-        if (
-            isinstance(now, bool)
-            or not isinstance(now, (int, float))
-            or not math.isfinite(float(now))
-        ):
-            raise ValueError("sidebar reconciliation time must be finite")
-        if (
-            isinstance(ttl_seconds, bool)
-            or not isinstance(ttl_seconds, (int, float))
-            or not math.isfinite(float(ttl_seconds))
-            or float(ttl_seconds) <= 0
-        ):
-            raise ValueError("sidebar reconciliation TTL must be positive and finite")
-        completed_at = float(now)
-        expires_at = completed_at + float(ttl_seconds)
-        if not math.isfinite(expires_at):
-            raise ValueError("sidebar reconciliation expiry must be finite")
+        completed_at, expires_at = _sidebar_reconciliation_window(now, ttl_seconds)
         try:
             projections = self._fresh_marker_inventory_projections(expected)
         except (KeyboardInterrupt, SystemExit):
@@ -405,6 +389,45 @@ class SidebarThreadVerifier:
             recovered_thread_id=(
                 recovered.thread_id if recovered is not None else None
             ),
+            fixed_reason=None,
+        )
+
+    def reconcile_reserved_thread(
+        self,
+        expected: BridgeMarkerPayload,
+        *,
+        thread_id: str,
+        now: float,
+        ttl_seconds: float,
+    ) -> SidebarReconciliationEvidence:
+        """Re-prove one reserved thread the marker-search inventory missed.
+
+        A marker-prefix search proves absence only of indexed content; a bound
+        thread can exist unindexed (never renamed, content-index lag). The
+        inventory examined here is exactly the reserved thread, so the evidence
+        digests that single authenticated projection. Raises
+        SidebarVerificationError exactly as verify_thread does; never returns
+        absence evidence.
+        """
+
+        expected = _validated_sidebar_marker_payload(expected)
+        completed_at, expires_at = _sidebar_reconciliation_window(now, ttl_seconds)
+        verified = self.verify_thread(thread_id=thread_id, expected=expected)
+        projection = verified.projection
+        if projection is None:
+            raise SidebarVerificationError("bridge_temporarily_unavailable")
+        marker = encode_bridge_marker(expected, self._marker_secret)
+        marker_digest = hashlib.sha256(marker.encode("utf-8")).hexdigest()
+        inventory_digest = _sidebar_inventory_digest((projection,))
+        return SidebarReconciliationEvidence.create(
+            state=SidebarReconciliationState.RECOVERED,
+            generation=f"codex:{int(completed_at * 1_000_000)}:{inventory_digest}",
+            completed_at=completed_at,
+            expires_at=expires_at,
+            inventory_digest=inventory_digest,
+            marker_digest=marker_digest,
+            match_count=1,
+            recovered_thread_id=verified.thread_id,
             fixed_reason=None,
         )
 
@@ -2499,6 +2522,30 @@ def _verified_sidebar_projection(
     if decoded:
         raise SidebarVerificationError("source_identity_mismatch")
     raise SidebarVerificationError("source_identity_mismatch")
+
+
+def _sidebar_reconciliation_window(
+    now: object,
+    ttl_seconds: object,
+) -> tuple[float, float]:
+    if (
+        isinstance(now, bool)
+        or not isinstance(now, (int, float))
+        or not math.isfinite(float(now))
+    ):
+        raise ValueError("sidebar reconciliation time must be finite")
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, (int, float))
+        or not math.isfinite(float(ttl_seconds))
+        or float(ttl_seconds) <= 0
+    ):
+        raise ValueError("sidebar reconciliation TTL must be positive and finite")
+    completed_at = float(now)
+    expires_at = completed_at + float(ttl_seconds)
+    if not math.isfinite(expires_at):
+        raise ValueError("sidebar reconciliation expiry must be finite")
+    return completed_at, expires_at
 
 
 def _sidebar_inventory_digest(
