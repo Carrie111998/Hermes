@@ -302,6 +302,19 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     text = (error or "unknown error").strip()
     lower = text.lower()
 
+    # The provider branches below classify on the error's FIRST line only.
+    # Provider errors arrive as single-line ``str(exc)`` ("Error code: 401 -
+    # ...", "httpx.ReadTimeout: ..."), so the signature lives on line one.
+    # Later lines are embedded content — an OSError filename carries a whole
+    # script's source (newlines included), subprocess output gets captured
+    # into exception text, tool payloads land in tracebacks — and reading
+    # them as an error signature blames a provider that was never called
+    # (#99988: a "File name too long" crash whose embedded script contained
+    # the word "Authorization" was delivered as "provider authentication
+    # error"). ``text[:2000]`` bounds length, not position.
+    first_line = text.splitlines()[0] if text else ""
+    first_lower = first_line.lower()
+
     if "skipped to prevent unintended spend: global inference config drifted" in lower:
         if "finite one-shot job is consumed" in lower:
             remediation = (
@@ -356,14 +369,17 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     # Provider/API failures are the common noisy path. Keep these short.
     # Match 429 as a whole token (#83188 @cation98): bare substring matching
     # let identifiers containing those digits (job ids, ports, hashes) trip
-    # a false "provider rate limit" alert.
+    # a false "provider rate limit" alert. First-line-only for the same
+    # reason as the timeout/auth branches below (#99988).
     if provider_reachable and (
-        re.search(r"\b429\b", text) or "rate limit" in lower or "usage limit" in lower
+        re.search(r"\b429\b", first_line)
+        or "rate limit" in first_lower
+        or "usage limit" in first_lower
     ):
         reason = "rate limit"
-        if "weekly usage limit" in lower:
+        if "weekly usage limit" in first_lower:
             reason = "weekly usage limit"
-        elif "quota" in lower:
+        elif "quota" in first_lower:
             reason = "quota limit"
         return (
             f"⚠️ Cron '{job_name}' failed: provider {reason}. "
@@ -396,7 +412,9 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
         )
 
     if provider_reachable and (
-        "readtimeout" in lower or "timed out" in lower or "timeout" in lower
+        "readtimeout" in first_lower
+        or "timed out" in first_lower
+        or "timeout" in first_lower
     ):
         return (
             f"⚠️ Cron '{job_name}' failed: provider timeout. "
@@ -406,9 +424,12 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
 
     # Match authentication/authorization wording at a word boundary and the
     # 401/403 status codes as whole tokens, so "oauth", "4015" and similar do
-    # not trip a misleading auth message.
+    # not trip a misleading auth message. First line only: an embedded
+    # payload word like a curl "Authorization" header inside a long OSError
+    # filename is script content, not a provider signature (#99988).
     if provider_reachable and (
-        re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text)
+        re.search(r"authenticat|authoriz", first_lower)
+        or re.search(r"\b(401|403)\b", first_line)
     ):
         return (
             f"⚠️ Cron '{job_name}' failed: provider authentication error. "
