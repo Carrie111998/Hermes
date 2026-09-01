@@ -2879,11 +2879,11 @@ async def _standalone_send(
             try:
                 if os.path.isfile(temp_path) or os.path.islink(temp_path):
                     os.remove(temp_path)
-            except OSError:
+            except OSError as exc:
                 logger.debug(
-                    "SimpleX: failed to remove standalone image conversion %s",
+                    "SimpleX: failed to remove standalone image conversion %s (%s)",
                     os.path.basename(temp_path),
-                    exc_info=True,
+                    type(exc).__name__,
                 )
 
 

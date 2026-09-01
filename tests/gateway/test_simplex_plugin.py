@@ -1846,6 +1846,7 @@ async def test_completed_receive_rearms_cleanup_ttl(tmp_path):
 
 
 def test_owned_media_cleanup_failure_is_diagnostic(tmp_path, monkeypatch, caplog):
+    import errno
     import os
 
     from gateway.config import PlatformConfig
@@ -1856,8 +1857,8 @@ def test_owned_media_cleanup_failure_is_diagnostic(tmp_path, monkeypatch, caplog
         PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
     )
 
-    def fail_remove(_path):
-        raise OSError("cleanup denied")
+    def fail_remove(path):
+        raise OSError(errno.EACCES, "cleanup denied", path)
 
     monkeypatch.setattr(os, "remove", fail_remove)
     with caplog.at_level("WARNING"):
@@ -1866,6 +1867,7 @@ def test_owned_media_cleanup_failure_is_diagnostic(tmp_path, monkeypatch, caplog
     assert adapter.get_runtime_diagnostics()["media_cleanup_failures"] == 1
     assert "failed to remove owned temporary media" in caplog.text
     assert str(tmp_path) not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 @pytest.mark.asyncio
