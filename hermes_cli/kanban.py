@@ -2311,7 +2311,20 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
-def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
+# Kept in sync with tools/kanban_tools.py's copy of this note (#98160).
+_REVIEW_READINESS_NOTE = (
+    "\n\nJudging note: this checks whether the implementation work described "
+    "above is finished and ready to hand off to a reviewer — it does not "
+    "check whether the card as a whole is done. If the card's own criteria "
+    "call for a reviewer to approve or close out the work, treat that as a "
+    "later step outside this check: do not withhold DONE merely because "
+    "reviewer/approval evidence is absent."
+)
+
+
+def _goal_mode_handoff_rejection(
+    task: Optional[kb.Task], evidence: str, *, handoff: str = "complete"
+) -> Optional[str]:
     """Apply the goal judge to every terminal worker handoff, including review."""
     if task is None or not task.goal_mode:
         return None
@@ -2326,11 +2339,21 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Opti
 
     from hermes_cli.goals import judge_goal
 
+    goal = f"{task.title}\n\n{task.body or ''}".strip()
+    if handoff == "review":
+        # judge_goal truncates its goal argument to 2000 chars before sending
+        # it to the judge; reserve room here so a long title/body can't push
+        # the note itself past that limit and silently drop it (#98160).
+        budget = 2000 - len(_REVIEW_READINESS_NOTE)
+        if len(goal) > budget:
+            goal = goal[:budget]
+        goal = f"{goal}{_REVIEW_READINESS_NOTE}"
+
     verdict = "done"
     reason = ""
     try:
         verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
+            goal=goal,
             last_response=evidence.strip(),
         )
     except Exception as judge_exc:
@@ -2535,6 +2558,7 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
         rejection = _goal_mode_handoff_rejection(
             kb.get_task(conn, tid),
             summary or "",
+            handoff="review",
         )
         if rejection is not None:
             print(

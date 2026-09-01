@@ -251,15 +251,43 @@ def _goal_judge_available() -> bool:
     return client is not None and bool(model)
 
 
-def _goal_mode_handoff_rejection(task, evidence: str) -> Optional[str]:
+# Appended to the judge's goal text only for a review handoff. A goal-mode
+# card whose own acceptance criteria require same-card review can never
+# satisfy the full-goal judge from an implementer's summary alone — that
+# reviewer step hasn't happened yet, and can't until review is requested.
+# This note keeps the judge gate (vague/absent evidence is still rejected)
+# while scoping it to "is the implementation ready for review", not "has the
+# whole card (including review) been achieved" (#98160).
+_REVIEW_READINESS_NOTE = (
+    "\n\nJudging note: this checks whether the implementation work described "
+    "above is finished and ready to hand off to a reviewer — it does not "
+    "check whether the card as a whole is done. If the card's own criteria "
+    "call for a reviewer to approve or close out the work, treat that as a "
+    "later step outside this check: do not withhold DONE merely because "
+    "reviewer/approval evidence is absent."
+)
+
+
+def _goal_mode_handoff_rejection(
+    task, evidence: str, *, handoff: str = "complete"
+) -> Optional[str]:
     """Return a rejection reason when a goal-mode terminal handoff is premature."""
     if not task or not task.goal_mode or not _goal_judge_available():
         return None
+    goal = f"{task.title}\n\n{task.body or ''}".strip()
+    if handoff == "review":
+        # judge_goal truncates its goal argument to 2000 chars before sending
+        # it to the judge; reserve room here so a long title/body can't push
+        # the note itself past that limit and silently drop it (#98160).
+        budget = 2000 - len(_REVIEW_READINESS_NOTE)
+        if len(goal) > budget:
+            goal = goal[:budget]
+        goal = f"{goal}{_REVIEW_READINESS_NOTE}"
     verdict = "done"
     reason = ""
     try:
         verdict, reason, _, _, _ = judge_goal(
-            goal=f"{task.title}\n\n{task.body or ''}".strip(),
+            goal=goal,
             last_response=evidence.strip(),
         )
     except Exception as judge_exc:
@@ -937,7 +965,7 @@ def _handle_request_review(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             task = kb.get_task(conn, tid)
-            rejection = _goal_mode_handoff_rejection(task, summary)
+            rejection = _goal_mode_handoff_rejection(task, summary, handoff="review")
             if rejection is not None:
                 return tool_error(
                     f"Goal review handoff rejected by judge: {rejection}. "
