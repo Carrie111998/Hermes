@@ -183,7 +183,7 @@ function isInjectedSystemNote(text: string): boolean {
 const SS_SESSION_KEY = "hermes.m.activeSession";
 const SS_TITLE_KEY = "hermes.m.activeTitle";
 const SS_MOBILE_SESSION_KEY = "hermes.m.mobileSession";
-const BUILD_TAG = "build 2026-08-31.6 · send-recovery";
+const BUILD_TAG = "build 2026-08-31.7 · photo-send-fix";
 
 function ssGet(key: string): string {
   try {
@@ -860,7 +860,8 @@ const prevSid = ssGet(SS_MOBILE_SESSION_KEY);
     const sid = sessionIdRef.current;
     const gw = gwRef.current;
     const text = composer.trim();
-    if (!sid || !gw || !text || busy) return;
+    // Photo-only sends are valid: bail only when there's no text AND no images.
+    if (!sid || !gw || busy || (!text && pendingImages.length === 0)) return;
 
     const body = [...pendingImages.map((im) => `@image:${im.path}`), text].join(
       "\n\n",
