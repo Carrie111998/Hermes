@@ -338,7 +338,7 @@ class MemoryStore:
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT fact_id, trust_score FROM facts WHERE fact_id = ?", (fact_id,)
+                "SELECT fact_id, trust_score, category FROM facts WHERE fact_id = ?", (fact_id,)
             ).fetchone()
             if row is None:
                 return False
@@ -381,10 +381,11 @@ class MemoryStore:
             if content is not None:
                 self._compute_hrr_vector(fact_id, content)
             # Rebuild bank for relevant category
-            cat = category or self._conn.execute(
-                "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)
-            ).fetchone()["category"]
+            old_category = row["category"]
+            cat = category or old_category
             self._rebuild_bank(cat)
+            if category is not None and old_category != category:
+                self._rebuild_bank(old_category)
 
             return True
 
@@ -505,10 +506,14 @@ class MemoryStore:
 
     @staticmethod
     def _bounded_int(value, *, name: str, minimum: int, maximum: int) -> int:
-        try:
+        if isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer")
+        if isinstance(value, int):
+            result = value
+        elif isinstance(value, str) and value.isascii() and value.isdigit():
             result = int(value)
-        except (TypeError, ValueError):
-            raise ValueError(f"{name} must be an integer") from None
+        else:
+            raise ValueError(f"{name} must be an integer")
         if not minimum <= result <= maximum:
             raise ValueError(f"{name} must be between {minimum} and {maximum}")
         return result
@@ -546,7 +551,7 @@ class MemoryStore:
         relation_type: str,
         metadata: dict | None = None,
     ) -> dict:
-        """Create or reactivate one directed typed edge without deleting history."""
+        """Create one directed typed edge without deleting archived history."""
         with self._lock:
             source_fact_id = self._bounded_int(
                 source_fact_id, name="source_fact_id", minimum=1, maximum=2**63 - 1
@@ -591,20 +596,10 @@ class MemoryStore:
                 """,
                 (source_fact_id, target_fact_id, relation),
             ).fetchone()
-            if archived is not None:
-                edge_id = int(archived["edge_id"])
-                self._conn.execute(
-                    """
-                    UPDATE edges
-                    SET status = 'active', metadata_json = ?, updated_at = CURRENT_TIMESTAMP,
-                        archived_at = NULL, archive_reason = NULL
-                    WHERE edge_id = ?
-                    """,
-                    (metadata_json, edge_id),
-                )
-                created = False
-                reactivated = True
-            else:
+            previous_archived_edge_id = (
+                int(archived["edge_id"]) if archived is not None else None
+            )
+            try:
                 cur = self._conn.execute(
                     """
                     INSERT INTO edges
@@ -616,12 +611,39 @@ class MemoryStore:
                 edge_id = int(cur.lastrowid)
                 created = True
                 reactivated = False
+            except sqlite3.IntegrityError:
+                # The RLock is process-local. Another MCP process can win
+                # the same active-edge insert between our SELECT and
+                # INSERT; the partial unique index is the cross-process
+                # arbiter. Return its row so add remains idempotent.
+                winner = self._conn.execute(
+                    """
+                    SELECT * FROM edges
+                    WHERE source_fact_id = ? AND target_fact_id = ?
+                      AND relation_type = ? AND status = 'active'
+                    ORDER BY edge_id LIMIT 1
+                    """,
+                    (source_fact_id, target_fact_id, relation),
+                ).fetchone()
+                if winner is None:
+                    raise
+                result = self._edge_to_dict(winner)
+                result.update({
+                    "created": False,
+                    "reactivated": False,
+                    "previous_archived_edge_id": previous_archived_edge_id,
+                })
+                return result
 
             row = self._conn.execute(
                 "SELECT * FROM edges WHERE edge_id = ?", (edge_id,)
             ).fetchone()
             result = self._edge_to_dict(row)
-            result.update({"created": created, "reactivated": reactivated})
+            result.update({
+                "created": created,
+                "reactivated": reactivated,
+                "previous_archived_edge_id": previous_archived_edge_id,
+            })
             return result
 
     def archive_edge(self, edge_id: int, reason: str | None = None) -> dict:
@@ -849,8 +871,10 @@ class MemoryStore:
                 active_clause = " AND (status IS NULL OR status = 'active')"
             node_rows = self._conn.execute(
                 f"SELECT * FROM facts WHERE category = ?{active_clause} ORDER BY fact_id LIMIT ?",
-                (category, limit_nodes),
+                (category, limit_nodes + 1),
             ).fetchall()
+            truncated = len(node_rows) > limit_nodes
+            node_rows = node_rows[:limit_nodes]
             fact_ids = [int(row["fact_id"]) for row in node_rows]
             edge_rows: list[sqlite3.Row] = []
             if fact_ids:
@@ -882,6 +906,7 @@ class MemoryStore:
                 "category": category,
                 "node_count": len(node_rows),
                 "edge_count": len(edge_rows),
+                "truncated": truncated,
                 "nodes": [self._json_safe_row(row) for row in node_rows],
                 "edges": [self._edge_to_dict(row) for row in edge_rows],
             }

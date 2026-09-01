@@ -4,11 +4,24 @@ Every test uses a temporary SQLite database. No configured Hermes store is opene
 """
 
 import json
+import multiprocessing
 import sqlite3
 
 import pytest
 
 from plugins.memory.holographic.store import MemoryStore
+
+
+def _concurrent_edge_add(db_path, source, target, start, results):
+    store = MemoryStore(db_path)
+    try:
+        start.wait(timeout=10)
+        edge = store.add_edge(source, target, "progresses_to")
+        results.put(("ok", edge["edge_id"]))
+    except BaseException as exc:  # noqa: BLE001 - child result is asserted
+        results.put(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        store.close()
 
 
 @pytest.fixture(autouse=True)
@@ -83,7 +96,7 @@ def test_schema_is_additive_indexed_and_id_preserving(tmp_path):
         assert store._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
-def test_add_archive_and_reactivate_are_idempotent(tmp_path):
+def test_add_archive_and_readd_preserve_history(tmp_path):
     with MemoryStore(tmp_path / "graph.db") as store:
         source, target, _, _ = _facts(store)
         first = store.add_edge(
@@ -106,11 +119,29 @@ def test_add_archive_and_reactivate_are_idempotent(tmp_path):
             "SELECT COUNT(*) FROM edges WHERE edge_id = ?", (first["edge_id"],)
         ).fetchone()[0] == 1
 
-        revived = store.add_edge(source, target, "progresses_to")
-        assert revived["edge_id"] == first["edge_id"]
-        assert revived["reactivated"] is True
-        assert revived["status"] == "active"
-        assert revived["archived_at"] is None
+        readded = store.add_edge(source, target, "progresses_to")
+        assert readded["edge_id"] != first["edge_id"]
+        assert readded["created"] is True
+        assert readded["reactivated"] is False
+        assert readded["previous_archived_edge_id"] == first["edge_id"]
+        old = store._conn.execute(
+            "SELECT status, archived_at, archive_reason FROM edges WHERE edge_id = ?",
+            (first["edge_id"],),
+        ).fetchone()
+        assert tuple(old) == ("archived", archived["archived_at"], "superseded")
+        assert store._conn.execute("SELECT COUNT(*) FROM edges").fetchone()[0] == 2
+
+        store.archive_edge(readded["edge_id"], reason="second history record")
+        third = store.add_edge(source, target, "progresses_to")
+        assert third["previous_archived_edge_id"] == readded["edge_id"]
+        history = store._conn.execute(
+            "SELECT edge_id, status, archive_reason FROM edges ORDER BY edge_id"
+        ).fetchall()
+        assert [tuple(row) for row in history] == [
+            (first["edge_id"], "archived", "superseded"),
+            (readded["edge_id"], "archived", "second history record"),
+            (third["edge_id"], "active", None),
+        ]
 
 
 def test_add_edge_validates_endpoints_relation_and_metadata(tmp_path):
@@ -122,6 +153,11 @@ def test_add_edge_validates_endpoints_relation_and_metadata(tmp_path):
             store.add_edge(source, target, "not a relation")
         with pytest.raises(ValueError, match="metadata"):
             store.add_edge(source, target, "progresses_to", metadata=["bad"])
+        for invalid_id in (True, False, 1.0, "1.0", "1e0", " 1", "+1"):
+            with pytest.raises(ValueError, match="integer"):
+                store.add_edge(invalid_id, target, "progresses_to")
+        with pytest.raises(ValueError, match="between"):
+            store.add_edge(2**63, target, "progresses_to")
 
 
 def test_neighbors_preserve_direction_and_type_filters(tmp_path):
@@ -198,6 +234,50 @@ def test_list_subgraph_is_category_induced_and_keeps_isolated_nodes(tmp_path):
         connected = store.list_subgraph("exercise", include_isolated=False)
         assert {node["fact_id"] for node in connected["nodes"]} == {base, progression}
 
+        limited = store.list_subgraph("exercise", limit_nodes=2)
+        assert limited["node_count"] == 2
+        assert limited["truncated"] is True
+
+
+def test_category_change_rebuilds_source_and_destination_banks(tmp_path, monkeypatch):
+    with MemoryStore(tmp_path / "graph.db") as store:
+        fact_id = store.add_fact("Category move", category="hybrid_movement")
+        rebuilt = []
+        monkeypatch.setattr(store, "_rebuild_bank", rebuilt.append)
+        assert store.update_fact(fact_id, category="exercise") is True
+        assert rebuilt == ["exercise", "hybrid_movement"]
+
+
+def test_cross_process_duplicate_add_is_idempotent(tmp_path):
+    db_path = tmp_path / "graph.db"
+    with MemoryStore(db_path) as store:
+        source, target, _, _ = _facts(store)
+
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    workers = [
+        context.Process(
+            target=_concurrent_edge_add,
+            args=(str(db_path), source, target, start, results),
+        )
+        for _ in range(6)
+    ]
+    for worker in workers:
+        worker.start()
+    start.set()
+    outcomes = [results.get(timeout=20) for _ in workers]
+    for worker in workers:
+        worker.join(timeout=20)
+        assert worker.exitcode == 0
+
+    assert {kind for kind, _ in outcomes} == {"ok"}
+    assert len({edge_id for _, edge_id in outcomes}) == 1
+    with MemoryStore(db_path) as store:
+        assert store._conn.execute(
+            "SELECT COUNT(*) FROM edges WHERE status='active'"
+        ).fetchone()[0] == 1
+
 
 def test_multiple_instances_share_graph_writes(tmp_path):
     db_path = tmp_path / "graph.db"
@@ -215,4 +295,3 @@ def test_multiple_instances_share_graph_writes(tmp_path):
     finally:
         first.close()
         second.close()
-
