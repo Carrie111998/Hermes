@@ -123,6 +123,37 @@ class TestDriftAlertOnce:
         drift_alerts = [d for d in deliveries if "drift" in d.lower()]
         assert len(drift_alerts) == 2, f"expected re-alert after heal: {deliveries}"
 
+    def test_already_alerted_drift_skip_does_not_log_at_error(self, tmp_path, caplog):
+        """Sentry hooks Python logging at ERROR: once drift_alerted is True,
+        the scheduler must not re-emit an ERROR/exception log on every
+        subsequent tick, even though the run is still correctly skipped and
+        chat delivery is still correctly suppressed (see module docstring).
+        The FIRST (non-silent) drifted tick may still log normally — only
+        repeat ticks after alert-once has fired must be downgraded."""
+        job = _job(drift_alerted=True)
+        deliveries = []
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            fresh = [j for j in cron_jobs.load_jobs() if j["id"] == job["id"]][0]
+            import logging
+            with caplog.at_level(logging.INFO, logger="cron.scheduler"):
+                ok, agent_called = _tick(fresh, tmp_path, "nous", deliveries)
+
+        assert agent_called is False, "drifted tick must not spend"
+        assert deliveries == [], "already-alerted drift tick must not re-deliver"
+        error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert error_records == [], (
+            f"already-alerted drift skip must not log at ERROR (Sentry noise): "
+            f"{[(r.levelname, r.message) for r in error_records]}"
+        )
+        # Still visible in agent.log at a lower level so the skip isn't
+        # silently lost — just not loud enough to page/alert on.
+        info_records = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and "drift" in r.message.lower()
+        ]
+        assert info_records, "drift skip should still be logged at INFO"
+
     def test_non_drift_failures_untouched_by_the_bit(self, tmp_path):
         """A job with the drift bit set whose run fails for another reason
         still alerts — only the drift branch consults the bit."""

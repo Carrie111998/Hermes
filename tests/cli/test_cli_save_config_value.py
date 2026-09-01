@@ -59,7 +59,12 @@ class TestSaveConfigValueAtomic:
         from cli import save_config_value
 
         assert save_config_value("model.default", "new-model") is True
-        warning.assert_called_once_with("model.default", "new-model")
+        # config_env seeds model.default: "test-model" — the pre-write value
+        # must be captured and passed through so the audit-trail log (#44585
+        # follow-up) can report old -> new, not just the new value.
+        warning.assert_called_once_with(
+            "model.default", "new-model", old_value="test-model"
+        )
 
 
 
