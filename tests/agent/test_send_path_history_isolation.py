@@ -23,6 +23,7 @@ import copy
 import json
 
 import agent.conversation_loop as cl
+import agent.turn_request as tr
 from agent.message_sanitization import (
     _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates,
@@ -72,7 +73,7 @@ def _adversarial_history():
 
 def _api_copy(history):
     """Exactly the send path's build shape."""
-    return [cl._clone_message_for_send(m) for m in history]
+    return [tr._clone_message_for_send(m) for m in history]
 
 
 # Every send-path transform that rewrites api_messages in place. Add new
@@ -81,7 +82,7 @@ def _run_full_pipeline(api_messages):
     for am in api_messages:
         if isinstance(am.get("content"), str):
             am["content"] = am["content"].strip()
-    cl._canonicalize_api_tool_calls(api_messages)
+    tr._canonicalize_api_tool_calls(api_messages)
     _sanitize_messages_surrogates(api_messages)
     _sanitize_messages_non_ascii(api_messages)
 
@@ -101,7 +102,7 @@ class TestSendPathNeverMutatesHistory:
 
     def test_each_transform_in_isolation(self):
         transforms = {
-            "canonicalize/repair": cl._canonicalize_api_tool_calls,
+            "canonicalize/repair": tr._canonicalize_api_tool_calls,
             "surrogate sanitizer": _sanitize_messages_surrogates,
             "non-ascii sanitizer": _sanitize_messages_non_ascii,
         }
@@ -151,9 +152,13 @@ class TestSendPathNeverMutatesHistory:
 
     def test_non_dict_messages_pass_through(self):
         sentinel = object()
-        assert cl._clone_message_for_send(sentinel) is sentinel
-        assert cl._clone_message_for_send("plain") == "plain"
-        assert cl._clone_message_for_send(None) is None
+        assert tr._clone_message_for_send(sentinel) is sentinel
+        assert tr._clone_message_for_send("plain") == "plain"
+        assert tr._clone_message_for_send(None) is None
+
+    def test_conversation_loop_keeps_private_compatibility_aliases(self):
+        assert cl._clone_message_for_send is tr._clone_message_for_send
+        assert cl._canonicalize_api_tool_calls is tr._canonicalize_api_tool_calls
 
 
 class TestSendPathBuildIsWiredToTheClone:
@@ -172,7 +177,7 @@ class TestSendPathBuildIsWiredToTheClone:
         import ast
         import inspect
 
-        source = inspect.getsource(cl)
+        source = inspect.getsource(tr.build_turn_request)
         tree = ast.parse(source)
 
         clone_calls = []
@@ -184,24 +189,24 @@ class TestSendPathBuildIsWiredToTheClone:
                     if (
                         node.args
                         and isinstance(node.args[0], ast.Name)
-                        and node.args[0].id in ("msg", "pfm")
+                        and node.args[0].id in ("message", "prefill")
                     ):
                         clone_calls.append(node.args[0].id)
                 if (
                     isinstance(fn, ast.Attribute)
                     and fn.attr == "copy"
                     and isinstance(fn.value, ast.Name)
-                    and fn.value.id in ("msg", "pfm")
+                    and fn.value.id in ("message", "prefill")
                 ):
                     shallow_copies.append(fn.value.id)
 
-        assert "msg" in clone_calls, (
+        assert "message" in clone_calls, (
             "the api_messages history build no longer clones via "
-            "_clone_message_for_send(msg) — shallow aliasing (#80498) is back"
+            "_clone_message_for_send(message) — shallow aliasing (#80498) is back"
         )
-        assert "pfm" in clone_calls, (
+        assert "prefill" in clone_calls, (
             "the prefill insert no longer clones via "
-            "_clone_message_for_send(pfm)"
+            "_clone_message_for_send(prefill)"
         )
         assert not shallow_copies, (
             f"shallow .copy() reappeared on send-path message variables: "
