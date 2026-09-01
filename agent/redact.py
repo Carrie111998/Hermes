@@ -201,8 +201,8 @@ _ENV_LOOKUP_VALUE_RE = re.compile(
 # The ``*`` runs bordering {_SECRET_CFG_NAMES} must stay backtrackable
 # (secret words are matchable by the class, e.g. ``app.api.key=…``).
 _CFG_DOTTED_RE = re.compile(
-    rf"([A-Za-z0-9_\-]++\.[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*+"
-    rf"|[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*\.[A-Za-z0-9_.\-]++)"
+    rf"([A-Za-z0-9_\-]*\.[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*"
+    rf"|[A-Za-z0-9_.\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_.\-]*\.[A-Za-z0-9_.\-]*)"
     rf"={_CFG_VALUE}",
     re.IGNORECASE,
 )
@@ -224,7 +224,7 @@ _YAML_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)"
 # NOTE(perf): possessive quantifiers wherever the successor is disjoint; the
 # leading ``[A-Za-z0-9_.\-]*`` stays backtrackable (see _CFG_DOTTED_RE note).
 _YAML_ASSIGN_RE = re.compile(
-    rf"(^[ \t]*+[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)(:[ \t]*+)(?!['\"])([^\s&]++)",
+    rf"(^[ \t]*[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*)(:[ \t]*)(?!['\"])([^\s&]*)",
     re.IGNORECASE | re.MULTILINE,
 )
 
