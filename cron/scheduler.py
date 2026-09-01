@@ -3061,6 +3061,39 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _wrap_cron_response(content: str, job: dict, wrap_response: bool, response_format: str) -> str:
+    """Wrap cron delivery content with a header or footer signature.
+
+    ``header`` (default) puts the job metadata first; ``footer`` puts the
+    content first with the job id as a trailing signature so it is trivially
+    extractable programmatically. Both layouts keep a short "how to manage
+    this job" hint. When ``wrap_response`` is False the content is returned
+    verbatim.
+    """
+    if not wrap_response:
+        return content
+
+    task_name = job.get("name", job.get("id", "?"))
+    job_id = job.get("id", "")
+    rule = "-------------"
+
+    if response_format == "footer":
+        return (
+            f"{content}\n\n"
+            f"{rule}\n"
+            f"To stop or manage this job, reply \"stop reminder {task_name}\".\n"
+            f"Cronjob Response: {task_name} (job_id: {job_id})"
+        )
+
+    return (
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job_id})\n"
+        f"{rule}\n\n"
+        f"{content}\n\n"
+        f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+    )
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -3099,27 +3132,28 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
+    # in config.yaml for clean output. cron.response_format: "header" (default) or
+    # "footer" controls the layout — footer puts content first with the job id as
+    # a trailing signature, so the id is trivially extractable programmatically.
     wrap_response = True
+    response_format = "header"
     user_cfg = None
     try:
         user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+        cron_cfg = user_cfg.get("cron", {}) if user_cfg else {}
+        wrap_response = cron_cfg.get("wrap_response", True)
+        response_format = str(cron_cfg.get("response_format", "header")).lower()
+        if response_format not in ("header", "footer"):
+            logger.warning(
+                "cron.response_format=%r is invalid (expected \"header\" or \"footer\"); "
+                "falling back to header",
+                response_format,
+            )
+            response_format = "header"
     except Exception:
         pass
 
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
+    delivery_content = _wrap_cron_response(content, job, wrap_response, response_format)
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
