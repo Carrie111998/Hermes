@@ -934,20 +934,10 @@ class GatewayAuthorizationMixin:
             if normalized_user_id:
                 check_ids.add(normalized_user_id)
 
-        # SimpleX: SIMPLEX_ALLOWED_USERS accepts either the numeric contactId
-        # or the contact's display name. The adapter sets user_id=contactId for
-        # stability across renames, but the SimpleX UI never surfaces the
-        # numeric id — operators only see display names, so that's what they
-        # naturally put in the env var. Match both so the allowlist works
-        # regardless of which form was chosen.
-        # Plugin platform: compare by value since Platform.SIMPLEX is not a
-        # hardcoded enum member (it's a dynamic plugin platform).
-        if (
-            source.platform is not None
-            and source.platform.value == "simplex"
-            and source.user_name
-        ):
-            check_ids.add(source.user_name)
+        # SimpleX authorization deliberately uses only ``user_id``, which the
+        # adapter sets to the daemon's immutable numeric contactId. Remote
+        # profile/display names are mutable and therefore cannot safely grant
+        # access when they collide with an allowlist entry.
 
         # Buzz (Nostr-based): BUZZ_ALLOWED_USERS accepts npub or hex, but
         # inbound event pubkeys are always 64-char hex. Decode npub entries
