@@ -153,6 +153,20 @@ class TestDirectAliases:
             "custom:provider-a", "shared-model", "my-a",
         )
 
+    def test_reverse_lookup_normalizes_provider_alias_for_preference(self, monkeypatch):
+        """Provider aliases participate in reverse-lookup ownership preference."""
+        from hermes_cli.model_switch import DirectAlias, resolve_alias
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {
+            "other": DirectAlias("shared-model", "custom:other", "https://other.example.com"),
+            "claude": DirectAlias("shared-model", "claude", "https://anthropic.example.com"),
+        })
+
+        assert resolve_alias("shared-model", "anthropic") == (
+            "claude", "shared-model", "claude",
+        )
+
 
 # ---------------------------------------------------------------------------
 # /model command persistence
@@ -427,6 +441,54 @@ class TestResolveAliasSorting:
 class TestSwitchModelDirectAliasOverride:
     """switch_model should use base_url from direct alias."""
 
+    @staticmethod
+    def _stub_explicit_provider(
+        monkeypatch,
+        ms,
+        provider_id,
+        base_url,
+        *,
+        provider_name="Provider",
+        api_mode="openai_compat",
+        api_key="provider-key",
+    ):
+        """Wire provider lookup, runtime resolution, and model validation."""
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            ms,
+            "resolve_provider_full",
+            lambda explicit_provider, *_args, **_kwargs: SimpleNamespace(
+                id=provider_id,
+                name=provider_name,
+                base_url=base_url,
+            ),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None, **_kwargs: {
+                "api_key": api_key,
+                "base_url": base_url,
+                "api_mode": api_mode,
+                "provider": provider_id,
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.validate_requested_model",
+            lambda *a, **kw: {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            },
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.opencode_model_api_mode",
+            lambda *a, **kw: "openai_compat",
+        )
+        monkeypatch.setattr(ms, "get_model_capabilities", lambda *a, **kw: None)
+        monkeypatch.setattr(ms, "get_model_info", lambda *a, **kw: None)
+
     def test_switch_model_uses_alias_base_url(self, monkeypatch):
         """When resolved alias has base_url, switch_model should use it."""
         from hermes_cli.model_switch import DirectAlias
@@ -490,41 +552,14 @@ class TestSwitchModelDirectAliasOverride:
         that any surviving provider-A URL in the result can only have come from
         the direct-alias override path.
         """
-        from types import SimpleNamespace
-
-        monkeypatch.setattr(
+        TestSwitchModelDirectAliasOverride._stub_explicit_provider(
+            monkeypatch,
             ms,
-            "resolve_provider_full",
-            lambda explicit_provider, *_args, **_kwargs: SimpleNamespace(
-                id="custom:provider-b",
-                name="Provider B",
-                base_url="https://api-b.example.com",
-            ),
+            "custom:provider-b",
+            "https://api-b.example.com",
+            provider_name="Provider B",
+            api_key="sk-bbb",
         )
-        monkeypatch.setattr(
-            "hermes_cli.runtime_provider.resolve_runtime_provider",
-            lambda requested=None, **_kwargs: {
-                "api_key": "sk-bbb",
-                "base_url": "https://api-b.example.com",
-                "api_mode": "openai_compat",
-                "provider": "custom:provider-b",
-            },
-        )
-        monkeypatch.setattr(
-            "hermes_cli.models.validate_requested_model",
-            lambda *a, **kw: {
-                "accepted": True,
-                "persist": True,
-                "recognized": True,
-                "message": None,
-            },
-        )
-        monkeypatch.setattr(
-            "hermes_cli.models.opencode_model_api_mode",
-            lambda *a, **kw: "openai_compat",
-        )
-        monkeypatch.setattr(ms, "get_model_capabilities", lambda *a, **kw: None)
-        monkeypatch.setattr(ms, "get_model_info", lambda *a, **kw: None)
 
     def test_explicit_provider_prefers_matching_alias_base_url(self, monkeypatch):
         """An explicit switch adopts the alias belonging to the *requested* provider.
@@ -732,6 +767,109 @@ class TestSwitchModelDirectAliasOverride:
         assert result.success
         assert result.target_provider == "custom:provider-b"
         assert result.base_url == "https://api-b.example.com"
+        assert result.resolved_via_alias == ""
+
+    def test_explicit_provider_accepts_alias_spelling_owner(self, monkeypatch):
+        """An alias-spelled owner is equivalent to its canonical provider id."""
+        from hermes_cli.model_switch import DirectAlias
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {
+            "pinned": DirectAlias(
+                "shared-model",
+                "claude",
+                "https://pinned-anthropic.example.com",
+                api_key="alias-key",
+            ),
+        })
+        self._stub_explicit_provider(
+            monkeypatch,
+            ms,
+            "anthropic",
+            "https://api.anthropic.com",
+            provider_name="Anthropic",
+            api_mode="anthropic_messages",
+        )
+
+        result = ms.switch_model(
+            "shared-model",
+            "anthropic",
+            "old-model",
+            explicit_provider="claude",
+        )
+
+        assert result.success
+        assert result.target_provider == "anthropic"
+        assert result.base_url == "https://pinned-anthropic.example.com"
+        assert result.resolved_via_alias == "pinned"
+
+    def test_explicit_provider_accepts_case_only_owner_difference(self, monkeypatch):
+        """Provider ownership comparisons are case insensitive."""
+        from hermes_cli.model_switch import DirectAlias
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {
+            "pinned": DirectAlias(
+                "shared-model",
+                "Anthropic",
+                "https://pinned-anthropic.example.com",
+                api_key="alias-key",
+            ),
+        })
+        self._stub_explicit_provider(
+            monkeypatch,
+            ms,
+            "anthropic",
+            "https://api.anthropic.com",
+            provider_name="Anthropic",
+            api_mode="anthropic_messages",
+        )
+
+        result = ms.switch_model(
+            "shared-model",
+            "anthropic",
+            "old-model",
+            explicit_provider="anthropic",
+        )
+
+        assert result.success
+        assert result.target_provider == "anthropic"
+        assert result.base_url == "https://pinned-anthropic.example.com"
+        assert result.resolved_via_alias == "pinned"
+
+    def test_explicit_provider_still_rejects_different_normalized_owner(self, monkeypatch):
+        """Normalization does not admit aliases owned by another provider."""
+        from hermes_cli.model_switch import DirectAlias
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {
+            "pinned": DirectAlias(
+                "shared-model",
+                "claude",
+                "https://pinned-anthropic.example.com",
+                api_key="alias-key",
+            ),
+        })
+        self._stub_explicit_provider(
+            monkeypatch,
+            ms,
+            "kimi-for-coding",
+            "https://api.kimi.com/coding/v1",
+            provider_name="Kimi For Coding",
+            api_mode="anthropic_messages",
+            api_key="kimi-key",
+        )
+
+        result = ms.switch_model(
+            "shared-model",
+            "anthropic",
+            "old-model",
+            explicit_provider="moonshot",
+        )
+
+        assert result.success
+        assert result.target_provider == "kimi-for-coding"
+        assert result.base_url == "https://api.kimi.com/coding/v1"
         assert result.resolved_via_alias == ""
 
     def test_explicit_provider_without_any_alias_is_unchanged(self, monkeypatch):

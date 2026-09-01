@@ -36,6 +36,7 @@ from hermes_cli.providers import (
     get_label,
     host_mandated_api_mode,
     is_aggregator,
+    normalize_provider,
     resolve_provider_full,
 )
 from hermes_cli.model_normalize import (
@@ -1277,7 +1278,7 @@ def resolve_alias(
     for alias_name, da in DIRECT_ALIASES.items():
         if da.model.lower() != key:
             continue
-        if da.provider == current_provider:
+        if normalize_provider(da.provider or "") == normalize_provider(current_provider or ""):
             return (da.provider, da.model, alias_name)
         if reverse_fallback is None:
             reverse_fallback = (da.provider, da.model, alias_name)
@@ -2141,7 +2142,10 @@ def switch_model(
     if resolved_alias:
         _ensure_direct_aliases()
         _da = DIRECT_ALIASES.get(resolved_alias)
-        if _da is not None and _da.provider != target_provider:
+        if _da is not None and (
+            normalize_provider(_da.provider or "")
+            != normalize_provider(target_provider or "")
+        ):
             _da = None
             resolved_alias = ""
         if _da is not None and _da.base_url:
