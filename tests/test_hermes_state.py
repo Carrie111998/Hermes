@@ -12,6 +12,7 @@ import pytest
 import hermes_state
 from agent.session_activity import ActivityProvenance
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from hermes_state_common import safe_session_filename_component
 
 
 class _NoFtsCursor(sqlite3.Cursor):
@@ -3148,7 +3149,8 @@ class TestAutoMaintenance:
         db.create_session(session_id="new", source="cli")  # active
 
         # Transcript files mimicking real gateway/CLI layout
-        (sessions_dir / "old1.json").write_text("{}")
+        (sessions_dir / "session_old1.json").write_text("{}")  # new naming
+        (sessions_dir / "old2.json").write_text("{}")  # legacy naming
         (sessions_dir / "old1.jsonl").write_text("{}\n")
         (sessions_dir / "old2.jsonl").write_text("{}\n")
         (sessions_dir / "request_dump_old1_001.json").write_text("{}")
@@ -3159,8 +3161,9 @@ class TestAutoMaintenance:
         )
         assert result["pruned"] == 2
 
-        # Pruned transcript files are gone
-        assert not (sessions_dir / "old1.json").exists()
+        # Pruned transcript files are gone (both new and legacy JSON naming)
+        assert not (sessions_dir / "session_old1.json").exists()
+        assert not (sessions_dir / "old2.json").exists()
         assert not (sessions_dir / "old1.jsonl").exists()
         assert not (sessions_dir / "old2.jsonl").exists()
         assert not (sessions_dir / "request_dump_old1_001.json").exists()
@@ -3169,6 +3172,177 @@ class TestAutoMaintenance:
 
 
 
+
+    def test_delete_session_removes_session_prefixed_json(self, db, tmp_path):
+        """Regression: session_<id>.json must be cleaned up on delete.
+
+        The writer (run_agent.py) creates ``session_{id}.json`` but the
+        remover previously looked for ``{id}.json`` (missing the ``session_``
+        prefix), silently leaving the JSON dump orphaned on disk.
+        """
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        db.create_session(session_id="test123", source="cli")
+        # Writer creates session_<id>.json (not <id>.json)
+        json_file = sessions_dir / "session_test123.json"
+        json_file.write_text("{}")
+        jsonl_file = sessions_dir / "test123.jsonl"
+        jsonl_file.write_text("{}\n")
+
+        db.delete_session("test123", sessions_dir=sessions_dir)
+
+        assert not json_file.exists(), "session_<id>.json should be removed"
+        assert not jsonl_file.exists(), "<id>.jsonl should be removed"
+
+    def test_prune_removes_session_prefixed_json(self, db, tmp_path):
+        """Regression: prune must also clean up session_<id>.json files."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        self._make_old_ended(db, "old", days_old=100)
+        (sessions_dir / "session_old.json").write_text("{}")
+        (sessions_dir / "old.jsonl").write_text("{}\n")
+
+        db.prune_sessions(older_than_days=90, sessions_dir=sessions_dir)
+
+        assert not (sessions_dir / "session_old.json").exists()
+        assert not (sessions_dir / "old.jsonl").exists()
+
+    def test_delete_session_uses_shared_safe_component_mapping(self, db, tmp_path):
+        """Remover and writers must agree on one safe-component naming contract.
+
+        Snapshots are ``session_{safe}.json`` and request dumps
+        ``request_dump_{safe}_{ts}.json`` — both derived from the shared
+        ``hermes_state_common.safe_session_filename_component`` mapper.
+        Legacy bare-{id} names stay covered for ordinary IDs.
+        """
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        sid = "test123"
+        safe = safe_session_filename_component(sid)
+        assert safe == sid  # an ordinary ID passes through unchanged
+        db.create_session(session_id=sid, source="cli")
+
+        (sessions_dir / f"session_{safe}.json").write_text("{}")
+        (sessions_dir / f"request_dump_{safe}_001.json").write_text("{}")
+        (sessions_dir / f"{sid}.json").write_text("{}")  # legacy snapshot
+        (sessions_dir / f"{sid}.jsonl").write_text("{}\n")  # legacy transcript
+        (sessions_dir / "other.jsonl").write_text("{}\n")  # another session
+
+        assert db.delete_session(sid, sessions_dir=sessions_dir) is True
+
+        assert not (sessions_dir / f"session_{safe}.json").exists()
+        assert not (sessions_dir / f"request_dump_{safe}_001.json").exists()
+        assert not (sessions_dir / f"{sid}.json").exists()
+        assert not (sessions_dir / f"{sid}.jsonl").exists()
+        assert (sessions_dir / "other.jsonl").exists()
+
+    def test_delete_session_path_shaped_id_cannot_alias_other_session_files(
+        self, db, tmp_path
+    ):
+        """A traversal-shaped ID must never reach another session's files.
+
+        ``./victim`` used to be concatenated raw, aliasing
+        ``sessions/./victim.json`` onto session ``victim``'s legacy file
+        while leaving the path-shaped session's own safe-mapped artifacts
+        behind.
+        """
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        malicious = "./victim"
+        db.create_session(session_id=malicious, source="cli")
+        safe = safe_session_filename_component(malicious)
+        assert safe != malicious
+        assert "/" not in safe and "." not in safe
+
+        # Files the path-shaped session's own writers would have produced
+        (sessions_dir / f"session_{safe}.json").write_text("{}")
+        (sessions_dir / f"request_dump_{safe}_001.json").write_text("{}")
+        # Files belonging to the *other* session ("victim") — must survive
+        (sessions_dir / "victim.json").write_text("{}")
+        (sessions_dir / "victim.jsonl").write_text("{}\n")
+        (sessions_dir / "session_victim.json").write_text("{}")
+        (sessions_dir / "request_dump_victim_001.json").write_text("{}")
+
+        assert db.delete_session(malicious, sessions_dir=sessions_dir) is True
+
+        assert not (sessions_dir / f"session_{safe}.json").exists()
+        assert not (sessions_dir / f"request_dump_{safe}_001.json").exists()
+        assert (sessions_dir / "victim.json").exists()
+        assert (sessions_dir / "victim.jsonl").exists()
+        assert (sessions_dir / "session_victim.json").exists()
+        assert (sessions_dir / "request_dump_victim_001.json").exists()
+
+    def test_delete_session_parent_traversal_id_cannot_escape(self, db, tmp_path):
+        """``../victim`` must neither escape the directory nor alias inside it."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        malicious = "../victim"
+        db.create_session(session_id=malicious, source="cli")
+        safe = safe_session_filename_component(malicious)
+
+        # Where a raw ``../victim.json`` concatenation would have landed
+        (tmp_path / "victim.json").write_text("{}")
+        (sessions_dir / "victim.json").write_text("{}")
+        (sessions_dir / f"session_{safe}.json").write_text("{}")
+
+        assert db.delete_session(malicious, sessions_dir=sessions_dir) is True
+
+        assert (tmp_path / "victim.json").exists()  # no parent-directory escape
+        assert (sessions_dir / "victim.json").exists()  # no in-directory alias
+        assert not (sessions_dir / f"session_{safe}.json").exists()
+
+    def test_delete_session_glob_shaped_id_cannot_widen_request_dump_glob(
+        self, db, tmp_path
+    ):
+        """``a*b`` must not glob-match another session's request dumps.
+
+        The sanitizer maps ``a*b`` to ``a_b_<digest>``, so two distinct IDs
+        that normalize similarly keep disjoint file sets.
+        """
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        globby = "a*b"
+        db.create_session(session_id=globby, source="cli")
+        safe = safe_session_filename_component(globby)
+        assert safe.startswith("a_b_")  # sanitized stem + digest suffix
+
+        (sessions_dir / f"request_dump_{safe}_001.json").write_text("{}")
+        # Session "a_b"'s files — a raw-ID glob ``request_dump_a*b_*.json``
+        # would have swallowed these
+        (sessions_dir / "request_dump_a_b_001.json").write_text("{}")
+        (sessions_dir / "request_dump_aXb_002.json").write_text("{}")
+        (sessions_dir / "session_a_b.json").write_text("{}")
+
+        assert db.delete_session(globby, sessions_dir=sessions_dir) is True
+
+        assert not (sessions_dir / f"request_dump_{safe}_001.json").exists()
+        assert (sessions_dir / "request_dump_a_b_001.json").exists()
+        assert (sessions_dir / "request_dump_aXb_002.json").exists()
+        assert (sessions_dir / "session_a_b.json").exists()
+
+    def test_prune_uses_safe_component_mapping(self, db, tmp_path):
+        """Prune shares the hardened mapping: safe-mapped files go, a
+        similarly-normalizing neighbor's files stay."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        shaped = "old./x"
+        self._make_old_ended(db, shaped, days_old=100)
+        safe = safe_session_filename_component(shaped)
+        # "old./x" sanitizes to "old__x" + digest; plain session "old__x"
+        # normalizes to itself, so the two must not collide.
+        assert safe.startswith("old__x_")
+
+        (sessions_dir / f"session_{safe}.json").write_text("{}")
+        (sessions_dir / f"request_dump_{safe}_001.json").write_text("{}")
+        (sessions_dir / "session_old__x.json").write_text("{}")
+        (sessions_dir / "request_dump_old__x_001.json").write_text("{}")
+
+        db.prune_sessions(older_than_days=90, sessions_dir=sessions_dir)
+
+        assert not (sessions_dir / f"session_{safe}.json").exists()
+        assert not (sessions_dir / f"request_dump_{safe}_001.json").exists()
+        assert (sessions_dir / "session_old__x.json").exists()
+        assert (sessions_dir / "request_dump_old__x_001.json").exists()
 
 
 # =========================================================================

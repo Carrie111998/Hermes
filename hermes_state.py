@@ -18,6 +18,7 @@ import asyncio
 import atexit
 import contextlib
 import errno
+import glob
 import hashlib
 import json
 import logging
@@ -79,6 +80,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _sql_session_last_active,
     _sql_session_last_active_by_id,
     escape_like as _escape_like,
+    safe_session_filename_component as _safe_session_filename_component,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
     FTS_REBUILD_DEFERRAL_KEY,
@@ -14368,24 +14370,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def _remove_session_files(sessions_dir: Optional[Path], session_id: str) -> None:
-        """Remove on-disk transcript files for a session.
+        """Remove on-disk artifact files a session may own under *sessions_dir*.
 
-        Cleans up ``{session_id}.json``, ``{session_id}.jsonl``, and any
-        ``request_dump_{session_id}_*.json`` files left by the gateway.
-        Silently skips files that don't exist and swallows OSError so a
-        filesystem hiccup never blocks a DB operation.
+        Writers name artifacts with the shared path-safe session component
+        (:func:`hermes_state_common.safe_session_filename_component`):
+        snapshots as ``session_{safe}.json`` (run_agent) and gateway request
+        dumps as ``request_dump_{safe}_{timestamp}.json``. Legacy layouts
+        used the bare ID (``{id}.json`` / ``{id}.jsonl``); those names are
+        honored only when the raw ID is itself a validated single component,
+        so a path- or glob-shaped ID can never alias and remove another
+        session's files. Silently skips files that don't exist and swallows
+        OSError so a filesystem hiccup never blocks a DB operation.
         """
         if sessions_dir is None:
             return
-        for suffix in (".json", ".jsonl"):
-            p = sessions_dir / f"{session_id}{suffix}"
+        raw = str(session_id or "").strip()
+        safe_sid = _safe_session_filename_component(raw)
+        candidates = [
+            sessions_dir / f"session_{safe_sid}.json",  # snapshot writer
+        ]
+        if raw and safe_sid == raw:
+            # The raw ID survived sanitization unchanged, i.e. it is already
+            # a single traversal-free component, so the legacy bare-ID names
+            # are safe to touch. For any ID that had to be sanitized, its
+            # legacy files (if any) never existed under a raw-concatenated
+            # name reachable here — guessing at one could hit another
+            # session's files (``./victim`` aliasing ``victim.json``).
+            candidates.append(sessions_dir / f"{raw}.json")  # legacy snapshot
+            candidates.append(sessions_dir / f"{raw}.jsonl")  # legacy transcript
+        for p in candidates:
             try:
                 p.unlink(missing_ok=True)
             except OSError:
                 pass
-        # request_dump files use session_id as a prefix component
+        # request_dump files embed the safe component as a prefix segment;
+        # glob.escape is defence-in-depth so metacharacters can never widen
+        # the match even if the component rule ever changes.
         try:
-            for p in sessions_dir.glob(f"request_dump_{session_id}_*.json"):
+            for p in sessions_dir.glob(f"request_dump_{glob.escape(safe_sid)}_*.json"):
                 try:
                     p.unlink(missing_ok=True)
                 except OSError:

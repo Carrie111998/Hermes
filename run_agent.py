@@ -64,6 +64,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from hermes_constants import get_hermes_home
+from hermes_state_common import (
+    safe_session_filename_component as _safe_session_filename_component,
+)
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -398,31 +401,6 @@ def _qwen_portal_headers() -> dict:
         "X-DashScope-UserAgent": _ua,
         "X-DashScope-AuthType": "qwen-oauth",
     }
-
-
-def _safe_session_filename_component(session_id: str) -> str:
-    """Return a stable, path-safe filename component for a session ID.
-
-    Session IDs can originate from untrusted input (e.g. the
-    ``X-Hermes-Session-Id`` API header) and are otherwise interpolated raw
-    into on-disk artifact filenames under ``~/.hermes/sessions/``.  Without
-    sanitization, a traversal-shaped ID such as ``../../../../etc/pwned``
-    would let a caller write the session snapshot / request dump outside the
-    sessions directory.  This collapses every non ``[A-Za-z0-9_-]`` character
-    to ``_`` (so no path separators or ``.`` survive), caps the length, and —
-    when sanitization changed the string — appends a short content hash so two
-    distinct IDs that sanitize to the same component don't collide.  The
-    result is always a single, traversal-free path segment.
-    """
-    raw = str(session_id or "").strip()
-    sanitized = re.sub(r"[^\w-]", "_", raw).strip("._")
-    sanitized = sanitized[:96] or "session"
-    if raw and sanitized == raw:
-        return sanitized
-    digest = hashlib.sha256(
-        raw.encode("utf-8", errors="surrogatepass")
-    ).hexdigest()[:12]
-    return f"{sanitized}_{digest}"
 
 
 class _StreamErrorEvent(Exception):
