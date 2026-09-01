@@ -194,3 +194,162 @@ async def test_block_returns_reply_to_id(monkeypatch):
 
     result = await consumer._send_new_chunk("text", "original_reply", final=True)
     assert result == "original_reply"
+
+
+@pytest.mark.asyncio
+async def test_redirect_fail_closed_on_missing_adapter(monkeypatch):
+    """When redirect target platform has no adapter, message is dropped (fail-closed)."""
+    gateway = SimpleNamespace(
+        config=SimpleNamespace(gate=None),
+        adapters={},  # no adapters at all
+        session_store=MagicMock(),
+    )
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_send":
+            return [{"action": "redirect", "target": "telegram:99999"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    ctx = _make_hook_context(gateway=gateway)
+    consumer, adapter = _make_consumer(hook_context=ctx)
+
+    result = await consumer._send_new_chunk("Hello world", "reply_1", final=False)
+
+    # Original adapter should NOT be called (fail-closed)
+    adapter.send.assert_not_awaited()
+    assert result == "reply_1"
+
+
+@pytest.mark.asyncio
+async def test_redirect_fail_closed_on_malformed_target(monkeypatch):
+    """When redirect target is malformed (no colon), message is dropped (fail-closed)."""
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_send":
+            return [{"action": "redirect", "target": "no-colon-here"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    ctx = _make_hook_context()
+    consumer, adapter = _make_consumer(hook_context=ctx)
+
+    result = await consumer._send_new_chunk("Hello world", "reply_1", final=False)
+
+    adapter.send.assert_not_awaited()
+    assert result == "reply_1"
+
+
+@pytest.mark.asyncio
+async def test_redirect_normalizes_platform_case(monkeypatch):
+    """Redirect with lowercase platform string ('telegram') still works."""
+    redirect_adapter = AsyncMock()
+    redirect_adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="redir_msg"))
+
+    gateway = SimpleNamespace(
+        config=SimpleNamespace(gate=None),
+        adapters={Platform.TELEGRAM: redirect_adapter},
+        session_store=MagicMock(),
+    )
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_send":
+            return [{"action": "redirect", "target": "telegram:99999"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    ctx = _make_hook_context(gateway=gateway)
+    consumer, adapter = _make_consumer(hook_context=ctx)
+
+    result = await consumer._send_new_chunk("Hello world", "reply_1", final=False)
+
+    adapter.send.assert_not_awaited()
+    redirect_adapter.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_partial_hook_context_missing_gateway(monkeypatch):
+    """hook_context with gateway=None skips the hook entirely."""
+    called = {"count": 0}
+
+    def _fake_hook(name, **kwargs):
+        called["count"] += 1
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    ctx = {"gateway": None, "source": None, "chat_type": "group", "session_store": None}
+    consumer, adapter = _make_consumer(hook_context=ctx)
+
+    await consumer._send_new_chunk("Hello world", "reply_1", final=False)
+
+    assert called["count"] == 0
+    adapter.send.assert_awaited_once()
+
+
+# --- builtin_hooks reference gate tests ---
+
+
+class TestBuiltinOutboundGate:
+    """Tests for the reference pre_gateway_send gate in builtin_hooks."""
+
+    def test_dm_always_passes(self):
+        from gateway.builtin_hooks import outbound_gate
+
+        assert outbound_gate("admin panel access", chat_type="dm") is None
+
+    def test_group_without_config_passes(self):
+        from gateway.builtin_hooks import outbound_gate
+
+        gateway = SimpleNamespace(config=SimpleNamespace(gate=None))
+        assert outbound_gate("admin panel access", chat_type="group", gateway=gateway) is None
+
+    def test_group_with_gate_disabled_passes(self):
+        from gateway.builtin_hooks import outbound_gate
+
+        gate_cfg = SimpleNamespace(enabled=False)
+        gateway = SimpleNamespace(config=SimpleNamespace(gate=gate_cfg))
+        assert outbound_gate("admin panel access", chat_type="group", gateway=gateway) is None
+
+    def test_group_with_gate_enabled_blocks_admin_content(self):
+        from gateway.builtin_hooks import outbound_gate
+
+        gate_cfg = SimpleNamespace(enabled=True, group_chat_types=["group", "supergroup"], redirect_target="")
+        gateway = SimpleNamespace(config=SimpleNamespace(gate=gate_cfg))
+        result = outbound_gate("admin panel access", chat_type="group", gateway=gateway)
+        assert result == {"action": "block", "reason": "admin-content-gate"}
+
+    def test_group_with_gate_enabled_passes_normal_content(self):
+        from gateway.builtin_hooks import outbound_gate
+
+        gate_cfg = SimpleNamespace(enabled=True, group_chat_types=["group", "supergroup"], redirect_target="")
+        gateway = SimpleNamespace(config=SimpleNamespace(gate=gate_cfg))
+        assert outbound_gate("Hello, how are you?", chat_type="group", gateway=gateway) is None
+
+    def test_group_with_redirect_target(self):
+        from gateway.builtin_hooks import outbound_gate
+
+        gate_cfg = SimpleNamespace(enabled=True, group_chat_types=["group", "supergroup"], redirect_target="telegram:ADMIN_CHAT")
+        gateway = SimpleNamespace(config=SimpleNamespace(gate=gate_cfg))
+        result = outbound_gate("admin panel access", chat_type="group", gateway=gateway)
+        assert result == {"action": "redirect", "target": "telegram:ADMIN_CHAT"}
+
+    def test_channel_type_passes(self):
+        from gateway.builtin_hooks import outbound_gate
+
+        gate_cfg = SimpleNamespace(enabled=True, group_chat_types=["group", "supergroup"], redirect_target="")
+        gateway = SimpleNamespace(config=SimpleNamespace(gate=gate_cfg))
+        assert outbound_gate("admin panel access", chat_type="channel", gateway=gateway) is None
+
+    def test_admin_patterns_match(self):
+        from gateway.builtin_hooks import _is_admin_content
+
+        assert _is_admin_content("admin panel access") is True
+        assert _is_admin_content("internal debug message") is True
+        assert _is_admin_content("recovery job started") is True
+        assert _is_admin_content("cold-start cursor restore") is True
+        assert _is_admin_content("system notification alert") is True
+        assert _is_admin_content("Hello, how are you?") is False
+        assert _is_admin_content("The weather is nice today") is False

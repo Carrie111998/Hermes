@@ -33,7 +33,7 @@ def outbound_gate(
 ) -> Optional[Dict[str, Any]]:
     """Reference pre_gateway_send gate: block admin content from group chats.
 
-    Reads config from gateway.config.gateway.gate (if present):
+    Reads config from gateway.config.gate (if present):
       enabled: bool (default False)
       group_chat_types: list[str] (default ["group", "supergroup"])
       redirect_target: str (default "" — no redirect, just block)

@@ -5909,7 +5909,7 @@ class TurnRunner:
                         hook_context={
                             "gateway": self._runner,
                             "source": ctx.source,
-                            "chat_type": ctx.source.chat_type,
+                            "chat_type": getattr(getattr(ctx, "source", None), "chat_type", None),
                             "session_store": getattr(self._runner, "session_store", None),
                         },
                     )

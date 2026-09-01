@@ -243,6 +243,7 @@ class GatewayStreamConsumer:
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
         run_still_current: Optional[Callable[[], bool]] = None,
+        *,
         hook_context: Optional[dict] = None,
     ):
         self.adapter = adapter
@@ -2101,7 +2102,7 @@ class GatewayStreamConsumer:
                             if self._hook_gateway is not None:
                                 try:
                                     from gateway.config import Platform as _Platform
-                                    _rp = _Platform(str(_redirect_platform))
+                                    _rp = _Platform(_redirect_platform.strip().lower())
                                     _redirect_adapter = self._hook_gateway.adapters.get(_rp)
                                     if _redirect_adapter:
                                         result = await _redirect_adapter.send(
@@ -2115,7 +2116,12 @@ class GatewayStreamConsumer:
                                             return reply_to_id
                                 except Exception as _redir_err:
                                     logger.warning("pre_gateway_send redirect failed: %s", _redir_err)
-                    # Fall through to normal send if redirect failed
+                    # Fail-closed: do NOT leak to original group chat if redirect fails
+                    logger.warning(
+                        "pre_gateway_send redirect failed for target %s; dropping message to prevent leakage",
+                        _new_target,
+                    )
+                    return reply_to_id
                 if _action == "allow":
                     break
 
