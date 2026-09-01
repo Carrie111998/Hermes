@@ -17,6 +17,7 @@ import {
 } from 'react'
 import { type GetTargetScrollTop, useStickToBottom } from 'use-stick-to-bottom'
 
+import { type PaneLifecycle } from '@/components/pane-shell/pane-lifecycle'
 import { usePaneLifecycle } from '@/components/pane-shell/pane-visibility'
 import { useI18n } from '@/i18n'
 import { messagePaintWeight } from '@/lib/render-weight'
@@ -123,6 +124,59 @@ export const transcriptBackfillFrameCount = (
   step = BACKFILL_STEP,
   budget = RENDER_BUDGET
 ): number => Math.ceil(Math.max(0, budget - firstPaint) / step)
+
+/** A tab round-trip keeps the transcript mounted (`hot-hidden` → `visible`)
+ *  without changing `sessionKey`, so the session-switch settle loop never
+ *  re-arms. The hide path also clamps the DOM to the live tail, which can
+ *  leave `scrollTop` at 0 on a still-scrollable tail. Coming back then
+ *  prepends older turns while treating that 0 as a chosen reading position —
+ *  the thread "scrolls up" onto old messages. */
+export const shouldResettleTranscript = (previous: PaneLifecycle, next: PaneLifecycle): boolean =>
+  previous === 'hot-hidden' && next === 'visible'
+
+/** Distance from the bottom to restore after older turns are prepended.
+ *  Mid-load (and a reveal that just unset settled) must not treat scrollTop 0
+ *  as a chosen position — that is how a switch-back lands on old turns. */
+export const prependAnchorFromBottom = (loadSettled: boolean, scrollHeight: number, scrollTop: number): number =>
+  loadSettled ? scrollHeight - scrollTop : 0
+
+/** Don't treat a boot-time 0-height window as a settled transcript. */
+export const TRANSCRIPT_MIN_VIEWPORT_PX = 2
+export const TRANSCRIPT_SETTLE_STABLE_FRAMES = 2
+/** Async markdown/images after backfill. The previous 15-frame cap handed
+ *  back during app reopen while the viewport was still empty or first-paint
+ *  had not caught up, so the thread painted at scrollTop 0. */
+export const TRANSCRIPT_SETTLE_MAX_FRAMES = 90
+
+export type TranscriptSettleTick = {
+  clientHeight: number
+  frame: number
+  lastHeight: number
+  paneBudget: number
+  renderBudget: number
+  scrollHeight: number
+  stableFrames: number
+}
+
+/** One rAF of the load settle loop. Pin to the end until the viewport has a
+ *  real box, first-paint backfill has caught up, and height is stable. */
+export const transcriptSettleAdvance = (
+  tick: TranscriptSettleTick
+): { done: boolean; frame: number; lastHeight: number; stableFrames: number } => {
+  if (tick.clientHeight < TRANSCRIPT_MIN_VIEWPORT_PX || tick.renderBudget < tick.paneBudget) {
+    return { done: false, frame: tick.frame, lastHeight: tick.scrollHeight, stableFrames: 0 }
+  }
+
+  const stableFrames = tick.scrollHeight === tick.lastHeight ? tick.stableFrames + 1 : 0
+  const frame = tick.frame + 1
+
+  return {
+    done: stableFrames >= TRANSCRIPT_SETTLE_STABLE_FRAMES || frame > TRANSCRIPT_SETTLE_MAX_FRAMES,
+    frame,
+    lastHeight: tick.scrollHeight,
+    stableFrames
+  }
+}
 
 // Browsers may quantize a requested scrollTop to a nearby device-pixel
 // boundary. use-stick-to-bottom otherwise compares the lower actual value to
@@ -421,11 +475,16 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
   const mountedPanes = useStore($mountedTranscriptPanes)
   const paneLifecycle = usePaneLifecycle()
+  const previousLifecycleRef = useRef(paneLifecycle)
   // Hidden panes retain only a live-tail budget. Visible panes share the normal
   // screen budget; a reveal backfills older rows in bounded transition steps.
   const paneBudget = transcriptPaneBudget(mountedPanes, paneLifecycle === 'hot-hidden')
 
   const [renderBudget, setRenderBudget] = useState(FIRST_PAINT_BUDGET)
+  const renderBudgetRef = useRef(renderBudget)
+  const paneBudgetRef = useRef(paneBudget)
+  renderBudgetRef.current = renderBudget
+  paneBudgetRef.current = paneBudget
 
   // Cut the budget during RENDER, not in the post-commit layout effect. An
   // effect-time cut is too late: React would first build the whole tree with
@@ -477,7 +536,9 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   const anchorBeforePrepend = useCallback(() => {
     const el = scrollRef.current
 
-    restoreFromBottomRef.current = el && loadSettledRef.current ? el.scrollHeight - el.scrollTop : 0
+    restoreFromBottomRef.current = el
+      ? prependAnchorFromBottom(loadSettledRef.current, el.scrollHeight, el.scrollTop)
+      : 0
   }, [scrollRef])
 
   // Backfill from FIRST_PAINT_BUDGET to the full budget after the small
@@ -639,8 +700,94 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
   // lurch on every cold load. The empty→non-empty flip re-arms for the
   // transcript that actually arrived; being a boolean, it cannot re-fire on a
   // streaming append.
+  //
+  // App reopen is the same class with a different empty: the viewport exists
+  // but clientHeight is 0 until the window finishes showing, or first-paint
+  // has not backfilled yet. The 15-frame cap used to fire anyway, leaving
+  // scrollTop 0 on the real transcript. Wait for a real box + a full pane
+  // before counting stable frames (see transcriptSettleAdvance).
   useLayoutEffect(() => {
+    loadSettledRef.current = false
+    stopScroll()
+
+    if (settleKeyRef.current !== sessionKey) {
+      settleKeyRef.current = sessionKey
+      restoreFromBottomRef.current = null
+    }
+
+    let rafId = 0
+    let frame = 0
+    let stableFrames = 0
+    let lastHeight = 0
+
+    const settle = () => {
+      const node = scrollRef.current
+
+      if (!node) {
+        rafId = requestAnimationFrame(settle)
+        return
+      }
+
+      node.scrollTop = node.scrollHeight
+
+      const next = transcriptSettleAdvance({
+        clientHeight: node.clientHeight,
+        frame,
+        lastHeight,
+        paneBudget: paneBudgetRef.current,
+        renderBudget: renderBudgetRef.current,
+        scrollHeight: node.scrollHeight,
+        stableFrames
+      })
+
+      frame = next.frame
+      lastHeight = next.lastHeight
+      stableFrames = next.stableFrames
+
+      if (next.done) {
+        void scrollToBottom('instant')
+        loadSettledRef.current = true
+        return
+      }
+
+      rafId = requestAnimationFrame(settle)
+    }
+
+    rafId = requestAnimationFrame(settle)
+
+    return () => cancelAnimationFrame(rafId)
+  }, [hasGroups, scrollRef, scrollToBottom, sessionKey, stopScroll])
+
+  // The hide clamp unmounts older turns from the top. Pin the remaining tail
+  // to its latest line so a `visibility: hidden` scroll reset cannot leave
+  // scrollTop at 0 on a still-scrollable tail.
+  useLayoutEffect(() => {
+    if (paneLifecycle !== 'hot-hidden') {
+      return
+    }
+
     const el = scrollRef.current
+
+    if (el) {
+      el.scrollTop = el.scrollHeight
+    }
+  }, [paneLifecycle, renderBudget, scrollRef])
+
+  // Tab return does not change sessionKey, so the settle loop above does not
+  // run. The hide clamp can leave scrollTop at 0; unset settled so the
+  // backfill prepends onto the bottom instead of restoring that 0.
+  useLayoutEffect(() => {
+    const previous = previousLifecycleRef.current
+    previousLifecycleRef.current = paneLifecycle
+
+    if (!shouldResettleTranscript(previous, paneLifecycle)) {
+      return
+    }
+
+    const el = scrollRef.current
+
+    loadSettledRef.current = false
+    restoreFromBottomRef.current = 0
 
     if (!el) {
       return
@@ -648,50 +795,7 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
 
     stopScroll()
     el.scrollTop = el.scrollHeight
-    loadSettledRef.current = false
-
-    // An anchor captured for the OUTGOING transcript must not be applied to
-    // this one — a switch owns the position outright. The empty→non-empty
-    // re-arm is the SAME load, whose in-flight anchor is still correct.
-    if (settleKeyRef.current !== sessionKey) {
-      settleKeyRef.current = sessionKey
-      restoreFromBottomRef.current = null
-    }
-
-    let frame = 0
-    let stableFrames = 0
-    let lastHeight = el.scrollHeight
-
-    const settle = () => {
-      const node = scrollRef.current
-
-      if (!node) {
-        return
-      }
-
-      const height = node.scrollHeight
-
-      stableFrames = height === lastHeight ? stableFrames + 1 : 0
-      lastHeight = height
-      node.scrollTop = height
-
-      // Most session switches are synchronous and stabilize within 2 frames;
-      // the old 90-frame ceiling was for slow async image loads. Cap at 15
-      // frames to minimize the settle-loop racing markdown paint on every switch.
-      if (stableFrames >= 2 || ++frame > 15) {
-        void scrollToBottom('instant')
-        loadSettledRef.current = true
-
-        return
-      }
-
-      rafId = requestAnimationFrame(settle)
-    }
-
-    let rafId = requestAnimationFrame(settle)
-
-    return () => cancelAnimationFrame(rafId)
-  }, [hasGroups, scrollRef, scrollToBottom, sessionKey, stopScroll])
+  }, [paneLifecycle, scrollRef, stopScroll])
 
   // Prepend an older page while preserving the on-screen position. The user is
   // scrolled up (reading history) so the stick-to-bottom lock is escaped and
