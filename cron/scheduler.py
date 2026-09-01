@@ -3497,10 +3497,27 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # anchor, so the metadata key bypasses that check and lets the
                 # adapter route via a plain message_thread_id.
                 route_thread_id = str(thread_id) if thread_id is not None else None
-                route_metadata = {"job_id": job["id"]}
+                route_metadata: dict[str, Any] = {"job_id": job["id"]}
                 if route_thread_id:
                     route_metadata["thread_id"] = route_thread_id
-                media_metadata = {"thread_id": thread_id} if thread_id else None
+                media_metadata: Optional[dict[str, Any]] = (
+                    {"thread_id": thread_id} if thread_id else None
+                )
+
+            # Cron deliveries are OUT-OF-BAND: they have no inbound message
+            # behind them, so each one is a NEW conversation turn — not a
+            # continuation of whatever round the adapter last closed (#96876).
+            # Round-tracking adapters must open a fresh round/msgId for these
+            # sends and must NOT fall back to their last-closed round (doing so
+            # appended the cron report to the previous user turn's bubble,
+            # invisible in the user's current conversation while the scheduler
+            # logged "delivered"). Adapters that don't track rounds ignore the
+            # unknown metadata key, so this is a no-op for them. Gateway-
+            # internal marker, same family as _interim_send /
+            # non_conversational in gateway/run.py.
+            route_metadata["new_round"] = True
+            media_metadata = dict(media_metadata or {})
+            media_metadata.setdefault("new_round", True)
 
             # Relay egress needs a tenant discriminator on the frame: the
             # connector's fail-closed guard resolves the workspace/guild from

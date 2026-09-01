@@ -2854,3 +2854,141 @@ class TestFailureStreakNudge:
         from cron.scheduler import _failure_streak_nudge
         with patch("cron.scheduler.load_config", side_effect=RuntimeError("boom")):
             assert "failed 3 runs" in _failure_streak_nudge(self._job(2))
+
+
+class TestCronDeliveryNewRoundMetadata:
+    """REGRESSION (#96876): cron deliveries ride the same adapter.send() path as
+    in-turn sends but carry no round-lifecycle signal. Round-tracking platform
+    adapters fall into their "reuse last closed round" branch and append the
+    cron report to the PREVIOUS user turn's bubble — invisible in the user's
+    current conversation while the scheduler logs "delivered".
+
+    _deliver_result must stamp a gateway-internal ``new_round: True`` marker on
+    BOTH the text-routing metadata and the media metadata so round-tracking
+    adapters open a fresh round instead of reusing the closed one. Adapters
+    that don't track rounds ignore unknown metadata keys (no-op for every
+    existing platform).
+    """
+
+    def _slack_cfg(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.SLACK: pconfig}
+        return mock_cfg
+
+    @staticmethod
+    def _fake_run_coro(coro, _loop):
+        from concurrent.futures import Future
+
+        future = Future()
+        try:
+            import asyncio as _asyncio
+            future.set_result(_asyncio.run(coro))
+        except BaseException as exc:  # noqa: BLE001
+            future.set_exception(exc)
+        return future
+
+    def _deliver_via_spy_router(self, job, content, adapter, media_root=None):
+        from concurrent.futures import Future  # noqa: F401 (style parity)
+        from gateway.config import Platform
+
+        captured = {}
+
+        class _SpyRouter:
+            def __init__(self, *a, **k):
+                pass
+
+            async def _deliver_to_platform(self, target, text, metadata):
+                captured["target"] = target
+                captured["metadata"] = metadata
+                return {"success": True, "message_id": "msg_1"}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        patches = [
+            patch("gateway.config.load_gateway_config", return_value=self._slack_cfg()),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("gateway.delivery.DeliveryRouter", _SpyRouter),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=self._fake_run_coro),
+        ]
+        if media_root is not None:
+            patches.insert(
+                0, patch("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (media_root,))
+            )
+        try:
+            for p in patches:
+                p.start()
+            _deliver_result(job, content, adapters={Platform.SLACK: adapter}, loop=loop)
+        finally:
+            for p in patches:
+                p.stop()
+        return captured
+
+    def test_cron_delivery_metadata_carries_new_round(self):
+        """The text send's routing metadata must be marked out-of-band."""
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(
+            success=True, message_id="msg_1", raw_response=None,
+        )
+        job = {
+            "id": "new-round-job",
+            "name": "weekly review",
+            "deliver": "origin",
+            "origin": {"platform": "slack", "chat_id": "C123"},
+        }
+        captured = self._deliver_via_spy_router(job, "Here is the weekly report.", adapter)
+        assert captured["metadata"].get("new_round") is True, (
+            "cron live-adapter delivery metadata must carry new_round=True so "
+            "round-tracking adapters open a fresh round instead of reusing "
+            "the last closed one (#96876)"
+        )
+        assert captured["metadata"].get("job_id") == "new-round-job"
+
+    def test_cron_media_metadata_carries_new_round(self):
+        """Attachment sends on the same delivery carry the same marker."""
+        import tempfile
+        from pathlib import Path
+
+        from gateway.config import Platform
+
+        media_root = Path(tempfile.mkdtemp(prefix="cron-new-round-media-"))
+        media_file = media_root / "report.png"
+        media_file.write_bytes(b"\x89PNG fake")
+
+        sent_media_metadata = {}
+
+        adapter = AsyncMock()
+        adapter.send.return_value = MagicMock(
+            success=True, message_id="msg_1", raw_response=None,
+        )
+
+        async def _fake_send_image(chat_id, image_path, metadata=None, **kwargs):
+            sent_media_metadata.update(metadata or {})
+            return MagicMock(success=True, message_id="img_1")
+
+        adapter.send_image_file = _fake_send_image
+
+        job = {
+            "id": "new-round-media-job",
+            "name": "weekly review",
+            "deliver": "origin",
+            "origin": {"platform": "slack", "chat_id": "C123"},
+        }
+
+        captured = self._deliver_via_spy_router(
+            job,
+            f"Report ready.\n\nMEDIA:{media_file}",
+            adapter,
+            media_root=media_root,
+        )
+
+        assert captured["metadata"].get("new_round") is True
+        assert sent_media_metadata.get("new_round") is True, (
+            "the media send must carry the same new_round marker as the text "
+            "send (#96876) — post-stop_typing attachment follow-ups are the "
+            "legitimate reuse case the marker must NOT break"
+        )
