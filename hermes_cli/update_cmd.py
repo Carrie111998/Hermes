@@ -549,6 +549,69 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
     except (subprocess.CalledProcessError, OSError):
         return None
 
+def _preserve_local_commits_before_reset(git_cmd, cwd, remote_ref) -> str | None:
+    """Branch off HEAD before ``git reset --hard <remote_ref>`` orphans work.
+
+    The autostash only covers working-tree changes. When the ff-only merge
+    fails on the update target branch itself, the updater resets to the
+    remote tip, and any local-only COMMITS on the branch
+    (``<remote_ref>..HEAD``) silently leave every ref — recoverable only via
+    the reflog, which expires. Create a ``hermes-update-backup-*`` branch at
+    HEAD so that work survives the reset under a real ref name. (A checkout
+    on a *custom* branch takes the merge path instead and never reaches the
+    reset, so this helper is only called on the one path that discards.)
+
+    Returns the backup branch name, or None when HEAD has no local-only
+    commits (the common managed-install case — no branch, no output). The
+    refs are known to resolve at this point (the failed ff-only merge just
+    used both), so a rev-list failure is treated as "nothing to preserve"
+    rather than aborting the update recovery. Every git invocation here is
+    also guarded against ``OSError`` (git briefly unresolvable on PATH, bad
+    exec format): this runs inside update recovery, where degrading to
+    today's reflog-only behavior beats dying and making things worse.
+    A branch-creation failure warns loudly and also returns None.
+
+    The branch name carries the UTC timestamp *and* HEAD's short SHA, so it
+    is self-describing and cannot collide with a second backup taken in the
+    same second. Backup branches accumulate across updates and are never
+    pruned automatically — deleting them is manual (`git branch -D`), which
+    is deliberate: nothing should silently reap the only ref pointing at a
+    user's orphaned work.
+    """
+    try:
+        ahead = subprocess.run(
+            git_cmd + ["rev-list", f"{remote_ref}..HEAD", "--count"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        return None
+    if ahead.returncode != 0 or not ahead.stdout.strip().isdigit():
+        return None
+    local_count = int(ahead.stdout.strip())
+    if local_count == 0:
+        return None
+
+    from datetime import timezone
+
+    backup = datetime.now(timezone.utc).strftime("hermes-update-backup-%Y%m%d-%H%M%S")
+    head = _capture_head_sha(git_cmd, cwd)
+    if head:
+        backup = f"{backup}-{head[:7]}"
+    try:
+        created = subprocess.run(
+            git_cmd + ["branch", backup, "HEAD"],
+            cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except OSError:
+        created = None
+    if created is None or created.returncode != 0:
+        print(
+            f"  ⚠ Could not create a backup branch for {local_count} local "
+            "commit(s) before the reset — they are recoverable via `git reflog`."
+        )
+        return None
+    return backup
+
 # Files that define the editable install. A pull that touches none of them
 # cannot have invalidated it.
 _INSTALL_DEFINING_FILES = (
@@ -8828,9 +8891,27 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     # Same branch as the update target — a true upstream
                     # force-push/rebase. Local changes are already stashed;
                     # reset to match the remote exactly (original behaviour).
+                    #
+                    # This is the one path that still discards commits: the
+                    # custom-branch path above merges, so nothing is orphaned
+                    # there, but here the autostash covers only working-tree
+                    # changes and the reset drops any local-only commit off
+                    # every ref. Branch off HEAD first so that work survives
+                    # under a real name instead of an expiring reflog entry.
+                    backup_branch = _preserve_local_commits_before_reset(
+                        git_cmd, _m().PROJECT_ROOT, f"origin/{branch}"
+                    )
                     print(
                         "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                     )
+                    if backup_branch:
+                        print(
+                            f"  ℹ Local commit(s) preserved on branch '{backup_branch}'"
+                        )
+                        print(
+                            f"    Recover with: git rebase origin/{branch} {backup_branch}"
+                            "  (or cherry-pick from it)"
+                        )
                     reset_result = subprocess.run(
                         git_cmd + ["reset", "--hard", f"origin/{branch}"],
                         cwd=_m().PROJECT_ROOT,
