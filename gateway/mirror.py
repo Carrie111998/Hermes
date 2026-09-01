@@ -208,11 +208,43 @@ def _find_session_id(
 
 
 def _append_to_sqlite(session_id: str, message: dict) -> None:
-    """Append a message to the SQLite session database."""
+    """Append a message to the SQLite session database.
+
+    Refuses to write into an ALREADY-ENDED session (#100177). After a
+    ``session_reset`` expiry the watcher finalizes the DB row but the
+    routing entry in ``sessions.json`` still points at it, so every
+    delivery between the expiry and the next inbound message (cron
+    briefs, ``hermes send``, ``send_message`` mirroring) was appended to
+    a dead session. The #54878 self-heal then drops the stale routing
+    entry and starts a fresh session, and those deliveries are gone from
+    the transcript the agent actually reads — it answers a reply to its
+    own message with "the previous session expired".
+
+    Writing into a dead session is never useful: nothing reads that
+    transcript again. Refusing surfaces the routing staleness at WARNING
+    so the delivery is visibly dropped instead of silently lost.
+    """
     db = None
     try:
         from hermes_state import SessionDB
         db = SessionDB()
+        row = None
+        try:
+            row = db.get_session(session_id)
+        except Exception:
+            # Lookup failure must not block the append — a mirror that
+            # can't verify the session is better than a lost delivery.
+            row = None
+        if row is not None and row.get("ended_at"):
+            logger.warning(
+                "Mirror: refusing to write into ended session %s "
+                "(end_reason=%s, ended_at=%s) — routing entry is stale; "
+                "delivery not mirrored",
+                session_id,
+                row.get("end_reason"),
+                row.get("ended_at"),
+            )
+            return
         db.append_message(
             session_id=session_id,
             role=message.get("role", "assistant"),
