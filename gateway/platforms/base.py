@@ -3930,10 +3930,11 @@ class BasePlatformAdapter(ABC):
         explicit ``is True`` must not have a truthy non-boolean (a status
         string, a sentinel object) silently promoted to an authorization.
         """
-        if not user_id or self._authorization_check is None:
+        authorization_check = getattr(self, "_authorization_check", None)
+        if not user_id or authorization_check is None:
             return None
         try:
-            result = self._authorization_check(user_id, chat_type, chat_id)
+            result = authorization_check(user_id, chat_type, chat_id)
             if result is True:
                 return True
             if result is False:
@@ -6380,10 +6381,14 @@ class BasePlatformAdapter(ABC):
                 except Exception:
                     _has_text_clarify = False
 
-                if _has_text_clarify:
+                _clarify_response_only = bool(
+                    (event.metadata or {}).get("_hermes_clarify_response_only")
+                )
+                if _has_text_clarify or _clarify_response_only:
                     logger.debug(
-                        "[%s] Routing message to clarify text-intercept for %s",
-                        self.name, session_key,
+                        "[%s] Routing message to clarify text-intercept/drop for %s",
+                        self.name,
+                        session_key,
                     )
                     try:
                         _thread_meta = _thread_metadata_for_source(

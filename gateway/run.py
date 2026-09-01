@@ -13869,6 +13869,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # The serial pre-filter (cheap checks, adapter creation, handler wiring) stays
         # sequential -- only the (slow) connect() calls run in parallel.
         _pending_connects = []  # (platform, platform_config, adapter)
+        _primary_profile_name: Optional[str] = None
+        if _multiplex_on:
+            from hermes_cli.profiles import get_active_profile_name
+
+            _primary_profile_name = get_active_profile_name() or "default"
         for platform, platform_config in self.config.platforms.items():
             if await self._abort_startup_if_shutdown_requested():
                 return True
@@ -15728,17 +15733,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         del self._failed_platforms[platform]
                         continue
 
-                    adapter.set_message_handler(self._primary_message_handler())
-                    adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-                    adapter.set_session_store(self.session_store)
-                    adapter.set_busy_session_handler(self._handle_active_session_busy_message)
-                    _set_reaction = getattr(adapter, "set_reaction_handler", None)
-                    if callable(_set_reaction):
-                        _set_reaction(self._handle_reaction_event)
-                    adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
-                    adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
+                    # Use one wiring path for startup and reconnect so a
+                    # multiplexed primary adapter keeps its profile scope.
+                    self._configure_primary_adapter(adapter, platform)
                     adapter.set_platform_event_handler(self._primary_platform_event_handler())
-                    adapter._busy_text_mode = self._busy_text_mode
 
                     # Reconnect after an outage: preserve the platform's
                     # server-side update queue so messages sent while the bot
@@ -16676,6 +16674,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Create+connect one profile's adapters under its runtime scope."""
         from gateway.config import load_gateway_config
 
+        profile_homes = getattr(self, "_profile_homes", None)
+        if not isinstance(profile_homes, dict):
+            profile_homes = {}
+            self._profile_homes = profile_homes
+        profile_homes[profile_name] = Path(profile_home)
+
         with _profile_runtime_scope(profile_home):
             profile_runtime_cfg = _load_gateway_runtime_config()
             from hermes_cli.plugins import discover_plugins
@@ -16833,6 +16837,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
         return connected
 
+    def _bind_profile_adapter_bot_policy(
+        self,
+        adapter: BasePlatformAdapter,
+        profile_name: str,
+    ) -> None:
+        """Bind legacy env bot policy to one multiplex Slack adapter."""
+        if getattr(adapter, "platform", None) != Platform.SLACK:
+            return
+        extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+        if extra.get("allow_bots"):
+            return
+
+        from agent.secret_scope import get_secret
+
+        try:
+            profile_home = self._profile_home_for_name(profile_name)
+            if profile_home is None:
+                return
+            with _profile_runtime_scope(profile_home):
+                policy = (get_secret("SLACK_ALLOW_BOTS") or "").strip().lower()
+        except Exception:
+            logger.warning(
+                "Could not bind Slack bot policy for profile %s; defaulting to none",
+                profile_name,
+                exc_info=True,
+            )
+            return
+        if policy:
+            adapter._gateway_allow_bots_policy = policy
+
+    def _configure_primary_adapter(
+        self,
+        adapter: BasePlatformAdapter,
+        platform: Platform,
+        profile_name: Optional[str] = None,
+    ) -> None:
+        """Install primary-adapter handlers consistently for startup/reconnect."""
+        if not profile_name and bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        ):
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile_name = get_active_profile_name() or "default"
+
+        if profile_name:
+            self._bind_profile_adapter_bot_policy(adapter, profile_name)
+            adapter._gateway_profile_name = profile_name
+            adapter.set_message_handler(
+                self._make_profile_message_handler(profile_name)
+            )
+            adapter.set_busy_session_handler(
+                self._make_profile_busy_session_handler(profile_name)
+            )
+        else:
+            adapter.set_message_handler(self._handle_message)
+            adapter.set_busy_session_handler(
+                self._handle_active_session_busy_message
+            )
+        adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
+        adapter.set_session_store(self.session_store)
+        _set_reaction = getattr(adapter, "set_reaction_handler", None)
+        if callable(_set_reaction):
+            _set_reaction(self._handle_reaction_event)
+        adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
+        adapter.set_authorization_check(
+            self._make_adapter_auth_check(platform, profile_name=profile_name)
+        )
+        adapter._busy_text_mode = self._busy_text_mode
+
     def _configure_profile_adapter(
         self,
         adapter: BasePlatformAdapter,
@@ -16844,6 +16917,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # profile-scoped.  Preserve both dimensions in the key so dashboard
         # and NAS health aggregation can see which secondary profile failed.
         adapter._runtime_status_platform_key = f"{profile_name}:{platform.value}"
+        # Adapters can need the routed namespace before their message handler
+        # runs (Slack's strict-mention clarify gate is one such pre-handler
+        # decision). Keep this internal ownership marker aligned with the
+        # handler that stamps SessionSource.profile below.
+        self._bind_profile_adapter_bot_policy(adapter, profile_name)
+        adapter._gateway_profile_name = profile_name
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
@@ -17117,6 +17196,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Reconnect is scoped to the profile's own config and secret mapping;
         # never rebuild a secondary adapter with the default profile's credentials.
 
+    def _profile_home_for_name(self, profile_name: str) -> Optional[Path]:
+        """Return the exact served home, falling back to profile discovery."""
+        profile_homes = getattr(self, "_profile_homes", None)
+        if isinstance(profile_homes, dict):
+            profile_home = profile_homes.get(profile_name)
+            if profile_home is not None:
+                return Path(profile_home).expanduser()
+
+        from hermes_cli.profiles import get_profile_dir
+
+        try:
+            return Path(get_profile_dir(profile_name)).expanduser()
+        except Exception:
+            return None
+
     def _make_profile_message_handler(self, profile_name: str):
         """Return a message handler that stamps source.profile then delegates.
 
@@ -17125,12 +17219,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         handler in ``_profile_runtime_scope`` so allowlists/tokens from that
         profile's ``.env`` are visible to ``get_secret`` / authz.
         """
-        from hermes_cli.profiles import get_profile_dir
-
-        try:
-            profile_home = get_profile_dir(profile_name)
-        except Exception:
-            profile_home = None
+        profile_home = self._profile_home_for_name(profile_name)
 
         async def _handler(event):
             try:
@@ -17146,17 +17235,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return _handler
 
     def _make_profile_busy_session_handler(self, profile_name: str):
-        """Stamp an owning adapter's profile before resolving busy policy."""
+        """Stamp the owning profile and resolve busy policy in its runtime scope."""
+        profile_home = self._profile_home_for_name(profile_name)
+
         async def _handler(event, _session_key):
             try:
                 if getattr(event, "source", None) is not None and not event.source.profile:
                     event.source.profile = profile_name
             except Exception:
                 pass
-            routed_session_key = self._session_key_for_source(event.source)
-            return await self._handle_active_session_busy_message(
-                event, routed_session_key
-            )
+
+            async def _dispatch():
+                routed_session_key = self._session_key_for_source(event.source)
+                return await self._handle_active_session_busy_message(
+                    event, routed_session_key
+                )
+
+            if profile_home is not None:
+                with _profile_runtime_scope(profile_home):
+                    return await _dispatch()
+            return await _dispatch()
 
         return _handler
 
@@ -17230,12 +17328,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _make_profile_platform_event_handler(self, profile_name: str):
         """Bind platform-event auth and hook dispatch to one multiplex profile."""
-        from hermes_cli.profiles import get_profile_dir
-
-        try:
-            profile_home = get_profile_dir(profile_name)
-        except Exception:
-            profile_home = None
+        profile_home = self._profile_home_for_name(profile_name)
 
         async def _handler(event, source):
             if getattr(source, "profile", None) is None:
@@ -17523,10 +17616,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         full auth chain — platform allowlists, group allowlists, pairing
         store, allow-all flags — stays the single source of truth.
 
-        ``profile_name`` binds the callback to the secondary adapter's own
-        multiplex profile, so its ``SessionSource`` resolves that profile's
-        secret scope instead of falling back to the active profile.
+        ``profile_name`` binds the callback to the adapter's own multiplex
+        profile. When omitted for the primary adapter, multiplex mode binds it
+        to the active profile so authorization never performs an unscoped
+        secret read.
         """
+        bound_profile_name = profile_name
+        if not bound_profile_name and bool(
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        ):
+            from hermes_cli.profiles import get_active_profile_name
+
+            bound_profile_name = get_active_profile_name() or "default"
+
         def check(
             user_id: str,
             chat_type: Optional[str] = None,
@@ -17539,9 +17641,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=chat_id or "",
                 chat_type=chat_type or "group",
                 user_id=user_id,
-                profile=profile_name,
+                profile=bound_profile_name,
             )
-            return self._is_user_authorized(source)
+            if not bound_profile_name:
+                return self._is_user_authorized(source)
+
+            from hermes_cli.profiles import get_profile_dir
+
+            profile_home = get_profile_dir(bound_profile_name)
+            with _profile_runtime_scope(profile_home):
+                return self._is_user_authorized(source)
+
         return check
 
 
@@ -18351,9 +18461,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
         allow_gateway_control = event.allow_gateway_control
+        _clarify_metadata = event.metadata or {}
+        _clarify_marker_present = "_hermes_clarify_response_only" in _clarify_metadata
+        _clarify_marker_value = _clarify_metadata.get("_hermes_clarify_response_only")
+        _clarify_expected_id = (
+            _clarify_marker_value
+            if isinstance(_clarify_marker_value, str) and _clarify_marker_value
+            else None
+        )
         _up_state = self._peek_session_state(_quick_key)
         if (
             allow_gateway_control
+            and not _clarify_marker_present
             and _up_state is not None
             and _up_state.persistent.update_prompt_pending
         ):
@@ -18454,10 +18573,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # command, not answer the clarify.  Leave the clarify pending
             # so the user can retry; if it times out, the agent unblocks
             # with an empty response.
-            if _raw_clarify_reply and not _raw_clarify_reply.startswith("/"):
-                _text_outcome = _clarify_mod.attempt_text_response_for_session(
-                    _quick_key, _raw_clarify_reply,
+            if (
+                _raw_clarify_reply
+                and not _raw_clarify_reply.startswith("/")
+                and (
+                    not _clarify_marker_present
+                    or _clarify_expected_id == _pending_clarify.clarify_id
                 )
+            ):
+                if _clarify_marker_present:
+                    _resolved = (
+                        _clarify_mod.resolve_text_response_for_clarify(
+                            _clarify_expected_id,
+                            _quick_key,
+                            _raw_clarify_reply,
+                        )
+                        if _clarify_expected_id
+                        else False
+                    )
+                    _text_outcome = (
+                        _clarify_mod.TEXT_RESOLVED if _resolved else _clarify_mod.TEXT_NO_PENDING
+                    )
+                else:
+                    _text_outcome = _clarify_mod.attempt_text_response_for_session(
+                        _quick_key, _raw_clarify_reply,
+                    )
                 if _text_outcome == _clarify_mod.TEXT_RESOLVED:
                     logger.info(
                         "Gateway intercepted clarify text response (session=%s, id=%s)",
@@ -18503,6 +18643,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _pending_clarify.clarify_id,
                         "",
                     )
+
+        # Slack may admit an otherwise-unmentioned message solely because the
+        # exact thread was awaiting free-form clarify text. Pending state can
+        # disappear between that adapter check and this interceptor (timeout,
+        # button resolution, or a concurrent answer). Such a marked event is
+        # clarification-only: if it did not resolve above, consume it rather
+        # than weakening strict mention by dispatching an ordinary agent turn.
+        if _clarify_marker_present:
+            logger.info(
+                "Dropping stale clarification-only response (session=%s)",
+                _quick_key,
+            )
+            return ""
 
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
