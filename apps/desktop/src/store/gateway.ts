@@ -30,6 +30,7 @@ interface RegistryConfig {
    * the connection store. */
   activeConnectionId?: () => null | string
   onEvent: (event: GatewayEvent) => void
+  onReplayGap?: (sessionId: string) => Promise<void> | void
   onActiveConnectionInvalidated?: (fallbackProfile: string, activationEpoch: number) => void
   onActiveConnectionChanged?: (connection: HermesConnection) => void
   /**
@@ -733,6 +734,7 @@ function createSecondary(profile: string, connectionId: null | string = null): S
     g.config?.onEvent({ ...event, profile, ...(connectionId ? { connectionId } : {}) })
     releaseTerminalTurnLease(entry.scope, event)
   })
+  gateway.onReplayGap?.(sessionId => g.config?.onReplayGap?.(sessionId))
   entry.offState = gateway.onState(state => {
     reportGatewayState(scope, state)
 

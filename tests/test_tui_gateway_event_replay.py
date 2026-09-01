@@ -110,6 +110,22 @@ def test_session_count_bounded_with_fifo_eviction():
     assert latest_seq(f"s{event_replay._REPLAY_SESSIONS_MAX + 9}") == 1
 
 
+def test_evicted_session_restarts_in_a_new_generation():
+    first = _frame("s0")
+    event_replay._stamp_event(first)
+    old_generation = first["params"]["replay_generation"]
+
+    for i in range(1, event_replay._REPLAY_SESSIONS_MAX + 1):
+        event_replay._stamp_event(_frame(f"s{i}"))
+
+    revisited = _frame("s0")
+    event_replay._stamp_event(revisited)
+
+    assert revisited["params"]["seq"] == 1
+    assert revisited["params"]["replay_generation"] != old_generation
+    assert event_replay.replay_generation("s0") == revisited["params"]["replay_generation"]
+
+
 def test_concurrent_stamping_never_drops_or_duplicates_seq():
     errors = []
 

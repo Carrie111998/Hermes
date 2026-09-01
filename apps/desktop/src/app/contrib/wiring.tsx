@@ -793,6 +793,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       closeAllTerminals()
     },
     handleGatewayEvent: handleGatewayEventWithPlugins,
+    resyncReplaySession: runtimeSessionId => {
+      const state = sessionStateByRuntimeIdRef.current.get(runtimeSessionId)
+
+      return hydrateFromStoredSession(3, state?.storedSessionId, runtimeSessionId)
+    },
     onConnectionReady: c => {
       connectionRef.current = c
     },

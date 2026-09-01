@@ -32,8 +32,12 @@ export interface GatewayEvent<P = unknown> {
    * absent for the local/legacy primary path). */
   connectionId?: string
   session_id?: string
+  /** Changes if this session's bounded replay ring is evicted and recreated. */
+  replay_generation?: string
   type: GatewayEventName
 }
+
+export type ReplayGapHandler = (sessionId: string) => Promise<void> | void
 
 export type ConnectionState = 'idle' | 'connecting' | 'open' | 'closed' | 'error'
 export type GatewayRequestId = number | string
@@ -128,6 +132,10 @@ export class JsonRpcGatewayClient {
    * silently believe nothing was missed.
    */
   private replayEpoch: string | null = null
+  /** Generation paired with each session watermark. */
+  private lastSeenGeneration = new Map<string, string>()
+  /** Authoritative-history refresh hooks run before parked live frames resume. */
+  private readonly replayGapHandlers = new Set<ReplayGapHandler>()
   private readonly eventHandlers = new Map<string, Set<(event: GatewayEvent) => void>>()
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>()
   private readonly options: Required<Omit<GatewayClientOptions, 'socketFactory'>> &
@@ -341,6 +349,13 @@ export class JsonRpcGatewayClient {
     return () => this.stateHandlers.delete(handler)
   }
 
+  /** Register an authoritative session-history refresh for truncated replay. */
+  onReplayGap(handler: ReplayGapHandler): () => void {
+    this.replayGapHandlers.add(handler)
+
+    return () => this.replayGapHandlers.delete(handler)
+  }
+
   request<T>(
     method: string,
     params: Record<string, unknown> = {},
@@ -507,6 +522,8 @@ export class JsonRpcGatewayClient {
       return
     }
 
+    this.adoptReplayGeneration(sid, event.replay_generation)
+
     const prev = this.lastSeenSeq.get(sid) ?? 0
 
     if (seq > prev) {
@@ -549,7 +566,19 @@ export class JsonRpcGatewayClient {
       // One RPC per known session keeps params flat; sessions are few (<20).
       const results = await Promise.allSettled(
         entries.map(([sid, lastSeen]) =>
-          this.request<{ events?: Array<{ type: string; session_id?: string; seq?: number; payload?: unknown }> }>(
+          this.request<{
+            events?: Array<{
+              type: string
+              session_id?: string
+              seq?: number
+              replay_generation?: string
+              payload?: unknown
+            }>
+            epoch?: string
+            generation?: string | null
+            latest_seq?: number
+            truncated?: boolean
+          }>(
             'session.events.since',
             { session_id: sid, last_seen: lastSeen },
             REPLAY_REQUEST_TIMEOUT_MS
@@ -557,8 +586,14 @@ export class JsonRpcGatewayClient {
         )
       )
 
-      for (const result of results) {
+      for (const [index, result] of results.entries()) {
         if (result.status !== 'fulfilled' || !Array.isArray(result.value?.events)) {
+          continue
+        }
+
+        const sid = entries[index]?.[0]
+
+        if (!sid) {
           continue
         }
 
@@ -575,6 +610,22 @@ export class JsonRpcGatewayClient {
 
         if (typeof epoch === 'string' && epoch && !this.replayEpoch) {
           this.replayEpoch = epoch
+        }
+
+        this.adoptReplayGeneration(sid, result.value.generation)
+
+        if (result.value.truncated === true) {
+          // A retained tail is not a valid transcript. Rebuild from the
+          // authoritative history before releasing live frames that raced the
+          // request, then advance to the server snapshot that history covers.
+          await Promise.allSettled([...this.replayGapHandlers].map(handler => handler(sid)))
+          const latest = result.value.latest_seq
+
+          if (typeof latest === 'number' && Number.isFinite(latest)) {
+            this.lastSeenSeq.set(sid, latest)
+          }
+
+          continue
         }
 
         for (const event of result.value.events) {
@@ -602,6 +653,7 @@ export class JsonRpcGatewayClient {
     const seq = (event as { seq?: unknown }).seq
 
     if (sid && typeof seq === 'number' && Number.isFinite(seq)) {
+      this.adoptReplayGeneration(sid, event.replay_generation)
       const prev = this.lastSeenSeq.get(sid) ?? 0
 
       if (seq <= prev) {
@@ -626,9 +678,25 @@ export class JsonRpcGatewayClient {
 
     if (this.replayEpoch !== null) {
       this.lastSeenSeq.clear()
+      this.lastSeenGeneration.clear()
     }
 
     this.replayEpoch = epoch
+  }
+
+  /** Reset one session's watermark when its bounded replay ring is recreated. */
+  private adoptReplayGeneration(sid: string, generation: unknown): void {
+    if (typeof generation !== 'string' || !generation) {
+      return
+    }
+
+    const previous = this.lastSeenGeneration.get(sid)
+
+    if (previous && previous !== generation) {
+      this.lastSeenSeq.delete(sid)
+    }
+
+    this.lastSeenGeneration.set(sid, generation)
   }
 
   /** Release frames parked during a replay fetch, seq-gated against dupes. */

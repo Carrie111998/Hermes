@@ -42,6 +42,7 @@ _replay_lock = threading.Lock()
 # the client's dispatch path consumes.
 _replay_buffers: "OrderedDict[str, deque]" = OrderedDict()
 _replay_next_seq: dict[str, int] = {}
+_replay_generations: dict[str, str] = {}
 
 
 def replay_epoch() -> str:
@@ -69,9 +70,12 @@ def _stamp_event(obj: dict) -> None:
         if buf is None:
             buf = deque(maxlen=_REPLAY_BUFFER_MAX)
             _replay_buffers[sid] = buf
+            _replay_generations[sid] = uuid.uuid4().hex
             while len(_replay_buffers) > _REPLAY_SESSIONS_MAX:
                 _oldest_sid, _oldest_buf = _replay_buffers.popitem(last=False)
                 _replay_next_seq.pop(_oldest_sid, None)
+                _replay_generations.pop(_oldest_sid, None)
+        params["replay_generation"] = _replay_generations[sid]
         buf.append((seq, params))
 
 
@@ -108,11 +112,18 @@ def latest_seq(sid: str) -> int:
         return _replay_next_seq.get(sid or "", 0)
 
 
+def replay_generation(sid: str) -> str | None:
+    """Current generation for *sid* (changes whenever its ring is recreated)."""
+    with _replay_lock:
+        return _replay_generations.get(sid or "")
+
+
 def reset_replay_state() -> None:
     """Test hook."""
     with _replay_lock:
         _replay_buffers.clear()
         _replay_next_seq.clear()
+        _replay_generations.clear()
 
 
 def replay_stats() -> dict:

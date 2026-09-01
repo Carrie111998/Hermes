@@ -3733,6 +3733,7 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {
         "events": frames,
         "latest_seq": event_replay.latest_seq(sid),
+        "generation": event_replay.replay_generation(sid),
         "truncated": event_replay.is_truncated(sid, last_seen),
         "count": len(frames),
         # Restart detection: seq counters are in-process, so after a gateway
