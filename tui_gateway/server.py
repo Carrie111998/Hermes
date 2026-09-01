@@ -659,7 +659,10 @@ def _claim_active_session_slot(
             session_id=session_key,
             surface=surface,
             config=_load_cfg(),
-            metadata={"live_session_id": live_session_id},
+            metadata={
+                "live_session_id": live_session_id,
+                "bot_live_delivery_consumer": True,
+            },
             registry_home=profile_home,
             track_liveness=track_liveness,
         )

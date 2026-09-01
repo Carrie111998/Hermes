@@ -202,6 +202,27 @@ def test_desktop_claim_fails_closed_when_registry_setup_fails(
     assert tui_message == server._SESSION_OWNERSHIP_UNAVAILABLE
 
 
+def test_gateway_session_lease_advertises_bot_live_delivery_consumer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    lease, message = server._claim_active_session_slot(
+        "canonical",
+        live_session_id="desktop-runtime",
+        surface="desktop",
+        profile_home=tmp_path,
+    )
+
+    assert lease is not None and message is None
+    entries = active_session_registry_snapshot(registry_home=tmp_path)
+    assert entries[0]["metadata"] == {
+        "live_session_id": "desktop-runtime",
+        "bot_live_delivery_consumer": True,
+    }
+    lease.release()
+
+
 def test_server_release_retries_liveness_lease_before_dropping_reference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

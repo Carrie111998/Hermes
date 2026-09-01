@@ -19,12 +19,32 @@ def test_find_canonical_live_owner_uses_profile_registry(tmp_path):
         session_id="canonical",
         surface="desktop",
         config={},
-        metadata={"live_session_id": "live-target"},
+        metadata={
+            "live_session_id": "live-target",
+            "bot_live_delivery_consumer": True,
+        },
         registry_home=tmp_path,
     )
     assert lease is not None and refusal is None
 
     assert bot_live_delivery.find_canonical_live_owner(tmp_path) == "canonical"
+
+
+def test_find_canonical_live_owner_ignores_owner_without_delivery_consumer(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("canonical", source="cli")
+    db.set_session_title("canonical", "Bot Chat")
+    db.set_session_hidden("canonical", True)
+    lease, refusal = try_acquire_active_session(
+        session_id="canonical",
+        surface="cli",
+        config={},
+        metadata={"live_session_id": "classic-cli"},
+        registry_home=tmp_path,
+    )
+    assert lease is not None and refusal is None
+
+    assert bot_live_delivery.find_canonical_live_owner(tmp_path) is None
 
 
 def test_find_canonical_live_owner_returns_none_when_session_is_idle(tmp_path):
@@ -120,3 +140,31 @@ def test_claimed_delivery_timeout_is_transport_ambiguous(tmp_path):
 
     assert result["status"] == "ambiguous"
     assert result["reason"] == "delivery_timeout"
+
+
+def test_claim_pending_delivery_uses_created_at_fifo_not_uuid_order(tmp_path):
+    pending_dir, _claimed_dir, _replies_dir = bot_live_delivery._paths(
+        tmp_path, "canonical"
+    )
+    now = time.time()
+    requests = [
+        ("f" * 32, now - 2, "older"),
+        ("0" * 32, now - 1, "newer"),
+    ]
+    for delivery_id, created_at, message in requests:
+        bot_live_delivery._atomic_json(
+            pending_dir / f"{delivery_id}.json",
+            {
+                "id": delivery_id,
+                "session_id": "canonical",
+                "message": message,
+                "created_at": created_at,
+                "owner_deadline": now + 30,
+            },
+        )
+
+    first = bot_live_delivery.claim_pending_delivery(tmp_path, "canonical")
+    second = bot_live_delivery.claim_pending_delivery(tmp_path, "canonical")
+
+    assert first is not None and first["message"] == "older"
+    assert second is not None and second["message"] == "newer"

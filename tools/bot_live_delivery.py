@@ -39,7 +39,9 @@ def find_canonical_live_owner(profile_home: Path | str) -> str | None:
     except Exception:
         return None
     return session_id if any(
-        str(entry.get("session_id") or "") == session_id for entry in owners
+        str(entry.get("session_id") or "") == session_id
+        and (entry.get("metadata") or {}).get("bot_live_delivery_consumer") is True
+        for entry in owners
     ) else None
 
 
@@ -175,14 +177,25 @@ def claim_pending_delivery(
     """Atomically claim the oldest unexpired request for one live session."""
     pending_dir, claimed_dir, _replies_dir = _paths(profile_home, session_id)
     now = time.time()
-    for pending in sorted(pending_dir.glob("*.json")):
+    candidates: list[tuple[float, str, Path, dict[str, Any]]] = []
+    for pending in pending_dir.glob("*.json"):
         payload = _read_json(pending)
         if payload is None or payload.get("session_id") != str(session_id):
             pending.unlink(missing_ok=True)
             continue
-        if float(payload.get("owner_deadline") or 0) <= now:
+        try:
+            owner_deadline = float(payload.get("owner_deadline"))
+            created_at = float(payload.get("created_at"))
+        except (TypeError, ValueError):
             pending.unlink(missing_ok=True)
             continue
+        delivery_id = str(payload.get("id") or "")
+        if delivery_id != pending.stem or owner_deadline <= now:
+            pending.unlink(missing_ok=True)
+            continue
+        candidates.append((created_at, delivery_id, pending, payload))
+
+    for _created_at, _delivery_id, pending, payload in sorted(candidates):
         claimed = claimed_dir / pending.name
         try:
             os.replace(pending, claimed)
