@@ -88,6 +88,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
+from urllib.parse import urlparse
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -12015,6 +12016,46 @@ def _resolve_explicit_local_task_route(
     return None
 
 
+def _resolve_process_local_provider_endpoint(provider: str) -> Optional[str]:
+    """Return a configured loopback endpoint for a local provider name.
+
+    Kanban workers run with ``HERMES_HOME`` set to the assignee profile so
+    profile-local state and credentials stay isolated.  Provider definitions,
+    however, are commonly owned by the process-level Hermes config.  A local
+    task pin must not become an unknown provider in that profile and then fall
+    through to a remote fallback.  Resolve only the named provider's endpoint
+    from the process config, and only when it is loopback; never copy or
+    expose a remote provider definition across the profile boundary.
+    """
+    provider_name = str(provider or "").strip().lower()
+    if provider_name not in _LOCAL_KANBAN_PROVIDERS:
+        return None
+    try:
+        from hermes_constants import get_process_hermes_home
+        from hermes_cli.config import read_user_config_raw
+
+        config = read_user_config_raw(
+            get_process_hermes_home() / "config.yaml"
+        )
+        providers = config.get("providers")
+        entry = providers.get(provider_name) if isinstance(providers, Mapping) else None
+        if not isinstance(entry, Mapping):
+            return None
+        endpoint = str(
+            entry.get("api") or entry.get("url") or entry.get("base_url") or ""
+        ).strip()
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in {"http", "https"}:
+            return None
+        if (parsed.hostname or "").lower().rstrip(".") not in {
+            "localhost", "127.0.0.1", "::1"
+        }:
+            return None
+        return endpoint.rstrip("/") or None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -12294,6 +12335,15 @@ def _default_spawn(
             "explicit task pin" if explicit_local_route else "profile local-first",
         )
         cmd.extend(["-m", local_model, "--provider", local_provider])
+        # A named local provider may live in the process config while the
+        # worker intentionally reads the assignee profile config.  Carry only
+        # a verified loopback endpoint into the child and use Hermes' built-in
+        # ``ollama`` alias so provider resolution cannot fall through to a
+        # remote profile fallback when the name is absent from the profile.
+        local_endpoint = _resolve_process_local_provider_endpoint(local_provider)
+        if local_endpoint:
+            env["CUSTOM_BASE_URL"] = local_endpoint
+            cmd[cmd.index("--provider") + 1] = "ollama"
     elif task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
