@@ -210,6 +210,8 @@ class TestProviderEnvBlocklist:
             "SIGNAL_ACCOUNT": "+15555550124",
             "HASS_TOKEN": "ha-secret",
             "EMAIL_PASSWORD": "email-secret",
+            "EMAIL_SMTP_USERNAME": "smtp-user@test.invalid",
+            "EMAIL_SMTP_PASSWORD": "smtp-pw",
             "FIRECRAWL_API_KEY": "fc-secret",
             "HERMES_DASHBOARD_SESSION_TOKEN": "dashboard-session-secret",
             "BROWSERBASE_PROJECT_ID": "bb-project",
@@ -229,6 +231,19 @@ class TestProviderEnvBlocklist:
         result_env = _run_with_env(extra_os_env=leaked_vars)
 
         for var in leaked_vars:
+            assert var not in result_env, f"{var} leaked into subprocess env"
+
+    def test_smtp_credentials_are_high_sensitivity_with_credential_inheritance(self):
+        """SMTP credentials stay stripped even for model-driving child CLIs."""
+        from tools.environments.local import hermes_subprocess_env
+
+        with patch.dict(os.environ, {
+            "EMAIL_SMTP_USERNAME": "smtp-user@test.invalid",
+            "EMAIL_SMTP_PASSWORD": "smtp-pw",
+        }, clear=False):
+            result_env = hermes_subprocess_env(inherit_credentials=True)
+
+        for var in ("EMAIL_SMTP_USERNAME", "EMAIL_SMTP_PASSWORD"):
             assert var not in result_env, f"{var} leaked into subprocess env"
 
     def test_safe_vars_are_preserved(self):
@@ -1527,6 +1542,8 @@ class TestBlocklistCoverage:
             "EMAIL_PASSWORD",
             "EMAIL_IMAP_HOST",
             "EMAIL_SMTP_HOST",
+            "EMAIL_SMTP_USERNAME",
+            "EMAIL_SMTP_PASSWORD",
             "EMAIL_HOME_ADDRESS",
             "EMAIL_HOME_ADDRESS_NAME",
             "HERMES_DASHBOARD_SESSION_TOKEN",

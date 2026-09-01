@@ -419,6 +419,8 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `EMAIL_IMAP_PORT` | IMAP port |
 | `EMAIL_SMTP_HOST` | SMTP hostname for the email adapter |
 | `EMAIL_SMTP_PORT` | SMTP port |
+| `EMAIL_SMTP_USERNAME` | Email gateway/adapter SMTP authentication username; independently falls back to `EMAIL_ADDRESS` when unset or blank |
+| `EMAIL_SMTP_PASSWORD` | Email gateway/adapter SMTP authentication password; independently falls back to `EMAIL_PASSWORD` when unset or blank |
 | `EMAIL_ALLOWED_USERS` | Comma-separated email addresses allowed to message the bot |
 | `EMAIL_HOME_ADDRESS` | Default recipient for proactive email delivery |
 | `EMAIL_HOME_ADDRESS_NAME` | Display name for the email home target |

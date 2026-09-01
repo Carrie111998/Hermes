@@ -403,6 +403,8 @@ def _build_provider_env_blocklist() -> frozenset:
         "EMAIL_PASSWORD",
         "EMAIL_IMAP_HOST",
         "EMAIL_SMTP_HOST",
+        "EMAIL_SMTP_USERNAME",
+        "EMAIL_SMTP_PASSWORD",
         "EMAIL_HOME_ADDRESS",
         "EMAIL_HOME_ADDRESS_NAME",
         "HERMES_DASHBOARD_SESSION_TOKEN",
@@ -823,6 +825,8 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "GATEWAY_RELAY_DELIVERY_KEY",
     "HASS_TOKEN",
     "EMAIL_PASSWORD",
+    "EMAIL_SMTP_USERNAME",
+    "EMAIL_SMTP_PASSWORD",
     "HERMES_DASHBOARD_SESSION_TOKEN",
     # Remote-compute / infrastructure secrets
     "MODAL_TOKEN_ID",

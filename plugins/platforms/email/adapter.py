@@ -9,8 +9,10 @@ Environment variables:
     EMAIL_IMAP_PORT     — IMAP server port (default: 993)
     EMAIL_SMTP_HOST     — SMTP server host (e.g., smtp.gmail.com)
     EMAIL_SMTP_PORT     — SMTP server port (default: 587)
-    EMAIL_ADDRESS       — Email address for the agent
-    EMAIL_PASSWORD      — Email password or app-specific password
+    EMAIL_ADDRESS       — Email address for the agent and IMAP username
+    EMAIL_PASSWORD      — IMAP password or app-specific password
+    EMAIL_SMTP_USERNAME — SMTP username (optional; defaults to EMAIL_ADDRESS)
+    EMAIL_SMTP_PASSWORD — SMTP password (optional; defaults to EMAIL_PASSWORD)
     EMAIL_POLL_INTERVAL — Seconds between mailbox checks (default: 15)
     EMAIL_ALLOWED_USERS — Comma-separated list of allowed sender addresses
 """
@@ -89,6 +91,61 @@ def _esecret_int(name: str, default: int) -> int:
 def _esecret_bool(name: str, default: bool = False) -> bool:
     """Scope-aware boolean read (``env_bool`` variant of ``_get_esecret``)."""
     return is_truthy_value(_get_esecret(name, ""), default=default)
+
+
+def _resolve_smtp_credentials(address: str, password: str) -> Tuple[str, str]:
+    """Resolve optional SMTP overrides with independent legacy fallbacks."""
+    smtp_username = _get_secret("EMAIL_SMTP_USERNAME", "")
+    smtp_password = _get_secret("EMAIL_SMTP_PASSWORD", "")
+    return (
+        smtp_username if smtp_username.strip() else address,
+        smtp_password if smtp_password.strip() else password,
+    )
+
+
+def _validated_smtp_status_code(value: Any) -> Optional[int]:
+    """Return a valid three-digit SMTP status without coercing response data."""
+    if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+        return value
+    return None
+
+
+def _smtp_auth_error_message(smtp_code: Optional[int]) -> str:
+    """Build the fixed credential-safe SMTP authentication guidance."""
+    status = f" (SMTP status {smtp_code})" if smtp_code is not None else ""
+    return (
+        f"SMTP authentication failed{status}. "
+        "Check EMAIL_SMTP_USERNAME / EMAIL_SMTP_PASSWORD overrides "
+        "or the EMAIL_ADDRESS / EMAIL_PASSWORD legacy fallbacks."
+    )
+
+
+class _SanitizedSMTPAuthenticationError(Exception):
+    """Local auth failure that retains only a validated SMTP status code."""
+
+    def __init__(self, smtp_code: Optional[int]) -> None:
+        self.smtp_code = smtp_code
+        super().__init__(_smtp_auth_error_message(smtp_code))
+
+
+def _smtp_login(smtp: smtplib.SMTP, username: str, password: str) -> None:
+    """Authenticate while preventing reflected credentials from escaping."""
+    try:
+        smtp.login(username, password)
+    except smtplib.SMTPAuthenticationError as exc:
+        smtp_code = _validated_smtp_status_code(exc.smtp_code)
+        raise _SanitizedSMTPAuthenticationError(smtp_code) from None
+
+
+def _cleanup_smtp(smtp: smtplib.SMTP) -> None:
+    """Best-effort SMTP teardown that never replaces the primary outcome."""
+    try:
+        smtp.quit()
+    except Exception:
+        try:
+            smtp.close()
+        except Exception:
+            pass
 
 
 # Automated sender patterns — emails from these are silently ignored
@@ -556,6 +613,9 @@ class EmailAdapter(BasePlatformAdapter):
         self._imap_port = _esecret_int("EMAIL_IMAP_PORT", 993)
         self._smtp_host = (_get_secret("EMAIL_SMTP_HOST", "") or extra.get("smtp_host", "")).strip()
         self._smtp_port = _esecret_int("EMAIL_SMTP_PORT", 587)
+        self._smtp_username, self._smtp_password = _resolve_smtp_credentials(
+            self._address, self._password
+        )
         self._poll_interval = _esecret_int("EMAIL_POLL_INTERVAL", 15)
 
         # Skip attachments — configured via config.yaml:
@@ -656,7 +716,7 @@ class EmailAdapter(BasePlatformAdapter):
             try:
                 smtp.starttls(context=ctx)
             except Exception:
-                smtp.close()
+                _cleanup_smtp(smtp)
                 raise
             return smtp
 
@@ -668,6 +728,10 @@ class EmailAdapter(BasePlatformAdapter):
             # Connection-level failure (may be unreachable IPv6).
             # Retry with IPv4 only.
             return _connect(ipv4_only=True)
+
+    def _smtp_login(self, smtp: smtplib.SMTP) -> None:
+        """Authenticate using the adapter's resolved SMTP credential pair."""
+        _smtp_login(smtp, self._smtp_username, self._smtp_password)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to the IMAP server and start polling for new messages."""
@@ -766,21 +830,25 @@ class EmailAdapter(BasePlatformAdapter):
             # Test SMTP connection
             smtp = self._connect_smtp()
             try:
-                smtp.login(self._address, self._password)
+                self._smtp_login(smtp)
             finally:
-                smtp.quit()
+                _cleanup_smtp(smtp)
             logger.info("[Email] SMTP connection test passed.")
-        except smtplib.SMTPAuthenticationError as e:
-            logger.error("[Email] SMTP authentication failed: %s", e)
+        except (
+            _SanitizedSMTPAuthenticationError,
+            smtplib.SMTPAuthenticationError,
+        ) as exc:
+            auth_error_message = _smtp_auth_error_message(
+                _validated_smtp_status_code(exc.smtp_code)
+            )
+            logger.error("[Email] %s", auth_error_message)
             # Typed auth failure (535 & friends): bad or revoked credentials
             # can never self-heal, so drop out of the reconnect queue instead
             # of retrying a dead password forever (OOF-156). Type-based only —
             # SMTPAuthenticationError is unambiguous, unlike IMAP4.error above.
             self._set_fatal_error(
                 "email_auth_error",
-                f"SMTP authentication failed for {self._address}: {e}. "
-                "Check EMAIL_PASSWORD (for Gmail/Outlook this must be an "
-                "app password, not the account password).",
+                auth_error_message,
                 retryable=False,
             )
             return False
@@ -1189,13 +1257,10 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.login(self._address, self._password)
+            self._smtp_login(smtp)
             smtp.send_message(msg)
         finally:
-            try:
-                smtp.quit()
-            except Exception:
-                smtp.close()
+            _cleanup_smtp(smtp)
 
         logger.info("[Email] Sent reply to %s (subject: %s)", to_addr, subject)
         return msg_id
@@ -1315,13 +1380,10 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.login(self._address, self._password)
+            self._smtp_login(smtp)
             smtp.send_message(msg)
         finally:
-            try:
-                smtp.quit()
-            except Exception:
-                smtp.close()
+            _cleanup_smtp(smtp)
 
         logger.info("[Email] Sent multi-attachment email to %s (%d files)", to_addr, len(file_paths))
         return msg_id
@@ -1393,13 +1455,10 @@ class EmailAdapter(BasePlatformAdapter):
 
         smtp = self._connect_smtp()
         try:
-            smtp.login(self._address, self._password)
+            self._smtp_login(smtp)
             smtp.send_message(msg)
         finally:
-            try:
-                smtp.quit()
-            except Exception:
-                smtp.close()
+            _cleanup_smtp(smtp)
 
         return msg_id
 
@@ -1445,6 +1504,7 @@ async def _standalone_send(
     extra = getattr(pconfig, "extra", {}) or {}
     address = extra.get("address") or _get_secret("EMAIL_ADDRESS", "")
     password = _get_secret("EMAIL_PASSWORD", "")
+    smtp_username, smtp_password = _resolve_smtp_credentials(address, password)
     smtp_host = extra.get("smtp_host") or _get_secret("EMAIL_SMTP_HOST", "")
     try:
         smtp_port = int(_get_secret("EMAIL_SMTP_PORT", "587") or "587")
@@ -1454,6 +1514,7 @@ async def _standalone_send(
     if not all([address, password, smtp_host]):
         return {"error": "Email not configured (EMAIL_ADDRESS, EMAIL_PASSWORD, EMAIL_SMTP_HOST required)"}
 
+    server = None
     try:
         msg = MIMEText(message, "plain", "utf-8")
         msg["From"] = address
@@ -1463,16 +1524,30 @@ async def _standalone_send(
 
         server = smtplib.SMTP(smtp_host, smtp_port)
         server.starttls(context=_ssl.create_default_context())
-        server.login(address, password)
+        _smtp_login(server, smtp_username, smtp_password)
         server.send_message(msg)
-        server.quit()
         return {"success": True, "platform": "email", "chat_id": chat_id}
+    except (
+        _SanitizedSMTPAuthenticationError,
+        smtplib.SMTPAuthenticationError,
+    ) as exc:
+        error_message = _smtp_auth_error_message(
+            _validated_smtp_status_code(exc.smtp_code)
+        )
+        try:
+            from tools.send_message_tool import _error as _e
+            return _e(error_message)
+        except Exception:
+            return {"error": error_message}
     except Exception as e:
         try:
             from tools.send_message_tool import _error as _e
             return _e(f"Email send failed: {e}")
         except Exception:
             return {"error": f"Email send failed: {e}"}
+    finally:
+        if server is not None:
+            _cleanup_smtp(server)
 
 
 def _is_connected(config) -> bool:
