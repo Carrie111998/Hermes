@@ -1009,7 +1009,7 @@ def _audit_pr(ctx: Any, args: argparse.Namespace) -> int:
             if not handoff_blocked:
                 _complete_current_ci_task(receipt)
                 handoff_completed = True
-        except (CIValidationError, GitHubClientError, RuntimeError):
+        except (CIValidationError, GitHubClientError, RuntimeError) as error:
             if not handoff_blocked:
                 try:
                     _block_current_ci_task(
