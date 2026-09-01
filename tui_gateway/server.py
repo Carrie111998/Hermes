@@ -9084,12 +9084,18 @@ def _make_agent(
             # The switch already resolved concrete credentials/endpoint; honor
             # persisted overrides only while using that original runtime. They
             # must not leak into a different fallback provider/model pair.
+            _override_updates: dict[str, Any] = {}
             if override_base_url:
-                runtime["base_url"] = override_base_url
+                _override_updates["base_url"] = override_base_url
             if override_api_key:
-                runtime["api_key"] = override_api_key
+                _override_updates["api_key"] = override_api_key
             if override_api_mode:
-                runtime["api_mode"] = override_api_mode
+                _override_updates["api_mode"] = override_api_mode
+            if _override_updates:
+                # ResolvedRuntime is immutable; with_updates() returns the
+                # patched value (persisted overrides must not leak into a
+                # different fallback provider/model pair, see comment above).
+                runtime = runtime.with_updates(**_override_updates)
     else:
         model, requested_provider = _resolve_startup_runtime()
         if isinstance(model_override, str) and model_override:

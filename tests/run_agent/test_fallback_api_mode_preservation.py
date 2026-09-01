@@ -42,12 +42,23 @@ def _mock_client(base_url="https://openrouter.ai/api/v1", api_key="fb-key"):
     return mock
 
 
-def _activate(agent, resolved_base_url, resolved_model, build_anthropic=None):
+def _activate(agent, resolved_base_url, resolved_model, *, anthropic_wire=False):
     """Run _try_activate_fallback with the standard mock stack.
 
     Returns the mock for resolve_provider_client so callers can assert on
     the api_mode kwarg passed at the fallback call site.
     """
+    resolved_client = _mock_client(base_url=resolved_base_url)
+    if anthropic_wire:
+        from agent.auxiliary_client import AnthropicAuxiliaryClient
+
+        resolved_client = AnthropicAuxiliaryClient(
+            MagicMock(name="anthropic-request-client"),
+            resolved_model,
+            "fb-key",
+            resolved_base_url,
+        )
+
     patches = [
         patch(
             "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
@@ -56,7 +67,7 @@ def _activate(agent, resolved_base_url, resolved_model, build_anthropic=None):
         patch(
             "agent.auxiliary_client.resolve_provider_client",
             return_value=(
-                _mock_client(base_url=resolved_base_url),
+                resolved_client,
                 resolved_model,
             ),
         ),
@@ -66,8 +77,9 @@ def _activate(agent, resolved_base_url, resolved_model, build_anthropic=None):
         ),
         patch(
             "agent.anthropic_adapter.build_anthropic_client",
-            side_effect=build_anthropic
-            or (lambda api_key, base_url, timeout=None, **kw: MagicMock()),
+            side_effect=AssertionError(
+                "fallback must not rebuild the resolved client"
+            ),
         ),
     ]
     with patches[0], patches[1] as mock_rpc, patches[2], patches[3]:
@@ -85,7 +97,12 @@ class TestExplicitApiModeHonored:
             "api_mode": "anthropic_messages",
         }]
         agent = _make_agent(fallback_model=fbs)
-        mock_rpc = _activate(agent, "https://gateway.example.com/v1", "claude-opus-4-6")
+        mock_rpc = _activate(
+            agent,
+            "https://gateway.example.com/v1",
+            "claude-opus-4-6",
+            anthropic_wire=True,
+        )
         assert agent.api_mode == "anthropic_messages"
         # Behavior (3): api_mode forwarded to the resolver.
         assert mock_rpc.call_args.kwargs["api_mode"] == "anthropic_messages"
@@ -135,7 +152,12 @@ class TestOriginalUrlDetection:
             "api_key": "k",
         }]
         agent = _make_agent(fallback_model=fbs)
-        mock_rpc = _activate(agent, "https://api.minimax.io/v1", "MiniMax-M2.5")
+        mock_rpc = _activate(
+            agent,
+            "https://api.minimax.io/v1",
+            "MiniMax-M2.5",
+            anthropic_wire=True,
+        )
         assert agent.api_mode == "anthropic_messages"
         assert mock_rpc.call_args.kwargs["api_mode"] == "anthropic_messages"
 
@@ -147,7 +169,12 @@ class TestOriginalUrlDetection:
             "api_key": "k",
         }]
         agent = _make_agent(fallback_model=fbs)
-        _activate(agent, "https://api.anthropic.com", "claude-opus-4-6")
+        _activate(
+            agent,
+            "https://api.anthropic.com",
+            "claude-opus-4-6",
+            anthropic_wire=True,
+        )
         assert agent.api_mode == "anthropic_messages"
 
     def test_provider_anthropic_without_base_url(self):
@@ -155,7 +182,12 @@ class TestOriginalUrlDetection:
         to anthropic_messages (follow-up commit 38303343 in PR #79787)."""
         fbs = [{"provider": "anthropic", "model": "claude-opus-4-6", "api_key": "k"}]
         agent = _make_agent(fallback_model=fbs)
-        mock_rpc = _activate(agent, "https://api.anthropic.com", "claude-opus-4-6")
+        mock_rpc = _activate(
+            agent,
+            "https://api.anthropic.com",
+            "claude-opus-4-6",
+            anthropic_wire=True,
+        )
         assert agent.api_mode == "anthropic_messages"
         assert mock_rpc.call_args.kwargs["api_mode"] == "anthropic_messages"
 
@@ -170,7 +202,7 @@ class TestPlainFallbackUnchanged:
         agent = _make_agent(fallback_model=fbs)
         mock_rpc = _activate(agent, "https://openrouter.ai/api/v1", "z-ai/glm-5")
         assert agent.api_mode == "chat_completions"
-        assert mock_rpc.call_args.kwargs["api_mode"] == "chat_completions"
+        assert mock_rpc.call_args.kwargs["api_mode"] is None
 
     def test_post_resolve_anthropic_host_still_detected(self):
         """Named custom providers resolve api.anthropic.com from config, not
@@ -178,5 +210,10 @@ class TestPlainFallbackUnchanged:
         (#32243, #49247)."""
         fbs = [{"provider": "cron-anthropic", "model": "claude-opus-4-6", "api_key": "k"}]
         agent = _make_agent(fallback_model=fbs)
-        _activate(agent, "https://api.anthropic.com/v1", "claude-opus-4-6")
+        _activate(
+            agent,
+            "https://api.anthropic.com/v1",
+            "claude-opus-4-6",
+            anthropic_wire=True,
+        )
         assert agent.api_mode == "anthropic_messages"

@@ -1660,6 +1660,27 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     assert resolved["requested_provider"] == "custom:lmstudio"
 
 
+def test_resolve_named_custom_runtime_includes_tls_settings(monkeypatch):
+    """TLS configuration is runtime data consumed by the bundle factory."""
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+    monkeypatch.setattr(
+        rp,
+        "_get_named_custom_provider",
+        lambda p: {
+            "name": "btcapp",
+            "base_url": "https://btcapp.example/v1",
+            "api_key": "btc-key",
+            "ssl_ca_cert": "C:/certs/btc-ca.pem",
+            "ssl_verify": "false",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="custom:btcapp")
+
+    assert resolved["ssl_ca_cert"] == "C:/certs/btc-ca.pem"
+    assert resolved["ssl_verify"] is False
+
+
 def test_resolve_runtime_provider_opencode_free_keyless_despite_exhausted_pool(monkeypatch):
     """OpenCode Free is keyless: an exhausted credential pool must not raise
     a missing-credential error. The provider resolves with the keyless

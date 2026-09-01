@@ -2709,7 +2709,14 @@ def anthropic_prompt_cache_policy(
 
 
 
-def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+def create_openai_client(
+    agent,
+    client_kwargs: dict,
+    *,
+    reason: str,
+    shared: bool,
+    runtime=None,
+) -> Any:
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
     from agent.ssl_verify import resolve_httpx_verify
     # Treat client_kwargs as read-only. Callers pass agent._client_kwargs (or shallow
@@ -2729,15 +2736,30 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # _client_kwargs carry an unrelated relay base_url, leaks the request to a
     # foreign gateway. Rebuild the facade instead (build_moa_facade also
     # re-wires the reference relay, see #53802).
-    if (getattr(agent, "provider", "") or "").strip().lower() == "moa":
+    runtime_provider = (
+        getattr(runtime, "provider", "")
+        if runtime is not None
+        else getattr(agent, "provider", "")
+    ) or ""
+    runtime_model = (
+        getattr(runtime, "model", "")
+        if runtime is not None
+        else getattr(agent, "model", "")
+    ) or ""
+    runtime_base_url = (
+        getattr(runtime, "base_url", "")
+        if runtime is not None
+        else getattr(agent, "base_url", "")
+    ) or ""
+    if runtime_provider.strip().lower() == "moa":
         from agent.moa_loop import build_moa_facade
-        return build_moa_facade(agent, getattr(agent, "model", None) or "default")
+        return build_moa_facade(agent, runtime_model or "default")
     ssl_ca_cert = client_kwargs.pop("ssl_ca_cert", None)
     ssl_verify_cfg = client_kwargs.pop("ssl_verify", None)
     httpx_verify = resolve_httpx_verify(ca_bundle=ssl_ca_cert, ssl_verify=ssl_verify_cfg)
     _validate_proxy_env_urls()
     _validate_base_url(client_kwargs.get("base_url"))
-    if agent.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
+    if runtime_provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
         from agent.copilot_acp_client import CopilotACPClient
 
         client = CopilotACPClient(**client_kwargs)
@@ -2748,7 +2770,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return client
-    if agent.provider == "gemini":
+    if runtime_provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
         base_url = str(client_kwargs.get("base_url", "") or "")
@@ -2833,7 +2855,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # opencode-free client through the shared keyless header policy: an
     # empty Authorization default_header overrides the SDK's
     # "Bearer <api_key>" so no credential ever reaches the wire.
-    if agent.provider == "opencode-free":
+    if runtime_provider == "opencode-free":
         from hermes_cli.models import opencode_zen_free_headers
 
         _existing = dict(client_kwargs.get("default_headers") or {})
@@ -2852,11 +2874,18 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # Uses the module-level `OpenAI` name, resolved lazily on first
     # access via __getattr__ below. Tests patch via `run_agent.OpenAI`.
     client = _ra().OpenAI(**client_kwargs)
+    if runtime is None:
+        log_context = agent._client_log_context()
+    else:
+        log_context = (
+            f"thread={agent._thread_identity()} provider={runtime_provider} "
+            f"base_url={runtime_base_url} model={runtime_model}"
+        )
     _ra().logger.info(
         "OpenAI client created (%s, shared=%s) %s",
         reason,
         shared,
-        agent._client_log_context(),
+        log_context,
     )
     return client
 

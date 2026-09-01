@@ -5483,6 +5483,95 @@ class AIAgent:
             self._client_lock = lock
         return lock
 
+    def install_runtime(self, bundle, *, reason: str = "runtime_install"):
+        """Atomically install a completely built provider runtime.
+
+        Client construction deliberately happens before this method is called.
+        The lock protects one small commit boundary: readers either observe the
+        complete old runtime or the complete new runtime, never a new provider
+        or model paired with the previous wire client. Replaced shared clients
+        are retired only after the commit succeeds and the lock is released.
+
+        Prompt text, message history, context-engine state, credential pools,
+        and fallback bookkeeping are intentionally outside this boundary.
+        """
+        from agent.runtime_bundle import ClientBundle
+
+        if not isinstance(bundle, ClientBundle):
+            raise TypeError("install_runtime requires a ClientBundle")
+        if bundle.client is not None and bundle.anthropic_client is not None:
+            raise ValueError("ClientBundle cannot contain both wire clients")
+
+        runtime = bundle.runtime
+        client_kwargs = dict(bundle.client_kwargs)
+        model = runtime.model or getattr(self, "model", "")
+        provider = runtime.provider or getattr(self, "provider", "")
+        requested_provider = runtime.requested_provider or provider
+        api_mode = runtime.api_mode or "chat_completions"
+        api_key = (
+            bundle.anthropic_api_key
+            if bundle.anthropic_client is not None
+            else client_kwargs.get("api_key", runtime.api_key)
+        )
+        base_url = (
+            bundle.anthropic_base_url
+            if bundle.anthropic_client is not None
+            else client_kwargs.get("base_url", runtime.base_url)
+        )
+
+        with self._openai_client_lock():
+            old_clients = (
+                getattr(self, "client", None),
+                getattr(self, "_anthropic_client", None),
+            )
+            self.model = model
+            self.provider = provider
+            self.requested_provider = requested_provider
+            self.base_url = base_url or ""
+            self.api_mode = api_mode
+            self.api_key = api_key
+            self.client = bundle.client
+            self._anthropic_client = bundle.anthropic_client
+            self._client_kwargs = client_kwargs
+            self._anthropic_api_key = (
+                bundle.anthropic_api_key
+                if bundle.anthropic_client is not None
+                else ""
+            )
+            self._anthropic_base_url = (
+                bundle.anthropic_base_url
+                if bundle.anthropic_client is not None
+                else ""
+            )
+            self._is_anthropic_oauth = (
+                bundle.is_anthropic_oauth
+                if bundle.anthropic_client is not None
+                else False
+            )
+            self._resolved_runtime = runtime
+            if hasattr(self, "_transport_cache"):
+                self._transport_cache.clear()
+
+        active_ids = {
+            id(client)
+            for client in (bundle.client, bundle.anthropic_client)
+            if client is not None
+        }
+        retired_ids = set()
+        for old_client in old_clients:
+            if (
+                old_client is None
+                or id(old_client) in active_ids
+                or id(old_client) in retired_ids
+            ):
+                continue
+            retired_ids.add(id(old_client))
+            self._retire_shared_openai_client(
+                old_client,
+                reason=f"install:{reason}",
+            )
+        return runtime
+
     @staticmethod
     def _is_openai_client_closed(client: Any) -> bool:
         """Check if an OpenAI client is closed.
@@ -5520,10 +5609,23 @@ class AIAgent:
 
         return build_keepalive_http_client(base_url, verify=verify)
 
-    def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+    def _create_openai_client(
+        self,
+        client_kwargs: dict,
+        *,
+        reason: str,
+        shared: bool,
+        runtime=None,
+    ) -> Any:
         """Forwarder — see ``agent.agent_runtime_helpers.create_openai_client``."""
         from agent.agent_runtime_helpers import create_openai_client
-        return create_openai_client(self, client_kwargs, reason=reason, shared=shared)
+        return create_openai_client(
+            self,
+            client_kwargs,
+            reason=reason,
+            shared=shared,
+            runtime=runtime,
+        )
 
     @staticmethod
     def _force_close_tcp_sockets(client: Any) -> int:
@@ -6667,6 +6769,9 @@ class AIAgent:
         base_url: str,
         *,
         apply_user_headers: bool = True,
+        client_kwargs: Optional[dict] = None,
+        provider: Optional[str] = None,
+        api_mode: Optional[str] = None,
     ) -> None:
         from agent.auxiliary_client import (
             _AI_GATEWAY_HEADERS,
@@ -6674,65 +6779,79 @@ class AIAgent:
             build_or_headers,
         )
 
+        target_kwargs = self._client_kwargs if client_kwargs is None else client_kwargs
+        effective_provider = self.provider if provider is None else provider
+        effective_api_mode = self.api_mode if api_mode is None else api_mode
+
         if base_url_host_matches(base_url, "openrouter.ai"):
-            self._client_kwargs["default_headers"] = build_or_headers()
+            target_kwargs["default_headers"] = build_or_headers()
         elif base_url_host_matches(base_url, "ai-gateway.vercel.sh"):
-            self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
+            target_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
         elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
-            self._client_kwargs["default_headers"] = build_nvidia_nim_headers(base_url)
+            target_kwargs["default_headers"] = build_nvidia_nim_headers(base_url)
         elif base_url_host_matches(base_url, "api.routermint.com"):
-            self._client_kwargs["default_headers"] = _routermint_headers()
+            target_kwargs["default_headers"] = _routermint_headers()
         elif base_url_host_matches(base_url, "githubcopilot.com"):
             from hermes_cli.models import copilot_default_headers
 
-            self._client_kwargs["default_headers"] = copilot_default_headers()
+            target_kwargs["default_headers"] = copilot_default_headers()
         elif base_url_host_matches(base_url, "api.kimi.com"):
             from agent.auxiliary_client import _AI_GATEWAY_HEADERS
-            self._client_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
+            target_kwargs["default_headers"] = dict(_AI_GATEWAY_HEADERS)
         elif base_url_host_matches(base_url, "portal.qwen.ai"):
-            self._client_kwargs["default_headers"] = _qwen_portal_headers()
+            target_kwargs["default_headers"] = _qwen_portal_headers()
         elif base_url_host_matches(base_url, "chatgpt.com"):
             from agent.codex_headers import codex_cloudflare_headers
-            self._client_kwargs["default_headers"] = codex_cloudflare_headers(
-                self._client_kwargs.get("api_key", ""), base_url=base_url,
+
+            target_kwargs["default_headers"] = codex_cloudflare_headers(
+                target_kwargs.get("api_key", ""), base_url=base_url,
             )
         elif base_url_host_matches(base_url, "x.ai"):
             # Cover both provider=xai and provider=xai-oauth (api.x.ai).
             from tools.xai_http import hermes_xai_default_headers
 
-            self._client_kwargs["default_headers"] = hermes_xai_default_headers()
+            target_kwargs["default_headers"] = hermes_xai_default_headers()
         else:
             # No URL-specific headers — check profile.default_headers before clearing.
             _ph_headers = None
             try:
                 from providers import get_provider_profile as _gpf2
-                _ph2 = _gpf2(self.provider)
+                _ph2 = _gpf2(effective_provider)
                 if _ph2 and _ph2.default_headers:
                     _ph_headers = dict(_ph2.default_headers)
             except Exception:
                 pass
             if _ph_headers:
-                self._client_kwargs["default_headers"] = _ph_headers
+                target_kwargs["default_headers"] = _ph_headers
             else:
-                self._client_kwargs.pop("default_headers", None)
+                target_kwargs.pop("default_headers", None)
 
         # User-configured overrides win over URL/profile defaults for the same
         # route. A credential swap to another endpoint must not inherit them.
         if apply_user_headers:
-            self._apply_user_default_headers()
+            if client_kwargs is None:
+                self._apply_user_default_headers()
+            elif effective_api_mode not in ("anthropic_messages", "bedrock_converse"):
+                from agent.auxiliary_client import (
+                    _apply_user_default_headers as _merge_user_headers,
+                )
+
+                merged = _merge_user_headers(target_kwargs.get("default_headers"))
+                if merged:
+                    target_kwargs["default_headers"] = merged
 
         # Per-provider extra HTTP headers (providers.<name>.extra_headers /
         # custom_providers[].extra_headers) — applied last so the most
         # specific config level survives credential swaps and rebuilds too.
         # SECURITY: values may carry credentials — never log them.
-        if self.api_mode not in ("anthropic_messages", "bedrock_converse"):
+        if effective_api_mode not in ("anthropic_messages", "bedrock_converse"):
             try:
                 from hermes_cli.config import (
                     apply_custom_provider_extra_headers_to_client_kwargs,
                 )
 
                 apply_custom_provider_extra_headers_to_client_kwargs(
-                    self._client_kwargs, base_url,
+                    target_kwargs, base_url,
                 )
             except Exception:
                 logger.debug("custom-provider extra_headers skipped", exc_info=True)

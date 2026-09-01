@@ -7,8 +7,9 @@ to the next provider.
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from agent.auxiliary_client import AnthropicAuxiliaryClient
 from run_agent import AIAgent
 
 
@@ -39,6 +40,16 @@ def _mock_client(base_url="https://chatgpt.com/backend-api/codex", api_key="fb-k
     mock.chat.completions = type("Completions", (), {})()
     mock.chat.completions.create = lambda *args, **kwargs: None
     return mock
+
+
+def _mock_anthropic_client(model="anthropic/claude-sonnet-4.6"):
+    return AnthropicAuxiliaryClient(
+        MagicMock(),
+        model,
+        "fb-key",
+        "https://inference-api.nousresearch.com/anthropic",
+        is_oauth=True,
+    )
 
 
 class TestNousFallbackLocalAvailability:
@@ -94,7 +105,7 @@ class TestNousFallbackLocalAvailability:
             return_value={"access_token": "abc", "refresh_token": "xyz"},
         ), patch(
             "agent.auxiliary_client.resolve_provider_client",
-            return_value=(_mock_client(api_key="fb"), "anthropic/claude-sonnet-4.6"),
+            return_value=(_mock_anthropic_client(), "anthropic/claude-sonnet-4.6"),
         ):
             activated = agent._try_activate_fallback(None)
         assert activated is True

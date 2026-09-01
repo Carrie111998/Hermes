@@ -1164,7 +1164,7 @@ def init_agent(
     _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
 
     if agent.api_mode == "anthropic_messages":
-        from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+        from agent.anthropic_adapter import resolve_anthropic_token
         # Bedrock + Claude → use AnthropicBedrock SDK for full feature parity
         # (prompt caching, thinking budgets, adaptive thinking).
         _is_bedrock_anthropic = agent.provider == "bedrock"
@@ -1213,9 +1213,6 @@ def init_agent(
                         _mm_exc,
                     )
 
-            agent.api_key = effective_key
-            agent._anthropic_api_key = effective_key
-            agent._anthropic_base_url = base_url
             # Only mark the session as OAuth-authenticated when the token
             # genuinely belongs to native Anthropic.  Third-party providers
             # (MiniMax, Kimi, GLM, LiteLLM proxies) that accept the
@@ -1223,12 +1220,19 @@ def init_agent(
             # so injects Claude-Code identity headers and system prompts
             # that cause 401/403 on their endpoints.  Guards #1739 and
             # the third-party identity-injection bug.
-            from agent.anthropic_adapter import _is_oauth_token as _is_oat
-            agent._is_anthropic_oauth = _is_oat(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
-            agent._anthropic_client = build_anthropic_client(effective_key, base_url, timeout=_provider_timeout)
+            from agent.runtime_bundle import ResolvedRuntime, build_client_bundle
+
+            runtime = ResolvedRuntime.from_mapping({
+                "provider": agent.provider,
+                "requested_provider": agent.requested_provider,
+                "model": agent.model,
+                "api_mode": agent.api_mode,
+                "api_key": effective_key,
+                "base_url": base_url or "",
+            })
+            bundle = build_client_bundle(runtime, timeout=_provider_timeout)
+            agent.install_runtime(bundle, reason="agent_init")
             # No OpenAI client needed for Anthropic mode
-            agent.client = None
-            agent._client_kwargs = {}
             if not agent.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {agent.model} (Anthropic native)")
                 # ``effective_key`` may be a callable Entra ID bearer
@@ -1477,8 +1481,6 @@ def init_agent(
             if agent.provider == "bedrock" and "bedrock-mantle." in str(client_kwargs.get("base_url", "")):
                 raise
         
-        agent._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
-
         # Enable fine-grained tool streaming for Claude on OpenRouter.
         # Without this, Anthropic buffers the entire tool call and goes
         # silent for minutes while thinking — OpenRouter's upstream proxy
@@ -1503,7 +1505,15 @@ def init_agent(
         # OpenAI SDK's identifying headers swap in a plain User-Agent. (#40033)
         # client_kwargs is the same dict object as agent._client_kwargs, so
         # this mutation is reflected in the client built just below.
-        agent._apply_user_default_headers()
+        from agent.auxiliary_client import (
+            _apply_user_default_headers as _merge_user_default_headers,
+        )
+
+        _merged_user_headers = _merge_user_default_headers(
+            client_kwargs.get("default_headers")
+        )
+        if _merged_user_headers:
+            client_kwargs["default_headers"] = _merged_user_headers
 
         try:
             from hermes_cli.config import (
@@ -1533,13 +1543,44 @@ def init_agent(
         except Exception:
             logger.debug("custom-provider TLS resolution skipped", exc_info=True)
 
-        agent.api_key = client_kwargs.get("api_key", "")
-        agent.base_url = client_kwargs.get("base_url", agent.base_url)
         try:
             from agent.ssl_guard import verify_ca_bundle_with_fallback
 
             verify_ca_bundle_with_fallback()
-            agent.client = agent._create_openai_client(client_kwargs, reason="agent_init", shared=True)
+            if agent.provider == "bedrock":
+                # Bedrock Mantle keeps its existing SigV4-wired construction
+                # path until the Bedrock wire moves behind runtime_bundle.
+                agent.api_key = client_kwargs.get("api_key", "")
+                agent.base_url = client_kwargs.get("base_url", agent.base_url)
+                agent._client_kwargs = client_kwargs
+                agent.client = agent._create_openai_client(
+                    client_kwargs,
+                    reason="agent_init",
+                    shared=True,
+                )
+            else:
+                from agent.runtime_bundle import (
+                    ResolvedRuntime,
+                    build_client_bundle,
+                )
+
+                runtime = ResolvedRuntime.from_mapping({
+                    "provider": agent.provider,
+                    "requested_provider": agent.requested_provider,
+                    "model": agent.model,
+                    "api_mode": agent.api_mode,
+                    **client_kwargs,
+                })
+                bundle = build_client_bundle(
+                    runtime,
+                    openai_builder=lambda kwargs: agent._create_openai_client(
+                        kwargs,
+                        reason="agent_init",
+                        shared=True,
+                        runtime=runtime,
+                    ),
+                )
+                agent.install_runtime(bundle, reason="agent_init")
             if not agent.quiet_mode:
                 print(f"🤖 AI Agent initialized with model: {agent.model}")
                 if base_url:

@@ -15,6 +15,7 @@ loaded) so this module never imports ``cli`` at import time -> no import cycle.
 from __future__ import annotations
 
 import sys
+from collections.abc import Mapping
 
 from rich.markup import escape as _escape
 
@@ -237,7 +238,7 @@ class CLIAgentSetupMixin:
             )
         except Exception:
             return False
-        if not isinstance(runtime, dict):
+        if not isinstance(runtime, Mapping):
             return False
         api_key = runtime.get("api_key")
         base_url = runtime.get("base_url")

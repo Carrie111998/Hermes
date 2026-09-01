@@ -1,5 +1,6 @@
 """Tests for named custom provider and 'main' alias resolution in auxiliary_client."""
 
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -121,6 +122,153 @@ class TestResolveProviderClientNamedCustom:
         client, model = resolve_provider_client("local", "test")
         assert client is not None
         # no-key-required should be used
+
+    def test_cloudflare_headers_and_tls_flow_through_runtime_bundle(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression: btcapp-style Cloudflare Access headers must reach the
+        OpenAI client or auxiliary calls are rejected with HTTP 403."""
+        _write_config(tmp_path, {
+            "model": {
+                "default": "btc-model",
+                "default_headers": {
+                    "User-Agent": "HermesAgent/test",
+                    "CF-Access-Client-Id": "stale-global-id",
+                },
+            },
+            "providers": {
+                "btcapp": {
+                    "base_url": "https://btcapp.example/v1",
+                    "api_key": "btc-key",
+                    "default_model": "btc-model",
+                    "extra_headers": {
+                        "CF-Access-Client-Id": "btc-client-id",
+                        "CF-Access-Client-Secret": "btc-client-secret",
+                    },
+                    "ssl_verify": False,
+                },
+            },
+        })
+
+        import agent.auxiliary_client as auxiliary
+        import agent.runtime_bundle as runtime_bundle
+
+        captured = {}
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                api_key=kwargs["api_key"],
+                base_url=kwargs["base_url"],
+                close=lambda: None,
+            )
+
+        real_factory = runtime_bundle.build_client_bundle
+        with (
+            patch.object(runtime_bundle, "build_client_bundle", wraps=real_factory) as factory,
+            patch.object(auxiliary, "_create_openai_client", side_effect=fake_create),
+        ):
+            client, model = auxiliary.resolve_provider_client("btcapp")
+
+        assert client is not None
+        assert model == "btc-model"
+        factory.assert_called_once()
+        assert captured["default_headers"] == {
+            "User-Agent": "HermesAgent/test",
+            "CF-Access-Client-Id": "btc-client-id",
+            "CF-Access-Client-Secret": "btc-client-secret",
+        }
+        assert captured["ssl_verify"] is False
+
+    def test_async_named_custom_keeps_cloudflare_headers(self, tmp_path):
+        """AsyncOpenAI recreation must not drop the bundle's entry headers."""
+        _write_config(tmp_path, {
+            "model": {"default": "btc-model"},
+            "providers": {
+                "btcapp": {
+                    "base_url": "https://btcapp.example/v1",
+                    "api_key": "btc-key",
+                    "default_model": "btc-model",
+                    "extra_headers": {
+                        "CF-Access-Client-Id": "btc-client-id",
+                        "CF-Access-Client-Secret": "btc-client-secret",
+                    },
+                },
+            },
+        })
+
+        import agent.auxiliary_client as auxiliary
+
+        async_kwargs = {}
+
+        def fake_sync_create(**kwargs):
+            return SimpleNamespace(
+                api_key=kwargs["api_key"],
+                base_url=kwargs["base_url"],
+                close=lambda: None,
+            )
+
+        def fake_async_create(**kwargs):
+            async_kwargs.update(kwargs)
+            return SimpleNamespace(**kwargs)
+
+        with (
+            patch.object(auxiliary, "_create_openai_client", side_effect=fake_sync_create),
+            patch("openai.AsyncOpenAI", side_effect=fake_async_create),
+            patch.object(auxiliary, "_openai_http_client_kwargs", return_value={}),
+        ):
+            client, model = auxiliary.resolve_provider_client(
+                "btcapp", async_mode=True
+            )
+
+        assert client is not None
+        assert model == "btc-model"
+        assert async_kwargs["default_headers"]["CF-Access-Client-Id"] == "btc-client-id"
+        assert (
+            async_kwargs["default_headers"]["CF-Access-Client-Secret"]
+            == "btc-client-secret"
+        )
+
+    def test_anthropic_named_custom_headers_flow_through_bundle(
+        self, tmp_path, monkeypatch
+    ):
+        """The same entry-header contract applies to Anthropic Messages."""
+        _write_config(tmp_path, {
+            "providers": {
+                "btc-claude": {
+                    "base_url": "https://btcapp.example/anthropic",
+                    "api_key": "btc-key",
+                    "transport": "anthropic_messages",
+                    "default_model": "claude-btc",
+                    "extra_headers": {
+                        "CF-Access-Client-Id": "btc-client-id",
+                        "CF-Access-Client-Secret": "btc-client-secret",
+                    },
+                },
+            },
+        })
+
+        import agent.auxiliary_client as auxiliary
+
+        captured = {}
+        native_client = SimpleNamespace(close=lambda: None)
+
+        def fake_anthropic(api_key, base_url, **kwargs):
+            captured.update(api_key=api_key, base_url=base_url, **kwargs)
+            return native_client
+
+        with patch(
+            "agent.anthropic_adapter.build_anthropic_client",
+            side_effect=fake_anthropic,
+        ):
+            client, model = auxiliary.resolve_provider_client("btc-claude")
+
+        assert isinstance(client, auxiliary.AnthropicAuxiliaryClient)
+        assert model == "claude-btc"
+        assert captured["default_headers"] == {
+            "CF-Access-Client-Id": "btc-client-id",
+            "CF-Access-Client-Secret": "btc-client-secret",
+        }
 
 
 

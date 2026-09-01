@@ -566,6 +566,7 @@ def _build_anthropic_client_with_bearer_hook(
     timeout: float = None,
     *,
     drop_context_1m_beta: bool = False,
+    default_headers: Optional[Dict[str, str]] = None,
 ):
     """Anthropic-on-Foundry Entra ID variant of :func:`build_anthropic_client`.
 
@@ -633,6 +634,11 @@ def _build_anthropic_client_with_bearer_hook(
     if common_betas:
         kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
+    if default_headers:
+        merged_headers = dict(kwargs.get("default_headers") or {})
+        merged_headers.update(default_headers)
+        kwargs["default_headers"] = merged_headers
+
     client = _anthropic_sdk.Anthropic(**kwargs)
     # Same env-inference trap as build_anthropic_client: auth_token-only
     # construction would otherwise also send ANTHROPIC_API_KEY as X-Api-Key.
@@ -646,6 +652,7 @@ def build_anthropic_client(
     timeout: float = None,
     *,
     drop_context_1m_beta: bool = False,
+    default_headers: Optional[Dict[str, str]] = None,
 ):
     """Create an Anthropic client, auto-detecting setup-tokens vs API keys.
 
@@ -687,6 +694,7 @@ def build_anthropic_client(
         return _build_anthropic_client_with_bearer_hook(
             api_key, base_url, timeout,
             drop_context_1m_beta=drop_context_1m_beta,
+            default_headers=default_headers,
         )
 
     normalize_proxy_env_vars()
@@ -782,6 +790,11 @@ def build_anthropic_client(
         headers.setdefault("HTTP-Referer", "https://hermes-agent.nousresearch.com")
         headers.setdefault("X-Title", "Hermes Agent")
         headers.setdefault("User-Agent", f"HermesAgent/{_HERMES_VERSION}")
+        kwargs["default_headers"] = headers
+
+    if default_headers:
+        headers = dict(kwargs.get("default_headers") or {})
+        headers.update(default_headers)
         kwargs["default_headers"] = headers
 
     client = _anthropic_sdk.Anthropic(**kwargs)

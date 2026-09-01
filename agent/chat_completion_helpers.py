@@ -2651,17 +2651,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             from agent.secret_scope import get_secret
 
             fb_api_key_hint = get_secret("OLLAMA_API_KEY") or None
-        fb_client, _resolved_fb_model = resolve_provider_client(
-            fb_provider, model=fb_model, raw_codex=True,
-            explicit_base_url=fb_base_url_hint,
-            explicit_api_key=fb_api_key_hint,
-            api_mode=fb_api_mode)
-        if fb_client is None:
-            logger.warning(
-                "Fallback to %s failed: provider not configured",
-                fb_provider)
-            unavailable.add(fb_key)
-            return agent._try_activate_fallback(reason)  # try next in chain
+
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2672,6 +2662,40 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_model, fb_provider, _norm_err,
             )
 
+        # Resolve the complete request client with the destination timeout.
+        # In particular, a named Anthropic-compatible provider's entry headers
+        # must stay attached to the exact native client installed below.
+        _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
+        # A default here is only local detection state, not an explicit
+        # override.  Passing chat_completions unconditionally would erase a
+        # named provider's own anthropic_messages declaration before the
+        # resolver can build its header-complete native client.
+        resolver_api_mode = (
+            fb_api_mode
+            if fb_api_mode_explicit or fb_api_mode != "chat_completions"
+            else None
+        )
+        fb_client, _resolved_fb_model = resolve_provider_client(
+            fb_provider, model=fb_model, raw_codex=True,
+            explicit_base_url=fb_base_url_hint,
+            explicit_api_key=fb_api_key_hint,
+            api_mode=resolver_api_mode,
+            timeout=_fb_timeout,
+        )
+        if fb_client is None:
+            logger.warning(
+                "Fallback to %s failed: provider not configured",
+                fb_provider)
+            unavailable.add(fb_key)
+            return agent._try_activate_fallback(reason)  # try next in chain
+        from agent.auxiliary_client import AnthropicAuxiliaryClient
+
+        fb_client_is_anthropic = isinstance(fb_client, AnthropicAuxiliaryClient)
+        if not fb_api_mode_explicit and fb_client_is_anthropic:
+            # The named provider may declare anthropic_messages on a generic
+            # URL whose host/path has no wire hint.  The resolved client is the
+            # authoritative transport signal in that case.
+            fb_api_mode = "anthropic_messages"
         # Re-determine api_mode from provider / resolved base URL / model when
         # the pre-computed pass above landed on the default and the user did
         # not pin api_mode explicitly. An explicit fb.api_mode (even
@@ -2684,9 +2708,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_api_mode = "codex_responses"
             elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
                 # Portal is dual-wire: anthropic/* must land on /v1/messages.
-                # resolve_provider_client still returns an OpenAI client for
-                # Nous; the anthropic_messages branch below rebuilds the native
-                # client from that credential + base_url.
+                # The resolver projects those catalog ids into the same
+                # Anthropic wrapper contract consumed below.
                 from hermes_cli.providers import nous_api_mode
 
                 fb_api_mode = nous_api_mode(fb_model)
@@ -2719,6 +2742,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 and base_url_host_matches(fb_base_url, "amazonaws.com")
             ):
                 fb_api_mode = "bedrock_converse"
+
+        fb_anthropic_request_client = None
+        fb_anthropic_is_oauth = False
+        if fb_api_mode == "anthropic_messages":
+            if not fb_client_is_anthropic:
+                logger.warning(
+                    "Fallback to %s/%s failed: resolver did not produce an "
+                    "Anthropic Messages client",
+                    fb_provider,
+                    fb_model,
+                )
+                unavailable.add(fb_key)
+                return agent._try_activate_fallback(reason)
+            fb_anthropic_request_client = fb_client.request_client
+            fb_anthropic_is_oauth = fb_client.is_oauth
 
         old_model = agent.model
         old_provider = agent.provider
@@ -2779,22 +2817,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                     fb_provider, fb_model, exc,
                 )
 
-        # Honor per-provider / per-model request_timeout_seconds for the
-        # fallback target (same knob the primary client uses).  None = use
-        # SDK default.
-        _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
-
         if fb_api_mode == "anthropic_messages":
-            # Build native Anthropic client instead of using OpenAI client
-            from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
-            effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
+            # The resolver already built the complete native request client,
+            # including named-provider extra_headers and the timeout above.
+            # Install that same object instead of projecting ambient fields
+            # into a second, incomplete construction.
+            effective_key = fb_client.api_key or ""
             agent.api_key = effective_key
             agent._anthropic_api_key = effective_key
             agent._anthropic_base_url = fb_base_url
-            agent._anthropic_client = build_anthropic_client(
-                effective_key, agent._anthropic_base_url, timeout=_fb_timeout,
+            agent._anthropic_client = fb_anthropic_request_client
+            agent._is_anthropic_oauth = (
+                fb_anthropic_is_oauth if fb_provider == "anthropic" else False
             )
-            agent._is_anthropic_oauth = _is_oauth_token(effective_key) if fb_provider == "anthropic" else False
             agent.client = None
             agent._client_kwargs = {}
         else:
