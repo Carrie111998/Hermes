@@ -79,3 +79,16 @@ class TestBackgroundGuidanceRecipes:
 
     def test_quoted_ampersand_not_flagged(self):
         assert _foreground_background_guidance('git commit -m "a & b"') is None
+
+    def test_attached_docker_compose_up_is_blocked(self):
+        msg = _foreground_background_guidance("docker compose up nextcloud-app")
+        assert msg is not None
+        assert "long-lived server/watch process" in msg
+
+    @pytest.mark.parametrize("detach_flag", ["-d", "--detach"])
+    def test_detached_docker_compose_up_is_allowed(self, detach_flag):
+        command = (
+            f"docker compose up {detach_flag} --no-deps "
+            "--force-recreate nextcloud-app"
+        )
+        assert _foreground_background_guidance(command) is None
