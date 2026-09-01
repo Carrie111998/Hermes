@@ -4014,13 +4014,15 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     # indefinitely (e.g. a long-running job just finished).
                     new_next = compute_next_run(schedule, now.isoformat())
                     if new_next:
+                        lateness = (now - next_run_dt).total_seconds()
                         logger.info(
-                            "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                            "Running now; next run provisionally set to: %s "
-                            "(re-anchored on completion)",
+                            "Job '%s' missed its scheduled time (%s, grace=%ds, "
+                            "late by %.0fs). Running now as catch-up; next run "
+                            "provisionally set to: %s (re-anchored on completion)",
                             job.get("name", job.get("id", "?")),
                             next_run,
                             grace,
+                            lateness,
                             new_next,
                         )
                         # Persist the fast-forward to storage now (skip accumulated
@@ -4037,6 +4039,16 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                                 needs_save = True
                                 break
                         record_catch_up_occurrence()
+                        # Tag the in-memory job so the execution record surfaces
+                        # the catch-up provenance in the Routines UI/CLI — scheduled
+                        # vs actual dispatch time, lateness, and kind — instead of
+                        # silently appearing as an ordinary on-time run (#99879).
+                        job["_dispatch_meta"] = {
+                            "scheduled_at": next_run,
+                            "dispatched_at": now.isoformat(),
+                            "lateness_seconds": round(lateness, 1),
+                            "dispatch_kind": "catch_up",
+                        }
                         # Fall through to due.append(job) — execute once now
 
                 # One-shot grace gate: a one-shot whose persisted run time is
