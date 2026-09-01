@@ -4649,3 +4649,30 @@ def test_marker_stripping_does_not_invent_an_answer() -> None:
     assert not _has_exact_registered_response("* NOT REGISTERED\r\n", prompt)
     assert _exact_registered_suffix("* REGISTEREDX\r\n") is None
     assert _exact_registered_suffix("*REGISTERED\r\n") is None
+
+
+def test_materialize_claim_accepts_pre_rotation_signed_marker_via_retired_keys() -> (
+    None
+):
+    retired_secret = b"registrar-retired-marker-secret"
+    value = candidate()
+    old_identity = derive_claude_visibility_identity(value, retired_secret)
+    item = claim(signed_marker=old_identity.signed_marker)
+
+    pinned = registrar(FakeSource(), FakeFactory())
+    with pytest.raises(ValueError):
+        pinned._materialize_claim(item)
+
+    keyring = registrar(
+        FakeSource(),
+        FakeFactory(),
+        retired_marker_secrets=(retired_secret,),
+    )
+    materialized_candidate, materialized_identity = keyring._materialize_claim(item)
+    assert materialized_candidate.source_session_id == value.source_session_id
+    assert materialized_identity.signed_marker == old_identity.signed_marker
+    assert materialized_identity.job_id == old_identity.job_id
+
+    result = pinned.process(item)
+    assert result.status == "failed"
+    assert result.error_code == "bridge_conflict"

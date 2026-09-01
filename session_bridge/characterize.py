@@ -1492,7 +1492,12 @@ def _write_characterization_record(
             pass
 
 
-def _read_characterization_record(path: Path, secret: bytes) -> dict[str, Any]:
+def _read_characterization_record(
+    path: Path,
+    secret: bytes,
+    *,
+    retired_secrets: tuple[bytes, ...] = (),
+) -> dict[str, Any]:
     try:
         if _path_is_redirect(path):
             raise RuntimeError("characterization_cleanup_token_invalid")
@@ -1524,10 +1529,13 @@ def _read_characterization_record(path: Path, secret: bytes) -> dict[str, Any]:
         raise RuntimeError("characterization_cleanup_token_invalid")
     payload = envelope["payload"]
     signature = envelope["signature"]
-    if (
-        not isinstance(payload, dict)
-        or not isinstance(signature, str)
-        or not hmac.compare_digest(signature, _record_signature(payload, secret))
+    if not isinstance(payload, dict) or not isinstance(signature, str):
+        raise RuntimeError("characterization_cleanup_token_invalid")
+    # Durable records written before a key rotation authenticate through the
+    # retired epochs; writes always sign with the current key.
+    if not any(
+        hmac.compare_digest(signature, _record_signature(payload, epoch_secret))
+        for epoch_secret in (secret, *retired_secrets)
     ):
         raise RuntimeError("characterization_cleanup_token_invalid")
     return payload
@@ -2477,6 +2485,7 @@ def load_codex_characterization_origins(
     *,
     report_root: Path | None = None,
     marker_secret: bytes | None = None,
+    retired_marker_secrets: tuple[bytes, ...] = (),
 ) -> dict[str, str]:
     """Return exact Codex native IDs created by trusted characterization reports.
 
@@ -2530,7 +2539,11 @@ def load_codex_characterization_origins(
             )
         origins[native_id] = bridge_id
 
-    for guard in _read_codex_origin_guards(root, marker_secret=marker_secret):
+    for guard in _read_codex_origin_guards(
+        root,
+        marker_secret=marker_secret,
+        retired_marker_secrets=retired_marker_secrets,
+    ):
         characterization_id = guard["characterization_id"]
         native_id = guard["native_id"]
         report = reports_by_id.get(characterization_id)
@@ -2571,6 +2584,7 @@ def _read_codex_origin_guards(
     report_root: Path,
     *,
     marker_secret: bytes | None,
+    retired_marker_secrets: tuple[bytes, ...] = (),
 ) -> list[dict[str, Any]]:
     guard_root = report_root / _CODEX_ORIGIN_GUARD_DIRECTORY
     if _path_is_redirect(guard_root):
@@ -2603,7 +2617,9 @@ def _read_codex_origin_guards(
     guards: list[dict[str, Any]] = []
     for path in paths:
         try:
-            payload = _read_characterization_record(path, marker_secret)
+            payload = _read_characterization_record(
+                path, marker_secret, retired_secrets=retired_marker_secrets
+            )
             guards.append(_validate_codex_origin_guard(payload, path=path))
         except CharacterizationGateError:
             raise

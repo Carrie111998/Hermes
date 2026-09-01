@@ -519,3 +519,52 @@ def test_error_codes_are_fixed_and_malformed_values_fail_closed() -> None:
         "unknown_error_code",
         False,
     )
+
+
+def test_identity_binding_accepts_pre_rotation_marker_via_retired_keys() -> None:
+    retired_secret = b"claude-visibility-retired-secret"
+    source = _projection(
+        Provider.CODEX,
+        native_id="rotation-source",
+        content="Implement the original substantive request",
+    )
+    candidate = build_claude_visibility_candidate(source, eligible_at=30.0)
+    old_identity = derive_claude_visibility_identity(candidate, retired_secret)
+    assert (
+        old_identity.signed_marker
+        != derive_claude_visibility_identity(candidate, SECRET).signed_marker
+    )
+
+    with pytest.raises(ValueError, match="signed marker is malformed"):
+        validate_claude_visibility_identity_binding(candidate, old_identity, SECRET)
+
+    validate_claude_visibility_identity_binding(
+        candidate,
+        old_identity,
+        SECRET,
+        retired_marker_secrets=(retired_secret,),
+    )
+    prompt = build_claude_registration_prompt(
+        candidate,
+        old_identity,
+        SECRET,
+        retired_marker_secrets=(retired_secret,),
+    )
+    assert old_identity.signed_marker.removeprefix(
+        "HERMES_SESSION_BRIDGE_V1:"
+    ) in prompt
+
+    with pytest.raises(ValueError, match="signed marker is malformed"):
+        validate_claude_visibility_identity_binding(
+            candidate,
+            old_identity,
+            SECRET,
+            retired_marker_secrets=(b"claude-visibility-wrong-secret",),
+        )
+    with pytest.raises(ValueError, match="retired marker secrets are malformed"):
+        validate_claude_visibility_identity_binding(
+            candidate,
+            old_identity,
+            SECRET,
+            retired_marker_secrets=(b"",),
+        )

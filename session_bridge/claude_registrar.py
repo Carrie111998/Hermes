@@ -1250,6 +1250,7 @@ class ClaudeNativeRegistrar:
         source_adapter: ClaudeReadableSource,
         *,
         marker_secret: bytes,
+        retired_marker_secrets: tuple[bytes, ...] = (),
         startup_theme: str,
         pty_factory: InteractivePtyFactory | None = None,
         claude_command: Sequence[str] = ("claude",),
@@ -1262,9 +1263,15 @@ class ClaudeNativeRegistrar:
         retry_delay: float = 30.0,
         poll_interval: float = 0.1,
     ) -> None:
+        if type(retired_marker_secrets) is not tuple or any(
+            type(value) is not bytes or not value
+            for value in retired_marker_secrets
+        ):
+            raise ValueError("registrar retired marker secrets are malformed")
         self._store = store
         self._source = source_adapter
         self._secret = marker_secret
+        self._retired_secrets = retired_marker_secrets
         self._startup_settings = _canonical_claude_startup_settings(startup_theme)
         self._factory = pty_factory or WindowsConPtyFactory()
         self._command = list(claude_command)
@@ -1577,7 +1584,14 @@ class ClaudeNativeRegistrar:
             claude_uuid=claim.reserved_claude_uuid,
             signed_marker=claim.signed_marker,
         )
-        validate_claude_visibility_identity_binding(candidate, identity, self._secret)
+        # The claim's signed marker is the stored ledger value and may predate
+        # a key rotation; the binding accepts any keyring epoch.
+        validate_claude_visibility_identity_binding(
+            candidate,
+            identity,
+            self._secret,
+            retired_marker_secrets=self._retired_secrets,
+        )
         return candidate, identity
 
     @staticmethod
@@ -1681,7 +1695,12 @@ class ClaudeNativeRegistrar:
         if existing is not None:
             return self._validate_and_commit(claim, candidate, identity, existing)
 
-        prompt = build_claude_registration_prompt(candidate, identity, self._secret)
+        prompt = build_claude_registration_prompt(
+            candidate,
+            identity,
+            self._secret,
+            retired_marker_secrets=self._retired_secrets,
+        )
         argv = [
             *self._command,
             "--session-id",
@@ -1981,7 +2000,13 @@ class ClaudeNativeRegistrar:
         transcript: _ExactTranscript,
     ) -> ClaudeRegistrarOutcome:
         try:
-            _validate_projection(transcript, candidate, identity, self._secret)
+            _validate_projection(
+                transcript,
+                candidate,
+                identity,
+                self._secret,
+                retired_marker_secrets=self._retired_secrets,
+            )
         except _TranscriptConflict as exc:
             return self._fail(claim, exc.code, "exact transcript conflict")
         projection = transcript.projection
@@ -2047,6 +2072,8 @@ def _validate_projection(
     candidate: ClaudeVisibilityCandidate,
     identity: ClaudeVisibilityIdentity,
     marker_secret: bytes,
+    *,
+    retired_marker_secrets: tuple[bytes, ...] = (),
 ) -> None:
     projection = transcript.projection
     if transcript.parsed.malformed_lines or transcript.parsed.unknown_records:
@@ -2071,7 +2098,12 @@ def _validate_projection(
         or projection.origin_kind is not OriginKind.BRIDGE_PLACEHOLDER
     ):
         raise _TranscriptConflict("bridge_conflict")
-    expected = build_claude_registration_prompt(candidate, identity, marker_secret)
+    expected = build_claude_registration_prompt(
+        candidate,
+        identity,
+        marker_secret,
+        retired_marker_secrets=retired_marker_secrets,
+    )
     messages = list(projection.messages)
     recovery_kind = _classify_exact_auth_recovery_messages(
         messages,

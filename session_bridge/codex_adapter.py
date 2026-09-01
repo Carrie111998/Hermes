@@ -534,13 +534,20 @@ class CodexSourceAdapter:
         client: _RequestClient,
         *,
         marker_secret: bytes,
+        retired_marker_secrets: tuple[bytes, ...] = (),
         monotonic=time.monotonic,
         trusted_origins: Mapping[str, str]
         | Callable[[], Mapping[str, str]]
         | None = None,
     ) -> None:
+        if type(retired_marker_secrets) is not tuple or any(
+            type(value) is not bytes or not value
+            for value in retired_marker_secrets
+        ):
+            raise ValueError("Codex source retired marker secrets are malformed")
         self._client = client
         self._marker_secret = marker_secret
+        self._retired_marker_secrets = retired_marker_secrets
         self._monotonic = monotonic
         self._initialized = False
         self._initialization_failed = False
@@ -1226,7 +1233,9 @@ class CodexSourceAdapter:
                 )
             )
         origin_kind, origin_bridge_id = _detect_origin(
-            messages, marker_secret=self._marker_secret
+            messages,
+            marker_secret=self._marker_secret,
+            retired_marker_secrets=self._retired_marker_secrets,
         )
         origin_kind, origin_bridge_id = self._reconcile_trusted_origin(
             summary,
@@ -1339,7 +1348,9 @@ class CodexSourceAdapter:
                     )
 
         origin_kind, origin_bridge_id = _detect_origin(
-            projected, marker_secret=self._marker_secret
+            projected,
+            marker_secret=self._marker_secret,
+            retired_marker_secrets=self._retired_marker_secrets,
         )
         origin_kind, origin_bridge_id = self._reconcile_trusted_origin(
             summary,
@@ -1387,8 +1398,15 @@ class CodexSourceAdapter:
         projection: SessionProjection,
         payload: BridgeMarkerPayload,
     ) -> bool:
-        marker = encode_bridge_marker(payload, self._marker_secret)
-        return _projection_has_exact_marker(projection, marker=marker)
+        # The embedded marker's signature half is keyed to the epoch that
+        # minted it, so a pre-rotation thread only matches the payload when
+        # the expected marker is re-encoded under that retired epoch.
+        return any(
+            _projection_has_exact_marker(
+                projection, marker=encode_bridge_marker(payload, secret)
+            )
+            for secret in (self._marker_secret, *self._retired_marker_secrets)
+        )
 
     def _inventory_index(
         self,
@@ -3043,7 +3061,10 @@ def _valid_reasoning_item(item: dict[str, Any]) -> bool:
 
 
 def _detect_origin(
-    messages: list[ProjectedMessage], *, marker_secret: bytes
+    messages: list[ProjectedMessage],
+    *,
+    marker_secret: bytes,
+    retired_marker_secrets: tuple[bytes, ...] = (),
 ) -> tuple[OriginKind, str | None]:
     marker_message_indexes: set[int] = set()
     marker_occurrences: list[tuple[int, BridgeMarkerPayload]] = []
@@ -3051,9 +3072,17 @@ def _detect_origin(
         if message.role != "user" or not message.content:
             continue
         for match in _MARKER_CANDIDATE_RE.finditer(message.content):
-            try:
-                payload = decode_bridge_marker(match.group(0), marker_secret)
-            except InvalidBridgeMarker:
+            # Markers minted before a key rotation authenticate through the
+            # retired epochs; an unauthenticated candidate is still ignored,
+            # so a pre-rotation bridge thread never reclassifies as NATIVE.
+            payload = None
+            for secret in (marker_secret, *retired_marker_secrets):
+                try:
+                    payload = decode_bridge_marker(match.group(0), secret)
+                except InvalidBridgeMarker:
+                    continue
+                break
+            if payload is None:
                 continue
             if payload.target_provider is Provider.CODEX:
                 marker_message_indexes.add(index)

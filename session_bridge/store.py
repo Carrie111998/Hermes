@@ -1096,6 +1096,7 @@ class SessionBridgeStore:
         identity: Any,
         marker_secret: bytes,
         *,
+        retired_marker_secrets: object = (),
         operation_id: str,
         evidence_digest: str,
     ) -> dict[str, Any]:
@@ -1116,7 +1117,13 @@ class SessionBridgeStore:
             raise TypeError("candidate must be a ClaudeVisibilityCandidate")
         if not isinstance(identity, ClaudeVisibilityIdentity):
             raise TypeError("identity must be a ClaudeVisibilityIdentity")
-        validate_claude_visibility_identity_binding(candidate, identity, marker_secret)
+        retired_secrets = _validated_retired_marker_secrets(retired_marker_secrets)
+        validate_claude_visibility_identity_binding(
+            candidate,
+            identity,
+            marker_secret,
+            retired_marker_secrets=retired_secrets,
+        )
         normalized_operation = _exact_nonempty_text(
             operation_id, "Claude characterization operation ID"
         )
@@ -1144,7 +1151,12 @@ class SessionBridgeStore:
         def _write(conn: Any) -> dict[str, Any]:
             recorded_at = _finite_number(self._clock(), "clock")
             row, created = self._insert_claude_visibility_job(
-                conn, candidate, identity, marker_secret, recorded_at
+                conn,
+                candidate,
+                identity,
+                marker_secret,
+                recorded_at,
+                retired_marker_secrets=retired_secrets,
             )
             existing = conn.execute(
                 """SELECT *
@@ -1245,10 +1257,17 @@ class SessionBridgeStore:
         identity: Any,
         marker_secret: bytes,
         now: float,
+        *,
+        retired_marker_secrets: tuple[bytes, ...] = (),
     ) -> tuple[dict[str, Any], bool]:
         from .claude_visibility import validate_claude_visibility_identity_binding
 
-        validate_claude_visibility_identity_binding(candidate, identity, marker_secret)
+        validate_claude_visibility_identity_binding(
+            candidate,
+            identity,
+            marker_secret,
+            retired_marker_secrets=retired_marker_secrets,
+        )
         collisions = conn.execute(
             """SELECT * FROM session_claude_visibility_jobs
                    WHERE source_session_id = ? OR bridge_id = ?
@@ -3405,6 +3424,7 @@ class SessionBridgeStore:
         *,
         limit: int,
         marker_secret: bytes,
+        retired_marker_secrets: object = (),
         apply: bool = False,
         cursor: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -3424,9 +3444,11 @@ class SessionBridgeStore:
                 f"{_CLAUDE_LINEAGE_RECONCILE_LIMIT_MAX}"
             )
         cursor_secret = _validated_claude_lineage_cursor_secret(marker_secret)
+        retired_secrets = _validated_retired_marker_secrets(retired_marker_secrets)
         normalized_cursor = _validated_claude_lineage_cursor(
             cursor,
             marker_secret=cursor_secret,
+            retired_marker_secrets=retired_secrets,
             apply=apply,
         )
 
@@ -8367,6 +8389,7 @@ class SessionBridgeStore:
         signed_marker: str,
         evidence_digest: str,
         marker_secret: bytes,
+        retired_marker_secrets: object = (),
         cleanup_completed: bool,
         launch_aborted: bool = False,
     ) -> dict[str, Any]:
@@ -8420,6 +8443,7 @@ class SessionBridgeStore:
             )
         if not isinstance(marker_secret, bytes) or not marker_secret:
             raise ValueError("Claude characterization marker secret must be nonempty")
+        retired_secrets = _validated_retired_marker_secrets(retired_marker_secrets)
         if type(cleanup_completed) is not bool:
             raise ValueError("Claude characterization cleanup flag must be boolean")
         if type(launch_aborted) is not bool:
@@ -8477,13 +8501,27 @@ class SessionBridgeStore:
                 or derived.bridge_id != normalized_bridge
                 or derived.idempotency_key != normalized_idempotency
                 or derived.claude_uuid != normalized_uuid
-                or not hmac.compare_digest(derived.signed_marker, normalized_marker)
             ):
                 raise ValueError("Claude characterization identity mismatch")
-            try:
-                marker = decode_bridge_marker(normalized_marker, marker_secret)
-            except (TypeError, ValueError):
-                raise ValueError("Claude characterization identity mismatch") from None
+            # The stored signed marker may predate a key rotation: match it
+            # against the expected marker re-derived under each keyring epoch,
+            # and decode it under that same epoch — never mix-and-match.
+            marker = None
+            for epoch_secret in (marker_secret, *retired_secrets):
+                expected_marker = derive_claude_visibility_identity(
+                    candidate, epoch_secret
+                ).signed_marker
+                if not hmac.compare_digest(expected_marker, normalized_marker):
+                    continue
+                try:
+                    marker = decode_bridge_marker(normalized_marker, epoch_secret)
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        "Claude characterization identity mismatch"
+                    ) from None
+                break
+            if marker is None:
+                raise ValueError("Claude characterization identity mismatch")
             if (
                 marker.source_session_id != normalized_source
                 or marker.bridge_id != normalized_bridge
@@ -12921,6 +12959,7 @@ def _validated_claude_lineage_cursor(
     cursor: Mapping[str, Any] | None,
     *,
     marker_secret: bytes,
+    retired_marker_secrets: tuple[bytes, ...] = (),
     apply: bool,
 ) -> tuple[tuple[float, str], tuple[float, str]] | None:
     if cursor is None:
@@ -12963,14 +13002,18 @@ def _validated_claude_lineage_cursor(
             "Claude lineage reconciliation cursor exceeds its high-water mark"
         )
     signature = cursor["signature"]
-    expected_signature = _claude_lineage_cursor_signature(
-        {field: cursor[field] for field in _CLAUDE_LINEAGE_CURSOR_UNSIGNED_FIELDS},
-        marker_secret,
-    )
-    if (
-        not isinstance(signature, str)
-        or re.fullmatch(r"[0-9a-f]{64}", signature) is None
-        or not hmac.compare_digest(signature, expected_signature)
+    if not isinstance(signature, str) or re.fullmatch(r"[0-9a-f]{64}", signature) is None:
+        raise ValueError("Claude lineage reconciliation cursor signature is invalid")
+    # A cursor minted just before a key rotation stays honored through the
+    # retired epochs; new cursors are always signed with the current key.
+    unsigned = {
+        field: cursor[field] for field in _CLAUDE_LINEAGE_CURSOR_UNSIGNED_FIELDS
+    }
+    if not any(
+        hmac.compare_digest(
+            signature, _claude_lineage_cursor_signature(unsigned, secret)
+        )
+        for secret in (marker_secret, *retired_marker_secrets)
     ):
         raise ValueError("Claude lineage reconciliation cursor signature is invalid")
     return after_key, high_water_key

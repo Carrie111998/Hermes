@@ -1776,3 +1776,36 @@ def test_parse_keeps_block_order_within_one_timestamped_record(tmp_path):
         "gamma",
     ]
     assert [message.ordinal for message in messages[1:]] == [0, 1, 2]
+
+
+def test_pre_rotation_claude_marker_authenticates_via_retired_keys(tmp_path):
+    retired_secret = b"claude-adapter-retired-secret"
+    payload = BridgeMarkerPayload(
+        bridge_id="bridge-rotated",
+        source_session_id="codex:synthetic-source",
+        target_provider=Provider.CLAUDE,
+        policy_generation=4,
+    )
+    old_marker = encode_bridge_marker(payload, retired_secret)
+    assert old_marker != encode_bridge_marker(payload, SECRET)
+    path = tmp_path / "pre-rotation-marker.jsonl"
+    path.write_bytes(_json_line(_message_record(old_marker)))
+
+    reclassified = (
+        ClaudeSourceAdapter(tmp_path, marker_secret=SECRET).parse(path).projection
+    )
+    assert reclassified.origin_kind is OriginKind.NATIVE
+    assert reclassified.origin_bridge_id is None
+
+    keyring_adapter = ClaudeSourceAdapter(
+        tmp_path,
+        marker_secret=SECRET,
+        retired_marker_secrets=(retired_secret,),
+    )
+    recovered = keyring_adapter.parse(path).projection
+    assert recovered.origin_kind is OriginKind.BRIDGE_PLACEHOLDER
+    assert recovered.origin_bridge_id == "bridge-rotated"
+    assert keyring_adapter.projection_has_marker_payload(recovered, payload)
+    assert not ClaudeSourceAdapter(
+        tmp_path, marker_secret=SECRET
+    ).projection_has_marker_payload(recovered, payload)

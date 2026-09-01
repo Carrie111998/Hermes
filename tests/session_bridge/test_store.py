@@ -16565,3 +16565,75 @@ def test_replace_desktop_registry_conflicts_preserves_first_seen(db) -> None:
     assert rows[0]["filename"] == "a.json"
     assert rows[0]["first_seen_at"] == 100.0
     assert rows[0]["last_seen_at"] == 200.0
+
+
+def test_characterization_record_accepts_pre_rotation_marker_via_retired_keys(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    retired_secret = b"store-claude-visibility-retired"
+    operation_id = "31313131-3131-4131-8131-313131313131"
+    candidate, _current_identity = _claude_characterization_identity(operation_id)
+    old_identity = derive_claude_visibility_identity(candidate, retired_secret)
+    # The job was enqueued before the rotation, under the then-current key.
+    store.enqueue_claude_visibility_job(candidate, old_identity, retired_secret)
+
+    record_kwargs = dict(
+        job_id=old_identity.job_id,
+        operation_id=operation_id,
+        source_session_id=candidate.source_session_id,
+        bridge_id=old_identity.bridge_id,
+        idempotency_key=old_identity.idempotency_key,
+        reserved_claude_uuid=old_identity.claude_uuid,
+        native_name=candidate.native_name,
+        source_cwd=candidate.source_cwd,
+        signed_marker=old_identity.signed_marker,
+        evidence_digest="a" * 64,
+        cleanup_completed=False,
+    )
+    with pytest.raises(ValueError, match="identity mismatch"):
+        store.record_claude_visibility_characterization(
+            marker_secret=_CLAUDE_MARKER_SECRET,
+            **record_kwargs,
+        )
+
+    recorded = store.record_claude_visibility_characterization(
+        marker_secret=_CLAUDE_MARKER_SECRET,
+        retired_marker_secrets=(retired_secret,),
+        **record_kwargs,
+    )
+    assert recorded["status"] == "registered"
+
+
+def test_claude_lineage_cursor_minted_pre_rotation_validates_via_retired_keys(
+    db,
+) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 200.0, local_timezone=timezone.utc)
+    retired_secret = b"store-lineage-retired-secret"
+    for index in range(2):
+        _seed_unlinked_claude_visibility_lineage(
+            db, store, suffix=f"rotation-cursor-{index}", visible_at=100.0 + index
+        )
+
+    pre_rotation = store.reconcile_claude_visibility_lineage(
+        limit=1, marker_secret=retired_secret, apply=False
+    )
+    cursor = pre_rotation["next_cursor"]
+    assert cursor is not None
+
+    with pytest.raises(ValueError, match="cursor signature is invalid"):
+        store.reconcile_claude_visibility_lineage(
+            limit=1,
+            marker_secret=_CLAUDE_MARKER_SECRET,
+            apply=False,
+            cursor=cursor,
+        )
+
+    resumed = store.reconcile_claude_visibility_lineage(
+        limit=1,
+        marker_secret=_CLAUDE_MARKER_SECRET,
+        retired_marker_secrets=(retired_secret,),
+        apply=False,
+        cursor=cursor,
+    )
+    assert resumed["scanned"] == 1
