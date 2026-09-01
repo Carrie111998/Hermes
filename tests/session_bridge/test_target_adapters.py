@@ -1527,6 +1527,83 @@ def test_sidebar_reconcile_marker_paginates_active_and_archived_before_recovery(
     assert search_params[3]["cursor"] == "archive-next"
 
 
+def test_sidebar_reconcile_marker_recovers_pre_rotation_task_via_retired_keys() -> (
+    None
+):
+    expected = _sidebar_expected()
+    retired_secret = b"target-adapter-retired-secret"
+    current_marker = encode_bridge_marker(expected, SECRET)
+    old_marker = encode_bridge_marker(expected, retired_secret)
+    assert old_marker != current_marker
+    assert (
+        old_marker.rsplit(".", 1)[0] == current_marker.rsplit(".", 1)[0]
+    ), "the unsigned search prefix must stay key-independent"
+    old_read = _codex_read(
+        turns=[
+            {
+                "id": "turn-registration",
+                "status": "completed",
+                "items": [
+                    {
+                        "type": "userMessage",
+                        "id": "item-turn-registration",
+                        "content": [{"type": "text", "text": old_marker}],
+                    }
+                ],
+            }
+        ],
+    )
+
+    def search_responses() -> dict[str, list[dict[str, Any]]]:
+        return {
+            "thread/search": [
+                {
+                    "data": [
+                        {
+                            "thread": _codex_inventory()["data"][0],
+                            "snippet": old_marker,
+                        }
+                    ]
+                },
+                {"data": []},
+            ],
+            "thread/read": [deepcopy(old_read)],
+        }
+
+    blocked_client = ExperimentalSearchClient(search_responses())
+    without_retired = SidebarThreadVerifier(
+        CodexSourceAdapter(
+            blocked_client, marker_secret=SECRET, monotonic=lambda: 0.0
+        ),
+        marker_secret=SECRET,
+        reconciliation_interval=30.0,
+        monotonic=lambda: 0.0,
+    )
+    blocked = without_retired.reconcile_marker(expected, now=100.0, ttl_seconds=30.0)
+    assert blocked.state is SidebarReconciliationState.BLOCKED
+    assert blocked.fixed_reason == "marker_conflict"
+
+    recovered_client = ExperimentalSearchClient(search_responses())
+    with_retired = SidebarThreadVerifier(
+        CodexSourceAdapter(
+            recovered_client, marker_secret=SECRET, monotonic=lambda: 0.0
+        ),
+        marker_secret=SECRET,
+        retired_marker_secrets=(retired_secret,),
+        reconciliation_interval=30.0,
+        monotonic=lambda: 0.0,
+    )
+    evidence = with_retired.reconcile_marker(expected, now=100.0, ttl_seconds=30.0)
+
+    assert evidence.state is SidebarReconciliationState.RECOVERED
+    assert evidence.match_count == 1
+    assert evidence.recovered_thread_id == CODEX_ID
+    assert (
+        evidence.marker_digest
+        == hashlib.sha256(current_marker.encode()).hexdigest()
+    ), "proof digests must stay keyed to the live secret"
+
+
 def test_sidebar_reconcile_marker_blocks_multiple_authenticated_matches() -> None:
     expected = _sidebar_expected()
     marker = encode_bridge_marker(expected, SECRET)

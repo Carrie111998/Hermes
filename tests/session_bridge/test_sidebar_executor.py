@@ -1878,6 +1878,7 @@ def _executor(
     placement_resolver: Callable[[SidebarCandidate], SidebarPlacement] = (
         lambda _candidate: _placement()
     ),
+    retired_marker_secrets: tuple[bytes, ...] = (),
 ) -> SidebarExecutor:
     return SidebarExecutor(
         store=cast(SessionBridgeStore, store),
@@ -1885,6 +1886,7 @@ def _executor(
         native=native,
         placement_resolver=placement_resolver,
         marker_secret=SECRET,
+        retired_marker_secrets=retired_marker_secrets,
         clock=clock,
         monotonic=clock,
         sleep=clock.sleep,
@@ -2456,6 +2458,98 @@ def test_existing_create_reservation_recovers_exact_tagged_thread_without_create
         "read",
         "bind",
     ]
+
+
+def _pre_rotation_recovery_key(source: str, old_secret: bytes) -> str:
+    expected = BridgeMarkerPayload(
+        bridge_id=sidebar_bridge_id(source),
+        source_session_id=source,
+        target_provider=Provider.CODEX,
+        policy_generation=1,
+    )
+    marker = encode_bridge_marker(expected, old_secret)
+    digest = hmac.new(
+        old_secret,
+        b"sidebar-create-v1\0" + marker.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"hermes-session-bridge-create-v1:{digest}"
+
+
+def _pre_rotation_reservation_store(
+    events: list[tuple[Any, ...]],
+    old_secret: bytes,
+) -> "FakeStore":
+    return FakeStore(
+        events,
+        [_job(SOURCE_1)],
+        reservations={
+            SOURCE_1: {
+                "version": 1,
+                "job_id": f"sidebar-job:{SOURCE_1}",
+                "source_session_id": SOURCE_1,
+                "bridge_id": sidebar_bridge_id(SOURCE_1),
+                "recovery_key": _pre_rotation_recovery_key(SOURCE_1, old_secret),
+                "reserved_at": 50.0,
+            }
+        },
+    )
+
+
+def test_pre_rotation_reservation_fails_without_retired_marker_keys() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    old_secret = b"sidebar-executor-retired-secret"
+    store = _pre_rotation_reservation_store(events, old_secret)
+    native = FakeNative(events)
+    verifier = FakeVerifier(events, recovery_result=THREAD_1)
+
+    result = _executor(store, verifier, native, clock).run_once()
+
+    assert result == SidebarExecutionResult(
+        status="failed",
+        job_id=f"sidebar-job:{SOURCE_1}",
+        error_code="native_create_ambiguous",
+    )
+    assert native.create_calls == 0
+    assert [event[0] for event in events] == ["claim", "candidate", "find", "fail"]
+
+
+def test_pre_rotation_reservation_recovers_thread_via_retired_marker_keys() -> None:
+    events: list[tuple[Any, ...]] = []
+    clock = FakeClock()
+    old_secret = b"sidebar-executor-retired-secret"
+    store = _pre_rotation_reservation_store(events, old_secret)
+    stored_key = store.reservations[SOURCE_1]["recovery_key"]
+    old_marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=sidebar_bridge_id(SOURCE_1),
+            source_session_id=SOURCE_1,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        old_secret,
+    )
+    native = FakeNative(
+        events,
+        initial_prompt=build_registration_prompt(_candidate(SOURCE_1), old_marker),
+    )
+    verifier = FakeVerifier(events, recovery_result=THREAD_1)
+
+    result = _executor(
+        store,
+        verifier,
+        native,
+        clock,
+        retired_marker_secrets=(old_secret,),
+    ).run_once()
+
+    assert result.status == "visible"
+    assert result.thread_id == THREAD_1
+    assert native.create_calls == 0
+    recover_events = [event for event in events if event[0] == "recover"]
+    assert [event[1] for event in recover_events] == [stored_key]
+    assert store.reservations[SOURCE_1]["recovery_key"] == stored_key
 
 
 def test_ambiguous_registration_keeps_bound_exact_id_and_retries() -> None:

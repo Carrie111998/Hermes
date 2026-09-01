@@ -39,3 +39,14 @@ def default_marker_key_file() -> Path:
     """The one origin-marker HMAC key file; a fork here splits validation."""
 
     return auth_secret_root() / "marker-key"
+
+
+def default_retired_marker_key_dir() -> Path:
+    """Directory of retired origin-marker keys kept for validation only.
+
+    A rotation moves the previous ``marker-key`` bytes into this directory
+    (newest-first sortable filenames) so reservations and native markers
+    minted before the rotation keep verifying; signing never uses them.
+    """
+
+    return auth_secret_root() / "marker-key-retired"

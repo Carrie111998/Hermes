@@ -30,8 +30,11 @@ from session_bridge.sidebar import (
     is_sidebar_session_eligible,
     normalize_meaningful_user_text,
     sidebar_bridge_id,
+    sidebar_create_recovery_key,
     sidebar_idempotency_key,
+    sidebar_retired_create_recovery_keys,
     sidebar_title,
+    validate_sidebar_create_reservation,
 )
 from session_bridge.sidebar_placement import filesystem_path_identity
 
@@ -1112,3 +1115,135 @@ def test_registration_prompt_rejects_invalid_identity_fields(
 ) -> None:
     with pytest.raises(ValueError, match=f"^{message}$"):
         build_registration_prompt(candidate, marker)
+
+
+def _rotation_payload() -> BridgeMarkerPayload:
+    return BridgeMarkerPayload(
+        bridge_id=sidebar_bridge_id("claude:source-1"),
+        source_session_id="claude:source-1",
+        target_provider=Provider.CODEX,
+        policy_generation=1,
+    )
+
+
+def _reservation_minted_under(secret: bytes) -> dict[str, object]:
+    marker = encode_bridge_marker(_rotation_payload(), secret)
+    return {
+        "version": 1,
+        "job_id": "sidebar-job:" + "1" * 64,
+        "source_session_id": "claude:source-1",
+        "bridge_id": sidebar_bridge_id("claude:source-1"),
+        "recovery_key": sidebar_create_recovery_key(marker, secret),
+        "reserved_at": 100.0,
+    }
+
+
+def test_retired_recovery_keys_rederive_per_retired_epoch() -> None:
+    old_secret = b"o" * 32
+    older_secret = b"p" * 32
+    payload = _rotation_payload()
+
+    keys = sidebar_retired_create_recovery_keys(
+        payload,
+        (old_secret, older_secret),
+    )
+
+    assert keys == (
+        sidebar_create_recovery_key(
+            encode_bridge_marker(payload, old_secret), old_secret
+        ),
+        sidebar_create_recovery_key(
+            encode_bridge_marker(payload, older_secret), older_secret
+        ),
+    )
+    assert len(set(keys)) == 2
+    with pytest.raises(ValueError, match="must be a tuple"):
+        sidebar_retired_create_recovery_keys(payload, [old_secret])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="non-empty bytes"):
+        sidebar_retired_create_recovery_keys(payload, (b"",))
+
+
+def test_reservation_minted_before_rotation_validates_through_retired_keys() -> None:
+    old_secret = b"o" * 32
+    new_secret = b"n" * 32
+    payload = _rotation_payload()
+    reservation = _reservation_minted_under(old_secret)
+    current_key = sidebar_create_recovery_key(
+        encode_bridge_marker(payload, new_secret), new_secret
+    )
+
+    recovered = validate_sidebar_create_reservation(
+        reservation,
+        job_id="sidebar-job:" + "1" * 64,
+        source_session_id="claude:source-1",
+        bridge_id=sidebar_bridge_id("claude:source-1"),
+        expected_recovery_key=current_key,
+        retired_recovery_keys=sidebar_retired_create_recovery_keys(
+            payload, (old_secret,)
+        ),
+    )
+
+    assert recovered == reservation["recovery_key"]
+
+
+def test_reservation_minted_before_rotation_still_refuses_without_retired_keys() -> None:
+    old_secret = b"o" * 32
+    new_secret = b"n" * 32
+    payload = _rotation_payload()
+    reservation = _reservation_minted_under(old_secret)
+    current_key = sidebar_create_recovery_key(
+        encode_bridge_marker(payload, new_secret), new_secret
+    )
+
+    with pytest.raises(ValueError, match="reservation key mismatch"):
+        validate_sidebar_create_reservation(
+            reservation,
+            job_id="sidebar-job:" + "1" * 64,
+            source_session_id="claude:source-1",
+            bridge_id=sidebar_bridge_id("claude:source-1"),
+            expected_recovery_key=current_key,
+        )
+    with pytest.raises(ValueError, match="reservation key mismatch"):
+        validate_sidebar_create_reservation(
+            reservation,
+            job_id="sidebar-job:" + "1" * 64,
+            source_session_id="claude:source-1",
+            bridge_id=sidebar_bridge_id("claude:source-1"),
+            expected_recovery_key=current_key,
+            retired_recovery_keys=sidebar_retired_create_recovery_keys(
+                payload, (b"unrelated-retired-secret-32bytes",)
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "retired_recovery_keys",
+    [
+        ["hermes-session-bridge-create-v1:" + "a" * 64],
+        ("",),
+        (" padded ",),
+        ("line\nbreak",),
+        (b"bytes-not-str",),
+    ],
+)
+def test_retired_recovery_key_arguments_are_strictly_validated(
+    retired_recovery_keys: object,
+) -> None:
+    old_secret = b"o" * 32
+    reservation = _reservation_minted_under(old_secret)
+
+    with pytest.raises(ValueError, match="retired recovery keys are malformed"):
+        validate_sidebar_create_reservation(
+            reservation,
+            job_id="sidebar-job:" + "1" * 64,
+            source_session_id="claude:source-1",
+            bridge_id=sidebar_bridge_id("claude:source-1"),
+            expected_recovery_key=cast_recovery_key(reservation),
+            retired_recovery_keys=retired_recovery_keys,  # type: ignore[arg-type]
+        )
+
+
+def cast_recovery_key(reservation: dict[str, object]) -> str:
+    recovery_key = reservation["recovery_key"]
+    assert isinstance(recovery_key, str)
+    return recovery_key

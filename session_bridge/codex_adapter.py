@@ -173,6 +173,7 @@ class SidebarThreadVerifier:
         *,
         marker_secret: bytes,
         reconciliation_interval: float,
+        retired_marker_secrets: tuple[bytes, ...] = (),
         poll_interval: float = 0.25,
         inventory_page_cap: int = 250,
         inventory_thread_cap: int = 250,
@@ -207,8 +208,14 @@ class SidebarThreadVerifier:
                 raise ValueError(f"{label} must be a positive integer")
         if not isinstance(marker_secret, bytes) or not marker_secret:
             raise ValueError("sidebar verifier marker secret is unavailable")
+        if type(retired_marker_secrets) is not tuple or any(
+            type(value) is not bytes or not value
+            for value in retired_marker_secrets
+        ):
+            raise ValueError("sidebar verifier retired marker secrets are malformed")
         self._source_adapter = source_adapter
         self._marker_secret = marker_secret
+        self._retired_marker_secrets = retired_marker_secrets
         self._reconciliation_interval = float(reconciliation_interval)
         self._poll_interval = float(poll_interval)
         self._inventory_page_cap = inventory_page_cap
@@ -264,6 +271,7 @@ class SidebarThreadVerifier:
                     projection,
                     expected=expected,
                     marker_secret=self._marker_secret,
+                    retired_marker_secrets=self._retired_marker_secrets,
                     strict=True,
                 )
                 assert verified is not None
@@ -354,6 +362,7 @@ class SidebarThreadVerifier:
                     projection,
                     expected=expected,
                     marker_secret=self._marker_secret,
+                    retired_marker_secrets=self._retired_marker_secrets,
                     strict=False,
                 )
             except SidebarVerificationError as exc:
@@ -2398,19 +2407,31 @@ def _verified_sidebar_projection(
     expected: BridgeMarkerPayload,
     marker_secret: bytes,
     strict: bool,
+    retired_marker_secrets: tuple[bytes, ...] = (),
 ) -> VerifiedSidebarThread | None:
     decoded: list[BridgeMarkerPayload] = []
     invalid = False
     invalid_expected = False
+    # The unsigned body is key-independent; only the signature needs a key
+    # epoch, so markers minted before a rotation authenticate through the
+    # retired secrets while unauthenticated claims of this identity still
+    # block below.
     expected_unsigned = encode_bridge_marker(expected, marker_secret).rsplit(".", 1)[0]
     for message in projection.messages:
         if message.role != "user" or not message.content:
             continue
         for match in _MARKER_CANDIDATE_RE.finditer(message.content):
             marker = match.group(0)
-            try:
-                decoded.append(decode_bridge_marker(marker, marker_secret))
-            except InvalidBridgeMarker:
+            payload: BridgeMarkerPayload | None = None
+            for secret in (marker_secret, *retired_marker_secrets):
+                try:
+                    payload = decode_bridge_marker(marker, secret)
+                except InvalidBridgeMarker:
+                    continue
+                break
+            if payload is not None:
+                decoded.append(payload)
+            else:
                 invalid = True
                 invalid_expected = invalid_expected or (
                     marker.rsplit(".", 1)[0] == expected_unsigned

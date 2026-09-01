@@ -35,6 +35,7 @@ from session_bridge.mcp_server import (
     create_app,
     resolve_bearer_token,
     resolve_marker_key,
+    resolve_retired_marker_keys,
 )
 from session_bridge.models import (
     BridgeMarkerPayload,
@@ -3723,6 +3724,80 @@ def test_marker_key_rejects_oversized_file(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="too large"):
         resolve_marker_key(marker_key_file=marker_key_file)
+
+
+def test_retired_marker_keys_resolve_newest_first_and_dedupe(
+    tmp_path: Path,
+) -> None:
+    retired_dir = tmp_path / "marker-key-retired"
+    retired_dir.mkdir()
+    older = b"o" * 32
+    newer = b"n" * 32
+    current = b"c" * 32
+    for name, key in (
+        ("20260101T000000Z-marker-key", older),
+        ("20260827T145700Z-marker-key", newer),
+        ("20260828T000000Z-marker-key", current),
+        ("20260829T000000Z-marker-key", newer),
+    ):
+        path = retired_dir / name
+        path.write_bytes(key)
+        _restrict_secret_file(path)
+
+    resolved = resolve_retired_marker_keys(
+        retired_key_dir=retired_dir,
+        current_key=current,
+    )
+
+    assert resolved == (newer, older)
+
+
+def test_retired_marker_keys_missing_directory_means_no_rotation(
+    tmp_path: Path,
+) -> None:
+    assert (
+        resolve_retired_marker_keys(retired_key_dir=tmp_path / "missing") == ()
+    )
+
+
+def test_retired_marker_keys_enforce_cap_length_and_file_discipline(
+    tmp_path: Path,
+) -> None:
+    over_cap = tmp_path / "over-cap"
+    over_cap.mkdir()
+    for index in range(5):
+        path = over_cap / f"2026010{index}T000000Z-marker-key"
+        path.write_bytes(bytes([65 + index]) * 32)
+        _restrict_secret_file(path)
+    with pytest.raises(ValueError, match="rotation cap"):
+        resolve_retired_marker_keys(retired_key_dir=over_cap)
+
+    short = tmp_path / "short"
+    short.mkdir()
+    short_key = short / "20260101T000000Z-marker-key"
+    short_key.write_bytes(b"short")
+    _restrict_secret_file(short_key)
+    with pytest.raises(ValueError, match="32 bytes"):
+        resolve_retired_marker_keys(retired_key_dir=short)
+
+    not_a_directory = tmp_path / "not-a-directory"
+    not_a_directory.write_bytes(b"x" * 32)
+    with pytest.raises(PermissionError, match="must be a directory"):
+        resolve_retired_marker_keys(retired_key_dir=not_a_directory)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode assertion")
+def test_retired_marker_keys_reject_group_or_world_readable_file(
+    tmp_path: Path,
+) -> None:
+    retired_dir = tmp_path / "marker-key-retired"
+    retired_dir.mkdir()
+    loose = retired_dir / "20260101T000000Z-marker-key"
+    loose.write_bytes(b"r" * 32)
+    loose.chmod(0o644)
+
+    with pytest.raises(PermissionError, match="permissions"):
+        resolve_retired_marker_keys(retired_key_dir=retired_dir)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode assertion")

@@ -9806,6 +9806,98 @@ def _v2_attempt_zero_resolution_fixture(
     return store, candidate, failed, reservation, proof, arguments, marker_secret
 
 
+def test_v2_attempt_zero_resolution_accepts_pre_rotation_epoch_pairwise(db) -> None:
+    store, _candidate, failed, reservation, proof, arguments, old_secret = (
+        _v2_attempt_zero_resolution_fixture(
+            db,
+            native_id="v2-attempt-zero-rotation",
+        )
+    )
+    new_secret = b"v2-rotation-post-leak-new-secret"
+    rotated = {**arguments, "marker_secret": new_secret}
+
+    with pytest.raises(ValueError, match="does not match"):
+        store.acknowledge_sidebar_v2_attempt_zero_resolution(**rotated)
+    with pytest.raises(ValueError, match="does not match"):
+        store.acknowledge_sidebar_v2_attempt_zero_resolution(
+            **rotated,
+            retired_marker_secrets=(b"an-unrelated-retired-secret-32b!",),
+        )
+
+    accepted = store.acknowledge_sidebar_v2_attempt_zero_resolution(
+        **rotated,
+        retired_marker_secrets=(old_secret,),
+    )
+
+    assert accepted["created"] is True
+    [audit] = _rows(db, "SELECT * FROM session_sidebar_v2_attempt_zero_resolutions")
+    assert audit["reservation_reconciliation_proof_digest"] == proof["proof_digest"]
+    assert audit["failure_attempts"] == failed["attempts"]
+    assert audit["reservation_reserved_at"] == reservation["reserved_at"]
+
+
+def test_v2_attempt_zero_resolution_never_mixes_epochs_across_evidence(db) -> None:
+    old_secret = b"v2-mixed-epoch-old-marker-secret"
+    new_secret = b"v2-mixed-epoch-new-marker-secret"
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory("v2-mixed-epoch-token"),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="v2-mixed-epoch")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    payload = BridgeMarkerPayload(
+        bridge_id=candidate.bridge_id,
+        source_session_id=candidate.source_session_id,
+        target_provider=Provider.CODEX,
+        policy_generation=1,
+    )
+    old_marker = encode_bridge_marker(payload, old_secret)
+    new_marker = encode_bridge_marker(payload, new_secret)
+    proof = _record_absence_proof(
+        store,
+        lease["lease_token"],
+        completed_at=100.0,
+        expires_at=180.0,
+        generation="scan:v2-mixed-epoch",
+        marker_digest=hashlib.sha256(new_marker.encode("utf-8")).hexdigest(),
+    )
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key=sidebar_create_recovery_key(old_marker, old_secret),
+        reconciliation_proof_digest=proof["proof_digest"],
+        reconciliation_generation=proof["reconciliation_generation"],
+        now=105.0,
+    )
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=110.0,
+    )
+    evidence = sidebar_v2_attempt_zero_terminal_evidence_digest(
+        job=failed,
+        reservation=reservation,
+        proof=proof,
+        candidate=candidate,
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        store.acknowledge_sidebar_v2_attempt_zero_resolution(
+            job_id=failed["id"],
+            expected_error_code=failed["error_code"],
+            expected_attempts=failed["attempts"],
+            expected_next_attempt_at=failed["next_attempt_at"],
+            expected_updated_at=failed["updated_at"],
+            expected_reconciliation_proof_digest=proof["proof_digest"],
+            expected_reconciliation_generation=proof["reconciliation_generation"],
+            evidence_digest=evidence,
+            marker_secret=new_secret,
+            now=120.0,
+            retired_marker_secrets=(old_secret,),
+        )
+
+
 def test_v2_attempt_zero_resolution_binds_fresh_exact_absence_proof(db) -> None:
     store, candidate, failed, _reservation, proof, arguments, _marker_secret = (
         _v2_attempt_zero_resolution_fixture(
@@ -10412,6 +10504,96 @@ def test_unbound_create_resolution_is_append_only_after_exact_absence(db) -> Non
                 (failed["id"],),
             )
         )
+
+
+def test_unbound_create_resolution_accepts_pre_rotation_reservation_via_keyring(
+    db,
+) -> None:
+    old_secret = b"unbound-rotation-old-secret-32b!"
+    new_secret = b"unbound-rotation-new-secret-32b!"
+    store = SessionBridgeStore(
+        db,
+        sidebar_token_factory=_token_factory(
+            "unbound-rotation-token-1",
+            "unbound-rotation-token-2",
+        ),
+        sidebar_jitter=lambda _bound: 0.0,
+    )
+    candidate = _sidebar_candidate(db, native_id="unbound-rotation")
+    store.enqueue_sidebar_job(candidate)
+    lease = store.claim_sidebar_jobs(now=100.0, limit=1)[0]
+    old_marker = encode_bridge_marker(
+        BridgeMarkerPayload(
+            bridge_id=candidate.bridge_id,
+            source_session_id=candidate.source_session_id,
+            target_provider=Provider.CODEX,
+            policy_generation=1,
+        ),
+        old_secret,
+    )
+    proof = _record_absence_proof(store, lease["lease_token"])
+    reservation = store.reserve_sidebar_create(
+        lease_token=lease["lease_token"],
+        recovery_key=sidebar_create_recovery_key(old_marker, old_secret),
+        reconciliation_proof_digest=proof["proof_digest"],
+        reconciliation_generation=proof["reconciliation_generation"],
+        now=105.0,
+    )
+    retry = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="bridge_temporarily_unavailable",
+        now=110.0,
+    )
+    lease = store.claim_sidebar_jobs(now=retry["next_attempt_at"], limit=1)[0]
+    failed = store.fail_sidebar_job(
+        lease_token=lease["lease_token"],
+        error_code="native_create_ambiguous",
+        now=retry["next_attempt_at"] + 1.0,
+    )
+    evidence = sidebar_unbound_terminal_evidence_digest(
+        job=failed,
+        reservation=reservation,
+        candidate=candidate,
+    )
+    arguments = {
+        "job_id": failed["id"],
+        "expected_error_code": "native_create_ambiguous",
+        "expected_attempts": failed["attempts"],
+        "expected_next_attempt_at": failed["next_attempt_at"],
+        "expected_updated_at": failed["updated_at"],
+        "evidence_digest": evidence,
+        "marker_secret": new_secret,
+        "now": failed["updated_at"] + 1.0,
+    }
+
+    with pytest.raises(ValueError, match="does not match"):
+        store.acknowledge_sidebar_unbound_resolution(**arguments)
+    with pytest.raises(ValueError, match="does not match"):
+        store.acknowledge_sidebar_unbound_resolution(
+            **arguments,
+            retired_marker_secrets=(b"a-different-unrelated-secret-32b",),
+        )
+    with pytest.raises(ValueError, match="retired marker secrets are malformed"):
+        store.acknowledge_sidebar_unbound_resolution(
+            **arguments,
+            retired_marker_secrets=[old_secret],
+        )
+
+    accepted = store.acknowledge_sidebar_unbound_resolution(
+        **arguments,
+        retired_marker_secrets=(old_secret,),
+    )
+
+    assert accepted == {
+        "job_id": failed["id"],
+        "state": SidebarJobState.FAILED.value,
+        "error_code": "native_create_ambiguous",
+        "resolution_code": "native_create_unrecoverable",
+        "created": True,
+    }
+    [audit] = _rows(db, "SELECT * FROM session_sidebar_unbound_resolutions")
+    assert audit["reservation_reserved_at"] == reservation["reserved_at"]
+    assert audit["evidence_digest"] == evidence
     status = store.sidebar_delivery_status(now=failed["updated_at"] + 3.0)
     assert status["blocking_failed_count"] == 0
     assert status["terminally_resolved_failed_count"] == 1

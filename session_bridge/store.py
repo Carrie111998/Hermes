@@ -7110,11 +7110,13 @@ class SessionBridgeStore:
         *,
         marker_secret: bytes,
         now: float,
+        retired_marker_secrets: object = (),
     ) -> dict[str, Any]:
         """One-time quarantine for jobs that predate durable create intent."""
 
         if type(marker_secret) is not bytes or not marker_secret:
             raise ValueError("sidebar cutover marker secret is malformed")
+        retired_secrets = _validated_retired_marker_secrets(retired_marker_secrets)
         applied_at = _finite_number(now, "sidebar create reservation cutover time")
 
         def _write(conn):
@@ -7152,6 +7154,7 @@ class SessionBridgeStore:
                     conn,
                     ledger,
                     marker_secret=marker_secret,
+                    retired_marker_secrets=retired_secrets,
                 )
                 return ledger, True
 
@@ -7191,7 +7194,11 @@ class SessionBridgeStore:
                     _validate_sidebar_cutover_reservation(
                         reservation_row["value_json"],
                         job=job,
-                        expected_recovery_key=expected_recovery_key,
+                        expected_recovery_keys=_sidebar_cutover_recovery_keys(
+                            job,
+                            marker_secret=marker_secret,
+                            retired_marker_secrets=retired_secrets,
+                        ),
                     )
                     continue
                 if job["codex_thread_id"] is not None:
@@ -8602,6 +8609,7 @@ class SessionBridgeStore:
         evidence_digest: object,
         marker_secret: object,
         now: object,
+        retired_marker_secrets: object = (),
     ) -> dict[str, Any]:
         """Append evidence that one cutover reservation has no recoverable task."""
 
@@ -8625,6 +8633,7 @@ class SessionBridgeStore:
         if type(marker_secret) is not bytes or not marker_secret:
             raise ValueError("sidebar precreate marker secret is malformed")
         expected_marker_secret = cast(bytes, marker_secret)
+        retired_secrets = _validated_retired_marker_secrets(retired_marker_secrets)
         resolved_at = _finite_number(now, "sidebar precreate resolution time")
 
         def _write(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -8685,11 +8694,12 @@ class SessionBridgeStore:
                 or reservation["bridge_id"] != bridge_id
                 or expected_job_id not in cutover["quarantined_job_ids"]
                 or reservation["reserved_at"] != cutover["applied_at"]
-                or not hmac.compare_digest(
+                or not _matches_any_recovery_key(
                     reservation["recovery_key"],
-                    _sidebar_cutover_recovery_key(
+                    _sidebar_cutover_recovery_keys(
                         dict(job),
                         marker_secret=expected_marker_secret,
+                        retired_marker_secrets=retired_secrets,
                     ),
                 )
             ):
@@ -8865,6 +8875,7 @@ class SessionBridgeStore:
         evidence_digest: object,
         marker_secret: object,
         now: object,
+        retired_marker_secrets: object = (),
     ) -> dict[str, Any]:
         """Append one exact, fresh proof-bound v2 attempts-zero resolution."""
 
@@ -8898,6 +8909,7 @@ class SessionBridgeStore:
         if type(marker_secret) is not bytes or not marker_secret:
             raise ValueError("sidebar v2 attempt-zero marker secret is malformed")
         secret = cast(bytes, marker_secret)
+        retired_secrets = _validated_retired_marker_secrets(retired_marker_secrets)
         resolved_at = _finite_number(now, "sidebar v2 attempt-zero resolution time")
 
         def _write(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -8934,15 +8946,33 @@ class SessionBridgeStore:
             )
             proof = dict(proof_row)
             candidate = _validated_sidebar_cutover_candidate(conn, dict(job))
-            marker = encode_bridge_marker(
-                BridgeMarkerPayload(
-                    bridge_id=bridge_id,
-                    source_session_id=source_session_id,
-                    target_provider=Provider.CODEX,
-                    policy_generation=1,
-                ),
-                secret,
+            # A record minted before a marker-key rotation carries that
+            # epoch's marker digest AND recovery key together, so acceptance
+            # is per-epoch pairwise, never mix-and-match across epochs.
+            marker_payload = BridgeMarkerPayload(
+                bridge_id=bridge_id,
+                source_session_id=source_session_id,
+                target_provider=Provider.CODEX,
+                policy_generation=1,
             )
+            epoch_evidence_matches = False
+            for epoch_secret in (secret, *retired_secrets):
+                epoch_marker = encode_bridge_marker(marker_payload, epoch_secret)
+                epoch_evidence_matches = (
+                    hmac.compare_digest(
+                        proof["marker_digest"],
+                        hashlib.sha256(
+                            epoch_marker.encode("utf-8")
+                        ).hexdigest(),
+                    )
+                    and hmac.compare_digest(
+                        reservation["recovery_key"],
+                        _sidebar_cutover_recovery_key(
+                            dict(job),
+                            marker_secret=epoch_secret,
+                        ),
+                    )
+                ) or epoch_evidence_matches
             if (
                 canonical_job_id != expected_job_id
                 or job["idempotency_key"] != idempotency_key
@@ -8962,14 +8992,7 @@ class SessionBridgeStore:
                 or proof.get("recovered_thread_id") is not None
                 or proof.get("fixed_reason") is not None
                 or job["reconciliation_proof_digest"] != proof_digest
-                or not hmac.compare_digest(
-                    proof["marker_digest"],
-                    hashlib.sha256(marker.encode("utf-8")).hexdigest(),
-                )
-                or not hmac.compare_digest(
-                    reservation["recovery_key"],
-                    _sidebar_cutover_recovery_key(dict(job), marker_secret=secret),
-                )
+                or not epoch_evidence_matches
                 or job["codex_thread_id"] is not None
                 or job["state"] != SidebarJobState.FAILED.value
                 or job["error_code"] != expected_error
@@ -9090,6 +9113,7 @@ class SessionBridgeStore:
         evidence_digest: object,
         marker_secret: object,
         now: object,
+        retired_marker_secrets: object = (),
     ) -> dict[str, Any]:
         """Append exact-absence evidence for one post-dispatch unbound create."""
 
@@ -9113,6 +9137,7 @@ class SessionBridgeStore:
         if type(marker_secret) is not bytes or not marker_secret:
             raise ValueError("sidebar unbound marker secret is malformed")
         expected_marker_secret = cast(bytes, marker_secret)
+        retired_secrets = _validated_retired_marker_secrets(retired_marker_secrets)
         resolved_at = _finite_number(now, "sidebar unbound resolution time")
 
         def _write(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -9164,11 +9189,12 @@ class SessionBridgeStore:
             if (
                 reservation["job_id"] != expected_job_id
                 or reservation["bridge_id"] != bridge_id
-                or not hmac.compare_digest(
+                or not _matches_any_recovery_key(
                     reservation["recovery_key"],
-                    _sidebar_cutover_recovery_key(
+                    _sidebar_cutover_recovery_keys(
                         dict(job),
                         marker_secret=expected_marker_secret,
+                        retired_marker_secrets=retired_secrets,
                     ),
                 )
             ):
@@ -13260,6 +13286,14 @@ def _validated_sidebar_cutover_candidate(
     return candidate
 
 
+def _validated_retired_marker_secrets(value: object) -> tuple[bytes, ...]:
+    if type(value) is not tuple or any(
+        type(item) is not bytes or not item for item in value
+    ):
+        raise ValueError("sidebar retired marker secrets are malformed")
+    return cast(tuple[bytes, ...], value)
+
+
 def _sidebar_cutover_recovery_key(
     job: Mapping[str, Any],
     *,
@@ -13282,11 +13316,42 @@ def _sidebar_cutover_recovery_key(
     return sidebar_create_recovery_key(marker, marker_secret)
 
 
+def _sidebar_cutover_recovery_keys(
+    job: Mapping[str, Any],
+    *,
+    marker_secret: bytes,
+    retired_marker_secrets: tuple[bytes, ...] = (),
+) -> tuple[str, ...]:
+    """Epoch-ordered acceptable recovery keys, the live secret's first.
+
+    A reservation minted before a marker-key rotation only re-derives under
+    the secret that was current at mint time, so validation accepts any
+    keyring epoch while new mints keep using the live key alone.
+    """
+
+    return tuple(
+        _sidebar_cutover_recovery_key(job, marker_secret=secret)
+        for secret in (marker_secret, *retired_marker_secrets)
+    )
+
+
+def _matches_any_recovery_key(
+    recovery_key: object,
+    expected_recovery_keys: tuple[str, ...],
+) -> bool:
+    if type(recovery_key) is not str or not expected_recovery_keys:
+        return False
+    matched = False
+    for expected in expected_recovery_keys:
+        matched = hmac.compare_digest(recovery_key, expected) or matched
+    return matched
+
+
 def _validate_sidebar_cutover_reservation(
     value_json: object,
     *,
     job: Mapping[str, Any],
-    expected_recovery_key: str,
+    expected_recovery_keys: tuple[str, ...],
     expected_reserved_at: float | None = None,
 ) -> dict[str, Any]:
     reservation = _decode_sidebar_create_reservation(
@@ -13296,9 +13361,9 @@ def _validate_sidebar_cutover_reservation(
     if (
         reservation["job_id"] != job["id"]
         or reservation["bridge_id"] != job["bridge_id"]
-        or not hmac.compare_digest(
+        or not _matches_any_recovery_key(
             reservation["recovery_key"],
-            expected_recovery_key,
+            expected_recovery_keys,
         )
         or (
             expected_reserved_at is not None
@@ -13351,6 +13416,7 @@ def _validate_sidebar_create_reservation_cutover_replay(
     ledger: Mapping[str, Any],
     *,
     marker_secret: bytes,
+    retired_marker_secrets: tuple[bytes, ...] = (),
 ) -> None:
     applied_at = float(ledger["applied_at"])
     for job_id in ledger["quarantined_job_ids"]:
@@ -13371,9 +13437,10 @@ def _validate_sidebar_create_reservation_cutover_replay(
         _validate_sidebar_cutover_reservation(
             reservation_row["value_json"],
             job=job,
-            expected_recovery_key=_sidebar_cutover_recovery_key(
+            expected_recovery_keys=_sidebar_cutover_recovery_keys(
                 job,
                 marker_secret=marker_secret,
+                retired_marker_secrets=retired_marker_secrets,
             ),
             expected_reserved_at=applied_at,
         )

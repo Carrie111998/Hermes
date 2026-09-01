@@ -1448,6 +1448,10 @@ def test_production_sidebar_hydration_backfill_dry_runs_then_seeds_only_legacy(
     backend._store = store
     backend._catalog = object()  # type: ignore[assignment]
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
     monkeypatch.setattr("session_bridge.cli.time.time", lambda: now)
     monkeypatch.setattr(
         backend,
@@ -3087,9 +3091,13 @@ def test_production_v2_attempt_zero_acknowledgement_uses_fresh_exact_cwd_probes(
     verifier = _PrecreateProbeVerifier("zero")
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
     monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
         backend,
         "_require_sidebar_terminal_verifier",
-        lambda *, marker_secret: verifier,
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
         raising=False,
     )
     before = store.get_sidebar_job_for_source(candidate.source_session_id)
@@ -3152,9 +3160,13 @@ def test_production_v2_attempt_zero_acknowledgement_fails_closed_without_two_zer
     verifier = _PrecreateProbeVerifier(scenario)
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
     monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
         backend,
         "_require_sidebar_terminal_verifier",
-        lambda *, marker_secret: verifier,
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
         raising=False,
     )
     try:
@@ -3213,9 +3225,13 @@ def test_production_v2_attempt_zero_snapshot_change_after_probes_is_cas_rejected
     verifier.find_by_recovery_key = drift_after_probe  # type: ignore[method-assign]
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
     monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
         backend,
         "_require_sidebar_terminal_verifier",
-        lambda *, marker_secret: verifier,
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
         raising=False,
     )
     try:
@@ -3287,9 +3303,13 @@ def test_production_v2_attempt_zero_materialization_after_probes_is_cas_rejected
     verifier.find_by_recovery_key = materialize_after_probe  # type: ignore[method-assign]
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
     monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
         backend,
         "_require_sidebar_terminal_verifier",
-        lambda *, marker_secret: verifier,
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
         raising=False,
     )
     try:
@@ -3326,9 +3346,13 @@ def test_production_v2_attempt_zero_expired_proof_rejected_after_probes(
     verifier = _PrecreateProbeVerifier("zero")
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
     monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
         backend,
         "_require_sidebar_terminal_verifier",
-        lambda *, marker_secret: verifier,
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
         raising=False,
     )
     try:
@@ -3383,11 +3407,15 @@ def test_production_v2_attempt_zero_proof_expiring_during_second_probe_is_reject
 
     verifier.find_by_recovery_key = expire_during_recovery_probe  # type: ignore[method-assign]
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
     monkeypatch.setattr("session_bridge.cli.time.time", lambda: clock["now"])
     monkeypatch.setattr(
         backend,
         "_require_sidebar_terminal_verifier",
-        lambda *, marker_secret: verifier,
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
         raising=False,
     )
     try:
@@ -3437,9 +3465,13 @@ def test_production_v2_attempt_zero_recovery_probe_enforces_exact_candidate_cwd(
     verifier.find_by_recovery_key = wrong_cwd_probe  # type: ignore[method-assign]
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
     monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
         backend,
         "_require_sidebar_terminal_verifier",
-        lambda *, marker_secret: verifier,
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
         raising=False,
     )
     try:
@@ -3472,9 +3504,13 @@ def test_production_unbound_acknowledgement_probes_exact_identities_and_replays(
     verifier = _PrecreateProbeVerifier("zero")
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
     monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
         backend,
         "_require_sidebar_terminal_verifier",
-        lambda *, marker_secret: verifier,
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
         raising=False,
     )
     before_job = store.get_sidebar_job_for_source(candidate.source_session_id)
@@ -3512,6 +3548,129 @@ def test_production_unbound_acknowledgement_probes_exact_identities_and_replays(
         backend.close()
 
 
+def test_production_unbound_acknowledgement_accepts_pre_rotation_reservation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_secret = b"unbound-cli-pre-rotation-secret!"
+    new_secret = b"unbound-cli-post-rotation-secret"
+    backend, store, failed, reservation, candidate = (
+        _production_unbound_resolution_backend(
+            tmp_path,
+            marker_secret=old_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: new_secret)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
+        raising=False,
+    )
+    try:
+        with pytest.raises(
+            RolloutGateBlocked, match="sidebar_unbound_snapshot_mismatch"
+        ):
+            backend.sidebar_acknowledge_unbound_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+            )
+
+        monkeypatch.setattr(
+            "session_bridge.cli.resolve_retired_marker_keys",
+            lambda **_kwargs: (old_secret,),
+        )
+        acknowledged = backend.sidebar_acknowledge_unbound_unrecoverable(
+            job_id=failed["id"],
+            expected_error_code="native_create_ambiguous",
+        )
+
+        assert acknowledged == {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "native_create_unrecoverable",
+        }
+        assert [
+            (recovery_key, cwd)
+            for recovery_key, cwd, _deadline in verifier.recovery_calls
+        ] == [(reservation["recovery_key"], candidate.cwd)]
+        [audit] = store.db._conn.execute(
+            "SELECT * FROM session_sidebar_unbound_resolutions"
+        ).fetchall()
+        assert audit["resolution_code"] == "native_create_unrecoverable"
+    finally:
+        backend.close()
+
+
+def test_production_v2_attempt_zero_acknowledgement_accepts_pre_rotation_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_secret = b"v2-cli-pre-rotation-old-secret!!"
+    new_secret = b"v2-cli-post-rotation-new-secret!"
+    backend, store, failed, reservation, proof, candidate = (
+        _production_v2_attempt_zero_resolution_backend(
+            tmp_path,
+            marker_secret=old_secret,
+        )
+    )
+    verifier = _PrecreateProbeVerifier("zero")
+    monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: new_secret)
+    monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        backend,
+        "_require_sidebar_terminal_verifier",
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
+        raising=False,
+    )
+    try:
+        with pytest.raises(
+            RolloutGateBlocked, match="sidebar_v2_attempt_zero_snapshot_mismatch"
+        ):
+            backend.sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+                job_id=failed["id"],
+                expected_error_code="native_create_ambiguous",
+                reconciliation_proof_digest=proof["proof_digest"],
+                reconciliation_generation=proof["reconciliation_generation"],
+            )
+
+        monkeypatch.setattr(
+            "session_bridge.cli.resolve_retired_marker_keys",
+            lambda **_kwargs: (old_secret,),
+        )
+        acknowledged = backend.sidebar_acknowledge_v2_attempt_zero_unrecoverable(
+            job_id=failed["id"],
+            expected_error_code="native_create_ambiguous",
+            reconciliation_proof_digest=proof["proof_digest"],
+            reconciliation_generation=proof["reconciliation_generation"],
+        )
+
+        assert acknowledged == {
+            "status": "acknowledged",
+            "error_code": "native_create_ambiguous",
+            "resolution_code": "v2_attempt_zero_create_unrecoverable",
+        }
+        assert [
+            (recovery_key, cwd)
+            for recovery_key, cwd, _deadline in verifier.recovery_calls
+        ] == [(reservation["recovery_key"], candidate.cwd)]
+        assert proof["proof_digest"] == failed["reconciliation_proof_digest"]
+        [audit] = store.db._conn.execute(
+            "SELECT * FROM session_sidebar_v2_attempt_zero_resolutions"
+        ).fetchall()
+        assert audit["resolution_code"] == "v2_attempt_zero_create_unrecoverable"
+    finally:
+        backend.close()
+
+
 def test_production_precreate_acknowledgement_probes_exact_identities_and_replays(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3526,9 +3685,13 @@ def test_production_precreate_acknowledgement_probes_exact_identities_and_replay
     verifier = _PrecreateProbeVerifier("zero")
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
     monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
         backend,
         "_require_sidebar_terminal_verifier",
-        lambda *, marker_secret: verifier,
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
         raising=False,
     )
     before_job = store.get_sidebar_job_for_source(candidate.source_session_id)
@@ -3607,9 +3770,13 @@ def test_production_precreate_acknowledgement_never_writes_without_two_zero_prob
     verifier = _PrecreateProbeVerifier(scenario)
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
     monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
         backend,
         "_require_sidebar_terminal_verifier",
-        lambda *, marker_secret: verifier,
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
         raising=False,
     )
     before = store.get_sidebar_job_for_source(candidate.source_session_id)
@@ -3647,9 +3814,13 @@ def test_production_precreate_acknowledgement_archived_marker_blocks_without_wri
     verifier = _PrecreateProbeVerifier("archived_marker_match")
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
     monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
         backend,
         "_require_sidebar_terminal_verifier",
-        lambda *, marker_secret: verifier,
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
     )
     before = store.get_sidebar_job_for_source(candidate.source_session_id)
     try:
@@ -3692,9 +3863,13 @@ def test_production_precreate_acknowledgement_rejects_cutover_drift_before_probe
     verifier = _PrecreateProbeVerifier("zero")
     monkeypatch.setattr("session_bridge.cli.resolve_marker_key", lambda: marker_secret)
     monkeypatch.setattr(
+        "session_bridge.cli.resolve_retired_marker_keys",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
         backend,
         "_require_sidebar_terminal_verifier",
-        lambda *, marker_secret: verifier,
+        lambda *, marker_secret, retired_marker_secrets=(): verifier,
         raising=False,
     )
     try:

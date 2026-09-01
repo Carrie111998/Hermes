@@ -21,6 +21,7 @@ from .sidebar import (
     build_registration_prompt,
     decode_sidebar_registration_identity,
     sidebar_create_recovery_key,
+    sidebar_retired_create_recovery_keys,
     validate_sidebar_create_reservation,
 )
 from .sidebar_placement import (
@@ -641,6 +642,7 @@ class SidebarExecutor:
         native: NativeSidebarDelivery,
         placement_resolver: Callable[[SidebarCandidate], SidebarPlacement],
         marker_secret: bytes,
+        retired_marker_secrets: tuple[bytes, ...] = (),
         clock=time.time,
         monotonic=time.monotonic,
         sleep=time.sleep,
@@ -652,6 +654,11 @@ class SidebarExecutor:
     ) -> None:
         if not isinstance(marker_secret, bytes) or not marker_secret:
             raise ValueError("sidebar executor marker secret is unavailable")
+        if type(retired_marker_secrets) is not tuple or any(
+            type(value) is not bytes or not value
+            for value in retired_marker_secrets
+        ):
+            raise ValueError("sidebar executor retired marker secrets are malformed")
         for label, value in (
             ("read timeout", read_timeout_seconds),
             ("poll interval", poll_interval),
@@ -682,6 +689,7 @@ class SidebarExecutor:
         self._native = native
         self._placement_resolver = placement_resolver
         self._marker_secret = marker_secret
+        self._retired_marker_secrets = retired_marker_secrets
         self._clock = clock
         self._monotonic = monotonic
         self._sleep = sleep
@@ -930,6 +938,10 @@ class SidebarExecutor:
             marker,
             self._marker_secret,
         )
+        retired_recovery_keys = sidebar_retired_create_recovery_keys(
+            expected,
+            self._retired_marker_secrets,
+        )
         recovered: VerifiedSidebarThread | None = None
         if thread_id is None:
             if not self._has_budget(operation_deadline, lease_expires_at):
@@ -1049,6 +1061,7 @@ class SidebarExecutor:
                             source_session_id=source_session_id,
                             bridge_id=bridge_id,
                             expected_recovery_key=expected_recovery_key,
+                            retired_recovery_keys=retired_recovery_keys,
                         )
                     except ValueError:
                         return self._settle(
@@ -1317,10 +1330,21 @@ class SidebarExecutor:
                 thread_id=thread_id,
                 deadline=operation_deadline,
             )
-            registration_identity = decode_sidebar_registration_identity(
-                initial_prompt,
-                self._marker_secret,
-            )
+            registration_identity = None
+            registration_error: ValueError | None = None
+            for secret in (self._marker_secret, *self._retired_marker_secrets):
+                try:
+                    registration_identity = decode_sidebar_registration_identity(
+                        initial_prompt,
+                        secret,
+                    )
+                except ValueError as exc:
+                    registration_error = exc
+                    continue
+                break
+            if registration_identity is None:
+                assert registration_error is not None
+                raise registration_error
         except (KeyboardInterrupt, SystemExit):
             raise
         except NativeCreateRejected as exc:

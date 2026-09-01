@@ -40,7 +40,11 @@ from .models import (
     encode_bridge_marker,
 )
 from .preview import build_session_preview
-from .secret_paths import default_marker_key_file, default_token_file
+from .secret_paths import (
+    default_marker_key_file,
+    default_retired_marker_key_dir,
+    default_token_file,
+)
 from .sidebar import (
     build_registration_prompt,
     decode_hydration_marker,
@@ -80,6 +84,7 @@ _TOKEN_ENV = "HERMES_SESSION_BRIDGE_TOKEN"
 _MIN_TOKEN_BYTES = 32
 _MIN_MARKER_KEY_BYTES = 32
 _MAX_MARKER_KEY_BYTES = 4096
+_MAX_RETIRED_MARKER_KEYS = 4
 _WINDOWS_ACL_TIMEOUT_SECONDS = 15
 _MAX_CONTEXT_BUDGET = 100_000
 _DEFAULT_CONTEXT_BUDGET = 24_000
@@ -123,6 +128,57 @@ def resolve_marker_key(*, marker_key_file: Path | None = None) -> bytes:
     if len(key) < _MIN_MARKER_KEY_BYTES:
         raise ValueError("session bridge marker key must be at least 32 bytes")
     return key
+
+
+def resolve_retired_marker_keys(
+    *,
+    retired_key_dir: Path | None = None,
+    current_key: bytes | None = None,
+) -> tuple[bytes, ...]:
+    """Load retired origin-marker HMAC keys, newest retirement first.
+
+    A key rotation moves the previous ``marker-key`` bytes into the retired
+    directory under a sortable retirement-stamp filename; each file must keep
+    the exact restricted-file discipline of the live key. Validation-side
+    consumers accept these keys so ledger reservations and native markers
+    minted before a rotation keep verifying — signing never uses them, and a
+    leaked key must NOT be retired here (see the rotation runbook). A missing
+    directory means no rotation has retired a key yet.
+    """
+
+    directory = Path(
+        retired_key_dir
+        if retired_key_dir is not None
+        else default_retired_marker_key_dir()
+    ).expanduser()
+    try:
+        entries = sorted(directory.iterdir(), key=lambda entry: entry.name)
+    except FileNotFoundError:
+        return ()
+    except NotADirectoryError:
+        raise PermissionError(
+            "session bridge retired marker key path must be a directory"
+        ) from None
+    if len(entries) > _MAX_RETIRED_MARKER_KEYS:
+        raise ValueError(
+            "session bridge retired marker keys exceed the rotation cap"
+        )
+    keys: list[bytes] = []
+    for entry in reversed(entries):
+        try:
+            key = _read_restricted_marker_key(entry)
+        except FileNotFoundError:
+            raise RuntimeError(
+                "session bridge retired marker key file vanished during read"
+            ) from None
+        if len(key) < _MIN_MARKER_KEY_BYTES:
+            raise ValueError(
+                "session bridge marker key must be at least 32 bytes"
+            )
+        if key == current_key or key in keys:
+            continue
+        keys.append(key)
+    return tuple(keys)
 
 
 def _read_restricted_marker_key(path: Path) -> bytes:

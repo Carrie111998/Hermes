@@ -77,7 +77,12 @@ from .listener_watchdog import (
     ListenerWatchdog,
     make_deaf_listener_handler,
 )
-from .mcp_server import create_app, resolve_bearer_token, resolve_marker_key
+from .mcp_server import (
+    create_app,
+    resolve_bearer_token,
+    resolve_marker_key,
+    resolve_retired_marker_keys,
+)
 from .desktop_registry_worker import DesktopRegistrySyncWorker
 from .mirror_float import (
     ClaudeMirrorFloatWorker,
@@ -113,6 +118,7 @@ from .sidebar import (
     sidebar_bridge_id,
     sidebar_create_recovery_key,
     sidebar_idempotency_key,
+    sidebar_retired_create_recovery_keys,
     validate_sidebar_create_reservation,
 )
 from .preview import build_session_preview
@@ -1843,10 +1849,12 @@ class ProductionBackend:
         marker_secret: bytes | None = None,
     ) -> Mapping[str, Any]:
         secret = resolve_marker_key() if marker_secret is None else marker_secret
+        retired_marker_secrets = resolve_retired_marker_keys(current_key=secret)
         try:
             return self._require_store().apply_sidebar_create_reservation_cutover(
                 marker_secret=secret,
                 now=time.time(),
+                retired_marker_secrets=retired_marker_secrets,
             )
         except ConfigurationFailure:
             raise
@@ -1979,6 +1987,9 @@ class ProductionBackend:
             marker_secret = resolve_marker_key()
             if type(marker_secret) is not bytes or not marker_secret:
                 raise ValueError("marker key is unavailable")
+            retired_marker_secrets = resolve_retired_marker_keys(
+                current_key=marker_secret
+            )
         except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
             raise ConfigurationFailure("sidebar_precreate_probe_unavailable") from None
 
@@ -2039,6 +2050,13 @@ class ProductionBackend:
                 marker,
                 marker_secret,
             )
+            acceptable_recovery_keys = (
+                expected_recovery_key,
+                *sidebar_retired_create_recovery_keys(
+                    expected_marker,
+                    retired_marker_secrets,
+                ),
+            )
 
             reservation = store.get_sidebar_create_reservation(source_session_id)
             if (
@@ -2056,7 +2074,7 @@ class ProductionBackend:
                 or reservation.get("job_id") != job_id
                 or reservation.get("source_session_id") != source_session_id
                 or reservation.get("bridge_id") != expected_bridge_id
-                or reservation.get("recovery_key") != expected_recovery_key
+                or reservation.get("recovery_key") not in acceptable_recovery_keys
                 or not _is_finite_number(reservation.get("reserved_at"))
             ):
                 raise ValueError("sidebar precreate reservation mismatch")
@@ -2085,6 +2103,7 @@ class ProductionBackend:
 
         verifier = self._require_sidebar_terminal_verifier(
             marker_secret=marker_secret,
+            retired_marker_secrets=retired_marker_secrets,
         )
         try:
             marker_match = verifier.find_by_marker_including_archived(expected_marker)
@@ -2123,6 +2142,7 @@ class ProductionBackend:
                 evidence_digest=evidence_digest,
                 marker_secret=marker_secret,
                 now=time.time(),
+                retired_marker_secrets=retired_marker_secrets,
             )
         except (TypeError, ValueError):
             raise RolloutGateBlocked("sidebar_precreate_snapshot_mismatch") from None
@@ -2153,6 +2173,9 @@ class ProductionBackend:
             marker_secret = resolve_marker_key()
             if type(marker_secret) is not bytes or not marker_secret:
                 raise ValueError("marker key is unavailable")
+            retired_marker_secrets = resolve_retired_marker_keys(
+                current_key=marker_secret
+            )
         except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
             raise ConfigurationFailure("sidebar_unbound_probe_unavailable") from None
 
@@ -2220,12 +2243,17 @@ class ProductionBackend:
                 source_session_id=source_session_id,
                 bridge_id=expected_bridge_id,
                 expected_recovery_key=expected_recovery_key,
+                retired_recovery_keys=sidebar_retired_create_recovery_keys(
+                    expected_marker,
+                    retired_marker_secrets,
+                ),
             )
         except (KeyError, TypeError, ValueError):
             raise RolloutGateBlocked("sidebar_unbound_snapshot_mismatch") from None
 
         verifier = self._require_sidebar_terminal_verifier(
             marker_secret=marker_secret,
+            retired_marker_secrets=retired_marker_secrets,
         )
         try:
             marker_match = verifier.find_by_marker_including_archived(expected_marker)
@@ -2263,6 +2291,7 @@ class ProductionBackend:
                 evidence_digest=evidence_digest,
                 marker_secret=marker_secret,
                 now=time.time(),
+                retired_marker_secrets=retired_marker_secrets,
             )
         except (TypeError, ValueError):
             raise RolloutGateBlocked("sidebar_unbound_snapshot_mismatch") from None
@@ -2301,6 +2330,9 @@ class ProductionBackend:
             marker_secret = resolve_marker_key()
             if type(marker_secret) is not bytes or not marker_secret:
                 raise ValueError("marker key is unavailable")
+            retired_marker_secrets = resolve_retired_marker_keys(
+                current_key=marker_secret
+            )
         except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
             raise ConfigurationFailure(
                 "sidebar_v2_attempt_zero_probe_unavailable"
@@ -2369,6 +2401,10 @@ class ProductionBackend:
                 source_session_id=source_session_id,
                 bridge_id=expected_bridge_id,
                 expected_recovery_key=expected_recovery_key,
+                retired_recovery_keys=sidebar_retired_create_recovery_keys(
+                    expected_marker,
+                    retired_marker_secrets,
+                ),
             )
             if (
                 not isinstance(reservation, Mapping)
@@ -2382,7 +2418,12 @@ class ProductionBackend:
             proof = store.get_sidebar_reconciliation_proof_by_digest(
                 reconciliation_proof_digest
             )
-            marker_digest = hashlib.sha256(marker.encode("utf-8")).hexdigest()
+            acceptable_marker_digests = tuple(
+                hashlib.sha256(
+                    encode_bridge_marker(expected_marker, secret).encode("utf-8")
+                ).hexdigest()
+                for secret in (marker_secret, *retired_marker_secrets)
+            )
             if (
                 proof is None
                 or proof.get("job_id") != job_id
@@ -2390,7 +2431,7 @@ class ProductionBackend:
                 or proof.get("bridge_id") != expected_bridge_id
                 or proof.get("reconciliation_generation")
                 != reconciliation_generation
-                or proof.get("marker_digest") != marker_digest
+                or proof.get("marker_digest") not in acceptable_marker_digests
                 or proof.get("state") != "absence_proven"
                 or proof.get("match_count") != 0
                 or proof.get("recovered_thread_id") is not None
@@ -2406,6 +2447,7 @@ class ProductionBackend:
 
         verifier = self._require_sidebar_terminal_verifier(
             marker_secret=marker_secret,
+            retired_marker_secrets=retired_marker_secrets,
         )
         try:
             marker_match = verifier.find_by_marker_including_archived(expected_marker)
@@ -2446,6 +2488,7 @@ class ProductionBackend:
                 evidence_digest=evidence_digest,
                 marker_secret=marker_secret,
                 now=time.time(),
+                retired_marker_secrets=retired_marker_secrets,
             )
         except (TypeError, ValueError):
             raise RolloutGateBlocked(
@@ -3720,6 +3763,9 @@ class ProductionBackend:
         try:
             try:
                 marker_key = resolve_marker_key()
+                retired_marker_keys = resolve_retired_marker_keys(
+                    current_key=marker_key
+                )
             except (OSError, PermissionError, RuntimeError, ValueError) as exc:
                 raise ConfigurationFailure("marker_key_unavailable") from exc
             source_adapters: dict[Provider, object] = {}
@@ -3772,6 +3818,7 @@ class ProductionBackend:
                 SidebarThreadVerifier(
                     codex_source,
                     marker_secret=marker_key,
+                    retired_marker_secrets=retired_marker_keys,
                     reconciliation_interval=effective_config.service.reconcile_seconds,
                 )
                 if codex_source is not None
@@ -3918,6 +3965,7 @@ class ProductionBackend:
         self,
         *,
         marker_secret: bytes,
+        retired_marker_secrets: tuple[bytes, ...] = (),
     ) -> SidebarThreadVerifier:
         """Build a fresh read-only inventory verifier for precreate proof."""
 
@@ -3938,6 +3986,7 @@ class ProductionBackend:
             return SidebarThreadVerifier(
                 source,
                 marker_secret=marker_secret,
+                retired_marker_secrets=retired_marker_secrets,
                 reconciliation_interval=0.0,
             )
         except ConfigurationFailure:

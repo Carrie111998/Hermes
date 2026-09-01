@@ -15,6 +15,7 @@ from typing import cast
 
 from .context_pack import _redact
 from .models import (
+    BridgeMarkerPayload,
     InvalidBridgeMarker,
     OriginKind,
     HydrationMarkerPayload,
@@ -23,6 +24,7 @@ from .models import (
     SessionProjection,
     canonical_session_id,
     decode_bridge_marker,
+    encode_bridge_marker,
 )
 from .sidebar_placement import filesystem_path_identity
 
@@ -215,6 +217,29 @@ def sidebar_create_recovery_key(marker: str, marker_secret: bytes) -> str:
     return f"hermes-session-bridge-create-v1:{digest}"
 
 
+def sidebar_retired_create_recovery_keys(
+    payload: BridgeMarkerPayload,
+    retired_marker_secrets: tuple[bytes, ...],
+) -> tuple[str, ...]:
+    """Derive the retired-epoch reservation keys accepted for one identity.
+
+    Both the signed marker and its recovery key depend on the marker secret,
+    so a reservation minted before a key rotation only re-derives under the
+    secret that was current at mint time. Order follows the input keyring
+    order (newest retirement first).
+    """
+
+    if type(retired_marker_secrets) is not tuple:
+        raise ValueError("sidebar retired marker secrets must be a tuple")
+    keys: list[str] = []
+    for secret in retired_marker_secrets:
+        if type(secret) is not bytes or not secret:
+            raise ValueError("sidebar marker secret must be non-empty bytes")
+        marker = encode_bridge_marker(payload, secret)
+        keys.append(sidebar_create_recovery_key(marker, secret))
+    return tuple(keys)
+
+
 def validate_sidebar_create_reservation(
     reservation: object,
     *,
@@ -222,8 +247,25 @@ def validate_sidebar_create_reservation(
     source_session_id: str,
     bridge_id: str,
     expected_recovery_key: str,
+    retired_recovery_keys: tuple[str, ...] = (),
 ) -> str:
-    """Validate the exact durable reservation record returned by the store."""
+    """Validate the exact durable reservation record returned by the store.
+
+    ``retired_recovery_keys`` carries the same identity's keys re-derived
+    under retired marker secrets so reservations minted before a key
+    rotation stay valid; an empty tuple keeps the pre-rotation-story
+    single-key equality.
+    """
+
+    if type(retired_recovery_keys) is not tuple or any(
+        type(value) is not str
+        or not value
+        or value != value.strip()
+        or "\n" in value
+        or "\r" in value
+        for value in retired_recovery_keys
+    ):
+        raise ValueError("sidebar retired recovery keys are malformed")
 
     base_fields = {
         "version",
@@ -269,7 +311,10 @@ def validate_sidebar_create_reservation(
         or not math.isfinite(float(reserved_at))
     ):
         raise ValueError("sidebar create reservation is malformed")
-    if not hmac.compare_digest(recovery_key, expected_recovery_key):
+    accepted = hmac.compare_digest(recovery_key, expected_recovery_key)
+    for retired_key in retired_recovery_keys:
+        accepted = hmac.compare_digest(recovery_key, retired_key) or accepted
+    if not accepted:
         raise ValueError("sidebar create reservation key mismatch")
     if version == 2:
         proof_digest = reservation_map.get("reconciliation_proof_digest")
