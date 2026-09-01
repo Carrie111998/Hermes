@@ -1437,23 +1437,26 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         # the next run is anchored to the actual last execution time
         # rather than to an arbitrary restart time.
         base_time = now
+        using_last_run = False
         if last_run_at:
             try:
                 base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
+                using_last_run = True
             except Exception:
                 base_time = now
         cron = croniter(expr, base_time)
         next_run = cron.get_next(datetime)
 
-        # Fix #100030: croniter.get_next() returns the next occurrence STRICTLY
+        # Fix #100030: croniter.get_next() returns next occurrence STRICTLY
         # AFTER base_time. If base_time is at or very slightly past a scheduled
-        # fire time (e.g., due to timezone conversion near a month boundary),
-        # the current period's fire is silently skipped. Detect this by checking
-        # if the previous fire time is within a small epsilon of base_time; if
-        # so, that previous fire IS the scheduled time for the current period.
-        prev_fire = cron.get_prev(datetime)
-        if prev_fire <= base_time and (base_time - prev_fire).total_seconds() < 60:
-            next_run = prev_fire
+        # fire (e.g. timezone conversion near a month boundary), the current
+        # period's fire is silently skipped. Use prev_fire as next_run.
+        # Only apply this catch-up when base is derived from "now" (not from
+        # last_run_at) to avoid re-firing the same instant on fast cron jobs.
+        if not using_last_run:
+            prev_fire = cron.get_prev(datetime)
+            if prev_fire <= base_time and (base_time - prev_fire).total_seconds() < 60:
+                next_run = prev_fire
 
         return next_run.isoformat()
 
