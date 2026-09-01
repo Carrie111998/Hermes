@@ -190,9 +190,10 @@ def ensure_windows_bin_launchers(
     On Windows, ``hermes`` resolves through launchers derived from the venv
     console scripts — never ``venv\\Scripts`` itself on PATH, which would
     shadow the user's ``python`` (#83797). The canonical launcher home is
-    the managed binary dir — the default Hermes root's ``bin``
-    (``%LOCALAPPDATA%\\hermes\\bin``, next to the managed uv) — which lives
-    OUTSIDE the git checkout so no git operation can ever touch it. It is
+    the default Hermes root's ``bin`` (``%LOCALAPPDATA%\\hermes\\bin`` — the
+    managed uv lives in the sibling ``uv\\`` dir since the uv-isolation
+    change) which lives OUTSIDE the git checkout so no git operation can
+    ever touch it. It is
     a per-machine dir shared by every profile: ``get_hermes_home()`` would
     point inside ``profiles\\<name>`` under ``hermes -p``, so the anchor
     here is :func:`hermes_constants.get_default_hermes_root`.
