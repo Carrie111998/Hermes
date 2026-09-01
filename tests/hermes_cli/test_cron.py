@@ -46,6 +46,53 @@ class TestCronCommandLifecycle:
         assert updated["provider"] == "nous"
         assert "Updated job" in capsys.readouterr().out
 
+    def test_edit_persists_reversible_delivery_flags(self, tmp_cron_dir, capsys):
+        job = create_job(
+            prompt="Daily report",
+            schedule="every 1h",
+            deliver="slack:C123",
+            model="model-before",
+        )
+        unchanged = {
+            key: job[key] for key in ("prompt", "schedule", "deliver", "model")
+        }
+        parser = argparse.ArgumentParser(prog="hermes")
+        subparsers = parser.add_subparsers(dest="command")
+        build_cron_parser(subparsers, cmd_cron=cron_command)
+
+        enabled = parser.parse_args(
+            [
+                "cron",
+                "edit",
+                job["id"],
+                "--attach-to-session",
+                "--suppress-slack-unfurls",
+            ]
+        )
+        assert cron_command(enabled) == 0
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["attach_to_session"] is True
+        assert updated["suppress_slack_unfurls"] is True
+        assert {key: updated[key] for key in unchanged} == unchanged
+
+        disabled = parser.parse_args(
+            [
+                "cron",
+                "edit",
+                job["id"],
+                "--no-attach-to-session",
+                "--no-suppress-slack-unfurls",
+            ]
+        )
+        assert cron_command(disabled) == 0
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["attach_to_session"] is False
+        assert updated["suppress_slack_unfurls"] is False
+        assert {key: updated[key] for key in unchanged} == unchanged
+        assert "Updated job" in capsys.readouterr().out
+
     def test_edit_can_replace_and_clear_skills(self, tmp_cron_dir, capsys):
         job = create_job(
             prompt="Combine skill outputs",

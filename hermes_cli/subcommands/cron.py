@@ -214,6 +214,36 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_edit.add_argument(
+        "--attach-to-session",
+        dest="attach_to_session",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Attach delivery to its target session.",
+    )
+    cron_edit.add_argument(
+        "--no-attach-to-session",
+        dest="attach_to_session",
+        action="store_const",
+        const=False,
+        help="Do not attach delivery to its target session.",
+    )
+    cron_edit.add_argument(
+        "--suppress-slack-unfurls",
+        dest="suppress_slack_unfurls",
+        action="store_const",
+        const=True,
+        default=None,
+        help="Suppress Slack link and media previews for this job.",
+    )
+    cron_edit.add_argument(
+        "--no-suppress-slack-unfurls",
+        dest="suppress_slack_unfurls",
+        action="store_const",
+        const=False,
+        help="Use normal Slack link and media preview behavior.",
+    )
+    cron_edit.add_argument(
         "--monitor-script",
         dest="monitor_script",
         help=(

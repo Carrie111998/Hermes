@@ -10,6 +10,8 @@ Contract under test:
 - The scheduled/cron lane (send_for_platform) stamps too.
 """
 
+import asyncio
+
 import pytest
 
 from gateway.config import Platform, PlatformConfig
@@ -217,6 +219,23 @@ class TestSendForPlatformStampsUnfurl:
         await a.send_for_platform(P.SLACK, "C123", "brief")
         assert "unfurl_links" not in a._transport.sent["metadata"]
         assert "unfurl_media" not in a._transport.sent["metadata"]
+
+    def test_cron_lane_job_metadata_overrides_config(self):
+        a = _slack_adapter(
+            {"slack": {"unfurl_links": True, "unfurl_media": True}}
+        )
+
+        asyncio.run(
+            a.send_for_platform(
+                Platform.SLACK,
+                "C123",
+                "brief https://x.dev",
+                metadata={"unfurl_links": False, "unfurl_media": False},
+            )
+        )
+
+        assert a._transport.sent["metadata"]["unfurl_links"] is False
+        assert a._transport.sent["metadata"]["unfurl_media"] is False
 
 class TestUnfurlDisablesDraftStreaming:
     def test_explicit_unfurl_disables_slack_draft_stream(self):

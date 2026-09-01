@@ -806,6 +806,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["context_from"] = external_refs
     if isinstance(job.get("attach_to_session"), bool):
         result["attach_to_session"] = job["attach_to_session"]
+    if isinstance(job.get("suppress_slack_unfurls"), bool):
+        result["suppress_slack_unfurls"] = job["suppress_slack_unfurls"]
     return result
 
 
@@ -1479,6 +1481,7 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    suppress_slack_unfurls: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
@@ -1898,6 +1901,8 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if suppress_slack_unfurls is not None:
+                updates["suppress_slack_unfurls"] = bool(suppress_slack_unfurls)
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -2029,6 +2034,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "boolean",
                 "description": "True = the job's delivery is CONTINUABLE — the user can reply and the agent has the brief in context (threads on thread-capable platforms, mirrored into the DM elsewhere). Use for conversational recurring jobs (briefings); leave unset for fire-and-forget alerts. Scope: the job's own conversation only — the origin chat, the home-channel fallback when deliver='origin' captured no origin (script-created jobs), or the job's single explicit platform:chat target (this flag is the only way to attach an explicit target). Broadcast targets are never attached; no effect when deliver='local'."
             },
+            "suppress_slack_unfurls": {
+                "type": "boolean",
+                "description": "On update, true suppresses Slack link and media previews for this job; false restores normal Slack behavior."
+            },
         },
         "required": ["action"]
     }
@@ -2095,6 +2104,7 @@ def _cronjob_handler(args, **kw):
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
         attach_to_session=args.get("attach_to_session"),
+        suppress_slack_unfurls=args.get("suppress_slack_unfurls"),
         monitor_script=_mon_script,
         monitor_url=_mon_url,
         task_id=kw.get("task_id"),
