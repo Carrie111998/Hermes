@@ -76,6 +76,20 @@ STATUS_EXHAUSTED = "exhausted"
 # login) rewrites the tokens.
 STATUS_DEAD = "dead"
 
+
+class CredentialOwnershipRefused(RuntimeError):
+    code = "INHERITED-CREDENTIAL-OWNER-REFUSAL"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
+class CredentialBrakeRequired(RuntimeError):
+    code = "CREDENTIAL-BRAKE-REQUIRED"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
 # OAuth error reasons that indicate the credential is permanently invalid
 # server-side and cannot be recovered by retry/refresh.  Sourced from
 # OpenAI Codex Responses API, Anthropic, xAI, and Google OAuth spec.
@@ -808,9 +822,18 @@ def _write_through_provider_state_to_global_root(
 
 
 class CredentialPool:
-    def __init__(self, provider: str, entries: List[PooledCredential]):
+    def __init__(
+        self,
+        provider: str,
+        entries: List[PooledCredential],
+        *,
+        persistence_path: Optional[Path] = None,
+        inherited_from_global: bool = False,
+    ):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
+        self._persistence_path = persistence_path
+        self._inherited_from_global = inherited_from_global
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
         # RLock: the mutation primitives below (_replace_entry/_persist)
@@ -942,6 +965,7 @@ class CredentialPool:
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=removed_ids,
+                target_path=self._persistence_path,
             )
 
     def _is_terminal_auth_failure(
@@ -1535,6 +1559,11 @@ class CredentialPool:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        if os.environ.get("HERMES_CREDENTIAL_RECOVERY_SUPPRESSED") == "1":
+            # Read-only health canaries may present the existing access token,
+            # but they cannot refresh, rotate, login, or mutate credential
+            # custody. Surface the kernel brake as a machine-readable refusal.
+            raise CredentialBrakeRequired()
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -2799,6 +2828,12 @@ class CredentialPool:
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
         with self._lock:
+            # A profile may read the global pool as a fallback, but an explicit
+            # remove in that profile must not delete a globally-owned grant.
+            # Return a distinct ownership refusal so CLI/API callers cannot
+            # confuse the global row with an absent profile-local credential.
+            if self._inherited_from_global:
+                raise CredentialOwnershipRefused()
             if index < 1 or index > len(self._entries):
                 return None
             removed = self._entries.pop(index - 1)
@@ -2843,6 +2878,14 @@ class CredentialPool:
 
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
         with self._lock:
+            if self._inherited_from_global:
+                # A deliberate profile add establishes a local pool and thereby
+                # shadows the global fallback. Do not copy inherited credential
+                # bytes into that new profile-local store.
+                self._entries = []
+                self._current_id = None
+                self._persistence_path = None
+                self._inherited_from_global = False
             entry = replace(entry, priority=_next_priority(self._entries))
             self._entries.append(entry)
             self._persist()
@@ -3631,6 +3674,24 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
+    active_store = _load_auth_store()
+    active_pool = active_store.get("credential_pool")
+    active_entries = active_pool.get(provider) if isinstance(active_pool, dict) else None
+    has_active_entries = isinstance(active_entries, list) and bool(active_entries)
+    global_path = _global_auth_file_path()
+    global_entries = None
+    if global_path is not None and not has_active_entries:
+        global_store = auth_mod._load_global_auth_store()
+        global_pool = global_store.get("credential_pool")
+        if isinstance(global_pool, dict):
+            global_entries = global_pool.get(provider)
+    inherited_from_global = bool(
+        global_path is not None
+        and not has_active_entries
+        and isinstance(global_entries, list)
+        and global_entries
+    )
+    persistence_path = global_path if inherited_from_global else None
     raw_entries = read_credential_pool(provider)
     disk_ids = {
         entry.get("id")
@@ -3691,5 +3752,11 @@ def load_pool(provider: str) -> CredentialPool:
             provider,
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
             removed_ids=disk_ids - new_ids,
+            target_path=persistence_path,
         )
-    return CredentialPool(provider, entries)
+    return CredentialPool(
+        provider,
+        entries,
+        persistence_path=persistence_path,
+        inherited_from_global=inherited_from_global,
+    )

@@ -3,7 +3,8 @@
 When ``HERMES_HOME`` points to a named profile, ``read_credential_pool()``
 and ``get_provider_auth_state()`` fall back to the global-root
 ``auth.json`` per-provider when the profile has no entries for that
-provider.  Writes still target the profile only.
+provider. Explicit profile writes stay local; runtime status/refresh writes on
+an inherited row follow the global store that owns it.
 
 See the #18594 follow-up report: profile workers couldn't see providers
 authenticated only at the global root.
@@ -12,6 +13,8 @@ authenticated only at the global root.
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -50,6 +53,25 @@ def profile_env(tmp_path, monkeypatch):
 
 def _write(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2))
+
+
+def _concurrent_write_worker(auth_root: str, entry_id: str, start, results) -> None:
+    os.environ["HERMES_HOME"] = auth_root
+    try:
+        from hermes_cli.auth import write_credential_pool
+
+        start.wait(10)
+        write_credential_pool("openrouter", [{
+            "id": entry_id,
+            "label": entry_id,
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "fixture-" + entry_id,
+        }])
+        results.put(None)
+    except Exception as exc:  # pragma: no cover - reported in parent
+        results.put("%s:%s" % (type(exc).__name__, exc))
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +222,167 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
 
 
+def test_runtime_failure_on_global_fallback_never_materializes_profile_shadow(
+    profile_env,
+):
+    """Runtime status writes follow the store that owns the inherited grant.
+
+    A profile with no local Codex pool reads the global grant. Before this
+    regression fix, a 401 status update persisted that inherited entry into
+    the profile's auth.json. The resulting local row then shadowed every later
+    repair to the global pool.
+    """
+    from agent.credential_pool import STATUS_DEAD, load_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{
+            "id": "glob-codex",
+            "label": "global-codex",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "manual:device_code",
+            "access_token": "global-access",
+            "refresh_token": "global-refresh",
+        }],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+
+    pool = load_pool("openai-codex")
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "glob-codex"
+    pool.mark_exhausted_and_rotate(
+        status_code=401,
+        error_context={"reason": "token_invalidated"},
+    )
+
+    profile_store = json.loads(
+        (profile_env["profile"] / "auth.json").read_text()
+    )
+    assert profile_store.get("credential_pool", {}).get("openai-codex", []) == []
+
+    global_store = json.loads(
+        (profile_env["global"] / "auth.json").read_text()
+    )
+    persisted = global_store["credential_pool"]["openai-codex"][0]
+    assert persisted["id"] == "glob-codex"
+    assert persisted["last_status"] == STATUS_DEAD
+    assert persisted["last_error_reason"] == "token_invalidated"
+
+
+def test_profile_add_shadows_global_without_copying_inherited_secret(profile_env):
+    """An explicit profile add starts a local pool; it never copies globals."""
+    from agent.credential_pool import (
+        AUTH_TYPE_API_KEY,
+        PooledCredential,
+        SOURCE_MANUAL,
+        load_pool,
+    )
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{
+            "id": "glob-openrouter",
+            "label": "global",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "global-secret",
+        }],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+
+    pool = load_pool("openrouter")
+    pool.add_entry(PooledCredential(
+        provider="openrouter",
+        id="profile-openrouter",
+        label="profile",
+        auth_type=AUTH_TYPE_API_KEY,
+        priority=0,
+        source=SOURCE_MANUAL,
+        access_token="profile-secret",
+    ))
+
+    profile_store = json.loads(
+        (profile_env["profile"] / "auth.json").read_text()
+    )
+    rows = profile_store["credential_pool"]["openrouter"]
+    assert [row["id"] for row in rows] == ["profile-openrouter"]
+    assert "global-secret" not in (profile_env["profile"] / "auth.json").read_text()
+
+    global_store = json.loads(
+        (profile_env["global"] / "auth.json").read_text()
+    )
+    assert [
+        row["id"] for row in global_store["credential_pool"]["openrouter"]
+    ] == ["glob-openrouter"]
+
+
+def test_profile_remove_returns_distinct_global_owner_refusal(profile_env):
+    from agent.credential_pool import CredentialOwnershipRefused, load_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{
+            "id": "glob-openrouter",
+            "label": "global",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "global-secret",
+        }],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+
+    pool = load_pool("openrouter")
+    with pytest.raises(
+        CredentialOwnershipRefused,
+        match="INHERITED-CREDENTIAL-OWNER-REFUSAL",
+    ):
+        pool.remove_index(1)
+    assert json.loads(
+        (profile_env["profile"] / "auth.json").read_text()
+    ).get("credential_pool", {}).get("openrouter", []) == []
+
+
+def test_persistence_suppression_makes_canary_write_paths_read_only(
+    profile_env, monkeypatch
+):
+    from hermes_cli.auth import write_credential_pool
+
+    original = _make_auth_store(pool={
+        "openrouter": [_pool_entry(id="original", access_token="original-secret")],
+    })
+    _write(profile_env["profile"] / "auth.json", original)
+    before = (profile_env["profile"] / "auth.json").read_bytes()
+    monkeypatch.setenv("HERMES_CREDENTIAL_PERSISTENCE_SUPPRESSED", "1")
+    write_credential_pool(
+        "openrouter",
+        [_pool_entry(id="replacement", access_token="replacement-secret")],
+    )
+    assert (profile_env["profile"] / "auth.json").read_bytes() == before
+
+
+def test_recovery_suppression_raises_credential_brake(profile_env, monkeypatch):
+    from agent.credential_pool import CredentialBrakeRequired, load_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [{
+            "id": "glob-codex",
+            "label": "global",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "manual:device_code",
+            "access_token": "expired-access",
+            "refresh_token": "must-not-use",
+            "expires_at_ms": 1,
+        }],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+    monkeypatch.setenv("HERMES_CREDENTIAL_RECOVERY_SUPPRESSED", "1")
+    pool = load_pool("openai-codex")
+    with pytest.raises(CredentialBrakeRequired, match="CREDENTIAL-BRAKE-REQUIRED"):
+        pool.try_refresh_matching(credential_id="glob-codex")
+
+
 
 
 def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):
@@ -288,3 +471,52 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+
+
+def test_concurrent_owner_store_writers_are_serialized_and_merged(classic_env):
+    """Two processes cannot tear or last-writer-drop the owner auth store."""
+    _write(classic_env / "auth.json", _make_auth_store(pool={"openrouter": []}))
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_concurrent_write_worker,
+            args=(str(classic_env), entry_id, start, results),
+        )
+        for entry_id in ("writer-a", "writer-b")
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(20)
+        assert process.exitcode == 0
+    assert [results.get(timeout=2), results.get(timeout=2)] == [None, None]
+    persisted = json.loads((classic_env / "auth.json").read_text())
+    assert {row["id"] for row in persisted["credential_pool"]["openrouter"]} == {
+        "writer-a",
+        "writer-b",
+    }
+
+
+def test_crash_before_atomic_replace_preserves_complete_owner_store(
+    classic_env, monkeypatch
+):
+    """A crash after tmpfile fsync but before rename leaves old JSON intact."""
+    import hermes_cli.auth as auth
+
+    original = _make_auth_store(pool={"openrouter": [_pool_entry(id="original")]})
+    _write(classic_env / "auth.json", original)
+    before = (classic_env / "auth.json").read_bytes()
+
+    def crash_before_replace(_source, _destination):
+        raise RuntimeError("fixture-crash-before-rename")
+
+    monkeypatch.setattr(auth, "atomic_replace", crash_before_replace)
+    with pytest.raises(RuntimeError, match="fixture-crash-before-rename"):
+        auth.write_credential_pool(
+            "openrouter", [_pool_entry(id="replacement")]
+        )
+    assert (classic_env / "auth.json").read_bytes() == before
+    assert list(classic_env.glob("auth.json.tmp.*")) == []

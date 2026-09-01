@@ -1700,8 +1700,10 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     ``hermes auth add <provider>`` inside the profile, profile entries
     fully shadow global for that provider on the next read.
 
-    Writes always go to the profile (``write_credential_pool`` is unchanged).
-    See issue #18594 follow-up.
+    Explicit profile writes go to the profile. Runtime persistence for an
+    inherited row passes the global owner path explicitly, so status/refresh
+    updates cannot materialize a profile-local shadow. See issue #18594
+    follow-up.
     """
     auth_store = _load_auth_store()
     pool = auth_store.get("credential_pool")
@@ -1806,6 +1808,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    target_path: Optional[Path] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1824,10 +1827,21 @@ def write_credential_pool(
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
+
+    ``target_path`` is reserved for the profile-fallback runtime: inherited
+    rows persist status/refresh updates to the global store that owns them,
+    rather than materializing a profile-local shadow. Ordinary callers omit it
+    and retain the active-profile write contract.
     """
+    if os.getenv("HERMES_CREDENTIAL_PERSISTENCE_SUPPRESSED") == "1":
+        # Health probes/canaries are observational. They may exercise the
+        # currently loaded access token but can never mark, refresh, resurrect,
+        # add, or remove rows in either the profile or global owner store.
+        return target_path if target_path is not None else _auth_file_path()
+
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1865,7 +1879,7 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+        return _save_auth_store(auth_store, target_path)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
