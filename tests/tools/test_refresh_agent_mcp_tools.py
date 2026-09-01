@@ -337,3 +337,43 @@ def test_refresh_without_preserve_prefix_keeps_rebuilding(monkeypatch):
     mcp_tool.refresh_agent_mcp_tools(agent)
 
     assert [t["function"]["name"] for t in agent.tools] == ["read_file", "terminal"]
+
+
+def test_preserve_prefix_holds_the_prefix_under_concurrent_flapping(monkeypatch):
+    """The merge runs under ``_agent_tools_lock`` — prove it holds up.
+
+    Six threads refresh while one tool's availability probe flips randomly.
+    The invariant is positional, not just set-based: the tools ahead of the
+    flapping one must never move, or the provider re-prefills behind them.
+    """
+    import random
+
+    base = ["a_read", "b_term", "c_web", "d_mem"]
+    flap = {"up": True}
+
+    def _serve_flapping(**_kw):
+        return [_tool(n) for n in base if n != "c_web" or flap["up"]]
+
+    import model_tools
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _serve_flapping)
+    _registered(monkeypatch, base)
+
+    agent = _agent(base)
+    violations = []
+
+    def worker():
+        for _ in range(200):
+            flap["up"] = random.random() > 0.5
+            mcp_tool.refresh_agent_mcp_tools(agent, preserve_prefix=True)
+            names = [t["function"]["name"] for t in agent.tools]
+            if names != base:
+                violations.append(names)
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert violations == []
