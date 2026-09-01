@@ -1698,6 +1698,32 @@ def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
         return True, {}, ""
 
 
+def _canonical_toolset_name(name: str) -> str:
+    """Resolve a skill-authored toolset name to its canonical id.
+
+    Skill frontmatter is hand-authored, so the natural plural ``files`` drifts
+    from the canonical toolset id ``file`` (per ``hermes tools list`` /
+    ``toolsets.py``). Without reconciliation such a skill fails the
+    ``requires_toolsets`` gate in every toolset-filtered session and is silently
+    dropped from the index — no warning, no way to discover why (#99877).
+
+    Reconcile a one-letter singular/plural drift against the known toolset
+    registry. Unknown names are returned unchanged, so a genuine typo still
+    (correctly) gates the skill out rather than being force-matched.
+    """
+    try:
+        from toolsets import TOOLSETS
+    except Exception:
+        return name
+    if name in TOOLSETS:
+        return name
+    if name.endswith("s") and name[:-1] in TOOLSETS:
+        return name[:-1]
+    if (name + "s") in TOOLSETS:
+        return name + "s"
+    return name
+
+
 def _skill_should_show(
     conditions: dict,
     available_tools: "set[str] | None",
@@ -1724,10 +1750,15 @@ def _skill_should_show(
 
     at = available_tools or set()
     ats = available_toolsets or set()
+    # Reconcile the singular/plural toolset-name drift between hand-authored
+    # skill frontmatter and the canonical toolset ids (#99877). Tool names are
+    # exact identifiers with no singular/plural form, so only toolsets are
+    # canonicalized.
+    ats_canon = {_canonical_toolset_name(t) for t in ats}
 
     # fallback_for: hide when the primary tool/toolset IS available
     for ts in conditions.get("fallback_for_toolsets", []):
-        if ts in ats:
+        if _canonical_toolset_name(ts) in ats_canon:
             return False
     for t in conditions.get("fallback_for_tools", []):
         if t in at:
@@ -1735,7 +1766,7 @@ def _skill_should_show(
 
     # requires: hide when a required tool/toolset is NOT available
     for ts in conditions.get("requires_toolsets", []):
-        if ts not in ats:
+        if _canonical_toolset_name(ts) not in ats_canon:
             return False
     for t in conditions.get("requires_tools", []):
         if t not in at:
