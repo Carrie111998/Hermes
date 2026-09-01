@@ -30,8 +30,7 @@ describe('PlatformAvatar brand glyphs', () => {
   ])('renders a real mark for %s', (platformId, platformName) => {
     const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
 
-    expect(container.querySelector('svg, [data-platform-glyph="mask"]')).toBeTruthy()
-    expect(container.querySelector('img')).toBeNull()
+    expect(container.querySelector('svg, img[data-platform-glyph="asset"]')).toBeTruthy()
   })
 
   it('keeps the official Raft two-tone icon-only geometry', () => {
@@ -44,11 +43,12 @@ describe('PlatformAvatar brand glyphs', () => {
     expect(icon?.querySelectorAll('[fill="#FFFAEF"]')).toHaveLength(2)
   })
 
-  it('preserves Slack as a muted four-color mark', () => {
+  it('preserves Slack as the original four-color asset', () => {
     const { container } = render(<PlatformAvatar platformId="slack" platformName="Slack" />)
-    const fills = Array.from(container.querySelectorAll('svg path')).map(path => path.getAttribute('fill'))
+    const icon = container.querySelector('img[data-platform-glyph="asset"]')
 
-    expect(fills).toEqual(['#B56A7A', '#B56A7A', '#6E9FB5', '#6E9FB5', '#6E9A82', '#6E9A82', '#B59A5C', '#B59A5C'])
+    expect(icon).toBeTruthy()
+    expect(icon?.getAttribute('src')).toMatch(/^data:image\/svg\+xml|slack-logo\.svg/)
   })
 
   it('keeps the initial fallback for an unknown platform', () => {
@@ -58,22 +58,27 @@ describe('PlatformAvatar brand glyphs', () => {
     expect(screen.getByText('C')).toBeTruthy()
   })
 
-  it('uses the shared low-saturation field and colored DingTalk mark', () => {
+  it('renders the original DingTalk asset without a mask or color override', () => {
     const { container } = render(<PlatformAvatar platformId="dingtalk" platformName="DingTalk" />)
-    const chip = container.querySelector('span')
+    const icon = container.querySelector('img[data-platform-glyph="asset"]')
 
-    expect(chip?.getAttribute('style')).not.toContain('background-color: rgb(0, 137, 255)')
-    expect(chip?.querySelector('[data-platform-glyph="mask"]')).toBeTruthy()
-    expect(chip?.querySelector('img')).toBeNull()
+    expect(icon).toBeTruthy()
+    expect(icon?.getAttribute('src')).toMatch(/dingtalk-icon\.png/)
+    expect(container.querySelector('[data-platform-glyph="mask"]')).toBeNull()
   })
 
-  it('uses a pale field and black Matrix mark', () => {
+  it('keeps Matrix on the original Simple Icons SVG', () => {
     const { container } = render(<PlatformAvatar platformId="matrix" platformName="Matrix" />)
-    const chip = container.querySelector('span')
-    const icon = chip?.querySelector('svg')
+    const icon = container.querySelector('svg')
 
-    expect(chip?.getAttribute('style')).toContain('background-color: rgb(247, 247, 245)')
     expect(icon).toBeTruthy()
-    expect(icon?.getAttribute('fill')).toBe('currentColor')
+    expect(container.querySelector('img[data-platform-glyph="asset"]')).toBeNull()
+  })
+
+  it('keeps Email on the original Gmail preset', () => {
+    const { container } = render(<PlatformAvatar platformId="email" platformName="Email" />)
+
+    expect(container.querySelector('svg')).toBeTruthy()
+    expect(container.querySelector('img[data-platform-glyph="asset"]')).toBeNull()
   })
 })
