@@ -24,10 +24,15 @@ The SimpleX Chat project does not publish a prebuilt Docker image for the chat c
 ## Start the daemon
 
 ```bash
-simplex-chat -p 5225
+install -d -m 0700 /absolute/path/simplex/files /absolute/path/simplex/temp
+simplex-chat -p 5225 \
+  --files-folder /absolute/path/simplex/files \
+  --temp-folder /absolute/path/simplex/temp
 ```
 
-The daemon listens on WebSocket at `ws://127.0.0.1:5225` by default.
+The daemon listens on WebSocket at `ws://127.0.0.1:5225` by default. Keep the
+files and temporary folders on the same filesystem: SimpleX completes an XFTP
+download with a filesystem rename.
 
 ## Configure Hermes
 
@@ -45,7 +50,7 @@ Add these to `~/.hermes/.env`:
 
 ```
 SIMPLEX_WS_URL=ws://127.0.0.1:5225
-SIMPLEX_FILES_FOLDER=/absolute/path/used/by/simplex-chat
+SIMPLEX_FILES_FOLDER=/absolute/path/simplex/files
 SIMPLEX_ALLOWED_USERS=<contact-id-1>,<contact-id-2>
 SIMPLEX_HOME_CHANNEL=<contact-id>
 SIMPLEX_AUTO_ACCEPT=false

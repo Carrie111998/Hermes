@@ -264,11 +264,15 @@ class SimplexAdapter(BasePlatformAdapter):
         files_folder = os.getenv("SIMPLEX_FILES_FOLDER", "").strip() or str(
             extra.get("files_folder", "") or ""
         ).strip()
-        self.files_folder = (
-            os.path.abspath(os.path.expanduser(files_folder))
-            if files_folder
-            else ""
-        )
+        expanded_files_folder = os.path.expanduser(files_folder)
+        if expanded_files_folder and not os.path.isabs(expanded_files_folder):
+            logger.warning(
+                "SimpleX: ignoring relative SIMPLEX_FILES_FOLDER; configure the "
+                "exact absolute path passed to simplex-chat --files-folder"
+            )
+            self.files_folder = ""
+        else:
+            self.files_folder = expanded_files_folder
         self._file_transfer_timeout = max(
             1.0, float(extra.get("file_transfer_timeout", 300.0))
         )
@@ -316,6 +320,7 @@ class SimplexAdapter(BasePlatformAdapter):
         # consumed when the file finishes downloading.
         self._pending_file_transfers: Dict[int, dict] = {}
         self._file_transfer_tasks: Dict[int, asyncio.Task] = {}
+        self._file_receive_started: set[int] = set()
         self._file_receive_targets: Dict[int, str] = {}
         self._terminal_file_transfers: Dict[int, dict] = {}
         self._owned_media_cleanup_tasks: Dict[str, asyncio.Task] = {}
@@ -340,6 +345,7 @@ class SimplexAdapter(BasePlatformAdapter):
             "file_failures": 0,
             "file_timeouts": 0,
             "late_file_completions": 0,
+            "media_cleanup_failures": 0,
         }
 
         # Direct-message reaction approvals. State is intentionally ephemeral:
@@ -472,6 +478,7 @@ class SimplexAdapter(BasePlatformAdapter):
             )
         self._file_transfer_tasks.clear()
         self._pending_file_transfers.clear()
+        self._file_receive_started.clear()
         self._file_receive_targets.clear()
         self._terminal_file_transfers.clear()
         for path in list(self._owned_media_cleanup_tasks):
@@ -659,6 +666,12 @@ class SimplexAdapter(BasePlatformAdapter):
                         file_id,
                     )
                     return
+                if file_id in self._file_receive_started:
+                    logger.debug(
+                        "SimpleX: ignoring duplicate descriptor for fileId=%s",
+                        file_id,
+                    )
+                    return
                 wrapper = self._normalize_chat_item_wrapper(resp.get("chatItem", {}))
                 if not wrapper:
                     wrapper = self._pending_file_transfers.get(file_id, {})
@@ -669,6 +682,7 @@ class SimplexAdapter(BasePlatformAdapter):
                         file_id,
                     )
                     return
+                self._file_receive_started.add(file_id)
                 self._track_pending_file(file_id, wrapper)
                 inner = wrapper.get("chatItem", {}) if wrapper else {}
                 file_info = inner.get("file", {}) if isinstance(inner, dict) else {}
@@ -977,6 +991,7 @@ class SimplexAdapter(BasePlatformAdapter):
 
     def _mark_file_terminal(self, file_id: int, reason: str) -> Optional[str]:
         """Remember a terminal transfer long enough to reject late duplicates."""
+        self._file_receive_started.discard(file_id)
         target = self._file_receive_targets.pop(file_id, None)
         prior = self._terminal_file_transfers.get(file_id, {})
         if target is None:
@@ -1006,7 +1021,8 @@ class SimplexAdapter(BasePlatformAdapter):
             if os.path.isfile(normalized) or os.path.islink(normalized):
                 os.remove(normalized)
         except OSError:
-            logger.debug(
+            self._diagnostics["media_cleanup_failures"] += 1
+            logger.warning(
                 "SimpleX: failed to remove owned temporary media %s",
                 os.path.basename(normalized),
                 exc_info=True,
@@ -1019,12 +1035,14 @@ class SimplexAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             return
 
-    def _schedule_owned_media_cleanup(self, path: str) -> None:
+    def _schedule_owned_media_cleanup(self, path: str, *, reset: bool = False) -> None:
         """Install a TTL backstop for an adapter-created media path."""
         normalized = os.path.abspath(path)
         existing = self._owned_media_cleanup_tasks.get(normalized)
         if existing and not existing.done():
-            return
+            if not reset:
+                return
+            existing.cancel()
         task = asyncio.create_task(self._expire_owned_media_path(normalized))
         self._owned_media_cleanup_tasks[normalized] = task
 
@@ -1275,10 +1293,29 @@ class SimplexAdapter(BasePlatformAdapter):
             if file_path:
                 file_path = self._resolve_file_path(file_path)
 
+            # A daemon-relative path is only meaningful relative to the exact
+            # --files-folder configured on simplex-chat. Never pass a path
+            # relative to Hermes' unrelated working directory to media tools.
+            if file_path and not os.path.isabs(file_path):
+                reason = (
+                    "SIMPLEX_FILES_FOLDER is required to resolve the daemon's "
+                    "relative attachment path"
+                )
+                if normalized_file_id is not None:
+                    self._pending_file_transfers.pop(normalized_file_id, None)
+                    self._cancel_file_timeout(normalized_file_id)
+                    self._mark_file_terminal(normalized_file_id, reason)
+                self._diagnostics["file_failures"] += 1
+                logger.warning("SimpleX: %s", reason)
+                file_info = None
+                file_path = None
+                if not text:
+                    text = f"[Attachment unavailable: {reason}]"
+
             # XFTP-backed files can arrive before the download completes.
             # Accept exactly once from rcvFileDescrReady; accepting here can
             # race the descriptor and leave the transfer parked indefinitely.
-            if file_id is not None and (
+            if file_info and file_id is not None and (
                 not file_path
                 or file_status_type not in (None, "rcvComplete")
             ):
@@ -1416,7 +1453,10 @@ class SimplexAdapter(BasePlatformAdapter):
             metadata={"is_edit": True} if is_edit else {},
         )
         if owned_media_path and not self.retain_received_files:
-            self._schedule_owned_media_cleanup(owned_media_path)
+            # Descriptor receipt arms a backstop while the transfer is in
+            # flight. Re-arm it at completion so a long-running transfer does
+            # not shorten the consuming turn's cleanup window.
+            self._schedule_owned_media_cleanup(owned_media_path, reset=True)
             setattr(
                 msg_event,
                 "_post_turn_cleanup_callbacks",

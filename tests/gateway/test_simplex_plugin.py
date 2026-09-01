@@ -987,6 +987,54 @@ async def test_descriptor_without_files_folder_never_targets_system_tmp():
 
 
 @pytest.mark.asyncio
+async def test_duplicate_descriptor_is_accepted_once(tmp_path):
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"ws_url": "ws://localhost:5225", "files_folder": str(tmp_path)},
+        )
+    )
+    adapter._receive_file = AsyncMock()
+    adapter.set_authorization_check(lambda *_args: True)
+    wrapper = _make_file_chat_item("", "report.pdf")
+    wrapper["chatItem"]["file"].pop("fileSource")
+    event = {
+        "resp": {
+            "type": "rcvFileDescrReady",
+            "rcvFileTransfer": {"fileId": 7, "fileName": "report.pdf"},
+            "chatItem": wrapper,
+        }
+    }
+
+    await adapter._handle_event(event)
+    await adapter._handle_event(event)
+    await asyncio.gather(*list(adapter._command_tasks))
+
+    adapter._receive_file.assert_awaited_once()
+    assert adapter._file_receive_started == {7}
+
+
+def test_relative_files_folder_configuration_fails_closed(caplog):
+    from gateway.config import PlatformConfig
+
+    with caplog.at_level("WARNING"):
+        adapter = SimplexAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "ws_url": "ws://localhost:5225",
+                    "files_folder": "relative/files",
+                },
+            )
+        )
+
+    assert adapter.files_folder == ""
+    assert "ignoring relative SIMPLEX_FILES_FOLDER" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_relative_completion_without_files_folder_falls_back_to_caption():
     from gateway.config import PlatformConfig
 
@@ -1008,6 +1056,37 @@ async def test_relative_completion_without_files_folder_falls_back_to_caption():
 
     await adapter._handle_event(
         {"resp": {"type": "rcvFileComplete", "chatItem": complete}}
+    )
+    if adapter._pending_text_batch_tasks:
+        await asyncio.gather(*list(adapter._pending_text_batch_tasks.values()))
+
+    assert [event.text for event in captured] == ["here you go"]
+    assert captured[0].media_urls == []
+    assert adapter.get_runtime_diagnostics()["file_failures"] == 1
+
+
+@pytest.mark.asyncio
+async def test_relative_completed_chat_item_falls_back_without_media():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter.set_authorization_check(lambda *_args: True)
+    adapter._text_batch_delay = 0
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "newChatItems",
+                "chatItems": [_make_file_chat_item("report.pdf", "report.pdf")],
+            }
+        }
     )
     if adapter._pending_text_batch_tasks:
         await asyncio.gather(*list(adapter._pending_text_batch_tasks.values()))
@@ -1723,6 +1802,70 @@ async def test_successful_owned_receive_attaches_post_turn_cleanup(tmp_path):
     assert len(callbacks) == 1
     callbacks[0]()
     assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_completed_receive_rearms_cleanup_ttl(tmp_path):
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"ws_url": "ws://localhost:5225", "files_folder": str(tmp_path)},
+        )
+    )
+    adapter.set_authorization_check(lambda *_args: True)
+    adapter._receive_file = AsyncMock()
+    pending = _make_file_chat_item("", "owned.pdf")
+    pending["chatItem"]["file"].pop("fileSource")
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "rcvFileDescrReady",
+                "rcvFileTransfer": {"fileId": 7, "fileName": "owned.pdf"},
+                "chatItem": pending,
+            }
+        }
+    )
+    await asyncio.gather(*list(adapter._command_tasks))
+    target = Path(adapter._receive_file.await_args.args[1])
+    target.write_bytes(b"%PDF")
+    descriptor_task = adapter._owned_media_cleanup_tasks[str(target)]
+
+    complete = _make_file_chat_item(str(target), "owned.pdf")
+    await adapter._handle_event(
+        {"resp": {"type": "rcvFileComplete", "chatItem": complete}}
+    )
+    await _drain_dispatches(adapter)
+    completion_task = adapter._owned_media_cleanup_tasks[str(target)]
+
+    assert completion_task is not descriptor_task
+    assert descriptor_task.done()
+    assert target.exists()
+    await adapter.disconnect()
+
+
+def test_owned_media_cleanup_failure_is_diagnostic(tmp_path, monkeypatch, caplog):
+    import os
+
+    from gateway.config import PlatformConfig
+
+    target = tmp_path / "simplex-rcv-owned.pdf"
+    target.write_bytes(b"%PDF")
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+
+    def fail_remove(_path):
+        raise OSError("cleanup denied")
+
+    monkeypatch.setattr(os, "remove", fail_remove)
+    with caplog.at_level("WARNING"):
+        adapter._cleanup_owned_media_path(str(target))
+
+    assert adapter.get_runtime_diagnostics()["media_cleanup_failures"] == 1
+    assert "failed to remove owned temporary media" in caplog.text
+    assert str(tmp_path) not in caplog.text
 
 
 @pytest.mark.asyncio
