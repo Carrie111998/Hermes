@@ -21,6 +21,7 @@ import { Badge } from "@nous-research/ui/ui/components/badge";
 import { ConfirmDialog } from "@nous-research/ui/ui/components/confirm-dialog";
 import { OAuthLoginModal } from "@/components/OAuthLoginModal";
 import { useI18n } from "@/i18n";
+import { en } from "@/i18n/en";
 
 interface Props {
   onError?: (msg: string) => void;
@@ -66,9 +67,15 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
     api
       .getOAuthProviders()
       .then((resp) => setProviders(resp.providers))
-      .catch((e) => onErrorRef.current?.(`Failed to load providers: ${e}`))
+      .catch((e) =>
+        onErrorRef.current?.(
+          (t.oauth.loadProvidersFailed ?? en.oauth.loadProvidersFailed!)(
+            String(e),
+          ),
+        ),
+      )
       .finally(() => setLoading(false));
-  }, []);
+  }, [t.oauth.loadProvidersFailed]);
 
   useEffect(() => {
     refresh();
@@ -79,10 +86,14 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
     setDisconnectTarget(null);
     try {
       await api.disconnectOAuthProvider(provider.id);
-      onSuccess?.(`${provider.name} ${t.oauth.disconnect.toLowerCase()}ed`);
+      onSuccess?.(
+        (t.oauth.disconnectSuccess ?? en.oauth.disconnectSuccess!)(provider.name),
+      );
       refresh();
     } catch (e) {
-      onError?.(`${t.oauth.disconnect} failed: ${e}`);
+      onError?.(
+        (t.oauth.disconnectFailed ?? en.oauth.disconnectFailed!)(String(e)),
+      );
     } finally {
       setBusyId(null);
     }
@@ -175,7 +186,9 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                     </div>
                     {p.status.logged_in && p.status.token_preview && (
                       <span className="truncate text-xs font-mono-ui text-text-secondary">
-                        <span className="text-text-tertiary">token </span>
+                        <span className="text-text-tertiary">
+                          {t.oauth.tokenLabel ?? en.oauth.tokenLabel!}{" "}
+                        </span>
                         {p.status.token_preview}
                         {p.status.source_label && (
                           <span className="text-text-tertiary">
@@ -220,7 +233,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                       target="_blank"
                       rel="noopener noreferrer"
                       className="inline-flex"
-                      title={`Open ${p.name} docs`}
+                      title={(t.oauth.docsTooltip ?? en.oauth.docsTooltip!)(p.name)}
                     >
                       <Button ghost size="icon">
                         <ExternalLink />
@@ -277,8 +290,12 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
         onConfirm={() => {
           if (disconnectTarget) void handleDisconnect(disconnectTarget);
         }}
-        title={`${t.oauth.disconnect} ${disconnectTarget?.name ?? ""}?`}
-        description={`This will remove the stored OAuth tokens for ${disconnectTarget?.name ?? "this provider"}. You will need to re-authenticate to use it again.`}
+        title={(t.oauth.disconnectConfirmTitle ?? en.oauth.disconnectConfirmTitle!)(
+          disconnectTarget?.name ?? "",
+        )}
+        description={(
+          t.oauth.disconnectConfirmDescription ?? en.oauth.disconnectConfirmDescription!
+        )(disconnectTarget?.name ?? "")}
         destructive
         confirmLabel={t.oauth.disconnect}
       />

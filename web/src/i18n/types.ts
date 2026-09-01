@@ -1,5 +1,6 @@
 export type Locale =
   | "en"
+  | "pl"
   | "zh"
   | "zh-hant"
   | "ja"
@@ -122,6 +123,7 @@ export interface Translations {
     /** NS-656 disk-usage banner — optional, English fallback. */
     diskCriticalBanner?: string;
     diskElevatedBanner?: string;
+    diskFreeSpace?: (megabytes: number) => string;
     dismiss?: string;
   };
 
@@ -442,11 +444,13 @@ export interface Translations {
     enabledOf: string;
     all: string;
     categories: string;
+    /** Known bundled category ids; unknown external ids keep the UI fallback. */
+    categoryLabels?: Record<string, string>;
     filters: string;
     noSkills: string;
     noSkillsMatch: string;
-    skillCount: string;
-    resultCount: string;
+    skillCount: (count: number) => string;
+    resultCount: (count: number) => string;
     noDescription: string;
     toolsets: string;
     toolsetLabel: string;
@@ -458,6 +462,99 @@ export interface Translations {
     profileSelector?: string;
     currentProfile?: string;
     managingProfile?: string;
+    browseHub?: string;
+    learnSkill?: string;
+    newSkill?: string;
+    learnDescription?: string;
+    learnLocalSource?: string;
+    learnLocalPlaceholder?: string;
+    learnUrl?: string;
+    learnUrlPlaceholder?: string;
+    learnNotes?: string;
+    learnNotesPlaceholder?: string;
+    learnCancel?: string;
+    learnSubmit?: string;
+    skillSaved?: (name: string) => string;
+    editSkill?: (name: string) => string;
+    configure?: string;
+    editSkillMd?: string;
+    hub?: {
+      searchPlaceholder: string;
+      search: string;
+      updateAll: string;
+      searchFailed: (error: string) => string;
+      installing: (identifier: string) => string;
+      installFailed: (error: string) => string;
+      updating: string;
+      updateFailed: (error: string) => string;
+      running: string;
+      done: string;
+      dismiss: string;
+      starting: string;
+      featured: string;
+      featuredDescription: string;
+      landingEmpty: string;
+      noMatches: string;
+      connecting: string;
+      sourcesFallback: string;
+      connectedHubs: string;
+      githubRateLimitTooltip: string;
+      indexUnavailableTooltip: string;
+      rateLimitedSuffix: string;
+      results: (count: number) => string;
+      timedOut: (sources: string) => string;
+      openSkill: (name: string) => string;
+      details: string;
+      installed: string;
+      install: string;
+      trustLabels: {
+        trusted: string;
+        builtin: string;
+        community: string;
+        unknown: string;
+      };
+      verdictLabels: {
+        safe: string;
+        caution: string;
+        dangerous: string;
+      };
+      severityLabels: {
+        critical: string;
+        high: string;
+        medium: string;
+        low: string;
+      };
+      dialogDescription: (name: string) => string;
+      previewFailed: (error: string) => string;
+      scanFailed: (error: string) => string;
+      readSkillMd: string;
+      rescan: string;
+      securityScan: string;
+      files: string;
+      emptySkillMd: string;
+      sourceLoadFailed: string;
+      scanning: string;
+      scanPrompt: string;
+      verdict: (label: string) => string;
+      findingSummary: (trust: string, count: number) => string;
+      policyLabels: {
+        allow: string;
+        ask: string;
+        block: string;
+      };
+      severityCount: (label: string, count: number) => string;
+      noRiskyPatterns: string;
+    };
+    editorEditDescription?: string;
+    editorCreateDescription?: string;
+    editorName?: string;
+    editorCategoryOptional?: string;
+    editorNameRequired?: string;
+    editorContentRequired?: string;
+    editorSaving?: string;
+    editorSaveChanges?: string;
+    editorCreateSkill?: string;
+    editorCreateTemplate?: string;
   };
 
   // ── Config page ──
@@ -473,7 +570,7 @@ export interface Translations {
     resetScopeToast: string;
     rawYaml: string;
     searchResults: string;
-    fields: string;
+    fields: (count: number) => string;
     noFieldsMatch: string;
     configSaved: string;
     yamlConfigSaved: string;
@@ -511,7 +608,7 @@ export interface Translations {
     getKey: string;
     hideAdvanced: string;
     hideValue: string;
-    keysCount: string;
+    keysCount: (count: number) => string;
     llmProviders: string;
     notConfigured: string;
     notSet: string;
@@ -523,12 +620,21 @@ export interface Translations {
     showValue: string;
     customTitle: string;
     customHint: string;
-    customConfigured: string;
+    customConfigured: (count: number) => string;
+    configuredCount: (count: number) => string;
+    configuredSummary: (configured: number, total: number) => string;
     addCustomKey: string;
     customKeyName: string;
     customKeyNamePlaceholder: string;
     add: string;
     invalidKeyName: string;
+    sectionProviders?: string;
+    sectionTools?: string;
+    sectionSettings?: string;
+    jumpToSection?: string;
+    keySaved?: (key: string) => string;
+    revealKey?: (key: string) => string;
+    hideKey?: (key: string) => string;
   };
 
   // ── OAuth ──
@@ -571,6 +677,13 @@ export interface Translations {
       external: string;
     };
     expiresIn: string;
+    disconnectSuccess?: (provider: string) => string;
+    disconnectFailed?: (error: string) => string;
+    loadProvidersFailed?: (error: string) => string;
+    docsTooltip?: (provider: string) => string;
+    disconnectConfirmTitle?: (provider: string) => string;
+    disconnectConfirmDescription?: (provider: string) => string;
+    tokenLabel?: string;
   };
 
   // ── Language switcher ──

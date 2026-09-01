@@ -37,6 +37,7 @@ import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
 import { useI18n } from "@/i18n";
+import { en } from "@/i18n/en";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { PluginSlot } from "@/plugins";
 
@@ -81,7 +82,7 @@ function getProviderPriority(groupName: string): number {
   return entry?.priority ?? 99;
 }
 
-interface ProviderGroup {
+export interface ProviderGroup {
   name: string;
   priority: number;
   entries: [string, EnvVarInfo][];
@@ -99,7 +100,7 @@ const CATEGORY_META_ICONS: Record<string, typeof KeyRound> = {
 /*  EnvVarRow — single key edit row                                    */
 /* ------------------------------------------------------------------ */
 
-function EnvVarRow({
+export function EnvVarRow({
   varKey,
   info,
   edits,
@@ -261,7 +262,11 @@ function EnvVarRow({
               size="icon"
               onClick={() => onReveal(varKey)}
               title={isRevealed ? t.env.hideValue : t.env.showValue}
-              aria-label={isRevealed ? `Hide ${varKey}` : `Reveal ${varKey}`}
+              aria-label={
+                isRevealed
+                  ? (t.env.hideKey ?? en.env.hideKey!)(varKey)
+                  : (t.env.revealKey ?? en.env.revealKey!)(varKey)
+              }
             >
               {isRevealed ? <EyeOff /> : <Eye />}
             </Button>
@@ -336,7 +341,7 @@ function EnvVarRow({
 /*  ProviderGroupCard — groups API key + base URL per provider         */
 /* ------------------------------------------------------------------ */
 
-function ProviderGroupCard({
+export function ProviderGroupCard({
   group,
   edits,
   setEdits,
@@ -400,7 +405,7 @@ function ProviderGroupCard({
           </span>
           {hasAnyConfigured && (
             <Badge tone="success" className="text-xs">
-              {configuredCount} {t.common.set.toLowerCase()}
+              {t.env.configuredCount(configuredCount)}
             </Badge>
           )}
         </div>
@@ -417,9 +422,7 @@ function ProviderGroupCard({
             </a>
           )}
           <span className="text-xs text-text-tertiary">
-            {t.env.keysCount
-              .replace("{count}", String(group.entries.length))
-              .replace("{s}", group.entries.length !== 1 ? "s" : "")}
+            {t.env.keysCount(group.entries.length)}
           </span>
         </div>
       </ListItem>
@@ -550,9 +553,7 @@ function CustomKeysCard({
           <CardTitle className="text-base">{t.env.customTitle}</CardTitle>
         </div>
         <CardDescription>
-          {t.env.customConfigured
-            .replace("{count}", String(entries.length))
-            .replace("{s}", entries.length !== 1 ? "s" : "")}
+          {t.env.customConfigured(entries.length)}
         </CardDescription>
         <CardDescription className="text-text-tertiary">
           {t.env.customHint}
@@ -628,14 +629,14 @@ export default function EnvPage() {
   const sections = useMemo(() => {
     const items: { id: string; label: string }[] = [
       { id: "section-oauth", label: "OAuth" },
-      { id: "section-providers", label: "Providers" },
+      { id: "section-providers", label: t.env.sectionProviders ?? en.env.sectionProviders! },
     ];
     if (vars) {
       const categories = ["tool", "messaging", "setting"];
       const CATEGORY_LABELS: Record<string, string> = {
-        tool: "Tools",
+        tool: t.env.sectionTools ?? en.env.sectionTools!,
         messaging: t.common.gateway ?? "Gateway",
-        setting: "Settings",
+        setting: t.env.sectionSettings ?? en.env.sectionSettings!,
       };
       for (const cat of categories) {
         const hasEntries = Object.values(vars).some(
@@ -662,7 +663,7 @@ export default function EnvPage() {
     setAfterTitle(
       <nav
         className="flex shrink-0 flex-nowrap items-center gap-1"
-        aria-label="Jump to section"
+        aria-label={t.env.jumpToSection ?? en.env.jumpToSection}
       >
         {sections.map((s) => (
           <button
@@ -679,7 +680,7 @@ export default function EnvPage() {
     return () => {
       setAfterTitle(null);
     };
-  }, [vars, sections, setAfterTitle]);
+  }, [vars, sections, setAfterTitle, t.env.jumpToSection]);
 
   const handleSave = async (key: string) => {
     const value = edits[key];
@@ -709,7 +710,7 @@ export default function EnvPage() {
         delete n[key];
         return n;
       });
-      showToast(`${key} ${t.common.save.toLowerCase()}d`, "success");
+      showToast((t.env.keySaved ?? en.env.keySaved!)(key), "success");
     } catch (e) {
       showToast(`${t.config.failedToSave} ${key}: ${e}`, "error");
     } finally {
@@ -1008,7 +1009,7 @@ export default function EnvPage() {
 /*  EnvCategoryCard — keys / messaging / settings sections             */
 /* ------------------------------------------------------------------ */
 
-function EnvCategoryCard({
+export function EnvCategoryCard({
   section,
   edits,
   setEdits,
@@ -1080,8 +1081,7 @@ function EnvCategoryCard({
         </div>
 
         <CardDescription>
-          {section.setEntries.length} {t.common.of} {section.totalEntries}{" "}
-          {t.common.configured}
+          {t.env.configuredSummary(section.setEntries.length, section.totalEntries)}
         </CardDescription>
 
         {section.hint && (
