@@ -557,6 +557,22 @@ def get_pool_strategy(provider: str) -> str:
     return STRATEGY_FILL_FIRST
 
 
+def _canon_provider_id(name: str) -> str:
+    """Resolve a provider id through the shared ALIASES map.
+
+    Best-effort: returns the ALIASES-canonical id (``opencode-zen`` →
+    ``opencode``) so the same provider matches under either spelling, and
+    falls back to the input unchanged if the alias map can't be imported.
+    """
+    if not name:
+        return name
+    try:
+        from hermes_cli.providers import normalize_provider
+        return normalize_provider(name)
+    except Exception:
+        return name
+
+
 def credential_pool_matches_provider(
     pool_or_provider: Any,
     provider: Optional[str],
@@ -586,7 +602,17 @@ def credential_pool_matches_provider(
     if not pool_provider or not provider_norm:
         return False
     if not pool_provider.startswith(CUSTOM_POOL_PREFIX):
-        return pool_provider == provider_norm
+        # Canonicalize both sides through the shared ALIASES map before the
+        # literal compare. The pool is seeded from the auth-registry slug
+        # (e.g. ``opencode-zen``), while a ``/model`` switch runs the provider
+        # through ``normalize_provider`` and stores the ALIASES-canonical id
+        # (``opencode``) on the session override. Comparing the two literally
+        # treats the same provider as a mismatch and skips pool rotation / 429
+        # retry / billing recovery for every provider whose canonical id
+        # differs from its slug (#87526). Genuinely different providers still
+        # differ after canonicalization, preserving fallback isolation
+        # (#33088/#33163).
+        return _canon_provider_id(pool_provider) == _canon_provider_id(provider_norm)
     if provider_norm == "custom":
         try:
             matched_pool = get_custom_provider_pool_key(base_url or "")
