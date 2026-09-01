@@ -200,6 +200,18 @@ def build_top_level_parser():
     )
     _inherited_flag(
         parser,
+        "--hindsight-bank",
+        default=None,
+        metavar="BANK",
+        help=(
+            "Force the Hindsight long-term-memory bank id for this invocation. "
+            "Applies to -z/--oneshot and --tui. Overrides the closest "
+            ".hindsight/config.toml `bank_id` and the configured bank_id/"
+            "bank_id_template for this run only."
+        ),
+    )
+    _inherited_flag(
+        parser,
         "--reasoning",
         default=None,
         metavar="LEVEL",
@@ -436,6 +448,16 @@ def build_top_level_parser():
         # `--provider` flag.
         default=argparse.SUPPRESS,
         help="Inference provider (default: auto). Built-in or a user-defined name from `providers:` in config.yaml.",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--hindsight-bank",
+        # Mirrors the top-level flag; SUPPRESS so the subparser only sets the
+        # attribute when the user explicitly passes it after `chat`, matching
+        # `-m/--model` and the other relaunch-inherited flags.
+        default=argparse.SUPPRESS,
+        metavar="BANK",
+        help="Force the Hindsight long-term-memory bank id for this session (overrides .hindsight/config.toml and configured bank_id/bank_id_template).",
     )
     chat_parser.add_argument(
         "-v",
