@@ -770,7 +770,11 @@ export function useSessionActions({
         // unlisted (draft) tab stays out of the session list until its first
         // turn persists and a refresh surfaces it.
         if (listed) {
-          upsertOptimisticSession(created, stored, null, null, null, undefined, capturedRoute)
+          // `cwd` is the workspace this tile was created FOR (already resolved
+          // above). Pass it so the optimistic row lands in the right lane even
+          // when the primary chat sits in another project — `$currentCwd` still
+          // names that other project at this point.
+          upsertOptimisticSession(created, stored, null, null, null, undefined, capturedRoute, cwd)
         }
 
         // A tile lives in its OWN worktree, so it must not run the full

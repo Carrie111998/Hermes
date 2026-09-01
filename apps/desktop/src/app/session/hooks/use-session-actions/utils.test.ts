@@ -8,6 +8,7 @@ import { $activeGatewayProfile } from '@/store/profile'
 import {
   $currentBranch,
   $currentCwd,
+  $sessions,
   setCurrentBranch,
   setCurrentCwd,
   setSelectedStoredSessionId,
@@ -33,7 +34,8 @@ import {
   selectBranchMessages,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
-  toBranchMessages
+  toBranchMessages,
+  upsertOptimisticSession
 } from './utils'
 
 const msg = (id: string, role: ChatMessage['role'], text: string, extra: Partial<ChatMessage> = {}): ChatMessage =>
@@ -1715,5 +1717,73 @@ describe('overlayConcurrentMessageChanges', () => {
       { type: 'text', text: 'partial A' },
       { type: 'text', text: ' + delta B' }
     ])
+  })
+})
+
+describe('upsertOptimisticSession workspace lane', () => {
+  const created = (cwd?: string) =>
+    ({
+      session_id: 'rt-1',
+      stored_session_id: 'sess-new',
+      ...(cwd === undefined ? {} : { info: { cwd } })
+    }) as never
+
+  beforeEach(() => {
+    $sessions.set([])
+    setCurrentCwd('')
+  })
+
+  afterEach(() => {
+    $sessions.set([])
+    setCurrentCwd('')
+  })
+
+  const rowCwd = () => $sessions.get().find(s => s.id === 'sess-new')?.cwd
+
+  // The regression. The sidebar "+" of one project creates a tile while the
+  // main chat sits in ANOTHER project; `$currentCwd` still names the main
+  // chat's folder at that moment, so falling back to it filed the new row in
+  // the wrong project's lane (the session itself ran in the right folder).
+  it('files the row under the workspace it was created for, not the primary chat', () => {
+    setCurrentCwd('/main-chat-project')
+
+    upsertOptimisticSession(created(), 'sess-new', null, null, null, undefined, undefined, '/plus-clicked-project')
+
+    expect(rowCwd()).toBe('/plus-clicked-project')
+  })
+
+  // An empty requested cwd is a DECISION ("New session in Home"), not a missing
+  // value: it must stay detached instead of inheriting the primary chat's path.
+  it('keeps an explicitly detached session detached', () => {
+    setCurrentCwd('/main-chat-project')
+
+    upsertOptimisticSession(created(), 'sess-new', null, null, null, undefined, undefined, '')
+
+    expect(rowCwd()).toBeNull()
+  })
+
+  // The backend may normalise the path it actually used, so its answer wins.
+  it('prefers the create response over the requested workspace', () => {
+    upsertOptimisticSession(
+      created('/normalised/by/backend'),
+      'sess-new',
+      null,
+      null,
+      null,
+      undefined,
+      undefined,
+      '/plus-clicked-project'
+    )
+
+    expect(rowCwd()).toBe('/normalised/by/backend')
+  })
+
+  // Callers that name nothing (a plain new chat) keep the previous behaviour.
+  it('falls back to the composer workspace when no cwd was requested', () => {
+    setCurrentCwd('/main-chat-project')
+
+    upsertOptimisticSession(created(), 'sess-new')
+
+    expect(rowCwd()).toBe('/main-chat-project')
   })
 })

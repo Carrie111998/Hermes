@@ -68,8 +68,14 @@ import {
   openReview,
   REVIEW_PANE_ID
 } from '@/store/review'
-import { $currentCwd, $selectedStoredSessionId, $sessions, $yoloActive, sessionMatchesStoredId } from '@/store/session'
+import {
+  $selectedStoredSessionId,
+  $sessions,
+  $yoloActive,
+  sessionMatchesStoredId
+} from '@/store/session'
 import { watchSessionPins } from '@/store/session-pin-sync'
+import { $focusedWorkspaceCwd } from '@/store/session-states'
 import { watchUnreadWriteGuard } from '@/store/session-unread-remote'
 import { $statusbarVisible } from '@/store/statusbar-prefs'
 import { isBrowserWindow, isHudWindow } from '@/store/windows'
@@ -582,7 +588,14 @@ bindTreeSideVisibility('right', $fileBrowserOpen, setFileBrowserOpen)
 // collapse and the chat absorbs the width; picking a project brings them
 // back. The terminal is NOT workspace-gated: unlike the old shell (where it
 // rode the rail's row and vanished with it), its zone stands on its own.
-const $hasWorkspace = computed($currentCwd, cwd => Boolean(cwd.trim()))
+//
+// `$focusedWorkspaceCwd`, not a bare `Boolean(cwd)`: the pane's own body reads
+// the same derivation, so this gate must too or the pane mounts and renders
+// "No project open" inside itself. It also follows the FOCUSED conversation
+// rather than the `$currentCwd` singleton, so a tile in another project keeps
+// its pane instead of showing the primary chat's tree. See the store for the
+// full note.
+const $hasWorkspace = computed($focusedWorkspaceCwd, cwd => Boolean(cwd))
 
 // The tree pane's own presence tracks ⌘J directly, not just the column's
 // collapse — otherwise a pane revealed into that shared column would drag the

@@ -1249,7 +1249,19 @@ export function upsertOptimisticSession(
   preview: string | null = null,
   parentSessionId: string | null = null,
   lastActive?: number,
-  owner?: null | SessionProfileRoute
+  owner?: null | SessionProfileRoute,
+  /**
+   * Workspace this session was explicitly created FOR, when the caller named
+   * one (the sidebar "+" on a project/worktree lane passes its path straight
+   * into `session.create`). Preferred over the `$currentCwd` fallback below:
+   * that singleton describes the PRIMARY chat, which is a different
+   * conversation in the very case this argument exists for.
+   *
+   * An empty string is a DECISION ("Home / detached"), not a missing value, and
+   * stays detached rather than inheriting the primary chat's folder. Omit the
+   * argument when the caller named nothing.
+   */
+  requestedCwd?: string
 ) {
   const now = lastActive ?? Date.now() / 1000
   // Stamp the profile the session was just created on so the scoped sidebar
@@ -1267,9 +1279,19 @@ export function upsertOptimisticSession(
 
   const session: SessionInfo = {
     // Seed cwd so the grouped sidebar can place the new row in its repo/worktree
-    // lane immediately (the overlay groups by path); fall back to the workspace
-    // the session was just started in when the create response omits it.
-    cwd: created.info?.cwd ?? ($currentCwd.get().trim() || null),
+    // lane immediately (the overlay groups by path).
+    //
+    // Order matters. `$currentCwd` is the LAST resort because it is a shared
+    // singleton naming the PRIMARY chat's folder — when the sidebar "+" of one
+    // project creates a tile while the main chat sits in another, that fallback
+    // filed the new row under the main chat's project and the row appeared in
+    // the wrong lane (the session itself ran in the right folder). The
+    // caller-named workspace is authoritative whenever there is one; the
+    // create response outranks it only because the backend may normalise the
+    // path it actually used.
+    cwd:
+      created.info?.cwd ??
+      (requestedCwd === undefined ? $currentCwd.get().trim() || null : requestedCwd.trim() || null),
     ended_at: null,
     id,
     input_tokens: 0,

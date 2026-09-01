@@ -40,11 +40,14 @@ import { clearAllProviderWaits, clearSessionProviderWait } from './provider-wait
 import {
   $activeSessionId,
   $connection,
+  $currentCwd,
   $lastReadAtBySessionId,
   $selectedStoredSessionId,
   $sessions,
+  $workspaceCwdIsOwned,
   clearReadBaseline,
   getSessionOwnerHint,
+  idsShareLineage,
   knownSessionOwner,
   lineageAliases,
   markSessionRead,
@@ -1867,6 +1870,80 @@ export const $focusedRuntimeId = computed(
 /** The focused session's state slice (undefined while unresolved/unbound). */
 export const $focusedSessionState = computed([$focusedRuntimeId, $sessionStates], (runtimeId, states) =>
   runtimeId ? states[runtimeId] : undefined
+)
+
+/**
+ * Working directory of the FOCUSED conversation — the surface the user is
+ * actually looking at, tile or primary. Every workspace-derived surface that
+ * describes "this chat's project" reads this.
+ *
+ * Three sources, in falling authority:
+ *   1. the focused session's live runtime slice, gated on ownership (during a
+ *      tab switch the runtime id can lag a frame behind the selection, so an
+ *      ungated read paints session A's workspace under session B's tab);
+ *   2. the focused session's stored row, for cold tabs and mid-switch lag;
+ *   3. `$workspaceCwdIsOwned` — the `$currentCwd` singleton, and only when the
+ *      selected conversation owns it.
+ *
+ * Why the first two rungs exist at all: `$currentCwd` describes the PRIMARY
+ * chat. A tile is deliberately excluded from it (`applyRuntimeInfo` with
+ * `foreground: false`) so a tile's folder cannot re-point the main composer's
+ * coding rail. Surfaces that read the singleton alone therefore described the
+ * primary chat while the user had a TILE focused — measured: with a base-image
+ * tile in front, the Files pane listed main-quarkus and its header said
+ * MAIN-QUARKUS, while the statusbar (which already followed the focused
+ * session) correctly said base-image.
+ *
+ * Ownership still gates the singleton rung, because that is the rung which can
+ * name a folder belonging to a conversation the user already left (ae6eb578bb).
+ * It must NOT gate the row rung: a released marker says nothing about the row,
+ * so dropping it too would blank a workspace we do know (416e025c46).
+ */
+export const $focusedWorkspaceCwd = computed(
+  [$focusedSessionState, $focusedStoredSessionId, $selectedStoredSessionId, $sessions, $currentCwd, $workspaceCwdIsOwned],
+  (state, focusedStoredId, selectedStoredId, sessions, primaryCwd, primaryIsOwned) => {
+    const stateCwd = state?.cwd?.trim() || ''
+    const stateStoredId = state?.storedSessionId?.trim() || null
+
+    const liveBelongsToFocus =
+      Boolean(stateCwd) &&
+      (!focusedStoredId ||
+        !stateStoredId ||
+        stateStoredId === focusedStoredId ||
+        idsShareLineage(focusedStoredId, stateStoredId, sessions))
+
+    if (liveBelongsToFocus) {
+      return stateCwd
+    }
+
+    if (focusedStoredId) {
+      const row = sessions.find(s => sessionMatchesStoredId(s, focusedStoredId))
+      const rowCwd = row?.cwd?.trim() || ''
+
+      if (rowCwd) {
+        return rowCwd
+      }
+
+      // A row that EXISTS and names no workspace reads as detached — but only
+      // when nothing better is known. An owned singleton is a positive claim by
+      // this very conversation (`commitWorkspaceCwdForSelectedSession`), and it
+      // outranks a row that is merely not backfilled yet; `cwd` is null on
+      // history rows predating the backfill, so trusting the row here blanked a
+      // workspace the runtime had just confirmed. For a TILE there is no such
+      // claim to fall back on, so it stays detached.
+      const primaryOwnsSingleton = primaryIsOwned && (!selectedStoredId || focusedStoredId === selectedStoredId)
+
+      if (row && !primaryOwnsSingleton) {
+        return ''
+      }
+    }
+
+    // Primary draft / primary chat only. A focused TILE never inherits the
+    // primary's workspace — it stays empty rather than naming another project.
+    const primaryFocused = !focusedStoredId || focusedStoredId === selectedStoredId
+
+    return primaryFocused && primaryIsOwned ? primaryCwd.trim() : ''
+  }
 )
 
 /** A PRIMARY navigation (sidebar resume, route change, new chat) homes focus to

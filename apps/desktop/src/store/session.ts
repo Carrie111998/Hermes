@@ -1340,6 +1340,22 @@ export const commitWorkspaceCwdForSelectedSession = (cwd: string) => {
 export const workspaceCwdBelongsToSelectedSession = (): boolean =>
   ($workspaceCwdOwner.get() ?? null) === ($selectedStoredSessionId.get() ?? null)
 
+/** Reactive form of {@link workspaceCwdBelongsToSelectedSession}, ANDed with
+ *  "there is a path at all" — the one gate every surface that MOUNTS on the
+ *  presence of a workspace should read.
+ *
+ *  Ownership and not just a non-empty path: `$currentCwd` is a shared singleton
+ *  that keeps naming the PREVIOUS conversation until the new one's workspace is
+ *  confirmed (ae6eb578bb). A bare `Boolean(cwd)` therefore answered "yes,
+ *  workspace" for a path the selected conversation does not own, which mounted
+ *  the Files pane while its body — which does ask ownership — rendered
+ *  "No project open" inside it. Two gates on one pane must ask the same
+ *  question. */
+export const $workspaceCwdIsOwned = computed(
+  [$currentCwd, $selectedStoredSessionId, $workspaceCwdOwner],
+  (cwd, selected, owner) => Boolean(cwd.trim()) && (owner ?? null) === (selected ?? null)
+)
+
 export const setNewChatWorkspaceTarget = (next: NewChatWorkspaceTarget): number => {
   const generation = $newChatWorkspaceTargetGeneration.get() + 1
   $newChatWorkspaceTarget.set(next)

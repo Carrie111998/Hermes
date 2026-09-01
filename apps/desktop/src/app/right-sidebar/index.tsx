@@ -13,7 +13,7 @@ import { cn } from '@/lib/utils'
 import { $panesFlipped } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { openPreview } from '@/store/preview'
-import { $currentCwd, $selectedStoredSessionId, $workspaceCwdOwner } from '@/store/session'
+import { $focusedWorkspaceCwd } from '@/store/session-states'
 
 import { SidebarPanelLabel } from '../shell/sidebar-label'
 
@@ -29,14 +29,17 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
   const { t } = useI18n()
   const r = t.rightSidebar
   const panesFlipped = useStore($panesFlipped)
-  const currentCwd = useStore($currentCwd).trim()
-  const selectedStoredSessionId = useStore($selectedStoredSessionId)
-  const workspaceCwdOwner = useStore($workspaceCwdOwner)
 
-  // A transition intentionally retains the old CWD until the new session
-  // confirms its workspace. Do not issue a filesystem read against that path:
-  // under a gateway switch it may belong to a different remote machine.
-  const hasWorkspace = Boolean(currentCwd) && (workspaceCwdOwner ?? null) === (selectedStoredSessionId ?? null)
+  // The FOCUSED conversation's workspace, not the `$currentCwd` singleton. The
+  // singleton describes the PRIMARY chat, so with a tile focused this pane
+  // listed the primary chat's project while the statusbar beside it correctly
+  // named the tile's. `$focusedWorkspaceCwd` is the shared derivation the
+  // statusbar already followed, and it carries the ownership gate for its
+  // singleton rung — a transition intentionally retains the old path until the
+  // new session confirms its workspace, and no filesystem read may go out
+  // against that path (under a gateway switch it may be another machine's).
+  const currentCwd = useStore($focusedWorkspaceCwd)
+  const hasWorkspace = Boolean(currentCwd)
 
   const {
     collapseAll,
