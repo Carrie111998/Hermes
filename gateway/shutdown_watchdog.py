@@ -526,8 +526,8 @@ async def loop_heartbeat_forever(
     # disables the witness, and the payload flag tells probes that staleness is
     # no longer sufficient authority to escalate.
     #
-    # Windows: asyncio.start_unix_server raises (no AF_UNIX event-loop
-    # support), so the witness is PERMANENTLY absent there — the payload
+    # Windows: asyncio.start_unix_server is not attempted (no AF_UNIX
+    # event-loop support), so the witness is PERMANENTLY absent there — the payload
     # records loop_tick_socket=False and every stale-file probe classifies
     # UNKNOWN, never WEDGED. That is deliberate fail-safe: a wedged native
     # Windows gateway keeps the graceful-drain backstop instead of an
@@ -569,9 +569,15 @@ async def loop_heartbeat_forever(
                 logger.debug(
                     "stale loop-tick socket sweep failed", exc_info=True
                 )
-        tick_server = await asyncio.start_unix_server(
-            _tick_socket_handler, path=str(tick_socket_path)
-        )
+            tick_server = await asyncio.start_unix_server(
+                _tick_socket_handler, path=str(tick_socket_path)
+            )
+        else:
+            logger.info(
+                "Loop tick socket witness not armed on %s (no AF_UNIX) — "
+                "stale-loop probes will classify UNKNOWN, never WEDGED",
+                os.name,
+            )
     except Exception:
         tick_server = None
         logger.warning(

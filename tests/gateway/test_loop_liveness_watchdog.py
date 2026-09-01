@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import pathlib
 import inspect
+import os
+import pathlib
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -402,4 +403,31 @@ def test_loop_scheduling_witness_is_served_by_the_loop_itself():
     # thread, so an awaited start_unix_server is structurally loop-owned.
     assert "await asyncio.start_unix_server(" in body, (
         "the loop-scheduling witness socket is not armed by the loop task"
+    )
+
+
+def test_loop_scheduling_witness_skipped_on_windows(tmp_path, monkeypatch):
+    """Windows has no AF_UNIX event-loop support: the witness must be
+    skipped up front rather than attempted-and-failed, so gateway startup
+    logs carry no AttributeError traceback while the loop heartbeat still
+    runs and the payload still records loop_tick_socket=False."""
+    monkeypatch.setattr(os, "name", "nt")
+    info_messages = []
+
+    def _info(msg, *args, **kwargs):
+        info_messages.append(str(msg))
+
+    with patch("gateway.shutdown_watchdog.logger.warning") as warn, patch(
+        "gateway.shutdown_watchdog.logger.info", side_effect=_info
+    ):
+        asyncio.run(
+            loop_heartbeat_forever(
+                interval_s=1.0, home=tmp_path, should_continue=lambda: False
+            )
+        )
+    # The old code reached the failed-bind except path on Windows (the
+    # AttributeError traceback in gateway logs); the guarded code must not.
+    warn.assert_not_called()
+    assert any(
+        "Loop tick socket witness not armed" in m for m in info_messages
     )
