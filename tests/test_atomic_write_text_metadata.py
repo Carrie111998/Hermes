@@ -100,6 +100,27 @@ class TestPreserveMode:
 
         assert events == [("fchown", 123, 456), ("replace",)]
 
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX file descriptors")
+    def test_metadata_is_applied_after_content_is_complete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Do not expose a partially-written temp file to its preserved owner."""
+        target = tmp_path / "credentials.env"
+        target.write_text("old\n", encoding="utf-8")
+
+        observed_content = []
+        monkeypatch.setattr("utils._preserve_file_owner", lambda _path: (123, 456))
+
+        def inspect_before_chown(fd, _uid, _gid):
+            observed_content.append(os.pread(fd, 1024, 0))
+
+        monkeypatch.setattr("utils.os.fchown", inspect_before_chown)
+        monkeypatch.setattr("utils.os.chown", lambda *_args: None)
+
+        atomic_write_text(target, "complete-secret\n", preserve_mode=True)
+
+        assert observed_content == [b"complete-secret\n"]
+
     def test_fchmod_failure_falls_back_after_replace(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

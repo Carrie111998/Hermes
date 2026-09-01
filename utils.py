@@ -324,6 +324,11 @@ def atomic_write_text(
     mode_applied_before_replace = False
     try:
         with os.fdopen(fd, "w", encoding=encoding) as handle:
+            # Keep mkstemp's owner-only mode while content is incomplete. Apply
+            # preserved metadata only after the full payload is buffered, but
+            # still before fsync + replace so the target lands atomically.
+            handle.write(content)
+            handle.flush()
             if original_owner is not None and hasattr(os, "fchown"):
                 try:
                     os.fchown(handle.fileno(), original_owner[0], original_owner[1])
@@ -338,8 +343,6 @@ def atomic_write_text(
                     mode_applied_before_replace = True
                 except (OSError, NotImplementedError):
                     pass
-            handle.write(content)
-            handle.flush()
             os.fsync(handle.fileno())
         real_path = atomic_replace(tmp_path, path)
         if preserve_mode:
