@@ -123,10 +123,55 @@ class TestAppendToSqlite:
         """Verify _append_to_sqlite closes the SessionDB connection."""
         from gateway.mirror import _append_to_sqlite
         mock_db = MagicMock()
+        mock_db.get_session.return_value = {"id": "sess_1", "ended_at": None}
 
         with patch("hermes_state.SessionDB", return_value=mock_db):
             _append_to_sqlite("sess_1", {"role": "assistant", "content": "hello"})
 
         mock_db.append_message.assert_called_once()
         mock_db.close.assert_called_once()
+
+    def test_refuses_to_write_into_ended_session(self):
+        """#100177: after a session_reset expiry the routing entry still
+        points at the ended session, so cron deliveries / hermes send were
+        appended to a dead transcript and lost when the #54878 self-heal
+        started a fresh session. The append must be refused, not silent."""
+        from gateway.mirror import _append_to_sqlite
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {
+            "id": "sess_dead",
+            "ended_at": 1_756_000_000.0,
+            "end_reason": "session_reset",
+        }
+
+        with patch("hermes_state.SessionDB", return_value=mock_db):
+            _append_to_sqlite("sess_dead", {"role": "user", "content": "brief"})
+
+        mock_db.append_message.assert_not_called()
+        mock_db.close.assert_called_once()
+
+    def test_writes_when_session_lookup_fails(self):
+        """A lookup failure must not block the delivery — a mirror that
+        can't verify the session is better than a lost message."""
+        from gateway.mirror import _append_to_sqlite
+        mock_db = MagicMock()
+        mock_db.get_session.side_effect = RuntimeError("db busy")
+
+        with patch("hermes_state.SessionDB", return_value=mock_db):
+            _append_to_sqlite("sess_1", {"role": "user", "content": "brief"})
+
+        mock_db.append_message.assert_called_once()
+        mock_db.close.assert_called_once()
+
+    def test_writes_when_session_row_missing(self):
+        """No row (deterministic seed session not yet created) still writes —
+        append_message creates the row, which is the seeded-cron path."""
+        from gateway.mirror import _append_to_sqlite
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = None
+
+        with patch("hermes_state.SessionDB", return_value=mock_db):
+            _append_to_sqlite("sess_new", {"role": "user", "content": "brief"})
+
+        mock_db.append_message.assert_called_once()
 
