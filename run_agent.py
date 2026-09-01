@@ -7995,6 +7995,25 @@ class AIAgent:
             opts = self._lmstudio_reasoning_options_cached()
             # "off-only" (or absent) means no real reasoning capability.
             return any(opt and opt != "off" for opt in opts)
+        # Local Ollama-compatible routes use the native /api/show capability
+        # list. Handle both explicit custom routes and the ollama-launch alias
+        # so the custom profile can distinguish a thinking model from one that
+        # rejects every reasoning field.
+        if (self.provider or "").strip().lower() in {
+            "custom",
+            "ollama",
+            "ollama-launch",
+            "local",
+        }:
+            try:
+                from plugins.model_providers.custom import _looks_like_ollama_endpoint
+
+                if _looks_like_ollama_endpoint(self.base_url):
+                    return self._ollama_supports_thinking_cached()
+            except Exception:
+                # Capability discovery is advisory and must not make startup
+                # fail. The custom profile treats False as fail-closed.
+                return False
         # Ollama Cloud (and any Ollama-compatible server): the native
         # /api/show capabilities list is authoritative — emit reasoning_effort
         # only for models that declare the "thinking" capability. deepseek-v4
