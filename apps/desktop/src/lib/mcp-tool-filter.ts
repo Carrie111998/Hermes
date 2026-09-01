@@ -28,19 +28,20 @@ export function readToolsFilter(server: ServerConfig | null | undefined): McpToo
 export function isToolEnabled(server: ServerConfig | null | undefined, name: string): boolean {
   const { exclude, include } = readToolsFilter(server)
 
-  return include?.length ? include.includes(name) : !exclude?.includes(name)
+  return include !== undefined ? include.includes(name) : !exclude?.includes(name)
 }
 
 // Toggle one tool, preserving the config's mode (include if present, else an
-// exclude denylist). Empty lists — and an emptied `tools` — are dropped.
+// exclude denylist). An empty include is preserved because it means none;
+// empty excludes — and an otherwise emptied `tools` — are dropped.
 export function toggleToolInServer(server: ServerConfig, name: string): ServerConfig {
   const { exclude, include } = readToolsFilter(server)
-  const key = include?.length ? 'include' : 'exclude'
+  const key = include !== undefined ? 'include' : 'exclude'
   const current = (key === 'include' ? include : exclude) ?? []
   const names = current.includes(name) ? current.filter(n => n !== name) : [...current, name]
   const tools = { ...toolsObject(server) }
 
-  if (names.length) {
+  if (names.length || key === 'include') {
     tools[key] = names
   } else {
     delete tools[key]

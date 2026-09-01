@@ -217,26 +217,55 @@ _CFG_DOTTED_RE = re.compile(
     rf"={_CFG_VALUE}",
     re.IGNORECASE,
 )
-# Line-anchored bare key: ``password=…`` / ``export api_key=…`` at start of line.
+# Line-anchored bare key: ``password = …`` / ``export api_key=…`` at start of
+# line. Whitespace around ``=`` is captured separately so TOML formatting is
+# preserved in redacted file-tool output.
 _CFG_ANCHORED_RE = re.compile(
-    rf"(^[ \t]*(?:export[ \t]+)?[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)={_CFG_VALUE}",
+    rf"(?P<anchored_key>^[ \t]*(?:\d+\|)?[ \t]*(?:export[ \t]+)?"
+    rf"[A-Za-z0-9_\-]*{_SECRET_CFG_NAMES}[A-Za-z0-9_\-]*)"
+    rf"(?P<anchored_sep>[ \t]*=[ \t]*)(?P<anchored_quote>['\"]?)"
+    rf"(?P<anchored_value>[^\s&]+?)(?P=anchored_quote)(?=[\s&]|$)",
     re.IGNORECASE | re.MULTILINE,
 )
 
-# Unquoted YAML / colon config (e.g. ``password: secret``,
-# ``spring.datasource.password: hunter2``). The secret keyword must be part of
-# the KEY (anchored to the start of the line/indent), and the value is a single
-# whitespace-free token — so prose like ``note: secret meeting`` (keyword in the
-# value) and ``error: token expired`` are left alone. Bare ``auth`` is excluded
-# from the key set so ``Authorization:`` / ``author:`` don't match (the former
-# is masked by _AUTH_HEADER_RE); ``auth_token``/``auth-token`` still match via
-# the ``token`` keyword. Quoted values defer to _JSON_FIELD_RE via the lookahead.
-_YAML_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential)"
-# NOTE(perf): possessive quantifiers wherever the successor is disjoint; the
-# leading ``[A-Za-z0-9_.\-]*`` stays backtrackable (see _CFG_DOTTED_RE note).
+# TOML assignments permit whitespace around ``=`` and bare, basic-string, or
+# literal-string key segments. Keep this line-anchored and use possessive
+# quantifiers so malformed/very long quoted keys cannot trigger expensive
+# backtracking. This parser is only applied to file-tool output from .toml
+# paths; source-code examples retain the conservative code-file behavior.
+_TOML_KEY_SEGMENT = r'(?:[A-Za-z0-9_-]++|"(?:\\[^\r\n]|[^"\\\r\n])*+"|\'[^\'\r\n]*+\')'
+_TOML_SECRET_ASSIGN_RE = re.compile(
+    rf"(?P<toml_prefix>^[ \t]*(?:\d+\|)?[ \t]*)"
+    rf"(?P<toml_key>{_TOML_KEY_SEGMENT}"
+    rf"(?:[ \t]*+\.[ \t]*+{_TOML_KEY_SEGMENT})*+)"
+    rf"(?P<toml_sep>[ \t]*+=[ \t]*+)"
+    rf"(?:"
+    rf'(?P<toml_dquote>")(?P<toml_dvalue>(?:\\[^\r\n]|[^"\\\r\n])*+)"'
+    rf"|(?P<toml_squote>')(?P<toml_svalue>[^'\r\n]*+)'"
+    rf"|(?P<toml_bvalue>[^ \t\r\n#]++)"
+    rf")",
+    re.MULTILINE,
+)
+_TOML_INLINE_KEY_RE = re.compile(
+    rf"(?P<toml_inline_key>{_TOML_KEY_SEGMENT}"
+    rf"(?:[ \t]*+\.[ \t]*+{_TOML_KEY_SEGMENT})*+)"
+    rf"(?P<toml_inline_sep>[ \t]*+=[ \t]*+)",
+)
+
+
+# YAML / colon config assignments. Keys may be plain scalars or single-/double-
+# quoted scalars; quoted keys are common when they contain dots. Keep the match
+# line-anchored and newline-bounded so prose/source snippets do not become a
+# broader redaction surface. Secret semantics are validated from the decoded-ish
+# key spelling in the callback rather than embedded in this structural regex.
+_YAML_KEY = r'(?:[A-Za-z0-9_.\-]++|"(?:\\[^\r\n]|[^"\\\r\n])*+"|\'(?:\'\'|[^\'\r\n])*+\')'
 _YAML_ASSIGN_RE = re.compile(
-    rf"(^[ \t]*+[A-Za-z0-9_.\-]*{_YAML_CFG_NAMES}[A-Za-z0-9_.\-]*+)(:[ \t]*+)(?!['\"])([^\s&]++)",
-    re.IGNORECASE | re.MULTILINE,
+    rf"(?P<yaml_prefix>^[ \t]*+(?:\d+\|)?[ \t]*+)"
+    rf"(?P<yaml_key>{_YAML_KEY})"
+    rf"(?P<yaml_sep>:[ \t]*+)"
+    rf"(?P<yaml_quote>['\"]?)(?P<yaml_value>[^\s&]+?)(?P=yaml_quote)"
+    rf"(?=[\s&]|$)",
+    re.MULTILINE,
 )
 
 # Word-boundary validation for the mixed/lowercase key patterns above
@@ -326,12 +355,117 @@ def _key_has_secret_keyword(key: str) -> bool:
             return True
     return False
 
-# JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
+# JSON field pattern. Match bounded key names and a complete JSON string value,
+# including escaped quotes/backslashes. Stopping at the first escaped quote can
+# leak the remaining tail and turn otherwise valid JSON into invalid output.
+_JSON_STRING_BODY = r'(?:\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})|[^"\\\x00-\x1f])*+'
 _JSON_FIELD_RE = re.compile(
-    rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
-    re.IGNORECASE,
+    rf'(?P<json_key>"(?P<json_key_name>[A-Za-z0-9_.-]{{1,128}})")'
+    rf'(?P<json_sep>\s*+:\s*+)"(?P<json_value>{_JSON_STRING_BODY})"',
 )
+
+def _toml_string_end(text: str, start: int) -> tuple[int, int] | None:
+    """Return ``(exclusive_end, quote_width)`` for a TOML string at *start*.
+
+    The scan is linear and newline-bounded for ordinary strings. Triple-quoted
+    strings are recognized so braces inside them are never mistaken for inline
+    tables, even though inline-table secret values currently use scalar strings.
+    """
+    quote = text[start]
+    width = 3 if text.startswith(quote * 3, start) else 1
+    i = start + width
+    while i < len(text):
+        if text.startswith(quote * width, i):
+            return i + width, width
+        if quote == '"' and text[i] == "\\":
+            i += 2
+            continue
+        if width == 1 and text[i] in "\r\n":
+            return None
+        i += 1
+    return None
+
+
+def _redact_toml_inline_tables(text: str, value_mask) -> str:
+    """Redact scalar secret assignments inside structural TOML inline tables.
+
+    This small scanner tracks table/array nesting and skips strings and comments,
+    so dict-like text inside an ordinary TOML string is not treated as syntax.
+    Key and scalar-value token regexes are line-bounded and possessive; the
+    surrounding scan is iterative and linear rather than recursively parsing
+    nested inline tables.
+    """
+    stack: list[list[object]] = []  # [container delimiter, expects_key]
+    replacements: list[tuple[int, int, str]] = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+
+        if ch == "#":
+            newline = text.find("\n", i + 1)
+            i = len(text) if newline == -1 else newline + 1
+            continue
+
+        if stack and stack[-1][0] == "{" and stack[-1][1]:
+            if ch in " \t":
+                i += 1
+                continue
+            key_match = _TOML_INLINE_KEY_RE.match(text, i)
+            stack[-1][1] = False
+            if key_match:
+                key = key_match.group("toml_inline_key")
+                i = key_match.end()
+                if _key_has_secret_keyword(key) and i < len(text):
+                    if text[i] in "\"'":
+                        string_info = _toml_string_end(text, i)
+                        if string_info is not None:
+                            end, quote_width = string_info
+                            value_start = i + quote_width
+                            value_end = end - quote_width
+                            value = text[value_start:value_end]
+                            if not _ENV_LOOKUP_VALUE_RE.match(value):
+                                replacements.append(
+                                    (value_start, value_end, value_mask(value))
+                                )
+                            i = end
+                            continue
+                    else:
+                        value_end = i
+                        while (
+                            value_end < len(text)
+                            and text[value_end] not in " \t\r\n,#}"
+                        ):
+                            value_end += 1
+                        if value_end > i:
+                            value = text[i:value_end]
+                            if not _ENV_LOOKUP_VALUE_RE.match(value):
+                                replacements.append((i, value_end, value_mask(value)))
+                            i = value_end
+                            continue
+                continue
+
+        if ch in "\"'":
+            string_info = _toml_string_end(text, i)
+            if string_info is None:
+                break
+            i = string_info[0]
+            continue
+        if ch == "{":
+            stack.append(["{", True])
+        elif ch == "[":
+            stack.append(["[", False])
+        elif ch == "}" and stack and stack[-1][0] == "{":
+            stack.pop()
+        elif ch == "]" and stack and stack[-1][0] == "[":
+            stack.pop()
+        elif ch == "," and stack and stack[-1][0] == "{":
+            stack[-1][1] = True
+        i += 1
+
+    for start, end, replacement in reversed(replacements):
+        text = text[:start] + replacement + text[end:]
+    return text
+
 
 # Authorization headers — any scheme (Bearer, Basic, Token, Digest, …) plus the
 # bare-credential form, and Proxy-Authorization. The credential token is masked
@@ -782,12 +916,88 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
+def _mask_file_value(token: str) -> str:
+    """Mask file values without collapsing an existing non-reusable sentinel."""
+    if token == "«redacted-secret»" or (
+        token.startswith("«redacted:") and token.endswith("…»")
+    ):
+        return token
+    return _mask_token_nonreusable(token)
+
+
+_CONFIG_FILE_EXTENSIONS = frozenset({
+    ".cfg", ".conf", ".env", ".ini", ".json", ".properties", ".toml",
+    ".yaml", ".yml",
+})
+_CONFIG_VARIANT_EXTENSIONS = frozenset({".example", ".local", ".sample"})
+_CONFIG_BASENAME_WORDS = frozenset({"config", "configuration", "settings"})
+
+
+def is_config_like_path(path: object) -> bool:
+    """Return whether ``path`` names a configuration/settings data file."""
+    if not path:
+        return False
+    basename = str(path).replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if basename == ".env" or basename.startswith(".env."):
+        return True
+    extension = os.path.splitext(basename)[1]
+    if extension in _CONFIG_FILE_EXTENSIONS:
+        return True
+    words = re.split(r"[^a-z0-9]+", basename)
+    has_config_word = any(word in _CONFIG_BASENAME_WORDS for word in words)
+    if extension in _CONFIG_VARIANT_EXTENSIONS:
+        return has_config_word
+    # Unknown explicit extensions are source/data by default. This covers the
+    # broad and evolving set of code extensions (mjs/cjs/mts/cts included)
+    # without maintaining another finite allowlist. Extensionless config and
+    # settings basenames still use the conservative word fallback below.
+    if extension:
+        return False
+    return has_config_word
+
+
+def redact_patch_text(
+    text: str,
+    file_paths: tuple | list = (),
+    *,
+    force: bool = False,
+) -> str:
+    """Redact a unified diff using each section's target-file policy."""
+    if not text:
+        return text
+    paths = [str(path) for path in (file_paths or ()) if path]
+    current_path = paths[0] if len(paths) == 1 else None
+    redacted_lines = []
+    for line in text.splitlines(keepends=True):
+        if line.startswith(("--- ", "+++ ")):
+            candidate = line[4:].split("\t", 1)[0].strip()
+            if candidate != "/dev/null":
+                if candidate.startswith(("a/", "b/")):
+                    candidate = candidate[2:]
+                current_path = candidate
+            redacted_lines.append(line)
+            continue
+
+        if line[:1] in {"+", "-", " "}:
+            prefix, payload = line[:1], line[1:]
+            redacted_lines.append(prefix + redact_sensitive_text(
+                payload,
+                force=force,
+                file_read=True,
+                file_path=current_path,
+            ))
+        else:
+            redacted_lines.append(line)
+    return "".join(redacted_lines)
+
+
 def redact_sensitive_text(
     text: str,
     *,
     force: bool = False,
     code_file: bool = False,
     file_read: bool = False,
+    file_path: object = None,
     redact_url_credentials: bool = False,
 ) -> str:
     """Apply all redaction patterns to a block of text.
@@ -815,8 +1025,9 @@ def redact_sensitive_text(
     an agent reading it from config.yaml and writing it back silently corrupted
     the stored credential into a dead 13-char value → 401 (issue #35519). The
     sentinel is syntactically invalid as a token, so it can't be mistaken for a
-    usable key or written back as one. Implies code_file=True (config/data
-    files shouldn't trigger the source-code ENV/JSON false-positive paths).
+    usable key or written back as one. Pass ``file_path`` when available so
+    configuration/settings data files can use generic key-name redaction while
+    source files retain the conservative ``code_file`` behavior.
 
     Performance: each regex pattern is gated behind a cheap substring
     pre-check (e.g. ``"=" in text`` for ENV assignments, ``"://" in text``
@@ -836,10 +1047,49 @@ def redact_sensitive_text(
     if not (force or _REDACT_ENABLED):
         return text
 
-    # file_read content shouldn't hit the source-code ENV/JSON false-positive
-    # paths either (it's config/data, not log lines).
+    # File content defaults to the conservative source-code path. Configuration
+    # files are the exception: opaque values under secret-bearing keys are more
+    # likely credentials than examples, so enable the ENV/JSON/YAML passes.
     if file_read:
-        code_file = True
+        code_file = not is_config_like_path(file_path)
+
+    value_mask = _mask_file_value if file_read else _mask_token
+
+    # TOML's assignment grammar allows whitespace around ``=`` and quoted key
+    # segments, neither of which the generic dotted/bare config regexes fully
+    # cover. Restrict this richer parser to actual .toml file-tool surfaces so
+    # quoted assignment examples in source code remain editable.
+    if (
+        file_read
+        and os.path.splitext(str(file_path or ""))[1].casefold() == ".toml"
+        and "=" in text
+        and _CFG_SECRET_WORD_RE.search(text)
+    ):
+
+        def _redact_toml_assignment(m):
+            key = m.group("toml_key")
+            if not _key_has_secret_keyword(key):
+                return m.group(0)
+
+            if m.group("toml_dvalue") is not None:
+                quote = m.group("toml_dquote")
+                value = m.group("toml_dvalue")
+            elif m.group("toml_svalue") is not None:
+                quote = m.group("toml_squote")
+                value = m.group("toml_svalue")
+            else:
+                quote = ""
+                value = m.group("toml_bvalue")
+
+            if _ENV_LOOKUP_VALUE_RE.match(value):
+                return m.group(0)
+            return (
+                f"{m.group('toml_prefix')}{key}{m.group('toml_sep')}"
+                f"{quote}{value_mask(value)}{quote}"
+            )
+
+        text = _TOML_SECRET_ASSIGN_RE.sub(_redact_toml_assignment, text)
+        text = _redact_toml_inline_tables(text, value_mask)
 
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
@@ -870,7 +1120,7 @@ def redact_sensitive_text(
                 # embedded matching inside the helper.
                 if not _key_has_secret_keyword(name):
                     return m.group(0)
-                return f"{name}={quote}{_mask_token(value)}{quote}"
+                return f"{name}={quote}{value_mask(value)}{quote}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
             # Lowercase env names (``openai_key=…``). Skip URLs — the query
             # string may contain ``token=``/``key=`` params that are
@@ -894,26 +1144,52 @@ def redact_sensitive_text(
             # text.
             if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
                 text = _CFG_DOTTED_RE.sub(_redact_env, text)
-                text = _CFG_ANCHORED_RE.sub(_redact_env, text)
+
+                def _redact_anchored(m):
+                    key = m.group("anchored_key")
+                    value = m.group("anchored_value")
+                    if _ENV_LOOKUP_VALUE_RE.match(value):
+                        return m.group(0)
+                    if not _key_has_secret_keyword(key):
+                        return m.group(0)
+                    sep = m.group("anchored_sep")
+                    quote = m.group("anchored_quote")
+                    return f"{key}{sep}{quote}{value_mask(value)}{quote}"
+
+                text = _CFG_ANCHORED_RE.sub(_redact_anchored, text)
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         if ":" in text and '"' in text:
             def _redact_json(m):
-                key, value = m.group(1), m.group(2)
+                key = m.group("json_key")
+                key_name = m.group("json_key_name")
+                sep = m.group("json_sep")
+                value = m.group("json_value")
                 # Same programmatic-env-lookup exception as _redact_env above
                 # (issue #2852): "apiKey": "os.getenv('X')" is a code snippet,
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f'{key}: "{_mask_token(value)}"'
+                if key_name.casefold() != "bearer" and not _key_has_secret_keyword(key_name):
+                    return m.group(0)
+                return f'{key}{sep}"{value_mask(value)}"'
             text = _JSON_FIELD_RE.sub(_redact_json, text)
 
-        # Unquoted YAML / colon config: password: ***  (after JSON so quoted
-        # values are handled there; the lookahead in _YAML_ASSIGN_RE skips
-        # quotes). Skip URLs — web-URL query params pass through by design.
-        if ":" in text and "://" not in text:
+        # YAML / colon config: password: *** (quoted or unquoted scalar).
+        # Skip URLs — web-URL query params pass through by design.
+        if (
+            ":" in text
+            and "://" not in text
+            and _CFG_SECRET_WORD_RE.search(text)
+        ):
             def _redact_yaml(m):
-                key, sep, value = m.group(1), m.group(2), m.group(3)
+                prefix, key, sep, quote, value = (
+                    m.group("yaml_prefix"),
+                    m.group("yaml_key"),
+                    m.group("yaml_sep"),
+                    m.group("yaml_quote"),
+                    m.group("yaml_value"),
+                )
                 # Same programmatic-env-lookup exception as _redact_env above
                 # (issue #2852): api_key: os.getenv('X') is a code snippet,
                 # not a leaked secret value.
@@ -924,7 +1200,7 @@ def redact_sensitive_text(
                 # document text, not credentials (nearai/ironclaw#6129).
                 if not _key_has_secret_keyword(key):
                     return m.group(0)
-                return f"{key}{sep}{_mask_token(value)}"
+                return f"{prefix}{key}{sep}{quote}{value_mask(value)}{quote}"
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after

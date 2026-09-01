@@ -20,6 +20,10 @@ describe('isToolEnabled', () => {
     expect(isToolEnabled({ command: 'x' }, 'anything')).toBe(true)
   })
 
+  it('disables everything with an explicit empty include', () => {
+    expect(isToolEnabled({ tools: { include: [] } }, 'anything')).toBe(false)
+  })
+
   it('include wins over exclude', () => {
     const server = { tools: { exclude: ['a'], include: ['a'] } }
     expect(isToolEnabled(server, 'a')).toBe(true)
@@ -54,6 +58,16 @@ describe('toggleToolInServer', () => {
     expect(next.tools).toEqual({ include: ['b', 'a'] })
   })
 
+  it('respects explicit empty include mode when re-enabling a tool', () => {
+    const next = toggleToolInServer({ tools: { include: [] } }, 'a')
+    expect(next.tools).toEqual({ include: ['a'] })
+  })
+
+  it('preserves an empty include after disabling its last tool', () => {
+    const next = toggleToolInServer({ tools: { include: ['a'] } }, 'a')
+    expect(next.tools).toEqual({ include: [] })
+  })
+
   it('preserves sibling tools keys like resources/prompts', () => {
     const next = toggleToolInServer({ tools: { resources: false } }, 'a')
     expect(next.tools).toEqual({ exclude: ['a'], resources: false })
@@ -70,5 +84,9 @@ describe('countEnabledTools', () => {
   it('counts enabled tools out of a discovered list', () => {
     const server = { tools: { exclude: ['b'] } }
     expect(countEnabledTools(server, ['a', 'b', 'c'])).toBe(2)
+  })
+
+  it('counts zero for an explicit empty include', () => {
+    expect(countEnabledTools({ tools: { include: [] } }, ['a', 'b'])).toBe(0)
   })
 })

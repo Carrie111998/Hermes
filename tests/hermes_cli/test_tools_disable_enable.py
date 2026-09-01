@@ -65,6 +65,33 @@ class TestToolsList:
         assert "github" in out
         assert "create_issue" in out
 
+    def test_list_explicit_empty_include_reports_zero_selected(self, capsys):
+        config = {
+            "mcp_servers": {"smart-web": {"tools": {"include": []}}},
+        }
+        with patch("hermes_cli.tools_config.load_config", return_value=config):
+            tools_disable_enable_command(Namespace(tools_action="list", platform="cli"))
+        out = capsys.readouterr().out
+        assert "smart-web" in out
+        assert "0 selected" in out
+
+    def test_list_absent_include_reports_all_tools_enabled(self, capsys):
+        config = {"mcp_servers": {"smart-web": {}}}
+        with patch("hermes_cli.tools_config.load_config", return_value=config):
+            tools_disable_enable_command(Namespace(tools_action="list", platform="cli"))
+        out = capsys.readouterr().out
+        assert "smart-web" in out
+        assert "all tools enabled" in out
+
+    def test_list_nonempty_include_reports_selected_tools(self, capsys):
+        config = {
+            "mcp_servers": {"smart-web": {"tools": {"include": ["search", "extract"]}}},
+        }
+        with patch("hermes_cli.tools_config.load_config", return_value=config):
+            tools_disable_enable_command(Namespace(tools_action="list", platform="cli"))
+        out = capsys.readouterr().out
+        assert "include only: search, extract" in out
+
 
 # ── Validation ───────────────────────────────────────────────────────────────
 

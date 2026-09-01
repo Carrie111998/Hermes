@@ -125,6 +125,100 @@ class TestDoctorToolAvailabilitySummary:
         ]
 
 
+class TestDoctorWebBackendSelectionIntegration:
+    @staticmethod
+    def _configure(monkeypatch, tmp_path, web_config):
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("TAVILY_API_KEY", "test-key")
+        (home / "config.yaml").write_text(
+            "web:\n" + "".join(
+                f"  {key}: {value}\n" for key, value in web_config.items()
+            ),
+            encoding="utf-8",
+        )
+
+    def test_explicit_unknown_backends_do_not_report_healthy_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        self._configure(
+            monkeypatch,
+            tmp_path,
+            {"search_backend": "smart-web", "extract_backend": "smart-web"},
+        )
+
+        rows = doctor._doctor_web_capability_rows()
+
+        assert [(status, label) for status, label, _ in rows] == [
+            ("warn", "web search"),
+            ("warn", "web extract"),
+        ]
+        assert all("smart-web" in detail for _, _, detail in rows)
+        assert not any(status == "ok" and detail == "(tavily)" for status, _, detail in rows)
+
+    def test_explicit_extract_capability_mismatch_does_not_report_healthy_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        self._configure(monkeypatch, tmp_path, {"extract_backend": "searxng"})
+
+        rows = doctor._doctor_web_capability_rows()
+        extract_row = next(row for row in rows if row[1] == "web extract")
+
+        assert extract_row[0] == "warn"
+        assert "searxng" in extract_row[2]
+        assert "does not support extraction" in extract_row[2]
+        assert extract_row[2] != "(tavily)"
+
+    def test_shared_search_only_backend_reports_extract_capability_mismatch(
+        self, monkeypatch, tmp_path
+    ):
+        self._configure(monkeypatch, tmp_path, {"backend": "searxng"})
+
+        rows = doctor._doctor_web_capability_rows()
+        extract_row = next(row for row in rows if row[1] == "web extract")
+
+        assert extract_row[0] == "warn"
+        assert "web.backend" in extract_row[2]
+        assert "searxng" in extract_row[2]
+        assert "does not support extraction" in extract_row[2]
+        assert extract_row[2] != "(tavily)"
+
+    def test_managed_nous_alias_resolves_to_firecrawl_not_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        self._configure(monkeypatch, tmp_path, {"backend": "nous"})
+
+        rows = doctor._doctor_web_capability_rows()
+
+        assert [label for _, label, _ in rows] == ["web search", "web extract"]
+        assert all("firecrawl" in detail for _, _, detail in rows)
+        assert not any("tavily" in detail for _, _, detail in rows)
+
+    def test_disabled_selected_plugin_is_reported_instead_of_healthy_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        self._configure(monkeypatch, tmp_path, {"extract_backend": "firecrawl"})
+        home = tmp_path / ".hermes"
+        (home / "config.yaml").write_text(
+            "plugins:\n"
+            "  disabled:\n"
+            "    - web/firecrawl\n"
+            "web:\n"
+            "  extract_backend: firecrawl\n",
+            encoding="utf-8",
+        )
+
+        rows = doctor._doctor_web_capability_rows()
+        extract_row = next(row for row in rows if row[1] == "web extract")
+
+        assert extract_row[0] == "warn"
+        assert "firecrawl" in extract_row[2]
+        assert "web/firecrawl" in extract_row[2]
+        assert "disabled" in extract_row[2]
+        assert extract_row[2] != "(tavily)"
+
+
 class TestDoctorEnvFileEncoding:
     """Regression for #18637 (bug 3): `hermes doctor` crashed on Windows
     Chinese locale (GBK) because `.env` was read with Path.read_text() which

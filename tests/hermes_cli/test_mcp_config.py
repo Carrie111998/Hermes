@@ -122,6 +122,47 @@ class TestMcpList:
         assert "myserver" in out
         assert "enabled" in out
 
+    def test_list_explicit_empty_include_reports_zero_selected(self, tmp_path, capsys):
+        _seed_config(tmp_path, {
+            "none": {
+                "url": "https://example.com/mcp",
+                "tools": {"include": []},
+            },
+        })
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list()
+        out = capsys.readouterr().out
+        assert "0 selected" in out
+
+    def test_list_absent_include_reports_all(self, tmp_path, capsys):
+        _seed_config(tmp_path, {
+            "all": {"url": "https://example.com/mcp"},
+        })
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list()
+        out = capsys.readouterr().out
+        assert "all" in out
+
+    def test_list_nonempty_include_and_exclude_report_filters(self, tmp_path, capsys):
+        _seed_config(tmp_path, {
+            "selected": {
+                "url": "https://example.com/selected",
+                "tools": {"include": ["read", "write"]},
+            },
+            "excluded": {
+                "url": "https://example.com/excluded",
+                "tools": {"exclude": ["delete"]},
+            },
+        })
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list()
+        out = capsys.readouterr().out
+        assert "2 selected" in out
+        assert "-1 excluded" in out
+
 
 # ---------------------------------------------------------------------------
 # Tests: cmd_mcp_remove
@@ -302,6 +343,81 @@ class TestMcpTest:
         assert "Connected" in out
         assert "Tools discovered: 2" in out
 
+    def test_test_explicit_empty_include_warns_agent_sees_none(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        _seed_config(tmp_path, {
+            "smart-web": {
+                "url": "https://example.com/mcp",
+                "tools": {"include": []},
+            },
+        })
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config, **kw: [
+                ("search_web", "Search"),
+                ("search_news", "News"),
+                ("extract", "Extract"),
+                ("admin_reset", "Reset"),
+            ],
+        )
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        cmd_mcp_test(_make_args(name="smart-web"))
+        out = capsys.readouterr().out
+        assert "Tools discovered: 4" in out
+        assert "Active config enables 0/4 discovered tools" in out
+        assert "agent will see none" in out
+
+    def test_test_absent_include_keeps_normal_success_output(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        _seed_config(tmp_path, {
+            "smart-web": {"url": "https://example.com/mcp"},
+        })
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config, **kw: [("search", "Search")],
+        )
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        cmd_mcp_test(_make_args(name="smart-web"))
+        out = capsys.readouterr().out
+        assert "Tools discovered: 1" in out
+        assert "Active config enables" not in out
+
+    @pytest.mark.parametrize(
+        ("tools_filter", "expected"),
+        [
+            ({"include": ["search_*"]}, "2/4"),
+            ({"exclude": ["admin_*"]}, "3/4"),
+        ],
+    )
+    def test_test_nonempty_filter_reports_agent_visible_count(
+        self, tmp_path, capsys, monkeypatch, tools_filter, expected
+    ):
+        _seed_config(tmp_path, {
+            "smart-web": {
+                "url": "https://example.com/mcp",
+                "tools": tools_filter,
+            },
+        })
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config, **kw: [
+                ("search_web", "Search"),
+                ("search_news", "News"),
+                ("extract", "Extract"),
+                ("admin_reset", "Reset"),
+            ],
+        )
+        from hermes_cli.mcp_config import cmd_mcp_test
+
+        cmd_mcp_test(_make_args(name="smart-web"))
+        out = capsys.readouterr().out
+        assert "Tools discovered: 4" in out
+        assert f"Active config enables {expected} discovered tools" in out
+
     def test_probe_uses_configured_connect_timeout(self, monkeypatch):
         """OAuth-capable probes must not hard-code a short 30s timeout."""
         import asyncio
@@ -339,6 +455,57 @@ class TestMcpTest:
         assert captured["inner_timeout"] == 300.0
         assert captured["outer_timeout"] == 310.0
         assert captured["shutdown"] is True
+
+
+# ---------------------------------------------------------------------------
+# Tests: cmd_mcp_configure
+# ---------------------------------------------------------------------------
+
+class TestMcpConfigure:
+    @pytest.mark.parametrize(
+        ("tools_filter", "expected_pre_selected", "expected_status"),
+        [
+            (None, {0, 1}, "Currently 2/2 tools enabled"),
+            ({"include": []}, set(), "Currently 0/2 tools enabled"),
+            ({"include": ["write"]}, {1}, "Currently 1/2 tools enabled"),
+        ],
+        ids=["absent-include", "empty-include", "nonempty-include"],
+    )
+    def test_configure_preselection_matches_active_include_filter(
+        self,
+        tmp_path,
+        capsys,
+        monkeypatch,
+        tools_filter,
+        expected_pre_selected,
+        expected_status,
+    ):
+        server = {"url": "https://example.com/mcp"}
+        if tools_filter is not None:
+            server["tools"] = tools_filter
+        _seed_config(tmp_path, {"test-server": server})
+        _set_interactive_stdin(monkeypatch)
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config: [("read", "Read"), ("write", "Write")],
+        )
+
+        captured = {}
+
+        def capture_checklist(title, labels, pre_selected, **kwargs):
+            captured["pre_selected"] = pre_selected
+            return pre_selected
+
+        monkeypatch.setattr(
+            "hermes_cli.curses_ui.curses_checklist", capture_checklist
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_configure
+
+        cmd_mcp_configure(_make_args())
+
+        assert captured["pre_selected"] == expected_pre_selected
+        assert expected_status in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,8 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.tools_config import _configure_mcp_tools_interactive
 
 # Patch targets: imports happen inside the function body, so patch at source
@@ -10,10 +12,35 @@ _CHECKLIST = "hermes_cli.curses_ui.curses_checklist"
 _SAVE = "hermes_cli.tools_config.save_config"
 
 
+@pytest.mark.parametrize(
+    ("tools_filter", "expected_pre_selected"),
+    [
+        (None, {0, 1}),
+        ({"include": []}, set()),
+        ({"include": ["write"]}, {1}),
+    ],
+    ids=["absent-include", "empty-include", "nonempty-include"],
+)
+def test_configure_preselection_matches_active_include_filter(
+    tools_filter, expected_pre_selected
+):
+    server = {"command": "npx"}
+    if tools_filter is not None:
+        server["tools"] = tools_filter
+    config = {"mcp_servers": {"demo": server}}
+    captured = {}
 
+    def capture_checklist(title, labels, pre_selected, **kwargs):
+        captured["pre_selected"] = pre_selected
+        return pre_selected
 
+    with patch(
+        _PROBE,
+        return_value={"demo": [("read", "Read"), ("write", "Write")]},
+    ), patch(_CHECKLIST, side_effect=capture_checklist), patch(_SAVE):
+        _configure_mcp_tools_interactive(config)
 
-
+    assert captured["pre_selected"] == expected_pre_selected
 
 
 def test_disabling_tool_writes_include_list(capsys):

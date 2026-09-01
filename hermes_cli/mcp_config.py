@@ -721,7 +721,7 @@ def cmd_mcp_list(args=None):
         if isinstance(tools_cfg, dict):
             include = tools_cfg.get("include")
             exclude = tools_cfg.get("exclude")
-            if include and isinstance(include, list):
+            if isinstance(include, list):
                 tools_str = f"{len(include)} selected"
             elif exclude and isinstance(exclude, list):
                 tools_str = f"-{len(exclude)} excluded"
@@ -796,6 +796,23 @@ def cmd_mcp_test(args):
 
     _success(f"Connected ({elapsed_ms:.0f}ms)")
     _success(f"Tools discovered: {len(tools)}")
+
+    # The probe intentionally reports the server's raw tools/list response, but
+    # a configured include/exclude filter can expose fewer tools to the agent.
+    # Use the runtime predicate so explicit include: [] cannot false-green as
+    # "4 tools" when the active agent-visible count is actually zero.
+    from tools.mcp_tool import mcp_tool_filter_predicate
+
+    tool_enabled, filter_active = mcp_tool_filter_predicate(cfg, name)
+    if filter_active:
+        enabled_count = sum(tool_enabled(tool_name) for tool_name, _ in tools)
+        message = (
+            f"Active config enables {enabled_count}/{len(tools)} discovered tools"
+        )
+        if enabled_count == 0:
+            _warning(message + "; agent will see none.")
+        else:
+            _info(message + ".")
 
     if tools:
         print()
@@ -1035,7 +1052,8 @@ def cmd_mcp_configure(args):
         def matches_name_filter(tool_name, patterns):
             return tool_name in patterns
 
-    if include and isinstance(include, list):
+    include_mode = isinstance(include, list)
+    if include_mode:
         include_set = {str(p) for p in include}
         pre_selected = {
             i for i, tn in enumerate(tool_names)
@@ -1074,7 +1092,9 @@ def cmd_mcp_configure(args):
     config = load_config()
     server_entry = cfg_get(config, "mcp_servers", name, default={})
 
-    exclude_mode = bool(exclude) and isinstance(exclude, list) and not include
+    exclude_mode = (
+        isinstance(exclude, list) and bool(exclude) and not include_mode
+    )
 
     if len(chosen) == total and not exclude_mode:
         # All selected → remove include/exclude (register all)

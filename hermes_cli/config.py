@@ -2367,6 +2367,177 @@ class ConfigIssue:
     hint: str
 
 
+_WEB_BACKEND_CONFIG_CAPABILITIES = {
+    # The shared backend services both tools; capability-specific overrides
+    # may select providers that implement only their one tool.
+    "web.backend": ("search", "extract"),
+    "web.search_backend": ("search",),
+    "web.extract_backend": ("extract",),
+}
+_WEB_BACKEND_PROVIDER_ALIASES = {
+    # ``hermes tools`` stores this sentinel so Firecrawl routes through the
+    # managed Nous gateway. The registry provider remains ``firecrawl``.
+    "nous": "firecrawl",
+}
+
+
+def normalize_web_backend_provider_id(value: str) -> str:
+    """Return the registry provider ID that implements a stored selection."""
+    normalized = value.strip()
+    return _WEB_BACKEND_PROVIDER_ALIASES.get(normalized, normalized)
+
+
+@dataclass(frozen=True)
+class EffectiveWebBackendSelection:
+    """One capability's effective explicit web provider selection."""
+
+    source_key: str
+    configured_value: Any
+    provider_id: Optional[str]
+
+
+def effective_web_backend_selection(
+    web_config: Any, capability: str
+) -> Optional[EffectiveWebBackendSelection]:
+    """Resolve per-capability override → shared backend and normalize aliases."""
+    if capability not in {"search", "extract"} or not isinstance(web_config, dict):
+        return None
+    capability_leaf = f"{capability}_backend"
+    for leaf in (capability_leaf, "backend"):
+        if leaf not in web_config:
+            continue
+        value = web_config.get(leaf)
+        if isinstance(value, str):
+            if not value.strip():
+                continue
+            configured_value: Any = value.strip()
+            provider_id: Optional[str] = normalize_web_backend_provider_id(
+                configured_value
+            )
+        else:
+            # Preserve malformed explicit values so doctor can report the same
+            # type error as config set/check rather than showing a healthy auto
+            # fallback. No registry provider can resolve a non-string ID.
+            configured_value = value
+            provider_id = None
+        return EffectiveWebBackendSelection(
+            source_key=f"web.{leaf}",
+            configured_value=configured_value,
+            provider_id=provider_id,
+        )
+    return None
+
+
+def _known_web_backend_providers(
+) -> Tuple[Dict[str, Any], Set[str], Dict[str, str]]:
+    """Return registered providers, catalog IDs, and disabled plugin keys.
+
+    Provider registration is independent of credentials, so capability checks
+    remain useful on fresh installs. Manifest IDs are included for diagnostics
+    when a plugin did not register; explicitly disabled plugins are tracked
+    separately so a known catalog ID cannot be mistaken for a usable provider.
+    """
+    from agent.web_search_registry import list_providers
+    from hermes_cli.plugins import _ensure_plugins_discovered
+
+    manager = _ensure_plugins_discovered()
+    registered = {provider.name: provider for provider in list_providers()}
+    catalog_ids = set(registered)
+    disabled_plugins: Dict[str, str] = {}
+    for plugin_key, loaded in manager._plugins.items():
+        plugin_path = Path(loaded.manifest.path or "")
+        manifest_path = plugin_path / "plugin.yaml"
+        if not manifest_path.is_file():
+            manifest_path = plugin_path / "plugin.yml"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest_data = yaml.safe_load(
+                manifest_path.read_text(encoding="utf-8")
+            ) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        for provider_id in manifest_data.get("provides_web_providers") or []:
+            if isinstance(provider_id, str) and provider_id.strip():
+                normalized_id = provider_id.strip()
+                catalog_ids.add(normalized_id)
+                if not loaded.enabled and loaded.error == "disabled via config":
+                    disabled_plugins[normalized_id] = plugin_key
+    return registered, catalog_ids, disabled_plugins
+
+
+def validate_web_backend_config_value(
+    key: str,
+    value: Any,
+    *,
+    required_capabilities: Optional[Tuple[str, ...]] = None,
+) -> Optional["ConfigIssue"]:
+    """Validate a web backend ID and its effective capability contract.
+
+    ``required_capabilities`` lets capability-specific consumers validate a
+    shared ``web.backend`` selection while retaining the actual source key in
+    diagnostics. Config writes/checks omit it and enforce the key's full
+    contract (both search and extract for the shared backend).
+    """
+    if key not in _WEB_BACKEND_CONFIG_CAPABILITIES:
+        return None
+    capabilities = (
+        required_capabilities
+        if required_capabilities is not None
+        else _WEB_BACKEND_CONFIG_CAPABILITIES[key]
+    )
+    if isinstance(value, str) and not value.strip():
+        return None
+    if not isinstance(value, str):
+        return ConfigIssue(
+            "error",
+            f"{key} must be a web provider ID string, got {type(value).__name__}",
+            f"Run 'hermes tools' to choose a provider, or: hermes config set {key} <provider>",
+        )
+
+    provider_id = normalize_web_backend_provider_id(value)
+    registered, catalog_ids, disabled_plugins = _known_web_backend_providers()
+    disabled_plugin = disabled_plugins.get(provider_id)
+    if disabled_plugin is not None:
+        return ConfigIssue(
+            "error",
+            f"{key} provider {value!r} is unavailable because plugin {disabled_plugin!r} is disabled",
+            f"Re-enable it with 'hermes plugins enable {disabled_plugin}', or remove it from plugins.disabled.",
+        )
+    provider = registered.get(provider_id)
+    if provider is not None:
+        if "search" in capabilities and not provider.supports_search():
+            return ConfigIssue(
+                "error",
+                f"{key} provider {value!r} does not support search",
+                f"Run 'hermes tools' to choose a search provider, or: hermes config set {key} <provider>",
+            )
+        if "extract" in capabilities and not provider.supports_extract():
+            return ConfigIssue(
+                "error",
+                f"{key} provider {value!r} does not support extraction",
+                f"Run 'hermes tools' to choose an extract provider, or: hermes config set {key} <provider>",
+            )
+        return None
+    if provider_id in catalog_ids:
+        return None
+
+    eligible_ids = set(catalog_ids) - set(registered) - set(disabled_plugins)
+    for provider_id, candidate in registered.items():
+        if "search" in capabilities and not candidate.supports_search():
+            continue
+        if "extract" in capabilities and not candidate.supports_extract():
+            continue
+        eligible_ids.add(provider_id)
+    known = ", ".join(sorted(eligible_ids)) or "none discovered"
+    return ConfigIssue(
+        "error",
+        f"{key} names unknown web provider {value!r} (eligible: {known})",
+        f"Run 'hermes tools' to choose a provider, or: hermes config set {key} <provider>. "
+        "For an advanced custom plugin provider, use 'hermes config set --force ...'.",
+    )
+
+
 def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["ConfigIssue"]:
     """Validate config.yaml structure and return a list of detected issues.
 
@@ -2382,6 +2553,18 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    # ── web backend IDs and per-capability support ───────────────────────
+    web_cfg = config.get("web")
+    if isinstance(web_cfg, dict):
+        for leaf in ("backend", "search_backend", "extract_backend"):
+            if leaf not in web_cfg:
+                continue
+            issue = validate_web_backend_config_value(
+                f"web.{leaf}", web_cfg.get(leaf)
+            )
+            if issue is not None:
+                issues.append(issue)
 
     # ── voice.submit_mode: direct | draft ────────────────────────────────
     voice_cfg = config.get("voice")
@@ -5847,13 +6030,14 @@ def set_config_value(key: str, value: str, force: bool = False):
     Args:
         key: Dotted config path (e.g. ``terminal.backend``).
         value: String value (auto-coerced to bool/int/float when matching).
-        force: When True, skip the unknown-key warning — useful for scripted
-            writes of keys the running version doesn't recognize yet — AND
-            authorize destructive replacement of a mapping section by a
-            scalar (e.g. ``--force model gpt-x`` replaces the whole ``model:``
-            mapping). Without --force, scalar writes over mapping sections are
-            refused (bare ``model`` is redirected to ``model.default``). The
-            CLI exposes this via ``hermes config set --force``.
+        force: When True, bypass key/value validation — useful for advanced
+            custom plugin settings or scripted writes of keys the running
+            version does not recognize yet — AND authorize destructive
+            replacement of a mapping section by a scalar (e.g. ``--force
+            model gpt-x`` replaces the whole ``model:`` mapping). Without
+            --force, scalar writes over mapping sections are refused (bare
+            ``model`` is redirected to ``model.default``). The CLI exposes
+            this via ``hermes config set --force``.
     """
     if is_managed():
         managed_error("set configuration values")
@@ -5898,6 +6082,13 @@ def set_config_value(key: str, value: str, force: bool = False):
         save_provider_env_credential(key.upper(), value)
         print(f"✓ Set {key} in {get_env_path()}")
         return
+
+    if not force:
+        web_backend_issue = validate_web_backend_config_value(key, value)
+        if web_backend_issue is not None:
+            print(f"✗ {web_backend_issue.message}", file=sys.stderr)
+            print(f"  {web_backend_issue.hint}", file=sys.stderr)
+            sys.exit(1)
 
     # Unknown-key notice (#34067): the key is still written (arbitrary keys
     # are supported — top-level scalars are bridged into os.environ for
@@ -6221,7 +6412,7 @@ def config_command(args):
             print("  hermes config set terminal.backend docker")
             print("  hermes config set OPENROUTER_API_KEY sk-or-...")
             print()
-            print("  --force: skip the unknown-key notice for unrecognized keys,")
+            print("  --force: bypass key/value validation for advanced custom plugins,")
             print("           and allow a scalar to replace a whole mapping section")
             sys.exit(1)
         try:
@@ -6346,8 +6537,20 @@ def config_command(args):
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
             print("    Run 'hermes config migrate' to add them")
+
+        config_issues = validate_config_structure()
+        if config_issues:
+            print()
+            print(color("  Config validation:", Colors.BOLD))
+            for issue in config_issues:
+                marker = "✗" if issue.severity == "error" else "⚠"
+                issue_color = Colors.RED if issue.severity == "error" else Colors.YELLOW
+                print(color(f"    {marker} {issue.message}", issue_color))
+                print(f"      {issue.hint}")
         
         print()
+        if any(issue.severity == "error" for issue in config_issues):
+            sys.exit(1)
     
     else:
         print(f"Unknown config command: {subcmd}")
