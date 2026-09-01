@@ -6057,3 +6057,64 @@ def test_live_characterization_aborts_before_sessions_when_cli_preflight_fails(
         ["C:/launchable/codex.exe", "--version"],
     ]
     assert provider_calls == []
+
+
+def test_sidebar_inventory_kinds_do_not_share_one_page_budget() -> None:
+    """Archived enumeration must not be charged for the active kind's pages.
+
+    Regression: the archived fetch was called with ``page_cap - used``. Once the
+    active kind spent the whole cap, the archived kind was handed ``page_cap``
+    <= 0 and raised "page cap exceeded" WITHOUT issuing a single request, which
+    both attributed the exhaustion to the wrong kind and failed a call whose
+    archived half was tiny and would have completed on its own.
+    """
+    active_first = _codex_inventory(native_id=CODEX_ID)
+    active_first["nextCursor"] = "more"
+    active_second = _codex_inventory(native_id="33333333-3333-4333-8333-333333333333")
+    archived_only = _codex_inventory(native_id="44444444-4444-4444-8444-444444444444")
+    client = FakeRequestClient(
+        {"thread/list": [active_first, active_second, archived_only]}
+    )
+    source = CodexSourceAdapter(client, marker_secret=SECRET)
+
+    summaries = source.list_sidebar_inventory(deadline=None, page_cap=2)
+
+    kinds = [params.get("archived") for _method, params, _timeout in client.calls]
+    assert kinds == [False, False, True]
+    assert len(summaries) == 3
+
+
+def test_sidebar_request_refuses_a_budget_too_small_to_finish() -> None:
+    """A sub-threshold remainder must fail as a budget error, not a fake timeout.
+
+    Regression: any remaining > 0 was passed straight through as the per-RPC
+    timeout, so an exhausted budget surfaced as e.g. "thread/list timed out
+    after 0.062s" -- naming a figure that describes the leftover budget, not the
+    request, and pointing diagnosis at the transport instead of the deadline.
+    """
+    client = FakeRequestClient({"thread/list": [_codex_inventory()]})
+    source = CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 29.8)
+
+    with pytest.raises(RuntimeError, match="deadline exhausted"):
+        source.list_sidebar_inventory(deadline=30.0, page_cap=2)
+
+    assert client.calls == []
+
+
+def test_sidebar_budget_timeout_is_reported_as_budget_not_transport() -> None:
+    """A clamped-timeout expiry must surface as budget exhaustion.
+
+    Regression: when the remaining budget was passed through as the per-RPC
+    limit and the request then expired, the transport's own TimeoutError
+    escaped, naming the leftover budget as if it were the request's cost. Real
+    example that misdirected three sessions: "codex app-server method
+    'thread/list' timed out after 0.062s" for a call that reliably takes ~0.4s.
+    """
+    client = FakeRequestClient({"thread/list": [TimeoutError("timed out after 1.5s")]})
+    source = CodexSourceAdapter(client, marker_secret=SECRET, monotonic=lambda: 0.0)
+
+    with pytest.raises(RuntimeError, match="deadline exhausted") as raised:
+        source.list_sidebar_inventory(deadline=1.5, page_cap=2)
+
+    assert not isinstance(raised.value, TimeoutError)
+    assert [method for method, _params, _timeout in client.calls] == ["thread/list"]
