@@ -7434,7 +7434,7 @@ class SlackAdapter(BasePlatformAdapter):
             result = await self._get_client(chat_id).chat_postMessage(**kwargs)
             msg_ts = result.get("ts", "")
             if msg_ts:
-                # Mark unresolved so the action handler's atomic-pop guard can
+                # Mark unresolved so the action handler's consume-marker guard can
                 # reject double-clicks (mirrors _approval_resolved).
                 self._clarify_resolved[msg_ts] = False
                 self._trim_oldest_dict_entries(
@@ -7672,7 +7672,7 @@ class SlackAdapter(BasePlatformAdapter):
                 channel=channel_id,
                 user=user_id,
                 text=(
-                    "You're not authorized to resolve this approval — "
+                    "You're not authorized to resolve this prompt — "
                     "ask an authorized user to press the button."
                 ),
             )
@@ -7748,13 +7748,25 @@ class SlackAdapter(BasePlatformAdapter):
             # restart) — the dict is in-process memory, so restart-orphaned
             # prompts are absent, NOT already-resolved. Treating absent as
             # resolved silently swallowed the first legitimate click
-            # (enterprise field report 2026-08-20). Fall through: resolve
-            # (0 pending renders the honest "expired" outcome); the consumed
-            # marker set here keeps a double-click on the orphan a no-op.
+            # (enterprise field report 2026-08-20).
+            #
+            # Do NOT resolve anything from this branch: the orphan's waiter
+            # died with the old process, and resolve_gateway_approval() is
+            # FIFO within the session — an orphaned click could otherwise
+            # approve a DIFFERENT, live command (review finding). Render the
+            # honest outcome directly and consume the key so double-clicks
+            # on the orphan stay no-ops.
             self._approval_resolved[approval_key] = True
             self._trim_oldest_dict_entries(
                 self._approval_resolved, self._APPROVAL_RESOLVED_MAX
             )
+            await self._render_approval_outcome(
+                channel_id, msg_ts, message, team_id,
+                "⌛ Approval expired — command was not run "
+                "(the gateway restarted since this prompt was sent; "
+                "re-run the task to get a fresh prompt)",
+            )
+            return
 
         # Resolve the approval FIRST — this unblocks the agent thread. Render
         # after, so a click that lands past the approval timeout (count == 0)
@@ -7790,6 +7802,21 @@ class SlackAdapter(BasePlatformAdapter):
                 "(already timed out or resolved elsewhere)"
             )
 
+        await self._render_approval_outcome(
+            channel_id, msg_ts, message, team_id, decision_text
+        )
+
+        # (approval already resolved above; guard marker consumed in place)
+
+    async def _render_approval_outcome(
+        self,
+        channel_id: str,
+        msg_ts: str,
+        message: dict,
+        team_id: Optional[str],
+        decision_text: str,
+    ) -> None:
+        """Rewrite an approval message with its outcome and drop the buttons."""
         # Get original text from the section block
         original_text = ""
         for block in message.get("blocks", []):
@@ -7828,8 +7855,6 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[Slack] Failed to update approval message: %s", e)
 
-        # (approval already resolved above; state consumed by atomic pop)
-
     async def _update_clarify_message(
         self,
         channel_id: str,
@@ -7862,6 +7887,7 @@ class SlackAdapter(BasePlatformAdapter):
         """Handle a clarify button click (a choice or "Other") from Block Kit."""
         await ack()
 
+        team_id = self._event_team_id({}, body)
         action_id = action.get("action_id", "")
         value = action.get("value", "")
         message = body.get("message", {})
@@ -7879,7 +7905,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] Unauthorized clarify click by %s (%s) - ignoring",
                 user_name, user_id,
             )
-            await self._notify_unauthorized_click(channel_id, user_id, None)
+            await self._notify_unauthorized_click(channel_id, user_id, team_id)
             return
 
         # value packs ``clarify_id|<idx|other>``.

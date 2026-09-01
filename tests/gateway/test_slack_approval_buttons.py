@@ -875,12 +875,51 @@ class TestRestartOrphanedApprovalClick:
         with patch("tools.approval.resolve_gateway_approval", return_value=0) as mock_resolve:
             await adapter._handle_approval_action(ack, self._click_body(), action)
 
-        mock_resolve.assert_called_once()
+        # CRITICAL: the orphan branch must NOT call the FIFO resolver — the
+        # orphan's waiter died with the old process, and a FIFO resolve could
+        # approve a DIFFERENT live command in the same session (salt review
+        # finding on the first version of this fix).
+        mock_resolve.assert_not_called()
         assert mock_client.chat_update.called, (
             "restart-orphaned click was silently swallowed — no feedback"
         )
         update_text = mock_client.chat_update.call_args[1]["text"]
         assert "expired" in update_text.lower()
+
+    @pytest.mark.asyncio
+    async def test_orphan_click_cannot_approve_a_live_pending_approval(self):
+        """End-to-end FIFO-hazard probe with the REAL approval queue: a live
+        pending approval for a different command must still be pending after
+        an orphaned click lands in the same session."""
+        from tools import approval as approval_mod
+
+        session_key = "orphan-fifo-probe-session"
+        approval_mod._gateway_queues.pop(session_key, None)
+        try:
+            entry = approval_mod._ApprovalEntry(
+                {"command": "deploy --prod", "description": "live command",
+                 "pattern_key": "dangerous", "pattern_keys": ["dangerous"]}
+            ) if hasattr(approval_mod, "_ApprovalEntry") else None
+            if entry is None:
+                pytest.skip("_ApprovalEntry not accessible")
+            approval_mod._gateway_queues.setdefault(session_key, []).append(entry)
+
+            adapter = _make_adapter()
+            _attach_auth_runner(adapter)
+            ack = AsyncMock()
+            body = self._click_body("8888.0001")
+            action = {"action_id": "hermes_approve_once", "value": session_key}
+            adapter._team_clients["T1"].chat_update = AsyncMock()
+
+            await adapter._handle_approval_action(ack, body, action)
+
+            queue = approval_mod._gateway_queues.get(session_key) or []
+            assert len(queue) == 1, (
+                "orphaned click consumed a LIVE pending approval for a "
+                "different command — FIFO hazard"
+            )
+        finally:
+            approval_mod._gateway_queues.pop(session_key, None)
 
     @pytest.mark.asyncio
     async def test_genuine_double_click_stays_silent(self):
