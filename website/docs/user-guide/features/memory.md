@@ -251,8 +251,9 @@ external provider tools too.
 
 With only `memory_enabled: false` (user profile still on), the tool stays —
 it backs the profile store — but the system prompt swaps the full memory
-guidance for a narrower profile-only block, so the model is only instructed to
-save user-profile facts and never steered at the disabled notes store.
+guidance for a narrower profile-only block. The tool schema advertises only the
+`user` target, and direct or staged writes to disabled `MEMORY.md` are rejected.
+The inverse configuration advertises only `memory` and rejects `USER.md` writes.
 
 ## Controlling memory writes (`write_approval`)
 
@@ -348,6 +349,25 @@ With `enabled: false`, automatic post-turn forks do not spawn; manual
 Fork usage is persisted in `session_model_usage` with `task='background_review'`
 and a completion line is written to `agent.log`
 (`Background review complete: thread=bg-review calls=… in=… out=… result=…`).
+
+### Allowing a narrowly scoped extra review tool (`extra_tools`)
+
+Background review can use memory, skill-management, and read-only file tools
+by default. If a profile provides another tool that is safe for unattended
+review, opt it in by name:
+
+```yaml
+auxiliary:
+  background_review:
+    extra_tools:
+      - propose_shared_memory
+```
+
+The tool must already be available to the parent agent; this setting only adds
+it to the review fork's runtime whitelist. It does not enable arbitrary tools,
+and tools not listed here remain denied. Keep the list narrow and prefer tools
+that stage a proposal for human review rather than applying external or
+destructive changes directly. The default is an empty list.
 
 ## Controlling skill writes (`skills.write_approval`)
 
