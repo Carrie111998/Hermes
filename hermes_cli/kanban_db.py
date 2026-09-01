@@ -1454,6 +1454,14 @@ CREATE TABLE IF NOT EXISTS task_events (
     created_at INTEGER NOT NULL
 );
 
+-- Atomic claim for reviewer correction submissions.  The primary key is the
+-- reviewed-task + result digest, so concurrent deliveries share one child.
+CREATE TABLE IF NOT EXISTS reviewer_correction_claims (
+    idempotency_key TEXT PRIMARY KEY,
+    reviewed_task_id TEXT NOT NULL,
+    correction_task_id TEXT NOT NULL
+);
+
 -- Historical attempt record. Each time the dispatcher claims a task, a
 -- new row is created here; claim state, PID, heartbeat, runtime cap,
 -- and structured summary all live on the run, not the task. Multiple
@@ -6525,6 +6533,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    allow_nested: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6558,7 +6567,7 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
-    with write_txn(conn):
+    with write_txn(conn, allow_nested=allow_nested):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
