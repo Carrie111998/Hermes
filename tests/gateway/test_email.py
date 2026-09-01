@@ -468,6 +468,7 @@ class TestConnectDisconnect(unittest.TestCase):
         adapter = self._make_adapter()
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
         mock_imap.uid.return_value = ("OK", [b"1 2 3"])
 
         with patch("imaplib.IMAP4_SSL", return_value=mock_imap), \
@@ -485,6 +486,25 @@ class TestConnectDisconnect(unittest.TestCase):
             adapter._running = False
             if adapter._poll_task:
                 adapter._poll_task.cancel()
+
+    def test_connect_rejects_failed_inbox_selection(self):
+        """A server-declined SELECT must fail before SEARCH or SMTP setup."""
+        import asyncio
+
+        adapter = self._make_adapter()
+        mock_imap = MagicMock()
+        mock_imap.select.return_value = ("NO", [b"Mailbox unavailable"])
+
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap), patch(
+            "smtplib.SMTP"
+        ) as mock_smtp:
+            result = asyncio.run(adapter.connect())
+
+        self.assertFalse(result)
+        mock_imap.uid.assert_not_called()
+        mock_smtp.assert_not_called()
+        self.assertEqual(adapter.fatal_error_code, "email_imap_connect_error")
+        self.assertIn("Mailbox unavailable", adapter.fatal_error_message or "")
 
 
 class TestFetchNewMessages(unittest.TestCase):
@@ -513,6 +533,7 @@ class TestFetchNewMessages(unittest.TestCase):
         raw_email["Message-ID"] = "<msg@test.com>"
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
 
         def uid_handler(command, *args):
             if command == "search":
@@ -565,6 +586,7 @@ class TestPollLoop(unittest.TestCase):
         raw_email["Message-ID"] = "<inbox@test.com>"
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
 
         def uid_handler(command, *args):
             if command == "search":
@@ -596,6 +618,7 @@ class TestPollLoop(unittest.TestCase):
         adapter.set_fatal_error_handler(mock_fatal_handler)
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
         mock_imap.login.side_effect = Exception("read operation timed out")
 
         with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
@@ -605,6 +628,28 @@ class TestPollLoop(unittest.TestCase):
         self.assertEqual(adapter.fatal_error_code, "email_imap_fetch_failed")
         self.assertTrue(adapter.fatal_error_retryable)
         self.assertIn("read operation timed out", adapter.fatal_error_message)
+
+    def test_check_inbox_rejects_failed_inbox_selection(self):
+        """A SELECT NO response is a fetch failure, not an empty inbox."""
+        import asyncio
+
+        adapter = self._make_adapter()
+        notified = []
+
+        async def mock_fatal_handler(failed_adapter):
+            notified.append(failed_adapter)
+
+        adapter.set_fatal_error_handler(mock_fatal_handler)
+        mock_imap = MagicMock()
+        mock_imap.select.return_value = ("NO", [b"Mailbox unavailable"])
+
+        with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+            asyncio.run(adapter._check_inbox())
+
+        mock_imap.uid.assert_not_called()
+        self.assertEqual(notified, [adapter])
+        self.assertEqual(adapter.fatal_error_code, "email_imap_fetch_failed")
+        self.assertIn("Mailbox unavailable", adapter.fatal_error_message or "")
 
     def test_partial_batch_dispatched_before_escalation(self):
         """A mid-batch IMAP failure must dispatch the messages already
@@ -629,6 +674,7 @@ class TestPollLoop(unittest.TestCase):
         raw_email["Message-ID"] = "<batch1@test.com>"
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
         fetches = []
 
         def uid_handler(command, *args):
@@ -665,6 +711,7 @@ class TestPollLoop(unittest.TestCase):
         raw_email["Message-ID"] = "<ok@test.com>"
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
         fetches = []
 
         def uid_handler(command, *args):
@@ -700,6 +747,7 @@ class TestPollLoop(unittest.TestCase):
         good_email["Message-ID"] = "<good@test.com>"
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
 
         def uid_handler(command, *args):
             if command == "search":
@@ -751,6 +799,7 @@ class TestReconnectSeenUidsRestore(unittest.TestCase):
         import asyncio
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
 
         def uid_handler(command, *args):
             if command == "search":
@@ -897,6 +946,7 @@ class TestImapConnectionCleanup(unittest.TestCase):
         """IMAP logout() must be called even when uid fetch raises."""
         adapter = self._make_adapter()
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
 
         def uid_handler(command, *args):
             if command == "search":
@@ -939,6 +989,7 @@ class TestImapIdExtensionForNetEase(unittest.TestCase):
         adapter = self._make_adapter()
 
         mock_imap = MagicMock()
+        mock_imap.select.return_value = ("OK", [b"1"])
         mock_imap.uid.return_value = ("OK", [b""])
 
         with patch("imaplib.IMAP4_SSL", return_value=mock_imap), \

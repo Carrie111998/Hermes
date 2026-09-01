@@ -240,6 +240,7 @@ class TestEmailConnectClassification:
         from plugins.platforms.email import adapter as email_adapter
 
         imap = MagicMock()
+        imap.select.return_value = ("OK", [b"1"])
         imap.uid.return_value = ("OK", [b""])
         monkeypatch.setattr(email_adapter.imaplib, "IMAP4_SSL", lambda *a, **k: imap)
 
@@ -259,6 +260,7 @@ class TestEmailConnectClassification:
         from plugins.platforms.email import adapter as email_adapter
 
         imap = MagicMock()
+        imap.select.return_value = ("OK", [b"1"])
         imap.uid.return_value = ("OK", [b""])
         monkeypatch.setattr(email_adapter.imaplib, "IMAP4_SSL", lambda *a, **k: imap)
 
