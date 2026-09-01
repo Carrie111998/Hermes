@@ -7222,9 +7222,18 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
         }
 
 
-def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
-    """Status snapshot for API-key providers (z.ai, Kimi, MiniMax)."""
-    pconfig = PROVIDER_REGISTRY.get(provider_id)
+def get_api_key_provider_status(
+    provider_id: str, pconfig: Optional["ProviderConfig"] = None
+) -> Dict[str, Any]:
+    """Status snapshot for API-key providers (z.ai, Kimi, MiniMax).
+
+    ``pconfig`` may be passed by callers for providers that are deliberately
+    NOT in ``PROVIDER_REGISTRY`` (openrouter) — the same synthesis
+    ``_model_flow_openrouter`` uses — so the status dispatcher and the
+    credential surfaces (``auth list``, ``config check``) agree on the
+    authentication contract (#95878).
+    """
+    pconfig = pconfig or PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "api_key":
         return {"configured": False}
 
@@ -7334,6 +7343,21 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return _get_azure_foundry_auth_status()
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
+    # openrouter is deliberately NOT in PROVIDER_REGISTRY (the model setup
+    # flow synthesizes a minimal pconfig, see _model_flow_openrouter) — but
+    # its credential lives in the same .env/pool surfaces `auth list` and
+    # `config check` read, so `auth status` must route it to the API-key
+    # resolver instead of falling through to {"logged_in": False} (#95878).
+    if target == "openrouter":
+        return get_api_key_provider_status(
+            target,
+            pconfig=ProviderConfig(
+                id="openrouter",
+                name="OpenRouter",
+                auth_type="api_key",
+                api_key_env_vars=("OPENROUTER_API_KEY",),
+            ),
+        )
     if pconfig and pconfig.auth_type == "api_key":
         return get_api_key_provider_status(target)
     # AWS SDK providers (Bedrock) — check via boto3 credential chain
