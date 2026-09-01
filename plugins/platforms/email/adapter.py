@@ -33,7 +33,7 @@ from email.header import decode_header
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
-from email.utils import formatdate
+from email.utils import formatdate, make_msgid
 from email import encoders
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -110,6 +110,110 @@ _AUTOMATED_HEADERS = {
 MAX_MESSAGE_LENGTH = 50_000
 
 SMTP_CONNECT_TIMEOUT = 30
+
+
+# Grep-able prefix for the one operationally visible new failure mode: a
+# message whose Gmail thread id could not be resolved after repeated attempts.
+THREAD_LOOKUP_FAILURE_LOG_PREFIX = "[Email][thread-lookup-failure]"
+
+# Matches the X-GM-THRID value in an IMAP FETCH response, e.g.
+#   b'1 (X-GM-THRID 1234567890123456789 UID 1)'
+_GM_THRID_RE = re.compile(rb"X-GM-THRID\s+(\d+)")
+
+# Matches the From: header line inside a BODY.PEEK[HEADER.FIELDS (FROM)]
+# payload. Anchored to the start of a line so the FETCH response preamble
+# ("... BODY[HEADER.FIELDS (FROM)] ...") cannot be mistaken for the header.
+_FROM_HEADER_RE = re.compile(r"^From:\s*(.+)$", re.IGNORECASE | re.MULTILINE)
+
+SMTP_CONNECT_TIMEOUT = 30
+
+# Gmail's IMAP capability advertising the X-GM-* extensions (X-GM-THRID et al).
+# https://developers.google.com/gmail/imap/imap-extensions
+GMAIL_IMAP_CAPABILITY = "X-GM-EXT-1"
+
+# RFC 5322 §3.6.4: msg-id = "<" id-left "@" id-right ">". Inbound Message-IDs
+# are attacker-controlled, so anything echoed back into In-Reply-To/References
+# must match this shape first. A value containing CR/LF would otherwise reach
+# the header setter and raise HeaderParseError at send time, which would make
+# every reply in that thread fail — a message-shaped denial of service.
+_MSG_ID_RE = re.compile(r"<[^<>@\s]+@[^<>@\s]+>")
+
+# RFC 5322 places no hard cap on References, but an unbounded chain eventually
+# trips server header-size limits. Common MUA practice is to keep the thread
+# root plus the most recent ancestors; we do the same.
+MAX_REFERENCES = 20
+
+
+def _sanitize_msg_id(raw: Optional[str]) -> str:
+    """Return ``raw`` as a single RFC 5322 msg-id, or "" when it isn't one.
+
+    Only the first well-formed ``<id-left@id-right>`` token is kept, so
+    injected headers, folded whitespace and bare tokens are all discarded
+    rather than propagated into our outgoing headers.
+    """
+    if not raw:
+        return ""
+    match = _MSG_ID_RE.search(str(raw))
+    return match.group(0) if match else ""
+
+
+def _parse_references(raw: Optional[str]) -> List[str]:
+    """Extract the msg-id chain from a References/In-Reply-To header value."""
+    if not raw:
+        return []
+    return _MSG_ID_RE.findall(str(raw))
+
+
+def _build_references(parent_references: Optional[str], parent_msg_id: str) -> str:
+    """Build a reply's References header per RFC 5322 §3.6.4.
+
+    The field is the parent's References followed by the parent's Message-ID —
+    preserving the ancestry a mail client needs to nest a deep thread. The
+    previous implementation emitted only the parent's Message-ID, discarding
+    every earlier ancestor.
+
+    Duplicates are dropped (order preserved) and the chain is capped by keeping
+    the thread root plus the most recent ancestors.
+    """
+    chain = _parse_references(parent_references)
+    parent = _sanitize_msg_id(parent_msg_id)
+    if parent:
+        chain.append(parent)
+
+    seen = set()
+    deduped = []
+    for mid in chain:
+        if mid not in seen:
+            seen.add(mid)
+            deduped.append(mid)
+
+    if len(deduped) > MAX_REFERENCES:
+        deduped = deduped[:1] + deduped[-(MAX_REFERENCES - 1):]
+    return " ".join(deduped)
+
+
+def _parse_gm_thrid(data: Any) -> Optional[str]:
+    """Extract the X-GM-THRID value from a raw IMAP FETCH response.
+
+    Gmail computes the thread id server-side, so it is stable and — unlike
+    ``References``/``In-Reply-To`` — not attacker-controlled.  imaplib hands
+    back a list whose items are either bytes or ``(header, payload)`` tuples
+    depending on the response shape, so both are scanned.
+
+    Returns ``None`` when no thread id is present; callers treat that
+    identically to a failed FETCH.
+    """
+    if not data:
+        return None
+    for item in data:
+        parts = item if isinstance(item, (tuple, list)) else (item,)
+        for part in parts:
+            if not isinstance(part, (bytes, bytearray)):
+                continue
+            match = _GM_THRID_RE.search(bytes(part))
+            if match:
+                return match.group(1).decode("ascii")
+    return None
 
 
 def _close_imap(imap: "imaplib.IMAP4") -> None:
@@ -529,6 +633,12 @@ def _extract_attachments(
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
 
+    # Consecutive failed X-GM-THRID lookups tolerated for a single UID before
+    # the message is reported to its sender and dropped.  A single transient
+    # IMAP hiccup must not cost a message, but retrying forever must not wedge
+    # the poll loop either.
+    _THRID_MAX_FAILURES = 5
+
     # Per-account snapshot of seen UIDs, surviving adapter recreation.
     # The gateway's reconnect watcher builds a FRESH adapter instance for
     # each retry; without this, connect(is_reconnect=True) would re-mark the
@@ -602,8 +712,31 @@ class EmailAdapter(BasePlatformAdapter):
         self._last_fetch_failed: bool = False
         self._last_fetch_error: str = ""
 
-        # Map chat_id (sender email) -> last subject + message-id for threading
-        self._thread_context: Dict[str, Dict[str, str]] = {}
+        # Map (sender email, thread_id) -> last subject + message-id for
+        # threading.  Keying on the address alone collapsed every thread with
+        # one correspondent into a single slot, so a reply — in particular a
+        # cron job's output — threaded onto whichever conversation with that
+        # sender had been touched most recently rather than the one it belonged
+        # to.  ``thread_id`` is Gmail's server-computed X-GM-THRID.
+        #
+        # Insertion order is maintained as recency order (see
+        # ``_remember_thread_context``) so a send that names no thread at all
+        # can still fall back to this correspondent's most recent one.
+        self._thread_context: Dict[Tuple[str, Optional[str]], Dict[str, str]] = {}
+
+        # Consecutive X-GM-THRID lookup failures, keyed by UID.  A message whose
+        # thread cannot be resolved is left UNSEEN and retried on the next poll
+        # cycle; after ``_THRID_MAX_FAILURES`` strikes it is reported to the
+        # sender, marked seen and dropped so one stuck message cannot wedge the
+        # poll loop forever.
+        self._thrid_failures: Dict[bytes, int] = {}
+
+        # Whether the IMAP server advertises Gmail's X-GM-EXT-1 capability.
+        # None until first probed. Per-thread sessions require the
+        # server-computed X-GM-THRID, so a server without the extension keeps
+        # the previous sender-keyed behaviour instead of failing every message.
+        self._has_gmail_ext: Optional[bool] = None
+        self._logged_no_gmail_ext = False
 
         logger.info("[Email] Adapter initialized for %s", self._address)
 
@@ -626,6 +759,106 @@ class EmailAdapter(BasePlatformAdapter):
         except (ValueError, TypeError):
             # Fallback: just clear old entries if sort fails
             self._seen_uids = set(list(self._seen_uids)[-self._seen_uids_max // 2:])
+
+    def _remember_thread_context(
+        self,
+        addr: str,
+        thread_id: Optional[str],
+        subject: str,
+        message_id: str,
+        references: str = "",
+    ) -> None:
+        """Record the latest subject/message-id/References for one thread.
+
+        ``references`` is the inbound message's own References header; a reply
+        needs it to build a compliant chain (RFC 5322 §3.6.4) rather than
+        pointing only at its immediate parent.
+
+        The entry is re-inserted rather than updated in place so dict order
+        stays recency order, which ``_thread_ctx`` relies on for its
+        no-thread_id fallback.
+        """
+        key = (addr, thread_id)
+        self._thread_context.pop(key, None)
+        self._thread_context[key] = {
+            "subject": subject,
+            "message_id": message_id,
+            "references": references or "",
+        }
+
+    def _thread_ctx(
+        self, addr: str, thread_id: Optional[str] = None
+    ) -> Dict[str, str]:
+        """Return the reply context for one (address, thread) pair.
+
+        With a ``thread_id`` the lookup is exact: a reply destined for a thread
+        must carry that thread's own ``In-Reply-To``/``References`` or none at
+        all.  Returning some other thread's message-id is the bug this keying
+        exists to prevent, so an unknown thread yields an empty context.
+
+        Without a ``thread_id`` — a standalone/home-channel send, or a caller
+        that never had a thread to begin with — the most recent thread for that
+        correspondent is used.  That is a best effort for a send that named no
+        thread, not a fallback for one whose thread is simply unknown.
+        """
+        if thread_id is not None:
+            return self._thread_context.get((addr, thread_id), {})
+        for (ctx_addr, _), ctx in reversed(self._thread_context.items()):
+            if ctx_addr == addr:
+                return ctx
+        return {}
+
+    def _apply_threading_headers(
+        self,
+        msg: MIMEMultipart,
+        ctx: Dict[str, str],
+        reply_to_msg_id: Optional[str] = None,
+    ) -> None:
+        """Set RFC 5322 §3.6.4 In-Reply-To / References on a reply.
+
+        ``In-Reply-To`` names the parent; ``References`` carries the parent's
+        own chain plus the parent — which is what lets a client nest a reply
+        under a long thread instead of only under its immediate parent.
+
+        Both values pass through :func:`_sanitize_msg_id` first, so a malformed
+        or header-injecting inbound Message-ID is dropped rather than echoed
+        (or raised on) at send time.
+        """
+        parent_id = _sanitize_msg_id(reply_to_msg_id or ctx.get("message_id"))
+        if not parent_id:
+            return
+        msg["In-Reply-To"] = parent_id
+        references = _build_references(ctx.get("references", ""), parent_id)
+        if references:
+            msg["References"] = references
+
+    def _new_message_id(self) -> str:
+        """Generate a globally unique RFC 5322 Message-ID.
+
+        ``make_msgid`` folds in a timestamp, the pid and a random component,
+        which is a stronger uniqueness guarantee than the previous 48 bits of
+        UUID hex.
+        """
+        try:
+            return make_msgid(idstring="hermes", domain=self._message_id_domain())
+        except Exception:
+            # A pathological domain must not break sending.
+            return f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
+
+    @staticmethod
+    def _thread_id_from_metadata(metadata: Optional[Dict[str, Any]]) -> Optional[str]:
+        """Pull the delivery thread id out of send metadata.
+
+        The gateway's DeliveryRouter and the interactive reply path both put the
+        originating ``SessionSource.thread_id`` here, which for email is the
+        X-GM-THRID captured at ingestion.
+        """
+        if not metadata:
+            return None
+        raw = metadata.get("thread_id")
+        if raw is None or raw == "":
+            return None
+        return str(raw)
 
     def _connect_smtp(self) -> smtplib.SMTP:
         """Create an SMTP connection, selecting the correct protocol for the port.
@@ -850,6 +1083,147 @@ class EmailAdapter(BasePlatformAdapter):
             )
             await self._notify_fatal_error()
 
+    def _probe_gmail_ext(self, imap: "imaplib.IMAP4") -> bool:
+        """Record whether this server advertises Gmail's X-GM-EXT-1 capability.
+
+        Per-thread session isolation is built on ``X-GM-THRID``, which only
+        Gmail/Workspace serves. Without this probe a non-Gmail deployment answers
+        every thread lookup with BAD, burns through the retry budget and drops
+        all inbound mail. Probing lets those servers degrade to the previous
+        sender-keyed behaviour instead.
+
+        Delegated mailboxes and some Workspace configurations also omit the
+        capability, so this is not purely a non-Gmail concern.
+        """
+        try:
+            caps = getattr(imap, "capabilities", None)
+            if not caps:
+                status, data = imap.capability()
+                if status != "OK" or not data:
+                    caps = ()
+                else:
+                    caps = tuple(
+                        part.decode("ascii", "replace") if isinstance(part, (bytes, bytearray)) else str(part)
+                        for item in data
+                        for part in (item.split() if isinstance(item, (bytes, bytearray)) else [item])
+                    )
+            names = {str(c).upper() for c in caps}
+            has_ext = GMAIL_IMAP_CAPABILITY.upper() in names
+        except Exception as e:
+            # Fail safe: without a definitive answer, keep the legacy behaviour
+            # rather than risk dropping mail.
+            logger.warning("[Email] IMAP capability probe failed: %s", e)
+            has_ext = False
+
+        self._has_gmail_ext = has_ext
+        if not has_ext and not self._logged_no_gmail_ext:
+            self._logged_no_gmail_ext = True
+            logger.warning(
+                "[Email] IMAP server does not advertise %s — per-thread session "
+                "isolation is unavailable; falling back to one session per "
+                "sender address. Gmail/Workspace mailboxes advertise this "
+                "capability; other providers are not yet supported.",
+                GMAIL_IMAP_CAPABILITY,
+            )
+        return has_ext
+
+    def _fetch_thread_id(self, imap: "imaplib.IMAP4", uid: bytes) -> Optional[str]:
+        """Fetch Gmail's server-computed thread id for one UID.
+
+        Returns ``None`` on any failure — a non-OK status, an empty response, or
+        a response carrying no X-GM-THRID.  The PRD treats all three identically:
+        the thread is unknown, so the message is not yet safe to process.
+        """
+        try:
+            status, data = imap.uid("fetch", uid, "(X-GM-THRID)")
+        except Exception as e:
+            logger.warning("[Email] X-GM-THRID fetch failed for UID %s: %s", uid, e)
+            return None
+        if status != "OK":
+            return None
+        return _parse_gm_thrid(data)
+
+    def _peek_sender(self, imap: "imaplib.IMAP4", uid: bytes) -> str:
+        """Best-effort sender lookup for a message we are about to give up on.
+
+        Uses BODY.PEEK so the probe itself does not set \\Seen — the give-up
+        path marks the message seen explicitly, and only after the notification
+        has been attempted.
+        """
+        try:
+            status, data = imap.uid(
+                "fetch", uid, "(BODY.PEEK[HEADER.FIELDS (FROM)])"
+            )
+            if status != "OK" or not data:
+                return ""
+            for item in data:
+                parts = item if isinstance(item, (tuple, list)) else (item,)
+                for part in parts:
+                    if not isinstance(part, (bytes, bytearray)):
+                        continue
+                    header = bytes(part).decode("utf-8", errors="replace")
+                    # Match a real From: header line, not the FETCH response
+                    # preamble — which itself contains the literal
+                    # "BODY[HEADER.FIELDS (FROM)]".
+                    match = _FROM_HEADER_RE.search(header)
+                    if match:
+                        return _extract_email_address(match.group(1))
+        except Exception as e:
+            logger.debug("[Email] Sender probe failed for UID %s: %s", uid, e)
+        return ""
+
+    def _give_up_on_thread_lookup(self, imap: "imaplib.IMAP4", uid: bytes) -> None:
+        """Report, mark seen and drop a message whose thread never resolved.
+
+        Called once the UID has burned through ``_THRID_MAX_FAILURES`` poll
+        cycles.  The body is never logged — only the UID and sender — so a
+        failure is discoverable without spilling message content into logs.
+        """
+        sender = self._peek_sender(imap, uid)
+        logger.error(
+            "%s UID %s (sender: %s) — X-GM-THRID unresolved after %d attempts; "
+            "notifying sender, marking seen and dropping",
+            THREAD_LOOKUP_FAILURE_LOG_PREFIX,
+            uid,
+            sender or "unknown",
+            self._THRID_MAX_FAILURES,
+        )
+
+        if sender:
+            try:
+                self._send_email(
+                    sender,
+                    "Hermes received your email but could not determine which "
+                    "conversation thread it belongs to, so it was not "
+                    "processed.\n\n"
+                    "Please try sending it again, ideally as a new message "
+                    "rather than a reply.",
+                    subject_override="Hermes could not process your message",
+                )
+            except Exception as e:
+                logger.error(
+                    "%s Failed to notify %s about UID %s: %s",
+                    THREAD_LOOKUP_FAILURE_LOG_PREFIX, sender, uid, e,
+                )
+        else:
+            logger.error(
+                "%s No sender resolvable for UID %s — dropping without notice",
+                THREAD_LOOKUP_FAILURE_LOG_PREFIX, uid,
+            )
+
+        # Mark seen last: until this succeeds the message is still eligible for
+        # another cycle, which is the safer way to fail.
+        try:
+            imap.uid("store", uid, "+FLAGS", "(\\Seen)")
+        except Exception as e:
+            logger.error(
+                "%s Failed to mark UID %s seen: %s",
+                THREAD_LOOKUP_FAILURE_LOG_PREFIX, uid, e,
+            )
+
+        self._thrid_failures.pop(uid, None)
+        self._seen_uids.add(uid)
+
     def _fetch_new_messages(self) -> List[Dict[str, Any]]:
         """Fetch new (unseen) messages from IMAP. Runs in executor thread."""
         results = []
@@ -865,9 +1239,51 @@ class EmailAdapter(BasePlatformAdapter):
                 if status != "OK" or not data or not data[0]:
                     return results
 
-                for uid in data[0].split():
+                # Probe once per IMAP session: a server without the Gmail
+                # extension cannot answer X-GM-THRID at all, and must not be
+                # put through the retry-and-drop path below.
+                gmail_ext = self._probe_gmail_ext(imap)
+
+                unseen_uids = data[0].split()
+                # Drop strike counters for UIDs that are no longer unseen — the
+                # message was read elsewhere, moved, or deleted between cycles.
+                # Without this a mid-retry disappearance leaks an entry forever.
+                if self._thrid_failures:
+                    still_unseen = set(unseen_uids)
+                    for stale in [
+                        u for u in self._thrid_failures if u not in still_unseen
+                    ]:
+                        del self._thrid_failures[stale]
+
+                for uid in unseen_uids:
                     if uid in self._seen_uids:
                         continue
+
+                    # Resolve the Gmail thread id BEFORE the RFC822 fetch. That
+                    # fetch implicitly sets \Seen, which would strip the message
+                    # of the one flag that makes a retry possible — so the thread
+                    # lookup has to be the first thing that touches the UID.
+                    #
+                    # Without the Gmail extension there is no thread id to fetch:
+                    # process the message with thread_id=None, which reproduces
+                    # the previous sender-keyed behaviour exactly.
+                    thread_id = self._fetch_thread_id(imap, uid) if gmail_ext else None
+                    if gmail_ext and not thread_id:
+                        strikes = self._thrid_failures.get(uid, 0) + 1
+                        self._thrid_failures[uid] = strikes
+                        if strikes < self._THRID_MAX_FAILURES:
+                            # Transient: leave the message UNSEEN and untracked
+                            # so the next poll cycle picks it up again.
+                            logger.warning(
+                                "[Email] X-GM-THRID unresolved for UID %s "
+                                "(attempt %d/%d) — leaving unseen for retry",
+                                uid, strikes, self._THRID_MAX_FAILURES,
+                            )
+                            continue
+                        self._give_up_on_thread_lookup(imap, uid)
+                        continue
+
+                    self._thrid_failures.pop(uid, None)
 
                     status, msg_data = imap.uid("fetch", uid, "(RFC822)")
                     if status != "OK":
@@ -907,7 +1323,9 @@ class EmailAdapter(BasePlatformAdapter):
                     # batch or escalate to a reconnect — it is already marked
                     # seen above, so log the UID and move on (#80032 review).
                     try:
-                        parsed = self._parse_fetched_message(uid, raw_email)
+                        parsed = self._parse_fetched_message(
+                            uid, raw_email, thread_id=thread_id
+                        )
                     except Exception as parse_exc:
                         logger.error(
                             "[Email] Failed to process message UID %s, skipping: %s",
@@ -931,7 +1349,12 @@ class EmailAdapter(BasePlatformAdapter):
         self._seen_uids_snapshot[self._address] = set(self._seen_uids)
         return results
 
-    def _parse_fetched_message(self, uid: bytes, raw_email: "bytes | bytearray") -> Optional[Dict[str, Any]]:
+    def _parse_fetched_message(
+        self,
+        uid: bytes,
+        raw_email: "bytes | bytearray",
+        thread_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Parse one fetched RFC822 payload into a dispatchable dict.
 
         Returns ``None`` for messages that should be silently skipped
@@ -951,6 +1374,7 @@ class EmailAdapter(BasePlatformAdapter):
         subject = _decode_header_value(msg.get("Subject", "(no subject)"))
         message_id = msg.get("Message-ID", "")
         in_reply_to = msg.get("In-Reply-To", "")
+        references = msg.get("References", "")
         # Skip automated/noreply senders before any processing
         msg_headers = dict(msg.items())
         if _is_automated_sender(sender_addr, msg_headers):
@@ -972,11 +1396,13 @@ class EmailAdapter(BasePlatformAdapter):
 
         return {
             "uid": uid,
+            "thread_id": thread_id,
             "sender_addr": sender_addr,
             "sender_name": sender_name,
             "subject": subject,
             "message_id": message_id,
             "in_reply_to": in_reply_to,
+            "references": references,
             "body": body,
             "attachments": attachments,
             "date": msg.get("Date", ""),
@@ -1102,18 +1528,28 @@ class EmailAdapter(BasePlatformAdapter):
                 # only classification that surfaces both.
                 msg_type = MessageType.DOCUMENT
 
-        # Store thread context for reply threading
-        self._thread_context[sender_addr] = {
-            "subject": subject,
-            "message_id": msg_data["message_id"],
-        }
+        # Store thread context for reply threading, scoped to this thread so a
+        # second concurrent conversation with the same sender cannot overwrite
+        # it.
+        thread_id = msg_data.get("thread_id")
+        self._remember_thread_context(
+            sender_addr,
+            thread_id,
+            subject,
+            msg_data["message_id"],
+            msg_data.get("references", ""),
+        )
 
+        # thread_id flows from here into SessionSource -> build_session_key ->
+        # HERMES_SESSION_THREAD_ID -> cron origin, giving each Gmail thread its
+        # own session and its own cron delivery target.
         source = self.build_source(
             chat_id=sender_addr,
             chat_name=msg_data["sender_name"] or sender_addr,
             chat_type="dm",
             user_id=sender_addr,
             user_name=msg_data["sender_name"] or sender_addr,
+            thread_id=thread_id,
         )
 
         event = MessageEvent(
@@ -1136,11 +1572,17 @@ class EmailAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send an email reply to the given address."""
+        """Send an email reply to the given address.
+
+        ``metadata["thread_id"]`` — set by the gateway's delivery router and by
+        the interactive reply path from ``SessionSource.thread_id`` — selects
+        which of this correspondent's threads the reply belongs to.
+        """
         try:
             loop = asyncio.get_running_loop()
+            thread_id = self._thread_id_from_metadata(metadata)
             message_id = await loop.run_in_executor(
-                None, self._send_email, chat_id, content, reply_to
+                None, self._send_email, chat_id, content, reply_to, thread_id
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -1162,27 +1604,38 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         reply_to_msg_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        subject_override: Optional[str] = None,
     ) -> str:
-        """Send an email via SMTP. Runs in executor thread."""
+        """Send an email via SMTP. Runs in executor thread.
+
+        ``thread_id`` scopes the reply-threading lookup so the outgoing
+        ``In-Reply-To``/``References`` name the thread this reply belongs to
+        rather than whichever thread with this correspondent was touched last.
+
+        ``subject_override`` sends a fresh subject instead of replying to a
+        stored one — used for the thread-lookup failure notice, which by
+        definition has no thread to reply into.
+        """
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
         # Thread context for reply
-        ctx = self._thread_context.get(to_addr, {})
-        subject = ctx.get("subject", "Hermes Agent")
-        if not subject.startswith("Re:"):
-            subject = f"Re: {subject}"
+        ctx = {} if subject_override else self._thread_ctx(to_addr, thread_id)
+        if subject_override:
+            subject = subject_override
+        else:
+            subject = ctx.get("subject", "Hermes Agent")
+            if not subject.startswith("Re:"):
+                subject = f"Re: {subject}"
         msg["Subject"] = subject
 
-        # Threading headers
-        original_msg_id = reply_to_msg_id or ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        # Threading headers (RFC 5322 §3.6.4)
+        self._apply_threading_headers(msg, ctx, reply_to_msg_id)
 
         msg["Date"] = formatdate(localtime=True)
-        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
+        msg_id = self._new_message_id()
         msg["Message-ID"] = msg_id
 
         msg.attach(MIMEText(body, "plain", "utf-8"))
@@ -1213,12 +1666,11 @@ class EmailAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an image URL as part of an email body.
 
-        ``metadata`` is accepted to honor the base-class contract; the
-        email body send doesn't use it.
+        ``metadata`` is forwarded so the send lands in the right thread.
         """
         text = caption or ""
         text += f"\n\nImage: {image_url}"
-        return await self.send(chat_id, text.strip(), reply_to)
+        return await self.send(chat_id, text.strip(), reply_to, metadata)
 
     async def send_multiple_images(
         self,
@@ -1267,6 +1719,7 @@ class EmailAdapter(BasePlatformAdapter):
                 chat_id,
                 body,
                 local_paths,
+                self._thread_id_from_metadata(metadata),
             )
         except Exception as e:
             logger.error("[Email] Multi-image send failed, falling back: %s", e, exc_info=True)
@@ -1277,25 +1730,23 @@ class EmailAdapter(BasePlatformAdapter):
         to_addr: str,
         body: str,
         file_paths: List[str],
+        thread_id: Optional[str] = None,
     ) -> str:
         """Send an email with multiple file attachments via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
+        ctx = self._thread_ctx(to_addr, thread_id)
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
         msg["Subject"] = subject
 
-        original_msg_id = ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        self._apply_threading_headers(msg, ctx)
 
         msg["Date"] = formatdate(localtime=True)
-        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
+        msg_id = self._new_message_id()
         msg["Message-ID"] = msg_id
 
         if body:
@@ -1345,6 +1796,7 @@ class EmailAdapter(BasePlatformAdapter):
                 caption or "",
                 file_path,
                 file_name,
+                self._thread_id_from_metadata(kwargs.get("metadata")),
             )
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
@@ -1357,25 +1809,23 @@ class EmailAdapter(BasePlatformAdapter):
         body: str,
         file_path: str,
         file_name: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> str:
         """Send an email with a file attachment via SMTP."""
         msg = MIMEMultipart()
         msg["From"] = self._address
         msg["To"] = to_addr
 
-        ctx = self._thread_context.get(to_addr, {})
+        ctx = self._thread_ctx(to_addr, thread_id)
         subject = ctx.get("subject", "Hermes Agent")
         if not subject.startswith("Re:"):
             subject = f"Re: {subject}"
         msg["Subject"] = subject
 
-        original_msg_id = ctx.get("message_id")
-        if original_msg_id:
-            msg["In-Reply-To"] = original_msg_id
-            msg["References"] = original_msg_id
+        self._apply_threading_headers(msg, ctx)
 
         msg["Date"] = formatdate(localtime=True)
-        msg_id = f"<hermes-{uuid.uuid4().hex[:12]}@{self._message_id_domain()}>"
+        msg_id = self._new_message_id()
         msg["Message-ID"] = msg_id
 
         if body:
@@ -1405,7 +1855,7 @@ class EmailAdapter(BasePlatformAdapter):
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return basic info about the email chat."""
-        ctx = self._thread_context.get(chat_id, {})
+        ctx = self._thread_ctx(chat_id)
         return {
             "name": chat_id,
             "type": "dm",
