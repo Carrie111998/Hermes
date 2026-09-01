@@ -91,6 +91,16 @@ class InvalidCodeError(Exception):
     """
 
 
+class MalformedTokenError(InvalidCodeError):
+    """A token was structurally malformed / unparseable as a JWT.
+
+    This is a bad credential, not evidence that the identity provider is
+    unreachable. The subtype preserves ``verify_session``'s existing
+    ``InvalidCodeError -> None`` contract while allowing shared token-response
+    helpers to distinguish and re-map malformed endpoint responses.
+    """
+
+
 class InvalidCredentialsError(Exception):
     """A username/password pair was rejected by a password provider.
 

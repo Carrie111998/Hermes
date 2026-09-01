@@ -406,6 +406,22 @@ class TestCompleteLogin:
                     redirect_uri="https://hermes.example/auth/callback",
                 )
 
+    def test_malformed_id_token_raises_invalid_code(self, provider):
+        provider._jwks_client = jwt.PyJWKClient("https://jwks.invalid/keys")
+        mock_resp = _mock_post(
+            200, {"id_token": "not-a-jwt", "token_type": "Bearer"}
+        )
+        with patch(
+            "plugins.dashboard_auth.self_hosted.httpx.post", return_value=mock_resp
+        ):
+            with pytest.raises(InvalidCodeError):
+                provider.complete_login(
+                    code="abc",
+                    state="s",
+                    code_verifier="vfy",
+                    redirect_uri="https://hermes.example/auth/callback",
+                )
+
 
 # ---------------------------------------------------------------------------
 # Confidential client (client_secret) — token-endpoint client authentication
@@ -563,13 +579,51 @@ class TestVerifySession:
 
     def test_jwks_unreachable_raises(self, provider, rsa_keypair):
         token = _mint_id_token(rsa_keypair)
+        # PyJWT signals an unreachable endpoint with this subclass
+        # (``fetch_data`` maps URLError / TimeoutError onto it), not with a
+        # bare PyJWKClientError.
         bad_client = MagicMock()
-        bad_client.get_signing_key_from_jwt.side_effect = jwt.PyJWKClientError(
-            "fetch failed"
+        bad_client.get_signing_key_from_jwt.side_effect = (
+            jwt.exceptions.PyJWKClientConnectionError("fetch failed")
         )
         provider._jwks_client = bad_client
         with pytest.raises(ProviderError, match="JWKS"):
             provider.verify_session(access_token=token)
+
+    def test_unknown_signing_key_returns_none(self, provider, rsa_keypair):
+        """A well-formed ID token whose kid matches no JWK comes from another
+        issuer: PyJWT already refreshed the JWK set once before raising."""
+        token = _mint_id_token(rsa_keypair)
+        other_client = MagicMock()
+        other_client.get_signing_key_from_jwt.side_effect = jwt.PyJWKClientError(
+            'Unable to find a signing key that matches: "kid42"'
+        )
+        provider._jwks_client = other_client
+        assert provider.verify_session(access_token=token) is None
+
+    def test_foreign_opaque_token_returns_none(self, provider):
+        # A non-JWT token (e.g. a session minted by a different provider, or a
+        # stale cookie) must read as "not my token" → None, NOT a ProviderError
+        # that the middleware would surface as a bogus 503 "provider
+        # unreachable". ``get_signing_key_from_jwt`` raises ``jwt.DecodeError``
+        # (an InvalidTokenError, not a PyJWKClientError) for such a token.
+        provider._jwks_client.get_signing_key_from_jwt.side_effect = (
+            jwt.DecodeError("Not enough segments")
+        )
+        assert provider.verify_session(access_token="opaque-not-a-jwt") is None
+
+    def test_real_pyjwt_malformed_token_returns_none(self, provider):
+        """Through the REAL PyJWKClient parse path: a two-segment string fails
+        header parsing locally before any JWKS fetch (URL never contacted)."""
+        provider._jwks_client = jwt.PyJWKClient("https://jwks.invalid/keys")
+        assert provider.verify_session(access_token="aaa.bbb") is None
+
+    def test_non_decode_token_error_remains_provider_error(self, provider):
+        provider._jwks_client.get_signing_key_from_jwt.side_effect = (
+            jwt.InvalidAudienceError("unexpected audience")
+        )
+        with pytest.raises(ProviderError, match="JWKS lookup failed"):
+            provider.verify_session(access_token="well.formed.token")
 
     def test_jwks_client_sends_explicit_http_headers(self):
         provider = oidc_plugin.SelfHostedOIDCProvider(
@@ -601,6 +655,26 @@ class TestRefreshAndRevoke:
     @pytest.fixture
     def provider(self, rsa_keypair):
         return _make_provider(rsa_keypair)
+
+    def test_refresh_with_malformed_id_token_raises_refresh_expired(
+        self, provider
+    ):
+        """Regression / shared-helper hazard: if the IDP returns 200 with a
+        MALFORMED id_token on the refresh grant, the shared token parser must
+        re-map to RefreshExpiredError (force re-login), NOT let a raw
+        MalformedTokenError/InvalidCodeError escape into the middleware refresh
+        loop (which would 500)."""
+        provider._jwks_client = jwt.PyJWKClient("https://jwks.invalid/keys")
+        mock_resp = _mock_post(
+            200,
+            {"id_token": "not-a-jwt", "token_type": "Bearer", "refresh_token": "rt2"},
+        )
+        with patch(
+            "plugins.dashboard_auth.self_hosted.httpx.post", return_value=mock_resp
+        ):
+            with pytest.raises(RefreshExpiredError):
+                provider.refresh_session(refresh_token="rt_old")
+
 
 
 # ---------------------------------------------------------------------------

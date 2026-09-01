@@ -91,6 +91,7 @@ from hermes_cli.dashboard_auth import (
     DashboardAuthProvider,
     InvalidCodeError,
     LoginStart,
+    MalformedTokenError,
     ProviderError,
     RefreshExpiredError,
     Session,
@@ -461,7 +462,12 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
         if token_type and token_type != "bearer":
             raise ProviderError(f"unexpected token_type={token_type!r}")
 
-        claims = self._verify_id_token(id_token)
+        try:
+            claims = self._verify_id_token(id_token)
+        except MalformedTokenError as exc:
+            # Preserve auth-code vs. refresh failure semantics for a malformed
+            # token returned by the token endpoint.
+            raise bad_request_exc(f"IDP returned a malformed token: {exc}") from exc
 
         # Refresh-token rotation: prefer a freshly-issued one, else keep the
         # previous (some IDPs don't rotate). Empty string if neither — the
@@ -617,8 +623,23 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             signing_key = self._get_jwks_client().get_signing_key_from_jwt(
                 id_token
             )
-        except jwt.PyJWKClientError as exc:
+        except jwt.DecodeError as exc:
+            # Header parsing happens before any JWKS fetch. Catch only structural
+            # decode failures; other token errors keep their existing semantics.
+            raise MalformedTokenError(f"malformed id token: {exc}") from exc
+        except jwt.exceptions.PyJWKClientConnectionError as exc:
+            # The JWKS endpoint could not be fetched: the token can be neither
+            # confirmed nor denied, so this stays a ProviderError and the
+            # middleware answers 503 rather than logging a valid user out on a
+            # transient outage.
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
+        except jwt.PyJWKClientError as exc:
+            # No JWK matches the token's kid. PyJWT refetches the JWK set once
+            # and retries before raising this, so the endpoint has answered:
+            # the token is well-formed but belongs to another issuer. Same
+            # "not my token" case as a malformed one, reached with a real JWT
+            # instead of an opaque blob.
+            raise InvalidCodeError(f"no matching signing key: {exc}") from exc
         except Exception as exc:  # pragma: no cover - defensive
             raise ProviderError(f"JWKS lookup failed: {exc!r}") from exc
 
