@@ -170,6 +170,16 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       return () => ipcRenderer.removeListener('hermes:quick-entry:shown', listener)
     }
   },
+  chatZ: {
+    onSubmit: callback => {
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on('hermes:chat-z:submit', listener)
+
+      return () => ipcRenderer.removeListener('hermes:chat-z:submit', listener)
+    },
+    complete: payload => ipcRenderer.send('hermes:chat-z:complete', payload),
+    ready: () => ipcRenderer.invoke('hermes:chat-z:ready')
+  },
   getBootProgress: () => ipcRenderer.invoke('hermes:boot-progress:get'),
   getConnectionConfig: profile => ipcRenderer.invoke('hermes:connection-config:get', profile),
   saveConnectionConfig: payload => ipcRenderer.invoke('hermes:connection-config:save', payload),

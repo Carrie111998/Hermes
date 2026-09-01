@@ -2,6 +2,7 @@ import type { GatewayWsUrlResult } from '@hermes/shared'
 import type { TranslucencyState } from '@hermes/shared/translucency'
 
 import type { WakeIndicatorState } from './lib/wake-indicator'
+import type { ChatZSubmitReceipt, ChatZSubmitRequest } from './store/chat-z'
 import type {
   PetOverlayBounds,
   PetOverlayControl,
@@ -147,6 +148,11 @@ declare global {
         // Quick window subscribes to "you were just summoned" so it can reset
         // its draft and re-focus the input on every open.
         onShown: (callback: () => void) => () => void
+      }
+      chatZ: {
+        onSubmit: (callback: (payload: ChatZSubmitRequest) => void) => () => void
+        complete: (payload: ChatZSubmitReceipt) => void
+        ready: () => Promise<{ ok: boolean }>
       }
       getBootProgress: () => Promise<DesktopBootProgress>
       getConnectionConfig: (profile?: null | string) => Promise<DesktopConnectionConfig>

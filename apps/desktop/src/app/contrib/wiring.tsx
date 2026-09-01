@@ -145,6 +145,7 @@ import {
   resolveActiveTranscriptSession,
   useBackgroundSync
 } from './hooks/use-background-sync'
+import { useChatZBridge } from './hooks/use-chat-z-bridge'
 import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
 import { usePetBridge } from './hooks/use-pet-bridge'
 import { useQuickEntryBridge } from './hooks/use-quick-entry-bridge'
@@ -676,6 +677,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // SAME submit machinery the normal composer uses (current chat / picked
   // session / new session), and it hears gateway truth from this window.
   useQuickEntryBridge({ startFreshSessionDraft, submitText })
+
+  useChatZBridge({
+    activeProfile: normalizeProfileKey(activeGatewayProfile),
+    createDesktopSession: async cwd => (await openNewSessionTile('center', { cwd, listed: true })) ?? null,
+    getSelectedStoredSessionId: () => $selectedStoredSessionId.get(),
+    requestGateway,
+    submitText
+  })
 
   // Leaving HUD mode hands this window the session back (see hud/handoff).
   useHudHandoff({ navigate, resumeSession })

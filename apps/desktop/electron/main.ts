@@ -88,6 +88,16 @@ import {
   buildBrowserWindowUrl
 } from './browser-windows'
 import { detectBundleSkew } from './bundle-skew'
+import {
+  type ChatZReceipt,
+  type ChatZRequest,
+  ChatZRequestError,
+  ChatZRequestState,
+  isChatZRequestId,
+  readChatZRequest,
+  removeChatZRequest,
+  writeChatZReceipt
+} from './chat-z'
 import { applyConnectionChange, sshQuitShouldBlock, teardownSshState } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -14170,6 +14180,11 @@ function createWindow() {
     wakeIndicatorController.close()
 
     if (mainWindow === createdMainWindow) {
+      _failChatZRendererRequests(
+        'renderer-window-closed',
+        'Hermes Desktop closed before it could confirm the request',
+        true
+      )
       mainWindow = null
       // the replacement renderer must register before queued links can be delivered.
       _rendererReadyForDeepLink = false
@@ -14251,6 +14266,14 @@ function createWindow() {
     reloadMax: RENDERER_RELOAD_MAX,
     recentReloadTimesRef: rendererReloadTimesRef,
     reloadOnFailedLoad: true
+  })
+  createdMainWindow.webContents.on('render-process-gone', () => {
+    if (mainWindow === createdMainWindow) {
+      _failChatZRendererRequests(
+        'renderer-process-gone',
+        'Hermes Desktop renderer stopped before it could confirm the request'
+      )
+    }
   })
 
   // Electron always passes the event first. The canonical (Electron 36+) shape
@@ -17341,6 +17364,135 @@ const HERMES_PROTOCOL = DEV_SERVER ? 'hermes-dev' : 'hermes'
 const DEEPLINK_SCHEMES = DEV_SERVER ? ['hermes-dev', 'hermes'] : ['hermes']
 let _pendingDeepLink = null
 let _rendererReadyForDeepLink = false
+const _chatZRequests = new ChatZRequestState()
+let _rendererReadyForChatZ = false
+
+function _chatZErrorReceipt(requestId: string, error: unknown): ChatZReceipt {
+  const code = error instanceof ChatZRequestError ? error.code : 'desktop-error'
+  const message = error instanceof Error ? error.message : String(error)
+
+  return { requestId, status: 'error', code, message }
+}
+
+function _writeChatZError(requestId: string, error: unknown): boolean {
+  try {
+    writeChatZReceipt(app.getPath('userData'), _chatZErrorReceipt(requestId, error))
+
+    return true
+  } catch (receiptError) {
+    rememberLog(`[chat-z] failed to write error receipt for ${requestId}: ${(receiptError as Error).message}`)
+
+    return false
+  }
+}
+
+function _finishChatZError(requestId: string, error: unknown): void {
+  if (!_writeChatZError(requestId, error)) {
+    return
+  }
+
+  try {
+    removeChatZRequest(app.getPath('userData'), requestId)
+  } catch (removeError) {
+    rememberLog(`[chat-z] failed to remove rejected request ${requestId}: ${(removeError as Error).message}`)
+  }
+}
+
+function _failChatZRendererRequests(code: string, message: string, dropPending = false): void {
+  _rendererReadyForChatZ = false
+
+  for (const requestId of _chatZRequests.rendererLost({ dropPending })) {
+    _finishChatZError(requestId, new ChatZRequestError(code, message))
+    rememberLog(`[chat-z] renderer unavailable for ${requestId}: ${code}`)
+  }
+}
+
+function _deliverChatZ(request: ChatZRequest): void {
+  if (!_rendererReadyForChatZ || !mainWindow || mainWindow.isDestroyed()) {
+    _chatZRequests.queue(request)
+
+    return
+  }
+
+  if (!_chatZRequests.begin(request)) {
+    return
+  }
+
+  mainWindow.webContents.send('hermes:chat-z:submit', request)
+  rememberLog(`[chat-z] routed ${request.requestId} to primary renderer`)
+}
+
+function _handleChatZLink(requestId: string): void {
+  if (!isChatZRequestId(requestId)) {
+    rememberLog(`[chat-z] ignoring invalid request id: ${requestId}`)
+
+    return
+  }
+
+  if (_chatZRequests.has(requestId)) {
+    return
+  }
+
+  try {
+    _deliverChatZ(readChatZRequest(app.getPath('userData'), requestId))
+  } catch (error) {
+    rememberLog(`[chat-z] rejected ${requestId}: ${(error as Error).message}`)
+    _finishChatZError(requestId, error)
+  }
+}
+
+ipcMain.handle('hermes:chat-z:ready', event => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) {
+    return { ok: false }
+  }
+
+  _rendererReadyForChatZ = true
+
+  for (const request of _chatZRequests.pendingRequests()) {
+    _deliverChatZ(request)
+  }
+
+  return { ok: true }
+})
+
+ipcMain.on('hermes:chat-z:complete', (event, payload) => {
+  if (!mainWindow || event.sender !== mainWindow.webContents) {
+    return
+  }
+
+  const requestId = payload?.requestId
+
+  if (!isChatZRequestId(requestId) || !_chatZRequests.isInflight(requestId)) {
+    return
+  }
+
+  try {
+    const status = payload?.status === 'accepted' ? 'accepted' : 'error'
+
+    const receipt: ChatZReceipt = {
+      requestId,
+      status,
+      ...(typeof payload?.code === 'string' ? { code: payload.code.slice(0, 128) } : {}),
+      ...(typeof payload?.message === 'string' ? { message: payload.message.slice(0, 2_000) } : {}),
+      ...(typeof payload?.profile === 'string' ? { profile: payload.profile.slice(0, 128) } : {}),
+      ...(typeof payload?.storedSessionId === 'string'
+        ? { storedSessionId: payload.storedSessionId.slice(0, 500) }
+        : {}),
+      ...(typeof payload?.title === 'string' ? { title: payload.title.slice(0, 500) } : {}),
+      ...(payload?.created === true ? { created: true } : {}),
+      ...(typeof payload?.cwd === 'string' ? { cwd: payload.cwd.slice(0, 4_096) } : {})
+    }
+
+    writeChatZReceipt(app.getPath('userData'), receipt)
+    removeChatZRequest(app.getPath('userData'), requestId)
+    rememberLog(`[chat-z] renderer ${status} ${requestId}`)
+  } catch (error) {
+    rememberLog(`[chat-z] completion failed for ${requestId}: ${(error as Error).message}`)
+    _writeChatZError(requestId, error)
+  } finally {
+    _chatZRequests.complete(requestId)
+  }
+})
 
 function _extractDeepLink(argv) {
   if (!Array.isArray(argv)) {
@@ -17376,6 +17528,13 @@ function handleDeepLink(url) {
   // hermes://blueprint/<key>?slot=val  -> host="blueprint", path="/<key>"
   const kind = parsed.hostname || ''
   const name = decodeURIComponent((parsed.pathname || '').replace(/^\//, ''))
+
+  if (kind === 'chat-z') {
+    _handleChatZLink(name)
+
+    return
+  }
+
   const params = {}
   parsed.searchParams.forEach((v, k) => {
     params[k] = v
