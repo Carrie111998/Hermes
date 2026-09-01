@@ -63,7 +63,10 @@ _GUARDED_TESTS = (
 )
 
 _FORBIDDEN_IN_SOURCE = {
-    # "$260K", and the underscore form a literal constant takes: 180_000.
+    # Shape-only, and deliberately so: this comment must not name the values
+    # it forbids, or the guard republishes the very data it exists to catch.
+    # Covers the "$NNNK" spelling and the underscore form a literal integer
+    # constant takes (e.g. $123K, 123_456).
     "a compensation figure": re.compile(r"\$\s?\d{2,3}\s?[Kk]\b|\b\d{3}_\d{3}\b"),
     # Context-anchored: a bare five-digit run is far too common in source to be
     # evidence of anything (slice limits, token budgets, ports).
