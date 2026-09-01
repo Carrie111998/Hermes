@@ -388,3 +388,245 @@ def _make_file_chat_item(file_path: str, file_name: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# 11. Multiplex secondary-profile scope
+# ---------------------------------------------------------------------------
+#
+# ``__init__``'s auto-accept/group-allowlist reads, the registry gates
+# (``check_requirements``/``validate_config``/``is_connected``),
+# ``_env_enablement``, and ``_standalone_send`` all previously read raw
+# ``SIMPLEX_*`` env vars unconditionally. Under a multiplexed secondary
+# profile, ``os.environ`` holds the DEFAULT profile's YAML-to-env bridge
+# output — a secondary profile with its own (different, or absent) SimpleX
+# config would silently borrow the default profile's daemon URL, group
+# allowlist, or auto-accept setting. Mirrors the Buzz fix for #98738.
+
+_SIMPLEX_ENV_VARS = (
+    "SIMPLEX_WS_URL",
+    "SIMPLEX_AUTO_ACCEPT",
+    "SIMPLEX_GROUP_ALLOWED",
+    "SIMPLEX_HOME_CHANNEL",
+    "SIMPLEX_HOME_CHANNEL_NAME",
+    "SIMPLEX_ALLOWED_USERS",
+    "SIMPLEX_ALLOW_ALL_USERS",
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_simplex_env(monkeypatch):
+    """Keep the new multiplex tests hermetic regardless of ambient env."""
+    for var in _SIMPLEX_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    yield
+
+
+@pytest.fixture
+def multiplex_scope():
+    """Install multiplex + a secondary-profile secret scope; restore after."""
+    tokens = []
+
+    def install(scope=None):
+        from agent.secret_scope import set_multiplex_active, set_secret_scope
+
+        set_multiplex_active(True)
+        tokens.append(set_secret_scope(scope or {}))
+        return tokens[-1]
+
+    yield install
+
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active
+
+    for token in reversed(tokens):
+        reset_secret_scope(token)
+    set_multiplex_active(False)
+
+
+@pytest.fixture
+def default_profile_env(monkeypatch):
+    """The default profile's YAML-to-env bridge output in os.environ."""
+    monkeypatch.setenv("SIMPLEX_WS_URL", "ws://default-daemon:5225")
+    monkeypatch.setenv("SIMPLEX_AUTO_ACCEPT", "false")
+    monkeypatch.setenv("SIMPLEX_GROUP_ALLOWED", "*")
+    monkeypatch.setenv("SIMPLEX_HOME_CHANNEL", "default-contact")
+
+
+class TestMultiplexProfileScope:
+
+    def test_secondary_extra_wins_over_default_profile_env(
+        self, multiplex_scope, default_profile_env
+    ):
+        """The secondary profile's own config is authoritative, not the
+        default profile's wildcard group-allow / disabled auto-accept."""
+        from gateway.config import PlatformConfig
+
+        multiplex_scope()
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={
+                "ws_url": "ws://profile-daemon:5225",
+                "auto_accept": True,
+                "group_allowed": "grp-secondary-only",
+            },
+        )
+        adapter = SimplexAdapter(cfg)
+        assert adapter.auto_accept is True
+        assert adapter.group_allow_from == {"grp-secondary-only"}
+
+    def test_secondary_missing_keys_fail_closed(
+        self, multiplex_scope, default_profile_env
+    ):
+        """Keys absent from the profile's config must NOT borrow the default
+        profile's bridged env values — that would silently disable
+        auto-accept or widen the group allowlist to the default's wildcard."""
+        from gateway.config import PlatformConfig
+
+        multiplex_scope()
+        adapter = SimplexAdapter(PlatformConfig(enabled=True, extra={}))
+        # Default profile's env has AUTO_ACCEPT=false and GROUP_ALLOWED=*;
+        # an unconfigured secondary profile must fail closed to the
+        # documented safe defaults instead, not inherit either value.
+        assert adapter.auto_accept is True
+        assert adapter.group_allow_from == set()
+
+    def test_default_profile_unscoped_keeps_env_precedence(
+        self, monkeypatch, default_profile_env
+    ):
+        """Multiplex ON but no scope (the DEFAULT profile constructs
+        unscoped): env is its own bridge output and still wins."""
+        from agent.secret_scope import set_multiplex_active
+        from gateway.config import PlatformConfig
+
+        set_multiplex_active(True)
+        try:
+            adapter = SimplexAdapter(
+                PlatformConfig(enabled=True, extra={"auto_accept": True})
+            )
+        finally:
+            set_multiplex_active(False)
+        assert adapter.auto_accept is False
+        assert adapter.group_allow_from == {"*"}
+
+    def test_check_requirements_scoped_reads_profile_config(
+        self, multiplex_scope, default_profile_env, tmp_path
+    ):
+        """The gate must consult the profile's own config.yaml, not the
+        default profile's bridged SIMPLEX_WS_URL."""
+        import yaml
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "gateway": {
+                        "platforms": {
+                            "simplex": {
+                                "enabled": True,
+                                "extra": {"ws_url": "ws://profile-daemon:5225"},
+                            }
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        multiplex_scope()
+        token = set_hermes_home_override(str(tmp_path))
+        try:
+            # The default profile's env WS_URL must NOT pass the gate on
+            # its own for a profile whose config.yaml has its own entry...
+            assert check_requirements() is True
+        finally:
+            reset_hermes_home_override(token)
+
+        # ...and a profile whose config.yaml has no simplex entry fails
+        # closed even though the default profile's env value is present.
+        empty_home = tmp_path / "empty-profile"
+        empty_home.mkdir()
+        multiplex_scope()
+        token = set_hermes_home_override(str(empty_home))
+        try:
+            assert check_requirements() is False
+        finally:
+            reset_hermes_home_override(token)
+
+    def test_validate_config_and_is_connected_scoped(
+        self, multiplex_scope, default_profile_env
+    ):
+        from gateway.config import PlatformConfig
+
+        multiplex_scope()
+        # Secondary profile's own extra is authoritative...
+        cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://profile-daemon:5225"})
+        assert validate_config(cfg) is True
+        assert is_connected(cfg) is True
+        # ...and an unconfigured secondary profile fails closed even though
+        # the default profile's env WS_URL is present.
+        empty_cfg = PlatformConfig(enabled=True, extra={})
+        assert validate_config(empty_cfg) is False
+        assert is_connected(empty_cfg) is False
+
+    def test_env_enablement_returns_none_when_profile_scoped(
+        self, multiplex_scope, default_profile_env
+    ):
+        """Env enablement must not fabricate a SimpleX platform for a
+        secondary profile from the default profile's bridged env."""
+        multiplex_scope()
+        assert _env_enablement() is None
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_uses_scoped_ws_url(
+        self, default_profile_env, monkeypatch
+    ):
+        """Cron/out-of-process delivery must connect to the secondary
+        profile's own daemon, not the default profile's bridged env URL.
+
+        Scope is installed/reset inline (not via the ``multiplex_scope``
+        fixture) so the ``ContextVar`` set/reset pair stays inside the same
+        asyncio task context as this coroutine — resetting a token from the
+        surrounding sync fixture-teardown context raises ``ValueError:
+        token was created in a different Context``.
+        """
+        from agent.secret_scope import (
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+
+        set_multiplex_active(True)
+        token = set_secret_scope({})
+        try:
+            pconfig = MagicMock()
+            pconfig.extra = {"ws_url": "ws://profile-daemon:5225"}
+
+            class DummyWs:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    return None
+
+                async def send(self, payload):
+                    pass
+
+            connected_urls = []
+
+            def fake_connect(url, **kwargs):
+                connected_urls.append(url)
+                return DummyWs()
+
+            import websockets
+
+            monkeypatch.setattr(websockets, "connect", fake_connect)
+            result = await _standalone_send(pconfig, "contact-42", "hi")
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
+
+        assert result["success"] is True
+        assert connected_urls == ["ws://profile-daemon:5225"]
+
+

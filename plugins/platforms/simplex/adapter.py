@@ -91,6 +91,69 @@ def _parse_comma_list(value: str) -> List[str]:
     return [v.strip() for v in value.split(",") if v.strip()]
 
 
+def _profile_scoped() -> bool:
+    """True when running inside a multiplexed secondary profile's scope.
+
+    Secondary-profile adapters are constructed, connected, and reloaded
+    inside ``_profile_runtime_scope`` (secret scope installed + multiplex
+    active) — the same discriminator the Buzz adapter uses (#98738). The
+    DEFAULT profile under multiplexing runs unscoped: ``os.environ`` holds
+    its own bridge output there and keeps its legacy precedence.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        return bool(is_multiplex_active() and current_secret_scope() is not None)
+    except Exception:
+        return False
+
+
+def _scoped_platform_setting(env_name, extra, key):
+    """Raw read of a non-secret SimpleX setting, multiplex-profile-correct.
+
+    Inside a secondary profile scope ``os.environ`` holds the DEFAULT
+    profile's YAML-to-env bridge output, so the profile's
+    ``PlatformConfig.extra`` is authoritative and env is not consulted: a
+    missing key yields ``None`` and callers fail closed to their default
+    instead of silently borrowing the default profile's daemon URL, group
+    allowlist, or auto-accept setting. Everywhere else — single-profile
+    gateways, the default profile under multiplexing — the legacy
+    ``os.getenv`` read is returned unchanged, so env-over-config precedence
+    is preserved.
+    """
+    if _profile_scoped():
+        return (extra or {}).get(key)
+    return os.getenv(env_name)
+
+
+def _profile_simplex_extra() -> dict:
+    """Read ``simplex.extra`` from the active profile's config.yaml (scoped path).
+
+    Only meaningful inside a secondary profile scope, where the hermes-home
+    override points at that profile's home. Used by ``check_requirements``
+    (which has no ``PlatformConfig`` argument) so the multiplex gate
+    consults the profile's own configuration instead of the process env.
+    Best-effort: any failure yields an empty mapping and the caller fails
+    closed.
+    """
+    if not _profile_scoped():
+        return {}
+    try:
+        from hermes_constants import get_hermes_home
+        from hermes_cli.config import read_user_config_raw
+
+        cfg = read_user_config_raw(Path(get_hermes_home()) / "config.yaml")
+    except Exception:
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    simplex = ((cfg.get("gateway") or {}).get("platforms") or {}).get("simplex")
+    if not isinstance(simplex, dict):
+        return {}
+    extra = simplex.get("extra", simplex)
+    return extra if isinstance(extra, dict) else {}
+
+
 def _redact_id(contact_id: str) -> str:
     """Redact a contact/group ID for logging."""
     if not contact_id:
@@ -152,20 +215,22 @@ class SimplexAdapter(BasePlatformAdapter):
 
         # Contact-request auto-accept (on by default — matches the way most
         # bot deployments expect to behave). Read from env first, then fall
-        # back to the value seeded by ``_env_enablement``.
-        env_auto = os.getenv("SIMPLEX_AUTO_ACCEPT")
-        if env_auto is not None:
-            self.auto_accept = env_auto.strip().lower() not in {"0", "false", "no", ""}
-        else:
-            self.auto_accept = bool(extra.get("auto_accept", True))
+        # back to the value seeded by ``_env_enablement``. Scope-aware: a
+        # secondary multiplex profile must not borrow the default profile's
+        # bridged env value (mirrors the Buzz fix for #98738).
+        _auto_raw = _scoped_platform_setting("SIMPLEX_AUTO_ACCEPT", extra, "auto_accept")
+        _auto_cfg = extra.get("auto_accept", True) if _auto_raw is None else _auto_raw
+        self.auto_accept = str(_auto_cfg).strip().lower() not in {"0", "false", "no", ""}
 
         # Group allowlist. Without ``SIMPLEX_GROUP_ALLOWED``, group messages
         # are ignored entirely (safer default — a bot in a group otherwise
         # processes every member's traffic). Use ``*`` to accept any group.
-        group_allowed_str = os.getenv("SIMPLEX_GROUP_ALLOWED", "") or extra.get(
-            "group_allowed", ""
-        )
-        self.group_allow_from = set(_parse_comma_list(group_allowed_str))
+        # Scope-aware for the same reason as auto-accept above: a secondary
+        # profile's own (possibly tighter) allowlist must not be widened by
+        # the default profile's bridged env value.
+        _group_raw = _scoped_platform_setting("SIMPLEX_GROUP_ALLOWED", extra, "group_allowed")
+        group_allowed_str = _group_raw or extra.get("group_allowed", "")
+        self.group_allow_from = set(_parse_comma_list(group_allowed_str or ""))
 
         # Running state
         self._ws = None  # websockets connection
@@ -1172,7 +1237,15 @@ def check_requirements() -> bool:
     so the gateway never instantiates the adapter when the dependency is
     missing or no daemon URL is configured.
     """
-    if not os.getenv("SIMPLEX_WS_URL"):
+    if _profile_scoped():
+        # Multiplexed secondary profile: os.environ's SIMPLEX_WS_URL is the
+        # default profile's bridge output and must not satisfy this gate for
+        # a profile that never configured SimpleX itself (mirrors the Buzz
+        # fix for #98738). Consult the profile's own config.yaml instead; an
+        # unconfigured profile fails closed.
+        if not str(_profile_simplex_extra().get("ws_url", "")).strip():
+            return False
+    elif not os.getenv("SIMPLEX_WS_URL"):
         return False
     try:
         import websockets  # noqa: F401
@@ -1184,14 +1257,16 @@ def check_requirements() -> bool:
 def validate_config(config) -> bool:
     """Validate that the platform config has enough info to connect."""
     extra = getattr(config, "extra", {}) or {}
-    ws_url = os.getenv("SIMPLEX_WS_URL") or extra.get("ws_url", "")
+    _ws_raw = _scoped_platform_setting("SIMPLEX_WS_URL", extra, "ws_url")
+    ws_url = _ws_raw or extra.get("ws_url", "")
     return bool(ws_url)
 
 
 def is_connected(config) -> bool:
     """Check whether SimpleX is configured (env or config.yaml)."""
     extra = getattr(config, "extra", {}) or {}
-    ws_url = os.getenv("SIMPLEX_WS_URL") or extra.get("ws_url", "")
+    _ws_raw = _scoped_platform_setting("SIMPLEX_WS_URL", extra, "ws_url")
+    ws_url = _ws_raw or extra.get("ws_url", "")
     return bool(ws_url)
 
 
@@ -1207,6 +1282,12 @@ def _env_enablement() -> Optional[dict]:
     becomes a proper ``HomeChannel`` dataclass on the ``PlatformConfig``
     rather than being merged into ``extra``.
     """
+    if _profile_scoped():
+        # Secondary profile scope: the process env's SIMPLEX_* values are
+        # the default profile's configuration, not this profile's — env
+        # enablement must not fabricate a SimpleX platform for a profile
+        # that did not configure one (mirrors the Buzz fix for #98738).
+        return None
     ws_url = os.getenv("SIMPLEX_WS_URL", "").strip()
     if not ws_url:
         return None
@@ -1257,9 +1338,8 @@ async def _standalone_send(
         return {"error": "websockets not installed. Run: pip install websockets"}
 
     extra = getattr(pconfig, "extra", {}) or {}
-    ws_url = os.getenv("SIMPLEX_WS_URL") or extra.get(
-        "ws_url", "ws://127.0.0.1:5225"
-    )
+    _ws_raw = _scoped_platform_setting("SIMPLEX_WS_URL", extra, "ws_url")
+    ws_url = _ws_raw or extra.get("ws_url", "ws://127.0.0.1:5225")
     if not ws_url:
         return {"error": "SimpleX standalone send: SIMPLEX_WS_URL is required"}
 
