@@ -690,7 +690,7 @@ class GoalState:
             for i, text in enumerate(self.prior_turn_evidence, start=1)
             if text.strip()
         ]
-        return _truncate("\n".join(lines), _JUDGE_PRIOR_EVIDENCE_CHARS)
+        return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────────────────
