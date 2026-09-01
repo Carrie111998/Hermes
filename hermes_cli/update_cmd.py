@@ -643,6 +643,78 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
     return _validate_python_files_syntax(root, _UPDATE_CRITICAL_FILES)
 
 
+def _scan_working_tree_for_conflict_markers(root: Path) -> list[str]:
+    """Return paths under ``root`` whose working-tree content contains
+    unmerged git conflict markers (``<<<<<<<`` or ``>>>>>>>``).
+
+    The Python syntax guard above only parses ``_UPDATE_CRITICAL_FILES``,
+    which is why a TS file with orphan merge-conflict markers slipped past
+    earlier updates and bricked the desktop build with a cryptic
+    ``SyntaxError: Unexpected token`` at vite-parse time (#94387). This
+    helper closes that gap by scanning every changed source file for the
+    standard git conflict markers and returning the offenders.
+
+    Implementation notes:
+
+    - ``git diff --name-only`` (no commit range) lists files changed in
+      the working tree vs the index. That's exactly the post-autostash-
+      apply state we care about — files with conflict markers that the
+      syntax guard won't see because they're not Python.
+    - Scoped to the extensions the desktop build pipeline actually parses,
+      so a literal ``<<<<<<<`` in a doc, fixture, or image header never
+      false-positives.
+    - 2 MB read cap and 10 s git-diff timeout keep the check cheap on the
+      full repo.
+    - Fails open: any error returns ``[]`` so a tooling bug can never
+      wedge an update.
+
+    The caller is expected to bail with a clear "resolve manually"
+    message — we deliberately do not try to auto-resolve, because picking
+    the wrong side of a real conflict is far worse than asking the user
+    to ``git checkout --theirs`` / ``git checkout --ours`` themselves.
+    """
+    SOURCE_EXTS = (
+        ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+        ".css", ".scss", ".html", ".json",
+    )
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only"],
+            cwd=root,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return []
+        changed = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+
+    offenders: list[str] = []
+    for relpath in changed:
+        if not any(relpath.endswith(ext) for ext in SOURCE_EXTS):
+            continue
+        path = root / relpath
+        if not path.is_file():
+            continue
+        try:
+            with open(path, "rb") as f:
+                data = f.read(2 * 1024 * 1024)
+        except OSError:
+            continue
+        # Marker bytes must appear at line start to count — that prevents
+        # matching the string in a comment or docblock.
+        if (
+            b"\n<<<<<<< " in data
+            or data.startswith(b"<<<<<<< ")
+            or b"\n>>>>>>> " in data
+            or data.startswith(b">>>>>>> ")
+        ):
+            offenders.append(relpath)
+    return offenders
+
+
 # Modules imported on every agent startup. Unlike _UPDATE_CRITICAL_FILES (which
 # is only parsed), these are actually *imported* so that cross-module breakage
 # is caught — a file can be syntactically perfect and still fail to import
@@ -7731,6 +7803,35 @@ def _rebuild_desktop_after_update(
         print("  ✓ Desktop app up to date")
         return True
 
+    # Defensive: refuse to launch the desktop build if the working tree still
+    # has unmerged git conflict markers. Vite/esbuild cannot parse a file
+    # containing ``<<<<<<<`` markers, so the build would die with a cryptic
+    # ``SyntaxError: Unexpected token`` and we'd surface it as
+    # "Desktop build failed" with no actionable guidance (#94387). Bail
+    # here with a clear "resolve manually" message instead. The Python
+    # syntax guard at line 6581 only inspects _UPDATE_CRITICAL_FILES, so
+    # this is the only thing standing between a half-merged tree and a
+    # bricked desktop rebuild.
+    conflict_files = _scan_working_tree_for_conflict_markers(_m().PROJECT_ROOT)
+    if conflict_files:
+        print()
+        print("✗ Unmerged conflict markers in source files — refusing to build:")
+        for f in conflict_files[:20]:
+            print(f"  {f}")
+        if len(conflict_files) > 20:
+            print(f"  ... and {len(conflict_files) - 20} more")
+        print()
+        print("  Resolve them before retrying:")
+        print(f"    cd {_m().PROJECT_ROOT} && git status")
+        print("    # then for each: git checkout --theirs <path>  # or --ours, or hand-edit")
+        print("    # then: git add <path>")
+        print(f"  Then re-run `hermes desktop --force-build --build-only`.")
+        # Treat as a non-fatal skip: return True so the rest of the update
+        # pipeline (skills sync, config migration, gateway restart) still
+        # lands. The user resolves the merge and rebuilds at their leisure,
+        # without losing the rest of the update.
+        return True
+
     desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
     # Capture the (very loud) Electron/vite build output into update.log
     # instead of streaming it to the terminal. On the rare nonzero exit,
@@ -8825,9 +8926,64 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         )
                         sys.exit(1)
                 else:
-                    # Same branch as the update target — a true upstream
-                    # force-push/rebase. Local changes are already stashed;
-                    # reset to match the remote exactly (original behaviour).
+                    # Same branch as the update target. Before resetting (which
+                    # would silently destroy any unpushed local commits), check
+                    # whether such commits actually exist. The autostash only
+                    # captures WORKING-TREE changes, not committed-but-unpushed
+                    # work — so a ``reset --hard`` here would obliterate the
+                    # latter with no recourse. If unpushed commits exist, tag
+                    # the current HEAD as a recovery anchor and exit cleanly
+                    # rather than wipe (#94387: a defensive conflict-marker
+                    # guard was lost this way on the second divergent update,
+                    # because every divergent update triggered the same
+                    # reset).
+                    unpushed_result = subprocess.run(
+                        git_cmd + ["rev-list", "--count", "HEAD", f"^origin/{branch}"],
+                        cwd=_m().PROJECT_ROOT,
+                        capture_output=True,
+                        text=True, encoding="utf-8", errors="replace",
+                    )
+                    unpushed_count = 0
+                    try:
+                        unpushed_count = int((unpushed_result.stdout or "0").strip())
+                    except (TypeError, ValueError):
+                        unpushed_count = 0
+                    if unpushed_count > 0:
+                        tag_name = (
+                            f"pre-update-local-commits-"
+                            f"{_time.strftime('%Y%m%d-%H%M%S')}"
+                        )
+                        subprocess.run(
+                            git_cmd + ["tag", tag_name],
+                            cwd=_m().PROJECT_ROOT,
+                            capture_output=True,
+                            check=False,
+                        )
+                        print(
+                            f"  ⚠ Local branch has {unpushed_count} commit(s) "
+                            f"not on origin/{branch} — refusing to reset to "
+                            f"avoid silent data loss."
+                        )
+                        print(
+                            f"  Tagged current HEAD as '{tag_name}' so you can recover:"
+                        )
+                        print(f"    git reset --hard {tag_name}")
+                        print()
+                        print("  To finish the update, pick one:")
+                        print(f"    1. Push first:  git push <remote> {branch}")
+                        print(f"    2. Drop them:   git reset --hard origin/{branch}")
+                        print(f"    3. Inspect:     git log --oneline HEAD ^origin/{branch}")
+                        print()
+                        print(
+                            "  Local working-tree changes remain parked in "
+                            f"stash '{auto_stash_ref}' and will be restored "
+                            "on the next update run."
+                        )
+                        sys.exit(1)
+
+                    # No unpushed commits — a true upstream force-push/rebase.
+                    # Working-tree changes are already stashed; resetting HEAD
+                    # to match remote is safe and matches original behaviour.
                     print(
                         "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                     )
