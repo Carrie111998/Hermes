@@ -1,7 +1,7 @@
 import type { PointerEvent as ReactPointerEvent } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { group } from '@/components/pane-shell/tree/model'
+import { findGroupOfPane, group, split } from '@/components/pane-shell/tree/model'
 import { $layoutTree } from '@/components/pane-shell/tree/store'
 import { openSessionTile } from '@/store/session-states'
 
@@ -123,6 +123,105 @@ describe('session drop targeting across stacked tabs', () => {
     dragTo(document.getElementById('row')!, 120, 400)
 
     expect(requestComposerInsertRefs).not.toHaveBeenCalled()
+    expect(openSessionTile).not.toHaveBeenCalled()
+  })
+
+  it('moves the primary workspace pane when its loaded chat is stacked into another chat strip', () => {
+    document.body.innerHTML = `
+      <div data-tree-group="top">
+        <div data-zone-tabstrip="top">
+          <button data-tree-tab="session-tile:top"></button>
+        </div>
+      </div>
+      <div data-tree-group="bottom">
+        <button id="workspace-tab" data-tree-tab="workspace"></button>
+      </div>
+    `
+
+    const top = document.querySelector<HTMLElement>('[data-tree-group="top"]')!
+    const bottom = document.querySelector<HTMLElement>('[data-tree-group="bottom"]')!
+    const strip = document.querySelector<HTMLElement>('[data-zone-tabstrip="top"]')!
+    const targetTab = document.querySelector<HTMLElement>('[data-tree-tab="session-tile:top"]')!
+    const workspaceTab = document.getElementById('workspace-tab')!
+
+    stubRect(top, { left: 0, top: 0, right: 1000, bottom: 390 })
+    stubRect(strip, { left: 0, top: 0, right: 1000, bottom: 32 })
+    stubRect(targetTab, { left: 0, top: 0, right: 300, bottom: 32 })
+    stubRect(bottom, { left: 0, top: 410, right: 1000, bottom: 800 })
+    stubRect(workspaceTab, { left: 0, top: 410, right: 300, bottom: 442 })
+
+    $layoutTree.set(
+      split('column', [
+        group(['session-tile:top'], { active: 'session-tile:top', id: 'top' }),
+        group(['workspace'], { active: 'workspace', id: 'bottom' })
+      ])
+    )
+
+    startSessionDrag(
+      { id: 'main-session', profile: 'default', title: 'Main chat' },
+      {
+        button: 0,
+        clientX: 100,
+        clientY: 425,
+        currentTarget: workspaceTab,
+        pointerId: 1
+      } as unknown as ReactPointerEvent<HTMLElement>,
+      { sourcePaneId: 'workspace' }
+    )
+
+    window.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: 800, clientY: 16 }))
+    window.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, clientX: 800, clientY: 16 }))
+
+    expect(findGroupOfPane($layoutTree.get()!, 'workspace')).toMatchObject({
+      id: 'top',
+      panes: ['session-tile:top', 'workspace']
+    })
+    expect(openSessionTile).not.toHaveBeenCalled()
+  })
+
+  it('excludes the primary workspace pane from its own same-strip insertion slots', () => {
+    document.body.innerHTML = `
+      <div data-tree-group="shared">
+        <div data-zone-tabstrip="shared">
+          <button id="workspace-tab" data-tree-tab="workspace"></button>
+          <button data-tree-tab="session-tile:other"></button>
+        </div>
+      </div>
+    `
+
+    const groupEl = document.querySelector<HTMLElement>('[data-tree-group="shared"]')!
+    const strip = document.querySelector<HTMLElement>('[data-zone-tabstrip="shared"]')!
+    const workspaceTab = document.getElementById('workspace-tab')!
+    const otherTab = document.querySelector<HTMLElement>('[data-tree-tab="session-tile:other"]')!
+
+    stubRect(groupEl, { left: 0, top: 0, right: 1000, bottom: 800 })
+    stubRect(strip, { left: 0, top: 0, right: 1000, bottom: 32 })
+    stubRect(workspaceTab, { left: 0, top: 0, right: 300, bottom: 32 })
+    stubRect(otherTab, { left: 300, top: 0, right: 600, bottom: 32 })
+
+    const tree = group(['workspace', 'session-tile:other'], { active: 'workspace', id: 'shared' })
+    $layoutTree.set(tree)
+
+    startSessionDrag(
+      { id: 'main-session', profile: 'default', title: 'Main chat' },
+      {
+        button: 0,
+        clientX: 150,
+        clientY: 16,
+        currentTarget: workspaceTab,
+        pointerId: 1
+      } as unknown as ReactPointerEvent<HTMLElement>,
+      { sourcePaneId: 'workspace' }
+    )
+
+    // A small leftward drag over the workspace's own slot is a no-op. Before
+    // the fix, the slot named `workspace`; removal erased that anchor and the
+    // insert fell back to append, unexpectedly moving workspace to the end.
+    window.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: 10, clientY: 16 }))
+    window.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, clientX: 10, clientY: 16 }))
+
+    expect($layoutTree.get()).toBe(tree)
+    expect(findGroupOfPane($layoutTree.get()!, 'workspace')?.panes).toEqual(['workspace', 'session-tile:other'])
     expect(openSessionTile).not.toHaveBeenCalled()
   })
 })
