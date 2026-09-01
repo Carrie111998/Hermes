@@ -95,6 +95,25 @@ def test_request_gate_shares_secondary_limit_cooldown_across_instances(tmp_path)
     assert sleeps == [30.0]
 
 
+def test_request_gate_fails_fast_when_cooldown_exceeds_wait_budget(tmp_path) -> None:
+    path = tmp_path / "github-request-gate.json"
+    path.write_text('{"cooldown_until": 1945.0}\n', encoding="utf-8")
+    sleeps: list[float] = []
+
+    with pytest.raises(GitHubClientError) as raised:
+        with GitHubRequestGate(
+            path,
+            sleeper=sleeps.append,
+            clock=lambda: 100.0,
+            max_wait_seconds=30.0,
+        ):
+            pass
+
+    assert raised.value.code == "rate_limited"
+    assert "cooldown" in str(raised.value)
+    assert sleeps == []
+
+
 def test_request_gate_spaces_shared_requests_at_a_conservative_rate(tmp_path) -> None:
     now = [100.0]
     sleeps: list[float] = []
@@ -199,7 +218,10 @@ def test_subprocess_runner_retries_timeout_without_rate_limit_backoff(
     ],
 )
 def test_subprocess_runner_exposes_safe_failure_code_without_output(
-    monkeypatch: pytest.MonkeyPatch, stderr: str, code: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    stderr: str,
+    code: str,
 ) -> None:
     monkeypatch.setattr(
         "github_pr_feedback.github_client.subprocess.run",
@@ -208,7 +230,14 @@ def test_subprocess_runner_exposes_safe_failure_code_without_output(
         ),
     )
     with pytest.raises(GitHubClientError) as raised:
-        SubprocessCommandRunner(sleeper=lambda _delay: None).run(["gh", "api", "labels"])
+        SubprocessCommandRunner(
+            sleeper=lambda _delay: None,
+            request_gate=GitHubRequestGate(
+                tmp_path / "github-request-gate.json",
+                sleeper=lambda _delay: None,
+                min_interval_seconds=0,
+            ),
+        ).run(["gh", "api", "labels"])
     assert raised.value.code == code
     assert stderr not in str(raised.value)
 

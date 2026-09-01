@@ -1332,3 +1332,21 @@ def test_plugin_directory_exposes_hermes_register_entry_point() -> None:
     spec.loader.exec_module(module)
 
     assert callable(module.register)
+
+
+def test_agent_label_selection_cursor_persists_catalogue_progress(
+    tmp_path: Path,
+) -> None:
+    ledger = FeedbackLedger(tmp_path / "ledger.sqlite3")
+    updated_at = datetime(2026, 8, 26, 8, 0, tzinfo=UTC)
+
+    assert ledger.agent_label_selection_cursor("acme/widgets") == 0
+    ledger.advance_agent_label_selection_cursor(
+        "acme/widgets",
+        cursor=3,
+        candidate_count=5,
+        updated_at=updated_at,
+    )
+
+    assert ledger.agent_label_selection_cursor("acme/widgets") == 3
+    ledger.close()

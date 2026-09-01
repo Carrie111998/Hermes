@@ -184,9 +184,13 @@ def test_scan_prioritizes_feedback_before_degraded_repair_maintenance(
             return ScanResult(0, {"github_state_unavailable": 1}, degraded=True)
 
     class Feedback:
-        def scan(self) -> ScanResult:
+        def scan(self, *, apply_labels: bool) -> ScanResult:
+            assert apply_labels is False
             order.append("feedback")
             return ScanResult(0, {})
+
+        def apply_agent_labels(self) -> dict[str, object]:
+            return {"status": "ok", "updated": 0, "skipped": {}}
 
     monkeypatch.setattr("github_pr_feedback.cli._load_policy_from_context", lambda _ctx: Policy())
     monkeypatch.setattr("github_pr_feedback.cli._exclusive_scan_lock", lambda: Lock())
@@ -230,9 +234,13 @@ def _run_scan_with_primary_result(
         release_maintenance = object()
 
     class Primary:
-        def scan(self):
+        def scan(self, *, apply_labels: bool):
+            assert apply_labels is False
             order.append("primary")
             return primary_result
+
+        def apply_agent_labels(self):
+            return {"status": "ok", "updated": 0, "skipped": {}}
 
     class Repair:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -294,6 +302,66 @@ def test_scan_keeps_merge_maintainer_moving_during_required_ci_backlog(
     assert payload["required_local_ci_backlog"] == 2
     assert payload["deferred"] == ["repair", "release_maintenance"]
     assert payload["merge"]["status"] == "ok"
+
+
+def test_scan_runs_label_side_lane_after_merge_maintainer(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from github_pr_feedback.cli import _scan
+
+    order: list[str] = []
+
+    class Lock:
+        def __enter__(self) -> bool:
+            return True
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    class Ledger:
+        @classmethod
+        def for_current_profile(cls):
+            return cls()
+
+        def close(self) -> None:
+            pass
+
+    class Policy:
+        repair_steward = None
+        merge_maintainer = object()
+        release_maintenance = None
+
+    class Primary:
+        def scan(self, *, apply_labels: bool):
+            assert apply_labels is False
+            order.append("primary")
+            return SimpleNamespace(
+                created=0,
+                skipped={},
+                degraded=False,
+                required_local_ci_backlog=1,
+                local_ci_catalogue_deferred=0,
+            )
+
+        def apply_agent_labels(self):
+            order.append("labels")
+            return {"status": "ok", "updated": 1, "skipped": {}}
+
+    def merge(*_args: object, **_kwargs: object) -> dict[str, object]:
+        order.append("merge")
+        return {"status": "ok"}
+
+    monkeypatch.setattr("github_pr_feedback.cli._load_policy_from_context", lambda _ctx: Policy())
+    monkeypatch.setattr("github_pr_feedback.cli._exclusive_scan_lock", lambda: Lock())
+    monkeypatch.setattr("github_pr_feedback.cli.FeedbackLedger", Ledger)
+    monkeypatch.setattr("github_pr_feedback.cli._controller", lambda *_args: Primary())
+    monkeypatch.setattr("github_pr_feedback.cli._run_merge_scan", merge)
+
+    assert _scan(object()) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert order == ["primary", "merge", "labels"]
+    assert payload["labels"]["status"] == "ok"
 
 
 def test_scan_does_not_defer_secondary_fanout_for_read_cap_without_ci_backlog(
@@ -1552,8 +1620,12 @@ def test_scan_and_retry_exit_nonzero_and_report_degraded_on_incomplete_work(
     from github_pr_feedback.controller import ScanResult
 
     class DegradedController:
-        def scan(self) -> ScanResult:
+        def scan(self, *, apply_labels: bool) -> ScanResult:
+            assert apply_labels is False
             return ScanResult(0, {"github_error": 1}, degraded=True)
+
+        def apply_agent_labels(self):
+            return {"status": "ok", "updated": 0, "skipped": {}}
 
         def retry_failed(self, _receipt: FeedbackReceipt) -> ScanResult:
             return ScanResult(0, {"dispatch_failed": 1}, degraded=True)
