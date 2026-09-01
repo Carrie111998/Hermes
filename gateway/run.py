@@ -6959,6 +6959,10 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_display_kind"] = (
                     ctx.persist_user_display_kind
                 )
+                if ctx.persist_user_display_metadata is not None:
+                    _conversation_kwargs["persist_user_display_metadata"] = (
+                        ctx.persist_user_display_metadata
+                    )
             if ctx.moa_config is not None:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
@@ -20653,13 +20657,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # background watch notifications, resume wake-ups) arrive as
         # MessageEvent(internal=True). Persist their user row typed with
         # display_kind="internal_notification" so transcripts/UIs can render
-        # them as timeline notices instead of user bubbles (#82888). Role and
-        # content are untouched — display_kind is a DB-only sidecar stripped
-        # from every provider-bound payload (see conversation_loop's
-        # api_msg.pop("display_kind")).
+        # them as timeline notices instead of user bubbles (#82888). A
+        # canonical workflow envelope upgrades the projection below without
+        # changing the model-facing role or content.
         persist_user_display_kind = (
             "internal_notification" if getattr(event, "internal", False) else None
         )
+        persist_user_display_metadata = None
+        if getattr(event, "internal", False):
+            try:
+                from tools.async_delegation import internal_event_persistence
+
+                internal_metadata = dict(
+                    getattr(event, "metadata", None) or {}
+                )
+                internal_metadata.setdefault("type", "gateway_internal")
+                internal_metadata.setdefault(
+                    "source",
+                    source.platform.value if source.platform else "gateway",
+                )
+                internal_metadata.setdefault(
+                    "message_id",
+                    str(getattr(event, "message_id", "") or ""),
+                )
+                internal_metadata.setdefault(
+                    "text",
+                    str(getattr(event, "text", "") or ""),
+                )
+                internal_display_kind, internal_display_metadata = (
+                    internal_event_persistence(
+                        internal_metadata,
+                        trusted_internal=True,
+                    )
+                )
+                if internal_display_kind is not None:
+                    persist_user_display_kind = internal_display_kind
+                    persist_user_display_metadata = internal_display_metadata
+            except Exception:
+                logger.debug(
+                    "Internal-event transcript metadata validation failed",
+                    exc_info=True,
+                )
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
@@ -22226,6 +22264,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -22667,6 +22706,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
                 if persist_user_display_kind:
                     _user_entry["display_kind"] = persist_user_display_kind
+                if persist_user_display_metadata:
+                    _user_entry["display_metadata"] = persist_user_display_metadata
                 if event.message_id:
                     _user_entry["message_id"] = str(event.message_id)
                 # Dedupe: skip if this platform message_id is already in the
@@ -22711,6 +22752,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     }
                     if persist_user_display_kind:
                         _user_entry["display_kind"] = persist_user_display_kind
+                    if persist_user_display_metadata:
+                        _user_entry["display_metadata"] = persist_user_display_metadata
                     if event.message_id:
                         _user_entry["message_id"] = str(event.message_id)
                     await self.async_session_store.append_to_transcript(
@@ -22910,6 +22953,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         }
                         if 'persist_user_display_kind' in locals() and persist_user_display_kind:
                             _user_entry["display_kind"] = persist_user_display_kind
+                        if (
+                            'persist_user_display_metadata' in locals()
+                            and persist_user_display_metadata
+                        ):
+                            _user_entry["display_metadata"] = persist_user_display_metadata
                         if getattr(event, "message_id", None):
                             _user_entry["message_id"] = str(event.message_id)
                         await self.async_session_store.append_to_transcript(
@@ -27272,6 +27320,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            for key in (
+                "event_schema",
+                "event_id",
+                "event_kind",
+                "workflow_id",
+                "delegation_id",
+                "display_kind",
+                "user_originated",
+                "terminal",
+            ):
+                if key in evt:
+                    metadata[key] = evt[key]
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -30056,6 +30116,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -30077,6 +30138,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
                 message_type=message_type,
             )
 
@@ -30091,6 +30153,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                persist_user_display_metadata=persist_user_display_metadata,
                 message_type=message_type,
             )
 
@@ -30235,6 +30298,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -30546,6 +30610,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            persist_user_display_metadata=persist_user_display_metadata,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
