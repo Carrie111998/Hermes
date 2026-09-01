@@ -19,6 +19,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
@@ -194,6 +195,46 @@ class TestStartRun:
                 assert status["run_id"] == data["run_id"]
                 assert status["status"] in {"queued", "running", "completed"}
                 assert status["object"] == "hermes.run"
+
+    @pytest.mark.asyncio
+    async def test_interrupted_run_hides_sentinel_and_exposes_metadata(self, adapter):
+        app = _create_runs_app(adapter)
+        sentinel = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}2.0s elapsed)."
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {
+                    "final_response": sentinel,
+                    "completed": False,
+                    "interrupted": True,
+                    "partial": False,
+                }
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                data = await response.json()
+                run_id = data["run_id"]
+
+            status = None
+            for _ in range(40):
+                status_response = await cli.get(f"/v1/runs/{run_id}")
+                status = await status_response.json()
+                if status.get("status") == "completed":
+                    break
+                await asyncio.sleep(0.05)
+
+        assert status is not None
+        assert status["status"] == "completed"
+        assert status["output"] == ""
+        assert status["hermes"] == {
+            "completed": False,
+            "interrupted": True,
+            "partial": False,
+        }
+        assert sentinel not in str(status)
+
 
     @pytest.mark.asyncio
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
@@ -380,6 +421,38 @@ class TestRunEvents:
                 # Should contain run.completed
                 assert "run.completed" in body
                 assert "Hello!" in body
+
+
+    @pytest.mark.asyncio
+    async def test_events_stream_hides_interrupt_sentinel_delta(self, adapter):
+        app = _create_runs_app(adapter)
+        sentinel = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}2.0s elapsed)."
+
+        def _create_with_delta(**kwargs):
+            kwargs["stream_delta_callback"](sentinel)
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": sentinel,
+                "completed": False,
+                "interrupted": True,
+                "partial": False,
+            }
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_with_delta):
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                data = await response.json()
+                events_response = await cli.get(f"/v1/runs/{data['run_id']}/events")
+                body = await events_response.text()
+
+        assert events_response.status == 200
+        assert "message.delta" not in body
+        assert sentinel not in body
+        assert '"interrupted": true' in body
 
 
     @pytest.mark.asyncio

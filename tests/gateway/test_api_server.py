@@ -15,6 +15,7 @@ Tests cover:
 import asyncio
 import json
 import os
+import re
 import stat
 import sys
 import time
@@ -26,6 +27,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
@@ -1000,6 +1002,71 @@ class TestChatCompletionsEndpoint:
             data = await resp.json()
             assert "messages" in data["error"]["message"]
 
+    @pytest.mark.asyncio
+    async def test_nonstream_interrupt_sentinel_is_metadata_not_assistant_text(self, adapter):
+        sentinel = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}2.0s elapsed)."
+
+        async def _mock_run_agent(**_kwargs):
+            return (
+                {
+                    "final_response": sentinel,
+                    "completed": False,
+                    "interrupted": True,
+                    "partial": False,
+                    "messages": [{"role": "assistant", "content": sentinel}],
+                },
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        app = _create_app(adapter)
+        with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
+                )
+                assert response.status == 200
+                payload = await response.json()
+
+        assert payload["choices"][0]["message"]["content"] == ""
+        assert sentinel not in json.dumps(payload)
+        assert payload["hermes"]["interrupted"] is True
+
+    @pytest.mark.asyncio
+    async def test_stream_interrupt_preserves_metadata_without_sentinel_text(self, adapter):
+        sentinel = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}2.0s elapsed)."
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**_kwargs):
+            return (
+                {
+                    "final_response": sentinel,
+                    "completed": False,
+                    "interrupted": True,
+                    "partial": False,
+                    "messages": [{"role": "assistant", "content": sentinel}],
+                },
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert response.status == 200
+                body = await response.text()
+
+        assert sentinel not in body
+        assert '"interrupted": true' in body
+        assert '"completed": false' in body
+        assert '"partial": false' in body
+
 
     @pytest.mark.asyncio
     async def test_chat_completions_stream_passes_request_model_provider_options(self, adapter):
@@ -1366,6 +1433,75 @@ class TestResponsesEndpoint:
             assert data["output"][0]["type"] == "message"
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
+
+    @pytest.mark.asyncio
+    async def test_nonstream_interrupt_sentinel_is_not_stored_or_returned(self, adapter):
+        sentinel = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}2.0s elapsed)."
+        mock_result = {
+            "final_response": sentinel,
+            "completed": False,
+            "interrupted": True,
+            "partial": False,
+            "messages": [{"role": "assistant", "content": sentinel}],
+        }
+
+        app = _create_app(adapter)
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi"},
+                )
+                assert response.status == 200
+                payload = await response.json()
+
+        assert sentinel not in json.dumps(payload)
+        assert payload["hermes"] == {
+            "completed": False,
+            "interrupted": True,
+            "partial": False,
+        }
+        stored = adapter._response_store.get(payload["id"])
+        assert sentinel not in json.dumps(stored)
+        assert stored["response"]["hermes"] == payload["hermes"]
+
+    @pytest.mark.asyncio
+    async def test_stream_interrupt_sentinel_is_not_fallback_delta(self, adapter):
+        sentinel = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}2.0s elapsed)."
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**_kwargs):
+            return (
+                {
+                    "final_response": sentinel,
+                    "completed": False,
+                    "interrupted": True,
+                    "partial": False,
+                    "messages": [{"role": "assistant", "content": sentinel}],
+                },
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/responses",
+                    json={"model": "hermes-agent", "input": "hi", "stream": True},
+                )
+                assert response.status == 200
+                body = await response.text()
+
+        assert sentinel not in body
+        assert '"interrupted": true' in body
+        assert '"completed": false' in body
+        assert '"partial": false' in body
+        response_match = re.search(r'"id":\s*"(resp_[^"]+)"', body)
+        assert response_match is not None
+        response_id = response_match.group(1)
+        stored = adapter._response_store.get(response_id)
+        assert stored["response"]["hermes"]["interrupted"] is True
+        assert stored["response"]["hermes"]["completed"] is False
 
 
     @pytest.mark.asyncio

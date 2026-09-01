@@ -422,6 +422,9 @@ async def _handle_runs(
     _publish_turn_process_ownership = _api_server._publish_turn_process_ownership
     _redact_api_error_text = _api_server._redact_api_error_text
     _request_agent_overrides = _api_server._request_agent_overrides
+    _api_interrupt_status = _api_server._api_interrupt_status
+    _api_final_response_text = _api_server._api_final_response_text
+    _is_api_interrupt_text = _api_server._is_api_interrupt_text
 
     # Long-term memory scope header (see chat_completions for details).
     gateway_session_key, key_err = self._parse_session_key_header(request)
@@ -641,7 +644,7 @@ async def _handle_runs(
 
     # Also wire stream_delta_callback so message.delta events flow through.
     def _text_cb(delta: Optional[str]) -> None:
-        if delta is None:
+        if delta is None or _is_api_interrupt_text(delta):
             return
         if run_id not in self._run_streams:
             return
@@ -915,7 +918,10 @@ async def _handle_runs(
                     last_event="run.failed",
                 )
             else:
-                final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                final_response = _api_final_response_text(result) if isinstance(result, dict) else ""
+                completed, interrupted, partial = (
+                    _api_interrupt_status(result) if isinstance(result, dict) else (True, False, False)
+                )
                 # Undelivered steer text (accepted after the final response;
                 # see turn_finalizer) rides on the terminal event/status so
                 # the client can replay it as the next user turn.
@@ -925,6 +931,14 @@ async def _handle_runs(
                     "run_id": run_id,
                     "timestamp": time.time(),
                     "output": final_response,
+                    "completed": completed,
+                    "interrupted": interrupted,
+                    "partial": partial,
+                    "hermes": {
+                        "completed": completed,
+                        "interrupted": interrupted,
+                        "partial": partial,
+                    },
                     "usage": usage,
                 }
                 if pending_steer:
@@ -934,6 +948,14 @@ async def _handle_runs(
                     run_id,
                     "completed",
                     output=final_response,
+                    completed=completed,
+                    interrupted=interrupted,
+                    partial=partial,
+                    hermes={
+                        "completed": completed,
+                        "interrupted": interrupted,
+                        "partial": partial,
+                    },
                     usage=usage,
                     last_event="run.completed",
                     **({"pending_steer": pending_steer} if pending_steer else {}),

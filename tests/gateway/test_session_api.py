@@ -117,6 +117,52 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
 
 
 @pytest.mark.asyncio
+async def test_session_messages_latest_offset_beyond_transcript_is_empty(adapter, session_db):
+    session_id = session_db.create_session("latest-offset-range", "api_server")
+    session_db.replace_messages(
+        session_id,
+        [{"role": "user", "content": f"msg {i}"} for i in range(3)],
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(
+            f"/api/sessions/{session_id}/messages?limit=1&offset=5&order=latest"
+        )
+        assert resp.status == 200
+        payload = await resp.json()
+
+    assert payload["data"] == []
+    assert payload["pagination"]["returned"] == 0
+
+
+@pytest.mark.asyncio
+async def test_session_messages_filters_before_bounded_latest_pagination(adapter, session_db):
+    session_id = session_db.create_session("bounded-filtered-messages", "api_server")
+    sentinel = "Operation interrupted: waiting for model response (18.8s elapsed)."
+    session_db.replace_messages(
+        session_id,
+        [
+            *[{"role": "user", "content": f"msg {i}"} for i in range(501)],
+            {"role": "assistant", "content": sentinel},
+        ],
+    )
+
+    app = _create_session_app(adapter)
+    with patch.object(session_db, "get_messages", wraps=session_db.get_messages) as get_messages:
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(f"/api/sessions/{session_id}/messages")
+            assert resp.status == 200
+            payload = await resp.json()
+
+    assert payload["data"][0]["content"] == "msg 1"
+    assert payload["data"][-1]["content"] == "msg 500"
+    assert get_messages.call_count >= 2
+    assert all(call.kwargs.get("limit") is not None for call in get_messages.call_args_list)
+    assert all(call.kwargs["limit"] <= 500 for call in get_messages.call_args_list)
+
+
+@pytest.mark.asyncio
 async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeypatch):
     """API-server request sessions should reach tools and terminal subprocess env."""
     monkeypatch.setenv("HERMES_SESSION_ID", "stale-session")
@@ -891,3 +937,297 @@ async def test_patch_session_still_rejects_unknown_fields(adapter, session_db):
         resp = await cli.patch(f"/api/sessions/{session_id}", json={"nonsense": 1})
         assert resp.status == 400, await resp.text()
         assert (await resp.json())["error"]["code"] == "unsupported_session_field"
+# ---------------------------------------------------------------------------
+# Internal API-interrupt timer sentinel must never leak as assistant content.
+# conversation_loop emits INTERRUPT_WAITING_FOR_MODEL_PREFIX + "<n>s elapsed)."
+# as final_response when a turn is interrupted while waiting on the model.
+# That is internal bookkeeping, not an assistant reply, so the API surface
+# (non-stream chat, stream chat, and the persisted /messages transcript) must
+# suppress it while still exposing completed/interrupted/partial metadata,
+# and must not touch unrelated partial text that merely happens to start
+# with the same prefix.
+# ---------------------------------------------------------------------------
+
+
+def _sse_events(body: str) -> dict:
+    """Parse an SSE body into {event_name: json_data} for assertions."""
+    import json
+
+    events = {}
+    for block in body.split("\n\n"):
+        lines = block.splitlines()
+        event = next((line.removeprefix("event: ") for line in lines if line.startswith("event: ")), None)
+        data = next((line.removeprefix("data: ") for line in lines if line.startswith("data: ")), None)
+        if event and data:
+            events[event] = json.loads(data)
+    return events
+
+
+@pytest.mark.asyncio
+async def test_session_messages_hide_internal_interrupt_sentinel(adapter, session_db):
+    session_id = session_db.create_session("interrupt-history", "api_server")
+    sentinel = "Operation interrupted: waiting for model response (18.8s elapsed)."
+    session_db.append_message(session_id, "user", "continue")
+    session_db.append_message(session_id, "assistant", sentinel)
+    session_db.append_message(session_id, "assistant", "visible answer")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(f"/api/sessions/{session_id}/messages")
+        assert response.status == 200
+        payload = await response.json()
+
+    assert [message["content"] for message in payload["data"]] == ["continue", "visible answer"]
+
+
+@pytest.mark.asyncio
+async def test_session_chat_hides_interrupt_sentinel_and_exposes_status(adapter, session_db):
+    session_id = session_db.create_session("interrupt-chat", "api_server")
+    sentinel = "Operation interrupted: waiting for model response (18.8s elapsed)."
+    result = {
+        "final_response": sentinel,
+        "session_id": session_id,
+        "completed": False,
+        "interrupted": True,
+        "partial": False,
+    }
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", AsyncMock(return_value=(result, {"total_tokens": 0}))):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "continue"})
+            assert response.status == 200
+            payload = await response.json()
+
+    assert payload["message"]["content"] == ""
+    assert payload["completed"] is False
+    assert payload["interrupted"] is True
+    assert payload["partial"] is False
+
+
+@pytest.mark.asyncio
+async def test_session_chat_preserves_partial_text_from_interrupted_turn(adapter, session_db):
+    session_id = session_db.create_session("partial-interrupt-chat", "api_server")
+    result = {
+        "final_response": "partial answer",
+        "session_id": session_id,
+        "completed": False,
+        "interrupted": True,
+        "partial": True,
+    }
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", AsyncMock(return_value=(result, {"total_tokens": 0}))):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(f"/api/sessions/{session_id}/chat", json={"message": "continue"})
+            assert response.status == 200
+            payload = await response.json()
+
+    assert payload["message"]["content"] == "partial answer"
+    assert payload["completed"] is False
+    assert payload["interrupted"] is True
+    assert payload["partial"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_hides_interrupt_sentinel_and_transcript(adapter, session_db):
+    session_id = session_db.create_session("interrupt-stream", "api_server")
+    sentinel = "Operation interrupted: waiting for model response (18.8s elapsed)."
+
+    async def fake_run(**kwargs):
+        kwargs["stream_delta_callback"](sentinel)
+        return {
+            "final_response": sentinel,
+            "session_id": session_id,
+            "completed": False,
+            "interrupted": True,
+            "messages": [
+                {"role": "user", "content": "continue"},
+                {"role": "assistant", "content": sentinel},
+            ],
+        }, {"total_tokens": 0}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "continue"})
+            assert response.status == 200
+            body = await response.text()
+
+    events = _sse_events(body)
+    assert sentinel not in body
+    assert events["assistant.completed"]["content"] == ""
+    assert events["assistant.completed"]["completed"] is False
+    assert events["assistant.completed"]["interrupted"] is True
+    assert events["run.completed"]["completed"] is False
+    assert events["run.completed"]["interrupted"] is True
+    assert events["run.completed"]["partial"] is False
+    assert all(sentinel not in str(message) for message in events["run.completed"]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_keeps_prior_tool_call_that_matches_sentinel(adapter, session_db):
+    """Only the terminal assistant message that equals the sentinel is dropped
+    from the turn transcript; a tool call/result pair that happens to share the
+    same content string earlier in the turn must survive."""
+    session_id = session_db.create_session("interrupt-tool-transcript", "api_server")
+    sentinel = "Operation interrupted: waiting for model response (18.8s elapsed)."
+
+    async def fake_run(**_kwargs):
+        return {
+            "final_response": sentinel,
+            "session_id": session_id,
+            "completed": False,
+            "interrupted": True,
+            "messages": [
+                {"role": "user", "content": "continue"},
+                {
+                    "role": "assistant",
+                    "content": sentinel,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "example_tool", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "ok", "tool_call_id": "call_1", "tool_name": "example_tool"},
+                {"role": "assistant", "content": sentinel},
+            ],
+        }, {"total_tokens": 0}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "continue"})
+            assert response.status == 200
+            events = _sse_events(await response.text())
+
+    messages = events["run.completed"]["messages"]
+    assert [message["role"] for message in messages] == ["assistant", "tool"]
+    assert messages[0]["tool_calls"][0]["id"] == "call_1"
+    assert messages[1]["tool_call_id"] == "call_1"
+
+
+@pytest.mark.asyncio
+async def test_session_messages_preserves_user_and_tool_sentinel_text(adapter, session_db):
+    """History filtering must not hide user text or tool-call rows by content."""
+    session_id = session_db.create_session("history-sentinel-shapes", "api_server")
+    sentinel = "Operation interrupted: waiting for model response (1.0s elapsed)."
+    session_db.replace_messages(
+        session_id,
+        [
+            {"role": "user", "content": sentinel},
+            {
+                "role": "assistant",
+                "content": sentinel,
+                "tool_calls": [{"id": "call_1", "type": "function"}],
+            },
+            {"role": "tool", "content": "tool result", "tool_call_id": "call_1"},
+            {"role": "assistant", "content": sentinel},
+        ],
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(f"/api/sessions/{session_id}/messages?limit=10&order=oldest")
+        assert response.status == 200
+        data = (await response.json())["data"]
+
+    assert [message["role"] for message in data] == ["user", "assistant", "tool"]
+    assert data[0]["content"] == sentinel
+    assert data[1]["tool_calls"][0]["id"] == "call_1"
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_keeps_partial_text_that_only_starts_like_sentinel(adapter, session_db):
+    """Strict sentinel matching: text that merely starts with the interrupt
+    prefix but isn't the exact timer-elapsed sentinel is real model output and
+    must not be suppressed."""
+    session_id = session_db.create_session("prefix-like-partial", "api_server")
+    partial_text = (
+        "Operation interrupted: waiting for model response ("
+        "this is actual partial model text, not the timer sentinel"
+    )
+
+    async def fake_run(**_kwargs):
+        return {
+            "final_response": partial_text,
+            "session_id": session_id,
+            "completed": False,
+            "interrupted": True,
+            "partial": True,
+            "messages": [
+                {"role": "user", "content": "continue"},
+                {"role": "assistant", "content": partial_text},
+            ],
+        }, {"total_tokens": 0}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "continue"})
+            assert response.status == 200
+            events = _sse_events(await response.text())
+
+    assert events["assistant.completed"]["content"] == partial_text
+    assert events["assistant.completed"]["partial"] is True
+    assert events["run.completed"]["partial"] is True
+    assert [message["content"] for message in events["run.completed"]["messages"]] == [partial_text]
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_preserves_legacy_completion_for_noninterrupt_turn(adapter, session_db):
+    """A turn that stops early for a non-interrupt reason (e.g. max
+    iterations) must keep its own completed/interrupted/partial flags as
+    reported by the agent — the sentinel handling here must not force
+    completed=True back onto legitimately incomplete, non-interrupted turns."""
+    session_id = session_db.create_session("noninterrupt-incomplete", "api_server")
+
+    async def fake_run(**_kwargs):
+        return {
+            "final_response": "max iteration reply",
+            "session_id": session_id,
+            "completed": False,
+            "interrupted": False,
+            "partial": True,
+        }, {"total_tokens": 0}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(f"/api/sessions/{session_id}/chat/stream", json={"message": "continue"})
+            assert response.status == 200
+            body = await response.text()
+
+    completed = _sse_events(body)["assistant.completed"]
+    assert completed["content"] == "max iteration reply"
+    assert completed["completed"] is False
+    assert completed["interrupted"] is False
+    assert completed["partial"] is True
+
+
+@pytest.mark.asyncio
+async def test_session_messages_paginates_after_hiding_interrupt_sentinels(adapter, session_db):
+    session_id = session_db.create_session("visible-pagination", "api_server")
+    sentinel = "Operation interrupted: waiting for model response (2.0s elapsed)."
+    session_db.replace_messages(
+        session_id,
+        [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": sentinel},
+            {"role": "user", "content": "second"},
+        ],
+    )
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(
+            f"/api/sessions/{session_id}/messages?limit=1&offset=1&order=oldest"
+        )
+        assert response.status == 200
+        payload = await response.json()
+
+    assert [message["content"] for message in payload["data"]] == ["second"]
+    assert payload["pagination"]["returned"] == 1
