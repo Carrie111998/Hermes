@@ -940,6 +940,7 @@ def build_session_health_evidence(
     hydration_status: object,
     claude_visibility_status: object,
     catalog_scan_seconds: object,
+    sidebar_enabled: object,
     hydration_enabled: object,
     claude_visibility_enabled: object,
 ) -> dict[str, Any]:
@@ -1078,7 +1079,18 @@ def build_session_health_evidence(
             name="sidebar_registration",
             source=sidebar,
             observed_at=sidebar_at,
-            feature_flag=True,
+            # 2026-09-01: was hardcoded True. The custom sidebar delivery lane was
+            # retired that day (root config.yaml session_bridge.sidebar.enabled=false,
+            # superseded by the official Codex importer), which short-circuits the
+            # delivery claim at coordinator.py:1375 -- so its ~517 parked rows can
+            # never drain. Hardcoded True rendered that permanent backlog as
+            # "work_state_readable": accidentally green, because the counts are
+            # readable and bounded, not because anything knew the lane was off. Route
+            # it through the same feature flag sidebar_hydration and claude_visibility
+            # already use so a retired lane reports as deliberately disabled.
+            feature_flag=(
+                sidebar_enabled if type(sidebar_enabled) is bool else None
+            ),
             owner="session_bridge_sidebar",
             counts_key="counts",
             count_fields=(
