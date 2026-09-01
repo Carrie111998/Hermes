@@ -114,6 +114,11 @@ class ScanSummary:
     rebuilt: int
     failed: int
     duration_ms: float
+    # Threads the scan DECLINED without failing: the local `sessions` row
+    # already owns the canonical id (LocalSessionOwnsCanonicalId), so the
+    # handler `continue`s. Counted at each site but historically dropped
+    # before this summary, which made failed=0 read as "nothing declined".
+    locally_owned: int = 0
 
 
 @dataclass(frozen=True)
@@ -1267,6 +1272,7 @@ class SessionBridgeCoordinator:
             rebuilt=sum(summary.rebuilt for summary in summaries),
             failed=sum(summary.failed for summary in summaries),
             duration_ms=sum(summary.duration_ms for summary in summaries),
+            locally_owned=sum(summary.locally_owned for summary in summaries),
         )
         await self._after_successful_scan(summary)
         return summary
@@ -1293,6 +1299,7 @@ class SessionBridgeCoordinator:
             rebuilt=sum(summary.rebuilt for summary in summaries),
             failed=sum(summary.failed for summary in summaries),
             duration_ms=sum(summary.duration_ms for summary in summaries),
+            locally_owned=sum(summary.locally_owned for summary in summaries),
         )
 
     async def register_sidebar_jobs_once(
@@ -4369,6 +4376,7 @@ class SessionBridgeCoordinator:
                 rebuilt=summary.rebuilt,
                 failed=summary.failed,
                 duration_ms=self._elapsed_ms(started),
+                locally_owned=summary.locally_owned,
             )
 
     async def _scan_all_history_provider(self, provider: Provider) -> ScanSummary:
@@ -4407,6 +4415,7 @@ class SessionBridgeCoordinator:
                 rebuilt=summary.rebuilt,
                 failed=summary.failed,
                 duration_ms=self._elapsed_ms(started),
+                locally_owned=summary.locally_owned,
             )
 
     async def _scan_all_claude_history(self) -> ScanSummary:
@@ -4548,6 +4557,7 @@ class SessionBridgeCoordinator:
             rebuilt=rebuilt,
             failed=failed,
             duration_ms=0,
+            locally_owned=locally_owned,
         )
 
     async def _scan_claude(self, discovery_mode: DiscoveryMode) -> ScanSummary:
@@ -4703,6 +4713,7 @@ class SessionBridgeCoordinator:
             rebuilt=0,
             failed=failed,
             duration_ms=0,
+            locally_owned=locally_owned,
         )
 
     async def _scan_claude_persistent(
@@ -4880,7 +4891,7 @@ class SessionBridgeCoordinator:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
-            except (LocalSessionOwnsCanonicalId, StaleExternalProjection):
+            except LocalSessionOwnsCanonicalId:
                 # 2026-08-13: all three CODEX scan paths handled these; none of the
                 # CLAUDE paths did. Hermes materialises its own claude-provider
                 # sessions under the canonical id the bridge wants for an imported
@@ -4893,6 +4904,13 @@ class SessionBridgeCoordinator:
                 # session). Excluding it here let claude's backfill reach 0 for the
                 # first time.
                 locally_owned += 1
+                continue
+            except StaleExternalProjection:
+                # Split out of the clause above 2026-09-01. Behaviour is
+                # IDENTICAL (still a no-op `continue`, claude retry semantics
+                # unchanged); the split exists so `locally_owned` counts only
+                # real canonical-id collisions. Folding a stale projection in
+                # would make the new ScanSummary field overstate them.
                 continue
             except Exception:
                 failed_ids.append(native_id)
@@ -4950,6 +4968,7 @@ class SessionBridgeCoordinator:
             rebuilt=rebuilt,
             failed=len(failed_ids) + len(unavailable_ids),
             duration_ms=0,
+            locally_owned=locally_owned,
         )
 
     async def _parse_claude(
@@ -5267,6 +5286,7 @@ class SessionBridgeCoordinator:
                     rebuilt=0,
                     failed=1,
                     duration_ms=0,
+                    locally_owned=locally_owned,
                 )
             indexed += 1
             terminal_ids.add(native_id)
@@ -5337,6 +5357,7 @@ class SessionBridgeCoordinator:
             rebuilt=0,
             failed=0,
             duration_ms=0,
+            locally_owned=locally_owned,
         )
 
     async def _load_pending(self, provider: Provider) -> list[str]:
