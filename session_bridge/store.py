@@ -1923,13 +1923,34 @@ class SessionBridgeStore:
             )
             attempts_spent = max(int(due["attempts"]), max_ordinal)
             if attempts_spent >= max_attempts and not operator_recovery:
+                # 2026-09-01: carry the LAST NON-TERMINAL CAUSE into error_detail.
+                # This transition used to overwrite both error_code and error_detail
+                # unconditionally, which destroyed the only record of WHY the attempts
+                # failed: every registrar failure that produces no transcript funnels
+                # into ("retry", "creation_ambiguous", <reason>), the reason is the only
+                # discriminator, and after exhaustion the row said only
+                # "max_attempts_exhausted" with retry_codes={} and error_code null in
+                # telemetry. A 2026-09-01 job burned 7 paid attempts and the cause was
+                # unrecoverable an hour later, because the bridge log had rotated past
+                # the window. error_code is DELIBERATELY unchanged -- it is the public
+                # vocabulary the evidence envelope and the tray validate against, and a
+                # code outside that set voids the whole envelope. Only error_detail,
+                # which is not part of any validated public surface, is enriched.
+                # The RHS of an UPDATE sees the pre-update row, so error_code here is
+                # still the last non-terminal code.
                 cursor = conn.execute(
                     """UPDATE session_claude_visibility_jobs
                        SET state = 'claude_failed', attempts = ?,
                            lease_digest = NULL,
                            lease_expires_at = NULL, lease_kind = NULL,
+                           error_detail = CASE
+                               WHEN error_code IS NOT NULL
+                                    AND error_code <> 'max_attempts_exhausted'
+                               THEN 'maximum paid launch attempts exhausted'
+                                    || '; last attempt failed with ' || error_code
+                               ELSE 'maximum paid launch attempts exhausted'
+                           END,
                            error_code = 'max_attempts_exhausted',
-                           error_detail = 'maximum paid launch attempts exhausted',
                            updated_at = ?
                        WHERE id = ? AND state = ? AND attempts = ?""",
                     (
@@ -3013,9 +3034,18 @@ class SessionBridgeStore:
                               'exact transcript conflict'
                           ))
                          OR
+                         -- 2026-09-01: PREFIX match, not equality. The terminal
+                         -- transition now appends '; last attempt failed with
+                         -- <code>' so an exhausted row still records WHY. This
+                         -- guard exists to prove the row is a genuine
+                         -- system-written exhaustion rather than an arbitrary
+                         -- failure, and the prefix still proves exactly that.
+                         -- Equality here silently disabled operator recovery for
+                         -- every enriched row -- caught by
+                         -- test_exact_operator_recovery_preserves_exhausted_identity_and_attempt_history.
                          (error_code = 'max_attempts_exhausted'
-                          AND error_detail =
-                              'maximum paid launch attempts exhausted')
+                          AND error_detail LIKE
+                              'maximum paid launch attempts exhausted%')
                      )
                      AND attempts > 0""",
                 (

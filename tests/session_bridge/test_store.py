@@ -13927,6 +13927,66 @@ def test_claude_visibility_reset_counter_with_spent_usage_terminalizes(
     ).status == "no_due_job"
 
 
+def test_terminal_exhaustion_preserves_the_last_non_terminal_cause(
+    db: SessionDB,
+) -> None:
+    """The exhausted row must still say WHY the attempts failed.
+
+    Every registrar failure that writes no transcript funnels into
+    ("retry", "creation_ambiguous", <reason>), so the per-attempt code is the only
+    discriminator. Before 2026-09-01 the terminal transition overwrote it, and a job
+    that burned 7 paid attempts recorded only "max_attempts_exhausted" -- leaving the
+    bridge log, which rotates, as the sole evidence.
+    """
+
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("terminal-cause-preserved")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    _corrupt_claude_visibility_counter(db, identity.job_id, 7)
+    with db._lock:
+        db._conn.execute(
+            "UPDATE session_claude_visibility_jobs SET error_code = ? WHERE id = ?",
+            ("creation_ambiguous", identity.job_id),
+        )
+        db._conn.commit()
+
+    claim = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02", 7)
+
+    assert claim.status == "max_attempts_exhausted"
+    row = _rows(
+        db,
+        "SELECT error_code, error_detail FROM session_claude_visibility_jobs",
+    )[0]
+    # The public vocabulary is unchanged -- a code outside the validated set voids
+    # the whole evidence envelope and blanks the tray rows.
+    assert row["error_code"] == "max_attempts_exhausted"
+    assert row["error_detail"] == (
+        "maximum paid launch attempts exhausted"
+        "; last attempt failed with creation_ambiguous"
+    )
+
+
+def test_terminal_exhaustion_detail_unchanged_without_a_prior_cause(
+    db: SessionDB,
+) -> None:
+    """No prior code (or an already-terminal one) must not produce a doubled detail."""
+
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("terminal-cause-absent")
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    _corrupt_claude_visibility_counter(db, identity.job_id, 7)
+
+    assert store.claim_claude_visibility_job(
+        100.0, 60, 25, "0.50", "0.02", 7
+    ).status == "max_attempts_exhausted"
+    row = _rows(
+        db,
+        "SELECT error_code, error_detail FROM session_claude_visibility_jobs",
+    )[0]
+    assert row["error_code"] == "max_attempts_exhausted"
+    assert row["error_detail"] == "maximum paid launch attempts exhausted"
+
+
 def test_claude_visibility_reset_counter_below_max_resumes_after_spent_ordinals(
     db: SessionDB,
 ) -> None:
@@ -13972,6 +14032,15 @@ def test_exact_operator_recovery_preserves_exhausted_identity_and_attempt_histor
     clock[0] = 86_500.0
     exhausted = store.claim_claude_visibility_job(86_500.0, 60, 25, "1.00", "0.02", 1)
     assert exhausted.status == "max_attempts_exhausted"
+    # This row is ENRICHED (it retried with creation_ambiguous above), so the
+    # operator-recovery guard below must match error_detail by PREFIX. It used to
+    # match by equality, which silently refused recovery for every enriched row.
+    assert _rows(
+        db, "SELECT error_detail FROM session_claude_visibility_jobs"
+    )[0]["error_detail"] == (
+        "maximum paid launch attempts exhausted"
+        "; last attempt failed with creation_ambiguous"
+    )
 
     repaired = store.requeue_failed_claude_visibility_reconciliation(
         identity.job_id, identity.claude_uuid
