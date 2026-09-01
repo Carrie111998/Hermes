@@ -18,6 +18,7 @@
  */
 
 import { execFile } from 'node:child_process'
+import { createBenignStderrSink } from './subprocess-stderr-noise'
 import fs from 'node:fs'
 
 import { electronProcessStartMarker } from './parent-process-identity'
@@ -150,7 +151,9 @@ export interface BackendOutputTail {
   /** Attach stdout/stderr data listeners to a just-spawned child. */
   attach(child: {
     stdout?: { on: (event: 'data', listener: (chunk: unknown) => void) => unknown } | null
-    stderr?: { on: (event: 'data', listener: (chunk: unknown) => void) => unknown } | null
+    stderr?: {
+      on: (event: 'data' | 'end' | 'close', listener: (chunk?: unknown) => void) => unknown
+    } | null
   }): void
   append(chunk: unknown): void
   /** The buffered tail (most recent `limit` characters), or ''. */
@@ -182,7 +185,14 @@ export function createBackendOutputTail(limit: number = DEFAULT_OUTPUT_TAIL_LIMI
     append,
     attach(child) {
       child.stdout?.on('data', append)
-      child.stderr?.on('data', append)
+      // #54833: stderr goes through the benign-noise sink (Darwin-only exact
+      // line); stdout is never filtered. flush() is wired on stream end so
+      // the held-back tail still reaches the boot-failure tail.
+      const stderrSink = createBenignStderrSink(append)
+
+      child.stderr?.on('data', stderrSink)
+      child.stderr?.on('end', () => append(stderrSink.flush()))
+      child.stderr?.on('close', () => append(stderrSink.flush()))
     },
     text() {
       return buffer

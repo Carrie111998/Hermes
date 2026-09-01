@@ -739,10 +739,19 @@ def execute_in_session_kernel(
 
             raw_text = _drain_raw(kernel)
             stderr_raw = _drain_stderr(kernel)
+            # #54833: strip the known-benign Darwin libmalloc teardown line
+            # before it can enter the tool result / model context.
+            from hermes_cli.subprocess_noise import (
+                filter_benign_darwin_subprocess_stderr,
+            )
+
+            stderr_raw = filter_benign_darwin_subprocess_stderr(stderr_raw)
             stdout_text = str(payload.get("stdout", ""))
             if raw_text:
                 stdout_text = stdout_text + raw_text
-            cell_stderr = str(payload.get("stderr", ""))
+            cell_stderr = filter_benign_darwin_subprocess_stderr(
+                str(payload.get("stderr", ""))
+            )
             if stderr_raw:
                 cell_stderr = cell_stderr + stderr_raw
 

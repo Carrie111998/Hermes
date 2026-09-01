@@ -34,10 +34,18 @@ def _write_timestamped_line(log_file: TextIO, line: str) -> None:
 
 
 def _copy_stderr_with_timestamps(stderr: BinaryIO, log_path: Path) -> None:
+    from hermes_cli.subprocess_noise import (
+        is_benign_darwin_malloc_stack_logging_line,
+    )
+
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8", buffering=1) as log_file:
         for raw_line in iter(stderr.readline, b""):
             line = raw_line.decode("utf-8", errors="replace")
+            # #54833: drop the known-benign Darwin libmalloc teardown line
+            # before it can reach gateway.error.log (no-op on other OSes).
+            if is_benign_darwin_malloc_stack_logging_line(line):
+                continue
             _write_timestamped_line(log_file, line)
 
 

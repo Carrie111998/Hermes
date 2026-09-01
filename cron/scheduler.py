@@ -2697,7 +2697,13 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
             creationflags=windows_hide_flags(),
         )
         if result.returncode != 0:
-            tail = (result.stderr or result.stdout or "").strip()[-500:]
+            from hermes_cli.subprocess_noise import (
+                filter_benign_darwin_subprocess_stderr,
+            )
+
+            tail = filter_benign_darwin_subprocess_stderr(
+                (result.stderr or result.stdout or "").strip()
+            )[-500:]
             msg = (
                 f"bot-chat delivery to profile "
                 f"'{profile or '(own)'}' failed (exit {result.returncode})"
@@ -4441,6 +4447,13 @@ def _run_job_script(
 
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
+        # #54833: benign Darwin libmalloc teardown noise must not become the
+        # only reported error for a failing script (falls back to exit code).
+        from hermes_cli.subprocess_noise import (
+            filter_benign_darwin_subprocess_stderr,
+        )
+
+        stderr = filter_benign_darwin_subprocess_stderr(stderr).strip()
 
         # Redact secrets from both stdout and stderr before any return path.
         try:

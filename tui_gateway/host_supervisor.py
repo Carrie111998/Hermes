@@ -427,9 +427,13 @@ class HostSupervisor:
 
     def _drain_stderr(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stderr is not None
+        from hermes_cli.subprocess_noise import (
+            is_benign_darwin_malloc_stack_logging_line,
+        )
+
         for raw in proc.stderr:
             text = raw.rstrip("\n")
-            if text:
+            if text and not is_benign_darwin_malloc_stack_logging_line(text):
                 self._stderr_tail = (self._stderr_tail + [text])[-80:]
                 logger.warning("compute host stderr: %s", text)
 

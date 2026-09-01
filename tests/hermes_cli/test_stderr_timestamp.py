@@ -157,3 +157,53 @@ def test_main_does_not_mark_unsupervised_child(tmp_path, monkeypatch):
 
     assert rc == 0
     assert marker_path.read_text(encoding="utf-8") == "unset"
+
+
+def _fake_darwin(monkeypatch):
+    """Force the noise filter's platform seam to darwin on any CI host."""
+    from types import SimpleNamespace
+
+    from hermes_cli import subprocess_noise
+
+    monkeypatch.setattr(subprocess_noise, "sys", SimpleNamespace(platform="darwin"))
+
+
+# Exact line from #54833 (the optional Python(pid) prefix varies by build).
+_MALLOC_NOISE = (
+    "python(56273) MallocStackLogging: can't turn off malloc stack logging "
+    "because it was not enabled."
+)
+
+
+def test_main_drops_benign_malloc_line_on_darwin(tmp_path, monkeypatch):
+    _fake_darwin(monkeypatch)
+    log_path = tmp_path / "gateway.error.log"
+    code = (
+        "import sys\n"
+        "sys.stderr.write('real failure\\n')\n"
+        f"sys.stderr.write({(_MALLOC_NOISE + chr(10))!r})\n"
+        "sys.stderr.write('another real failure\\n')\n"
+    )
+
+    rc = stderr_timestamp.main(["--error-log", str(log_path), "--", sys.executable, "-c", code])
+
+    assert rc == 0
+    body = log_path.read_text(encoding="utf-8")
+    assert "MallocStackLogging" not in body
+    assert "real failure" in body
+    assert "another real failure" in body
+
+
+def test_main_keeps_malloc_line_on_linux(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from hermes_cli import subprocess_noise
+
+    monkeypatch.setattr(subprocess_noise, "sys", SimpleNamespace(platform="linux"))
+    log_path = tmp_path / "gateway.error.log"
+    code = f"import sys\nsys.stderr.write({(_MALLOC_NOISE + chr(10))!r})\n"
+
+    rc = stderr_timestamp.main(["--error-log", str(log_path), "--", sys.executable, "-c", code])
+
+    assert rc == 0
+    assert "MallocStackLogging" in log_path.read_text(encoding="utf-8")

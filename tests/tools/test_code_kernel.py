@@ -402,3 +402,52 @@ class TestPerCellRpcAuthority(unittest.TestCase):
             _run("y = 2")
             self.assertIsNot(kernel.cell_authority, first_authority)
             self.assertFalse(kernel.cell_authority.active)
+
+
+# ── #54833: benign Darwin malloc-stack-logging noise ──────────────────────
+_MALLOC_NOISE = (
+    "python(16414) MallocStackLogging: can't turn off malloc stack logging "
+    "because it was not enabled."
+)
+
+
+@pytest.fixture
+def _force_darwin_noise_filter(monkeypatch):
+    """Act as if on macOS so the filter fires on any CI host."""
+    from types import SimpleNamespace
+
+    from hermes_cli import subprocess_noise
+
+    monkeypatch.setattr(subprocess_noise, "sys", SimpleNamespace(platform="darwin"))
+
+
+def test_cell_written_malloc_noise_never_reaches_the_result(
+    _force_darwin_noise_filter,
+):
+    code = (
+        "import os, sys\n"
+        f"os.write(2, {(_MALLOC_NOISE + chr(10))!r}.encode())\n"
+        "sys.stderr.write('real diagnostic\\n')\n"
+    )
+    with _kernel_config():
+        result = _run(code)
+    assert result["status"] == "success", result
+    assert "MallocStackLogging" not in result["output"]
+    assert "real diagnostic" in result["output"]
+
+
+def test_malloc_noise_is_kept_when_not_on_darwin(monkeypatch):
+    """Non-Darwin no-op: the filter must not remove anything on Linux/CI."""
+    from types import SimpleNamespace
+
+    from hermes_cli import subprocess_noise
+
+    monkeypatch.setattr(subprocess_noise, "sys", SimpleNamespace(platform="linux"))
+    code = (
+        "import os\n"
+        f"os.write(2, {(_MALLOC_NOISE + chr(10))!r}.encode())\n"
+    )
+    with _kernel_config():
+        result = _run(code)
+    assert result["status"] == "success", result
+    assert "MallocStackLogging" in result["output"]

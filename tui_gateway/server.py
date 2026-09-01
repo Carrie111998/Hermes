@@ -526,8 +526,13 @@ class _SlashWorker:
         self.stdout_queue.put(None)
 
     def _drain_stderr(self):
+        from hermes_cli.subprocess_noise import (
+            is_benign_darwin_malloc_stack_logging_line,
+        )
+
         for line in self.proc.stderr or []:
-            if text := line.rstrip("\n"):
+            text = line.rstrip("\n")
+            if text and not is_benign_darwin_malloc_stack_logging_line(text):
                 self.stderr_tail = (self.stderr_tail + [text])[-80:]
 
     def run(self, command: str) -> str:

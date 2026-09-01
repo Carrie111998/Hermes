@@ -267,6 +267,12 @@ class WebhookRouteProcessor:
 
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
+        # #54833: benign Darwin libmalloc teardown noise is not diagnostics.
+        from hermes_cli.subprocess_noise import (
+            filter_benign_darwin_subprocess_stderr,
+        )
+
+        stderr = filter_benign_darwin_subprocess_stderr(stderr).strip()
         try:
             from agent.redact import redact_sensitive_text
 

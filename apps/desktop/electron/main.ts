@@ -44,6 +44,7 @@ import {
   probeStartMarker,
   processStartMarker
 } from './backend-claim'
+import { createBenignStderrSink } from './subprocess-stderr-noise'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { BackendDialClaims } from './backend-dial-claim'
@@ -12079,7 +12080,16 @@ async function spawnPoolBackend(profile, entry, opts: { forceLocal?: boolean; po
   await claimBackendChild(child, `${backend.command} ${backend.args.join(' ')}`, profile, backendNonce, outputTail)
 
   child.stdout.on('data', rememberLog)
-  child.stderr.on('data', rememberLog)
+  // #54833: filter the known-benign Darwin libmalloc teardown line out of
+  // backend stderr before it reaches desktop.log; stdout is never filtered.
+  const stderrNoiseSink = createBenignStderrSink(rememberLog)
+  child.stderr?.on('data', stderrNoiseSink)
+  child.stderr?.on('end', () => {
+    const rest = stderrNoiseSink.flush()
+    if (rest) {
+      rememberLog(rest)
+    }
+  })
 
   let ready = false
   let rejectStart = null
@@ -12480,7 +12490,15 @@ async function startHermes() {
     }
 
     hermesProcess.stdout.on('data', rememberLog)
-    hermesProcess.stderr.on('data', rememberLog)
+    // #54833: same benign-stderr filter as the pooled backend path above.
+    const hermesStderrSink = createBenignStderrSink(rememberLog)
+    hermesProcess.stderr?.on('data', hermesStderrSink)
+    hermesProcess.stderr?.on('end', () => {
+      const rest = hermesStderrSink.flush()
+      if (rest) {
+        rememberLog(rest)
+      }
+    })
     let backendReady = false
     let rejectBackendStart = null
 
