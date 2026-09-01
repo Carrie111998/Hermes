@@ -12365,6 +12365,24 @@ def _default_spawn(
         # outside that tree.  Kanban APIs remain available because they write
         # through the board database layer rather than generic file tools.
         env["HERMES_WRITE_SAFE_ROOT"] = workspace
+        # Commands issued through the worker's terminal (for example the
+        # required ``python -m pytest`` lane) resolve executables from PATH,
+        # not from the worker's process cwd.  A dispatcher commonly launches
+        # from a gateway environment whose PATH has no project venv, so the
+        # same command can fail with ``python: command not found`` even when
+        # ``<workspace>/.venv/bin/python`` exists.  Scope the fix to the child
+        # environment and preserve the inherited PATH for non-Python tools.
+        venv_bin_name = "Scripts" if _IS_WINDOWS else "bin"
+        for venv_root in (".venv", "venv"):
+            venv_bin = os.path.join(workspace, venv_root, venv_bin_name)
+            if os.path.isdir(venv_bin):
+                inherited_path = env.get("PATH", "")
+                env["PATH"] = (
+                    venv_bin
+                    if not inherited_path
+                    else os.pathsep.join((venv_bin, inherited_path))
+                )
+                break
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
