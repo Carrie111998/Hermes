@@ -4384,6 +4384,47 @@ class TestRunConversation:
         assert third_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in third_call_messages[-1]["content"]
 
+    def test_ollama_glm_kaomoji_ending_not_treated_as_truncated(self, agent):
+        """Decorative/kaomoji endings are intentional, not truncation.
+
+        ♡ (U+2661), ~, ✨ (U+2728), * and friends sit below the U+1F300
+        emoji cutoff, so persona-style agents ending turns with them were
+        falsely flagged as truncated by the Ollama GLM stop-misreport
+        heuristic and re-continued — duplicating the ending to the user.
+        """
+        self._setup_agent(agent)
+        agent.base_url = "http://localhost:11434/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.model = "glm-5.1:cloud"
+
+        tool_turn = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call(name="web_search", arguments="{}", call_id="c1")],
+        )
+        done_with_kaomoji = _mock_response(
+            content="All done, the dashboard is up at http://192.168.4.95:9119/~ *v* ♡",
+            finish_reason="stop",
+        )
+        agent.client.chat.completions.create.side_effect = [
+            tool_turn,
+            done_with_kaomoji,
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="search result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["api_calls"] == 2
+        assert result["final_response"] == (
+            "All done, the dashboard is up at http://192.168.4.95:9119/~ *v* ♡"
+        )
+
 
 
 

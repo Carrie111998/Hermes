@@ -1864,7 +1864,14 @@ class AIAgent:
         if stripped.endswith('^'):
             return True
         last = stripped[-1]
-        if last in '.!?:)"\']}。！？：）】」』》^':
+        if last in '.!?:)"]]}。！？：）】」』》^':
+            return True
+        # Kaomoji / decorative endings are intentional completions, not
+        # truncation. U+2661 (♡), U+2665 (♥), U+2728 (✨) etc. sit BELOW the
+        # 0x1F300 emoji cutoff above, so persona-heavy agents ending turns
+        # with these were falsely flagged as truncated and re-continued
+        # (duplicate message endings on Ollama GLM backends).
+        if last in '~♡♥✨♪☆★*❤':
             return True
         # Emoji ranges (Misc Symbols, Dingbats, Emoticons, Supplemental, etc.)
         if ord(last) >= 0x1F300:
