@@ -71,6 +71,12 @@ logger = logging.getLogger(__name__)
 
 CHECKPOINT_BASE = get_hermes_home() / "checkpoints"
 
+# Session-terminate marker directory — ~/.hermes/sessions/<id>.interrupted
+# Used by #99869: long-running sessions that die mid-task (auth error,
+# timeout 124, context exhaustion) record a marker so the next session can
+# triage instead of trusting stale in-memory state.
+_SESSION_MARKER_DIRNAME = "sessions"
+
 # Single shared store directory under CHECKPOINT_BASE.
 _STORE_DIRNAME = "store"
 _REFS_PREFIX = "refs/hermes"
@@ -780,13 +786,19 @@ class CheckpointManager:
         max_snapshots: int = 20,
         max_total_size_mb: int = 500,
         max_file_size_mb: int = 10,
+        checkpoint_interval: int = 10,
     ):
         self.enabled = enabled
         self.max_snapshots = max(1, int(max_snapshots))
         self.max_total_size_mb = max(0, int(max_total_size_mb))
         self.max_file_size_mb = max(0, int(max_file_size_mb))
+        self.checkpoint_interval = max(1, int(checkpoint_interval))
         self._checkpointed_dirs: Set[str] = set()
         self._git_available: Optional[bool] = None  # lazy probe
+        # Periodic checkpoint counter for long-running sessions (#99869).
+        self._periodic_counter: int = 0
+        # Last periodic checkpoint timestamp per working_dir (rate-limit fallback).
+        self._last_periodic_ts: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Turn lifecycle
@@ -925,6 +937,34 @@ class CheckpointManager:
             return self._take(abs_dir, reason)
         except Exception as e:
             logger.debug("Checkpoint failed (non-fatal): %s", e)
+            return False
+
+    def maybe_periodic_checkpoint(self, working_dir: str, reason: str = "periodic") -> bool:
+        """Periodic checkpoint hook for long-running sessions (#99869).
+
+        Fires every ``checkpoint_interval`` tool calls regardless of the
+        per-turn dedup, so a multi-hour sweep that stays within one turn
+        or loops over many files still persists progress incrementally.
+        Bypasses the per-turn dedup by clearing the dir from the set
+        before delegating to :meth:`ensure_checkpoint`.
+
+        Returns True if a checkpoint was taken.
+        Never raises.
+        """
+        if not self.enabled:
+            return False
+        try:
+            self._periodic_counter += 1
+            if self._periodic_counter % self.checkpoint_interval != 0:
+                return False
+            abs_dir = str(_normalize_path(working_dir))
+            # Bypass per-turn dedup for the periodic tick — long loops often
+            # mutate many files within one turn and would otherwise keep only
+            # the first snapshot.
+            self._checkpointed_dirs.discard(abs_dir)
+            return self.ensure_checkpoint(working_dir, reason)
+        except Exception as exc:
+            logger.debug("Periodic checkpoint failed: %s", exc)
             return False
 
     def list_checkpoints(self, working_dir: str) -> List[Dict]:
@@ -1648,6 +1688,92 @@ def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:
     lines.append("  /rollback diff <N>        preview changes since checkpoint N")
     lines.append("  /rollback <N> <file>      restore a single file from checkpoint N")
     return "\n".join(lines)
+
+
+
+# ---------------------------------------------------------------------------
+# Session-terminate markers — #99869
+# ---------------------------------------------------------------------------
+# When a long-running session dies mid-task (AuthenticationError, terminal
+# exit 124, context exhaustion), the next session has no way to know the
+# prior session died partway through a write. These markers give that
+# signal: a small JSON file under ~/.hermes/sessions/<id>.interrupted
+# with timestamp + last_action + reason. The next session can surface a
+# warning and suggest rollback instead of trusting stale state.
+
+def _session_marker_dir(base=None):
+    return (base or get_hermes_home()) / _SESSION_MARKER_DIRNAME
+
+
+def _session_marker_path(session_id, base=None):
+    safe_id = __import__("re").sub(r"[^a-zA-Z0-9._-]", "_", session_id.strip())[:128]
+    if not safe_id:
+        safe_id = "unknown"
+    return _session_marker_dir(base) / f"{safe_id}.interrupted"
+
+
+def write_interrupted_marker(session_id, last_action="", reason="interrupted", base=None):
+    """Write a marker for a terminated session. Best-effort."""
+    try:
+        marker = _session_marker_path(session_id, base)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "session_id": session_id,
+            "timestamp": __import__("time").time(),
+            "iso_time": __import__("time").strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "last_action": (last_action or "")[:2000],
+            "reason": (reason or "interrupted")[:500],
+        }
+        tmp = marker.with_suffix(".tmp")
+        tmp.write_text(__import__("json").dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(marker)
+        return marker
+    except Exception as exc:
+        logger.debug("write_interrupted_marker failed for %s: %s", session_id, exc)
+        return None
+
+
+def read_interrupted_marker(session_id, base=None):
+    """Read an interrupted marker, or None if absent/unreadable."""
+    try:
+        marker = _session_marker_path(session_id, base)
+        if not marker.exists():
+            return None
+        return __import__("json").loads(marker.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def clear_interrupted_marker(session_id, base=None):
+    """Remove a marker after it has been triaged. Returns True if removed."""
+    try:
+        marker = _session_marker_path(session_id, base)
+        if marker.exists():
+            marker.unlink()
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def list_interrupted_markers(base=None):
+    """List all interrupted markers (newest first)."""
+    try:
+        d = _session_marker_dir(base)
+        if not d.exists():
+            return []
+        out = []
+        for p in d.glob("*.interrupted"):
+            try:
+                data = __import__("json").loads(p.read_text(encoding="utf-8"))
+                data["_path"] = str(p)
+                out.append(data)
+            except Exception:
+                continue
+        out.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        return out
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
