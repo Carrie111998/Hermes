@@ -507,6 +507,9 @@ def _read_message_page(
     if row is None:
         return tool_error(f"message_id {message_id} not found in session_id {session_id}", success=False)
     content = row.get("content") if isinstance(row.get("content"), str) else ""
+    if "\x1b" in content:
+        from tools.ansi_strip import strip_ansi
+        content = strip_ansi(content)
     page = content[content_offset:content_offset + max_chars]
     return json.dumps({
         "success": True, "mode": "message_page", "session_id": session_id,

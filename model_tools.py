@@ -1610,9 +1610,15 @@ def handle_function_call(
                 # results use the existing spillover cache and expose a
                 # receipt only to hooks that choose to use it.
                 from tools.tool_result_storage import preserve_raw_tool_result
+                try:
+                    from tools.terminal_tool import get_active_env
+                    raw_result_env = get_active_env(task_id or "")
+                except Exception:
+                    raw_result_env = None
                 raw_result_receipt = preserve_raw_tool_result(
                     result if isinstance(result, str) else str(result),
                     tool_call_id or function_name,
+                    env=raw_result_env,
                 )
                 status, error_type, error_message = _tool_result_observer_fields(
                     function_name,

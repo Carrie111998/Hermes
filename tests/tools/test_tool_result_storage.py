@@ -278,6 +278,33 @@ class TestPreserveRawToolResult:
     def test_skips_small_result(self):
         assert preserve_raw_tool_result("small", "call") is None
 
+    def test_remote_receipt_uses_visible_cache_path(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.tool_result_storage.get_spillover_dir", lambda: tmp_path)
+        monkeypatch.setattr("tools.tool_result_storage._is_host_side_env", lambda env: False)
+        monkeypatch.setattr(
+            "tools.tool_result_storage._sandbox_visible_spillover_path",
+            lambda path, env: "/sandbox/cache/spillover/call_raw.txt",
+        )
+        receipt = preserve_raw_tool_result("x" * 12_000, "call", env=MagicMock())
+        assert receipt["result_ref"] == "/sandbox/cache/spillover/call_raw.txt"
+        assert receipt["detail_reader"]["path"] == receipt["result_ref"]
+
+    def test_remote_receipt_falls_back_to_sandbox_copy(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.tool_result_storage.get_spillover_dir", lambda: tmp_path)
+        monkeypatch.setattr("tools.tool_result_storage._is_host_side_env", lambda env: False)
+        monkeypatch.setattr("tools.tool_result_storage._sandbox_visible_spillover_path", lambda *args: None)
+        monkeypatch.setattr("tools.tool_result_storage._resolve_storage_dir", lambda env: "/remote/tmp")
+        monkeypatch.setattr("tools.tool_result_storage._write_to_sandbox", lambda *args: True)
+        receipt = preserve_raw_tool_result("x" * 12_000, "call", env=MagicMock())
+        assert receipt["result_ref"] == "/remote/tmp/call_raw.txt"
+
+    def test_remote_receipt_omits_unreadable_raw_reference(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("tools.tool_result_storage.get_spillover_dir", lambda: tmp_path)
+        monkeypatch.setattr("tools.tool_result_storage._is_host_side_env", lambda env: False)
+        monkeypatch.setattr("tools.tool_result_storage._sandbox_visible_spillover_path", lambda *args: None)
+        monkeypatch.setattr("tools.tool_result_storage._write_to_sandbox", lambda *args: False)
+        assert preserve_raw_tool_result("x" * 12_000, "call", env=MagicMock()) is None
+
 
 # ── enforce_turn_budget ───────────────────────────────────────────────
 

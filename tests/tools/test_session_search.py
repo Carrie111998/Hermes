@@ -471,6 +471,17 @@ class TestReadShape:
         assert page["returned_chars"] == 8_000
         assert page["has_more"] is False
 
+    def test_message_page_strips_ansi_sequences(self, db):
+        db.create_session("s_ansi_page", source="cli")
+        message_id = db.append_message(
+            "s_ansi_page", role="assistant", content="\u001b[31mred text\u001b[0m"
+        )
+        page = json.loads(session_search(
+            session_id="s_ansi_page", message_id=message_id, db=db,
+        ))
+        assert page["content"] == "red text"
+        assert "\u001b" not in page["content"]
+
 
 # =========================================================================
 # Session links — the value the agent writes to point the user at a session
