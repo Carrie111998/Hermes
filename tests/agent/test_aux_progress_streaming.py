@@ -407,6 +407,64 @@ class TestAggregateChatStream:
         assert local_client.calls[0]["stream"] is True
         assert result.choices[0].message.content == "abc"
 
+    def test_request_local_worker_discards_chunks_after_caller_timeout(self, monkeypatch):
+        from agent.auxiliary_client import _aux_provider_response, _aux_timing_hook
+
+        peer_release = threading.Event()
+        worker_closed = threading.Event()
+        caller_returned = threading.Event()
+        late_callbacks = []
+        close_threads = []
+
+        class _LateLocalClient(_FakeClient):
+            def _create(self, **kwargs):
+                self.calls.append(kwargs)
+
+                def _chunks():
+                    peer_release.wait(timeout=1.0)
+                    yield _chunk(content="stale")
+
+                return _chunks()
+
+            def close(self):
+                close_threads.append(threading.get_ident())
+                worker_closed.set()
+
+        cached_client = _FakeClient(stream_chunks=[])
+        local_client = _LateLocalClient()
+        monkeypatch.setattr(
+            "agent.auxiliary_client._AUX_STREAM_NO_PROGRESS_TIMEOUT_SECONDS", 0.02
+        )
+        monkeypatch.setattr(
+            "agent.auxiliary_client._copy_request_local_streaming_client",
+            lambda client: (local_client, True),
+        )
+        monkeypatch.setattr(
+            "agent.agent_runtime_helpers.force_close_tcp_sockets", lambda client: 0
+        )
+
+        def _record_callback(kind):
+            if caller_returned.is_set():
+                late_callbacks.append(kind)
+
+        caller_thread = threading.get_ident()
+        with (
+            aux_progress_hook(lambda: _record_callback("progress")),
+            _aux_timing_hook(
+                _aux_provider_response, lambda: _record_callback("timing")
+            ),
+            pytest.raises(TimeoutError, match="no-progress timeout"),
+        ):
+            _create_with_progress(
+                cached_client, {"model": "m1", "messages": [], "timeout": 1.0}
+            )
+
+        caller_returned.set()
+        peer_release.set()
+        assert worker_closed.wait(timeout=1.0)
+        assert late_callbacks == []
+        assert close_threads and close_threads[0] != caller_thread
+
     def test_stream_attempt_uses_and_closes_request_local_client(self, monkeypatch):
         cached_client = _FakeClient(stream_chunks=[])
         local_client = _FakeClient(

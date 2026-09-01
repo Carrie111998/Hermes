@@ -9952,9 +9952,9 @@ def _aggregate_chat_stream(
     _arm_watchdog()
     try:
         for chunk in chunks:
-            made_progress = acc.feed(chunk)
             if cancel_event is not None and cancel_event.is_set():
                 raise TimeoutError("Auxiliary streamed call cancelled after caller timeout")
+            made_progress = acc.feed(chunk)
             if watchdog_expired.is_set():
                 raise TimeoutError(_timeout_message())
             if made_progress:
