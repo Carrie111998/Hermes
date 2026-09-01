@@ -105,6 +105,73 @@ _DEFAULT_SIDECAR_BIND = "127.0.0.1"
 _MAX_MESSAGE_LENGTH = 8000
 
 # ---------------------------------------------------------------------------
+# Sidecar dedup persistence
+
+# Photon dedup persistence file — stores seen/sent message IDs so a gateway
+# restart doesn't lose the dedup state and double-dispatch inbound messages
+# (#100032). Stored in the profile data dir so it survives restarts.
+_DEDUP_STATE_NAME = "photon-dedup.json"
+_DEDUP_STATE_MAX_IDS = 5000  # bound the on-disk state
+
+
+def _dedup_state_path() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "runtime" / _DEDUP_STATE_NAME
+
+
+def _load_dedup_state() -> tuple[Dict[str, float], Dict[str, float]]:
+    """Load persisted dedup state from disk. Returns (seen, sent) dicts."""
+    path = _dedup_state_path()
+    if not path.exists():
+        return {}, {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        seen = raw.get("seen", {}) if isinstance(raw, dict) else {}
+        sent = raw.get("sent", {}) if isinstance(raw, dict) else {}
+        # Validate: must be dict[str, float]
+        if not isinstance(seen, dict) or not isinstance(sent, dict):
+            return {}, {}
+        return (
+            # Reverse to oldest-first so runtime eviction (which deletes from
+            # the front of the dict) correctly keeps the most recent IDs.
+            {k: float(v) for k, v in sorted(seen.items(), key=lambda x: x[1]) if isinstance(v, (int, float))},
+            {k: float(v) for k, v in sorted(sent.items(), key=lambda x: x[1]) if isinstance(v, (int, float))},
+        )
+    except (OSError, ValueError, TypeError):
+        return {}, {}
+
+
+def _save_dedup_state(seen: Dict[str, float], sent: Dict[str, float]) -> None:
+    """Persist dedup state to disk atomically."""
+    import tempfile
+
+    path = _dedup_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Bound the state: keep only the most recent entries
+        seen_items = sorted(seen.items(), key=lambda x: x[1], reverse=True)[:_DEDUP_STATE_MAX_IDS]
+        sent_items = sorted(sent.items(), key=lambda x: x[1], reverse=True)[:_DEDUP_STATE_MAX_IDS]
+        fd, tmp = tempfile.mkstemp(
+            dir=str(path.parent), prefix=".photon-dedup.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"seen": dict(seen_items), "sent": dict(sent_items)},
+                    fh,
+                )
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        pass  # best-effort persistence
+
+# ---------------------------------------------------------------------------
 # Sidecar runtime record
 #
 # Out-of-process senders (cron subprocesses, `hermes send`, the dashboard)
