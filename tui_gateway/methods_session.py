@@ -3094,7 +3094,8 @@ def _(rid, params: dict) -> dict:
     except Exception as e:
         return _err(rid, 5011, f"failed to create save directory {saved_dir}: {e}")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Microseconds so two rapid saves can't silently overwrite each other.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     path = saved_dir / f"hermes_conversation_{timestamp}.json"
 
     with session["history_lock"]:
