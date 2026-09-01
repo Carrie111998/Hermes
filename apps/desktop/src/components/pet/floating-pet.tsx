@@ -18,6 +18,8 @@ import {
   mergePetInfoMeta,
   type PetInfo,
   type PetInfoMeta,
+  type PetOwner,
+  petOwnerChanged,
   petOwnerUsesAmbientGateway,
   requestPetForOwner,
   setPetInfo
@@ -114,6 +116,7 @@ export function FloatingPet() {
   const atRest = useStore($petAtRest)
   const roamDir = useStore($petRoamDir)
   const routeOverlayOpen = useRouteOverlayActive()
+  const previousOwnerRef = useRef<PetOwner | undefined>(undefined)
   const usesAmbientGateway = petOwnerUsesAmbientGateway(owner)
 
   const requestPetGateway = useCallback(
@@ -292,7 +295,15 @@ export function FloatingPet() {
   // Pets follow the exact Bot owner as well as ordinary profile switches. Drop
   // the prior sprite immediately so a slow remote dial never leaves the default
   // profile's mascot painted over the selected bot.
+  // eslint-disable-next-line no-restricted-syntax -- component-local history distinguishes mount hydration from a real owner switch
   useEffect(() => {
+    const previous = previousOwnerRef.current
+    previousOwnerRef.current = owner
+
+    if (!petOwnerChanged(previous, owner)) {
+      return
+    }
+
     setPetInfo({ enabled: false })
     resetPetGallery()
   }, [owner])

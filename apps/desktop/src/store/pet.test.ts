@@ -14,6 +14,7 @@ import {
   mergePetInfoMeta,
   type PetInfo,
   petOwner,
+  petOwnerChanged,
   petOwnerUsesAmbientGateway,
   petProfile,
   requestPetForOwner,
@@ -40,6 +41,28 @@ describe('pet owner routing', () => {
       targetProfile: 'scout'
     })
     expect(petOwnerUsesAmbientGateway(petOwner())).toBe(false)
+
+    setWorkspaceScope('sessions')
+  })
+
+  it('does not treat initial owner hydration as a switch', () => {
+    const ambient = { profile: 'default', targetProfile: 'default' }
+    const routed = { connectionId: 'jaime-vpn', profile: 'scout', targetProfile: 'scout' }
+
+    expect(petOwnerChanged(undefined, ambient)).toBe(false)
+    expect(petOwnerChanged(ambient, { ...ambient })).toBe(false)
+    expect(petOwnerChanged(ambient, routed)).toBe(true)
+  })
+
+  it('falls back to ambient ownership for a malformed Bot route', () => {
+    $activeGatewayProfile.set('default')
+    setWorkspaceScope('bots', 'broken::route', {
+      kind: 'route',
+      route: { connectionId: undefined, profile: undefined } as never
+    })
+
+    expect(() => petOwner()).not.toThrow()
+    expect(petOwner()).toEqual({ profile: 'default', targetProfile: 'default' })
 
     setWorkspaceScope('sessions')
   })

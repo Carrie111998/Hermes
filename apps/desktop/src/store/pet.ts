@@ -161,14 +161,17 @@ export const $petOwner = computed(
     const activeProfile = normalizeProfileKey(activeGatewayProfile)
 
     if (workspaceMode === 'bots' && workspaceTarget?.kind === 'route') {
-      const connectionId = workspaceTarget.route.connectionId.trim()
-      const profile = normalizeProfileKey(workspaceTarget.route.profile)
+      const route = workspaceTarget.route
+      const connectionId = String(route?.connectionId ?? '').trim()
+      const routeProfile = String(route?.profile ?? '').trim()
 
-      if (connectionId) {
+      if (connectionId && routeProfile) {
+        const profile = normalizeProfileKey(routeProfile)
+
         return {
           connectionId,
           profile,
-          targetProfile: normalizeProfileKey(workspaceTarget.route.targetProfile || profile)
+          targetProfile: normalizeProfileKey(route.targetProfile || profile)
         }
       }
     }
@@ -179,6 +182,17 @@ export const $petOwner = computed(
 
 export function petOwner(): PetOwner {
   return $petOwner.get()
+}
+
+/** Whether a previously rendered owner actually changed. The missing previous
+ * owner is initial hydration, not a switch — callers must preserve warm state. */
+export function petOwnerChanged(previous: PetOwner | undefined, next: PetOwner): boolean {
+  return Boolean(
+    previous &&
+      (previous.connectionId !== next.connectionId ||
+        previous.profile !== next.profile ||
+        previous.targetProfile !== next.targetProfile)
+  )
 }
 
 /** Ambient gateway state/events apply only when no exact Bot owner route exists. */
