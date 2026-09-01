@@ -924,6 +924,7 @@ def _ci_receipt_payload(receipt: CIAuditReceipt) -> dict[str, object]:
         "head_sha": receipt.identity.head_sha,
         "manifest_digest": receipt.manifest_digest,
         "command_count": len(receipt.commands),
+        "handoff_status": "pending",
     }
 
 
@@ -996,8 +997,9 @@ def _audit_pr(ctx: Any, args: argparse.Namespace) -> int:
             print(
                 json.dumps(
                     {
-                        "status": "audit_handoff_unavailable",
+                        "status": "audit_handoff_retryable",
                         "receipt_id": receipt.receipt_id,
+                        "retryable": True,
                     },
                     sort_keys=True,
                 ),

@@ -930,10 +930,12 @@ class ScanController:
             except Exception:  # noqa: BLE001 - an adapter failure must not admit work.
                 skipped["github_error"] += 1
                 continue
-            # GitHub's list order is not a freshness contract.  A PR comment,
+            # GitHub's list order is not a freshness contract. A PR comment,
             # review, or synchronize event advances updated_at, so newest-first
-            # keeps the bounded scanner on the changes that can actually need
-            # work instead of replaying hundreds of historical open PRs.
+            # is the normal fallback order. Local-CI backlog selection below
+            # reserves this bounded window for older heads that still lack
+            # passed exact-head evidence, preventing the freshness window from
+            # starving historical open PRs forever.
             pull_requests = tuple(
                 sorted(
                     pull_requests,
@@ -971,6 +973,12 @@ class ScanController:
                         skipped[error] += 1
                         if error == "agent_label_error":
                             break
+            required_local_ci_backlog += _required_local_ci_backlog_count(
+                self._policy,
+                self._ledger,
+                target,
+                pull_requests,
+            )
             if (
                 self._policy.local_ci_audit is not None
                 and self._policy.local_ci_audit.applies_to(repository)
@@ -981,15 +989,12 @@ class ScanController:
                     len(pull_requests)
                     - self._policy.local_ci_audit.max_open_prs_per_scan
                 )
-                pull_requests = pull_requests[
-                    : self._policy.local_ci_audit.max_open_prs_per_scan
-                ]
-            required_local_ci_backlog += _required_local_ci_backlog_count(
-                self._policy,
-                self._ledger,
-                target,
-                pull_requests,
-            )
+                pull_requests = _select_local_ci_candidates(
+                    self._policy,
+                    self._ledger,
+                    target,
+                    pull_requests,
+                )
             if actions_enabled and pull_requests:
                 # actions_enabled is only the repo-level Actions on/off toggle;
                 # it stays True through a billing lockout, where every job
@@ -2266,6 +2271,90 @@ def _required_local_ci_backlog_count(
         ):
             missing += 1
     return missing
+
+
+def _select_local_ci_candidates(
+    policy: PluginPolicy,
+    ledger: FeedbackLedger,
+    target: RepositoryTarget,
+    pull_requests: tuple[PullRequest, ...],
+) -> tuple[PullRequest, ...]:
+    """Select a bounded local-CI window without starving old missing heads.
+
+    The primary PR listing has already been fetched, so this performs no
+    additional GitHub reads. Oldest-first applies only to admitted PRs without
+    a passed receipt for the current base/head/manifest; the remaining slots
+    retain the normal newest-first order for timely feedback processing.
+    """
+
+    audit_policy = policy.local_ci_audit
+    if audit_policy is None or not audit_policy.applies_to(target.base_repository):
+        return pull_requests
+    limit = audit_policy.max_open_prs_per_scan
+    if len(pull_requests) <= limit:
+        return pull_requests
+
+    backlog = tuple(
+        pull
+        for pull in pull_requests
+        if policy.admit_pull_request(pull).admitted
+        and not _has_current_passed_ci_receipt(ledger, target, pull)
+    )
+    backlog = tuple(
+        sorted(
+            backlog,
+            key=lambda pull: (
+                pull.updated_at or datetime.min.replace(tzinfo=UTC),
+                pull.number,
+            ),
+        )
+    )
+    selected = list(backlog[:limit])
+    selected_keys = {(pull.number, pull.head_sha.casefold()) for pull in selected}
+    if len(selected) < limit:
+        for pull in pull_requests:
+            key = (pull.number, pull.head_sha.casefold())
+            if key in selected_keys:
+                continue
+            selected.append(pull)
+            selected_keys.add(key)
+            if len(selected) == limit:
+                break
+    return tuple(selected)
+
+
+def _has_current_passed_ci_receipt(
+    ledger: FeedbackLedger,
+    target: RepositoryTarget,
+    pull: PullRequest,
+) -> bool:
+    """Return whether one listed PR has passed evidence for its exact base."""
+
+    if pull.base_sha is None:
+        return False
+    manifest_path = target.local_path / "tests" / "manifests" / "test_lanes.toml"
+    try:
+        manifest_digest = sha256(manifest_path.read_bytes()).hexdigest()
+        receipt = ledger.latest_ci_receipt(
+            pull.base_repository,
+            pull.number,
+            pull.head_sha,
+            manifest_digest=manifest_digest,
+            not_before=datetime.min.replace(tzinfo=UTC),
+        )
+    except (OSError, LedgerStateError, TypeError, ValueError):
+        return False
+    from .ci_runner import CIAuditReceipt
+
+    return (
+        isinstance(receipt, CIAuditReceipt)
+        and receipt.status == "passed"
+        and receipt.identity.repository == pull.base_repository
+        and receipt.identity.pr_number == pull.number
+        and receipt.identity.base_sha.casefold() == pull.base_sha.casefold()
+        and receipt.identity.head_sha.casefold() == pull.head_sha.casefold()
+        and receipt.manifest_digest == manifest_digest
+    )
 
 
 def _worker_capability_preflight(identity_command: str) -> str:
