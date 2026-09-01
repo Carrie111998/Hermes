@@ -1079,6 +1079,37 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         return
     if stored_prompt:
         stored_state = "stale_runtime"
+        patched = _patch_runtime_identity_lines(stored_prompt, agent)
+        if patched != stored_prompt and _stored_prompt_matches_runtime(agent, patched):
+            logger.info(
+                "Stored system prompt for session %s has stale runtime "
+                "identity; patched Model/Provider/Platform trailer in "
+                "place for model=%s provider=%s (stable prefix kept).",
+                agent.session_id,
+                getattr(agent, "model", "") or "",
+                getattr(agent, "provider", "") or "",
+            )
+            agent._cached_system_prompt = patched
+            from agent.system_prompt import (
+                reconstruct_static_prefix,
+                restore_plugin_prompt_sections,
+            )
+
+            restore_plugin_prompt_sections(agent, patched)
+            reconstruct_static_prefix(agent, system_message=system_message)
+            if agent._session_db:
+                try:
+                    agent._session_db.update_system_prompt(
+                        agent.session_id, patched
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Session DB update_system_prompt failed after "
+                        "runtime-identity patch (session=%s): %s. The "
+                        "patch will re-apply next turn.",
+                        agent.session_id, exc,
+                    )
+            return
         logger.info(
             "Stored system prompt for session %s has stale runtime identity; "
             "rebuilding for model=%s provider=%s.",
@@ -1107,29 +1138,33 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
     # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    # A /model switch used to NULL the snapshot and fall through here,
+    # re-firing the hook on a live conversation (#100336). Keep it
+    # gated to rows that never had a usable prompt.
+    if stored_state in ("missing", "null", "empty"):
+        try:
+            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
-    # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
-    # desktop build seeds at session OPEN (see seed_credits_at_session_start in
-    # tui_gateway), so this call is usually a no-op there (idempotent: skips when
-    # _credits_state already exists). For the plain CLI / any path that didn't seed
-    # at build, it primes credits state from /api/oauth/account (or a fixture) on the
-    # first turn so depletion / usage-band warnings fire. Fail-open inside the helper.
-    try:
-        from agent.credits_tracker import seed_credits_at_session_start
+        # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
+        # desktop build seeds at session OPEN (see seed_credits_at_session_start in
+        # tui_gateway), so this call is usually a no-op there (idempotent: skips when
+        # _credits_state already exists). For the plain CLI / any path that didn't seed
+        # at build, it primes credits state from /api/oauth/account (or a fixture) on the
+        # first turn so depletion / usage-band warnings fire. Fail-open inside the helper.
+        try:
+            from agent.credits_tracker import seed_credits_at_session_start
 
-        seed_credits_at_session_start(agent)
-    except Exception:
-        logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
+            seed_credits_at_session_start(agent)
+        except Exception:
+            logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
     # Persist the system prompt snapshot in SQLite.  Failure here used
     # to log at DEBUG, which silently broke prefix-cache reuse on the
@@ -1145,6 +1180,56 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                 "miss the prefix cache.",
                 agent.session_id, exc,
             )
+
+
+def _patch_runtime_identity_lines(prompt: str, agent) -> str:
+    """Rewrite the volatile Model/Provider/Platform trailer in place.
+
+    These fields are emitted at the end of the system prompt. Replacing
+    only their last occurrences keeps the stable+context prefix
+    byte-identical across a mid-session /model switch so implicit
+    longest-prefix caches can still hit everything in front of the
+    trailer. Last-match is the same rule ``_stored_prompt_matches_runtime``
+    uses, so project-context lines earlier in the prompt are not edited.
+    """
+
+    model = str(getattr(agent, "model", "") or "").strip()
+    provider = str(getattr(agent, "provider", "") or "").strip()
+    platform = str(getattr(agent, "platform", "") or "").strip()
+    replacements = (
+        ("Model", model),
+        ("Provider", provider),
+        ("Platform", platform),
+    )
+    if not any(value for _label, value in replacements):
+        return prompt
+
+    lines = prompt.splitlines(keepends=True)
+    if not lines:
+        return prompt
+
+    def replace_last(label: str, value: str) -> bool:
+        prefix = f"{label}:"
+        idx = None
+        for i, line in enumerate(lines):
+            raw = line[:-1] if line.endswith("\n") else line
+            if raw.startswith(prefix):
+                idx = i
+        if idx is None:
+            return False
+        newline = "\n" if lines[idx].endswith("\n") else ""
+        lines[idx] = f"{prefix} {value}{newline}"
+        return True
+
+    for label, value in replacements:
+        if not value:
+            continue
+        if replace_last(label, value):
+            continue
+        if not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(f"{label}: {value}\n")
+    return "".join(lines)
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
