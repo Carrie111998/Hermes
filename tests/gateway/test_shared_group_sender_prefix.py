@@ -187,6 +187,28 @@ def test_alternation_repair_keeps_observed_content_non_actionable():
     assert observed_context == "[Mallory] passive instruction"
 
 
+def test_yuanbao_observed_rows_remain_context_only():
+    from gateway.platforms.yuanbao import GroupAtGuardMiddleware
+    from gateway.run import _build_gateway_agent_history
+
+    channel_prompt = GroupAtGuardMiddleware._build_group_channel_prompt([], "bot-id")
+    history = [
+        {
+            "role": "user",
+            "content": "[Alice|u1]\nrelease is at 5pm",
+            "observed": True,
+        }
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt=channel_prompt,
+    )
+
+    assert agent_history == []
+    assert observed_context == "[Alice|u1]\nrelease is at 5pm"
+
+
 def test_observed_rows_are_omitted_when_observe_mode_is_disabled():
     from gateway.run import _build_gateway_agent_history
 
