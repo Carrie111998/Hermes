@@ -788,8 +788,51 @@ def test_service_publishes_deferred_turn_continues_and_retries_new_generation(
     requeued = service.retry_room_task(
         "room-1",
         task_id=first["identity"].task_id,
+        retry_id="retry-1",
     )
     assert requeued["status"] == "queued"
+    replayed = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+        retry_id="retry-1",
+    )
+    assert replayed["status"] == "queued"
+    assert replayed["idempotent"] is True
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE hosted_room_driver_tasks
+                  SET status='deferred', execution_generation=2
+                WHERE room_id='room-1' AND task_id=?""",
+            (first["identity"].task_id,),
+        )
+        conn.commit()
+    second_retry = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+        retry_id="retry-2",
+    )
+    assert second_retry["status"] == "queued"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """UPDATE hosted_room_driver_tasks
+                  SET status='deferred', execution_generation=3
+                WHERE room_id='room-1' AND task_id=?""",
+            (first["identity"].task_id,),
+        )
+        conn.commit()
+    delayed_first = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+        retry_id="retry-1",
+    )
+    assert delayed_first["status"] == "deferred"
+    assert delayed_first["idempotent"] is True
+    third_retry = service.retry_room_task(
+        "room-1",
+        task_id=first["identity"].task_id,
+        retry_id="retry-3",
+    )
+    assert third_retry["status"] == "queued"
     lease = service.runtime._leases["room-1"]
     retried = driver.start_task(
         db,
@@ -798,7 +841,7 @@ def test_service_publishes_deferred_turn_continues_and_retries_new_generation(
         expected_cancel_generation=0,
         clock=clock,
     )
-    assert retried.execution_generation == old_attempt.execution_generation + 1
+    assert retried.execution_generation == third_retry["execution_generation"] + 1
 
 
 def test_stop_fence_prevents_the_next_room_member_from_starting(

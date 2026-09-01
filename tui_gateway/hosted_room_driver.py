@@ -133,6 +133,10 @@ class HostedRoomRuntime:
         rpc: InternalSessionRPC | None = None,
         transport_resolver: MemberTransportResolver | None = None,
         prepare_room: Callable[[HostedRoomBinding], None] | None = None,
+        prepare_leased_room: Callable[
+            [HostedRoomBinding, state.DriverLease], None
+        ]
+        | None = None,
         publish_terminal: Callable[[HostedRoomBinding, Mapping[str, Any]], None]
         | None = None,
         pending_action: Callable[[str, str, Mapping[str, Any] | None], None]
@@ -176,6 +180,7 @@ class HostedRoomRuntime:
         self.transport_resolver = transport_resolver
         self.turn_lock = turn_lock
         self.prepare_room = prepare_room
+        self.prepare_leased_room = prepare_leased_room
         self.publish_terminal = publish_terminal
         self.pending_action = pending_action
         self.clock = clock
@@ -298,7 +303,7 @@ class HostedRoomRuntime:
                 raise state.InvalidTaskTransitionError(
                     f"cannot cancel task in state '{before['status']}'"
                 )
-            if before["status"] in {"queued", "deferred"}:
+            if before["status"] == "queued":
                 try:
                     cancelled = state.cancel_task(
                         self.db_path,
@@ -407,7 +412,12 @@ class HostedRoomRuntime:
         )
         return self._info_acknowledges_peer_cancel(info, task)
 
-    def retry_indeterminate(self, identity: state.TaskIdentity) -> dict[str, Any]:
+    def retry_indeterminate(
+        self,
+        identity: state.TaskIdentity,
+        *,
+        retry_id: str | None = None,
+    ) -> dict[str, Any]:
         """Explicitly retry one uncertain attempt under the current room lease."""
         task = state.get_task(self.db_path, identity)
         if task["status"] not in {"indeterminate", "deferred"}:
@@ -426,6 +436,7 @@ class HostedRoomRuntime:
                 expected_execution_generation=task["execution_generation"],
                 expected_cancel_generation=task["cancel_generation"],
                 clock=self.clock,
+                retry_id=retry_id,
             )
             with self._status_lock:
                 self._blocked_rooms.discard(identity.room_id)
@@ -446,6 +457,7 @@ class HostedRoomRuntime:
                 status=inspection.terminal.status,
                 result=inspection.terminal.result,
                 clock=self.clock,
+                retry_id=retry_id,
             )
             if self.publish_terminal is not None:
                 self.publish_terminal(binding, resolved)
@@ -459,6 +471,7 @@ class HostedRoomRuntime:
                 expected_cancel_generation=task["cancel_generation"],
                 cancel_id=f"remote-cancel:{task['execution_generation']}",
                 clock=self.clock,
+                retry_id=retry_id,
             )
             if self.publish_terminal is not None:
                 self.publish_terminal(binding, resolved)
@@ -476,6 +489,7 @@ class HostedRoomRuntime:
             expected_execution_generation=task["execution_generation"],
             expected_cancel_generation=task["cancel_generation"],
             clock=self.clock,
+            retry_id=retry_id,
         )
         with self._status_lock:
             self._blocked_rooms.discard(identity.room_id)
@@ -765,6 +779,8 @@ class HostedRoomRuntime:
         if recovery_key not in self._recovered_leases:
             state.recover_room(self.db_path, lease, clock=self.clock)
             self._recovered_leases.add(recovery_key)
+        if self.prepare_leased_room is not None:
+            self.prepare_leased_room(binding, lease)
         if self._retry_stopping_tasks(binding, lease):
             with self._status_lock:
                 self._blocked_rooms.add(binding.room_id)
@@ -790,6 +806,8 @@ class HostedRoomRuntime:
                 expected_cancel_generation=task["cancel_generation"],
                 clock=self.clock,
             )
+            if attempt is None:
+                continue
             self._execute_attempt(binding, task, attempt)
             current = state.get_task(self.db_path, task["identity"])
             if current["status"] not in state.TERMINAL_STATUSES:
