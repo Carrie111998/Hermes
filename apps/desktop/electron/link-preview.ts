@@ -1,3 +1,5 @@
+import { toDataUrl } from './favicon'
+
 /**
  * Link preview resolution — the click-to-expand unfurl (D7).
  *
@@ -39,6 +41,13 @@ export interface LinkPreviewMeta {
   siteName: string
   /** Absolute og:image / twitter:image URL, or '' when absent or non-http. */
   imageUrl: string
+  /**
+   * Thumbnail as a validated data URL, or '' when the image could not be
+   * fetched and sniffed under the guard. The renderer paints THIS — it never
+   * GETs imageUrl itself (a renderer-side <img> fetch bypasses every SSRF
+   * guard); data-URL bytes ride the IPC envelope with the rest of the meta.
+   */
+  image: string
   /** Epoch ms when the meta was fetched; drives the cache TTL. */
   fetchedAt: number
 }
@@ -170,7 +179,8 @@ export function parseLinkMeta(html: string, baseUrl: string): Omit<LinkPreviewMe
     title: usableTitle(title),
     description: first(DESCRIPTION_KEYS),
     siteName: cleanField(meta.get('og:site_name') ?? '', PREVIEW_TITLE_MAX),
-    imageUrl
+    imageUrl,
+    image: ''
   }
 }
 
@@ -276,24 +286,24 @@ function isDottedQuad(value: string): boolean {
 export const PREVIEW_MAX_REDIRECTS = 3
 
 /** One HTTP hop: a single response, with redirect following left to the caller. */
-export interface HttpHopResponse {
+export interface HttpHopResponse<B = string> {
   /** Status code; 0 means transport failure (an empty final body). */
   status: number
   /** Raw Location header value — possibly relative — or ''. */
   location: string
   /** Response body with the header block stripped. */
-  body: string
+  body: B
 }
 
-export interface GuardedRedirectIo {
+export interface GuardedRedirectIo<B = string> {
   /** Exactly one HTTP request; must never follow redirects on its own. */
-  fetchOnce: (url: string, addresses: string[]) => Promise<HttpHopResponse>
+  fetchOnce: (url: string, addresses: string[]) => Promise<HttpHopResponse<B>>
   /** Resolved addresses for a hostname; [] when resolution fails. */
   resolveHost: (hostname: string) => Promise<string[]>
 }
 
-export type GuardedRedirectResult =
-  | { ok: true; url: string; html: string }
+export type GuardedRedirectResult<B = string> =
+  | { ok: true; url: string; body: B }
   | { ok: false; reason: LinkPreviewFailureReason }
 
 /**
@@ -306,7 +316,7 @@ export type GuardedRedirectResult =
  * transport resolve the name again would reopen a rebinding window between
  * this verdict and the actual request. (Shape adopted from upstream #63171.)
  */
-async function guardHop(url: URL, io: GuardedRedirectIo): Promise<{ refusal: LinkPreviewFailureReason | null; addresses: string[] }> {
+async function guardHop<B>(url: URL, io: GuardedRedirectIo<B>): Promise<{ refusal: LinkPreviewFailureReason | null; addresses: string[] }> {
   if (url.protocol !== 'http:' && url.protocol !== 'https:') {
     return { refusal: 'private-url', addresses: [] }
   }
@@ -342,11 +352,11 @@ async function guardHop(url: URL, io: GuardedRedirectIo): Promise<{ refusal: Lin
  * with at most PREVIEW_MAX_REDIRECTS hops. Everything else about the fetch
  * (timeouts, byte budget, UA) stays in the injected fetchOnce.
  */
-export async function fetchWithGuardedRedirects(
+export async function fetchWithGuardedRedirects<B = string>(
   rawUrl: string,
-  io: GuardedRedirectIo,
+  io: GuardedRedirectIo<B>,
   options: { maxRedirects?: number } = {}
-): Promise<GuardedRedirectResult> {
+): Promise<GuardedRedirectResult<B>> {
   const maxRedirects = options.maxRedirects ?? PREVIEW_MAX_REDIRECTS
 
   let current: URL
@@ -367,20 +377,20 @@ export async function fetchWithGuardedRedirects(
   let redirectsFollowed = 0
 
   for (;;) {
-    let response: HttpHopResponse
+    let response: HttpHopResponse<B>
 
     try {
       response = await io.fetchOnce(current.toString(), addresses)
     } catch {
       // Transport failure ends the walk; the empty body is the caller's miss signal.
-      return { ok: true, url: current.toString(), html: '' }
+      return { ok: true, url: current.toString(), body: '' as B }
     }
 
     const location = (response.location || '').trim()
     const isRedirect = response.status >= 300 && response.status < 400 && location !== ''
 
     if (!isRedirect) {
-      return { ok: true, url: current.toString(), html: response.body }
+      return { ok: true, url: current.toString(), body: response.body }
     }
 
     if (redirectsFollowed >= maxRedirects) {
@@ -407,6 +417,79 @@ export async function fetchWithGuardedRedirects(
     // pre-guard flow where fetchOnce re-resolved the (already vetted) name.
     addresses = nextHop.addresses
   }
+}
+
+/** Past this an og:image is a download, not a thumbnail. */
+export const PREVIEW_IMAGE_MAX_BYTES = 2 * 1024 * 1024
+
+/**
+ * Fetch an og:image thumbnail under the SAME admission rules as the page
+ * fetch, returning a validated data URL — or '' when the image cannot be
+ * proven safe and real.
+ *
+ * The renderer must never GET `meta.imageUrl` itself: an <img src> is a
+ * renderer-side private-network fetch with cookie/referrer context and no
+ * guard at all (the reviewer's blocking item 2). So the main process fetches
+ * the bytes here — every hop admitted, every hop pinned to vetted addresses,
+ * the same walk the HTML fetch uses, just binary — and hands the renderer a
+ * data URL it can paint without touching the network. The bytes must sniff as
+ * a real image; a body that fails validation drops the thumbnail rather than
+ * poisoning the card.
+ */
+export async function resolveThumbnail(
+  rawUrl: string,
+  io: {
+    fetchOnce: (url: string, addresses: string[]) => Promise<HttpHopResponse<Uint8Array>>
+    resolveHost: (hostname: string) => Promise<string[]>
+  }
+): Promise<string> {
+  let result: GuardedRedirectResult<Uint8Array>
+
+  try {
+    result = await fetchWithGuardedRedirects<Uint8Array>(rawUrl, io)
+  } catch {
+    return ''
+  }
+
+  if (!result.ok) {
+    return ''
+  }
+
+  const bytes = result.body
+
+  if (!bytes || bytes.length === 0 || bytes.length > PREVIEW_IMAGE_MAX_BYTES) {
+    return ''
+  }
+
+  return imageMimeFromBytes(bytes) ? toDataUrl(imageMimeFromBytes(bytes), bytes) : ''
+}
+
+/** Minimal magic-byte sniff shared by the runtime; favicon.ts owns the full one. */
+function imageMimeFromBytes(bytes: Uint8Array): string {
+  const at = (offset: number, ...signature: number[]) =>
+    signature.every((byte, index) => bytes[offset + index] === byte)
+
+  if (at(0, 0x89, 0x50, 0x4e, 0x47)) {
+    return 'image/png'
+  }
+
+  if (at(0, 0xff, 0xd8, 0xff)) {
+    return 'image/jpeg'
+  }
+
+  if (at(0, 0x47, 0x49, 0x46, 0x38)) {
+    return 'image/gif'
+  }
+
+  if (at(0, 0x00, 0x00, 0x01, 0x00)) {
+    return 'image/x-icon'
+  }
+
+  if (at(0, 0x52, 0x49, 0x46, 0x46) && at(8, 0x57, 0x45, 0x42, 0x50)) {
+    return 'image/webp'
+  }
+
+  return ''
 }
 
 /**
@@ -592,6 +675,12 @@ export interface LinkPreviewIo {
   fetchRenderedTitle: (url: string) => Promise<string>
   /** Resolved addresses for a hostname; [] when resolution fails. */
   resolveHost: (hostname: string) => Promise<string[]>
+  /**
+   * og:image bytes as a validated data URL, or '' on any refusal. MUST run the
+   * same per-hop admission + pinning as fetchHtml — the whole point of this
+   * leg is that the renderer never GETs the image URL itself.
+   */
+  fetchThumbnail: (url: string) => Promise<string>
 }
 
 /**
@@ -638,15 +727,10 @@ export async function resolveLinkPreview(
     return { ok: false, reason: 'private-url' }
   }
 
-  // NOTE (DNS rebinding window): the addresses here are checked, then the
-  // fetch resolves the hostname AGAIN inside io.fetchHtml. An attacker who
-  // controls DNS can flip a public answer to a private one between those two
-  // lookups. Scope of exposure: the fetch is main-process, GET-only,
-  // byte-budget-capped, and renders nothing but og/title strings — this is a
-  // defense-in-depth gap, not a privileged read primitive. Pinning the socket
-  // to a vetted address (custom lookup + request option) is the full fix and
-  // deliberately out of scope here; flagged for a follow-up rather than
-  // shipping a half-tested resolver swap in this PR.
+  // The DNS rebinding window the pre-pinning version documented here is
+  // closed: every hop's request now carries the addresses the guard just
+  // vetted (see fetchWithGuardedRedirects), so the transport never resolves
+  // the name on its own.
 
   const release = await deps.limiter.acquire(parsed.hostname.toLowerCase())
 
@@ -672,7 +756,32 @@ export async function resolveLinkPreview(
       meta = { ...tier1, title: usableTitle((rendered || '').slice(0, PREVIEW_TITLE_MAX)) }
     }
 
-    if (!meta.title && !meta.description && !meta.siteName && !meta.imageUrl) {
+    // Thumbnail: fetched main-process-side under the same admission as the
+    // page (see fetchThumbnail's contract). A private og:image is refused
+    // HERE — the policy layer never even asks the I/O layer for it — and the
+    // pinned hop walk inside fetchThumbnail re-admits every redirect hop. An
+    // image that cannot be proven leaves `image` empty and the card renders
+    // without it; the raw URL is still shown by the chip tooltip.
+    let image = ''
+
+    if (meta.imageUrl) {
+      let imageHostPrivate = true
+
+      try {
+        const imageUrl = new URL(meta.imageUrl)
+
+        imageHostPrivate =
+          (imageUrl.protocol !== 'http:' && imageUrl.protocol !== 'https:') || isPrivateHostname(imageUrl.hostname)
+      } catch {
+        imageHostPrivate = true
+      }
+
+      if (!imageHostPrivate) {
+        image = await io.fetchThumbnail(meta.imageUrl).catch(() => '')
+      }
+    }
+
+    if (!meta.title && !meta.description && !meta.siteName && !image) {
       // A fetch that yields nothing readable is a miss: not cached.
       return { ok: false, reason: 'error' }
     }
@@ -682,12 +791,17 @@ export async function resolveLinkPreview(
       title: meta.title,
       description: meta.description,
       siteName: meta.siteName,
-      imageUrl: meta.imageUrl
+      imageUrl: meta.imageUrl,
+      // The durable store never holds image bytes (a few hundred thumbnails
+      // would weight the cache file enormously); the data URL rides the
+      // returned envelope and the runtime keeps a small memory LRU so
+      // re-expands and cache hits still render the thumbnail.
+      image: ''
     }
 
     deps.store.set(stored)
 
-    return { ok: true, meta: { ...stored, fetchedAt: (deps.now ?? Date.now)() } }
+    return { ok: true, meta: { ...stored, image, fetchedAt: (deps.now ?? Date.now)() } }
   } catch {
     return { ok: false, reason: 'error' }
   } finally {

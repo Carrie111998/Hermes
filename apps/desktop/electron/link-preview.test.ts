@@ -12,7 +12,9 @@ import {
   type LinkPreviewIo,
   LinkPreviewStore,
   parseLinkMeta,
+  PREVIEW_IMAGE_MAX_BYTES,
   resolveLinkPreview,
+  resolveThumbnail,
   usableTitle
 } from './link-preview'
 
@@ -22,6 +24,7 @@ function fakeIo(options: {
   html?: string
   addresses?: string[]
   renderedTitle?: string
+  thumbnail?: string
 } = {}): LinkPreviewIo & { calls: string[] } {
   const calls: string[] = []
 
@@ -37,7 +40,12 @@ function fakeIo(options: {
 
       return options.renderedTitle ?? ''
     },
-    resolveHost: async () => options.addresses ?? ['93.184.216.34']
+    resolveHost: async () => options.addresses ?? ['93.184.216.34'],
+    fetchThumbnail: async url => {
+      calls.push(`thumb:${url}`)
+
+      return options.thumbnail ?? ''
+    }
   }
 }
 
@@ -178,7 +186,7 @@ describe('LinkPreviewStore', () => {
   test('stores, returns by url, and stamps fetchedAt', async () => {
     const store = new LinkPreviewStore(null, { writeDebounceMs: 5 })
 
-    store.set({ url: PAGE_URL, title: 'T', description: '', siteName: '', imageUrl: '' })
+    store.set({ url: PAGE_URL, title: 'T', description: '', siteName: '', imageUrl: '', image: '' })
 
     const got = store.get(PAGE_URL)
 
@@ -191,7 +199,7 @@ describe('LinkPreviewStore', () => {
     let now = 1_000_000
     const store = new LinkPreviewStore(null, { ttlMs: 1_000, now: () => now })
 
-    store.set({ url: PAGE_URL, title: 'T', description: '', siteName: '', imageUrl: '' })
+    store.set({ url: PAGE_URL, title: 'T', description: '', siteName: '', imageUrl: '', image: '' })
     now += 2_000
 
     assert.equal(store.get(PAGE_URL), null)
@@ -200,9 +208,9 @@ describe('LinkPreviewStore', () => {
   test('evicts oldest when full', () => {
     const store = new LinkPreviewStore(null, { capacity: 2 })
 
-    store.set({ url: 'https://a.com/', title: 'A', description: '', siteName: '', imageUrl: '' })
-    store.set({ url: 'https://b.com/', title: 'B', description: '', siteName: '', imageUrl: '' })
-    store.set({ url: 'https://c.com/', title: 'C', description: '', siteName: '', imageUrl: '' })
+    store.set({ url: 'https://a.com/', title: 'A', description: '', siteName: '', imageUrl: '', image: '' })
+    store.set({ url: 'https://b.com/', title: 'B', description: '', siteName: '', imageUrl: '', image: '' })
+    store.set({ url: 'https://c.com/', title: 'C', description: '', siteName: '', imageUrl: '', image: '' })
 
     assert.equal(store.get('https://a.com/'), null)
     assert.ok(store.get('https://b.com/'))
@@ -212,7 +220,7 @@ describe('LinkPreviewStore', () => {
   test('persists debounced and hydrates fresh entries only', () => {
     vi.useFakeTimers()
 
-    const backing: Record<string, { url: string; title: string; description: string; siteName: string; imageUrl: string; at: number }> = {}
+    const backing: Record<string, { url: string; title: string; description: string; siteName: string; imageUrl: string; image: string; at: number }> = {}
     let now = 50_000
 
     const persisted = new LinkPreviewStore(
@@ -227,7 +235,7 @@ describe('LinkPreviewStore', () => {
       { writeDebounceMs: 10, now: () => now }
     )
 
-    persisted.set({ url: PAGE_URL, title: 'T', description: '', siteName: '', imageUrl: '' })
+    persisted.set({ url: PAGE_URL, title: 'T', description: '', siteName: '', imageUrl: '', image: '' })
     vi.advanceTimersByTime(20)
 
     assert.ok(backing['example.com/article'])
@@ -245,7 +253,7 @@ describe('LinkPreviewStore', () => {
   test('failed fetches are never stored — cache only holds successes', () => {
     const store = new LinkPreviewStore(null)
 
-    store.set({ url: PAGE_URL, title: '', description: 'desc only', siteName: '', imageUrl: '' })
+    store.set({ url: PAGE_URL, title: '', description: 'desc only', siteName: '', imageUrl: '', image: '' })
 
     assert.ok(store.get(PAGE_URL))
   })
@@ -380,11 +388,60 @@ describe('resolveLinkPreview', () => {
     assert.deepEqual(result, { ok: false, reason: 'error' })
   })
 
+  test('og:image thumbnail is fetched main-process-side and returned as a data URL', async () => {
+    // 1x1 PNG so the sniff accepts the bytes.
+    const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6300010000050001od', 'hex').subarray(0, 68)
+    const dataUrl = `data:image/png;base64,${PNG.toString('base64')}`
+    const io = fakeIo({
+      html: '<meta property="og:title" content="Hello"><meta property="og:image" content="https://cdn.example.com/pic.png">',
+      thumbnail: dataUrl
+    })
+
+    const result = await resolveLinkPreview(PAGE_URL, io, makeDeps(io))
+
+    assert.ok(result.ok)
+    assert.equal(result.meta.imageUrl, 'https://cdn.example.com/pic.png')
+    assert.equal(result.meta.image, dataUrl)
+    assert.ok(io.calls.includes('thumb:https://cdn.example.com/pic.png'), 'main process fetched the thumbnail')
+  })
+
+  test('private og:image is refused: no thumbnail call, card still renders', async () => {
+    // parseLinkMeta resolves relative URLs against the page; a private host in
+    // the og:image must never reach fetchThumbnail as a request.
+    const io = fakeIo({
+      html: '<meta property="og:title" content="Hello"><meta property="og:image" content="http://127.0.0.1:9222/secret.png">'
+    })
+
+    const result = await resolveLinkPreview(PAGE_URL, io, makeDeps(io))
+
+    assert.ok(result.ok)
+    assert.equal(result.meta.imageUrl, 'http://127.0.0.1:9222/secret.png')
+    assert.equal(result.meta.image, '')
+    assert.equal(io.calls.some(call => call.startsWith('thumb:')), false, 'zero thumbnail requests')
+  })
+
+  test('thumbnail fetch failure drops the image, not the card', async () => {
+    const io = fakeIo({
+      html: '<meta property="og:title" content="Hello"><meta property="og:image" content="https://cdn.example.com/pic.png">'
+    })
+
+    io.fetchThumbnail = async () => {
+      throw new Error('boom')
+    }
+
+    const result = await resolveLinkPreview(PAGE_URL, io, makeDeps(io))
+
+    assert.ok(result.ok)
+    assert.equal(result.meta.image, '')
+    assert.equal(result.meta.title, 'Hello')
+  })
+
   test('never throws across the bridge envelope', async () => {
     const io: LinkPreviewIo = {
       fetchHtml: () => Promise.reject(new Error('boom')),
       fetchRenderedTitle: () => Promise.reject(new Error('boom')),
-      resolveHost: () => Promise.reject(new Error('boom'))
+      resolveHost: () => Promise.reject(new Error('boom')),
+      fetchThumbnail: () => Promise.reject(new Error('boom'))
     }
 
     const result = await resolveLinkPreview(PAGE_URL, io, makeDeps(io))
@@ -426,7 +483,7 @@ describe('fetchWithGuardedRedirects', () => {
 
     assert.ok(result.ok)
     assert.equal(result.url, 'https://example.com/a')
-    assert.equal(result.html, HTML)
+    assert.equal(result.body, HTML)
     assert.deepEqual(io.requested, ['https://example.com/a'])
   })
 
@@ -441,7 +498,7 @@ describe('fetchWithGuardedRedirects', () => {
 
     assert.ok(result.ok)
     assert.equal(result.url, 'https://cdn.example.org/c')
-    assert.equal(result.html, HTML)
+    assert.equal(result.body, HTML)
     assert.deepEqual(io.requested, [
       'https://example.com/a',
       'https://cdn.example.org/b',
@@ -554,7 +611,7 @@ describe('fetchWithGuardedRedirects', () => {
     const result = await fetchWithGuardedRedirects('https://example.com/a', io)
 
     assert.ok(result.ok)
-    assert.equal(result.html, '')
+    assert.equal(result.body, '')
   })
 
   test('every hop request receives the addresses vetted for THAT hop (pinning contract)', async () => {
@@ -595,5 +652,79 @@ describe('fetchWithGuardedRedirects', () => {
 
     assert.deepEqual(result, { ok: false, reason: 'private-url' })
     assert.deepEqual(io.requested, [])
+  })
+})
+
+describe('resolveThumbnail', () => {
+  const PNG = Buffer.from(
+    '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da6360000002000148afa4710000000049454e44ae426082',
+    'hex'
+  )
+
+  function binaryIo(hops: Record<string, { status: number; location?: string; body?: Buffer }>, options: { addresses?: string[] } = {}) {
+    const requested: string[] = []
+
+    return {
+      requested,
+      fetchOnce: async (url: string, _addresses: string[]) => {
+        requested.push(url)
+        const hop = hops[url]
+
+        if (!hop) {
+          throw new Error(`unexpected hop: ${url}`)
+        }
+
+        return { status: hop.status, location: hop.location ?? '', body: hop.body ?? Buffer.alloc(0) }
+      },
+      resolveHost: async (_hostname: string) => options.addresses ?? ['93.184.216.34']
+    }
+  }
+
+  test('public png answers as a validated data URL', async () => {
+    const io = binaryIo({ 'https://cdn.example.com/pic.png': { status: 200, body: PNG } })
+    const dataUrl = await resolveThumbnail('https://cdn.example.com/pic.png', io)
+
+    assert.equal(dataUrl, `data:image/png;base64,${PNG.toString('base64')}`)
+    assert.deepEqual(io.requested, ['https://cdn.example.com/pic.png'])
+  })
+
+  test('redirect-to-private is refused and the private host is NEVER contacted (review proof)', async () => {
+    const io = binaryIo({
+      'https://example.com/thumb': { status: 302, location: 'http://169.254.169.254/latest/meta-data/' }
+    })
+
+    const dataUrl = await resolveThumbnail('https://example.com/thumb', io)
+
+    assert.equal(dataUrl, '')
+    assert.deepEqual(io.requested, ['https://example.com/thumb'], 'zero private requests')
+  })
+
+  test('redirect-to-rebinding-name is refused before its request', async () => {
+    const io = binaryIo(
+      {
+        'https://example.com/thumb': { status: 302, location: 'https://swap.example.net/i.png' }
+      },
+      {}
+    )
+
+    io.resolveHost = async hostname => (hostname === 'example.com' ? ['93.184.216.34'] : ['10.0.0.9'])
+
+    const dataUrl = await resolveThumbnail('https://example.com/thumb', io)
+
+    assert.equal(dataUrl, '')
+    assert.deepEqual(io.requested, ['https://example.com/thumb'], 'zero private requests')
+  })
+
+  test('non-image bytes yield no data URL', async () => {
+    const io = binaryIo({ 'https://cdn.example.com/x.png': { status: 200, body: Buffer.from('<html>challenge</html>') } })
+
+    assert.equal(await resolveThumbnail('https://cdn.example.com/x.png', io), '')
+  })
+
+  test('oversized bodies yield no data URL', async () => {
+    const big = Buffer.concat([PNG, Buffer.alloc(PREVIEW_IMAGE_MAX_BYTES, 0x41)])
+    const io = binaryIo({ 'https://cdn.example.com/huge.png': { status: 200, body: big } })
+
+    assert.equal(await resolveThumbnail('https://cdn.example.com/huge.png', io), '')
   })
 })
