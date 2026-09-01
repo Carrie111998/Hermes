@@ -1,5 +1,6 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
+import inspect
 import logging
 
 import pytest
@@ -1061,6 +1062,388 @@ class TestKeywordWordBoundary:
         text = "secrets: hunter2hunter2hunter2hh"
         result = redact_sensitive_text(text)
         assert "hunter2hunter2hunter2hh" not in result
+
+
+class TestRedactSensitiveTextApiCompatibility:
+    def test_old_signature_prefix_still_valid_and_new_args_are_trailing_keyword_only(self):
+        sig = inspect.signature(redact_sensitive_text)
+        assert list(sig.parameters) == [
+            "text",
+            "force",
+            "code_file",
+            "file_read",
+            "redact_url_credentials",
+            "extra_sensitive_keys",
+        ]
+        assert sig.parameters["force"].default is False
+        assert sig.parameters["code_file"].default is False
+        assert sig.parameters["file_read"].default is False
+        assert sig.parameters["redact_url_credentials"].default is False
+        assert sig.parameters["extra_sensitive_keys"].default is None
+        assert redact_sensitive_text(
+            "normal",
+            force=True,
+            code_file=True,
+            file_read=False,
+            redact_url_credentials=False,
+        ) == "normal"
+
+
+class TestExtraSensitiveKeys:
+    def test_session_id_without_opt_in_is_unchanged(self):
+        text = "session_id=session-value"
+        assert redact_sensitive_text(text, force=True) == text
+
+    def _assert_focused_repair(self, text, expected, *, secrets):
+        result = redact_sensitive_text(
+            text,
+            force=True,
+            extra_sensitive_keys={"session_id"},
+        )
+        assert result == expected
+        for secret in secrets:
+            assert secret not in result
+        assert redact_sensitive_text(
+            result,
+            force=True,
+            extra_sensitive_keys={"session_id"},
+        ) == result
+        return result
+
+    def test_focused_repair_nested_unquoted_yaml_preserves_indentation(self):
+        self._assert_focused_repair(
+            "parent:\n  session_id: secret",
+            "parent:\n  session_id: ***",
+            secrets=("secret",),
+        )
+
+    def test_focused_repair_nested_quoted_yaml_preserves_mapping(self):
+        import yaml
+
+        result = self._assert_focused_repair(
+            'parent:\n    session_id: "secret"',
+            'parent:\n    session_id: "***"',
+            secrets=("secret",),
+        )
+        assert yaml.safe_load(result) == {"parent": {"session_id": "***"}}
+
+    def test_focused_repair_yaml_preserves_mixed_indentation_bytes(self):
+        self._assert_focused_repair(
+            "parent:\n \t session_id: secret",
+            "parent:\n \t session_id: ***",
+            secrets=("secret",),
+        )
+
+    def test_focused_repair_unquoted_yaml_redacts_complete_multiword_value(self):
+        self._assert_focused_repair(
+            "session_id: my secret value",
+            "session_id: ***",
+            secrets=("my", "secret", "value"),
+        )
+
+    def test_focused_repair_assignment_redacts_complete_multiword_value(self):
+        self._assert_focused_repair(
+            "session_id = my secret value",
+            "session_id = ***",
+            secrets=("my", "secret", "value"),
+        )
+
+    def test_focused_repair_yaml_preserves_separated_trailing_comment(self):
+        self._assert_focused_repair(
+            "session_id: my secret value # trailing comment",
+            "session_id: *** # trailing comment",
+            secrets=("my", "secret", "value"),
+        )
+
+    def test_focused_repair_yaml_unspaced_hash_remains_in_sensitive_value(self):
+        self._assert_focused_repair(
+            "session_id: my#secret # public",
+            "session_id: *** # public",
+            secrets=("my", "secret"),
+        )
+
+    def test_focused_repair_double_quoted_yaml_uses_true_closing_quote(self):
+        self._assert_focused_repair(
+            'session_id: "my \\" secret" # public',
+            'session_id: "***" # public',
+            secrets=("my", "secret"),
+        )
+
+    def test_focused_repair_json_uses_true_closing_quote(self):
+        self._assert_focused_repair(
+            '{"session_id": "my \\" secret", "public": "ok"}',
+            '{"session_id": "***", "public": "ok"}',
+            secrets=("my", "secret"),
+        )
+
+    def test_focused_repair_single_quoted_yaml_honors_doubled_quotes(self):
+        self._assert_focused_repair(
+            "session_id: 'my ''secret''' # public",
+            "session_id: '***' # public",
+            secrets=("my", "secret"),
+        )
+
+    def test_focused_repair_quoted_assignment_preserves_public_suffix(self):
+        self._assert_focused_repair(
+            'session_id = "my secret" public-content',
+            'session_id = "***" public-content',
+            secrets=("my", "secret"),
+        )
+
+    def test_focused_repair_assignment_preserves_following_ampersand_pair(self):
+        self._assert_focused_repair(
+            "session_id=my secret&next=value",
+            "session_id=***&next=value",
+            secrets=("my", "secret"),
+        )
+
+    @pytest.mark.parametrize("line_ending", ["\r", "\n", "\r\n"], ids=["cr", "lf", "crlf"])
+    def test_focused_repair_assignment_does_not_cross_line_endings(self, line_ending):
+        self._assert_focused_repair(
+            f"session_id=my secret{line_ending}public=value",
+            f"session_id=***{line_ending}public=value",
+            secrets=("my", "secret"),
+        )
+
+    @pytest.mark.parametrize(
+        "text,key,secret",
+        [
+            ("session_id=session-value", "session_id", "session-value"),
+            ("session-id=session-value", "session_id", "session-value"),
+            ("SESSION_ID=session-value", "session_id", "session-value"),
+            ('"session_id": "session-value"', "session_id", "session-value"),
+            ("session_id: session-value", "session_id", "session-value"),
+            ("session_id='session-value'", "session_id", "session-value"),
+            ('session_id="session-value"', "session_id", "session-value"),
+            ("  session_id: 'session-value'", "session_id", "session-value"),
+        ],
+    )
+    def test_explicit_key_redacts_supported_textual_forms(self, text, key, secret):
+        result = redact_sensitive_text(text, force=True, extra_sensitive_keys={key})
+        assert secret not in result
+        assert "***" in result
+
+    def test_hyphen_key_opt_in_matches_underscore(self):
+        result = redact_sensitive_text(
+            "session_id=session-value",
+            force=True,
+            extra_sensitive_keys={"session-id"},
+        )
+        assert "session-value" not in result
+
+    def test_unrelated_similar_keys_remain_unchanged(self):
+        text = "session_name=session-value token_count=12345678901234567890"
+        assert redact_sensitive_text(text, force=True, extra_sensitive_keys={"session_id"}) == text
+
+    @pytest.mark.parametrize("bad", ["session_id", b"session_id"])
+    def test_top_level_string_collections_rejected(self, bad):
+        with pytest.raises(TypeError):
+            redact_sensitive_text("session_id=session-value", force=True, extra_sensitive_keys=bad)
+
+    def test_non_string_entry_rejected(self):
+        with pytest.raises(TypeError):
+            redact_sensitive_text(
+                "session_id=session-value",
+                force=True,
+                extra_sensitive_keys={object()},  # type: ignore[arg-type]
+            )
+
+    def test_empty_collection_does_not_change_behavior(self):
+        text = "session_id=session-value"
+        assert redact_sensitive_text(text, force=True, extra_sensitive_keys=set()) == text
+
+    def test_empty_keys_are_ignored(self):
+        text = "session_id=session-value"
+        assert redact_sensitive_text(text, force=True, extra_sensitive_keys={"", "   "}) == text
+
+    def test_does_not_persist_between_calls(self):
+        first = redact_sensitive_text(
+            "session_id=session-value",
+            force=True,
+            extra_sensitive_keys={"session_id"},
+        )
+        second = redact_sensitive_text("session_id=session-value", force=True)
+        assert "session-value" not in first
+        assert second == "session_id=session-value"
+
+    def test_code_file_explicit_key_still_redacts(self):
+        text = "SESSION_ID=session-value"
+        result = redact_sensitive_text(
+            text,
+            force=True,
+            code_file=True,
+            extra_sensitive_keys={"session_id"},
+        )
+        assert "session-value" not in result
+
+    def test_file_read_explicit_key_redacts_and_preserves_prefix_sentinel(self):
+        prefixed = "sk-" + "a" * 30
+        text = f"session_id=session-value\nOPENAI_API_KEY={prefixed}"
+        result = redact_sensitive_text(
+            text,
+            force=True,
+            file_read=True,
+            extra_sensitive_keys={"session_id"},
+        )
+        assert "session-value" not in result
+        assert "«redacted:sk-…»" in result
+
+
+class TestCliSensitiveSeparateValues:
+    def _assert_secret_redacted(
+        self,
+        text,
+        *,
+        secrets,
+        preserved=(),
+        expected=None,
+    ):
+        result = redact_sensitive_text(text, force=True)
+        assert "***" in result
+        for secret in secrets:
+            assert secret not in result
+        for external in preserved:
+            assert external in result
+        if expected is not None:
+            assert result == expected
+        assert redact_sensitive_text(result, force=True) == result
+
+    @pytest.mark.parametrize(
+        "text,secret,expected",
+        [
+            ("cmd --password secret-value", "secret-value", "cmd --password ***"),
+            ('cmd --password "secret-value"', "secret-value", 'cmd --password "***"'),
+            ("cmd --password 'secret-value'", "secret-value", "cmd --password '***'"),
+            ("cmd --passwd secret-value", "secret-value", "cmd --passwd ***"),
+            ("cmd --secret secret-value", "secret-value", "cmd --secret ***"),
+            ("cmd --token secret-value", "secret-value", "cmd --token ***"),
+            ("cmd --api-key secret-value", "secret-value", "cmd --api-key ***"),
+            ("cmd --api_key secret-value", "secret-value", "cmd --api_key ***"),
+            ("cmd --client-secret secret-value", "secret-value", "cmd --client-secret ***"),
+            ("cmd --password   secret-value", "secret-value", "cmd --password   ***"),
+        ],
+    )
+    def test_space_separated_sensitive_flag_values(self, text, secret, expected):
+        result = redact_sensitive_text(text, force=True)
+        assert secret not in result
+        assert result == expected
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "cmd --password=secret-value",
+            "cmd --token=secret-value",
+            "cmd --api-key=secret-value",
+        ],
+    )
+    def test_equals_form_still_redacts(self, text):
+        result = redact_sensitive_text(text, force=True)
+        assert "secret-value" not in result
+
+    def test_multiple_sensitive_flags_one_line(self):
+        result = redact_sensitive_text("cmd --password one --token two", force=True)
+        assert "one" not in result
+        assert "two" not in result
+        assert result == "cmd --password *** --token ***"
+
+    def test_flag_at_end_stable(self):
+        assert redact_sensitive_text("cmd --password", force=True) == "cmd --password"
+
+    def test_next_flag_not_consumed(self):
+        assert redact_sensitive_text("cmd --password --verbose", force=True) == "cmd --password --verbose"
+
+    def test_quoted_empty_not_changed(self):
+        assert redact_sensitive_text('cmd --password ""', force=True) == 'cmd --password ""'
+        assert redact_sensitive_text('cmd --password=""', force=True) == 'cmd --password=""'
+
+    def test_does_not_cross_newline(self):
+        text = "cmd --password\nsecret-value"
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_positional_ordinary_unchanged(self):
+        text = "cmd positional secret-value"
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_similar_prefix_flag_unchanged(self):
+        text = "cmd --password-file path"
+        assert redact_sensitive_text(text, force=True) == text
+
+    def test_space_quoted_value_with_escaped_quote_redacts_full_value(self):
+        text = 'cmd --secret "prefix ' + '\\"' + ' sensitive-suffix" --next'
+        self._assert_secret_redacted(
+            text,
+            secrets=(r'prefix \" sensitive-suffix', "sensitive-suffix"),
+            preserved=("cmd ", " --next"),
+            expected='cmd --secret "***" --next',
+        )
+
+    def test_equals_quoted_value_with_escaped_quote_redacts_full_value(self):
+        text = 'cmd --secret="prefix ' + '\\"' + ' sensitive-suffix" --next'
+        self._assert_secret_redacted(
+            text,
+            secrets=(r'prefix \" sensitive-suffix', "sensitive-suffix"),
+            preserved=("cmd ", " --next"),
+            expected='cmd --secret="***" --next',
+        )
+
+    def test_multiple_escaped_quotes_stay_inside_space_value(self):
+        text = 'cmd --secret "a ' + '\\"' + ' b ' + '\\"' + ' final-sensitive" tail'
+        self._assert_secret_redacted(
+            text,
+            secrets=(r'a \" b \" final-sensitive', "final-sensitive"),
+            preserved=("cmd ", " tail"),
+            expected='cmd --secret "***" tail',
+        )
+
+    def test_even_backslash_parity_closes_quote(self):
+        text = 'cmd --secret "prefix ' + ("\\" * 2) + '" outside-suffix --next'
+        result = redact_sensitive_text(text, force=True)
+        assert result == 'cmd --secret "***" outside-suffix --next'
+        assert "prefix" not in result
+        assert "outside-suffix --next" in result
+        assert redact_sensitive_text(result, force=True) == result
+
+    def test_odd_backslash_parity_above_one_keeps_quote_inside_value(self):
+        text = 'cmd --secret "prefix ' + ("\\" * 3) + '" final-sensitive" --next'
+        self._assert_secret_redacted(
+            text,
+            secrets=(r'prefix \\\" final-sensitive', "final-sensitive"),
+            preserved=("cmd ", " --next"),
+            expected='cmd --secret "***" --next',
+        )
+
+    def test_next_flag_preserved_after_escaped_quote_value(self):
+        text = 'cmd --token "hidden ' + '\\"' + ' sensitive-tail" --verbose'
+        self._assert_secret_redacted(
+            text,
+            secrets=("hidden", "sensitive-tail"),
+            preserved=("cmd ", " --verbose"),
+            expected='cmd --token "***" --verbose',
+        )
+
+    def test_equals_simple_quoted_value_redacts_and_preserves_tail(self):
+        text = 'cmd --api-key="secret-value" tail'
+        self._assert_secret_redacted(
+            text,
+            secrets=("secret-value",),
+            preserved=("cmd ", " tail"),
+            expected='cmd --api-key="***" tail',
+        )
+
+    def test_unterminated_escaped_quote_redacts_through_eol_only(self):
+        text = 'cmd --secret "prefix ' + '\\"' + ' sensitive-suffix --next' + "\nvisible-next-line"
+        result = redact_sensitive_text(text, force=True)
+        assert result == 'cmd --secret "***\nvisible-next-line'
+        assert "prefix" not in result
+        assert "sensitive-suffix" not in result
+        assert "--next" not in result
+        assert "visible-next-line" in result
+        assert redact_sensitive_text(result, force=True) == result
+
+    def test_non_sensitive_equivalent_quoting_remains_exact(self):
+        text = 'cmd --public "prefix ' + '\\"' + ' sensitive-suffix" --next'
+        assert redact_sensitive_text(text, force=True) == text
+
 
 
 class TestMaskSecretControlStripping:
