@@ -80,7 +80,7 @@ def _emit_event(event_type_str: str, source: str, payload: dict, priority: Optio
 _TRACER = get_tracer("hermes.jobflow")
 logger = logging.getLogger(__name__)
 
-# Diego mandate 2026-04-24: ONLY gpt-5.5 via OAuth across the whole platform.
+# Operator mandate 2026-04-24: ONLY gpt-5.5 via OAuth across the whole platform.
 # obs.oauth_llm.get_codex_chat_model() bridges langchain to chatgpt.com/backend-api/codex
 # (Responses API). Per-graph override via HERMES_JOBFLOW_MODEL.
 DEFAULT_MODEL = os.environ.get("HERMES_JOBFLOW_MODEL", "gpt-5.5")
@@ -135,9 +135,9 @@ def main_inbox_path() -> Path:
 class ScoreBreakdown(BaseModel):
     title_match: float = Field(description="0-10; seniority/role shape fit", ge=0, le=10)
     skills_overlap: float = Field(description="0-10; technical+domain coverage", ge=0, le=10)
-    industry_fit: float = Field(description="0-10; finance/fintech primary; non-finance<=2", ge=0, le=10)
-    location: float = Field(description="0-10; remote > FL/NY etc > non-remote", ge=0, le=10)
-    comp_alignment: float = Field(description="0-10; $260K sweet spot", ge=0, le=10)
+    industry_fit: float = Field(description="0-10; primary industries per the candidate profile; outside them <=2", ge=0, le=10)
+    location: float = Field(description="0-10; remote > the profile's preferred metros > non-remote", ge=0, le=10)
+    comp_alignment: float = Field(description="0-10; against the target comp band in the candidate profile", ge=0, le=10)
     growth: float = Field(description="0-10; trajectory + scope expansion", ge=0, le=10)
     culture: float = Field(description="0-10; team/values/impact signals", ge=0, le=10)
 
@@ -195,7 +195,7 @@ class JobFlowState(TypedDict, total=False):
     resume_hints: List[str]
     primary_angle: str
 
-    # After approval_hitl (PROCEED path only). Populated by Diego's WhatsApp reply
+    # After approval_hitl (PROCEED path only). Populated by the operator's WhatsApp reply
     # or auto-approved in headless test mode.
     approval: Literal["approved", "rejected", "pending"]
     approval_reason: str
@@ -342,7 +342,7 @@ def route_decision_node(state: JobFlowState) -> dict:
         span.set_attribute("threshold.proceed", proceed)
         span.set_attribute("threshold.review", review)
         if state.get("error"):
-            decision = "review"  # fail-safe: always surface errors to Diego
+            decision = "review"  # fail-safe: always surface errors to the operator
         elif score >= proceed:
             decision = "tailor"
         elif score >= review:
@@ -483,7 +483,7 @@ def approval_hitl_node(state: JobFlowState) -> dict:
 
         # interrupt() pauses the graph. The value passed here surfaces as
         # state["__interrupt__"] when the caller's invoke() returns.
-        # When Diego runs the approve CLI, Command(resume={...}) provides a
+        # When the operator runs the approve CLI, Command(resume={...}) provides a
         # dict that returns from the interrupt() call here.
         resume_payload = interrupt(
             {
@@ -522,7 +522,7 @@ def approval_hitl_node(state: JobFlowState) -> dict:
 
 def apply_node(state: JobFlowState) -> dict:
     """Dry-run applier. NEVER submits. Builds an APPLY_PACKET with everything
-    Diego needs to do the final manual click on the ATS portal:
+    The operator needs to do the final manual click on the ATS portal:
       - cover-letter paragraph
       - resume customization hints
       - primary-angle hook
@@ -532,7 +532,7 @@ def apply_node(state: JobFlowState) -> dict:
       * Writes the packet as a MAILBOX_MESSAGE to mailbox/main/inbox/ so it
         threads alongside other tracker outputs.
       * Emits an APPLY_PACKET event to the bus -> Telegram tailor_applier
-        topic + WhatsApp IMPORTANT tier (Diego sees a digest entry, not a
+        topic + WhatsApp IMPORTANT tier (the operator sees a digest entry, not a
         ping-storm).
       * Logs to apply-log.jsonl for audit.
 
@@ -695,7 +695,7 @@ def tracker_update_node(state: JobFlowState) -> dict:
             mgr = PipelineManager()
             actor = "langgraph"
             source = "langgraph"
-            # When Diego approved via Control Center, the approval_reason field
+            # When the operator approved via Control Center, the approval_reason field
             # captures that; surface it as the notes so pipeline.json history
             # shows his actual note.
             reason = state.get("approval_reason") or ""

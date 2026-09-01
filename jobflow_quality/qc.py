@@ -3,8 +3,8 @@
 This is the last gate before a document reaches an employer, and the failure it
 exists to stop is already in the historical record. Of 428 tailored packages on
 this machine, **three carry a fabricated surname across both the resume and the
-cover letter** — "Diego Rodrigues", "Diego Resende" — two of those with
-placeholder emails (`diego@email.com`, `diego.rodrigues@email.com`). Another is
+cover letter** — the correct first name paired with an invented one — two of
+those with placeholder contact emails. Another is
 addressed to `[Company Name]`. Seven have a PDF older than the markdown it was
 rendered from, so the file that actually gets sent is not the file that was
 last edited.
@@ -124,7 +124,7 @@ class QCResult:
 
 
 def _normalise(text: str) -> str:
-    """Fold case and accents so `DIEGO DE ARAGAO` matches `Diego De Aragao`."""
+    """Fold case and accents so `ADA LOVELACE` matches `Ada Lovelace`."""
     decomposed = unicodedata.normalize("NFKD", text)
     return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
 

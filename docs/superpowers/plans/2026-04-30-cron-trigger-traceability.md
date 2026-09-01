@@ -132,7 +132,7 @@ Expected: PASS.
 
 ```bash
 cd ~/.hermes/agent-src && git add events/schema.py events/paths.py tests/events/test_schema.py
-git commit --author="Diego <diegodearagao@gmail.com>" -m "feat(events): add CRON_TRIGGERED event type + cron_trigger_log_path helper"
+git commit --author="Diego <$(git config user.email)>" -m "feat(events): add CRON_TRIGGERED event type + cron_trigger_log_path helper"
 ```
 
 ---
@@ -302,7 +302,7 @@ Expected: 3 PASS.
 
 ```bash
 cd ~/.hermes/agent-src && git add events/producers/cron_trigger_emitter.py tests/events/producers/test_cron_trigger_emitter.py
-git commit --author="Diego <diegodearagao@gmail.com>" -m "feat(events): add cron_trigger_emitter helper for trigger_job audit"
+git commit --author="Diego <$(git config user.email)>" -m "feat(events): add cron_trigger_emitter helper for trigger_job audit"
 ```
 
 ---
@@ -498,7 +498,7 @@ Expected: All `TestTriggerJob` PASS, no regressions in other test classes.
 
 ```bash
 cd ~/.hermes/agent-src && git add cron/jobs.py tests/cron/test_jobs.py
-git commit --author="Diego <diegodearagao@gmail.com>" -m "feat(cron): trigger_job emits cron_triggered event with caller + reason"
+git commit --author="Diego <$(git config user.email)>" -m "feat(cron): trigger_job emits cron_triggered event with caller + reason"
 ```
 
 ---
@@ -619,7 +619,7 @@ Expected: All PASS, no regressions.
 
 ```bash
 cd ~/.hermes/agent-src && git add tools/cronjob_tools.py tests/tools/test_cronjob_tools.py
-git commit --author="Diego <diegodearagao@gmail.com>" -m "feat(tools): cronjob action=run threads caller + reason to trigger_job"
+git commit --author="Diego <$(git config user.email)>" -m "feat(tools): cronjob action=run threads caller + reason to trigger_job"
 ```
 
 ---
@@ -772,7 +772,7 @@ Expected: `--reason REASON` line appears.
 
 ```bash
 cd ~/.hermes/agent-src && git add hermes_cli/main.py hermes_cli/cron.py tests/hermes_cli/test_cron.py
-git commit --author="Diego <diegodearagao@gmail.com>" -m "feat(hermes-cli): cron run --reason flag + caller=hermes_cli:cron_run"
+git commit --author="Diego <$(git config user.email)>" -m "feat(hermes-cli): cron run --reason flag + caller=hermes_cli:cron_run"
 ```
 
 ---
@@ -811,7 +811,7 @@ Expected: `OK`.
 
 ```bash
 cd ~/.hermes/agent-src && git add hermes_cli/web_server.py
-git commit --author="Diego <diegodearagao@gmail.com>" -m "feat(web-server): /api/cron/jobs/{id}/trigger threads caller=http_api + ?reason="
+git commit --author="Diego <$(git config user.email)>" -m "feat(web-server): /api/cron/jobs/{id}/trigger threads caller=http_api + ?reason="
 ```
 
 ---
@@ -1073,7 +1073,7 @@ Expected: 4 PASS.
 
 ```bash
 cd ~/.hermes/agent-src && git add events/subscribers/cron_trigger_log.py tests/events/subscribers/test_cron_trigger_log.py events/gateway_integration.py
-git commit --author="Diego <diegodearagao@gmail.com>" -m "feat(events): CronTriggerLog subscriber for per-job rolling tail"
+git commit --author="Diego <$(git config user.email)>" -m "feat(events): CronTriggerLog subscriber for per-job rolling tail"
 ```
 
 ---
@@ -1156,7 +1156,7 @@ Expected: PASS.
 
 ```bash
 cd ~/.hermes/agent-src && git add tests/integration/test_cron_trigger_traceability.py
-git commit --author="Diego <diegodearagao@gmail.com>" -m "test(integration): cron run --reason → bus → cron_triggers.jsonl"
+git commit --author="Diego <$(git config user.email)>" -m "test(integration): cron run --reason → bus → cron_triggers.jsonl"
 ```
 
 ---
@@ -1218,7 +1218,7 @@ Report the branch name + tip SHA + line-count summary back to Diego.
 - [x] No change to cron schedules or `next_run_at = NOW` semantics — `trigger_job` still does exactly the same state mutation; emission is added AFTER
 - [x] No change to `HERMES_CRON_HARD_TIMEOUT` or env vars
 - [x] All work on agent-src — no parent `.hermes` repo edits
-- [x] Author override `--author="Diego <diegodearagao@gmail.com>"` on every commit
+- [x] Author override `--author="Diego <$(git config user.email)>"` on every commit
 - [x] No push or merge — branch is the deliverable
 
 **Type consistency:**
