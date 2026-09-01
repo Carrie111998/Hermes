@@ -274,10 +274,8 @@ class TestFailoverRestartsPreflight:
                     "exits the conversation loop and ends the turn (#84733)"
                 )
 
-    def test_restart_handler_clears_preflight_block(self):
-        """The single consumer of restart_with_rebuilt_messages must clear
-        _preflight_compression_blocked, so every retry-loop failover gets a
-        fresh preflight against the fallback's context window (#84733)."""
+    def test_fallback_rebuild_handler_clears_preflight_block(self):
+        """The single fallback-rebuild consumer must re-run preflight (#84733)."""
         from agent import conversation_loop
 
         tree = ast.parse(inspect.getsource(conversation_loop.run_conversation))
@@ -285,25 +283,23 @@ class TestFailoverRestartsPreflight:
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Attribute)
-            and node.test.attr == "restart_with_rebuilt_messages"
-        ]
-        assert handlers, "expected the restart_with_rebuilt_messages handler"
-        consumer = [
-            node
-            for node in handlers
-            if any(
-                isinstance(stmt, ast.Assign)
-                and any(
-                    isinstance(t, ast.Attribute)
-                    and t.attr == "restart_with_rebuilt_messages"
-                    for t in stmt.targets
-                )
-                for stmt in node.body
+            and any(
+                isinstance(item, ast.Constant) and item.value == "fallback"
+                for item in ast.walk(node.test)
+            )
+            and any(
+                isinstance(item, ast.Attribute) and item.attr == "outcome"
+                for item in ast.walk(node.test)
             )
         ]
-        assert consumer, "expected the flag-consuming handler"
-        for node in consumer:
+        assert handlers, "expected the fallback rebuild outcome handler"
+        for node in handlers:
+            assert any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "consume"
+                for call in ast.walk(node)
+            ), "the fallback-rebuild handler must consume its recovery outcome"
             assert any(
                 isinstance(stmt, ast.Assign)
                 and any(

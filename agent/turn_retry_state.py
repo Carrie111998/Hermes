@@ -27,6 +27,25 @@ imported by the turn loop without an import cycle.
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
+from enum import Enum
+
+
+class RecoveryOutcome(str, Enum):
+    """The only ways a completed provider-attempt can leave the retry loop."""
+
+    SUCCESS = "success"
+    REBUILD = "rebuild"
+    COMPRESS = "compress"
+    INTERRUPT = "interrupt"
+    TERMINATE = "terminate"
+
+
+@dataclass(frozen=True)
+class RecoveryDecision:
+    """A recovery transition selected after one provider-attempt."""
+
+    outcome: RecoveryOutcome
+    reason: str = ""
 
 
 @dataclass
@@ -91,3 +110,56 @@ class TurnRetryState:
         # Convenience for debugging / tests: iterate (name, value) pairs.
         for f in fields(self):
             yield f.name, getattr(self, f.name)
+
+    def request_rebuild(
+        self, *, reason: str = "fallback", reset_primary_recovery: bool = False
+    ) -> None:
+        """Schedule a fresh provider request after fallback or a redirect."""
+        if reason == "redirect":
+            self.restart_with_redirected_messages = True
+            return
+        self.restart_with_rebuilt_messages = True
+        if reset_primary_recovery:
+            self.primary_recovery_attempted = False
+
+    def request_compression(self) -> None:
+        """Schedule a fresh request after compaction rebuilt the transcript."""
+        self.restart_with_compressed_messages = True
+
+    def request_length_continuation(self) -> None:
+        """Schedule a fresh request with the appended continuation nudge."""
+        self.restart_with_length_continuation = True
+
+    def decision(
+        self, *, interrupted: bool, has_response: bool
+    ) -> RecoveryDecision:
+        """Classify the post-attempt transition without mutating state.
+
+        Priority exactly mirrors the former tail of ``run_conversation``: a
+        redirected user correction wins, then a terminal interrupt, then a
+        compacted/rebuilt request, and only then a missing response terminal.
+        """
+        if self.restart_with_redirected_messages:
+            return RecoveryDecision(RecoveryOutcome.REBUILD, "redirect")
+        if interrupted:
+            return RecoveryDecision(RecoveryOutcome.INTERRUPT)
+        if self.restart_with_compressed_messages:
+            return RecoveryDecision(RecoveryOutcome.COMPRESS, "compression")
+        if self.restart_with_rebuilt_messages:
+            return RecoveryDecision(RecoveryOutcome.REBUILD, "fallback")
+        if self.restart_with_length_continuation:
+            return RecoveryDecision(RecoveryOutcome.REBUILD, "length")
+        if not has_response:
+            return RecoveryDecision(RecoveryOutcome.TERMINATE, "no_response")
+        return RecoveryDecision(RecoveryOutcome.SUCCESS)
+
+    def consume(self, decision: RecoveryDecision) -> None:
+        """Clear the single restart signal consumed by ``decision``."""
+        if decision.reason == "redirect":
+            self.restart_with_redirected_messages = False
+        elif decision.reason == "compression":
+            self.restart_with_compressed_messages = False
+        elif decision.reason == "fallback":
+            self.restart_with_rebuilt_messages = False
+        elif decision.reason == "length":
+            self.restart_with_length_continuation = False

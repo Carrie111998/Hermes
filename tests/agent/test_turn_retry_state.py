@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import fields
 
-from agent.turn_retry_state import TurnRetryState
+from agent.turn_retry_state import RecoveryOutcome, TurnRetryState
 
 
 EXPECTED_FIELDS = {
@@ -58,6 +58,41 @@ def test_guards_are_independently_mutable():
     # untouched guards stay False
     assert s.has_retried_429 is False
     assert s.anthropic_auth_retry_attempted is False
+
+
+def test_recovery_decision_has_one_ordered_exit_for_each_restart_kind():
+    state = TurnRetryState()
+    assert state.decision(interrupted=False, has_response=True).outcome is RecoveryOutcome.SUCCESS
+    assert state.decision(interrupted=False, has_response=False).outcome is RecoveryOutcome.TERMINATE
+
+    state.request_rebuild()
+    decision = state.decision(interrupted=False, has_response=True)
+    assert (decision.outcome, decision.reason) == (RecoveryOutcome.REBUILD, "fallback")
+    state.consume(decision)
+
+    state.request_compression()
+    decision = state.decision(interrupted=False, has_response=True)
+    assert (decision.outcome, decision.reason) == (RecoveryOutcome.COMPRESS, "compression")
+    state.consume(decision)
+
+    state.request_length_continuation()
+    decision = state.decision(interrupted=False, has_response=True)
+    assert (decision.outcome, decision.reason) == (RecoveryOutcome.REBUILD, "length")
+    state.consume(decision)
+
+    state.request_rebuild(reason="redirect")
+    decision = state.decision(interrupted=True, has_response=False)
+    assert (decision.outcome, decision.reason) == (RecoveryOutcome.REBUILD, "redirect")
+    state.consume(decision)
+    assert state.decision(interrupted=True, has_response=True).outcome is RecoveryOutcome.INTERRUPT
+
+
+def test_fallback_rebuild_can_rearm_primary_transport_recovery_once():
+    state = TurnRetryState(primary_recovery_attempted=True)
+    state.request_rebuild(reset_primary_recovery=True)
+
+    assert state.primary_recovery_attempted is False
+    assert state.restart_with_rebuilt_messages is True
 
 
 def test_copilot_provider_check_accepts_alias_spellings():

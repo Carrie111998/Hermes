@@ -60,7 +60,7 @@ from agent.turn_provider import (
     _system_prompt_for_hooks,
     execute_provider_call,
 )
-from agent.turn_retry_state import TurnRetryState
+from agent.turn_retry_state import RecoveryOutcome, TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
@@ -2330,8 +2330,7 @@ def run_conversation(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
                             compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
-                            _retry.restart_with_rebuilt_messages = True
+                            _retry.request_rebuild(reset_primary_recovery=True)
                             break
                         # No fallback available — surface buffered context
                         # so user sees the rate-limit message that led here.
@@ -2419,7 +2418,7 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
                     if agent.clear_interrupt(preserve_redirect=True):
-                        _retry.restart_with_redirected_messages = True
+                        _retry.request_rebuild(reason="redirect")
                     else:
                         interrupted = True
                     break
@@ -2560,8 +2559,7 @@ def run_conversation(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
+                        _retry.request_rebuild(reset_primary_recovery=True)
                         break
 
                     # Check for error field in response (some providers include this)
@@ -2634,8 +2632,7 @@ def run_conversation(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
                             compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
-                            _retry.restart_with_rebuilt_messages = True
+                            _retry.request_rebuild(reset_primary_recovery=True)
                             break
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
@@ -2671,7 +2668,7 @@ def run_conversation(
                             # backoff. Rebuild from the correction instead,
                             # mirroring the InterruptedError handler.
                             if agent.clear_interrupt(preserve_redirect=True):
-                                _retry.restart_with_redirected_messages = True
+                                _retry.request_rebuild(reason="redirect")
                                 break
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
@@ -2812,8 +2809,7 @@ def run_conversation(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
+                        _retry.request_rebuild(reset_primary_recovery=True)
                         break
 
                     agent._flush_status_buffer()
@@ -3048,8 +3044,7 @@ def run_conversation(
                                 truncated_response_parts = []
                                 retry_count = 0
                                 compression_attempts = 0
-                                _retry.primary_recovery_attempted = False
-                                _retry.restart_with_rebuilt_messages = True
+                                _retry.request_rebuild(reset_primary_recovery=True)
                                 break
                             # No fallback available — fall through to normal
                             # continuation (best-effort, may loop).
@@ -3123,7 +3118,7 @@ def run_conversation(
                                 }
                                 append_message(messages, continue_msg)
                                 agent._session_messages = messages
-                                _retry.restart_with_length_continuation = True
+                                _retry.request_length_continuation()
                                 break
 
                             partial_response = agent._strip_think_blocks(_join_truncated_parts(truncated_response_parts)).strip()
@@ -3614,7 +3609,7 @@ def run_conversation(
                     # loop rebuild a clean request tail. Never materialize
                     # incomplete signed/encrypted reasoning items.
                     if agent.clear_interrupt(preserve_redirect=True):
-                        _retry.restart_with_redirected_messages = True
+                        _retry.request_rebuild(reason="redirect")
                         break
                 api_elapsed = time.time() - api_start_time
                 agent._vprint(f"{agent.log_prefix}⚡ Interrupted during API call.", force=True)
@@ -4440,7 +4435,7 @@ def run_conversation(
                     # user is steering, not stopping. Rebuild the turn from the
                     # correction instead of aborting with a dead-end interrupt.
                     if agent.clear_interrupt(preserve_redirect=True):
-                        _retry.restart_with_redirected_messages = True
+                        _retry.request_rebuild(reason="redirect")
                         break
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
@@ -4582,7 +4577,7 @@ def run_conversation(
                                 )
                             )
                             time.sleep(2)
-                            _retry.restart_with_compressed_messages = True
+                            _retry.request_compression()
                             break
                     # Fall through to normal error handling if compression
                     # is exhausted or didn't help.
@@ -4681,8 +4676,7 @@ def run_conversation(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
                             compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
-                            _retry.restart_with_rebuilt_messages = True
+                            _retry.request_rebuild(reset_primary_recovery=True)
                             break
 
                 # ── Auth-failure provider failover ───────────────────────
@@ -4715,8 +4709,7 @@ def run_conversation(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
+                        _retry.request_rebuild(reset_primary_recovery=True)
                         break
 
                 # ── Nous Portal: record rate limit & skip retries ─────
@@ -4909,7 +4902,7 @@ def run_conversation(
                                 f"payload bytes, retrying..."
                             )
                         time.sleep(2)  # Brief pause between compression retries
-                        _retry.restart_with_compressed_messages = True
+                        _retry.request_compression()
                         break
                     else:
                         if agent._try_strip_image_parts_from_tool_messages(
@@ -5053,7 +5046,7 @@ def run_conversation(
                                 "%sOutput-cap compression hit an error; retrying on max_tokens only.",
                                 agent.log_prefix,
                             )
-                        _retry.restart_with_compressed_messages = True
+                        _retry.request_compression()
                         break
 
                     # The error is output-cap-shaped (about max_tokens being
@@ -5215,7 +5208,7 @@ def run_conversation(
                         elif new_tokens > 0 and new_tokens < original_tokens * 0.95:
                             agent._buffer_status(COMPRESSION_RETRY_TOKENS_STATUS_TEMPLATE.format(before=original_tokens, after=new_tokens))
                         time.sleep(2)  # Brief pause between compression retries
-                        _retry.restart_with_compressed_messages = True
+                        _retry.request_compression()
                         break
                     else:
                         # Can't compress further and already at minimum tier
@@ -5352,8 +5345,7 @@ def run_conversation(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
+                        _retry.request_rebuild(reset_primary_recovery=True)
                         break
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
@@ -5566,8 +5558,7 @@ def run_conversation(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
+                        _retry.request_rebuild(reset_primary_recovery=True)
                         break
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
@@ -5828,7 +5819,7 @@ def run_conversation(
                         # a steering correction must survive backoff, not die
                         # as "Operation interrupted".
                         if agent.clear_interrupt(preserve_redirect=True):
-                            _retry.restart_with_redirected_messages = True
+                            _retry.request_rebuild(reason="redirect")
                             break
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
@@ -5857,28 +5848,34 @@ def run_conversation(
                     # stale request.
                     break
         
-        if _retry.restart_with_redirected_messages:
+        _recovery = _retry.decision(
+            interrupted=interrupted, has_response=response is not None
+        )
+
+        if (
+            _recovery.outcome is RecoveryOutcome.REBUILD
+            and _recovery.reason == "redirect"
+        ):
             # The cancelled request produced no valid assistant item. Reuse the
             # same logical iteration after the outer loop appends the displayed
             # partial context and correction to ``messages``.
             api_call_count -= 1
             agent.iteration_budget.refund()
-            _retry.restart_with_redirected_messages = False
+            _retry.consume(_recovery)
             continue
 
-        # If the API call was interrupted, skip response processing
-        if interrupted:
+        if _recovery.outcome is RecoveryOutcome.INTERRUPT:
             _turn_exit_reason = "interrupted_during_api_call"
             break
 
-        if _retry.restart_with_compressed_messages:
+        if _recovery.outcome is RecoveryOutcome.COMPRESS:
             api_call_count -= 1
             agent.iteration_budget.refund()
             # Count compression restarts toward the retry limit to prevent
             # infinite loops when compression reduces messages but not enough
             # to fit the context window.
             retry_count += 1
-            _retry.restart_with_compressed_messages = False
+            _retry.consume(_recovery)
             if _should_skip_model_call_for_reference_handoff(
                 messages, user_message
             ):
@@ -5905,7 +5902,10 @@ def run_conversation(
             agent._persist_user_message_idx = current_turn_user_idx
             continue
 
-        if _retry.restart_with_rebuilt_messages:
+        if (
+            _recovery.outcome is RecoveryOutcome.REBUILD
+            and _recovery.reason == "fallback"
+        ):
             # A stream stall or provider failure was escalated to the
             # fallback chain (10 activation sites in the retry loop set this
             # flag and break here).  Re-issue the API call against the
@@ -5913,7 +5913,7 @@ def run_conversation(
             # stalled attempt so the fallback gets a fair turn.
             api_call_count -= 1
             agent.iteration_budget.refund()
-            _retry.restart_with_rebuilt_messages = False
+            _retry.consume(_recovery)
             # Failover shrank the compressor's context window to the
             # fallback's; clear the preflight block so the pre-API preflight
             # re-runs against the new threshold before the first fallback
@@ -5922,7 +5922,10 @@ def run_conversation(
             _preflight_compression_blocked = False
             continue
 
-        if _retry.restart_with_length_continuation:
+        if (
+            _recovery.outcome is RecoveryOutcome.REBUILD
+            and _recovery.reason == "length"
+        ):
             # Progressively boost the output token budget on each retry.
             # Retry 1 → 2× base, retry 2 → 4× base, retry 3 → 8× base,
             # retry 4 → 16× base, then cap at 32 768.
@@ -5937,12 +5940,13 @@ def run_conversation(
                 _boost = max(_boost, _requested_cap)
             _boost_cap = max(32768, _requested_cap or 0)
             agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
+            _retry.consume(_recovery)
             continue
 
         # Guard: if all retries exhausted without a successful response
         # (e.g. repeated context-length errors that exhausted retry_count),
         # the `response` variable is still None. Break out cleanly.
-        if response is None:
+        if _recovery.outcome is RecoveryOutcome.TERMINATE:
             _turn_exit_reason = "all_retries_exhausted_no_response"
             print(f"{agent.log_prefix}❌ All API retries exhausted with no successful response.")
             agent._persist_session(messages, conversation_history)
