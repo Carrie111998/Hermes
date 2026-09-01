@@ -183,7 +183,7 @@ def test_query_runs_and_prefers_the_id_row_against_live_postgres():
 
     psycopg = pytest.importorskip("psycopg")
     dsn = os.environ.get(
-        "HERMES_JOBFLOW_PG_DSN", "postgres://jobflow:jobflow@127.0.0.1:5432/jobflow"
+        "HERMES_JOBFLOW_PG_DSN", "postgres://jobflow@127.0.0.1:5432/jobflow"
     )
     try:
         conn = psycopg.connect(dsn, connect_timeout=2.0, autocommit=True)
@@ -206,3 +206,40 @@ def test_query_runs_and_prefers_the_id_row_against_live_postgres():
 
     r = NativePgJobStateReader(dsn=dsn)
     assert r(job_id) == own_state, "reader must report the target job, not its twin"
+
+
+def test_default_dsn_carries_no_password():
+    """The in-source default DSN must not embed a credential.
+
+    `_DEFAULT_DSN` shipped with the same word as both user and password until
+    2026-09-01, when a public-fork exposure sweep found it published on
+    github.com/daragao3/hermes-agent. The password was decorative -- the loopback
+    server authenticates this user without one -- so it bought nothing and had to
+    be read, judged and cleared by a human during that sweep.
+
+    Removing it is only safe while nothing depends on the password being present,
+    so this pins the *shape*: a userinfo section with a colon in it. Deployments
+    that genuinely need a password still supply a whole DSN through
+    HERMES_JOBFLOW_PG_DSN, which this does not constrain.
+    """
+    from urllib.parse import urlsplit
+
+    from intent_applier.job_state_reader import _DEFAULT_DSN
+
+    userinfo = urlsplit(_DEFAULT_DSN).netloc.rpartition("@")[0]
+    assert ":" not in userinfo, (
+        f"_DEFAULT_DSN embeds a password in {userinfo!r}; put it in "
+        "HERMES_JOBFLOW_PG_DSN instead -- this file is published to a public fork"
+    )
+
+
+def test_env_dsn_still_overrides_the_default(monkeypatch):
+    """The override path is what deployments needing a password must use."""
+    from intent_applier import job_state_reader
+
+    monkeypatch.setenv("HERMES_JOBFLOW_PG_DSN", "postgres://u@example.invalid:5432/d")
+    reader = job_state_reader.NativePgJobStateReader()
+    assert reader._dsn == "postgres://u@example.invalid:5432/d"
+
+    monkeypatch.delenv("HERMES_JOBFLOW_PG_DSN", raising=False)
+    assert job_state_reader.NativePgJobStateReader()._dsn == job_state_reader._DEFAULT_DSN
