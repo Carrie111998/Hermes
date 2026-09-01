@@ -9520,6 +9520,9 @@ def _provider_requires_stream(provider: str, base_url: Optional[str]) -> bool:
     # Tencent Copilot — "Non-stream chat request is currently not supported"
     if base_url_host_matches(_url, "copilot.tencent.com"):
         return True
+    # Ollama Cloud — non-streaming requests to reasoning models time out
+    if provider == "ollama-cloud" or base_url_host_matches(_url, "ollama.com"):
+        return True
     try:
         from hermes_cli.config import load_config
         aux_cfg = (load_config() or {}).get("auxiliary", {})
