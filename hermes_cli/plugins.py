@@ -226,13 +226,29 @@ VALID_HOOKS: Set[str] = {
     "subagent_start",
     "subagent_stop",
     # Gateway pre-dispatch hook. Fired once per incoming MessageEvent
-    # after the internal-event guard but BEFORE auth/pairing and agent
-    # dispatch. Plugins may return a dict to influence flow:
+    # after the internal-event guard and the core authorization decision, but
+    # BEFORE auth enforcement/pairing and agent dispatch. Plugins may return a
+    # dict to influence flow:
     #   {"action": "skip",    "reason": "..."}  -> drop message (no reply)
     #   {"action": "rewrite", "text": "..."}    -> replace event.text, continue
     #   {"action": "allow"}  /  None             -> normal dispatch
-    # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
+    # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store,
+    # adapter: BasePlatformAdapter, is_authorized: bool.
     "pre_gateway_dispatch",
+    # Synchronous gateway message policy boundaries. These callbacks must stay
+    # fast and must not return awaitables: adapters call them before message
+    # coalescing and while reconstructing conversational history.
+    #
+    # gateway_control_message receives ``platform`` and ``event``. Returning
+    # True (or {"control": True}) keeps the event intact and lets it bypass an
+    # active session's pending-message merge. A claiming plugin must consume
+    # the event from pre_gateway_dispatch.
+    "gateway_control_message",
+    # gateway_history_message receives normalized platform/message/source
+    # metadata. Returning True (or {"exclude": True}) omits that message from
+    # reconstructed agent context. Callback errors fail closed for the one
+    # message so a known control record cannot leak into the LLM prompt.
+    "gateway_history_message",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs an approval decision -- fires for CLI-interactive prompts,
     # gateway/ACP approvals, and smart-mode auxiliary-LLM decisions.
@@ -396,6 +412,8 @@ VALID_HOOKS: Set[str] = {
 # Support for a shell response shape can lift an event out of this set.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
     "transform_api_error_classification",
+    "gateway_control_message",
+    "gateway_history_message",
 }
 
 # Timeout coverage is an allowlist for the agent-turn hot path, not every
@@ -414,6 +432,10 @@ SHELL_UNSUPPORTED_HOOKS: Set[str] = {
 #   - pre_gateway_dispatch — policy gate (skip/rewrite/allow). Abandoning is
 #     unsafe either way (fail-open skips auth-like checks; fail-closed can
 #     drop legitimate messages). Prefer finish-or-exception fallthrough.
+#   - gateway_control_message / gateway_history_message — caller-thread,
+#     synchronous adapter policy. Async returns are rejected explicitly;
+#     callbacks must remain cheap because these run before coalescing and while
+#     reconstructing history.
 #   - pre_approval_request / post_approval_response — observers only (cannot
 #     veto); the approval UX already has its own timeout; not on the tool
 #     loop hot path.
@@ -1486,6 +1508,16 @@ class PluginContext:
             if key == plugin_id or loaded.manifest.name == plugin_id:
                 return True
         return False
+
+    def supports_hook(self, hook_name: str) -> bool:
+        """Return whether this host implements an official hook contract.
+
+        Unknown hooks remain registerable for forward compatibility, so
+        plugins that require a real fire site should probe with this method
+        before activating functionality that must fail closed.
+        """
+
+        return isinstance(hook_name, str) and hook_name in VALID_HOOKS
 
     # -- namespaced config and durable state --------------------------------
 
@@ -5899,6 +5931,59 @@ class PluginManager:
         """Return True when at least one callback is registered for a hook."""
         return bool(self._hooks.get(hook_name))
 
+    def should_exclude_gateway_history_message(self, **kwargs: Any) -> bool:
+        """Apply synchronous history filters, failing closed per message."""
+
+        payload = dict(kwargs)
+        payload.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        for callback in self._hooks.get("gateway_history_message", []):
+            try:
+                result = self._invoke_hook_callback(callback, payload)
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    raise TypeError(
+                        "gateway_history_message callbacks must be synchronous"
+                    )
+                if result is True or (
+                    isinstance(result, Mapping) and result.get("exclude") is True
+                ):
+                    return True
+            except Exception as exc:
+                logger.warning(
+                    "History filter callback %s raised; excluding message: %s",
+                    getattr(callback, "__name__", repr(callback)),
+                    exc,
+                )
+                return True
+        return False
+
+    def is_gateway_control_message(self, **kwargs: Any) -> bool:
+        """Return whether a plugin claims an intact pre-dispatch event."""
+
+        payload = dict(kwargs)
+        payload.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        for callback in self._hooks.get("gateway_control_message", []):
+            try:
+                result = self._invoke_hook_callback(callback, payload)
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    raise TypeError(
+                        "gateway_control_message callbacks must be synchronous"
+                    )
+                if result is True or (
+                    isinstance(result, Mapping) and result.get("control") is True
+                ):
+                    return True
+            except Exception as exc:
+                logger.warning(
+                    "Gateway control-message callback %s raised: %s",
+                    getattr(callback, "__name__", repr(callback)),
+                    exc,
+                )
+        return False
+
     def iter_hook_callbacks(self, hook_name: str) -> tuple[Callable, ...]:
         """Return a stable snapshot of callbacks registered for a hook."""
         return tuple(self._hooks.get(hook_name, ()))
@@ -6513,6 +6598,18 @@ def has_hook(hook_name: str) -> bool:
     :func:`has_middleware` (tracking #64178).
     """
     return _delivery_manager().has_hook(hook_name)
+
+
+def should_exclude_gateway_history_message(**kwargs: Any) -> bool:
+    """Return whether plugin policy excludes one reconstructed message."""
+
+    return _delivery_manager().should_exclude_gateway_history_message(**kwargs)
+
+
+def is_gateway_control_message(**kwargs: Any) -> bool:
+    """Return whether a plugin owns one intact pre-dispatch event."""
+
+    return _delivery_manager().is_gateway_control_message(**kwargs)
 
 
 def iter_hook_callbacks(hook_name: str) -> tuple[Callable, ...]:

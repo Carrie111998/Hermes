@@ -235,7 +235,7 @@ class ThreadParticipationTracker:
 
     _MAX_TRACKED = 500
 
-    def __init__(self, platform_name: str, max_tracked: int = 500):
+    def __init__(self, platform_name: str, max_tracked: int | None = 500):
         self._platform = platform_name
         self._max_tracked = max_tracked
         self._threads: dict[str, None] = {
@@ -260,7 +260,7 @@ class ThreadParticipationTracker:
     def _save(self) -> None:
         path = self._state_path()
         thread_list = list(self._threads)
-        if len(thread_list) > self._max_tracked:
+        if self._max_tracked and len(thread_list) > self._max_tracked:
             thread_list = thread_list[-self._max_tracked:]
             self._threads = dict.fromkeys(thread_list)
         atomic_json_write(path, thread_list, indent=None)
@@ -270,6 +270,11 @@ class ThreadParticipationTracker:
         if thread_id not in self._threads:
             self._threads[thread_id] = None
             self._save()
+
+    def ids(self) -> tuple[str, ...]:
+        """Return a stable snapshot of all persistently tracked IDs."""
+
+        return tuple(self._threads)
 
     def __contains__(self, thread_id: str) -> bool:
         return thread_id in self._threads

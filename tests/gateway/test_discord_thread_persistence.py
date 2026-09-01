@@ -6,7 +6,11 @@ being persisted to ~/.hermes/discord_threads.json.
 
 import json
 import os
-from unittest.mock import patch
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+import pytest
 
 
 class TestDiscordThreadPersistence:
@@ -47,4 +51,82 @@ class TestDiscordThreadPersistence:
         assert "aaa" in adapter2._threads
         assert "bbb" in adapter2._threads
 
+    def test_public_snapshot_is_unbounded_for_discord(self, tmp_path):
+        adapter = self._make_adapter(tmp_path)
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            adapter._threads.mark("111")
+            adapter._threads.mark("222")
+
+        assert adapter._threads._max_tracked is None
+        assert adapter.participating_thread_ids() == ("111", "222")
+
+    @pytest.mark.asyncio
+    async def test_lightweight_metadata_refresh_skips_message_history(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        created_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+        class FakeThread:
+            id = 123
+            parent_id = 456
+            guild = SimpleNamespace(id=789)
+            name = "Tracked"
+            last_message_id = None
+            auto_archive_duration = 10080
+            archived = False
+
+            def __init__(self):
+                self.created_at = created_at
+                self.history_calls = 0
+
+            def history(self, **_kwargs):
+                self.history_calls += 1
+
+                async def messages():
+                    if False:
+                        yield None
+
+                return messages()
+
+        channel = FakeThread()
+        adapter = object.__new__(DiscordAdapter)
+        adapter._client = SimpleNamespace(
+            user=SimpleNamespace(id=1),
+            get_channel=lambda _thread_id: channel,
+        )
+
+        metadata = await adapter.resolve_thread_metadata(
+            "123", include_activity_history=False
+        )
+
+        assert metadata["accessible"] is True
+        assert metadata["parent_channel_id"] == "456"
+        assert metadata["last_hermes_activity_at"] == created_at
+        assert channel.history_calls == 0
+
+    @pytest.mark.asyncio
+    async def test_delivery_target_validation_checks_permissions_and_send(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        target = SimpleNamespace(
+            id=999,
+            guild=SimpleNamespace(me=SimpleNamespace(id=1)),
+            parent_id=None,
+            send=AsyncMock(),
+            permissions_for=lambda _member: SimpleNamespace(
+                view_channel=True,
+                read_messages=True,
+                send_messages=True,
+            ),
+        )
+        adapter = object.__new__(DiscordAdapter)
+        adapter._client = SimpleNamespace(
+            user=SimpleNamespace(id=1),
+            get_channel=lambda _channel_id: target,
+        )
+
+        assert await adapter.validate_delivery_target("999") == {
+            "ok": True,
+            "channel_id": "999",
+        }
 

@@ -462,7 +462,9 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `on_skill_lifecycle` | Observer | After an authoritative skill-usage state change; return ignored. | `action`, `skill_name`, `provenance`, `task_id`, `session_id`, `use_count`, `reused`, `reuse_after_patch` | Exposes the local skill name and provenance. |
 | `subagent_start` | Observer | Child constructed and about to run; return ignored. | `parent_session_id`, `parent_turn_id`, `parent_subagent_id`, `child_session_id`, `child_subagent_id`, `child_role`, `child_goal` | Child goal may contain user/project content. |
 | `subagent_stop` | Observer | Child exit; return ignored. | `parent_session_id`, `parent_turn_id`, `child_session_id`, `child_role`, `child_summary`, `child_status`, `tool_call_history`, `duration_ms` | Summary and redacted tool-history metadata may reveal project structure. |
-| `pre_gateway_dispatch` | Directive/control | Incoming non-internal message before auth/pairing/dispatch; first valid `skip`, `rewrite`, or `allow` controls flow. | `event`, `gateway`, `session_store` | Extremely privileged in-process objects expose inbound user/routing data and host handles. |
+| `pre_gateway_dispatch` | Directive/control | Incoming non-internal message after authorization is computed but before auth/pairing enforcement or agent dispatch; first valid `skip`, `rewrite`, or `allow` controls flow. | `event`, `gateway`, `session_store`, `adapter`, `is_authorized` | Extremely privileged in-process objects expose inbound user/routing data and host handles. |
+| `gateway_control_message` | Directive/control | Synchronous classification before adapter text batching and busy-session merging; any explicit claim keeps the event intact for `pre_gateway_dispatch`. | `platform`, `event` | Raw normalized event and platform SDK payload may contain user content. |
+| `gateway_history_message` | Filter | Synchronous filter before a platform history message enters reconstructed agent context; any explicit exclusion wins and callback errors exclude that one message. | `platform`, message/chat/author IDs and flags, `content`, `author_is_authorized` | Full historical message content and identity metadata. |
 | `gateway_platform_event` | Observer | After the gateway's profile-scoped authorization succeeds, when a supported platform-native event is normalized at the gateway boundary (Telegram: reactions, message edits; Discord: message edits/deletes, thread created/renamed); return ignored. | `platform`, `event_type`, `payload` (event-type-specific dict — see the per-event contracts below) | Normalized plain-dict envelope only; raw SDK objects, adapter handles, and bot clients are never exposed. |
 | `pre_command` | Observer | Recognized slash command about to be dispatched, before the handler runs, on CLI and gateway cold-path dispatch; return ignored in v1 (directive-shaped dicts are logged at debug). Gateway running-agent intercept commands (`/stop`, `/approve` during an active run) are deliberately excluded — control-plane escape hatches must stay outside plugin reach. | `surface` (`"cli"` \| `"gateway"`), `command` (canonical name), `alias_used`, `args_raw`, `session_key`, `platform` | `args_raw` may contain user content or secrets typed after the command. |
 | `pre_approval_request` | Observer | Before prompted or smart approval; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id` | Command may contain secrets; smart observer preparation force-redacts, but surfaces do not all have identical redaction. |
@@ -1167,12 +1169,12 @@ With heavy delegation (e.g. orchestrator roles × 5 leaves × nested depth), `su
 
 ### `pre_gateway_dispatch`
 
-Fires **once per incoming `MessageEvent`** in the gateway, after the internal-event guard but **before** auth/pairing and agent dispatch. This is the interception point for gateway-level message-flow policies (listen-only windows, human handover, per-chat routing, etc.) that don't fit cleanly into any single platform adapter.
+Fires **once per incoming `MessageEvent`** in the gateway, after the internal-event guard and after Hermes computes the ordinary authorization decision, but **before** auth/pairing enforcement and agent dispatch. This is the interception point for gateway-level message-flow policies (listen-only windows, human handover, per-chat routing, etc.) that don't fit cleanly into any single platform adapter.
 
 **Callback signature:**
 
 ```python
-def my_callback(event, gateway, session_store, **kwargs):
+def my_callback(event, gateway, session_store, adapter, is_authorized, **kwargs):
 ```
 
 | Parameter | Type | Description |
@@ -1180,8 +1182,10 @@ def my_callback(event, gateway, session_store, **kwargs):
 | `event` | `MessageEvent` | The normalized inbound message (has `.text`, `.source`, `.message_id`, `.internal`, etc.). |
 | `gateway` | `GatewayRunner` | The active gateway runner, so plugins can call `gateway.adapters[platform].send(...)` for side-channel replies (owner notifications, etc.). |
 | `session_store` | `SessionStore` | For silent transcript ingestion via `session_store.append_to_transcript(...)`. |
+| `adapter` | `BasePlatformAdapter` | The public adapter for this message's source platform. |
+| `is_authorized` | `bool` | Hermes' immutable authorization decision for this event. Plugins should not duplicate private allowlist logic. |
 
-**Fires:** In `gateway/run.py`, inside `GatewayRunner._handle_message()`, immediately after `is_internal` is computed. **Internal events skip the hook entirely** (they are system-generated — background-process completions, etc. — and must not be gate-kept by user-facing policy).
+**Fires:** In `gateway/run.py`, inside `GatewayRunner._handle_message()`, before the authorization decision is enforced. **Internal events skip the hook entirely** (they are system-generated — background-process completions, etc. — and must not be gate-kept by user-facing policy).
 
 **Return value:** `None` or a dict. The first recognized action dict wins; remaining plugin results are ignored. Exceptions in plugin callbacks are caught and logged; the gateway always falls through to normal dispatch on error.
 
@@ -1196,9 +1200,9 @@ def my_callback(event, gateway, session_store, **kwargs):
 **Example — drop unauthorized DMs silently without triggering the pairing code:**
 
 ```python
-def deny_unauthorized_dms(event, **kwargs):
+def deny_unauthorized_dms(event, is_authorized, **kwargs):
     src = event.source
-    if src.chat_type == "dm" and not _is_approved_user(src.user_id):
+    if src.chat_type == "dm" and not is_authorized:
         return {"action": "skip", "reason": "unauthorized-dm"}
     return None
 
@@ -1223,6 +1227,58 @@ def buffer_or_rewrite(event, **kwargs):
 
 def register(ctx):
     ctx.register_hook("pre_gateway_dispatch", buffer_or_rewrite)
+```
+
+---
+
+### `gateway_control_message`
+
+Classifies plugin-owned control messages **synchronously**, before Discord
+split-message batching and before any platform's busy-session pending-message
+merge. A callback receives `platform` and the normalized `event`; return
+`True` or `{"control": True}` to claim it.
+
+A claimed event is delivered intact to `pre_gateway_dispatch`, even while an
+agent turn is active. The same plugin must consume it there with an
+`{"action": "skip", ...}` result. Classifier exceptions fail open (the message
+follows the ordinary path), and async callbacks are rejected. Keep this
+callback limited to cheap parsing—no network or database work.
+
+```python
+def is_my_control(platform, event, **kwargs):
+    return platform == "discord" and event.text.startswith("!mine")
+
+def consume_my_control(event, **kwargs):
+    if event.text.startswith("!mine"):
+        update_local_state(event)
+        return {"action": "skip", "reason": "my-control"}
+
+def register(ctx):
+    ctx.register_hook("gateway_control_message", is_my_control)
+    ctx.register_hook("pre_gateway_dispatch", consume_my_control)
+```
+
+---
+
+### `gateway_history_message`
+
+Filters individual platform-history messages before Hermes uses them to
+reconstruct conversational context. Discord currently invokes it for missed
+message recovery, recent/reply context windows, and resolved reply text.
+
+Callbacks are synchronous and receive normalized fields: `platform`,
+`message_id`, `content`, `chat_type`, `chat_id`, `thread_id`,
+`parent_chat_id`, `scope_id`, `author_id`, `author_is_bot`, `author_is_self`,
+and `author_is_authorized`. Return `True` or `{"exclude": True}` to omit the
+message. If a registered callback raises or returns an awaitable, Hermes fails
+closed for that one message so a known control record cannot become LLM input.
+
+```python
+def exclude_receipts(platform, message_id, **kwargs):
+    return platform == "discord" and message_id in committed_receipt_ids
+
+def register(ctx):
+    ctx.register_hook("gateway_history_message", exclude_receipts)
 ```
 
 ---
