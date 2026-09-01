@@ -34,7 +34,11 @@ from .claude_adapter import (
     classify_claude_process_failure,
     resolve_claude_command,
 )
-from .codex_adapter import CodexSourceAdapter, CodexTargetAdapter
+from .codex_adapter import (
+    CodexSourceAdapter,
+    CodexTargetAdapter,
+    resolve_codex_command,
+)
 from .models import (
     BridgeMarkerPayload,
     InvalidBridgeMarker,
@@ -3966,14 +3970,10 @@ def resolve_cli_executable(
     suffix = candidate.suffix.casefold()
     if candidate.stem.casefold() == "claude":
         return resolve_claude_command(normalized, which=which)
+    if candidate.stem.casefold() == "codex":
+        return resolve_codex_command(normalized, which=which)
     if suffix not in {".cmd", ".ps1", ".bat"}:
         return (str(candidate.resolve()) if candidate.exists() else resolved,)
-
-    command_name = candidate.stem.casefold()
-    if command_name == "codex":
-        if suffix == ".cmd" and candidate.is_file():
-            return (str(candidate.resolve()),)
-        raise RuntimeError("unsupported_shell_shim")
     raise RuntimeError("unsupported_shell_shim")
 
 
