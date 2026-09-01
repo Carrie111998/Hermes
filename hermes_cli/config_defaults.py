@@ -416,6 +416,7 @@ DEFAULT_CONFIG = {
         # with a reason + retry hint so the model can act on it; "fail"
         # preserves the historical error + traceback behavior.
         "degraded_mode": "warn",
+        "ssh_file_sync": True,
         "cwd": ".",  # Use current directory
         # Root directory for Hermes' terminal session temp files (background
         # logs/pid/exit files, code-execution sandboxes, etc.). When empty,

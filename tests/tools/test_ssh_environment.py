@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -146,6 +147,22 @@ class TestControlSocketPath:
 
 
 class TestTerminalToolConfig:
+    def test_ssh_file_sync_can_be_disabled_for_native_remote_workspaces(self, monkeypatch):
+        from hermes_cli.config import apply_terminal_config_to_env
+        from tools.terminal_tool import _get_env_config, _ssh_config_from_config
+
+        bridged = apply_terminal_config_to_env(
+            env={},
+            config={"terminal": {"ssh_file_sync": False}},
+            override=True,
+        )
+        assert bridged["TERMINAL_SSH_FILE_SYNC"] == "False"
+        monkeypatch.setenv("TERMINAL_SSH_FILE_SYNC", bridged["TERMINAL_SSH_FILE_SYNC"])
+        config = _get_env_config()
+
+        assert config["ssh_file_sync"] is False
+        assert _ssh_config_from_config(config)["file_sync"] is False
+
     def test_ssh_persistent_default_true(self, monkeypatch):
         """SSH persistent defaults to True (via TERMINAL_PERSISTENT_SHELL)."""
         monkeypatch.delenv("TERMINAL_SSH_PERSISTENT", raising=False)
@@ -189,6 +206,55 @@ class TestSSHPreflight:
         assert called["count"] == 1
         assert env.host == "example.com"
         assert env.user == "alice"
+
+    def test_disabled_file_sync_never_scans_or_writes_remote_hermes_files(self, monkeypatch):
+        monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/alice")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
+        monkeypatch.setattr(
+            ssh_env.SSHEnvironment,
+            "_ensure_remote_dirs",
+            lambda self: pytest.fail("disabled sync must not create remote .hermes directories"),
+        )
+        monkeypatch.setattr(
+            ssh_env,
+            "FileSyncManager",
+            lambda **_kwargs: pytest.fail("disabled sync must not enumerate or transfer files"),
+        )
+
+        env = ssh_env.SSHEnvironment(host="example.com", user="alice", file_sync=False)
+
+        assert env._sync_manager is None
+        env._before_execute()
+        env.cleanup()
+
+    def test_remote_command_uses_a_tracked_process_group_and_kill_cleans_it_up(self, monkeypatch):
+        monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/Users/alice")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
+        process = SimpleNamespace(pid=123, kill=MagicMock())
+        monkeypatch.setattr(ssh_env, "_popen_bash", lambda command, stdin: (setattr(process, "command", command) or process))
+        cleanup_calls = []
+        monkeypatch.setattr(
+            ssh_env.subprocess,
+            "run",
+            lambda command, **kwargs: (cleanup_calls.append(command) or subprocess.CompletedProcess(command, 0)),
+        )
+
+        env = ssh_env.SSHEnvironment(host="example.com", user="alice", file_sync=False)
+        process = env._run_bash("sleep 300")
+        env._kill_process(process)
+
+        remote_command = process.command[-1]
+        assert "os.setsid" in remote_command
+        assert "/Users/alice/.hermes/run/" in remote_command
+        assert cleanup_calls
+        assert "kill -TERM" in cleanup_calls[-1][-1]
+        assert "kill -KILL" in cleanup_calls[-1][-1]
+        assert "rm -f" in cleanup_calls[-1][-1]
+        process.kill.assert_called_once()
 
 
 def _setup_ssh_env(monkeypatch, persistent: bool):
