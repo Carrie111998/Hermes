@@ -4,7 +4,6 @@ import {
   SiGooglechat,
   SiHomeassistant,
   SiLine,
-  SiMatrix,
   SiMattermost,
   SiNtfy,
   SiQq,
@@ -16,12 +15,10 @@ import {
 import type { ComponentPropsWithoutRef, ComponentType, SVGProps } from 'react'
 import { forwardRef, memo } from 'react'
 
-import blueBubblesIconUrl from '@/assets/brand/bluebubbles-icon.svg?url'
 import dingtalkIconUrl from '@/assets/brand/dingtalk-icon.png'
 import larkIconUrl from '@/assets/brand/lark-icon.svg?url'
 import slackIconUrl from '@/assets/brand/slack-logo.svg?url'
 import teamsIconUrl from '@/assets/brand/teams-icon.svg?url'
-import wecomIconUrl from '@/assets/brand/wecom-official.svg?url'
 import { AvatarChip } from '@/components/ui/avatar-chip'
 import { Globe, Link as LinkIcon, MessageSquareText } from '@/lib/icons'
 
@@ -35,6 +32,76 @@ function PhotonIcon(props: React.SVGProps<SVGSVGElement>) {
   )
 }
 
+function BlueBubblesIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg fill="none" viewBox="0 0 24 24" {...props}>
+      <g transform="translate(2 2) scale(0.014648)">
+        <path
+          d="m 282.22721,1212.3333 c -0.32825,-0.55 5.69752,-7.9 13.39061,-16.3334 33.18551,-36.3787 58.29388,-71.8345 75.23815,-106.2446 3.73304,-7.581 6.49275,-14.9172 6.24837,-16.6103 -0.33979,-2.3541 -4.59263,-5.3585 -19.01354,-13.432 -35.70283,-19.988 -61.53807,-37.8784 -94.09756,-65.16095 C 171.16156,916.76576 112.27757,812.10599 97.896372,699.33329 94.781572,674.90803 95.839037,616.72973 99.883646,589.99996 118.62238,466.16054 192.89128,353.15325 307.52801,274.04905 c 57.51358,-39.6868 119.86684,-68.77221 189.80529,-88.5369 92.27163,-26.07607 195.5171,-32.19794 293.28166,-17.38993 105.07046,15.91459 206.27664,57.29422 286.05164,116.95639 75.1003,56.16607 128.5993,122.56089 162.9707,202.25469 14.9183,34.58952 25.5556,73.82394 31.2695,115.33333 2.6514,19.262 2.2488,79.05098 -0.6734,99.99999 -7.1973,51.59646 -20.2747,93.78278 -43.0198,138.77775 -22.0789,43.67702 -49.2989,81.42109 -85.8471,119.03834 -86.2635,88.78679 -206.62891,149.79589 -339.60566,172.13449 -90.53541,15.2089 -180.99947,12.7908 -270.90069,-7.2411 -7.2654,-1.6189 -12.28279,-2.1026 -14.20992,-1.3699 -1.63845,0.6229 -11.60503,6.331 -22.14796,12.6847 -36.3239,21.8903 -86.62516,44.5647 -128.50229,57.925 -38.8873,12.4065 -81.55656,21.4307 -83.77277,17.7174 z"
+          fill="none"
+          stroke="currentColor"
+          strokeLinejoin="miter"
+          strokeWidth="96"
+        />
+        <circle cx="468.89728" cy="654.54889" fill="currentColor" r="80" />
+        <circle cx="682.66663" cy="654.54889" fill="currentColor" r="80" />
+        <circle cx="896.43597" cy="654.54889" fill="currentColor" r="80" />
+      </g>
+    </svg>
+  )
+}
+
+function MatrixIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg fill="currentColor" viewBox="0 0 24 24" {...props}>
+      <g transform="translate(2 2) scale(0.038462)">
+        <path d="M13.7,11.9v496.2h35.7V520H0V0h49.4v11.9H13.7z" fill="currentColor" />
+        <path
+          d="M166.3,169.2v25.1h0.7c6.7-9.6,14.8-17,24.2-22.2c9.4-5.3,20.3-7.9,32.5-7.9c11.7,0,22.4,2.3,32.1,6.8  c9.7,4.5,17,12.6,22.1,24c5.5-8.1,13-15.3,22.4-21.5c9.4-6.2,20.6-9.3,33.5-9.3c9.8,0,18.9,1.2,27.3,3.6c8.4,2.4,15.5,6.2,21.5,11.5  c6,5.3,10.6,12.1,14,20.6c3.3,8.5,5,18.7,5,30.7v124.1h-50.9V249.6c0-6.2-0.2-12.1-0.7-17.6c-0.5-5.5-1.8-10.3-3.9-14.3  c-2.2-4.1-5.3-7.3-9.5-9.7c-4.2-2.4-9.9-3.6-17-3.6c-7.2,0-13,1.4-17.4,4.1c-4.4,2.8-7.9,6.3-10.4,10.8c-2.5,4.4-4.2,9.4-5,15.1  c-0.8,5.6-1.3,11.3-1.3,17v103.3h-50.9v-104c0-5.5-0.1-10.9-0.4-16.3c-0.2-5.4-1.3-10.3-3.1-14.9c-1.8-4.5-4.8-8.2-9-10.9  c-4.2-2.7-10.3-4.1-18.5-4.1c-2.4,0-5.6,0.5-9.5,1.6c-3.9,1.1-7.8,3.1-11.5,6.1c-3.7,3-6.9,7.3-9.5,12.9c-2.6,5.6-3.9,13-3.9,22.1  v107.6h-50.9V169.2H166.3z"
+          fill="currentColor"
+        />
+        <path d="M506.3,508.1V11.9h-35.7V0H520v520h-49.4v-11.9H506.3z" fill="currentColor" />
+      </g>
+    </svg>
+  )
+}
+
+function WeComIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg fill="currentColor" viewBox="0 0 24 24" {...props}>
+      <g transform="translate(2 2) scale(0.4)">
+        <path
+          d="M36.75,37.19s-.09-.02-.14-.03c-.05,0-.09-.01-.14-.02-1.37-.26-2.68-.91-3.74-1.97-.08-.08-.15-.15-.22-.23h0c-.22-.22-.57-.22-.78,0-.2,.2-.22,.52-.04,.74,.01,.01,.02,.03,.04,.04,.02,.02,.05,.04,.08,.06,.05,.05,.11,.1,.16,.15,1.04,1.04,1.69,2.31,1.95,3.65,0,.08,.01,.15,.02,.22,.01,.08,.03,.16,.05,.24,.1,.38,.3,.73,.6,1.03,.9,.9,2.37,.9,3.27,0,.9-.9,.9-2.37,0-3.27-.32-.32-.71-.52-1.12-.62"
+          fill="currentColor"
+          fillRule="evenodd"
+        />
+        <path
+          d="M44.41,31.28c-.9-.9-2.37-.9-3.27,0-.32,.32-.52,.71-.62,1.12-.01,.05-.02,.09-.03,.14,0,.05-.01,.09-.02,.14-.26,1.37-.91,2.68-1.97,3.74-.08,.08-.15,.15-.23,.22h0c-.22,.22-.22,.57,0,.78,.2,.2,.52,.22,.74,.04,.01-.01,.03-.02,.04-.04,.02-.02,.04-.05,.06-.08,.05-.05,.1-.11,.15-.16,1.04-1.04,2.31-1.69,3.65-1.95,.08,0,.15-.01,.22-.02,.08-.01,.16-.03,.24-.05,.38-.1,.73-.3,1.03-.6,.9-.9,.9-2.37,0-3.27"
+          fill="currentColor"
+          fillRule="evenodd"
+        />
+        <path
+          d="M34.61,24.74c-.9,.9-.9,2.37,0,3.27,.32,.32,.71,.52,1.12,.62,.05,.01,.09,.02,.14,.03,.05,0,.09,.01,.14,.02,1.37,.26,2.68,.91,3.74,1.97,.08,.08,.15,.15,.22,.23,.22,.22,.57,.22,.78,0,.2-.2,.21-.52,.04-.74-.01-.01-.02-.03-.04-.04-.02-.02-.05-.04-.08-.06-.05-.05-.11-.1-.16-.15-1.04-1.04-1.69-2.31-1.95-3.65,0-.08-.01-.15-.02-.22-.01-.08-.03-.16-.05-.24-.1-.38-.3-.73-.6-1.03-.9-.9-2.37-.9-3.27,0"
+          fill="currentColor"
+          fillRule="evenodd"
+        />
+        <path
+          d="M31.98,33.29s.01-.09,.02-.14c.26-1.37,.91-2.68,1.97-3.74,.08-.08,.15-.15,.23-.22h0c.22-.22,.22-.57,0-.78-.2-.2-.52-.22-.74-.04-.01,.01-.03,.02-.04,.04-.02,.02-.05,.05-.06,.08-.05,.05-.1,.11-.15,.16-1.04,1.04-2.31,1.69-3.65,1.95-.07,0-.15,.01-.22,.02-.08,.01-.16,.03-.24,.05-.38,.1-.73,.3-1.03,.6-.9,.9-.9,2.37,0,3.27s2.37,.9,3.27,0c.32-.32,.52-.71,.62-1.12,.01-.05,.02-.09,.03-.14"
+          fill="currentColor"
+          fillRule="evenodd"
+        />
+        <path
+          d="M36.91,17.05c-.64-1.32-1.51-2.55-2.57-3.65-2.69-2.78-6.44-4.57-10.58-5.04-.74-.08-1.48-.13-2.19-.13s-1.38,.04-2.1,.12c-4.16,.45-7.94,2.23-10.64,5.01-1.07,1.1-1.94,2.32-2.59,3.64-.88,1.79-1.33,3.69-1.33,5.65,0,2.52,.77,5.01,2.22,7.19,.74,1.11,1.94,2.5,3.04,3.48h0s-.5,3.93-.5,3.93c-.02,.05-.04,.11-.05,.16-.01,.05-.01,.1-.02,.16,0,.04-.01,.08-.01,.12,0,.04,0,.09,.01,.13,.07,.65,.6,1.15,1.27,1.15,.23,0,.45-.07,.63-.17,0,0,.01,0,.02,0,.03-.02,.06-.03,.08-.05l1.19-.6,3.56-1.79c1.02,.29,2.04,.48,3.11,.6,.7,.08,1.4,.12,2.1,.12s1.45-.04,2.19-.13c1.46-.17,2.86-.5,4.2-.98-.14-.05-.29-.11-.42-.19-.82-.47-1.24-1.35-1.15-2.23-.95,.3-1.95,.52-2.97,.64-.62,.07-1.24,.11-1.83,.11s-1.17-.03-1.76-.1c-.12-.01-.24-.03-.36-.05-.8-.11-1.59-.27-2.35-.49-.16-.05-.32-.07-.49-.07-.26,0-.52,.07-.78,.2-.03,.02-.07,.03-.1,.05l-2.92,1.72-.13,.07h0c-.06,.04-.1,.05-.13,.05-.11,0-.19-.09-.19-.2l.11-.46c.03-.12,.08-.29,.13-.5,.06-.24,.14-.53,.21-.81,.08-.32,.17-.64,.24-.91,.03-.11,.06-.23,.06-.37,0-.39-.19-.76-.5-.99-.16-.12-.32-.24-.49-.38-.26-.21-.5-.43-.74-.65-.66-.63-1.24-1.31-1.73-2.05-1.15-1.73-1.76-3.69-1.76-5.67,0-1.54,.35-3.03,1.05-4.45,.52-1.05,1.22-2.04,2.07-2.92,2.22-2.28,5.35-3.75,8.8-4.12,.6-.07,1.19-.1,1.76-.1,.59,0,1.21,.04,1.83,.11,3.44,.39,6.55,1.86,8.75,4.14,.85,.88,1.55,1.87,2.06,2.93,.68,1.4,1.03,2.89,1.03,4.41,0,.16,0,.32-.02,.47,.89-.55,2.07-.44,2.84,.33,.04,.04,.07,.08,.11,.12,.03-.32,.04-.65,.04-.98,0-1.94-.44-3.83-1.3-5.61"
+          fill="currentColor"
+          fillRule="evenodd"
+        />
+      </g>
+    </svg>
+  )
+}
+
+// Preserve Raft's official icon-only geometry and two-tone treatment from
+// raft.build. The adjacent RAFT wordmark is intentionally omitted at 24px.
 function RaftIcon(props: React.SVGProps<SVGSVGElement>) {
   return (
     <svg fill="none" viewBox="0 0 113 104" {...props}>
@@ -158,43 +225,58 @@ interface PlatformIconSpec {
   Icon?: ComponentType<SVGProps<SVGSVGElement>>
   asset?: string
   color: string
+  backgroundColor?: string
+  glyphColor?: string
   kind: IconKind
+  mask?: string
+  monochrome?: boolean
   monogram?: string
 }
 
 const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   telegram: { Icon: SiTelegram, color: '#26A5E4', kind: 'brand' },
   discord: { Icon: SiDiscord, color: '#5865F2', kind: 'brand' },
-  slack: { asset: slackIconUrl, color: '#E01E5A', kind: 'brand' },
-  mattermost: { Icon: SiMattermost, color: '#0058CC', kind: 'brand' },
-  matrix: { Icon: SiMatrix, color: '#000000', kind: 'brand' },
+  slack: { asset: slackIconUrl, backgroundColor: '#F3EEF2', color: '#6B5870', kind: 'brand' },
+  mattermost: { Icon: SiMattermost, color: '#496FA6', kind: 'brand' },
+  matrix: {
+    backgroundColor: '#F7F7F5',
+    color: '#000000',
+    kind: 'brand',
+    Icon: MatrixIcon,
+    monochrome: true
+  },
   signal: { Icon: SiSignal, color: '#3A76F0', kind: 'brand' },
   whatsapp: { Icon: SiWhatsapp, color: '#25D366', kind: 'brand' },
-  bluebubbles: { asset: blueBubblesIconUrl, color: '#0099E5', kind: 'brand' },
-  photon: { Icon: PhotonIcon, color: '#6366F1', kind: 'brand' },
-  homeassistant: { Icon: SiHomeassistant, color: '#18BCF2', kind: 'brand' },
-  google_chat: { Icon: SiGooglechat, color: '#34A853', kind: 'brand' },
+  bluebubbles: { Icon: BlueBubblesIcon, color: '#5F8292', kind: 'brand' },
+  photon: { Icon: PhotonIcon, color: '#6D759E', kind: 'brand' },
+  homeassistant: { Icon: SiHomeassistant, color: '#4C9AB0', kind: 'brand' },
+  google_chat: { Icon: SiGooglechat, color: '#5C916B', kind: 'brand' },
   irc: { Icon: IrcIcon, color: '#64748B', kind: 'generic' },
-  line: { Icon: SiLine, color: '#00C300', kind: 'brand' },
-  ntfy: { Icon: SiNtfy, color: '#317F6F', kind: 'brand' },
+  line: { Icon: SiLine, color: '#4E9B79', kind: 'brand' },
+  ntfy: { Icon: SiNtfy, color: '#5D8E84', kind: 'brand' },
   raft: { Icon: RaftIcon, color: '#D7A928', kind: 'brand' },
   simplex: { Icon: SimplexChannelIcon, color: '#668BB2', kind: 'generic' },
-  teams: { asset: teamsIconUrl, color: '#5F50E2', kind: 'brand' },
+  teams: { color: '#74789E', kind: 'brand', mask: teamsIconUrl },
   email: { Icon: SiGmail, color: '#EA4335', kind: 'brand' },
   sms: { Icon: MessageSquareText, color: '#F43F5E', kind: 'generic' },
   webhook: { Icon: LinkIcon, color: '#71717A', kind: 'generic' },
   api_server: { Icon: Globe, color: '#64748B', kind: 'generic' },
-  weixin: { Icon: SiWechat, color: '#07C160', kind: 'brand' },
-  wecom: { asset: wecomIconUrl, color: '#0078FF', kind: 'brand' },
-  wecom_callback: { asset: wecomIconUrl, color: '#0078FF', kind: 'brand' },
-  dingtalk: { asset: dingtalkIconUrl, color: '#007FFF', kind: 'brand' },
-  qqbot: { Icon: SiQq, color: '#EB1923', kind: 'brand' },
+  weixin: { Icon: SiWechat, color: '#3A9B6D', kind: 'brand' },
+  wecom: { Icon: WeComIcon, color: '#5B9A63', kind: 'brand' },
+  wecom_callback: { Icon: WeComIcon, color: '#5B9A63', kind: 'brand' },
+  dingtalk: {
+    color: '#5F89B5',
+    glyphColor: '#5F89B5',
+    kind: 'brand',
+    mask: dingtalkIconUrl
+  },
+  qqbot: { Icon: SiQq, color: '#B45D66', kind: 'brand' },
   yuanbao: { Icon: YuanbaoIcon, color: '#63A886', kind: 'brand' },
   a2a: { Icon: A2AIcon, color: '#64748B', kind: 'generic' },
   buzz: { Icon: BuzzIcon, color: '#B28A4C', kind: 'generic' },
-  feishu: { asset: larkIconUrl, color: '#3370FF', kind: 'brand' },
+  feishu: { color: '#6689B2', kind: 'brand', mask: larkIconUrl },
   relay: { Icon: RelayIcon, color: '#64748B', kind: 'generic' },
-  whatsapp_cloud: { Icon: SiWhatsapp, color: '#25D366', kind: 'brand' },
+  whatsapp_cloud: { Icon: SiWhatsapp, color: '#5A9B78', kind: 'brand' },
   msgraph_webhook: { Icon: GraphWebhookIcon, color: '#74789E', kind: 'generic' }
 }
 
@@ -214,6 +296,23 @@ export const PlatformAvatar = memo(
       <AvatarChip brand={spec} className={className} name={platformName} ref={ref} {...rest}>
         {spec?.asset ? (
           <img alt="" aria-hidden className="size-[58%] object-contain" data-platform-glyph="asset" src={spec.asset} />
+        ) : spec?.mask ? (
+          <span
+            aria-hidden
+            className="size-[58%]"
+            data-platform-glyph="mask"
+            style={{
+              backgroundColor: spec.glyphColor ?? spec.color,
+              maskImage: `url(${spec.mask})`,
+              WebkitMaskImage: `url(${spec.mask})`,
+              maskPosition: 'center',
+              WebkitMaskPosition: 'center',
+              maskRepeat: 'no-repeat',
+              WebkitMaskRepeat: 'no-repeat',
+              maskSize: 'contain',
+              WebkitMaskSize: 'contain'
+            }}
+          />
         ) : undefined}
       </AvatarChip>
     )

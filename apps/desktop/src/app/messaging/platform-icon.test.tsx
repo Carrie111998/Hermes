@@ -30,7 +30,7 @@ describe('PlatformAvatar brand glyphs', () => {
   ])('renders a real mark for %s', (platformId, platformName) => {
     const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
 
-    expect(container.querySelector('svg, img[data-platform-glyph="asset"]')).toBeTruthy()
+    expect(container.querySelector('svg, [data-platform-glyph="mask"], img[data-platform-glyph="asset"]')).toBeTruthy()
   })
 
   it('keeps the official Raft two-tone icon-only geometry', () => {
@@ -43,12 +43,13 @@ describe('PlatformAvatar brand glyphs', () => {
     expect(icon?.querySelectorAll('[fill="#FFFAEF"]')).toHaveLength(2)
   })
 
-  it('preserves Slack as the original four-color asset', () => {
+  it('keeps Slack as the official four-color asset', () => {
     const { container } = render(<PlatformAvatar platformId="slack" platformName="Slack" />)
     const icon = container.querySelector('img[data-platform-glyph="asset"]')
 
     expect(icon).toBeTruthy()
     expect(icon?.getAttribute('src')).toMatch(/^data:image\/svg\+xml|slack-logo\.svg/)
+    expect(container.querySelector('span')?.getAttribute('style')).toContain('rgb(243, 238, 242)')
   })
 
   it('keeps the initial fallback for an unknown platform', () => {
@@ -58,27 +59,43 @@ describe('PlatformAvatar brand glyphs', () => {
     expect(screen.getByText('C')).toBeTruthy()
   })
 
-  it('renders the original DingTalk asset without a mask or color override', () => {
+  it('uses the shared low-saturation field and colored DingTalk mark', () => {
     const { container } = render(<PlatformAvatar platformId="dingtalk" platformName="DingTalk" />)
-    const icon = container.querySelector('img[data-platform-glyph="asset"]')
+    const chip = container.querySelector('span')
 
-    expect(icon).toBeTruthy()
-    expect(icon?.getAttribute('src')).toMatch(/dingtalk-icon\.png/)
-    expect(container.querySelector('[data-platform-glyph="mask"]')).toBeNull()
+    expect(chip?.getAttribute('style')).not.toContain('background-color: rgb(0, 137, 255)')
+    expect(chip?.querySelector('[data-platform-glyph="mask"]')).toBeTruthy()
+    expect(chip?.querySelector('img')).toBeNull()
   })
 
-  it('keeps Matrix on the original Simple Icons SVG', () => {
+  it.each([
+    ['teams', 'Microsoft Teams', 'rgb(116, 120, 158)'],
+    ['feishu', 'Feishu / Lark', 'rgb(102, 137, 178)']
+  ])('keeps %s as a low-saturation monochrome mask', (platformId, platformName, color) => {
+    const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
+    const chip = container.querySelector('span')
+
+    expect(chip?.getAttribute('style')).toContain(color.toLowerCase())
+    expect(chip?.querySelector('[data-platform-glyph="mask"]')).toBeTruthy()
+    expect(chip?.querySelector('img')).toBeNull()
+  })
+
+  it('keeps WeCom as a low-saturation monochrome glyph', () => {
+    const { container } = render(<PlatformAvatar platformId="wecom" platformName="WeCom" />)
+    const chip = container.querySelector('span')
+
+    expect(chip?.getAttribute('style')).toContain('rgb(91, 154, 99)')
+    expect(chip?.querySelector('svg')).toBeTruthy()
+    expect(chip?.querySelector('img')).toBeNull()
+  })
+
+  it('uses a pale field and black Matrix mark', () => {
     const { container } = render(<PlatformAvatar platformId="matrix" platformName="Matrix" />)
-    const icon = container.querySelector('svg')
+    const chip = container.querySelector('span')
+    const icon = chip?.querySelector('svg')
 
+    expect(chip?.getAttribute('style')).toContain('background-color: rgb(247, 247, 245)')
     expect(icon).toBeTruthy()
-    expect(container.querySelector('img[data-platform-glyph="asset"]')).toBeNull()
-  })
-
-  it('keeps Email on the original Gmail preset', () => {
-    const { container } = render(<PlatformAvatar platformId="email" platformName="Email" />)
-
-    expect(container.querySelector('svg')).toBeTruthy()
-    expect(container.querySelector('img[data-platform-glyph="asset"]')).toBeNull()
+    expect(icon?.getAttribute('fill')).toBe('currentColor')
   })
 })
