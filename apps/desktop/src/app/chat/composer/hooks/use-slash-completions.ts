@@ -203,15 +203,23 @@ export function useSlashCompletions(options: {
         // e.g. complete.slash returns `{text: "alice"}` for `/personality alic`
         // with replace_from = 14. Rewrite those entries so the popover inserts
         // the full `/personality alice` token instead of stranding `/alice`.
-        const replaceFrom = typeof result.replace_from === 'number' ? result.replace_from : 1
+        const replaceFromRaw = result.replace_from
+        const hasReplaceFrom = typeof replaceFromRaw === 'number'
+        const replaceFrom = hasReplaceFrom ? replaceFromRaw : 1
         const isArgCompletion = replaceFrom > 1
         const prefix = isArgCompletion ? text.slice(0, replaceFrom) : ''
 
         // Commands narrowed by `desktop_subcommands` (e.g. /skills exposes
         // only its review slice here) must not suggest the subcommands the
         // exec gate would refuse — filter before the arg-stub rewrite so the
-        // token under test is the bare subcommand word.
-        const scopedItems = filterDesktopSubcommandCompletions(text, result.items ?? [], { isArgCompletion })
+        // token under test is the bare subcommand word. Pass the backend
+        // stage only when replace_from is present; older backends omit it
+        // and the filter must keep its query-whitespace fallback.
+        const scopedItems = filterDesktopSubcommandCompletions(
+          text,
+          result.items ?? [],
+          hasReplaceFrom ? { isArgCompletion } : undefined
+        )
 
         const decorated = scopedItems
           .map(item => {

@@ -198,6 +198,23 @@ describe('useSlashCompletions', () => {
     expect(commandsOf(await completions(api, 'skills '))).toEqual(['/skills'])
   })
 
+  it('still filters /skills hub subcommands when replace_from is omitted', async () => {
+    const request = vi.fn().mockImplementation((method: string) =>
+      Promise.resolve(
+        method === 'commands.catalog'
+          ? CATALOG
+          : { items: [{ text: 'install' }, { text: 'search' }, { text: 'pending' }] }
+      )
+    )
+    const api = harness({ request } as unknown as HermesGateway)
+    const items = await completions(api, 'skills ')
+    const commands = commandsOf(items)
+
+    expect(commands.some(command => command?.includes('install'))).toBe(false)
+    expect(commands.some(command => command?.includes('search'))).toBe(false)
+    expect(commands.some(command => command?.includes('pending'))).toBe(true)
+  })
+
   it('filters blocked subcommands from replace_from even without trailing space', async () => {
     const request = vi.fn().mockImplementation((method: string) =>
       Promise.resolve(
