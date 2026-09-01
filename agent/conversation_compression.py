@@ -3321,6 +3321,10 @@ def compress_context(
     checkpoint_required = (
         getattr(agent, "compression_checkpoint_required", False) is True
     )
+    if checkpoint_required and commit_fence is not None:
+        # Arm fail-closed semantics before feasibility, lock, or snapshot work:
+        # any of those phases can stall before the provider hook itself starts.
+        commit_fence.require_precompress_checkpoint()
     if getattr(agent, "api_mode", None) == "codex_app_server":
         if checkpoint_required:
             raise _checkpoint_blocked(
@@ -3973,8 +3977,6 @@ def compress_context(
         # providers inside MemoryManager.on_pre_compress().
         evidence_messages = _direct_messages_for_pre_compress_memory(messages)
         if checkpoint_required and not _static_fallback_attempt:
-            if commit_fence is not None:
-                commit_fence.require_precompress_checkpoint()
             supports_checkpoint = getattr(
                 memory_manager, "supports_pre_compress_checkpoint", None
             )

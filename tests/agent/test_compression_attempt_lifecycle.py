@@ -24,7 +24,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -68,6 +68,63 @@ def _messages():
 
 
 class TestWorkerTeardownOnCeiling:
+    def test_checkpoint_required_arms_before_feasibility_can_stall(
+        self, tmp_path: Path
+    ):
+        _db, agent = _build_agent(tmp_path, "CHECKPOINT_EARLY_ARM")
+        agent._session_db = None
+        agent.compression_checkpoint_required = True
+        agent._compression_feasibility_checked = False
+        entered = threading.Event()
+        release = threading.Event()
+        static_fallback = MagicMock()
+        provider_fallback = MagicMock()
+        original = _messages()
+
+        def blocked_feasibility(_agent):
+            entered.set()
+            assert release.wait(timeout=5)
+
+        def worker(fence: CompressionCommitFence):
+            return compress_context(
+                agent,
+                copy.deepcopy(original),
+                "sys",
+                approx_tokens=500_000,
+                commit_fence=fence,
+            )
+
+        with (
+            patch(
+                "agent.conversation_compression.check_compression_model_feasibility",
+                side_effect=blocked_feasibility,
+            ),
+            patch(
+                "agent.conversation_compression.run_static_compression_fallback",
+                static_fallback,
+            ),
+            patch(
+                "agent.conversation_compression._retry_compression_on_fallback_chain",
+                provider_fallback,
+            ),
+        ):
+            try:
+                result = run_compress_context_with_progress_timeout(
+                    worker=worker,
+                    messages=original,
+                    system_prompt_fallback="fallback",
+                    idle_timeout_seconds=0.2,
+                    total_ceiling_seconds=2.0,
+                    telemetry_agent=agent,
+                )
+            finally:
+                release.set()
+
+        assert entered.is_set()
+        assert result == (original, "fallback")
+        static_fallback.assert_not_called()
+        provider_fallback.assert_not_called()
+
     def test_late_production_worker_cannot_republish_stall_backoff(
         self, tmp_path: Path
     ):
