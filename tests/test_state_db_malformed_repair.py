@@ -321,6 +321,100 @@ def test_fts_write_corruption_repaired_in_place(tmp_path):
     finally:
         db.close()
 
+def _corrupt_fts_segment_dependent(db_path: Path) -> None:
+    """Simulate segment-dependent FTS trigram corruption (#100227).
+
+    The reported on-disk corruption rejects writes into
+    ``messages_fts_trigram_idx`` with a PRIMARY KEY (segid, term) collision
+    only for messages whose trigrams land in the corrupt segment; a probe
+    string whose tokens live in a healthy segment passes. Model that shape
+    with a BEFORE INSERT trigger raising the exact IntegrityError signature
+    for contents carrying a common English trigram, while the legacy fixed
+    probe content passes — the exact blind spot of the single-string health
+    probe.
+    """
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    conn.execute(
+        "CREATE TRIGGER messages_simulated_corrupt_segment "
+        "BEFORE INSERT ON messages WHEN NEW.content LIKE '% the %' "
+        "BEGIN SELECT RAISE(ABORT, "
+        "'UNIQUE constraint failed: "
+        "messages_fts_trigram_idx.segid, messages_fts_trigram_idx.term'); END"
+    )
+    conn.close()
+
+
+def test_segment_dependent_fts_corruption_detected_by_probe(tmp_path):
+    """The multi-variant write probe flags corruption a single fixed string misses.
+
+    Regression for #100227: ``hermes doctor`` / ``sessions repair
+    --check-only`` reported the DB healthy while every real message append
+    failed, because the probe's fixed content never hit the corrupt
+    (segid, term) key range.
+    """
+    from hermes_state import _db_opens_cleanly
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    assert _db_opens_cleanly(db_path) is None  # healthy before
+
+    _corrupt_fts_segment_dependent(db_path)
+
+    # Prove the corruption is content-dependent in the simulated shape: the
+    # legacy fixed probe content still writes fine, a common-English content
+    # fails with the constraint signature — so only a multi-variant probe
+    # can see it.
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        conn.execute("BEGIN")
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES ((SELECT id FROM sessions LIMIT 1), 'user', "
+            "'_fts_health_probe', 0)"
+        )
+        try:
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) "
+                "VALUES ((SELECT id FROM sessions LIMIT 1), 'user', "
+                "'over the lazy dog', 0)"
+            )
+            pytest.fail("simulated corrupt-segment insert unexpectedly succeeded")
+        except sqlite3.IntegrityError as exc:
+            assert "messages_fts_trigram_idx" in str(exc)
+        conn.execute("ROLLBACK")
+    finally:
+        conn.close()
+
+    reason = _db_opens_cleanly(db_path)
+    assert reason is not None
+    assert reason.startswith("fts write probe failed:")
+    assert "messages_fts_trigram_idx" in reason
+
+
+def test_healthy_db_fts_write_probe_leaves_no_residue(tmp_path):
+    """The multi-variant probe is still non-destructive on a healthy DB."""
+    from hermes_state import _db_opens_cleanly
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+
+    assert _db_opens_cleanly(db_path) is None
+
+    # The probe rolled back: no probe session or message rows leaked in.
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        probe_sessions = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE id LIKE '_hermes_fts_health_probe_%'"
+        ).fetchone()[0]
+        probe_messages = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE content LIKE "
+            "'%fts health probe unique token%'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert probe_sessions == 0
+    assert probe_messages == 0
+
 
 
 
