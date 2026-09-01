@@ -624,3 +624,30 @@ describe('GatewayClient websocket attach mode', () => {
     vi.useRealTimers()
   })
 })
+
+describe('heartbeat env overrides (issue #100167)', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs()
+    vi.resetModules()
+  })
+
+  it('reads HERMES_TUI_HEARTBEAT_*_MS from the environment', async () => {
+    vi.resetModules()
+    vi.stubEnv('HERMES_TUI_HEARTBEAT_INTERVAL_MS', '20000')
+    vi.stubEnv('HERMES_TUI_HEARTBEAT_DEAD_MS', '120000')
+    const mod = await import('../gatewayClient.js')
+
+    expect(mod.WS_HEARTBEAT_INTERVAL_MS).toBe(20000)
+    expect(mod.WS_HEARTBEAT_DEAD_MS).toBe(120000)
+  })
+
+  it('falls back to defaults and floors invalid or too-small values', async () => {
+    vi.resetModules()
+    vi.stubEnv('HERMES_TUI_HEARTBEAT_INTERVAL_MS', 'nope')
+    vi.stubEnv('HERMES_TUI_HEARTBEAT_DEAD_MS', '1')
+    const mod = await import('../gatewayClient.js')
+
+    expect(mod.WS_HEARTBEAT_INTERVAL_MS).toBe(15000)
+    expect(mod.WS_HEARTBEAT_DEAD_MS).toBe(15000)
+  })
+})
