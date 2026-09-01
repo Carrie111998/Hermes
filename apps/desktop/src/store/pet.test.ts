@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
+import { $activeGatewayProfile } from '@/store/profile'
 
 import {
   $petActivity,
@@ -10,8 +13,69 @@ import {
   hasPetSpriteForMeta,
   mergePetInfoMeta,
   type PetInfo,
+  petOwner,
+  petProfile,
+  requestPetForOwner,
   setPetActivity
 } from './pet'
+
+describe('pet owner routing', () => {
+  it('follows the exact Bot workspace owner instead of the ambient default profile', () => {
+    $activeGatewayProfile.set('default')
+    setWorkspaceScope('bots', 'jaime-vpn::scout', {
+      kind: 'route',
+      route: {
+        connectionId: 'jaime-vpn',
+        mode: 'remote',
+        profile: 'scout',
+        targetProfile: 'scout'
+      }
+    })
+
+    expect(petProfile()).toBe('scout')
+    expect(petOwner()).toEqual({
+      connectionId: 'jaime-vpn',
+      profile: 'scout',
+      targetProfile: 'scout'
+    })
+
+    setWorkspaceScope('sessions')
+  })
+
+  it('routes a Bot pet RPC through the selected bot connection', async () => {
+    const ambient = vi.fn()
+    const routed = vi.fn(async () => ({ slug: 'cache-capy' }))
+
+    const owner = {
+      connectionId: 'jaime-vpn',
+      profile: 'scout',
+      targetProfile: 'scout'
+    }
+
+    await expect(
+      requestPetForOwner(owner, 'pet.info', { knownRevision: 'old' }, ambient, routed)
+    ).resolves.toEqual({ slug: 'cache-capy' })
+    expect(routed).toHaveBeenCalledWith('jaime-vpn', 'scout', 'pet.info', {
+      knownRevision: 'old',
+      profile: 'scout'
+    })
+    expect(ambient).not.toHaveBeenCalled()
+  })
+
+  it('uses the ambient profile outside an exactly routed Bot workspace', () => {
+    $activeGatewayProfile.set('nightwatch')
+    setWorkspaceScope('bots', 'group:ops', {
+      kind: 'blocked',
+      message: 'Group chats have no single owner.'
+    })
+
+    expect(petProfile()).toBe('nightwatch')
+    expect(petOwner()).toEqual({ profile: 'nightwatch', targetProfile: 'nightwatch' })
+
+    setWorkspaceScope('sessions')
+    $activeGatewayProfile.set('default')
+  })
+})
 
 describe('derivePetState', () => {
   it('rests at idle by default and uses waiting when awaiting input', () => {

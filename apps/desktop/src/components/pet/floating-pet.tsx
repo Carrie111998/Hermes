@@ -2,14 +2,15 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
-import { useOnProfileSwitch } from '@/app/hooks/use-on-profile-switch'
 import { useRouteOverlayActive } from '@/app/hooks/use-route-overlay-active'
 import { PetHeartField } from '@/components/chat/vibe-hearts'
 import { persistString, storedString } from '@/lib/storage'
+import { requestGatewayForAgent } from '@/store/gateway'
 import { $changeEventsAvailable, $petChange } from '@/store/live-sync'
 import {
   $petAtRest,
   $petInfo,
+  $petOwner,
   $petRoam,
   $petRoamDir,
   clearPetUnread,
@@ -17,7 +18,7 @@ import {
   mergePetInfoMeta,
   type PetInfo,
   type PetInfoMeta,
-  petProfile,
+  requestPetForOwner,
   setPetInfo
 } from '@/store/pet'
 import { resetPetGallery, setPetScale } from '@/store/pet-gallery'
@@ -104,6 +105,7 @@ export function FloatingPet() {
   const { resolvedMode } = useTheme()
   const gatewayState = useStore($gatewayState)
   const info = useStore($petInfo)
+  const owner = useStore($petOwner)
   const changeEventsAvailable = useStore($changeEventsAvailable)
   const petChange = useStore($petChange)
   const overlayActive = useStore($petOverlayActive)
@@ -111,6 +113,19 @@ export function FloatingPet() {
   const atRest = useStore($petAtRest)
   const roamDir = useStore($petRoamDir)
   const routeOverlayOpen = useRouteOverlayActive()
+
+  const requestPetGateway = useCallback(
+    <T,>(method: string, params: Record<string, unknown> = {}) =>
+      requestPetForOwner<T>(
+        owner,
+        method,
+        params,
+        (ambientMethod, ambientParams) => requestGateway<T>(ambientMethod, ambientParams),
+        (connectionId, profile, routedMethod, routedParams) =>
+          requestGatewayForAgent<T>(connectionId, profile, routedMethod, routedParams)
+      ),
+    [owner, requestGateway]
+  )
 
   const [position, setPosition] = useState<Point>(loadPosition)
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -158,7 +173,7 @@ export function FloatingPet() {
       try {
         if (active) {
           try {
-            const meta = await requestGateway<PetInfoMeta>('pet.info.meta', { profile: petProfile() })
+            const meta = await requestPetGateway<PetInfoMeta>('pet.info.meta', {})
 
             if (cancelled || !meta) {
               return
@@ -192,9 +207,8 @@ export function FloatingPet() {
         const held = $petInfo.get()
         const knownRevision = held.enabled && held.spritesheetBase64 ? held.spritesheetRevision : undefined
 
-        const next = await requestGateway<PetInfo & { spritesheetUnchanged?: boolean }>('pet.info', {
-          knownRevision,
-          profile: petProfile()
+        const next = await requestPetGateway<PetInfo & { spritesheetUnchanged?: boolean }>('pet.info', {
+          knownRevision
         })
 
         if (!cancelled && next) {
@@ -266,15 +280,15 @@ export function FloatingPet() {
 
       window.clearInterval(timer)
     }
-  }, [gatewayState, active, changeEventsAvailable, petChange, requestGateway])
+  }, [gatewayState, active, changeEventsAvailable, petChange, requestPetGateway])
 
-  // Pets are per-profile. When the active profile changes, drop the previous
-  // profile's mascot + gallery cache so the poll above refetches the new
-  // profile's pet (its config + pets dir resolve per-profile on the backend).
-  useOnProfileSwitch(() => {
+  // Pets follow the exact Bot owner as well as ordinary profile switches. Drop
+  // the prior sprite immediately so a slow remote dial never leaves the default
+  // profile's mascot painted over the selected bot.
+  useEffect(() => {
     setPetInfo({ enabled: false })
     resetPetGallery()
-  })
+  }, [owner])
 
   // Wire the overlay control channel once, only in the primary window — the
   // pop-out overlay belongs to it (main.ts positions it against the main
@@ -409,7 +423,7 @@ export function FloatingPet() {
   // off. The reclamp effect (via `clamp`) still guarantees it stays on-screen.
   const onScale = useCallback(
     (next: number, { clientX, clientY, ratio }: PetZoomAnchor) => {
-      setPetScale(requestGateway, next)
+      setPetScale(requestPetGateway, next)
       setPosition(prev => {
         const at = clampPoint(
           clientX - (clientX - prev.x) * ratio,
@@ -423,7 +437,7 @@ export function FloatingPet() {
         return at
       })
     },
-    [requestGateway, info.frameW, info.frameH]
+    [requestPetGateway, info.frameW, info.frameH]
   )
 
   usePetZoomGesture(containerRef, onScale, active && !overlayActive)
