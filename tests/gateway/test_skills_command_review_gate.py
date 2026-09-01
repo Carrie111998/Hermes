@@ -103,3 +103,12 @@ async def test_review_subcommands_answer_with_pending_state(hermes_home):
     assert "Usage:" in reject and "reject" in reject
     diff = await runner._handle_skills_command(_make_event("/skills diff"))
     assert "Usage: /skills diff <id>" in diff
+
+    approval = await runner._handle_skills_command(_make_event("/skills approval"))
+    assert approval is not None
+    assert "skills.write_approval" in approval
+    assert "Unknown /skills subcommand" not in approval
+    approval_on = await runner._handle_skills_command(_make_event("/skills approval on"))
+    assert "set to 'on'" in approval_on
+    approval_off = await runner._handle_skills_command(_make_event("/skills approval off"))
+    assert "set to 'off'" in approval_off
