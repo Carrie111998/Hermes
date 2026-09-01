@@ -289,6 +289,24 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
+    # A task that has ALREADY been worked is not fresh triage. `started_at` is
+    # set on first claim and never cleared, so it survives every later
+    # transition (review -> changes_requested -> blocked -> triage). Without
+    # this guard, parking an in-flight card in triage as a deliberate
+    # human-decision hold makes the auto-decomposer treat it as a brand-new
+    # request: it re-specifies work that already exists, links the synthetic
+    # children as PARENTS of the original card (inverting the graph), and the
+    # dispatcher then spawns a worker into the same workspace as the real
+    # card. Observed on t_3a7e66e3 (choker-os): 19 runs of finished work,
+    # parked in triage pending an owner decision, fanned out into 3 duplicate
+    # children with one already running against the live artifact.
+    # Rework is routed by the review lifecycle (request-changes / reopen-review),
+    # never by decomposition.
+    if task.started_at is not None:
+        return DecomposeOutcome(
+            task_id, False,
+            "task has prior runs (started_at set); triage is a hold, not fresh intake",
+        )
 
     cfg = _load_config()
     orchestrator = _resolve_orchestrator_profile(cfg)
