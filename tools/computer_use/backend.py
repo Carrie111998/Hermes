@@ -16,7 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 class UIElement:
     """One interactable element on the current screen."""
 
-    index: int                       # 1-based SOM index
+    # Driver-returned SOM index; pass through unchanged.
+    index: int
     role: str                        # AX role (AXButton, AXTextField, ...)
     label: str = ""                  # AXTitle / AXDescription / AXValue snippet
     bounds: Tuple[int, int, int, int] = (0, 0, 0, 0)  # x, y, w, h (logical px)
@@ -213,7 +214,8 @@ class ComputerUseBackend(ABC):
     def set_value(self, value: str, element: Optional[int] = None) -> ActionResult:
         """Set a native value on an element (e.g. AXPopUpButton selection).
 
-        `element` is the 1-based SOM index returned by a prior capture call.
+        `element` is the SOM index returned by a prior capture call. Pass it
+        through unchanged; the driver owns the index base.
         """
 
     # ── Timing ──────────────────────────────────────────────────────
