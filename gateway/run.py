@@ -4608,9 +4608,13 @@ def _requested_reasoning_effort(reasoning_config: Any) -> str:
 def _gateway_turn_runtime_metadata(
     agent: Any,
     *,
-    prompt_tokens_start: Any,
+    uncached_input_tokens_start: Any,
     completion_tokens_start: Any,
+    cache_read_tokens_start: Any,
+    cache_write_tokens_start: Any,
     usage_report_calls_start: Any,
+    cache_usage_report_calls_start: Any,
+    context_usage_report_calls_start: Any,
     result_api_calls: Any,
 ) -> dict[str, Any]:
     """Snapshot final runtime identity and honest reported per-turn usage.
@@ -4624,16 +4628,40 @@ def _gateway_turn_runtime_metadata(
         return {}
 
     compressor = getattr(agent, "context_compressor", None)
-    last_prompt_tokens = getattr(compressor, "last_prompt_tokens", 0) or 0
+    last_prompt_tokens = getattr(agent, "session_last_prompt_tokens", 0) or 0
     context_length = getattr(compressor, "context_length", 0) or 0
     input_tokens = getattr(agent, "session_prompt_tokens", 0) or 0
+    uncached_input_tokens = getattr(agent, "session_input_tokens", 0) or 0
     output_tokens = getattr(agent, "session_completion_tokens", 0) or 0
+    cache_read_tokens = getattr(agent, "session_cache_read_tokens", 0) or 0
+    cache_write_tokens = getattr(agent, "session_cache_write_tokens", 0) or 0
     usage_report_calls = getattr(agent, "session_usage_report_calls", 0) or 0
+    cache_usage_report_calls = (
+        getattr(agent, "session_cache_usage_report_calls", 0) or 0
+    )
+    context_usage_report_calls = (
+        getattr(agent, "session_context_usage_report_calls", 0) or 0
+    )
 
-    turn_input_tokens = _counter_delta(input_tokens, prompt_tokens_start)
+    turn_input_tokens = _counter_delta(
+        uncached_input_tokens,
+        uncached_input_tokens_start,
+    )
     turn_output_tokens = _counter_delta(output_tokens, completion_tokens_start)
+    turn_cache_read_tokens = _counter_delta(
+        cache_read_tokens, cache_read_tokens_start
+    )
+    turn_cache_write_tokens = _counter_delta(
+        cache_write_tokens, cache_write_tokens_start
+    )
     turn_usage_report_calls = _counter_delta(
         usage_report_calls, usage_report_calls_start
+    )
+    turn_cache_usage_report_calls = _counter_delta(
+        cache_usage_report_calls, cache_usage_report_calls_start
+    )
+    turn_context_usage_report_calls = _counter_delta(
+        context_usage_report_calls, context_usage_report_calls_start
     )
     try:
         expected_api_calls = (
@@ -4660,14 +4688,52 @@ def _gateway_turn_runtime_metadata(
         turn_input_tokens = None
         turn_output_tokens = None
 
+    cache_usage_status = None
+    if (
+        isinstance(turn_cache_usage_report_calls, int)
+        and turn_cache_usage_report_calls > 0
+        and turn_cache_read_tokens is not None
+        and turn_cache_write_tokens is not None
+    ):
+        cache_usage_status = "reported"
+        if (
+            expected_api_calls is None
+            or expected_api_calls < 0
+            or turn_cache_usage_report_calls != expected_api_calls
+        ):
+            cache_usage_status = "reported_partial"
+    else:
+        turn_cache_read_tokens = None
+        turn_cache_write_tokens = None
+
+    context_usage_status = None
+    if (
+        isinstance(turn_context_usage_report_calls, int)
+        and turn_context_usage_report_calls > 0
+        and expected_api_calls is not None
+        and expected_api_calls >= 0
+        and turn_context_usage_report_calls == expected_api_calls
+        and last_prompt_tokens > 0
+    ):
+        context_usage_status = "reported"
+
     return {
         "last_prompt_tokens": last_prompt_tokens,
         "input_tokens": input_tokens,
+        "uncached_input_tokens": uncached_input_tokens,
         "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
         "usage_report_calls": usage_report_calls,
+        "cache_usage_report_calls": cache_usage_report_calls,
+        "context_usage_report_calls": context_usage_report_calls,
         "turn_input_tokens": turn_input_tokens,
         "turn_output_tokens": turn_output_tokens,
+        "turn_cache_read_tokens": turn_cache_read_tokens,
+        "turn_cache_write_tokens": turn_cache_write_tokens,
         "token_usage_status": token_usage_status,
+        "cache_usage_status": cache_usage_status,
+        "context_usage_status": context_usage_status,
         "reasoning_effort": _requested_reasoning_effort(
             getattr(agent, "reasoning_config", None)
         ),
@@ -7002,12 +7068,26 @@ class TurnRunner:
         # Cached agents keep cumulative counters across turns. Snapshot them
         # immediately before this turn's model loop so footer usage is a turn
         # delta rather than the full session total.
-        _turn_prompt_tokens_start = getattr(agent, "session_prompt_tokens", 0) or 0
+        _turn_uncached_input_tokens_start = (
+            getattr(agent, "session_input_tokens", 0) or 0
+        )
         _turn_completion_tokens_start = (
             getattr(agent, "session_completion_tokens", 0) or 0
         )
+        _turn_cache_read_tokens_start = (
+            getattr(agent, "session_cache_read_tokens", 0) or 0
+        )
+        _turn_cache_write_tokens_start = (
+            getattr(agent, "session_cache_write_tokens", 0) or 0
+        )
         _turn_usage_report_calls_start = (
             getattr(agent, "session_usage_report_calls", 0) or 0
+        )
+        _turn_cache_usage_report_calls_start = (
+            getattr(agent, "session_cache_usage_report_calls", 0) or 0
+        )
+        _turn_context_usage_report_calls_start = (
+            getattr(agent, "session_context_usage_report_calls", 0) or 0
         )
 
         _approval_session_key = ctx.session_key or ""
@@ -7156,9 +7236,15 @@ class TurnRunner:
         _agent = ctx.agent_holder[0]
         _runtime_metadata = _gateway_turn_runtime_metadata(
             _agent,
-            prompt_tokens_start=_turn_prompt_tokens_start,
+            uncached_input_tokens_start=_turn_uncached_input_tokens_start,
             completion_tokens_start=_turn_completion_tokens_start,
+            cache_read_tokens_start=_turn_cache_read_tokens_start,
+            cache_write_tokens_start=_turn_cache_write_tokens_start,
             usage_report_calls_start=_turn_usage_report_calls_start,
+            cache_usage_report_calls_start=_turn_cache_usage_report_calls_start,
+            context_usage_report_calls_start=(
+                _turn_context_usage_report_calls_start
+            ),
             result_api_calls=(
                 result.get("api_calls") if isinstance(result, dict) else None
             ),
@@ -7169,7 +7255,11 @@ class TurnRunner:
         _context_length = _runtime_metadata.get("context_length", 0)
         _turn_input_toks = _runtime_metadata.get("turn_input_tokens")
         _turn_output_toks = _runtime_metadata.get("turn_output_tokens")
+        _turn_cache_read_toks = _runtime_metadata.get("turn_cache_read_tokens")
+        _turn_cache_write_toks = _runtime_metadata.get("turn_cache_write_tokens")
         _token_usage_status = _runtime_metadata.get("token_usage_status")
+        _cache_usage_status = _runtime_metadata.get("cache_usage_status")
+        _context_usage_status = _runtime_metadata.get("context_usage_status")
         _reasoning_effort = _runtime_metadata.get("reasoning_effort")
         _resolved_model = _runtime_metadata.get("model")
 
@@ -7308,7 +7398,11 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "turn_input_tokens": _turn_input_toks,
                 "turn_output_tokens": _turn_output_toks,
+                "turn_cache_read_tokens": _turn_cache_read_toks,
+                "turn_cache_write_tokens": _turn_cache_write_toks,
                 "token_usage_status": _token_usage_status,
+                "cache_usage_status": _cache_usage_status,
+                "context_usage_status": _context_usage_status,
                 "reasoning_effort": _reasoning_effort,
                 "model": _resolved_model,
                 "context_length": _context_length,
@@ -7393,7 +7487,11 @@ class TurnRunner:
             "output_tokens": _output_toks,
             "turn_input_tokens": _turn_input_toks,
             "turn_output_tokens": _turn_output_toks,
+            "turn_cache_read_tokens": _turn_cache_read_toks,
+            "turn_cache_write_tokens": _turn_cache_write_toks,
             "token_usage_status": _token_usage_status,
+            "cache_usage_status": _cache_usage_status,
+            "context_usage_status": _context_usage_status,
             "reasoning_effort": _reasoning_effort,
             "model": _resolved_model,
             "context_length": _context_length,
@@ -22570,7 +22668,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     turn_seconds=_turn_seconds,
                     tokens_in=agent_result.get("turn_input_tokens"),
                     tokens_out=agent_result.get("turn_output_tokens"),
+                    cache_read_tokens=agent_result.get("turn_cache_read_tokens"),
+                    cache_write_tokens=agent_result.get("turn_cache_write_tokens"),
                     token_usage_status=agent_result.get("token_usage_status"),
+                    cache_usage_status=agent_result.get("cache_usage_status"),
+                    context_usage_status=agent_result.get("context_usage_status"),
                     reasoning_effort=agent_result.get("reasoning_effort"),
                 )
             except Exception as _footer_err:

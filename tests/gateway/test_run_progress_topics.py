@@ -963,8 +963,14 @@ class MissingUsageFooterAgent:
         self.model = "example-model"
         self.reasoning_config = {"enabled": True, "effort": "max"}
         self.session_prompt_tokens = 10_000
+        self.session_input_tokens = 10_000
         self.session_completion_tokens = 500
+        self.session_cache_read_tokens = 0
+        self.session_cache_write_tokens = 0
         self.session_usage_report_calls = 2
+        self.session_cache_usage_report_calls = 2
+        self.session_context_usage_report_calls = 2
+        self.session_last_prompt_tokens = 50_000
         self.context_compressor = SimpleNamespace(
             last_prompt_tokens=50_000,
             context_length=1_000_000,
@@ -982,9 +988,14 @@ class MixedUsageFooterAgent(MissingUsageFooterAgent):
     """A two-call tool loop has usable usage for only one response."""
 
     def run_conversation(self, message, conversation_history=None, task_id=None):
-        self.session_prompt_tokens += 2_500
+        self.session_prompt_tokens += 50_000
+        self.session_input_tokens += 2_500
         self.session_completion_tokens += 400
+        self.session_cache_read_tokens += 47_500
         self.session_usage_report_calls += 1
+        self.session_cache_usage_report_calls += 1
+        self.session_context_usage_report_calls += 1
+        self.session_last_prompt_tokens = 50_000
         return {
             "final_response": "done",
             "messages": [],

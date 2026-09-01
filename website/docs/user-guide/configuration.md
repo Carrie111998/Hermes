@@ -2007,13 +2007,13 @@ Notes:
 
 ### Runtime-metadata footer (gateway only)
 
-When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. It can show the final active model, context-window percentage, turn latency, provider-reported per-turn token usage, Hermes' active reasoning-effort request, and current working directory. Off by default; opt in per-gateway if your team wants every reply to include this provenance.
+When `display.runtime_footer.enabled: true`, Hermes appends a small runtime-context footer to the **final** message of each gateway turn. It can show the final active model, exact last-call context state, turn latency, non-cached turn input, prompt-cache hit ratio, Hermes' active reasoning-effort request, and current working directory. Off by default; opt in per-gateway if your team wants every reply to include this provenance.
 
 ```yaml
 display:
   runtime_footer:
     enabled: true
-    fields: ["model", "reasoning_effort", "tokens_turn", "context_pct", "latency"]
+    fields: ["model", "reasoning_effort", "tokens_turn", "cache_hit", "context_window", "latency"]
 ```
 
 Supported fields:
@@ -2022,19 +2022,21 @@ Supported fields:
 | --- | --- | --- |
 | `model` | Final active model, vendor prefix dropped | `gpt-5.4` |
 | `context_pct` | Last-call context occupancy as a percent | `5%` |
+| `context_window` | Exact last-call used/total context plus percentage | `ctx(last):123.0k/1.0M (12%)` |
 | `latency` | Wall-clock duration of the turn | `22s`, `1m05s` |
 | `cwd` | Home-relative working directory | `~` |
-| `tokens_turn` | Labelled known provider usage for this turn | `tokens(reported):15.9k in/1.2k out` |
+| `tokens_turn` | Labelled non-cached provider input and output for this turn | `tokens(turn,uncached):15.9k in/1.2k out` |
+| `cache_hit` | Prompt cache-read share for this turn | `cache(turn):87%` |
 | `reasoning_effort` | Hermes' active request intent | `effort(req):max` |
 
-The default field set remains `["model", "context_pct", "cwd"]`; all other fields are opt-in. `tokens_turn` labels known provider-reported usage as `reported` or `reported,partial`. If no usable usage report exists, the field is omitted rather than shown as `0 / 0`. `reasoning_effort` is request intent, not a claim about reasoning tokens consumed. Any field whose data is unavailable is skipped silently rather than rendering an empty slot.
+The default field set remains `["model", "context_pct", "cwd"]`; all other fields are opt-in. `tokens_turn` counts the provider's canonical non-cached input bucket and becomes `tokens(turn,uncached,partial)` when only some logical calls report usage. `cache_hit` is `cache-read / (non-cached + cache-read + cache-write)`; it is omitted when cache telemetry is unknown or unreliable. `context_window` is shown only when every logical call in the turn supplied trustworthy full-prompt usage, so a previous value or preflight estimate is never labelled as current. If no usable usage report exists, token fields are omitted rather than shown as `0 / 0`. `reasoning_effort` is request intent, not a claim about reasoning tokens consumed.
 
 The `/footer` slash command toggles this at runtime in any session.
 
 Example footer appended to a Telegram/Discord/Slack reply:
 
 ```
-gpt-5.4 · effort(req):high · tokens(reported):15.9k in/1.2k out · 68% · 42s
+gpt-5.4 · effort(req):high · tokens(turn,uncached):15.9k in/1.2k out · cache(turn):87% · ctx(last):123.0k/1.0M (12%) · 42s
 ```
 
 Only the **final** message of a turn gets the footer; interim updates stay clean.
