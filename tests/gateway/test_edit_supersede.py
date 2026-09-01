@@ -195,6 +195,28 @@ class TestReplaceQueuedMessage:
         assert replaced is True
         assert _session_state(runner, sk).conversation.queued_events[0].text == "edited text"
 
+    def test_replace_one_component_of_batched_simplex_event(self):
+        """Editing the second item in a batch must not erase the first item."""
+        runner = _make_runner()
+        adapter = _make_adapter()
+        sk = "test_session"
+        batched = _make_event(text="first\nsecond", message_id="msg_1")
+        batched.metadata = {
+            "simplex_batch_items": [
+                {"message_id": "msg_1", "text": "first"},
+                {"message_id": "msg_2", "text": "second"},
+            ]
+        }
+        adapter._pending_messages[sk] = batched
+
+        replaced = runner._replace_queued_message(
+            sk, adapter, "msg_2", "corrected second"
+        )
+
+        assert replaced is True
+        assert adapter._pending_messages[sk].text == "first\ncorrected second"
+        assert adapter._pending_messages[sk].message_id == "msg_1"
+
 
 # ===================================================================
 # Tests: _handle_edit_supersede
@@ -390,3 +412,29 @@ class TestHandleEditSupersede:
         assert result is True
         assert adapter._pending_messages[sk].text == "edit that matches both"
         agent.redirect.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_busy_handler_correlates_edit_before_ordinary_busy_policy(self):
+        """Base adapter busy ingress must reach edit supersession directly."""
+        runner = _make_runner()
+        source = _make_source()
+        event = _make_event(
+            text="corrected while active",
+            message_id="msg_inflight",
+            is_edit=True,
+            source=source,
+        )
+        adapter = _make_adapter()
+        runner.adapters[source.platform] = adapter
+        sk = "test_session"
+        agent = _make_running_agent(supports_redirect=True)
+        state = _session_state(runner, sk)
+        state.turn.agent = agent
+        state.turn.active_message_id = "msg_inflight"
+
+        handled = await runner._handle_active_session_busy_message(event, sk)
+
+        assert handled is True
+        agent.redirect.assert_called_once()
+        assert "corrected while active" in agent.redirect.call_args.args[0]
+        adapter._send_with_retry.assert_not_awaited()

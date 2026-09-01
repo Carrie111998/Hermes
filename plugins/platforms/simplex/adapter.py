@@ -49,6 +49,7 @@ is present, so the gateway will not attempt to instantiate the adapter.
 
 import asyncio
 import base64
+import copy
 import json
 import logging
 import os
@@ -153,6 +154,8 @@ def _response_error(resp: Optional[dict]) -> Optional[str]:
     if not isinstance(resp, dict):
         return "SimpleX daemon did not answer"
     resp_type = _response_type(resp)
+    if resp_type == "localCommandOutcomeUnknown":
+        return str(resp.get("error") or "SimpleX command outcome is unknown")[:1000]
     if resp_type not in {"chatCmdError", "chatError", "chatErrors"}:
         return None
     detail = resp.get("chatError") or resp.get("chatErrors") or resp
@@ -220,6 +223,20 @@ class SimplexAdapter(BasePlatformAdapter):
         # exposes only a setter, not a query API. Mirror the non-secret path in
         # config so downstream media consumers always receive openable paths.
         self.files_folder = str(extra.get("files_folder", "") or "")
+        self._file_transfer_timeout = max(
+            1.0, float(extra.get("file_transfer_timeout", 300.0))
+        )
+
+        allow_entries = _parse_comma_list(os.getenv("SIMPLEX_ALLOWED_USERS", ""))
+        ignored_allow_entries = [
+            entry for entry in allow_entries if entry != "*" and not entry.isdigit()
+        ]
+        if ignored_allow_entries:
+            logger.warning(
+                "SimpleX: %d non-numeric SIMPLEX_ALLOWED_USERS entries are "
+                "ignored; migrate to stable contactIds from /contacts",
+                len(ignored_allow_entries),
+            )
 
         # Group allowlist. Without ``SIMPLEX_GROUP_ALLOWED``, group messages
         # are ignored entirely (safer default — a bot in a group otherwise
@@ -246,6 +263,7 @@ class SimplexAdapter(BasePlatformAdapter):
         # when a newChatItems event carries an unfinished rcvFileTransfer,
         # consumed when the file finishes downloading.
         self._pending_file_transfers: Dict[int, dict] = {}
+        self._file_transfer_tasks: Dict[int, asyncio.Task] = {}
 
         # Correlation tracking for ``_send_command``. Separate from
         # ``_pending_corr_ids`` (which is the upstream cosmetic echo filter)
@@ -253,6 +271,7 @@ class SimplexAdapter(BasePlatformAdapter):
         self._pending_responses: Dict[str, asyncio.Future] = {}
         self._corr_counter = 0
         self._command_tasks: set[asyncio.Task] = set()
+        self._dispatch_tasks: set[asyncio.Task] = set()
 
         # Bounded, non-secret runtime diagnostics. The details are also logged;
         # these counters make health checks useful without scraping prose.
@@ -261,6 +280,9 @@ class SimplexAdapter(BasePlatformAdapter):
             "async_errors": 0,
             "reconnects": 0,
             "send_failures": 0,
+            "file_rejections": 0,
+            "file_failures": 0,
+            "file_timeouts": 0,
         }
 
         # Direct-message reaction approvals. State is intentionally ephemeral:
@@ -376,6 +398,23 @@ class SimplexAdapter(BasePlatformAdapter):
         if self._command_tasks:
             await asyncio.gather(*self._command_tasks, return_exceptions=True)
         self._command_tasks.clear()
+
+        for task in list(self._dispatch_tasks):
+            if not task.done():
+                task.cancel()
+        if self._dispatch_tasks:
+            await asyncio.gather(*self._dispatch_tasks, return_exceptions=True)
+        self._dispatch_tasks.clear()
+
+        for task in list(self._file_transfer_tasks.values()):
+            if not task.done():
+                task.cancel()
+        if self._file_transfer_tasks:
+            await asyncio.gather(
+                *self._file_transfer_tasks.values(), return_exceptions=True
+            )
+        self._file_transfer_tasks.clear()
+        self._pending_file_transfers.clear()
         self._ws_ready.clear()
         self._approval_prompts_by_item.clear()
         self._approval_prompt_by_session.clear()
@@ -537,9 +576,18 @@ class SimplexAdapter(BasePlatformAdapter):
             rcv_file = resp.get("rcvFileTransfer", {}) or {}
             file_id = rcv_file.get("fileId") if isinstance(rcv_file, dict) else None
             if file_id is not None:
+                file_id = int(file_id)
                 wrapper = self._normalize_chat_item_wrapper(resp.get("chatItem", {}))
-                if wrapper:
-                    self._pending_file_transfers.setdefault(file_id, wrapper)
+                if not wrapper:
+                    wrapper = self._pending_file_transfers.get(file_id, {})
+                if not wrapper or not self._file_sender_is_authorized(wrapper):
+                    self._diagnostics["file_rejections"] += 1
+                    logger.warning(
+                        "SimpleX: refusing file %s before sender authorization",
+                        file_id,
+                    )
+                    return
+                self._track_pending_file(file_id, wrapper)
                 inner = wrapper.get("chatItem", {}) if wrapper else {}
                 file_info = inner.get("file", {}) if isinstance(inner, dict) else {}
                 file_name = (
@@ -602,14 +650,40 @@ class SimplexAdapter(BasePlatformAdapter):
                 logger.exception("SimpleX: error processing reaction event")
             return
 
+        if resp_type in {"rcvFileSndCancelled", "rcvFileError"}:
+            wrapper = self._normalize_chat_item_wrapper(
+                resp.get("chatItem") or resp.get("chatItem_") or {}
+            )
+            rcv_file = resp.get("rcvFileTransfer", {}) or {}
+            raw_file_id = (
+                rcv_file.get("fileId") if isinstance(rcv_file, dict) else None
+            )
+            file_id = self._file_id_from_wrapper(wrapper)
+            if file_id is None and raw_file_id is not None:
+                try:
+                    file_id = int(raw_file_id)
+                except (TypeError, ValueError):
+                    file_id = None
+            if file_id is not None:
+                if wrapper and file_id not in self._pending_file_transfers:
+                    self._pending_file_transfers[file_id] = wrapper
+                await self._fail_file_transfer(file_id, resp_type)
+            return
+
         # File transfer completion — deliver any deferred chat item
         if resp_type == "rcvFileComplete":
-            chat_item = resp.get("chatItem", {}) or {}
+            chat_item = self._normalize_chat_item_wrapper(
+                resp.get("chatItem", {}) or {}
+            )
             chat_item_data = chat_item.get("chatItem", {}) or {}
             file_info = chat_item_data.get("file", {}) or {}
-            file_id = file_info.get("fileId") if isinstance(file_info, dict) else None
-            if file_id is not None and file_id in self._pending_file_transfers:
-                pending = self._pending_file_transfers.pop(file_id)
+            file_id = self._file_id_from_wrapper(chat_item)
+            if file_id is not None:
+                pending = self._pending_file_transfers.pop(file_id, None) or chat_item
+                self._cancel_file_timeout(file_id)
+                if not self._file_sender_is_authorized(pending):
+                    self._diagnostics["file_rejections"] += 1
+                    return
                 file_source = file_info.get("fileSource", {}) or {}
                 file_path = (
                     file_source.get("filePath")
@@ -678,6 +752,110 @@ class SimplexAdapter(BasePlatformAdapter):
 
         return payload
 
+    @staticmethod
+    def _file_id_from_wrapper(wrapper: dict) -> Optional[int]:
+        normalized = SimplexAdapter._normalize_chat_item_wrapper(wrapper)
+        inner = normalized.get("chatItem", {}) if normalized else {}
+        file_info = inner.get("file", {}) if isinstance(inner, dict) else {}
+        raw_id = file_info.get("fileId") if isinstance(file_info, dict) else None
+        try:
+            return int(raw_id) if raw_id is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _file_sender_context(
+        self, wrapper: dict
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Return ``(user_id, chat_type, chat_id)`` for an attachment event."""
+        normalized = self._normalize_chat_item_wrapper(wrapper)
+        chat_info = normalized.get("chatInfo", {}) if normalized else {}
+        inner = normalized.get("chatItem", {}) if normalized else {}
+        chat_dir = inner.get("chatDir", {}) if isinstance(inner, dict) else {}
+        chat_type = chat_info.get("type") if isinstance(chat_info, dict) else None
+        if chat_type == "direct":
+            contact = chat_info.get("contact", {}) or {}
+            contact_id = contact.get("contactId")
+            user_id = str(contact_id) if contact_id is not None else None
+            return user_id, "dm", user_id
+        if chat_type == "group":
+            group = chat_info.get("groupInfo", {}) or {}
+            group_id = group.get("groupId")
+            member = chat_dir.get("groupMember", {}) if isinstance(chat_dir, dict) else {}
+            member_id = member.get("memberId") if isinstance(member, dict) else None
+            user_id = str(member_id) if member_id is not None else None
+            chat_id = f"group:{group_id}" if group_id is not None else None
+            if (
+                group_id is None
+                or not self.group_allow_from
+                or (
+                    "*" not in self.group_allow_from
+                    and str(group_id) not in self.group_allow_from
+                )
+            ):
+                return user_id, "group", None
+            return user_id, "group", chat_id
+        return None, None, None
+
+    def _file_sender_is_authorized(self, wrapper: dict) -> bool:
+        user_id, chat_type, chat_id = self._file_sender_context(wrapper)
+        if not user_id or not chat_id:
+            return False
+        return self._is_sender_authorized(user_id, chat_type, chat_id) is True
+
+    def _cancel_file_timeout(self, file_id: int) -> None:
+        task = self._file_transfer_tasks.pop(file_id, None)
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    def _track_pending_file(self, file_id: int, wrapper: dict) -> None:
+        self._pending_file_transfers[file_id] = wrapper
+        existing = self._file_transfer_tasks.get(file_id)
+        if existing and not existing.done():
+            return
+        task = asyncio.create_task(self._expire_file_transfer(file_id))
+        self._file_transfer_tasks[file_id] = task
+
+        def _done(done: asyncio.Task) -> None:
+            if self._file_transfer_tasks.get(file_id) is done:
+                self._file_transfer_tasks.pop(file_id, None)
+            if not done.cancelled():
+                try:
+                    done.result()
+                except Exception:
+                    logger.exception("SimpleX: file-transfer expiry task failed")
+
+        task.add_done_callback(_done)
+
+    async def _dispatch_file_fallback(self, wrapper: dict, reason: str) -> None:
+        """Deliver an authorized file caption without an unavailable attachment."""
+        fallback = copy.deepcopy(self._normalize_chat_item_wrapper(wrapper))
+        inner = fallback.get("chatItem", {}) if fallback else {}
+        if not isinstance(inner, dict):
+            return
+        inner.pop("file", None)
+        content = inner.get("content", {}) or {}
+        msg_content = content.get("msgContent", {}) if isinstance(content, dict) else {}
+        text = msg_content.get("text", "") if isinstance(msg_content, dict) else ""
+        if not text:
+            return
+        logger.info("SimpleX: delivering file caption without attachment (%s)", reason)
+        await self._handle_chat_item(fallback)
+
+    async def _expire_file_transfer(self, file_id: int) -> None:
+        await asyncio.sleep(self._file_transfer_timeout)
+        wrapper = self._pending_file_transfers.pop(file_id, None)
+        if not wrapper:
+            return
+        self._diagnostics["file_timeouts"] += 1
+        await self._dispatch_file_fallback(wrapper, "transfer timed out")
+
+    async def _fail_file_transfer(self, file_id: int, reason: str) -> None:
+        wrapper = self._pending_file_transfers.pop(file_id, None)
+        self._cancel_file_timeout(file_id)
+        self._diagnostics["file_failures"] += 1
+        if wrapper:
+            await self._dispatch_file_fallback(wrapper, reason)
+
     async def _accept_contact_request(self, request_id: str) -> None:
         resp = await self._send_command(f"/_accept {request_id}", timeout=30.0)
         error = _response_error(resp)
@@ -691,12 +869,14 @@ class SimplexAdapter(BasePlatformAdapter):
         )
         error = _response_error(resp)
         if error or _response_type(resp) == "rcvFileAcceptedSndCancelled":
-            self._pending_file_transfers.pop(file_id, None)
             self._diagnostics["command_errors"] += 1
             logger.warning(
                 "SimpleX: file %s receive failed: %s",
                 file_id,
                 error or "sender cancelled",
+            )
+            await self._fail_file_transfer(
+                file_id, error or "sender cancelled during acceptance"
             )
 
     def _resolve_file_path(self, file_path: str) -> str:
@@ -821,14 +1001,30 @@ class SimplexAdapter(BasePlatformAdapter):
                 not file_path
                 or file_status_type not in (None, "rcvComplete")
             ):
-                logger.info(
-                    "SimpleX: file %d pending descriptor/completion",
-                    file_id,
-                )
-                self._pending_file_transfers[file_id] = chat_item
-                return
+                try:
+                    normalized_file_id = int(file_id)
+                except (TypeError, ValueError):
+                    normalized_file_id = None
+                if (
+                    normalized_file_id is None
+                    or not self._file_sender_is_authorized(chat_item)
+                ):
+                    self._diagnostics["file_rejections"] += 1
+                    logger.warning(
+                        "SimpleX: refusing pending file before sender authorization"
+                    )
+                    if not text:
+                        return
+                    file_info = None
+                else:
+                    logger.info(
+                        "SimpleX: file %d pending descriptor/completion",
+                        normalized_file_id,
+                    )
+                    self._track_pending_file(normalized_file_id, chat_item)
+                    return
 
-            if file_path:
+            if file_info and file_path:
                 ext = Path(file_name).suffix.lower() or Path(file_path).suffix.lower()
                 if not _is_image_ext(ext) and not _is_audio_ext(ext):
                     try:
@@ -935,12 +1131,14 @@ class SimplexAdapter(BasePlatformAdapter):
         # Batch consecutive text messages so the agent sees one combined
         # message instead of dropping earlier ones when the user pastes
         # several lines in quick succession.
+        if is_edit and self._replace_pending_batch_edit(msg_event):
+            return
         if is_edit:
-            await self.handle_message(msg_event)
+            self._spawn_dispatch_task(self.handle_message(msg_event))
         elif msg_type == MessageType.TEXT and text:
             self._enqueue_text_event(msg_event)
         else:
-            await self.handle_message(msg_event)
+            self._spawn_dispatch_task(self.handle_message(msg_event))
 
     # ------------------------------------------------------------------
     # Text message batching
@@ -961,6 +1159,11 @@ class SimplexAdapter(BasePlatformAdapter):
         """Buffer a text event and reset the flush timer."""
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
+        event.metadata = dict(event.metadata or {})
+        event.metadata.setdefault(
+            "simplex_batch_items",
+            [{"message_id": event.message_id, "text": event.text or ""}],
+        )
         if existing is None:
             self._pending_text_batches[key] = event
         else:
@@ -968,6 +1171,10 @@ class SimplexAdapter(BasePlatformAdapter):
                 existing.text = (
                     f"{existing.text}\n{event.text}" if existing.text else event.text
                 )
+            existing.metadata = dict(existing.metadata or {})
+            existing.metadata.setdefault("simplex_batch_items", []).extend(
+                event.metadata["simplex_batch_items"]
+            )
             if event.media_urls:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -978,6 +1185,33 @@ class SimplexAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
+
+    def _replace_pending_batch_edit(self, event: MessageEvent) -> bool:
+        """Supersede a SimpleX text item still inside the quiet-period batch."""
+        key = self._text_batch_key(event)
+        pending = self._pending_text_batches.get(key)
+        if pending is None or not event.message_id:
+            return False
+        items = (pending.metadata or {}).get("simplex_batch_items", [])
+        if not isinstance(items, list):
+            return False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("message_id")) != str(event.message_id):
+                continue
+            item["text"] = event.text or ""
+            pending.text = "\n".join(
+                str(component.get("text", ""))
+                for component in items
+                if isinstance(component, dict)
+            )
+            logger.info(
+                "SimpleX: superseded batched message item_id=%s",
+                event.message_id,
+            )
+            return True
+        return False
 
     async def _flush_text_batch(self, key: str) -> None:
         """Wait for the quiet period then dispatch the aggregated text."""
@@ -1064,14 +1298,20 @@ class SimplexAdapter(BasePlatformAdapter):
             return result
         except asyncio.TimeoutError:
             logger.warning("SimpleX: command timed out: %s", command.split(" ", 1)[0])
-            return None
+            return {
+                "type": "localCommandOutcomeUnknown",
+                "error": "SimpleX daemon confirmation timed out; delivery may have occurred",
+            }
         except Exception as e:
             logger.warning(
                 "SimpleX: command failed: %s — %s",
                 command.split(" ", 1)[0],
                 e,
             )
-            return None
+            return {
+                "type": "localCommandOutcomeUnknown",
+                "error": "SimpleX connection failed after command submission; delivery outcome is unknown",
+            }
         finally:
             self._pending_responses.pop(corr_id, None)
             self._pending_corr_ids.discard(corr_id)
@@ -1089,6 +1329,23 @@ class SimplexAdapter(BasePlatformAdapter):
                 done.result()
             except Exception:
                 logger.exception("SimpleX: background command task failed")
+
+        task.add_done_callback(_done)
+        return task
+
+    def _spawn_dispatch_task(self, coroutine) -> asyncio.Task:
+        """Dispatch inbound work without ever blocking the WebSocket reader."""
+        task = asyncio.create_task(coroutine)
+        self._dispatch_tasks.add(task)
+
+        def _done(done: asyncio.Task) -> None:
+            self._dispatch_tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                done.result()
+            except Exception:
+                logger.exception("SimpleX: background message dispatch failed")
 
         task.add_done_callback(_done)
         return task
@@ -1131,6 +1388,14 @@ class SimplexAdapter(BasePlatformAdapter):
         error = _response_error(resp)
         if error:
             self._diagnostics["command_errors"] += 1
+            if _response_type(resp) == "localCommandOutcomeUnknown":
+                return SendResult(
+                    success=False,
+                    error=error,
+                    error_kind="delivery_unknown",
+                    retryable=False,
+                    raw_response=resp,
+                )
             kind, retryable = self._error_kind(error)
             return SendResult(
                 success=False,
@@ -1241,6 +1506,8 @@ class SimplexAdapter(BasePlatformAdapter):
                 if not result.success:
                     result.message_id = delivered_ids[-1] if delivered_ids else None
                     if delivered_ids:
+                        result.error_kind = "partial_delivery"
+                        result.retryable = False
                         result.raw_response = {
                             "partial_delivery": True,
                             "delivered_message_ids": tuple(delivered_ids),
@@ -1257,7 +1524,18 @@ class SimplexAdapter(BasePlatformAdapter):
             else:
                 media_result = await self.send_document(chat_id, path)
             if not media_result.success:
+                if delivered_ids:
+                    media_result.message_id = delivered_ids[-1]
+                    media_result.error_kind = "partial_delivery"
+                    media_result.retryable = False
+                    media_result.raw_response = {
+                        "partial_delivery": True,
+                        "delivered_message_ids": tuple(delivered_ids),
+                        "daemon_response": media_result.raw_response,
+                    }
                 return media_result
+            if media_result.message_id:
+                delivered_ids.append(media_result.message_id)
         return SendResult(
             success=True,
             message_id=delivered_ids[-1] if delivered_ids else None,
@@ -1573,6 +1851,8 @@ class SimplexAdapter(BasePlatformAdapter):
                     continuation_ids[-1] if continuation_ids else str(message_id)
                 )
                 continuation.continuation_message_ids = tuple(continuation_ids)
+                continuation.error_kind = "partial_delivery"
+                continuation.retryable = False
                 continuation.raw_response = {
                     "partial_overflow": True,
                     "delivered_chunks": 1 + len(continuation_ids),
@@ -1671,6 +1951,7 @@ class SimplexAdapter(BasePlatformAdapter):
         self._sweep_approval_prompts(now)
         is_dm = not str(chat_id).startswith("group:")
         existing_id = self._approval_prompt_by_session.get(session_key)
+        superseded_prior = bool(existing_id)
         typed_only = self._approval_typed_only_until.get(session_key, 0.0) > now
 
         if existing_id:
@@ -1687,6 +1968,11 @@ class SimplexAdapter(BasePlatformAdapter):
             smart_denied=smart_denied,
             reactions=reaction_lane,
         )
+        if superseded_prior:
+            text = (
+                "The earlier approval prompt was superseded; its reactions no "
+                "longer apply. Use the typed choices below.\n\n" + text
+            )
         result = await self.send(chat_id, text, metadata=metadata)
         if not result.success or not result.message_id or not reaction_lane:
             if not result.success or not result.message_id:
@@ -1781,11 +2067,15 @@ class SimplexAdapter(BasePlatformAdapter):
         chat_type = chat_info.get("type", "")
         chat_dir = reaction.get("chatDir", {}) or {}
         if chat_type == "direct":
+            if not isinstance(chat_dir, dict) or chat_dir.get("type") != "directRcv":
+                return None
             contact = chat_info.get("contact", {}) or {}
             chat_id = str(contact.get("contactId", ""))
             user_id = chat_id
             user_name = contact.get("localDisplayName", "")
         elif chat_type == "group":
+            if not isinstance(chat_dir, dict) or chat_dir.get("type") != "groupRcv":
+                return None
             group = chat_info.get("groupInfo", {}) or {}
             chat_id = f"group:{group.get('groupId', '')}"
             member = chat_dir.get("groupMember", {}) if isinstance(chat_dir, dict) else {}

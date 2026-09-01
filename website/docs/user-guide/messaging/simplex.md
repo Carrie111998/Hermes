@@ -1,6 +1,6 @@
 # SimpleX Chat
 
-[SimpleX Chat](https://simplex.chat/) is a private, decentralised messaging platform where users own their contacts and groups. Unlike other platforms, SimpleX assigns no persistent user IDs — every contact is identified by an opaque internal ID generated at connection time, which makes it one of the most private messengers available.
+[SimpleX Chat](https://simplex.chat/) is a private, decentralised messaging platform where users own their contacts and groups. SimpleX has no global user identifiers; the local daemon assigns each connection an opaque numeric `contactId`. Hermes uses that identity-local, rename-stable ID for authorization.
 
 > Run `hermes gateway setup` and pick **SimpleX** for a guided walk-through.
 
@@ -52,23 +52,25 @@ SIMPLEX_HOME_CHANNEL=<contact-id>
 | Variable | Required | Description |
 |---|---|---|
 | `SIMPLEX_WS_URL` | Yes | WebSocket URL of the simplex-chat daemon |
-| `SIMPLEX_ALLOWED_USERS` | Recommended | Comma-separated allowlist. Each entry can be a numeric `contactId` **or** a display name — both forms work. |
+| `SIMPLEX_ALLOWED_USERS` | Recommended | Comma-separated numeric `contactId` allowlist. Display names are mutable labels and are not authorization identities. |
 | `SIMPLEX_ALLOW_ALL_USERS` | Optional | Set `true` to allow every contact (use carefully) |
 | `SIMPLEX_AUTO_ACCEPT` | Optional | Auto-accept incoming contact requests (default: `true`) |
 | `SIMPLEX_GROUP_ALLOWED` | Optional | Comma-separated group IDs the bot participates in, or `*` for any group. Omit to ignore group messages entirely |
 | `SIMPLEX_HOME_CHANNEL` | Optional | Default contact/group ID for cron job delivery |
 | `SIMPLEX_HOME_CHANNEL_NAME` | Optional | Human label for the home channel |
 | `HERMES_SIMPLEX_TEXT_BATCH_DELAY` | Optional | Quiet-period seconds (default: `0.8`) used to concatenate rapid-fire inbound text messages into one event |
+| `platforms.simplex.extra.files_folder` | Optional | Absolute daemon `--files-folder` path used to resolve relative received-file paths |
+| `platforms.simplex.extra.file_transfer_timeout` | Optional | Seconds before a stalled inbound transfer is discarded and its caption is delivered without the attachment (default: `300`) |
 
-## Find your contact ID or display name
+## Find your contact ID
 
-After starting the daemon, open a conversation with your agent contact. The numeric `contactId` appears in session logs. If you'd rather use the display name shown in the SimpleX UI, that works too — `SIMPLEX_ALLOWED_USERS` accepts either form.
+After starting the daemon, open a conversation with your agent contact and run `/contacts` in the SimpleX CLI. Copy the numeric `contactId`. A display name shown in the UI may be renamed or collide with another contact, so Hermes deliberately ignores display-name entries in `SIMPLEX_ALLOWED_USERS` and logs a migration warning.
 
 ## Authorization
 
 By default **all contacts are denied**. You must either:
 
-1. Set `SIMPLEX_ALLOWED_USERS` to a comma-separated list of `contactId`s and/or display names (e.g. `SIMPLEX_ALLOWED_USERS=4,alice` matches either contactId 4 or the contact whose display name is "alice"), or
+1. Set `SIMPLEX_ALLOWED_USERS` to a comma-separated list of numeric `contactId`s (for example, `SIMPLEX_ALLOWED_USERS=4,7`), or
 2. Use **DM pairing** — send any message to the bot and it will reply with a pairing code. Enter that code via `hermes pairing approve simplex <CODE>`.
 
 ## Group chats
@@ -91,7 +93,7 @@ SimpleX works as a standalone send target — the daemon must be running,
 but a live gateway is not required for plain text:
 
 ```bash
-hermes send --to simplex:alice "hello"          # DM by contact display name
+hermes send --to simplex:4 "hello"              # DM by numeric contactId
 hermes send --to simplex:group:12 "hello"       # group by numeric ID
 hermes send --to simplex "hello"                # SIMPLEX_HOME_CHANNEL
 ```
@@ -106,10 +108,12 @@ hint — direct targets like the ones above work regardless.
 
 The adapter supports native SimpleX attachments in both directions:
 
-- **Inbound** — incoming images, voice notes, and files are accepted via
+- **Inbound** — attachments from authorized senders are accepted via
   the daemon's XFTP flow (`rcvFileDescrReady` → `/freceive` → wait for
   `rcvFileComplete`) and surfaced as `MessageEvent.media_urls` with the
-  appropriate `MessageType` (`PHOTO`, `VOICE`, `TEXT` + document).
+  appropriate `MessageType` (`PHOTO`, `VOICE`, or `DOCUMENT`). Unknown senders
+  cannot trigger a download. Cancelled, failed, or timed-out transfers release
+  their state and preserve any text caption without presenting a missing file.
 - **Outbound** — `send_image_file`, `send_voice`, `send_document`, and
   `send_video` all use the structured `/_send` form with `filePath`, so
   the receiving SimpleX client renders images inline and plays voice

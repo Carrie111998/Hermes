@@ -9886,20 +9886,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Modeled on ``_clear_goal_pending_continuations`` (same two-level
         search pattern).
         """
+        def _replace_event(event: Any) -> bool:
+            metadata = getattr(event, "metadata", None) or {}
+            components = metadata.get("simplex_batch_items", [])
+            if isinstance(components, list):
+                for component in components:
+                    if not isinstance(component, dict):
+                        continue
+                    if str(component.get("message_id")) != str(message_id):
+                        continue
+                    component["text"] = new_text
+                    event.text = "\n".join(
+                        str(item.get("text", ""))
+                        for item in components
+                        if isinstance(item, dict)
+                    )
+                    return True
+            if getattr(event, "message_id", None) == message_id:
+                event.text = new_text
+                return True
+            return False
+
         # Primary slot
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if isinstance(pending_slot, dict):
             pending_event = pending_slot.get(session_key)
-            if pending_event is not None and getattr(pending_event, "message_id", None) == message_id:
-                pending_event.text = new_text
+            if pending_event is not None and _replace_event(pending_event):
                 return True
 
         # Overflow FIFO
         _q_state = self._peek_session_state(session_key)
         overflow = _q_state.conversation.queued_events if _q_state else []
         for ev in overflow:
-            if getattr(ev, "message_id", None) == message_id:
-                ev.text = new_text
+            if _replace_event(ev):
                 return True
 
         return False
@@ -11152,6 +11171,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             return True  # handled (silently dropped); do not fall through
+
+        # Edits must supersede the matching queued or in-flight message before
+        # ordinary busy-mode redirect/queue logic sees them. Base adapters call
+        # this busy handler instead of the cold ``_handle_message`` path, so
+        # leaving correlation only there makes the feature unreachable during
+        # the exact active-turn window it is designed for.
+        edit_adapter = self._adapter_for_source(event.source)
+        if edit_adapter is not None and self._handle_edit_supersede(
+            event, session_key, edit_adapter
+        ):
+            return True
 
         effective_mode = self._effective_busy_input_mode(event.source)
 

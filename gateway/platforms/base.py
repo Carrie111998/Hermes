@@ -5785,6 +5785,14 @@ class BasePlatformAdapter(ABC):
         if result.success:
             return result
 
+        # A transport that has already delivered part of a split response, or
+        # lost the acknowledgement after submitting a command, cannot safely
+        # retry or fall back with the full content: either path duplicates
+        # messages the user may already have received. Preserve the adapter's
+        # explicit outcome and let the caller/operator decide whether to resend.
+        if result.error_kind in {"partial_delivery", "delivery_unknown"}:
+            return result
+
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
