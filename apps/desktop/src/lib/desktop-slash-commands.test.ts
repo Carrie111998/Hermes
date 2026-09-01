@@ -296,6 +296,7 @@ describe('desktop slash command curation', () => {
       { text: 'diff <id>' },
       { text: 'approval' }
     ]
+
     const allowed = ['pending', 'approve <id>', 'reject', 'diff <id>', 'approval']
 
     expect(filterDesktopSubcommandCompletions(' /skills ', hubItems).map(item => item.text)).toEqual(allowed)
