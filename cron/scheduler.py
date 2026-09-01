@@ -723,6 +723,7 @@ from cron.jobs import (
     heartbeat_run_claim,
     mark_job_run,
     save_job_output,
+    update_job,
     use_cron_store,
 )
 from cron.executions import create_execution, finish_execution, mark_execution_running
@@ -3061,6 +3062,50 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+def _record_delivery_receipt(
+    job: dict,
+    platform_name: str,
+    chat_id: str,
+    configured_thread_id: Optional[str],
+    send_result: Any,
+) -> None:
+    """Persist safe identifiers for a confirmed *text* delivery, never payloads.
+
+    This lets automation link a just-created Slack discussion to an external
+    artifact without depending on the bot receiving its own outbound message.
+    A root message is its own Slack thread anchor; replies retain their parent.
+    Attachment-only sends do not currently create receipts. ``thread_id`` is a
+    platform-routing identifier: on non-Slack platforms consumers must treat it
+    as opaque rather than assume it names a discussion thread.
+    """
+    if isinstance(send_result, dict):
+        message_id = send_result.get("message_id")
+        raw = send_result.get("raw_response")
+    else:
+        message_id = getattr(send_result, "message_id", None)
+        raw = getattr(send_result, "raw_response", None)
+    if not message_id and isinstance(raw, dict):
+        message_id = raw.get("ts") or (raw.get("message") or {}).get("ts")
+    if not message_id:
+        return
+    thread_id = configured_thread_id
+    if isinstance(raw, dict):
+        thread_id = raw.get("thread_ts") or (raw.get("message") or {}).get("thread_ts") or thread_id
+    receipt = {
+        "platform": str(platform_name),
+        "chat_id": str(chat_id),
+        "message_id": str(message_id),
+        "thread_id": str(thread_id or message_id),
+    }
+    receipts = job.setdefault("_delivery_receipts", [])
+    if receipt not in receipts:
+        receipts.append(receipt)
+        # One job has one active delivery attempt: claim_job_for_fire() fences
+        # concurrent fires before they reach _deliver_result. update_job's lock
+        # then serializes this persistence with other job-store mutations.
+        update_job(job["id"], {"last_delivery_receipts": receipts})
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -3073,6 +3118,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     Returns None on success, or an error string on failure.
     """
     targets = _resolve_delivery_targets(job)
+    # Receipts describe this run only. Keep the working copy local until a
+    # confirmed provider response supplies a safe message identifier.
+    job.pop("_delivery_receipts", None)
+    update_job(job["id"], {"last_delivery_receipts": []})
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
@@ -3668,6 +3717,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 )
                                 logger.warning("Job '%s': %s", job["id"], msg)
                                 delivery_errors.append(msg)
+                            else:
+                                _record_delivery_receipt(
+                                    job, platform_name, chat_id, thread_id, send_result,
+                                )
 
                 # Send extracted media files as native attachments via the live
                 # adapter, using the same DM-topic-aware routing as the text send
@@ -3905,6 +3958,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
 
+            _record_delivery_receipt(
+                job, platform_name, chat_id, thread_id, result,
+            )
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,

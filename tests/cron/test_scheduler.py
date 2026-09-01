@@ -340,6 +340,49 @@ class TestRoutingIntents:
         assert "matrix" not in platforms
 
 
+class TestDeliveryReceipts:
+    """Cron stores only provider routing identifiers, not outbound content."""
+
+    def test_records_slack_root_message_as_its_own_thread(self):
+        from cron.scheduler import _record_delivery_receipt
+
+        job = {"id": "receipt-job"}
+        sent = MagicMock(
+            message_id="1787612400.000100",
+            raw_response={"ts": "1787612400.000100", "text": "must not persist"},
+        )
+        with patch("cron.scheduler.update_job") as update:
+            _record_delivery_receipt(job, "slack", "C123", None, sent)
+
+        assert job["_delivery_receipts"] == [{
+            "platform": "slack",
+            "chat_id": "C123",
+            "message_id": "1787612400.000100",
+            "thread_id": "1787612400.000100",
+        }]
+        update.assert_called_once_with("receipt-job", {
+            "last_delivery_receipts": job["_delivery_receipts"],
+        })
+
+    def test_records_parent_thread_for_a_reply(self):
+        from cron.scheduler import _record_delivery_receipt
+
+        job = {"id": "reply-receipt-job"}
+        result = {
+            "message_id": "1787612401.000200",
+            "raw_response": {"ts": "1787612401.000200", "thread_ts": "1787612400.000100"},
+        }
+        with patch("cron.scheduler.update_job"):
+            _record_delivery_receipt(job, "slack", "C123", None, result)
+
+        assert job["_delivery_receipts"] == [{
+            "platform": "slack",
+            "chat_id": "C123",
+            "message_id": "1787612401.000200",
+            "thread_id": "1787612400.000100",
+        }]
+
+
 class TestDeliverResultWrapping:
     """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
 
