@@ -218,6 +218,17 @@ class TestOtherEcosystems:
         assert recipe.kind == "compose"
         assert recipe.port == 3002
 
+    def test_compose_port_from_short_range_syntax(self, tmp_path):
+        # "FIRST-LAST:CONTAINER" pins a range — probe its first port, the
+        # same tie-break the long syntax applies to a str "published".
+        (tmp_path / "docker-compose.yml").write_text(
+            "services:\n"
+            "  app:\n"
+            '    ports: ["3000-3005:3000"]\n',
+            encoding="utf-8",
+        )
+        assert detect_recipe(tmp_path).port == 3000
+
     def test_compose_port_from_long_syntax(self, tmp_path):
         (tmp_path / "compose.yaml").write_text(
             "services:\n"

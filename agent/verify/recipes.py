@@ -25,10 +25,13 @@ Layer ownership vs :mod:`agent.coding_context`:
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -452,6 +455,13 @@ def _compose_host_port(root: Path, compose_file: str) -> int | None:
 
         doc = yaml.safe_load((root / compose_file).read_text(encoding="utf-8"))
     except Exception:
+        # An unparseable compose file must stay indistinguishable from an
+        # unpinned one in behavior, but leave a trace for debugging a wrong
+        # probe target.
+        logger.debug(
+            "verify: could not parse %s for a published host port",
+            compose_file, exc_info=True,
+        )
         return None
     services = doc.get("services") if isinstance(doc, dict) else None
     if not isinstance(services, dict):
@@ -478,6 +488,7 @@ def _compose_host_port(root: Path, compose_file: str) -> int | None:
             if not (isinstance(entry, str) and ":" in entry):
                 continue  # container-only entry: host port not pinned
             host = entry.split(":")[-2]  # "[IP:]HOST:CONTAINER[/proto]"
+            host = host.split("-")[0]  # "3000-3005" range pins several — take the first
             if host.isdigit() and 0 < int(host) < 65536:
                 return int(host)
     return None
