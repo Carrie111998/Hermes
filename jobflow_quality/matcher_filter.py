@@ -34,8 +34,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+import json
+import logging
+from pathlib import Path
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class ExclusionReason(str, Enum):
@@ -58,20 +63,24 @@ class ExclusionReason(str, Enum):
 #
 # The other nine say the opposite of what the keyword implies:
 #
-#   Citi          "already possess OR APPLY UPON ARRIVAL FOR Series 7 and 63"
-#   Fifth Third   "Series 7 ... (OR ABILITY TO OBTAIN within company policy)"
-#   Draper        "MAY BE required to obtain ... security clearance"
-#   Roadrunner    "Security clearance ELIGIBILITY. U.S. citizenship with the
-#                  ability to obtain" — the candidate is a US citizen
-#   Global Ord.   "ability to obtain ... if required PREFERRED"
-#   DriveWealth   listed under "Relevant certifications"
+# The postings, quoted by their obtainability language rather than by
+# employer -- the phrasing is the evidence, the company name is not, and
+# naming them publishes the candidate's live application pipeline:
+#
+#   "already possess OR APPLY UPON ARRIVAL FOR Series 7 and 63"
+#   "Series 7 ... (OR ABILITY TO OBTAIN within company policy)"
+#   "MAY BE required to obtain ... security clearance"
+#   "Security clearance ELIGIBILITY. U.S. citizenship with the ability to
+#    obtain" — eligibility the candidate profile may satisfy
+#   "ability to obtain ... if required PREFERRED"
+#   listed under "Relevant certifications"
 #
 # A credential obtainable after hire is not a disqualifier, and the difference
 # between "must already hold" and "will apply for on arrival" lives in the
 # sentence, not the phrase. That is a reading task — precisely what the
 # seven-dimension ranker does, and what this filter must not attempt. At 1/10
-# precision the rule archives target-profile roles at Citi, Fifth Third and
-# Draper to save ten model calls, which is the expensive error trading against
+# precision the rule archives target-profile roles at three of the employers
+# above to save ten model calls, which is the expensive error trading against
 # the cheap one.
 #
 # The mechanism stays because Criteria is caller-supplied and a future phrase
@@ -79,11 +88,52 @@ class ExclusionReason(str, Enum):
 # real postings and shown not to fire on obtainability language.
 _HARD_REQUIREMENT_PHRASES: tuple[str, ...] = ()
 
-# The candidate's stated bail line. The repo also states a $200K "floor" in
-# three places; the two genuinely disagree, so the lower number wins here
-# because it excludes strictly fewer jobs. See the module docstring's
-# asymmetry note — raising this is a policy decision, not a code change.
-_COMPENSATION_FLOOR_USD = 180_000
+# The candidate's stated bail line, READ FROM LOCAL STATE -- never a literal
+# here. It is the single most negotiation-sensitive number in this repository:
+# a counterparty who knows the floor knows exactly how low an offer can go. It
+# was a hardcoded constant until 2026-09-01 and this file is tracked, so it was
+# published to a public fork and is no longer retractable.
+#
+# Absent or unreadable config yields None, which disables compensation
+# filtering entirely. That is the correct failure direction and the same one
+# the module docstring argues for throughout: a job wrongly kept costs one
+# model call, a job wrongly excluded costs a real opportunity silently. Never
+# "helpfully" restore a default figure here.
+#
+# The repo has historically stated two different floors; they genuinely
+# disagree, so the config should carry the LOWER one, which excludes strictly
+# fewer jobs. Raising it is a policy decision, not a code change.
+_CRITERIA_PATH = (
+    Path.home() / ".hermes" / "profiles" / "cv-handler" / "workspace" / "kb"
+    / "matcher-criteria.json"
+)
+
+
+def _load_compensation_floor_usd() -> int | None:
+    """Read the compensation floor from local state; None if unavailable."""
+
+    try:
+        raw = json.loads(_CRITERIA_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "matcher criteria unreadable at %s (%s) -- compensation filtering "
+            "disabled; no job will be excluded on pay",
+            _CRITERIA_PATH,
+            exc,
+        )
+        return None
+    value = raw.get("compensation_floor_usd") if isinstance(raw, Mapping) else None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        logger.warning(
+            "matcher criteria at %s has no usable compensation_floor_usd -- "
+            "compensation filtering disabled",
+            _CRITERIA_PATH,
+        )
+        return None
+    return value
+
+
+_COMPENSATION_FLOOR_USD = _load_compensation_floor_usd()
 
 _EXCLUDED_COMPANIES: tuple[str, ...] = ("dataannotation",)
 

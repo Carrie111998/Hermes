@@ -15,14 +15,25 @@ ranker is for.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
+from jobflow_quality import matcher_filter
 from jobflow_quality.matcher_filter import (
     DEFAULT_CRITERIA,
     Criteria,
     ExclusionReason,
     hard_filter,
 )
+
+# DELIBERATELY NOT the operator's real bail line. The real figure lives in
+# matcher-criteria.json outside the repository, so DEFAULT_CRITERIA's floor is
+# None on any machine without that file -- asserting comp behaviour against the
+# ambient default would make this suite pass only on the operator's box. Every
+# salary fixture below keeps its meaning at this value.
+_TEST_FLOOR_USD = 175_000
+TEST_CRITERIA = replace(DEFAULT_CRITERIA, compensation_floor_usd=_TEST_FLOOR_USD)
 
 
 def _job(**over):
@@ -40,18 +51,18 @@ def _job(**over):
 
 class TestEligibleByDefault:
     def test_a_normal_posting_reaches_the_ranker(self):
-        d = hard_filter(_job(), DEFAULT_CRITERIA)
+        d = hard_filter(_job(), TEST_CRITERIA)
         assert d.eligible is True
         assert d.reasons == ()
 
     def test_an_empty_posting_is_eligible_not_excluded(self):
         """Missing evidence is not evidence. A thin JD is a data problem."""
         d = hard_filter(_job(description="", title="", company="", location=""),
-                        DEFAULT_CRITERIA)
+                        TEST_CRITERIA)
         assert d.eligible is True
 
     def test_a_job_with_no_recognisable_fields_is_eligible(self):
-        assert hard_filter({}, DEFAULT_CRITERIA).eligible is True
+        assert hard_filter({}, TEST_CRITERIA).eligible is True
 
 
 _CREDENTIALS = Criteria(hard_requirement_phrases=("security clearance", "series 7"))
@@ -105,7 +116,7 @@ class TestCredentialPhrasesAreNotShippedByDefault:
         "ability to obtain a U.S. Government security clearance, if required preferred",
     ))
     def test_obtainability_language_reaches_the_ranker(self, posting):
-        assert hard_filter(_job(description=posting), DEFAULT_CRITERIA).eligible is True
+        assert hard_filter(_job(description=posting), TEST_CRITERIA).eligible is True
 
     def test_a_genuine_requirement_also_reaches_the_ranker_by_default(self):
         """The cost of the above: the one true positive goes through too.
@@ -114,7 +125,7 @@ class TestCredentialPhrasesAreNotShippedByDefault:
         opportunities. Stated plainly so the trade is visible, not discovered.
         """
         genuine = "FINRA Series 7, 24, and 65 licenses required"
-        assert hard_filter(_job(description=genuine), DEFAULT_CRITERIA).eligible is True
+        assert hard_filter(_job(description=genuine), TEST_CRITERIA).eligible is True
         assert hard_filter(_job(description=genuine), _CREDENTIALS).eligible is False
 
 
@@ -126,17 +137,17 @@ class TestCompensationFloor:
     """
 
     def test_a_ceiling_below_the_floor_excludes(self):
-        d = hard_filter(_job(salary_range="$90,000 - $120,000"), DEFAULT_CRITERIA)
+        d = hard_filter(_job(salary_range="$90,000 - $120,000"), TEST_CRITERIA)
         assert d.eligible is False
         assert ExclusionReason.BELOW_COMPENSATION_FLOOR in d.reasons
 
     def test_a_range_straddling_the_floor_is_eligible(self):
-        d = hard_filter(_job(salary_range="$150,000 - $250,000"), DEFAULT_CRITERIA)
+        d = hard_filter(_job(salary_range="$150,000 - $250,000"), TEST_CRITERIA)
         assert d.eligible is True
 
     def test_an_undisclosed_salary_is_eligible(self):
-        assert hard_filter(_job(salary_range=None), DEFAULT_CRITERIA).eligible is True
-        assert hard_filter(_job(salary_range="Competitive"), DEFAULT_CRITERIA).eligible is True
+        assert hard_filter(_job(salary_range=None), TEST_CRITERIA).eligible is True
+        assert hard_filter(_job(salary_range="Competitive"), TEST_CRITERIA).eligible is True
 
     def test_a_small_bare_figure_is_not_read_as_an_annual_salary(self):
         """`$85 - $95` is a unit the parser cannot identify, not a $95 salary.
@@ -144,7 +155,7 @@ class TestCompensationFloor:
         Guarded by the magnitude check rather than the hourly rule — this input
         never reaches the hourly rule, which is why the case below exists.
         """
-        d = hard_filter(_job(salary_range="$85 - $95 per hour"), DEFAULT_CRITERIA)
+        d = hard_filter(_job(salary_range="$85 - $95 per hour"), TEST_CRITERIA)
         assert d.eligible is True
 
     def test_an_hourly_rate_above_the_magnitude_floor_is_still_not_annual(self):
@@ -155,19 +166,19 @@ class TestCompensationFloor:
         above the floor. Without this case the hourly rule is dead code that
         no test would notice losing.
         """
-        d = hard_filter(_job(salary_range="$1,200 per hour"), DEFAULT_CRITERIA)
+        d = hard_filter(_job(salary_range="$1,200 per hour"), TEST_CRITERIA)
         assert d.eligible is True
 
     def test_an_hourly_rate_written_with_a_slash_is_recognised(self):
-        d = hard_filter(_job(salary_range="$1,500/hr"), DEFAULT_CRITERIA)
+        d = hard_filter(_job(salary_range="$1,500/hr"), TEST_CRITERIA)
         assert d.eligible is True
 
     def test_a_k_suffix_is_understood(self):
-        assert hard_filter(_job(salary_range="$90k-$120k"), DEFAULT_CRITERIA).eligible is False
-        assert hard_filter(_job(salary_range="$200k-$260k"), DEFAULT_CRITERIA).eligible is True
+        assert hard_filter(_job(salary_range="$90k-$120k"), TEST_CRITERIA).eligible is False
+        assert hard_filter(_job(salary_range="$200k-$260k"), TEST_CRITERIA).eligible is True
 
     def test_an_unparseable_salary_string_is_eligible(self):
-        d = hard_filter(_job(salary_range="DOE, plus equity"), DEFAULT_CRITERIA)
+        d = hard_filter(_job(salary_range="DOE, plus equity"), TEST_CRITERIA)
         assert d.eligible is True
 
 
@@ -184,52 +195,52 @@ class TestStructuredSalary:
     def test_a_structured_ceiling_below_the_floor_excludes(self):
         d = hard_filter(_job(salary_range={
             "min": 90000.0, "max": 120000.0, "currency": "USD", "period": "annual",
-        }), DEFAULT_CRITERIA)
+        }), TEST_CRITERIA)
         assert d.eligible is False
         assert ExclusionReason.BELOW_COMPENSATION_FLOOR in d.reasons
 
     def test_a_structured_range_straddling_the_floor_is_eligible(self):
         d = hard_filter(_job(salary_range={
             "min": 165000.0, "max": 205000.0, "currency": "USD", "period": "annual",
-        }), DEFAULT_CRITERIA)
+        }), TEST_CRITERIA)
         assert d.eligible is True
 
     def test_an_hourly_period_is_never_compared_to_an_annual_floor(self):
         d = hard_filter(_job(salary_range={
             "min": 80.0, "max": 95.0, "currency": "USD", "period": "hourly",
-        }), DEFAULT_CRITERIA)
+        }), TEST_CRITERIA)
         assert d.eligible is True
 
     def test_a_non_usd_currency_is_not_compared(self):
         """A foreign-currency figure is not commensurable without a rate."""
         d = hard_filter(_job(salary_range={
             "min": 90000.0, "max": 120000.0, "currency": "EUR", "period": "annual",
-        }), DEFAULT_CRITERIA)
+        }), TEST_CRITERIA)
         assert d.eligible is True
 
     def test_a_missing_max_is_eligible(self):
         """Excluding on `min` alone would archive every open-topped band."""
         d = hard_filter(_job(salary_range={
             "min": 90000.0, "max": None, "currency": "USD", "period": "annual",
-        }), DEFAULT_CRITERIA)
+        }), TEST_CRITERIA)
         assert d.eligible is True
 
     def test_an_empty_dict_is_eligible(self):
-        assert hard_filter(_job(salary_range={}), DEFAULT_CRITERIA).eligible is True
+        assert hard_filter(_job(salary_range={}), TEST_CRITERIA).eligible is True
 
 
 class TestExcludedCompanies:
     def test_a_blocklisted_company_excludes(self):
-        d = hard_filter(_job(company="DataAnnotation"), DEFAULT_CRITERIA)
+        d = hard_filter(_job(company="DataAnnotation"), TEST_CRITERIA)
         assert d.eligible is False
         assert ExclusionReason.EXCLUDED_COMPANY in d.reasons
 
     def test_company_matching_is_case_insensitive(self):
-        assert hard_filter(_job(company="dataannotation"), DEFAULT_CRITERIA).eligible is False
+        assert hard_filter(_job(company="dataannotation"), TEST_CRITERIA).eligible is False
 
     def test_a_company_merely_containing_the_name_is_not_excluded(self):
         """Substring matching on company names archives innocent employers."""
-        d = hard_filter(_job(company="DataAnnotation Partners Group"), DEFAULT_CRITERIA)
+        d = hard_filter(_job(company="DataAnnotation Partners Group"), TEST_CRITERIA)
         assert d.eligible is True
 
 
@@ -245,7 +256,7 @@ class TestVipIsNeverExcluded:
     ))
     def test_vip_survives_every_exclusion(self, job):
         job = dict(job, vip={"is_vip": True})
-        d = hard_filter(job, DEFAULT_CRITERIA)
+        d = hard_filter(job, TEST_CRITERIA)
         assert d.eligible is True
         assert d.vip_exempt is True
 
@@ -259,22 +270,22 @@ class TestVipIsNeverExcluded:
     def test_the_suppressed_reasons_are_still_reported(self):
         """Exempt must not mean invisible — the operator still needs the why."""
         job = _job(company="DataAnnotation", vip={"is_vip": True})
-        d = hard_filter(job, DEFAULT_CRITERIA)
+        d = hard_filter(job, TEST_CRITERIA)
         assert d.eligible is True
         assert ExclusionReason.EXCLUDED_COMPANY in d.suppressed_reasons
 
     def test_a_non_vip_flag_does_not_exempt(self):
         job = _job(company="DataAnnotation", vip={"is_vip": False})
-        assert hard_filter(job, DEFAULT_CRITERIA).eligible is False
+        assert hard_filter(job, TEST_CRITERIA).eligible is False
 
 
 class TestDecisionContract:
     def test_reasons_are_bounded_codes_never_free_text(self):
-        d = hard_filter(_job(description="security clearance required"), DEFAULT_CRITERIA)
+        d = hard_filter(_job(description="security clearance required"), TEST_CRITERIA)
         assert all(isinstance(r, ExclusionReason) for r in d.reasons)
 
     def test_the_decision_is_immutable(self):
-        d = hard_filter(_job(), DEFAULT_CRITERIA)
+        d = hard_filter(_job(), TEST_CRITERIA)
         with pytest.raises(AttributeError):
             d.eligible = False
 
@@ -313,24 +324,37 @@ class TestPurity:
 
         monkeypatch.setattr(builtins, "open", _no)
         monkeypatch.setattr(socket, "socket", _no)
-        hard_filter(_job(description="security clearance required"), DEFAULT_CRITERIA)
+        hard_filter(_job(description="security clearance required"), TEST_CRITERIA)
 
     def test_the_job_mapping_is_not_mutated(self):
         job = _job()
         before = dict(job)
-        hard_filter(job, DEFAULT_CRITERIA)
+        hard_filter(job, TEST_CRITERIA)
         assert job == before
 
 
 class TestDefaultCriteriaProvenance:
-    def test_the_floor_is_the_documented_bail_line(self):
-        """$180K is the explicit "bail" line; $200K is stated as a preference.
+    def test_the_floor_comes_from_local_state_not_from_source(self, tmp_path, monkeypatch):
+        """The bail line is config, not a literal -- assert the WIRING, not the value.
 
-        The sources genuinely disagree, so the filter takes the LOWER number:
-        at $180K it excludes strictly fewer jobs, and over-exclusion is the
-        expensive error. Raising it is a policy decision, not a code change.
+        This used to assert a specific figure, which both republished the most
+        negotiation-sensitive number in the system and tied the suite to the
+        operator's machine. Which number is correct stays a policy decision:
+        the repo has stated two that genuinely disagree, and the config should
+        carry the LOWER one, because it excludes strictly fewer jobs and
+        over-exclusion is the expensive error.
         """
-        assert DEFAULT_CRITERIA.compensation_floor_usd == 180_000
+        path = tmp_path / "matcher-criteria.json"
+        path.write_text('{"compensation_floor_usd": 111222}', encoding="utf-8")
+        monkeypatch.setattr(matcher_filter, "_CRITERIA_PATH", path)
+        assert matcher_filter._load_compensation_floor_usd() == 111222
+
+    def test_an_absent_config_disables_the_floor_rather_than_defaulting(
+        self, tmp_path, monkeypatch
+    ):
+        """Failing open is the documented direction: exclude nothing on pay."""
+        monkeypatch.setattr(matcher_filter, "_CRITERIA_PATH", tmp_path / "absent.json")
+        assert matcher_filter._load_compensation_floor_usd() is None
 
     def test_no_authorization_criterion_is_asserted(self):
         """No visa/sponsorship signal exists in any job record or criteria file.
