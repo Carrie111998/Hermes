@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
+from hermes_state_common import safe_session_filename_component
 from agent.message_sanitization import (
     _FULL_ARGS_LOG_BOUND,
     coalesce_tool_call_id,
@@ -2115,7 +2116,7 @@ def dump_api_request_debug(
         # Sanitize the session ID into a traversal-free path segment — it can
         # originate from untrusted input (X-Hermes-Session-Id header), and an
         # unsanitized "../"-shaped ID would write the dump outside logs_dir.
-        safe_sid = _ra()._safe_session_filename_component(agent.session_id)
+        safe_sid = safe_session_filename_component(agent.session_id)
         dump_file = agent.logs_dir / f"request_dump_{safe_sid}_{timestamp}.json"
 
         # Redact secrets before persisting/printing. This dump captures the

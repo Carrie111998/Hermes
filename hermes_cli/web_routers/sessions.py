@@ -735,7 +735,17 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
             sid = _resolve_session_id(db, session_id)
             if not sid:
                 return {"ok": True, "already_absent": True}
-            db.delete_session(sid)
+            # On-disk cleanup uses the same directory the prune endpoint uses:
+            # the selected profile's home (or the serving home) ``sessions``
+            # directory, where the snapshot/request-dump writers put files —
+            # matching ``hermes sessions delete`` on the CLI.
+            from hermes_constants import get_hermes_home
+
+            profile_home = _cron_profile_home(profile)[1] if profile else get_hermes_home()
+            sessions_dir = profile_home / "sessions"
+            db.delete_session(
+                sid, sessions_dir=sessions_dir if sessions_dir.exists() else None
+            )
             return {"ok": True}
         finally:
             db.close()

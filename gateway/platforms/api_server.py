@@ -4597,6 +4597,36 @@ class APIServerAdapter(BasePlatformAdapter):
         session = await asyncio.to_thread(db.get_session, session_id) or session
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
 
+    def _resolve_sessions_dir(self, request: "web.Request") -> "Path":
+        """Resolve the active sessions directory for on-disk cleanup.
+
+        The gateway runtime is authoritative: ``GatewayRunner`` builds its
+        session store from ``config.sessions_dir``, and the auto-prune hook
+        passes that same directory to ``SessionDB`` maintenance
+        (``gateway/run.py``), so a configured non-default directory must be
+        honored here too. The runner is resolved the same way the scheduler
+        fire handler does — injected ``gateway_runner`` attribute, then the
+        app key, then the process-wide reference. Without a runner
+        (standalone server / tests) the fallback is the default-home sessions
+        directory, which is exactly where the snapshot/request-dump writers
+        put files (``agent_init`` pins ``logs_dir`` to
+        ``get_hermes_home() / "sessions"``).
+        """
+        runner = self.gateway_runner or request.app.get("gateway_runner")
+        if runner is None:
+            try:
+                from gateway.run import _gateway_runner_ref
+
+                runner = _gateway_runner_ref()
+            except Exception:
+                runner = None
+        configured = getattr(getattr(runner, "config", None), "sessions_dir", None)
+        if configured:
+            return Path(configured)
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "sessions"
+
     async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
         """DELETE /api/sessions/{session_id}."""
         auth_err = self._check_auth(request)
@@ -4607,7 +4637,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
         db = await self._ensure_session_db_async()
-        deleted = await asyncio.to_thread(db.delete_session, session_id)
+        sessions_dir = self._resolve_sessions_dir(request)
+        deleted = await asyncio.to_thread(
+            db.delete_session, session_id, sessions_dir=sessions_dir
+        )
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
     async def _handle_session_messages(self, request: "web.Request") -> "web.Response":

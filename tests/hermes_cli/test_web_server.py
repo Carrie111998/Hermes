@@ -4019,6 +4019,38 @@ class TestDeleteSessionEndpoint:
         assert resp.status_code == 200
         assert resp.json().get("ok") is True
 
+    def test_delete_removes_on_disk_artifacts(self):
+        """Deleting via the dashboard HTTP endpoint must also remove the
+        session's on-disk artifacts under the home's sessions directory —
+        writer-named snapshot + request dumps plus legacy bare names —
+        while another session's files survive."""
+        from hermes_constants import get_hermes_home
+        from hermes_state_common import safe_session_filename_component
+
+        sid = "transcript_test_session"
+        self._seed([sid])
+        sessions_dir = get_hermes_home() / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        safe = safe_session_filename_component(sid)
+
+        (sessions_dir / f"session_{safe}.json").write_text("{}")
+        (sessions_dir / f"request_dump_{safe}_abc.json").write_text("{}")
+        (sessions_dir / f"{sid}.json").write_text("{}")
+        (sessions_dir / f"{sid}.jsonl").write_text("")
+        (sessions_dir / "session_unrelated_session.json").write_text("{}")
+
+        resp = self.auth_client.delete(f"/api/sessions/{sid}")
+        assert resp.status_code == 200
+        assert resp.json().get("ok") is True
+        assert not self._exists(sid)
+
+        assert not (sessions_dir / f"session_{safe}.json").exists()
+        assert not (sessions_dir / f"request_dump_{safe}_abc.json").exists()
+        assert not (sessions_dir / f"{sid}.json").exists()
+        assert not (sessions_dir / f"{sid}.jsonl").exists()
+        # Another session's files in the same directory must survive.
+        assert (sessions_dir / "session_unrelated_session.json").exists()
+
 
 class TestBulkDeleteSessionsEndpoint:
     """Tests for ``POST /api/sessions/bulk-delete`` — backs the
