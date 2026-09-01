@@ -373,6 +373,32 @@ class TestCompress:
     def _make_messages(self, n):
         return [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"} for i in range(n)]
 
+    def test_forced_static_fallback_skips_remote_summary(self):
+        from agent.context_compressor import static_summary_fallback
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test/model",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=1,
+            )
+        msgs = self._make_messages(12)
+
+        with patch("agent.context_compressor.call_llm") as mock_llm, \
+             static_summary_fallback("host total ceiling exhausted"):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        mock_llm.assert_not_called()
+        assert result != msgs
+        assert c._last_summary_fallback_used is True
+        fallback = next(
+            message["content"]
+            for message in result
+            if "Summary generation was unavailable" in message.get("content", "")
+        )
+        assert "host total ceiling exhausted" in fallback
+
 
 
 

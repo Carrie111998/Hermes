@@ -1402,6 +1402,89 @@ def _retry_compression_on_fallback_chain(
     return result_msgs, result_prompt
 
 
+def _retry_compression_with_static_fallback(
+    *,
+    worker: Callable[[CompressionCommitFence], Tuple[list, str]],
+    messages: list,
+    reason: str,
+    telemetry_agent: Any = None,
+    new_fence: Optional[Callable[[], CompressionCommitFence]] = None,
+) -> Optional[Tuple[list, str]]:
+    """Commit the built-in deterministic handoff after a summary stall.
+
+    The remote attempt has already lost commit admission.  This bounded,
+    network-free retry runs synchronously so it cannot queue behind provider
+    workers that are themselves wedged. Plugin engines keep their configured
+    route fallback because only the built-in compressor owns this handoff.
+    """
+    hard_cancel = getattr(telemetry_agent, "_hard_interrupt_requested", None)
+    if callable(getattr(hard_cancel, "is_set", None)) and hard_cancel.is_set():
+        return None
+
+    try:
+        from agent.context_compressor import (
+            ContextCompressor,
+            static_summary_fallback,
+        )
+    except Exception:
+        return None
+    compressor = getattr(telemetry_agent, "context_compressor", None)
+    if not isinstance(compressor, ContextCompressor):
+        return None
+
+    retry_fence = None
+    if new_fence is not None:
+        try:
+            retry_fence = new_fence()
+        except Exception:
+            logger.warning(
+                "static compression fallback fence factory failed",
+                exc_info=True,
+            )
+    if not isinstance(retry_fence, CompressionCommitFence):
+        retry_fence = CompressionCommitFence()
+
+    logger.warning(
+        "Context compression summary %s — committing the local deterministic "
+        "handoff without another LLM request",
+        reason,
+    )
+    try:
+        with static_summary_fallback(reason):
+            result_msgs, result_prompt = worker(retry_fence)
+    except Exception:
+        logger.warning(
+            "Local deterministic compression fallback failed",
+            exc_info=True,
+        )
+        return None
+    if result_msgs is messages:
+        return None
+
+    record = getattr(compressor, "record_timeout_failure", None)
+    if callable(record):
+        try:
+            record(
+                f"local fallback after summary {reason}",
+                failure_kind=(
+                    "ceiling_exhausted" if "total ceiling" in reason else "stalled"
+                ),
+            )
+        except Exception:
+            logger.debug("failed to record local fallback cooldown", exc_info=True)
+    emit = getattr(telemetry_agent, "_emit_warning", None)
+    if callable(emit):
+        try:
+            emit(
+                "⚠ Context compression used a local fallback summary because "
+                f"the summary model {reason}. The session remains usable; "
+                "future remote summary attempts are temporarily paused."
+            )
+        except Exception:
+            logger.debug("failed to emit local fallback warning", exc_info=True)
+    return result_msgs, result_prompt
+
+
 def run_compress_context_with_progress_timeout(
     *,
     worker: Callable[[CompressionCommitFence], Tuple[list, str]],
@@ -1450,13 +1533,11 @@ def run_compress_context_with_progress_timeout(
     ``on_timeout`` runs, allowing hosts to report the timeout accurately while
     preserving the existing three-argument timeout callback contract.
 
-    ``stall_fallback`` (default on) makes an aborted stall attempt the
-    configured ``auxiliary.compression.fallback_chain`` once — pinned onto a
-    fresh fence — before degrading to "continue without compression". Nothing
-    raises out of a silent stall, so the auxiliary client's own fallback
-    handling (exception-path only) never sees it (#78981). ``on_timeout``
-    therefore fires only after that attempt has also failed, which keeps its
-    cooldown bookkeeping from suppressing the retry it precedes.
+    ``stall_fallback`` (default on) makes the built-in compressor commit its
+    deterministic local handoff on a fresh fence after a stall. Plugin engines
+    that do not own that handoff retain the configured
+    ``auxiliary.compression.fallback_chain`` retry. ``on_timeout`` therefore
+    fires only if the applicable fallback also fails.
 
     ``new_fence`` mints that retry's fence. Hosts that publish the active
     fence for hard-interrupt admission pass a factory that publishes the new
@@ -1718,6 +1799,22 @@ def run_compress_context_with_progress_timeout(
                     "overlaps it",
                     min(_CANCELLED_WORKER_TEARDOWN_GRACE_SECONDS, ceiling),
                 )
+        # The built-in local retry is safe to overlap with the detached
+        # provider worker: cancellation permanently revoked that worker's
+        # commit admission, and attempt generations discard late candidates.
+        # Waive total-ceiling retention so the holder-qualified lease can be
+        # released and the deterministic retry can commit.
+        if stall_fallback and telemetry_agent is not None:
+            try:
+                from agent.context_compressor import ContextCompressor
+
+                if isinstance(
+                    getattr(telemetry_agent, "context_compressor", None),
+                    ContextCompressor,
+                ):
+                    fence.allow_cancelled_lock_release()
+            except Exception:
+                pass
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
@@ -1726,17 +1823,30 @@ def run_compress_context_with_progress_timeout(
         # records the summary-failure cooldown, which would make the retry's
         # own summary call a no-op.
         if stall_fallback:
-            recovered = _retry_compression_on_fallback_chain(
+            reason = (
+                "exceeded its total ceiling"
+                if total_exhausted
+                else f"made no progress for {since_progress:.1f}s"
+            )
+            recovered = _retry_compression_with_static_fallback(
                 worker=worker,
                 messages=messages,
-                system_prompt_fallback=system_prompt_fallback,
-                idle_timeout_seconds=idle,
-                total_ceiling_seconds=ceiling,
-                on_commit_overrun=on_commit_overrun,
-                on_timeout_cause=on_timeout_cause,
+                reason=reason,
                 telemetry_agent=telemetry_agent,
                 new_fence=new_fence,
             )
+            if recovered is None:
+                recovered = _retry_compression_on_fallback_chain(
+                    worker=worker,
+                    messages=messages,
+                    system_prompt_fallback=system_prompt_fallback,
+                    idle_timeout_seconds=idle,
+                    total_ceiling_seconds=ceiling,
+                    on_commit_overrun=on_commit_overrun,
+                    on_timeout_cause=on_timeout_cause,
+                    telemetry_agent=telemetry_agent,
+                    new_fence=new_fence,
+                )
             if recovered is not None:
                 return recovered
         if on_timeout is not None:
@@ -3285,7 +3395,13 @@ def compress_context(
     # Every automatic entrypoint must honor compressor-owned cooldown and
     # breaker state. Gateway hygiene constructs a fresh AIAgent, so the
     # persisted fallback streak is loaded by bind_session_state() before this.
-    if not force:
+    try:
+        from agent.context_compressor import static_summary_fallback_reason
+
+        _static_fallback_attempt = bool(static_summary_fallback_reason())
+    except Exception:
+        _static_fallback_attempt = False
+    if not force and not _static_fallback_attempt:
         _refresh_persisted_compression_guards(agent.context_compressor)
         blocked = getattr(
             type(agent.context_compressor),

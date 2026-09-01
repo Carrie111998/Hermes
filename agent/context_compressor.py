@@ -83,6 +83,13 @@ _SUMMARY_ROUTE_PIN: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("hermes_summary_route_pin", default=None)
 )
 
+# A host timeout fences the remote worker before it can publish.  Its local
+# retry must bypass the LLM without mutating shared compressor attributes that
+# the detached worker can still see, so keep the decision attempt-local.
+_STATIC_SUMMARY_FALLBACK_REASON: contextvars.ContextVar[Optional[str]] = (
+    contextvars.ContextVar("hermes_static_summary_fallback_reason", default=None)
+)
+
 # call_llm kwargs a pinned route may set. ``timeout`` lets a fallback entry
 # keep its own deadline instead of inheriting one the primary already burned
 # (same per-entry semantics the aux client applies to chain candidates).
@@ -135,6 +142,23 @@ def _pinned_summary_call_kwargs() -> Dict[str, Any]:
         for field in _PINNED_ROUTE_FIELDS
         if route.get(field) not in (None, "")
     }
+
+
+@contextlib.contextmanager
+def static_summary_fallback(reason: str):
+    """Force one built-in compaction to use its deterministic handoff."""
+    token = _STATIC_SUMMARY_FALLBACK_REASON.set(
+        str(reason or "summary unavailable")
+    )
+    try:
+        yield
+    finally:
+        _STATIC_SUMMARY_FALLBACK_REASON.reset(token)
+
+
+def static_summary_fallback_reason() -> Optional[str]:
+    """Return the attempt-local reason for bypassing the summary LLM."""
+    return _STATIC_SUMMARY_FALLBACK_REASON.get()
 
 
 _SUMMARY_PERMANENT_QUOTA_MARKERS: tuple[str, ...] = (
@@ -8024,7 +8048,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                         self.threshold_tokens, self._prellm_skip_count,
                     )
 
-        if feasibility_skip:
+        static_fallback_reason = static_summary_fallback_reason()
+        if static_fallback_reason:
+            summary = None
+        elif feasibility_skip:
             summary = None  # No LLM call; Phase 4 inserts the deterministic fallback
         else:
             # Deriving the auto focus topic scans recent user turns — only pay
@@ -8064,7 +8091,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # rotating into a child session with a placeholder summary degrades the
         # conversation for zero benefit. Preserve it unchanged until access or
         # provider health is restored (#29559, #25585, #94448).
-        if not summary and not feasibility_skip and (
+        if not summary and not feasibility_skip and not static_fallback_reason and (
             self.abort_on_summary_failure
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
@@ -8188,7 +8215,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 turns_to_summarize,
                 # A stale error from an earlier real failure must not be
                 # embedded into a deliberate feasibility skip's fallback.
-                reason=None if feasibility_skip else self._last_summary_error,
+                reason=(
+                    static_fallback_reason
+                    if static_fallback_reason
+                    else (None if feasibility_skip else self._last_summary_error)
+                ),
             )
 
         tail_messages: List[Dict[str, Any]] = []

@@ -11,6 +11,7 @@ from __future__ import annotations
 import concurrent.futures
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -148,6 +149,69 @@ class TestResolveContextCompressionTimeouts:
 
 
 class TestRunCompressContextWithProgressTimeout:
+    def test_total_ceiling_commits_builtin_static_fallback(self, monkeypatch):
+        """A wedged summary must still yield a committed local handoff."""
+        from agent.context_compressor import ContextCompressor
+
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                "agent.context_compressor.get_model_context_length",
+                lambda *_a, **_kw: 100_000,
+            )
+            compressor = ContextCompressor(model="test/model", quiet_mode=True)
+
+        compressor.record_timeout_failure = MagicMock()
+        agent = SimpleNamespace(
+            context_compressor=compressor,
+            _hard_interrupt_requested=threading.Event(),
+            _emit_warning=MagicMock(),
+            _touch_activity=MagicMock(),
+        )
+        original = [{"role": "user", "content": "keep-me"}]
+        compressed = [{"role": "user", "content": "local handoff"}]
+        remote_started = threading.Event()
+        release_remote = threading.Event()
+        calls = []
+
+        def worker(fence: CompressionCommitFence):
+            from agent.context_compressor import static_summary_fallback_reason
+
+            reason = static_summary_fallback_reason()
+            calls.append(reason)
+            if reason:
+                assert fence.begin_commit()
+                try:
+                    return compressed, "fallback-prompt"
+                finally:
+                    fence.finish_commit()
+            remote_started.set()
+            release_remote.wait(timeout=5)
+            if not fence.begin_commit():
+                return original, "late"
+            try:
+                return original, "late"
+            finally:
+                fence.finish_commit()
+
+        try:
+            result = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=original,
+                system_prompt_fallback="system",
+                idle_timeout_seconds=0.5,
+                total_ceiling_seconds=0.5,
+                telemetry_agent=agent,
+            )
+        finally:
+            release_remote.set()
+
+        assert remote_started.wait(timeout=1)
+        assert result == (compressed, "fallback-prompt")
+        assert "total ceiling" in calls[-1]
+        assert calls[0] is None
+        compressor.record_timeout_failure.assert_called_once()
+        assert "local fallback" in agent._emit_warning.call_args.args[0].lower()
+
     def test_deadline_before_worker_start_uses_timeout_fallback(self, monkeypatch):
         original = [{"role": "user", "content": "keep-me"}]
         worker = MagicMock()
