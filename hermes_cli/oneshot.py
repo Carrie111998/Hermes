@@ -354,6 +354,23 @@ def _create_session_db_for_oneshot():
         return None
 
 
+def _resolve_oneshot_max_iterations(cfg: dict) -> int:
+    """Resolve the -z turn limit with the interactive CLI's precedence.
+
+    ``agent.max_turns`` from config (the legacy root-level spelling is already
+    folded in by ``load_config``), then ``HERMES_MAX_ITERATIONS``, else the
+    unlimited default — the tail of cli.py's HermesCLI chain minus the CLI
+    arg.  Until #99957 this value was resolved and then discarded on every
+    -z run: AIAgent fell back to its constructor default.
+    """
+    from hermes_cli.config import resolve_turn_limit
+
+    raw = (cfg.get("agent") or {}).get("max_turns")
+    if raw is None:
+        raw = os.getenv("HERMES_MAX_ITERATIONS")
+    return resolve_turn_limit(raw)
+
+
 def _run_agent(
     prompt: str,
     model: Optional[str] = None,
@@ -499,6 +516,7 @@ def _run_agent(
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
+            max_iterations=_resolve_oneshot_max_iterations(cfg),
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
