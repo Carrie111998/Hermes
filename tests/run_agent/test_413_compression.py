@@ -1007,12 +1007,14 @@ class TestPreflightCompression:
             {"role": "user", "content": "earlier question"},
             {"role": "assistant", "content": "earlier answer"},
         ]
-        pressure_readings = iter((30_000, 70_000, 28_000, 28_000))
+        compress_calls = 0
 
         def _request_pressure(*_args, **_kwargs):
-            return next(pressure_readings, 28_000)
-
-        compress_calls = 0
+            if agent.client.chat.completions.create.call_count == 0:
+                return 30_000
+            if compress_calls < 2:
+                return 70_000
+            return 28_000
 
         def _compress(_messages, *_args, **_kwargs):
             nonlocal compress_calls
