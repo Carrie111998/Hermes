@@ -42,25 +42,27 @@ def run_static_compression_fallback(
     reason: str,
     telemetry_agent: Any = None,
     new_fence: Optional[Callable[[], Any]] = None,
-) -> Optional[tuple[list, str]]:
+) -> tuple[bool, Optional[tuple[list, str]]]:
     """Commit the built-in deterministic handoff after a fenced summary stall.
 
     Imports are local to keep this bounded helper independent of the two
     compression orchestrator modules during module initialization.
     """
-    hard_cancel = getattr(telemetry_agent, "_hard_interrupt_requested", None)
-    if callable(getattr(hard_cancel, "is_set", None)) and hard_cancel.is_set():
-        return None
-
     try:
         from agent.context_compressor import ContextCompressor
         from agent.conversation_compression import CompressionCommitFence
     except Exception:
-        return None
+        return False, None
 
     compressor = getattr(telemetry_agent, "context_compressor", None)
     if not isinstance(compressor, ContextCompressor):
-        return None
+        return False, None
+
+    # From this point the built-in path owns recovery. A hard stop or local
+    # failure must degrade without issuing a second provider request.
+    hard_cancel = getattr(telemetry_agent, "_hard_interrupt_requested", None)
+    if callable(getattr(hard_cancel, "is_set", None)) and hard_cancel.is_set():
+        return True, None
 
     retry_fence = None
     if new_fence is not None:
@@ -87,9 +89,9 @@ def run_static_compression_fallback(
             "Local deterministic compression fallback failed",
             exc_info=True,
         )
-        return None
+        return True, None
     if result_msgs is messages:
-        return None
+        return True, None
 
     record = getattr(compressor, "record_timeout_failure", None)
     if callable(record):
@@ -113,4 +115,4 @@ def run_static_compression_fallback(
             )
         except Exception:
             logger.debug("failed to emit local fallback warning", exc_info=True)
-    return result_msgs, result_prompt
+    return True, (result_msgs, result_prompt)

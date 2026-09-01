@@ -154,6 +154,7 @@ class TestRunCompressContextWithProgressTimeout:
         self, monkeypatch, timeout_path
     ):
         """A stale provider exception cannot mutate fallback-owned state."""
+        from agent.compression_attempt_context import compression_cancelled_check
         from agent.compression_static_fallback import static_summary_fallback_reason
         from agent.context_compressor import ContextCompressor
 
@@ -212,11 +213,10 @@ class TestRunCompressContextWithProgressTimeout:
                     )
                     progress_thread.start()
                 try:
-                    if not is_fallback:
-                        compressor._compression_cancelled_check = lambda: fence.is_cancelled
-                    candidate = compressor.compress(
-                        list(original), current_tokens=999_999, force=True
-                    )
+                    with compression_cancelled_check(lambda: fence.is_cancelled):
+                        candidate = compressor.compress(
+                            list(original), current_tokens=999_999, force=True
+                        )
                     if not fence.begin_commit():
                         return original, "late"
                     try:
@@ -279,6 +279,78 @@ class TestRunCompressContextWithProgressTimeout:
             "fallback_used": compressor._last_summary_fallback_used,
             "telemetry": dict(compressor._last_compression_telemetry or {}),
         } == fallback_state
+
+    def test_builtin_static_fallback_failure_does_not_retry_provider(
+        self, monkeypatch
+    ):
+        original = [{"role": "user", "content": "keep"}]
+        release = threading.Event()
+        started = threading.Event()
+        provider_retry = MagicMock(
+            return_value=([{"role": "assistant", "content": "provider"}], "provider")
+        )
+
+        def worker(_fence):
+            started.set()
+            assert release.wait(timeout=2)
+            return original, "late"
+
+        monkeypatch.setattr(
+            cc,
+            "run_static_compression_fallback",
+            lambda **_kwargs: (True, None),
+        )
+        monkeypatch.setattr(
+            cc, "_retry_compression_on_fallback_chain", provider_retry
+        )
+        try:
+            result = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.05,
+                total_ceiling_seconds=1.0,
+                telemetry_agent=SimpleNamespace(),
+            )
+        finally:
+            release.set()
+
+        assert started.wait(timeout=1)
+        assert result == (original, "fallback")
+        provider_retry.assert_not_called()
+
+    def test_plugin_engine_keeps_configured_provider_fallback(self, monkeypatch):
+        original = [{"role": "user", "content": "keep"}]
+        release = threading.Event()
+        provider_result = ([{"role": "assistant", "content": "provider"}], "provider")
+        provider_retry = MagicMock(return_value=provider_result)
+
+        def worker(_fence):
+            assert release.wait(timeout=2)
+            return original, "late"
+
+        monkeypatch.setattr(
+            cc,
+            "run_static_compression_fallback",
+            lambda **_kwargs: (False, None),
+        )
+        monkeypatch.setattr(
+            cc, "_retry_compression_on_fallback_chain", provider_retry
+        )
+        try:
+            result = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.05,
+                total_ceiling_seconds=1.0,
+                telemetry_agent=SimpleNamespace(),
+            )
+        finally:
+            release.set()
+
+        assert result == provider_result
+        provider_retry.assert_called_once()
 
     def test_deadline_before_worker_start_uses_timeout_fallback(self, monkeypatch):
         original = [{"role": "user", "content": "keep-me"}]

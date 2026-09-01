@@ -67,6 +67,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
+from agent.compression_attempt_context import compression_cancelled_check
 from agent.compression_static_fallback import run_static_compression_fallback
 from agent.context_engine import (
     automatic_compaction_status_message,
@@ -1746,14 +1747,14 @@ def run_compress_context_with_progress_timeout(
                 if total_exhausted
                 else f"made no progress for {since_progress:.1f}s"
             )
-            recovered = run_static_compression_fallback(
+            builtin_fallback, recovered = run_static_compression_fallback(
                 worker=worker,
                 messages=messages,
                 reason=reason,
                 telemetry_agent=telemetry_agent,
                 new_fence=new_fence,
             )
-            if recovered is None:
+            if not builtin_fallback:
                 recovered = _retry_compression_on_fallback_chain(
                     worker=worker,
                     messages=messages,
@@ -3928,7 +3929,7 @@ def compress_context(
         # normalized evidence list is handed only to API v2+ checkpoint
         # providers inside MemoryManager.on_pre_compress().
         evidence_messages = _direct_messages_for_pre_compress_memory(messages)
-        if checkpoint_required:
+        if checkpoint_required and not _static_fallback_attempt:
             supports_checkpoint = getattr(
                 memory_manager, "supports_pre_compress_checkpoint", None
             )
@@ -3965,7 +3966,7 @@ def compress_context(
                 ) from exc
             if isinstance(_maybe_ctx, str):
                 memory_context = sanitize_memory_context(_maybe_ctx)
-        elif memory_manager:
+        elif memory_manager and not _static_fallback_attempt:
             try:
                 _maybe_ctx = memory_manager.on_pre_compress(
                     messages, evidence_messages=evidence_messages
@@ -4076,8 +4077,12 @@ def compress_context(
                 )
                 compressed = messages
             else:
-                with aux_progress_hook(_progress_hook), aux_interrupt_protection(
-                    cancel_check=_compression_cancel_requested
+                with (
+                    compression_cancelled_check(_compression_cancel_requested),
+                    aux_progress_hook(_progress_hook),
+                    aux_interrupt_protection(
+                        cancel_check=_compression_cancel_requested
+                    ),
                 ):
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider

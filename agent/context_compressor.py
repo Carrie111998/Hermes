@@ -35,6 +35,7 @@ from agent.auxiliary_client import (
     call_llm,
     extract_content_or_reasoning,
 )
+from agent.compression_attempt_context import attempt_compression_cancelled
 from agent.compression_static_fallback import (
     static_summary_fallback,
     static_summary_fallback_reason,
@@ -3108,6 +3109,9 @@ class ContextCompressor(ContextEngine):
 
     def _compression_cancelled(self) -> bool:
         """Read the host-owned cooperative cancellation signal, if installed."""
+        attempt_cancelled = attempt_compression_cancelled()
+        if attempt_cancelled is not None:
+            return attempt_cancelled
         cancelled_check = getattr(self, "_compression_cancelled_check", None)
         if not callable(cancelled_check):
             return False
