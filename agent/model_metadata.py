@@ -930,10 +930,11 @@ def is_local_endpoint(base_url: str) -> bool:
 
     Recognises loopback (``localhost``, ``127.0.0.0/8``, ``::1``),
     container-internal DNS names (``host.docker.internal`` et al.),
-    RFC-1918 private ranges (``10/8``, ``172.16/12``, ``192.168/16``),
-    link-local, and Tailscale CGNAT (``100.64.0.0/10``). Tailscale CGNAT
-    is included so remote-but-trusted Ollama boxes reached over a
-    Tailscale mesh get the same timeout auto-bumps as localhost Ollama.
+    mDNS names (``*.local``, RFC 6762), RFC-1918 private ranges (``10/8``,
+    ``172.16/12``, ``192.168/16``), link-local, and Tailscale CGNAT
+    (``100.64.0.0/10``). Tailscale CGNAT is included so remote-but-trusted
+    Ollama boxes reached over a Tailscale mesh get the same timeout
+    auto-bumps as localhost Ollama.
     """
     normalized = _normalize_base_url(base_url)
     if not normalized:
@@ -952,6 +953,13 @@ def is_local_endpoint(base_url: str) -> bool:
     # Unqualified hostnames (no dots) are local by definition — Docker
     # Compose service names, /etc/hosts entries, or mDNS names.
     if host and "." not in host:
+        return True
+    # RFC 6762 reserves `.local` for mDNS: such names resolve only on the
+    # local network, so an `ollama-box.local` endpoint is as local as a
+    # RFC-1918 address. Without this the cached-context reconciliation in
+    # get_model_context_length() is skipped for mDNS endpoints and a stale
+    # GGUF-maximum cache entry outlives any /api/ps correction.
+    if host.endswith(".local"):
         return True
     # RFC-1918 private ranges, link-local, and Tailscale CGNAT
     try:

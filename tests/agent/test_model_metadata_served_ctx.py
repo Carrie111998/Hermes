@@ -325,3 +325,67 @@ class TestColdToLoadedSequence:
         error = _ollama_context_limit_error(agent, 30000)
         assert error is not None
         assert "32,768" in error
+
+
+class TestMdnsStaleCacheRegression:
+    """Stale persistent cache at an mDNS endpoint must reconcile, not win.
+
+    Reported on #76332: with the GGUF maximum already cached on disk,
+    get_model_context_length() returned the cached value before ever reaching
+    the /api/ps cap, because `.local` hostnames failed is_local_endpoint()
+    and skipped _reconcile_local_cached_context_length(). Seeding the stale
+    value first is the point -- the fresh-cache path never exposes this.
+    """
+
+    MDNS_URL = "http://ollama-box.local:11434/v1"
+
+    def test_stale_gguf_cache_reconciles_to_served_value(self, tmp_path):
+        import agent.model_metadata as mm
+
+        cache_file = tmp_path / "cache.yaml"
+        with (
+            patch(
+                "agent.model_metadata._get_context_cache_path",
+                return_value=cache_file,
+            ),
+            patch("agent.model_metadata.fetch_model_metadata", return_value={}),
+            patch(
+                "agent.model_metadata._query_local_context_length",
+                return_value=198656,
+            ),
+        ):
+            mm.save_context_length("gpt-oss:20b", self.MDNS_URL, 262144)
+            result = mm.get_model_context_length(
+                "gpt-oss:20b", base_url=self.MDNS_URL
+            )
+            assert result == 198656
+            assert (
+                mm.get_cached_context_length("gpt-oss:20b", self.MDNS_URL)
+                == 198656
+            )
+
+    def test_subminimum_live_window_invalidates_stale_entry(self, tmp_path):
+        """A live sub-64K window drops the stale row instead of blessing it."""
+        import agent.model_metadata as mm
+
+        cache_file = tmp_path / "cache.yaml"
+        with (
+            patch(
+                "agent.model_metadata._get_context_cache_path",
+                return_value=cache_file,
+            ),
+            patch("agent.model_metadata.fetch_model_metadata", return_value={}),
+            patch(
+                "agent.model_metadata._query_local_context_length",
+                return_value=32768,
+            ),
+        ):
+            mm.save_context_length("gpt-oss:20b", self.MDNS_URL, 262144)
+            result = mm.get_model_context_length(
+                "gpt-oss:20b", base_url=self.MDNS_URL
+            )
+            assert result == 32768
+            assert (
+                mm.get_cached_context_length("gpt-oss:20b", self.MDNS_URL)
+                is None
+            )
