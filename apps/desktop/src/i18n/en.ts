@@ -3217,6 +3217,12 @@ export const en: Translations = {
       loadingSession: 'Loading session',
       showEarlier: 'Show earlier messages',
       loadingResponse: 'Hermes is loading a response',
+      foregroundRunning: 'Foreground task running',
+      inputRequired: 'Needs your input',
+      quietRunning: 'Working quietly',
+      stalledWarning: 'Still working — no output recently',
+      backgroundRunning: 'Background task running',
+      completed: 'Completed',
       resumeWhenBackgroundDone: count =>
         count === 1
           ? 'Will resume when the background task finishes'

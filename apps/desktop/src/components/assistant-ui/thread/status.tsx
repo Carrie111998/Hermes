@@ -17,6 +17,7 @@ import { $backgroundResume } from '@/store/background-delegation'
 import { sessionCompacting } from '@/store/compaction'
 import { sessionAwaitingInput } from '@/store/prompts'
 import { sessionProviderWait } from '@/store/provider-wait'
+import { $stalledSessionIds } from '@/store/session-states'
 import { type DraftingTool, sessionDraftingTool } from '@/store/tool-drafting'
 
 // A status line is scaffolding like any other — "Editing" while the model
@@ -47,8 +48,58 @@ const StatusRow: FC<{ children: ReactNode; label: string } & React.ComponentProp
 // Fixed label while auto-compaction runs — decoupled from backend status text.
 const COMPACTION_LABEL = 'Summarizing thread'
 
-const HintText: FC<{ children: ReactNode }> = ({ children }) => (
-  <span className={cn(SCAFFOLD_LABEL_CLASS, 'shimmer min-w-0 flex-1 truncate')}>{children}</span>
+export type ThreadActivityPhase =
+  | 'compacting'
+  | 'idle'
+  | 'input-required'
+  | 'provider-wait'
+  | 'quiet-running'
+  | 'running'
+  | 'stalled'
+
+export interface ThreadActivityEvidence {
+  awaitingInput: boolean
+  busy: boolean
+  compacting: boolean
+  providerWait: string
+  quiet: boolean
+  stalled: boolean
+}
+
+/**
+ * Reduce the already session-scoped evidence to one honest label family.
+ * Provider text is intentionally not interpreted: a missing deadline stays
+ * missing rather than becoming a fabricated timeout or countdown.
+ * Compaction is evaluated before provider-wait, so a compaction in progress
+ * masks coexisting provider wait text. The quiet flag is only meaningful for
+ * turn-activity surfaces; the pre-first-token spinner passes quiet: false.
+ */
+export function resolveThreadActivityPhase(evidence: ThreadActivityEvidence): ThreadActivityPhase {
+  if (evidence.awaitingInput) {
+    return 'input-required'
+  }
+
+  if (!evidence.busy) {
+    return 'idle'
+  }
+
+  if (evidence.compacting) {
+    return 'compacting'
+  }
+
+  if (evidence.providerWait.trim()) {
+    return 'provider-wait'
+  }
+
+  if (evidence.stalled) {
+    return 'stalled'
+  }
+
+  return evidence.quiet ? 'quiet-running' : 'running'
+}
+
+const HintText: FC<{ children: ReactNode; shimmer?: boolean }> = ({ children, shimmer = true }) => (
+  <span className={cn(SCAFFOLD_LABEL_CLASS, shimmer && 'shimmer', 'min-w-0 flex-1 truncate')}>{children}</span>
 )
 
 /** These indicators render inside whichever transcript mounted them, so every
@@ -57,6 +108,7 @@ const HintText: FC<{ children: ReactNode }> = ({ children }) => (
 function useThreadSessionStatus() {
   const view = useSessionView()
   const sessionId = useStore(view.$runtimeId)
+  const storedSessionId = useStore(view.$storedId)
   // The same turn-busy the composer's arc border and Stop button read. The
   // message-level `running` flag is a weaker signal: it goes false in the gaps
   // between bubbles (a sealed interim row, a settled turn the backend hasn't
@@ -71,6 +123,8 @@ function useThreadSessionStatus() {
   // user, not working — so don't resurrect the "thinking" timer while they
   // decide (matches the pet's awaitingInput pose taking priority over busy).
   const awaitingInput = useStore(useMemo(() => sessionAwaitingInput(sessionId), [sessionId]))
+  const stalledSessionIds = useStore($stalledSessionIds)
+  const stalled = Boolean(storedSessionId && stalledSessionIds.includes(storedSessionId))
 
   return {
     awaitingInput,
@@ -78,6 +132,7 @@ function useThreadSessionStatus() {
     compacting,
     drafting,
     providerWait,
+    stalled,
     // Epoch ms this surface's turn began, or undefined between turns. The
     // origin for anything measuring the WHOLE turn rather than one phase of
     // it — including the first seconds of a brand-new chat, where the value is
@@ -94,7 +149,39 @@ const DRAFTING_REVEAL_MS = 200
  * What to call the wait, if it deserves a name. Compaction outranks a draft —
  * it's rarer, slower, and explains a transcript that looks like it reset.
  */
-function useStatusHint(compacting: boolean, drafting: DraftingTool | null, providerWait: string): string {
+type StatusLabels = {
+  foregroundRunning: string
+  inputRequired: string
+  quietRunning: string
+  stalledWarning: string
+}
+
+function statusDescription(phase: ThreadActivityPhase, labels: StatusLabels): string | undefined {
+  if (phase === 'input-required') {
+    return labels.inputRequired
+  }
+
+  if (phase === 'stalled') {
+    return labels.stalledWarning
+  }
+
+  if (phase === 'quiet-running') {
+    return labels.quietRunning
+  }
+
+  if (phase === 'running' || phase === 'compacting') {
+    return labels.foregroundRunning
+  }
+
+  return undefined
+}
+
+function useStatusHint(
+  drafting: DraftingTool | null,
+  providerWait: string,
+  phase: ThreadActivityPhase,
+  labels: StatusLabels
+): string {
   const [revealed, setRevealed] = useState(false)
   const name = drafting?.name ?? ''
 
@@ -110,12 +197,24 @@ function useStatusHint(compacting: boolean, drafting: DraftingTool | null, provi
     return () => window.clearTimeout(id)
   }, [name])
 
-  if (compacting) {
+  if (phase === 'input-required') {
+    return labels.inputRequired
+  }
+
+  if (phase === 'stalled') {
+    return labels.stalledWarning
+  }
+
+  if (phase === 'compacting') {
     return COMPACTION_LABEL
   }
 
-  if (providerWait) {
+  if (phase === 'provider-wait' && providerWait.trim()) {
     return providerWait
+  }
+
+  if (phase === 'quiet-running') {
+    return labels.quietRunning
   }
 
   return revealed && name ? toolPresentVerb(name) : ''
@@ -144,18 +243,37 @@ export const CenteredThreadSpinner: FC = () => {
 
 export const ResponseLoadingIndicator: FC = () => {
   const { t } = useI18n()
-  const { compacting, drafting, providerWait, turnStartedAt } = useThreadSessionStatus()
+  const { awaitingInput, busy, compacting, drafting, providerWait, stalled, turnStartedAt } = useThreadSessionStatus()
+  const phase = resolveThreadActivityPhase({
+    awaitingInput,
+    busy,
+    compacting,
+    providerWait,
+    // Intentionally false: this row is the pre-first-token spinner and has no
+    // quiet state. quiet-running is owned by TurnActivityIndicator via quietSince.
+    quiet: false,
+    stalled
+  })
   const elapsed = useElapsedSeconds(true, undefined, turnStartedAt)
-  const hint = useStatusHint(compacting, drafting, providerWait)
+  const hint = useStatusHint(drafting, providerWait, phase, {
+    foregroundRunning: t.assistant.thread.foregroundRunning,
+    inputRequired: t.assistant.thread.inputRequired,
+    quietRunning: t.assistant.thread.quietRunning,
+    stalledWarning: t.assistant.thread.stalledWarning
+  })
 
   return (
-    <StatusRow data-slot="aui_response-loading" label={hint || t.assistant.thread.loadingResponse}>
+    <StatusRow
+      aria-description={statusDescription(phase, { foregroundRunning: t.assistant.thread.foregroundRunning, inputRequired: t.assistant.thread.inputRequired, quietRunning: t.assistant.thread.quietRunning, stalledWarning: t.assistant.thread.stalledWarning })}
+      data-slot="aui_response-loading"
+      label={hint || t.assistant.thread.loadingResponse}
+    >
       <StatusPulse
         aria-hidden="true"
         className="dither inline-block size-3 rounded-[2px] text-midground/80"
         kind="opacity"
       />
-      {hint && <HintText>{hint}</HintText>}
+      {hint && <HintText shimmer={phase !== 'input-required' && phase !== 'stalled'}>{hint}</HintText>}
       <ActivityTimerText seconds={elapsed} />
     </StatusRow>
   )
@@ -180,6 +298,7 @@ export const BackgroundResumeNotice: FC = () => {
 
   return (
     <div
+      aria-label={`${t.assistant.thread.backgroundRunning}: ${label}`}
       aria-live="polite"
       className="flex max-w-[min(86%,44rem)] items-center gap-1.5 self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/55"
       data-slot="aui_background-resume"
@@ -214,8 +333,8 @@ export const TurnActivityIndicator: FC = () => {
   // timer read "quiet for 12s" rather than the age of this component, which is
   // the whole turn so far.
   const [quietSince, setQuietSince] = useState<number | undefined>(undefined)
-  const { awaitingInput, busy, compacting, drafting, providerWait, turnStartedAt } = useThreadSessionStatus()
-  const hint = useStatusHint(compacting, drafting, providerWait)
+  const { t } = useI18n()
+  const { awaitingInput, busy, compacting, drafting, providerWait, stalled, turnStartedAt } = useThreadSessionStatus()
 
   // A tool run at the tail already narrates the wait — its summary counts the
   // calls, its ticker names the current one, and it carries its own timer. A
@@ -235,19 +354,30 @@ export const TurnActivityIndicator: FC = () => {
     return () => window.clearTimeout(id)
   }, [activity])
 
-  // Every second the app claims to be working belongs to something. A named
-  // wait says what it is straight away; an unnamed gap has to go quiet for
-  // TURN_QUIET_S first, or a run of quick calls would strobe a row between
-  // each one. The two exemptions are waits already accounted for elsewhere: a
-  // question the user is answering, and a tool call carrying its own timer.
   const working = busy || messageRunning
-  const active = working && !awaitingInput && !toolNarrating && (Boolean(hint) || quietSince !== undefined)
+  const phase = resolveThreadActivityPhase({
+    awaitingInput,
+    busy: working,
+    compacting,
+    providerWait,
+    quiet: quietSince !== undefined,
+    stalled
+  })
+  const hint = useStatusHint(drafting, providerWait, phase, {
+    foregroundRunning: t.assistant.thread.foregroundRunning,
+    inputRequired: t.assistant.thread.inputRequired,
+    quietRunning: t.assistant.thread.quietRunning,
+    stalledWarning: t.assistant.thread.stalledWarning
+  })
+  const active =
+    !toolNarrating &&
+    (phase === 'input-required' || (working && (Boolean(hint) || quietSince !== undefined)))
 
   // Compaction owns the whole turn, so it keeps counting from the turn's start;
   // anything else counts from the moment the turn last produced something — the
   // gap's own mark, or the draft's, whichever named the wait first.
   const elapsed = useElapsedSeconds(
-    active,
+    active && phase !== 'input-required',
     undefined,
     compacting ? turnStartedAt : (quietSince ?? drafting?.since ?? turnStartedAt)
   )
@@ -257,14 +387,24 @@ export const TurnActivityIndicator: FC = () => {
   }
 
   return (
-    <StatusRow data-slot="aui_turn-activity" label={hint || 'Hermes is working'}>
-      <StatusPulse
-        aria-hidden="true"
-        className="dither inline-block size-3 rounded-[2px] text-midground/80"
-        kind="opacity"
-      />
-      {hint && <HintText>{hint}</HintText>}
-      <ActivityTimerText seconds={elapsed} />
+    <StatusRow
+      aria-description={statusDescription(phase, { foregroundRunning: t.assistant.thread.foregroundRunning, inputRequired: t.assistant.thread.inputRequired, quietRunning: t.assistant.thread.quietRunning, stalledWarning: t.assistant.thread.stalledWarning })}
+      data-slot="aui_turn-activity"
+      label={hint || t.assistant.thread.loadingResponse}
+    >
+      {phase === 'input-required' ? (
+        <Codicon aria-hidden="true" className="text-amber-500/80" name="question" size="0.8rem" />
+      ) : phase === 'stalled' ? (
+        <Codicon aria-hidden="true" className="text-amber-500/80" name="warning" size="0.8rem" />
+      ) : (
+        <StatusPulse
+          aria-hidden="true"
+          className="dither inline-block size-3 rounded-[2px] text-midground/80"
+          kind="opacity"
+        />
+      )}
+      <HintText shimmer={phase !== 'input-required' && phase !== 'stalled'}>{hint}</HintText>
+      {phase !== 'input-required' && <ActivityTimerText seconds={elapsed} />}
     </StatusRow>
   )
 }

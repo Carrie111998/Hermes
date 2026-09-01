@@ -3377,6 +3377,12 @@ export const zh: Translations = {
       loadingSession: '正在加载会话',
       showEarlier: '显示更早的消息',
       loadingResponse: 'Hermes 正在加载回复',
+      foregroundRunning: '前台任务运行中',
+      inputRequired: '需要你的输入',
+      quietRunning: '正在安静地工作',
+      stalledWarning: '仍在工作——最近没有输出',
+      backgroundRunning: '后台任务运行中',
+      completed: '已完成',
       resumeWhenBackgroundDone: count =>
         count === 1 ? '后台任务完成后将自动继续' : `${count} 个后台任务完成后将自动继续`,
       thinking: '思考中',

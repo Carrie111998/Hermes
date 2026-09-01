@@ -2777,6 +2777,12 @@ export interface Translations {
       loadingSession: string
       showEarlier: string
       loadingResponse: string
+      foregroundRunning: string
+      inputRequired: string
+      quietRunning: string
+      stalledWarning: string
+      backgroundRunning: string
+      completed: string
       resumeWhenBackgroundDone: (count: number) => string
       thinking: string
       thought: string

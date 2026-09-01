@@ -2,11 +2,13 @@ import { act, cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { __resetElapsedTimerRegistryForTests } from '@/components/chat/activity-timer'
+import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { I18nProvider } from '@/i18n'
 import { $providerWaitSessions, setSessionProviderWait } from '@/store/provider-wait'
-import { $activeSessionId, $turnStartedAt } from '@/store/session'
+import { setSessionCompacting } from '@/store/compaction'
+import { $activeSessionId, $turnStartedAt, setBusy } from '@/store/session'
 
-import { ResponseLoadingIndicator } from './status'
+import { resolveThreadActivityPhase, ResponseLoadingIndicator } from './status'
 
 function renderIndicator() {
   return render(
@@ -64,6 +66,7 @@ describe('ResponseLoadingIndicator timer', () => {
   it('names a prolonged provider wait in the existing response status row', () => {
     $activeSessionId.set('session-a')
     $turnStartedAt.set(Date.now())
+    setBusy(() => true)
     setSessionProviderWait('session-a', '⏳ waiting on local-model — 30s with no output yet')
 
     renderIndicator()
@@ -84,5 +87,83 @@ describe('status line', () => {
     const { container } = renderIndicator()
 
     expect(container.querySelector('[role="status"]')?.hasAttribute('data-conversation-scaffold')).toBe(true)
+  })
+})
+
+describe('resolveThreadActivityPhase', () => {
+  const base = {
+    awaitingInput: false,
+    busy: true,
+    compacting: false,
+    providerWait: '',
+    quiet: false,
+    stalled: false
+  }
+
+  it('prioritizes user input over every other active signal', () => {
+    expect(resolveThreadActivityPhase({ ...base, awaitingInput: true, compacting: true, stalled: true })).toBe('input-required')
+  })
+
+  it('keeps provider wording instead of guessing a wait deadline', () => {
+    expect(resolveThreadActivityPhase({ ...base, providerWait: 'waiting on local-model' })).toBe('provider-wait')
+  })
+
+  it('distinguishes compaction, stalled, quiet, and ordinary running work', () => {
+    expect(resolveThreadActivityPhase({ ...base, compacting: true })).toBe('compacting')
+    expect(resolveThreadActivityPhase({ ...base, stalled: true })).toBe('stalled')
+    expect(resolveThreadActivityPhase({ ...base, quiet: true })).toBe('quiet-running')
+    expect(resolveThreadActivityPhase(base)).toBe('running')
+  })
+
+  it('does not claim a running phase for an idle session', () => {
+    expect(resolveThreadActivityPhase({ ...base, busy: false })).toBe('idle')
+  })
+
+  it('masks provider wait text while compaction is in progress', () => {
+    expect(
+      resolveThreadActivityPhase({
+        ...base,
+        compacting: true,
+        providerWait: 'waiting on local-model'
+      })
+    ).toBe('compacting')
+  })
+})
+describe('status hint', () => {
+  afterEach(() => {
+    cleanup()
+    clearClarifyRequest()
+    setSessionCompacting('session-a', false)
+    setBusy(() => false)
+    $activeSessionId.set(null)
+    $turnStartedAt.set(null)
+    $providerWaitSessions.set({})
+  })
+
+  it('uses input-required copy when input is requested during compaction', () => {
+    $activeSessionId.set('session-a')
+    $turnStartedAt.set(Date.now())
+    setBusy(() => true)
+    setSessionCompacting('session-a', true)
+    setClarifyRequest({ choices: null, multiSelect: false, question: 'q', requestId: 'req-a', sessionId: 'session-a' })
+
+    renderIndicator()
+
+    const status = screen.getByRole('status')
+    expect(status.getAttribute('aria-label')).toBe('Needs your input')
+    expect(status.getAttribute('aria-label')).not.toBe('Summarizing thread')
+    expect(status.querySelector('.shimmer')).toBeNull()
+  })
+
+  it('ignores whitespace-only provider wait in the status hint', () => {
+    $activeSessionId.set('session-a')
+    $turnStartedAt.set(Date.now())
+    setBusy(() => true)
+    setSessionProviderWait('session-a', '   ')
+
+    renderIndicator()
+
+    const status = screen.getByRole('status')
+    expect(status.getAttribute('aria-label')).toBe('Hermes is loading a response')
   })
 })

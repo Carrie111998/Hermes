@@ -598,9 +598,21 @@ const AssistantActionBar: FC<MessageActionProps & { durationS?: number }> = ({
     [react]
   )
 
+  const hasCompletedOutcome = typeof durationS === 'number' && Number.isFinite(durationS) && durationS >= 0
+
   return (
     <div className="relative flex w-full shrink-0 items-center justify-end gap-1.5">
-      {durationS !== undefined && (
+      {hasCompletedOutcome && (
+        <span
+          aria-label={t.assistant.thread.completed}
+          className="select-none px-0.5 text-[0.6875rem] leading-5 text-muted-foreground"
+          data-slot="aui_turn-outcome"
+          title={t.assistant.thread.completed}
+        >
+          {t.assistant.thread.completed}
+        </span>
+      )}
+      {hasCompletedOutcome && (
         <span
           className="mr-auto select-none px-0.5 text-[0.6875rem] leading-5 tabular-nums text-muted-foreground"
           data-slot="aui_turn-duration"
