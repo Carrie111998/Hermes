@@ -6,14 +6,11 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 from urllib.parse import urlparse
 
 from agent.transports.base import ProviderTransport
 from agent.transports import register_transport
-
-logger = logging.getLogger(__name__)
 
 _CURSOR_HOST = "api2.cursor.sh"
 
@@ -101,7 +98,4 @@ class GrokbotTransport(ProviderTransport):
         return self._inner.map_finish_reason(raw_reason)
 
 
-try:
-    register_transport("grokbot", GrokbotTransport)
-except Exception:
-    logger.debug("Grokbot transport not registered", exc_info=True)
+register_transport("grokbot", GrokbotTransport)

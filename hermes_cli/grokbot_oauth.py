@@ -13,7 +13,10 @@ from agent.grokbot import login as grokbot_login
 
 
 def existing_session() -> dict[str, Any] | None:
-    sess = grokbot_login._load()
+    try:
+        sess = grokbot_login._load()
+    except Exception:
+        return None
     if not isinstance(sess, dict):
         return None
     if not sess.get("accessToken") or not sess.get("refreshToken"):

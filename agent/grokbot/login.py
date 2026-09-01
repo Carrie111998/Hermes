@@ -41,9 +41,22 @@ HOME = Path(os.environ.get("GROKBOT_HOME", Path.home() / ".grokbot"))
 
 def _save(obj: dict, name: str = "session.json") -> Path:
     HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(HOME, 0o700)
+    except OSError:
+        pass
     p = HOME / name
-    p.write_text(json.dumps(obj, indent=2))
-    p.chmod(0o600)
+    payload = json.dumps(obj, indent=2)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    fd = os.open(str(p), flags, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.chmod(p, 0o600)
+    except OSError:
+        pass
     return p
 
 
@@ -51,7 +64,19 @@ def _load() -> dict | None:
     p = HOME / "session.json"
     if not p.is_file():
         return None
-    return json.loads(p.read_text())
+    try:
+        mode = p.stat().st_mode & 0o777
+    except OSError:
+        return None
+    if mode & 0o077:
+        return None
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
 
 
 # ------------------------------------------------------------- checksum -----
@@ -137,7 +162,7 @@ def poll(uuid: str, verifier: str, seconds: float = 300.0) -> dict | None:
     deadline = time.time() + seconds
     delay = 1.0
     while time.time() < deadline:
-        code, body = _req(url, b"", headers(), method="GET")
+        code, body = _req(url, None, headers(), method="GET")
         # 404 == not yet completed -> keep waiting (per main.cjs c5i)
         if code == 404:
             time.sleep(min(delay, 10.0))
