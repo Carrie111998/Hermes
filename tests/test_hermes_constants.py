@@ -371,6 +371,69 @@ class TestIsContainer:
         monkeypatch.setattr(os.path, "exists", lambda p: False)
         assert is_container() is True
 
+    def _probe_with_mountinfo(self, monkeypatch, mountinfo: str) -> bool:
+        """Run is_container() against a synthetic /proc/self/mountinfo.
+
+        Neutralizes every earlier signal (no /.dockerenv, no k8s env var,
+        clean cgroup) so only the mountinfo fallback decides.
+        """
+        import builtins
+        import io
+
+        self._reset_cache(monkeypatch)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+        monkeypatch.setattr(os.path, "exists", lambda p: False)
+
+        real_open = builtins.open
+
+        def fake_open(path, *args, **kwargs):
+            if path == "/proc/self/mountinfo":
+                return io.StringIO(mountinfo)
+            if path == "/proc/1/cgroup":
+                return io.StringIO("0::/init.scope\n")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        return is_container()
+
+    def test_container_host_is_not_a_container(self, monkeypatch):
+        """A HOST running containerd must not detect itself as containerized.
+
+        Regression: the cgroup-v2 fallback used to substring-match the whole
+        mount table, so the runtime's own overlay mounts (present on any
+        machine that *runs* containers) made every Docker host report True.
+        Here "/" is a plain ext4 device — the machine is not a container.
+        """
+        mountinfo = (
+            "29 1 8:18 / / rw,noatime shared:1 - ext4 /dev/sdb2 rw\n"
+            "118 163 0:50 / /var/lib/docker/overlay2/2917fb0b rw,relatime shared:70 "
+            "- overlay overlay rw,lowerdir=/var/lib/containerd/snapshots/1/fs\n"
+        )
+        assert self._probe_with_mountinfo(monkeypatch, mountinfo) is False
+
+    def test_detects_containerd_overlay_root(self, monkeypatch):
+        """Inside a real container "/" IS the runtime overlay → True."""
+        mountinfo = (
+            "640 639 0:65 / / rw,relatime - overlay overlay "
+            "rw,lowerdir=/var/lib/containerd/snapshots/9/fs\n"
+        )
+        assert self._probe_with_mountinfo(monkeypatch, mountinfo) is True
+
+    def test_detects_kubepods_root(self, monkeypatch):
+        """A k8s pod's root mount carries the runtime marker → True."""
+        mountinfo = (
+            "1234 1233 0:58 / / rw,relatime - overlay overlay "
+            "rw,lowerdir=/var/lib/containerd/snapshots/842/fs\n"
+            "1235 1234 0:59 /kubepods/besteffort/podabc /etc/hosts rw,relatime "
+            "- ext4 /dev/sda1 rw\n"
+        )
+        assert self._probe_with_mountinfo(monkeypatch, mountinfo) is True
+
+    def test_plain_host_without_runtime(self, monkeypatch):
+        """No runtime anywhere in the mount table → False."""
+        mountinfo = "29 1 8:18 / / rw,noatime shared:1 - ext4 /dev/sdb2 rw\n"
+        assert self._probe_with_mountinfo(monkeypatch, mountinfo) is False
+
 
 class TestParseReasoningEffort:
     """Tests for parse_reasoning_effort() — string → reasoning config dict."""
