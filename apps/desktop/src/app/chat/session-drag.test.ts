@@ -179,6 +179,61 @@ describe('session drop targeting across stacked tabs', () => {
     expect(openSessionTile).not.toHaveBeenCalled()
   })
 
+  it('reveals a minimized destination after moving the primary workspace into it', () => {
+    document.body.innerHTML = `
+      <div data-tree-group="top">
+        <div data-zone-tabstrip="top">
+          <button data-tree-tab="session-tile:top"></button>
+        </div>
+      </div>
+      <div data-tree-group="bottom">
+        <button id="workspace-tab" data-tree-tab="workspace"></button>
+      </div>
+    `
+
+    const top = document.querySelector<HTMLElement>('[data-tree-group="top"]')!
+    const bottom = document.querySelector<HTMLElement>('[data-tree-group="bottom"]')!
+    const strip = document.querySelector<HTMLElement>('[data-zone-tabstrip="top"]')!
+    const targetTab = document.querySelector<HTMLElement>('[data-tree-tab="session-tile:top"]')!
+    const workspaceTab = document.getElementById('workspace-tab')!
+
+    stubRect(top, { left: 0, top: 0, right: 1000, bottom: 390 })
+    stubRect(strip, { left: 0, top: 0, right: 1000, bottom: 32 })
+    stubRect(targetTab, { left: 0, top: 0, right: 300, bottom: 32 })
+    stubRect(bottom, { left: 0, top: 410, right: 1000, bottom: 800 })
+    stubRect(workspaceTab, { left: 0, top: 410, right: 300, bottom: 442 })
+
+    $layoutTree.set(
+      split('column', [
+        group(['session-tile:top'], { active: 'session-tile:top', id: 'top', minimized: true }),
+        group(['workspace'], { active: 'workspace', id: 'bottom' })
+      ])
+    )
+
+    startSessionDrag(
+      { id: 'main-session', profile: 'default', title: 'Main chat' },
+      {
+        button: 0,
+        clientX: 100,
+        clientY: 425,
+        currentTarget: workspaceTab,
+        pointerId: 1
+      } as unknown as ReactPointerEvent<HTMLElement>,
+      { sourcePaneId: 'workspace' }
+    )
+
+    window.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: 800, clientY: 16 }))
+    window.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, clientX: 800, clientY: 16 }))
+
+    expect(findGroupOfPane($layoutTree.get()!, 'workspace')).toMatchObject({
+      active: 'workspace',
+      id: 'top',
+      minimized: false,
+      panes: ['session-tile:top', 'workspace']
+    })
+    expect(openSessionTile).not.toHaveBeenCalled()
+  })
+
   it('excludes the primary workspace pane from its own same-strip insertion slots', () => {
     document.body.innerHTML = `
       <div data-tree-group="shared">

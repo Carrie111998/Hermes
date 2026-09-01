@@ -206,6 +206,10 @@ export function startSessionDrag(
             groupId: split.groupId,
             pos: split.pos
           })
+          // A minimized target keeps that state through movePane. The workspace
+          // is uncloseable and must never disappear into a collapsed zone, so
+          // finish the move through the same reveal invariant used by tiles.
+          revealTreePane(opts.sourcePaneId)
         } else {
           openSessionTile(payload.id, split.pos, split.anchor, split.before)
           // A tile for this session may already exist (openSessionTile is

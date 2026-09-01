@@ -98,4 +98,6 @@ test('a lower primary chat merges into an upper session strip', async () => {
   await drag(page, workspaceTab, stripBox!.x + stripBox!.width - 24, stripBox!.y + stripBox!.height / 2)
 
   await expect.poll(() => groupIdFor(page, 'workspace'), { timeout: 15_000 }).toBe(await groupIdFor(page, tilePaneId!))
+  await expect(page.locator('[data-tree-tab="workspace"]')).toHaveAttribute('aria-selected', 'true')
+  await expect(page.locator('[data-session-anchor="workspace"]:visible')).toContainText(mainPrompt)
 })
