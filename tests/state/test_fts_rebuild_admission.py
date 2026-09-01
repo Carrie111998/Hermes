@@ -17,9 +17,11 @@ prove nothing.
 """
 
 import contextlib
+import errno
 import subprocess
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -222,5 +224,80 @@ class TestSchemaPathAdmission:
         finally:
             d3.close()
         # Recovered: breadcrumb cleared, triggers restored.
+        assert _meta_value(db_path, FTS_STALE_KEY) is None
+        assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
+
+
+class TestLeftoverLockFileIsNotAHolder:
+    def test_empty_lock_file_without_flock_admits_immediately(self, tmp_path):
+        """A leftover 0-byte ``*.lock`` is not ownership (#100108)."""
+        db_path = tmp_path / "state.db"
+        lock = _lock_file(db_path)
+        lock.write_bytes(b"")
+        t0 = time.monotonic()
+        with hermes_state_common.fts_rebuild_admission(db_path) as admitted:
+            assert admitted is True
+        assert time.monotonic() - t0 < 2.0
+
+    def test_non_contention_oserror_does_not_wait_out_timeout(
+        self, tmp_path, monkeypatch
+    ):
+        import fcntl
+
+        monkeypatch.setattr(
+            hermes_state_common, "_FTS_REBUILD_LOCK_TIMEOUT_SECONDS", 30.0
+        )
+
+        def _flock(*_args, **_kwargs):
+            raise OSError(getattr(errno, "ESTALE", errno.EIO), "stale handle")
+
+        monkeypatch.setattr(fcntl, "flock", _flock)
+        db_path = tmp_path / "state.db"
+        t0 = time.monotonic()
+        with hermes_state_common.fts_rebuild_admission(db_path) as admitted:
+            assert admitted is False
+        assert time.monotonic() - t0 < 2.0
+
+    def test_retry_deferred_fts_recovery_rebuilds_same_instance(
+        self, tmp_path, monkeypatch
+    ):
+        """Gateway-shaped: same SessionDB stays open and retries after deferral."""
+        import hermes_state_schema
+
+        monkeypatch.setattr(hermes_state_schema, "_FTS_STALE_RETRY_SECONDS", 0.0)
+        db_path = tmp_path / "state.db"
+        d = SessionDB(db_path=db_path)
+        if not d._fts_enabled:
+            d.close()
+            pytest.skip("FTS5 unavailable in this build")
+        d.create_session("s1", source="test")
+        d.append_message("s1", "user", "hello recovery path")
+        d.close()
+
+        raw = sqlite3.connect(str(db_path))
+        raw.execute(
+            "INSERT OR REPLACE INTO state_meta(key, value) VALUES (?, '1')",
+            (FTS_STALE_KEY,),
+        )
+        for trig in _FTS_TRIGGERS:
+            raw.execute(f"DROP TRIGGER IF EXISTS {trig}")
+        raw.commit()
+        raw.close()
+
+        holders = [(4242, str(db_path))]
+        monkeypatch.setattr(
+            SessionDB, "_foreign_state_db_holders", lambda self: list(holders)
+        )
+        d2 = SessionDB(db_path=db_path)
+        try:
+            assert d2._fts_stale is True
+            d2._fts_stale_retry_after = 0.0
+            assert d2.retry_deferred_fts_recovery() is False
+            holders.clear()
+            d2._fts_stale_retry_after = 0.0
+            assert d2.retry_deferred_fts_recovery() is True
+            assert d2._fts_stale is False
+        finally:
+            d2.close()
         assert _meta_value(db_path, FTS_STALE_KEY) is None
         assert _base_fts_triggers(db_path) == set(_FTS_TRIGGERS)
