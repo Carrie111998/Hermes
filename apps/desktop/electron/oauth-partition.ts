@@ -20,8 +20,9 @@
  *   - A NON-primary v2 registry `remote` entry with cookie auth
  *     (`authMode: 'oauth'`, which covers dashboard basic/password providers —
  *     they authenticate via session cookies too) gets its own partition
- *     derived from the connection id, but ONLY when another cookie-auth entry
- *     (including the primary) shares its hostname. Chromium cookie jars
+ *     derived from the connection id, but ONLY when another cookie-auth
+ *     `remote` entry (including the primary, when it is itself a `remote`
+ *     entry) shares its hostname. Chromium cookie jars
  *     ignore the port, so that shared-host case is the only one where two
  *     entries can actually evict or read each other's session cookie in the
  *     legacy jar. Isolating on a different host solves nothing and costs a
