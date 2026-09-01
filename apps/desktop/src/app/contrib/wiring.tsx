@@ -377,14 +377,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   // Post-turn rehydrate from stored history (same behavior as DesktopController,
   // including finished-todos restoration).
-  const hydrateFromStoredSession = useCallback(
+  const tryHydrateFromStoredSession = useCallback(
     async (
       attempts = 1,
       storedSessionId = selectedStoredSessionIdRef.current,
       runtimeSessionId = activeSessionIdRef.current
     ) => {
       if (!storedSessionId || !runtimeSessionId) {
-        return
+        return false
       }
 
       const storedProfile = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))?.profile
@@ -415,7 +415,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
             clearSessionTodos(runtimeSessionId)
           }
 
-          return
+          return true
         } catch {
           // Best-effort fallback when live stream payloads are empty.
         }
@@ -424,8 +424,17 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           await new Promise(resolve => window.setTimeout(resolve, 250))
         }
       }
+
+      return false
     },
     [activeSessionIdRef, selectedStoredSessionIdRef, updateSessionState]
+  )
+
+  const hydrateFromStoredSession = useCallback(
+    async (attempts?: number, storedSessionId?: string | null, runtimeSessionId?: string | null) => {
+      await tryHydrateFromStoredSession(attempts, storedSessionId, runtimeSessionId)
+    },
+    [tryHydrateFromStoredSession]
   )
 
   // Refresh any active transcript changed by another process. Signature-gated
@@ -796,7 +805,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     resyncReplaySession: runtimeSessionId => {
       const state = sessionStateByRuntimeIdRef.current.get(runtimeSessionId)
 
-      return hydrateFromStoredSession(3, state?.storedSessionId, runtimeSessionId)
+      return tryHydrateFromStoredSession(3, state?.storedSessionId, runtimeSessionId)
     },
     onConnectionReady: c => {
       connectionRef.current = c

@@ -168,3 +168,32 @@ def test_truncation_detection_semantics():
     assert event_replay.is_truncated("s1", 5)
     # Unknown session: nothing evicted, nothing truncated.
     assert not event_replay.is_truncated("nope", 0)
+
+
+def test_replay_snapshot_is_atomic_and_detached_during_concurrent_stamping():
+    for _ in range(event_replay._REPLAY_BUFFER_MAX + 10):
+        event_replay._stamp_event(_frame("s1"))
+
+    stop = threading.Event()
+
+    def stamp():
+        while not stop.is_set():
+            event_replay._stamp_event(_frame("s1"))
+
+    writer = threading.Thread(target=stamp)
+    writer.start()
+    try:
+        for _ in range(100):
+            snapshot = event_replay.replay_snapshot("s1", 0)
+            assert snapshot.truncated
+            assert snapshot.events[-1]["seq"] == snapshot.latest_seq
+            assert all(
+                left["seq"] + 1 == right["seq"]
+                for left, right in zip(snapshot.events, snapshot.events[1:])
+            )
+
+        snapshot.events[-1]["seq"] = -1
+        assert event_replay.replay_snapshot("s1", 0).events[-1]["seq"] > 0
+    finally:
+        stop.set()
+        writer.join()

@@ -138,7 +138,7 @@ export function primaryRuntimeConnectionId(connection: Pick<HermesConnection, 'c
 interface GatewayBootOptions {
   beforeConnectionSwitch: () => void
   handleGatewayEvent: (event: RpcEvent) => void
-  resyncReplaySession?: (sessionId: string) => Promise<void> | void
+  resyncReplaySession?: (sessionId: string) => Promise<boolean> | boolean
   onConnectionReady: (
     connection: Awaited<ReturnType<NonNullable<typeof window.hermesDesktop>['getConnection']>> | null
   ) => void
@@ -150,7 +150,7 @@ interface GatewayBootOptions {
 export function useGatewayBoot({
   beforeConnectionSwitch,
   handleGatewayEvent,
-  resyncReplaySession = () => undefined,
+  resyncReplaySession = () => false,
   onConnectionReady,
   onGatewayReady,
   refreshHermesConfig,
@@ -846,6 +846,7 @@ export function useGatewayBoot({
       recordSessionEventScope(scopedEvent)
       callbacksRef.current.handleGatewayEvent(scopedEvent)
     })
+
     const offReplayGap = gateway.onReplayGap?.(sessionId => callbacksRef.current.resyncReplaySession(sessionId)) ?? (() => {})
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the

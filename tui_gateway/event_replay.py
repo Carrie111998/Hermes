@@ -21,6 +21,7 @@ from __future__ import annotations
 import threading
 import uuid
 from collections import OrderedDict, deque
+from typing import NamedTuple
 
 # Process identity for the replay contract. Seq counters live in-process, so
 # a gateway restart silently resets them to 1 while clients still hold high
@@ -43,6 +44,15 @@ _replay_lock = threading.Lock()
 _replay_buffers: "OrderedDict[str, deque]" = OrderedDict()
 _replay_next_seq: dict[str, int] = {}
 _replay_generations: dict[str, str] = {}
+
+
+class ReplaySnapshot(NamedTuple):
+    """One lock-consistent view of a session's replay state."""
+
+    events: list[dict]
+    latest_seq: int
+    generation: str | None
+    truncated: bool
 
 
 def replay_epoch() -> str:
@@ -93,6 +103,20 @@ def events_since(sid: str, last_seen: int) -> list[dict]:
         if not buf:
             return []
         return [event for seq, event in buf if seq > last_seen]
+
+
+def replay_snapshot(sid: str, last_seen: int) -> ReplaySnapshot:
+    """Return one atomic, detached replay response snapshot for *sid*."""
+    key = sid or ""
+    with _replay_lock:
+        buf = _replay_buffers.get(key)
+        events = [event.copy() for seq, event in buf or () if seq > last_seen]
+        return ReplaySnapshot(
+            events=events,
+            latest_seq=_replay_next_seq.get(key, 0),
+            generation=_replay_generations.get(key),
+            truncated=bool(buf and last_seen + 1 < buf[0][0]),
+        )
 
 
 def is_truncated(sid: str, last_seen: int) -> bool:
