@@ -54,6 +54,12 @@ from agent.turn_request import (
     _clone_message_for_send,
     build_turn_request,
 )
+from agent.turn_provider import (
+    ProviderCallContext,
+    _moa_client_consumes_prepared_request,
+    _system_prompt_for_hooks,
+    execute_provider_call,
+)
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
@@ -111,7 +117,7 @@ from agent import empty_response_guard as _empty_guard
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
-from utils import base_url_host_matches, env_var_enabled
+from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
 
@@ -363,20 +369,6 @@ def _is_interpreter_shutdown_error(exc: Exception) -> bool:
 
         return interpreter_shutting_down(exc)
     return False
-
-
-def _moa_client_consumes_prepared_request(client: Any) -> bool:
-    """True when ``client`` is the in-process MoA facade.
-
-    ``_moa_prepared_request`` is a private handshake with
-    ``MoAChatCompletions.create``, and only that facade exposes ``prepare()``.
-    Every other chat-completions object raises TypeError on the unexpected
-    keyword — including the native OpenAI client that credential rotation,
-    provider fallback and dead-connection cleanup rebuild from
-    ``_client_kwargs`` while ``agent.provider`` stays ``"moa"``.
-    """
-    completions = getattr(getattr(client, "chat", None), "completions", None)
-    return callable(getattr(completions, "prepare", None))
 
 
 def _join_truncated_parts(parts: List[str]) -> str:
@@ -659,24 +651,6 @@ def _print_nous_entitlement_guidance(agent, capability: str) -> bool:
     for line in message.splitlines():
         agent._vprint(f"{agent.log_prefix}   💡 {line}", force=True)
     return True
-
-
-def _system_prompt_for_hooks(api_kwargs: Any, request_messages: Any) -> Any:
-    """System prompt as actually sent to the provider, for observability hooks.
-
-    Providers move it out of ``messages``: Anthropic Messages uses a separate
-    ``system`` kwarg (str or content-block list), the Responses/Codex API uses
-    top-level ``instructions``; Chat Completions keeps it as ``messages[0]``.
-    Returns None when the request carries no system prompt.
-    """
-    system_prompt = api_kwargs.get("system")
-    if system_prompt is None:
-        system_prompt = api_kwargs.get("instructions")
-    if system_prompt is None and isinstance(request_messages, list) and request_messages:
-        first = request_messages[0]
-        if isinstance(first, dict) and first.get("role") == "system":
-            system_prompt = first.get("content")
-    return system_prompt
 
 
 def _is_nous_inference_route(provider: str, base_url: str) -> bool:
@@ -2404,174 +2378,6 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
-                if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
-                else:
-                    api_kwargs = agent._build_api_kwargs(
-                        api_messages,
-                        tools_for_api=tools_for_api,
-                    )
-                # Outbound-request surrogate chokepoint (#50959): the messages
-                # were scrubbed above, but the rest of the request body —
-                # tool/function descriptions (session_search's ±-heavy text is
-                # the recorded repro), extra_body, system strings routed via
-                # kwargs — can still carry invalid code points that providers
-                # reject with a non-retryable HTTP 400 ("invalid unicode code
-                # point"). One in-place walk here guarantees the entire
-                # payload json.dumps()-safe regardless of which leaf produced
-                # the string. Fast no-op when the payload is clean.
-                _sanitize_structure_surrogates(api_kwargs)
-                if agent._force_ascii_payload:
-                    _sanitize_structure_non_ascii(api_kwargs)
-                if agent.api_mode == "codex_responses":
-                    api_kwargs = agent._get_transport().preflight_kwargs(
-                        api_kwargs,
-                        allow_stream=False,
-                        is_github_responses=agent._is_copilot_url(),
-                        sanitize_harmony_tokens=agent._is_codex_backend(),
-                    )
-                # OpenRouter response caching replays identical successful
-                # responses verbatim, including empty completions. An empty-
-                # response retry must reach the provider instead of replaying
-                # the response that triggered the retry.
-                if agent._empty_content_retries > 0 and agent._is_openrouter_url():
-                    _xh = dict(api_kwargs.get("extra_headers") or {})
-                    _xh["X-OpenRouter-Cache"] = "false"
-                    api_kwargs["extra_headers"] = _xh
-                # Copilot x-initiator: the first API call of a user turn is
-                # marked "user" so Copilot bills a premium request; tool-loop
-                # follow-ups keep the default "agent" header (#3040).
-                if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
-                    _xh = dict(api_kwargs.get("extra_headers") or {})
-                    _xh["x-initiator"] = "user"
-                    api_kwargs["extra_headers"] = _xh
-                    agent._is_user_initiated_turn = False
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
-
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
-                    _original_api_kwargs = dict(api_kwargs)
-                    _llm_middleware_trace = []
-
-                try:
-                    from hermes_cli.lifecycle import (
-                        has_hook,
-                        invoke_hook as _invoke_hook,
-                    )
-                    if has_hook("pre_api_request"):
-                        request_messages = api_kwargs.get("messages")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_kwargs.get("input")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_messages
-                        # Shallow-copy the outer list so plugins that retain the
-                        # reference for async snapshotting don't observe later
-                        # mutations of api_messages.  The inner dicts are not
-                        # mutated by the agent loop, so a shallow copy is
-                        # sufficient; a deepcopy would walk every tool result
-                        # and base64 image on every API call.
-                        #
-                        # The ``request_messages`` and ``conversation_history``
-                        # kwargs below are pre-existing raw passthroughs
-                        # consumed by the bundled langfuse plugin
-                        # (``plugins/observability/langfuse/__init__.py:_coerce_request_messages``).
-                        # They predate ``request`` and are intentionally NOT
-                        # sanitised — secrets are not expected here because
-                        # ``api_kwargs`` is the same object passed to the
-                        # provider client.  New consumers should read the
-                        # sanitised view from ``request["body"]["messages"]``.
-                        _request_payload = agent._api_request_payload_for_hook(api_kwargs)
-                        # Anthropic (``system``) and Responses/Codex
-                        # (``instructions``) move the system prompt out of
-                        # messages; pass it explicitly for observability
-                        # plugins (Langfuse).
-                        system_prompt_for_hooks = _system_prompt_for_hooks(
-                            api_kwargs, request_messages
-                        )
-                        _invoke_hook(
-                            "pre_api_request",
-                            task_id=effective_task_id,
-                            turn_id=turn_id,
-                            api_request_id=api_request_id,
-                            session_id=agent.session_id or "",
-                            user_message=original_user_message,
-                            conversation_history=list(messages),
-                            platform=agent.platform or "",
-                            model=agent.model,
-                            provider=agent.provider,
-                            base_url=agent.base_url,
-                            api_mode=agent.api_mode,
-                            api_call_count=api_call_count,
-                            retry_count=retry_count,
-                            request_messages=list(request_messages)
-                            if isinstance(request_messages, list)
-                            else [],
-                            system_prompt=system_prompt_for_hooks,
-                            message_count=len(api_messages),
-                            tool_count=len(agent.tools or []),
-                            approx_input_tokens=approx_tokens,
-                            request_char_count=total_chars,
-                            max_tokens=agent.max_tokens,
-                            started_at=api_start_time,
-                            middleware_trace=list(_llm_middleware_trace),
-                            request=_request_payload,
-                        )
-                except Exception:
-                    pass
-
-                if env_var_enabled("HERMES_DUMP_REQUESTS"):
-                    agent._dump_api_request_debug(api_kwargs, reason="preflight")
-
-                # This object is private to the in-process MoA facade.  Add it
-                # only after middleware, hooks, and debug dumps so none of them
-                # attempts to serialize it as part of the provider payload.
-                if _moa_prepared_request is not None and agent.provider == "moa":
-                    # Re-read the live client instead of trusting the one that
-                    # prepared the request above. Credential rotation, provider
-                    # fallback and dead-connection cleanup all rebuild
-                    # agent.client from _client_kwargs between attempts, and
-                    # pending_moa_prepared_request carries a prepared request
-                    # across exactly that boundary. The rebuilt client is a
-                    # native OpenAI client while provider stays "moa", so this
-                    # private key would reach the SDK as an unexpected keyword
-                    # — a non-retryable TypeError that kills every remaining
-                    # turn on the session.
-                    if _moa_client_consumes_prepared_request(agent.client):
-                        api_kwargs["_moa_prepared_request"] = _moa_prepared_request
-                    else:
-                        logger.warning(
-                            "MoA client replaced mid-turn (client=%s); sending the "
-                            "prepared prompt without the MoA handshake",
-                            type(agent.client).__name__,
-                        )
-
-                # Always prefer the streaming path — even without stream
-                # consumers.  Streaming gives us fine-grained health
-                # checking (90s stale-stream detection, 60s read timeout)
-                # that the non-streaming path lacks.  Without this,
-                # subagents and other quiet-mode callers can hang
-                # indefinitely when the provider keeps the connection
-                # alive with SSE pings but never delivers a response.
-                # The streaming path is a no-op for callbacks when no
-                # consumers are registered, and falls back to non-
-                # streaming automatically if the provider doesn't
-                # support it.
                 def _stop_spinner():
                     nonlocal thinking_spinner
                     if thinking_spinner:
@@ -2580,123 +2386,28 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
-                _use_streaming = True
-                # A Host that must inspect the complete no-tool candidate
-                # before display can disable provider streaming at the
-                # required request gate.  This is turn-scoped and leaves every
-                # unowned/default session on Hermes' normal streaming path.
-                if getattr(agent, "_host_streaming_allowed", True) is False:
-                    _use_streaming = False
-                # Provider signaled "stream not supported" on a previous
-                # attempt — switch to non-streaming for the rest of this
-                # session instead of re-failing every retry.
-                elif getattr(agent, "_disable_streaming", False):
-                    _use_streaming = False
-                # An ACP client communicates via subprocess stdio and returns a
-                # plain SimpleNamespace — not an iterable stream.  Keyed on the
-                # `acp://` scheme rather than one vendor, so any ACP client is
-                # excluded.  Mirror the ACP exclusion used for Responses API
-                # upgrade (lines ~1083-1085).
-                elif (
-                    agent.provider in {"copilot-acp"}
-                    or str(agent.base_url or "").lower().startswith("acp://")
-                    or str(agent.base_url or "").lower().startswith("acp+tcp://")
-                ):
-                    _use_streaming = False
-                # MoA streams only when a display/TTS consumer is present to
-                # receive the deltas. MoAChatCompletions.create() honors
-                # stream=True (runs the references, then returns the aggregator's
-                # raw token stream) and is reached here because, for provider
-                # "moa", _create_request_openai_client returns the MoA facade
-                # itself. Without consumers (quiet mode, subagents, health-check
-                # probes) we keep the complete-response path: the facade returns a
-                # whole response when stream is not requested, preserving the
-                # prior behavior for those callers.
-                elif agent.provider == "moa" and not agent._has_stream_consumers():
-                    _use_streaming = False
-                elif not agent._has_stream_consumers():
-                    # No display/TTS consumer. Still prefer streaming for
-                    # health checking, but skip for Mock clients in tests
-                    # (mocks return SimpleNamespace, not stream iterators).
-                    from unittest.mock import Mock
-                    if isinstance(getattr(agent, "client", None), Mock):
-                        _use_streaming = False
-
-                def _perform_api_call(next_api_kwargs):
-                    if agent.api_mode == "codex_responses":
-                        next_api_kwargs = agent._get_transport().preflight_kwargs(
-                            next_api_kwargs,
-                            allow_stream=False,
-                            is_github_responses=agent._is_copilot_url(),
-                            sanitize_harmony_tokens=agent._is_codex_backend(),
-                        )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    from agent import relay_llm
-
-                    return relay_llm.execute(
-                        next_api_kwargs,
-                        agent._interruptible_api_call,
-                        session_id=str(agent.session_id or ""),
-                        name=str(agent.provider or "provider"),
-                        model_name=str(agent.model or ""),
-                        metadata={
-                            "api_mode": agent.api_mode,
-                            "api_request_id": api_request_id,
-                            "call_role": (
-                                "delegated"
-                                if getattr(agent, "is_subagent", False)
-                                else "fallback"
-                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                                else "primary"
-                            ),
-                            "retry_count": retry_count,
-                        },
-                        defer_logical_completion=True,
-                    )
-
-                from hermes_cli.middleware import run_llm_execution_middleware
-
-                _model_request_active = getattr(agent, "_model_request_active", None)
-                _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
-                if _redirect_lock is not None:
-                    with _redirect_lock:
-                        if _model_request_active is not None:
-                            _model_request_active.set()
-                elif _model_request_active is not None:
-                    _model_request_active.set()
-                _redirect_crossed_response = False
-                try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
+                _provider_call = execute_provider_call(
+                    agent,
+                    api_messages,
+                    tools_for_api=tools_for_api,
+                    moa_prepared_request=_moa_prepared_request,
+                    context=ProviderCallContext(
                         task_id=effective_task_id,
                         turn_id=turn_id,
                         api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
+                        original_user_message=original_user_message,
+                        conversation_messages=messages,
                         api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
-                finally:
-                    if _redirect_lock is not None:
-                        with _redirect_lock:
-                            if _model_request_active is not None:
-                                _model_request_active.clear()
-                            _redirect_crossed_response = bool(
-                                agent._pending_redirect
-                            )
-                    else:
-                        if _model_request_active is not None:
-                            _model_request_active.clear()
-                        _redirect_crossed_response = agent._has_pending_redirect()
+                        retry_count=retry_count,
+                        approx_input_tokens=approx_tokens,
+                        request_char_count=total_chars,
+                        started_at=api_start_time,
+                    ),
+                    on_first_delta=_stop_spinner,
+                )
+                response = _provider_call.response
+                api_kwargs = _provider_call.api_kwargs
+                _redirect_crossed_response = _provider_call.redirect_crossed_response
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
