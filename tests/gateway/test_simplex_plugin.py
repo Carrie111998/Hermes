@@ -444,6 +444,52 @@ async def test_standalone_send_defaults_to_local_daemon(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_standalone_send_removes_owned_image_conversion(monkeypatch, tmp_path):
+    source = tmp_path / "source.webp"
+    source.write_bytes(b"RIFFxxxxWEBP")
+    converted = tmp_path / "converted.png"
+    converted.write_bytes(b"\x89PNG")
+    monkeypatch.setattr(
+        SimplexAdapter,
+        "_prepare_image",
+        staticmethod(lambda _path: (str(converted), "data:image/jpg;base64,")),
+    )
+
+    sent_payloads = []
+
+    class DummyWs:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def send(self, payload):
+            sent_payloads.append(json.loads(payload))
+
+        async def recv(self):
+            return json.dumps(
+                {"corrId": sent_payloads[-1]["corrId"], "resp": _send_ack(91)}
+            )
+
+    import websockets
+
+    monkeypatch.setattr(websockets, "connect", lambda *_args, **_kwargs: DummyWs())
+    pconfig = MagicMock()
+    pconfig.extra = {"ws_url": "ws://localhost:5225"}
+
+    result = await _standalone_send(
+        pconfig,
+        "42",
+        "",
+        media_files=[str(source)],
+    )
+
+    assert result["success"] is True
+    assert not converted.exists()
+
+
+@pytest.mark.asyncio
 async def test_health_monitor_does_not_reconnect_quiet_healthy_ws(monkeypatch):
     from gateway.config import PlatformConfig
     cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
@@ -924,6 +970,37 @@ async def test_streaming_edit_and_final_overflow_lifecycle():
 
 
 @pytest.mark.asyncio
+async def test_partial_stream_overflow_reports_exact_delivered_source_prefix():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._send_command = AsyncMock(return_value={"type": "chatItemUpdated"})
+    adapter._send_composed = AsyncMock(
+        side_effect=[
+            _simplex.SendResult(success=True, message_id="701"),
+            _simplex.SendResult(
+                success=False,
+                error="not submitted",
+                error_kind="transient",
+                retryable=True,
+            ),
+        ]
+    )
+    content = "word " * (_simplex.MAX_MESSAGE_LENGTH // 2)
+
+    result = await adapter.edit_message("42", "700", content, finalize=True)
+
+    assert result.success is False
+    assert result.raw_response["partial_overflow"] is True
+    delivered_prefix = result.raw_response["delivered_prefix"]
+    assert delivered_prefix
+    assert content.startswith(delivered_prefix)
+    assert len(delivered_prefix) < len(content)
+
+
+@pytest.mark.asyncio
 async def test_delete_and_error_diagnostics_are_truthful():
     from gateway.config import PlatformConfig
 
@@ -1337,6 +1414,7 @@ async def test_pre_submit_failure_is_retryable_but_unknown_outcome_is_not():
     )
     assert delivered.success is True
     assert socket.calls == 2
+    assert adapter._pending_responses == {}
 
     adapter._send_command = AsyncMock(
         return_value={
@@ -1350,8 +1428,13 @@ async def test_pre_submit_failure_is_retryable_but_unknown_outcome_is_not():
 
 
 def test_utf8_payload_split_respects_serialized_byte_budget():
+    from gateway.config import PlatformConfig
+
     text = "🙂" * 4000
     chunks = SimplexAdapter._split_utf8_payload(text)
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
 
     assert len(chunks) > 1
     assert "".join(chunks) == text
@@ -1359,6 +1442,14 @@ def test_utf8_payload_split_respects_serialized_byte_budget():
         len(json.dumps(chunk, ensure_ascii=False).encode("utf-8")) - 2 <= 12000
         for chunk in chunks
     )
+    assert adapter.message_len_fn(text) > adapter.MAX_MESSAGE_LENGTH
+    assert len(
+        adapter.truncate_message(
+            text,
+            adapter.MAX_MESSAGE_LENGTH,
+            len_fn=adapter.message_len_fn,
+        )
+    ) > 1
 
 
 @pytest.mark.asyncio
@@ -1531,6 +1622,93 @@ async def test_successful_owned_receive_attaches_post_turn_cleanup(tmp_path):
     assert len(callbacks) == 1
     callbacks[0]()
     assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_retained_receive_survives_ttl_and_disconnect(tmp_path):
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "ws_url": "ws://localhost:5225",
+                "files_folder": str(tmp_path),
+                "retain_received_files": True,
+            },
+        )
+    )
+    adapter._media_cleanup_timeout = 0.01
+    adapter.set_authorization_check(lambda *_args: True)
+    adapter._receive_file = AsyncMock()
+    pending = _make_file_chat_item("", "retained.pdf")
+    pending["chatItem"]["file"].pop("fileSource")
+    pending["chatItem"]["file"]["fileStatus"] = {"type": "rcvInvitation"}
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "rcvFileDescrReady",
+                "rcvFileTransfer": {"fileId": 7, "fileName": "retained.pdf"},
+                "chatItem": pending,
+            }
+        }
+    )
+    await asyncio.gather(*list(adapter._command_tasks))
+    target = Path(adapter._receive_file.await_args.args[1])
+    target.write_bytes(b"%PDF")
+    complete = _make_file_chat_item(str(target), "retained.pdf")
+    await adapter._handle_event(
+        {"resp": {"type": "rcvFileComplete", "chatItem": complete}}
+    )
+    await _drain_dispatches(adapter)
+    await asyncio.sleep(0.03)
+
+    assert not hasattr(captured[0], "_post_turn_cleanup_callbacks")
+    assert adapter._owned_media_cleanup_tasks == {}
+    assert target.exists()
+
+    await adapter.disconnect()
+    assert target.exists()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_success_completion_does_not_delete_active_media(tmp_path):
+    from gateway.config import PlatformConfig
+
+    target = tmp_path / "simplex-rcv-active.pdf"
+    target.write_bytes(b"%PDF")
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter.set_authorization_check(lambda *_args: True)
+    adapter._file_receive_targets[7] = str(target)
+    pending = _make_file_chat_item("", "active.pdf")
+    pending["chatItem"]["file"].pop("fileSource")
+    adapter._pending_file_transfers[7] = pending
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    complete = _make_file_chat_item(str(target), "active.pdf")
+    event = {"resp": {"type": "rcvFileComplete", "chatItem": complete}}
+    await adapter._handle_event(event)
+    await _drain_dispatches(adapter)
+    await adapter._handle_event(event)
+    await _drain_dispatches(adapter)
+
+    assert len(captured) == 1
+    assert target.exists()
+    assert adapter.get_runtime_diagnostics()["late_file_completions"] == 1
+
+    captured[0]._post_turn_cleanup_callbacks[0]()
 
 
 @pytest.mark.asyncio

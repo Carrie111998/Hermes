@@ -103,6 +103,29 @@ async def test_sentinel_placed_before_agent_setup():
     )
 
 
+@pytest.mark.asyncio
+async def test_claim_records_every_batched_message_id_for_edit_correlation():
+    runner = _make_runner()
+    event = _make_event()
+    event.message_id = "msg_1"
+    event.metadata = {
+        "simplex_batch_items": [
+            {"message_id": "msg_1", "text": "first"},
+            {"message_id": "msg_2", "text": "second"},
+        ]
+    }
+    captured = set()
+
+    async def mock_inner(self_inner, ev, src, qk, generation):
+        captured.update(runner._session_state(qk).turn.active_message_ids)
+        return "ok"
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", mock_inner):
+        await runner._handle_message(event)
+
+    assert captured == {"msg_1", "msg_2"}
+
+
 # ------------------------------------------------------------------
 # Test 2: Sentinel is cleaned up after _handle_message_with_agent
 # ------------------------------------------------------------------

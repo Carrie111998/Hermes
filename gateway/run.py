@@ -9974,7 +9974,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # 2. Try in-flight redirect / steer
         _q_state = self._peek_session_state(session_key)
-        if _q_state and _q_state.turn.active_message_id == _msg_id:
+        if _q_state and (
+            _q_state.turn.active_message_id == _msg_id
+            or _msg_id in _q_state.turn.active_message_ids
+        ):
             running_agent = _q_state.turn.agent
             if running_agent is _AGENT_PENDING_SENTINEL:
                 logger.info(
@@ -20033,6 +20036,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
         _claim_state.turn.started_ts = time.time()
         _claim_state.turn.active_message_id = event.message_id or None
+        _component_ids = {
+            str(component.get("message_id"))
+            for component in (event.metadata or {}).get("simplex_batch_items", [])
+            if isinstance(component, dict) and component.get("message_id") is not None
+        }
+        if event.message_id is not None:
+            _component_ids.add(str(event.message_id))
+        _claim_state.turn.active_message_ids = _component_ids
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 

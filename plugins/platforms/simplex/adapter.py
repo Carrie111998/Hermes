@@ -79,8 +79,9 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 # The protocol's encoded JSON envelope must fit below roughly 15.6 KiB.
-# Keep a substantial envelope/escaping margin and split before serialization.
-MAX_MESSAGE_LENGTH = 8000
+# This limit is measured by ``message_len_fn`` in serialized UTF-8 bytes, not
+# Python code points, and leaves room for the command/chat JSON wrapper.
+MAX_MESSAGE_LENGTH = 12000
 WS_RETRY_DELAY_INITIAL = 2.0
 WS_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0
@@ -145,6 +146,36 @@ def _sanitize_filename(name: str) -> str:
     return cleaned[:120] or "file"
 
 
+def _simplex_payload_len(text: str) -> int:
+    """Measure a string as it appears inside the ensure_ascii=False JSON body."""
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
+
+
+def _delivered_source_prefix(content: str, chunks: List[str]) -> str:
+    """Map formatted overflow chunks back to a monotonic source prefix."""
+    cursor = 0
+    for index, formatted in enumerate(chunks):
+        visible = re.sub(r" \(\d+/\d+\)$", "", formatted)
+        variants = {visible}
+        if visible.endswith("\n```"):
+            variants.add(visible[:-4])
+        if visible.startswith("```") and "\n" in visible:
+            without_open = visible.split("\n", 1)[1]
+            variants.add(without_open)
+            if without_open.endswith("\n```"):
+                variants.add(without_open[:-4])
+
+        if index:
+            while cursor < len(content) and content[cursor].isspace():
+                cursor += 1
+        remaining = content[cursor:]
+        matches = [candidate for candidate in variants if remaining.startswith(candidate)]
+        if not matches:
+            return ""
+        cursor += len(max(matches, key=len))
+    return content[:cursor]
+
+
 def _response_type(resp: Optional[dict]) -> str:
     return str((resp or {}).get("type") or "") if isinstance(resp, dict) else ""
 
@@ -202,6 +233,11 @@ class SimplexAdapter(BasePlatformAdapter):
 
     _EA_HEADER = "⚠️ Dangerous command requires approval\n"
     _EA_CMD_BUDGET = 2000
+
+    @property
+    def message_len_fn(self):
+        """SimpleX constrains encoded command bytes, not Unicode code points."""
+        return _simplex_payload_len
 
     def __init__(self, config: PlatformConfig, **kwargs):
         platform = Platform("simplex")
@@ -642,7 +678,8 @@ class SimplexAdapter(BasePlatformAdapter):
                         f"simplex-rcv-{uuid.uuid4().hex}-{_sanitize_filename(file_name)}",
                     )
                 self._file_receive_targets[file_id] = target
-                self._schedule_owned_media_cleanup(target)
+                if not self.retain_received_files:
+                    self._schedule_owned_media_cleanup(target)
                 logger.debug(
                     "SimpleX: rcvFileDescrReady for fileId=%s — accepting transfer",
                     file_id,
@@ -739,7 +776,10 @@ class SimplexAdapter(BasePlatformAdapter):
                         else None
                     )
                     target = self._terminal_file_target(file_id)
-                    if late_path and target:
+                    terminal_reason = self._terminal_file_transfers[file_id].get(
+                        "reason"
+                    )
+                    if late_path and target and terminal_reason != "completed":
                         resolved = self._resolve_file_path(late_path)
                         if os.path.abspath(resolved) == os.path.abspath(target):
                             self._cleanup_owned_media_path(target)
@@ -761,7 +801,6 @@ class SimplexAdapter(BasePlatformAdapter):
                 )
                 if file_path:
                     file_path = self._resolve_file_path(file_path)
-                    self._mark_file_terminal(file_id, "completed")
                     pending_item_data = pending.get("chatItem", {}) or {}
                     pending_file = pending_item_data.setdefault("file", {})
                     pending_file["fileSource"] = {"filePath": file_path}
@@ -773,7 +812,7 @@ class SimplexAdapter(BasePlatformAdapter):
                         logger.exception(
                             "SimpleX: error processing deferred file message"
                         )
-                else:
+                elif file_id not in self._terminal_file_transfers:
                     self._mark_file_terminal(file_id, "completed-without-path")
             return
 
@@ -1153,6 +1192,7 @@ class SimplexAdapter(BasePlatformAdapter):
         media_types: List[str] = []
         file_info = chat_item_data.get("file")
         owned_media_path: Optional[str] = None
+        completed_file_id: Optional[int] = None
 
         if file_info and isinstance(file_info, dict):
             file_source = file_info.get("fileSource", {}) or {}
@@ -1167,6 +1207,20 @@ class SimplexAdapter(BasePlatformAdapter):
             file_status_type = (
                 file_status.get("type") if isinstance(file_status, dict) else None
             )
+            try:
+                normalized_file_id = int(file_id) if file_id is not None else None
+            except (TypeError, ValueError):
+                normalized_file_id = None
+            if (
+                normalized_file_id is not None
+                and normalized_file_id in self._terminal_file_transfers
+            ):
+                self._diagnostics["late_file_completions"] += 1
+                logger.info(
+                    "SimpleX: ignored duplicate completed chat item for fileId=%s",
+                    normalized_file_id,
+                )
+                return
             if file_path:
                 file_path = self._resolve_file_path(file_path)
 
@@ -1201,10 +1255,7 @@ class SimplexAdapter(BasePlatformAdapter):
                     return
 
             if file_info and file_path:
-                try:
-                    normalized_file_id = int(file_id) if file_id is not None else None
-                except (TypeError, ValueError):
-                    normalized_file_id = None
+                completed_file_id = normalized_file_id
                 receive_target = (
                     self._terminal_file_target(normalized_file_id)
                     if normalized_file_id is not None
@@ -1328,6 +1379,13 @@ class SimplexAdapter(BasePlatformAdapter):
             chat_id[:20],
             (text or "")[:50],
         )
+
+        # Mark only after constructing and dispatching the first completed
+        # item.  Subsequent rcvFileComplete/newChatItems duplicates with the
+        # same fileId are then ignored without deleting a file the active turn
+        # may still be consuming.
+        if completed_file_id is not None:
+            self._mark_file_terminal(completed_file_id, "completed")
 
         # Batch consecutive text messages so the agent sees one combined
         # message instead of dropping earlier ones when the user pastes
@@ -1501,6 +1559,10 @@ class SimplexAdapter(BasePlatformAdapter):
                 command.split(" ", 1)[0],
                 e,
             )
+            self._pending_responses.pop(corr_id, None)
+            self._pending_corr_ids.discard(corr_id)
+            if not fut.done():
+                fut.cancel()
             return {
                 "type": "localCommandNotSubmitted",
                 "error": "SimpleX command was not submitted to the daemon",
@@ -1681,7 +1743,9 @@ class SimplexAdapter(BasePlatformAdapter):
         return self._send_result_from_response(resp, expected={"newChatItems"})
 
     @staticmethod
-    def _split_utf8_payload(text: str, byte_budget: int = 12000) -> List[str]:
+    def _split_utf8_payload(
+        text: str, byte_budget: int = MAX_MESSAGE_LENGTH
+    ) -> List[str]:
         """Split by serialized UTF-8 bytes, never through a code point.
 
         ``simplex-chat`` limits the encoded command envelope rather than
@@ -1697,9 +1761,7 @@ class SimplexAdapter(BasePlatformAdapter):
             end = start
             last_break: Optional[int] = None
             while end < len(text):
-                char_cost = len(
-                    json.dumps(text[end], ensure_ascii=False).encode("utf-8")
-                ) - 2
+                char_cost = _simplex_payload_len(text[end])
                 if used + char_cost > byte_budget and end > start:
                     break
                 used += char_cost
@@ -1734,7 +1796,9 @@ class SimplexAdapter(BasePlatformAdapter):
         delivered_ids: List[str] = []
         if content:
             initial_chunks: List[str] = []
-            for logical_chunk in self.truncate_message(content, MAX_MESSAGE_LENGTH):
+            for logical_chunk in self.truncate_message(
+                content, MAX_MESSAGE_LENGTH, len_fn=self.message_len_fn
+            ):
                 initial_chunks.extend(self._split_utf8_payload(logical_chunk))
             queue = [
                 (chunk, index == 0)
@@ -2086,7 +2150,9 @@ class SimplexAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Update a streaming preview and finalize it with complete text."""
         chunks: List[str] = []
-        for logical_chunk in self.truncate_message(content, MAX_MESSAGE_LENGTH):
+        for logical_chunk in self.truncate_message(
+            content, MAX_MESSAGE_LENGTH, len_fn=self.message_len_fn
+        ):
             chunks.extend(self._split_utf8_payload(logical_chunk))
         first_chunk = chunks[0] if chunks else ""
         updated = {
@@ -2118,6 +2184,10 @@ class SimplexAdapter(BasePlatformAdapter):
                 chat_id, {"type": "text", "text": chunk}
             )
             if not continuation.success:
+                delivered_chunks = chunks[: 1 + len(continuation_ids)]
+                delivered_prefix = _delivered_source_prefix(
+                    content, delivered_chunks
+                )
                 continuation.message_id = (
                     continuation_ids[-1] if continuation_ids else str(message_id)
                 )
@@ -2129,6 +2199,7 @@ class SimplexAdapter(BasePlatformAdapter):
                     "delivered_chunks": 1 + len(continuation_ids),
                     "total_chunks": len(chunks),
                     "last_message_id": continuation.message_id,
+                    "delivered_prefix": delivered_prefix,
                     "continuation_message_ids": tuple(continuation_ids),
                     "daemon_response": continuation.raw_response,
                 }
@@ -2556,12 +2627,13 @@ async def _standalone_send(
                 )
             return resp
 
+    owned_temp_paths: List[str] = []
     try:
         chat_ref = SimplexAdapter._chat_ref(chat_id)
         commands: List[str] = []
         if message:
             for chunk in BasePlatformAdapter.truncate_message(
-                message, MAX_MESSAGE_LENGTH
+                message, MAX_MESSAGE_LENGTH, len_fn=_simplex_payload_len
             ):
                 composed = [{
                     "msgContent": {"type": "text", "text": chunk},
@@ -2587,6 +2659,8 @@ async def _standalone_send(
                 file_path = path
             elif not force_document and _is_image_ext(ext):
                 file_path, thumb = SimplexAdapter._prepare_image(path)
+                if os.path.abspath(file_path) != os.path.abspath(path):
+                    owned_temp_paths.append(file_path)
                 msg_content = {"type": "image", "image": thumb, "text": ""}
             else:
                 msg_content = {"type": "file", "text": ""}
@@ -2616,6 +2690,17 @@ async def _standalone_send(
         }
     except Exception as e:
         return {"error": f"SimpleX send failed: {e}"}
+    finally:
+        for temp_path in owned_temp_paths:
+            try:
+                if os.path.isfile(temp_path) or os.path.islink(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                logger.debug(
+                    "SimpleX: failed to remove standalone image conversion %s",
+                    os.path.basename(temp_path),
+                    exc_info=True,
+                )
 
 
 def interactive_setup() -> None:

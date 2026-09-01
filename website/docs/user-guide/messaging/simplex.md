@@ -69,6 +69,11 @@ SIMPLEX_AUTO_ACCEPT=false
 
 After starting the daemon, open a conversation with your agent contact and run `/contacts` in the SimpleX CLI. Copy the numeric `contactId`. A display name shown in the UI may be renamed or collide with another contact, so Hermes deliberately ignores display-name entries in `SIMPLEX_ALLOWED_USERS` and logs a migration warning.
 
+> **Upgrade note:** Older adapter builds accepted display-name entries in
+> `SIMPLEX_ALLOWED_USERS`. They no longer authorize direct messages. Replace
+> every such entry with the numeric `contactId` from `/contacts` before
+> restarting an existing deployment.
+
 ## Authorization
 
 By default **all contacts are denied**. You must either:

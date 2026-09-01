@@ -331,6 +331,27 @@ class TestHandleEditSupersede:
         assert 'User edited their earlier message.' in call_args
         assert 'mid-flight correction' in call_args
 
+    def test_edit_redirects_any_in_flight_batch_component(self):
+        runner = _make_runner()
+        sk = "test_session"
+        adapter = _make_adapter()
+        agent = _make_running_agent(supports_redirect=True)
+        state = _session_state(runner, sk)
+        state.turn.agent = agent
+        state.turn.active_message_id = "msg_1"
+        state.turn.active_message_ids = {"msg_1", "msg_2", "msg_3"}
+        edit_event = _make_event(
+            text="corrected second component",
+            message_id="msg_2",
+            is_edit=True,
+        )
+
+        result = runner._handle_edit_supersede(edit_event, sk, adapter)
+
+        assert result is True
+        agent.redirect.assert_called_once()
+        assert "corrected second component" in agent.redirect.call_args.args[0]
+
     def test_edit_steers_when_redirect_unsupported(self):
         """Edit falls back to steer() when redirect is unavailable."""
         runner = _make_runner()
