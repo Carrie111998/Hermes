@@ -466,6 +466,18 @@ describe('toChatMessages', () => {
     expect(chatMessageText(message)).toBe(content)
   })
 
+  it('does not infer an internal notification from user-authored text', () => {
+    const [message] = toChatMessages([
+      {
+        role: 'user',
+        content: '[ASYNC DELEGATION BATCH COMPLETE — deleg_8246d5af]\n2 background agents finished.',
+        timestamp: 1
+      }
+    ])
+
+    expect(message.role).toBe('user')
+  })
+
   // A backend older than this app serves display_metadata as unparsed JSON
   // text. Indexing into that string used to throw and fail the whole resume.
   it.each([
