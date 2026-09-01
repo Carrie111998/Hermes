@@ -97,6 +97,7 @@ Thread safety:
 import asyncio
 import contextvars
 import concurrent.futures
+import hashlib
 import errno
 import fnmatch
 import inspect
@@ -110,6 +111,7 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Callable
@@ -6067,7 +6069,54 @@ def _ensure_healthy_or_recycle(server: Any, server_name: str) -> None:
         _signal_reconnect(server)
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+_BASSHUB_APPROVAL_ORIGIN_META_KEY = "dev.basshub/origin"
+_MAX_APPROVAL_ORIGIN_ID_CHARS = 256
+
+
+def _approval_origin_id(value: Any) -> str:
+    """Return a bounded printable correlation ID, or empty when invalid."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or len(text) > _MAX_APPROVAL_ORIGIN_ID_CHARS:
+        return ""
+    if any(ord(char) < 32 or ord(char) == 127 for char in text):
+        return ""
+    return text
+
+
+def _snapshot_approval_origin_metadata(kwargs: dict) -> Optional[Dict[str, Any]]:
+    try:
+        from gateway.session_context import get_session_env
+
+        platform = str(get_session_env("HERMES_SESSION_PLATFORM", "") or "")
+        if platform.strip().lower() != "api_server":
+            return None
+        session_id = _approval_origin_id(get_session_env("HERMES_SESSION_CHAT_ID", ""))
+    except Exception:
+        return None
+    if not session_id:
+        return None
+    turn_id = (
+        _approval_origin_id(kwargs.get("turn_id"))
+        or _approval_origin_id(kwargs.get("api_request_id"))
+        or f"turn-{uuid.uuid4().hex}"
+    )
+    tool_id = _approval_origin_id(kwargs.get("tool_call_id"))
+    request_id = (
+        f"tool-{hashlib.sha256((turn_id + chr(0) + tool_id).encode()).hexdigest()}"
+        if tool_id
+        else f"req-{uuid.uuid4().hex}"
+    )
+    return {_BASSHUB_APPROVAL_ORIGIN_META_KEY: {
+        "surface": "chat",
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "request_id": request_id,
+    }}
+
+
+def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, *, forward_approval_origin: bool = False):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
@@ -6142,6 +6191,8 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
 
+        request_meta = _snapshot_approval_origin_metadata(kwargs) if forward_approval_origin else None
+
         async def _call():
             _mark_server_call_started(server)
             async with server._rpc_lock, _track_inflight_rpc(
@@ -6182,7 +6233,10 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                             f"exited; failing the call fast instead of "
                             f"waiting {float(tool_timeout):.0f}s"
                         )
-                    _call_coro = server.session.call_tool(tool_name, arguments=args)
+                    call_kwargs: Dict[str, Any] = {"arguments": args}
+                    if request_meta is not None:
+                        call_kwargs["meta"] = request_meta
+                    _call_coro = server.session.call_tool(tool_name, **call_kwargs)
                     _watch_children = getattr(server, "_watch_stdio_children", None)
                     _watch_ok = (
                         _watch_children is not None
@@ -7017,6 +7071,19 @@ def _parse_boolish(value: Any, default: bool = True) -> bool:
     return default
 
 
+def _approval_origin_metadata_enabled(server_name: str, config: dict) -> bool:
+    request_metadata = config.get("request_metadata")
+    if request_metadata is None:
+        return False
+    if not isinstance(request_metadata, dict):
+        logger.warning(
+            "MCP config mcp_servers.%s.request_metadata must be a mapping; "
+            "approval origin metadata remains disabled",
+            server_name,
+        )
+        return False
+    return _parse_boolish(request_metadata.get("approval_origin"), default=False)
+
 def _get_lifecycle_seconds(config: dict, key: str) -> Optional[float]:
     """Return an optional positive lifecycle timeout from top-level/nested config."""
     raw = config.get(key)
@@ -7195,6 +7262,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     exclude_set = _normalize_name_filter(
         tools_filter.get("exclude"), f"mcp_servers.{name}.tools.exclude"
     )
+    forward_approval_origin = _approval_origin_metadata_enabled(name, config)
 
     def _should_register(tool_name: str) -> bool:
         if include_active:
@@ -7229,7 +7297,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
-                    name, mcp_tool.name, server.tool_timeout
+                    name, mcp_tool.name, server.tool_timeout,
+                    forward_approval_origin=forward_approval_origin,
                 ),
                 "check_fn": check_fn,
             }

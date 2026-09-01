@@ -1550,12 +1550,22 @@ def handle_function_call(
                         enabled_tools=sandbox_enabled,
                     )
             else:
+                entry = registry.get_entry(function_name)
+                correlation = {}
+                if entry is not None and entry.toolset.startswith("mcp-"):
+                    correlation = {
+                        "session_id": session_id,
+                        "tool_call_id": tool_call_id,
+                        "turn_id": turn_id,
+                        "api_request_id": api_request_id,
+                    }
+
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
-                        session_id=session_id,
                         user_task=user_task,
+                        **correlation,
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
