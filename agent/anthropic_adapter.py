@@ -19,6 +19,7 @@ import re
 import secrets
 import stat
 import subprocess
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -129,25 +130,29 @@ except Exception:
 # paths. Access via the `_get_anthropic_sdk()` accessor below, which caches
 # the module after the first call and returns None on ImportError.
 _anthropic_sdk: Any = ...  # sentinel — None means "tried and missing"
+_anthropic_sdk_lock = threading.Lock()
 
 
 def _get_anthropic_sdk():
     """Return the ``anthropic`` SDK module, importing lazily. None if not installed."""
     global _anthropic_sdk
-    if _anthropic_sdk is ...:
-        try:
-            from tools.lazy_deps import ensure as _lazy_ensure
-            _lazy_ensure("provider.anthropic", prompt=False)
-        except ImportError:
-            pass
-        except Exception:
-            # FeatureUnavailable — fall through to ImportError handling below
-            pass
-        try:
-            import anthropic as _sdk
-            _anthropic_sdk = _sdk
-        except ImportError:
-            _anthropic_sdk = None
+    if _anthropic_sdk is not ...:
+        return _anthropic_sdk
+    with _anthropic_sdk_lock:
+        if _anthropic_sdk is ...:
+            try:
+                from tools.lazy_deps import ensure as _lazy_ensure
+                _lazy_ensure("provider.anthropic", prompt=False)
+            except ImportError:
+                pass
+            except Exception:
+                # FeatureUnavailable — fall through to ImportError handling below
+                pass
+            try:
+                import anthropic as _sdk
+                _anthropic_sdk = _sdk
+            except ImportError:
+                _anthropic_sdk = None
     return _anthropic_sdk
 
 logger = logging.getLogger(__name__)

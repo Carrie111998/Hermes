@@ -45,6 +45,32 @@ class TestIsOAuthToken:
 
 
 
+class TestAnthropicSdkLazyImport:
+    def test_get_anthropic_sdk_is_thread_safe(self, monkeypatch):
+        """Concurrent calls to _get_anthropic_sdk must be serialized by lock (#100461)."""
+        import concurrent.futures
+        import agent.anthropic_adapter as adapter
+
+        mock_module = SimpleNamespace(Anthropic=MagicMock())
+        monkeypatch.setitem(sys.modules, "anthropic", mock_module)
+        # Reset sentinel to simulate cold start
+        monkeypatch.setattr(adapter, "_anthropic_sdk", ...)
+
+        def worker():
+            return adapter._get_anthropic_sdk()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = [executor.submit(worker) for _ in range(10)]
+            results = [f.result() for f in futures]
+
+        assert all(r is mock_module for r in results)
+        assert adapter._anthropic_sdk is mock_module
+    def test_get_anthropic_sdk_has_thread_lock(self):
+        """_anthropic_sdk_lock must exist to serialize concurrent cold-start imports (#100461)."""
+        import agent.anthropic_adapter as adapter
+        assert hasattr(adapter, "_anthropic_sdk_lock")
+
+
 class TestBuildAnthropicClient:
 
 
