@@ -3,6 +3,7 @@
 import json
 
 from agent.tool_guardrails import (
+    LoopCapConfig,
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolCallSignature,
@@ -252,3 +253,18 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
 
 
 
+
+
+def test_file_mutation_does_not_reset_turn_loop_caps():
+    config = ToolCallGuardrailConfig(
+        loop_caps=LoopCapConfig(max_web_searches=2),
+    )
+    controller = ToolCallGuardrailController(config)
+    controller.before_call("web_search", {"query": "q1"})
+    controller.before_call("web_search", {"query": "q2"})
+    assert controller.before_call("web_search", {"query": "q3"}).action == "block"
+
+    patch_args = {"path": "/root/project/file.py", "content": "fix", "mode": "replace"}
+    controller.after_call("patch", patch_args, '{"success":true}', failed=False)
+
+    assert controller.before_call("web_search", {"query": "q3"}).action == "block"
