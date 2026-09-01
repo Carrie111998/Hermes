@@ -13402,6 +13402,21 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
                 if _error_surface:
                     payload["error_surface"] = _error_surface
+                # Match the exception path (_emit_terminal_turn_error): when the
+                # agent finished partial=True with a non-empty final_response
+                # that is not just the error string, keep that text under the
+                # red banner. Desktop only retains bubble text when
+                # failure.partial is set (#75801).
+                if isinstance(result, dict):
+                    final_text = result.get("final_response")
+                    err_text = str(result.get("error") or "")
+                    if (
+                        result.get("partial")
+                        and isinstance(final_text, str)
+                        and final_text.strip()
+                        and final_text.strip() != err_text.strip()
+                    ):
+                        payload["partial"] = True
             if terminal_callback is not None:
                 terminal_receipt_attempted = True
                 terminal_callback(
