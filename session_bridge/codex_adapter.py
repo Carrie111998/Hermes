@@ -46,6 +46,12 @@ from .sidebar_reconciliation import (
 
 _PARSER_VERSION = 1
 _REQUEST_TIMEOUT = 30.0
+# Smallest remaining budget worth spending on a request. Below this the attempt
+# cannot finish (a thread/list page costs ~0.3-0.4s against a live app-server),
+# and issuing it anyway hands the transport a sub-second timeout whose error text
+# then names THAT figure -- e.g. "thread/list timed out after 0.062s" on a call
+# that is not slow. Refusing early keeps the failure attributable to the budget.
+_MIN_REQUEST_BUDGET_SECONDS = 0.5
 _TARGET_SOURCE_KINDS = ("vscode", "appServer")
 _CWD_ALIASES = ("cwd", "workingDirectory", "working_directory")
 _CODEX_DELEGATION_PREFIX = "<codex_delegation>"
@@ -681,7 +687,14 @@ class CodexSourceAdapter:
         self, *, deadline: float | None, page_cap: int
     ) -> list[CodexThreadSummary]:
         self._ensure_initialized()
-        active, used = self._bounded_sidebar_inventory_kind(
+        # Each kind gets the FULL page cap. The cap is a per-enumeration runaway
+        # guard, not a shared allowance: charging the second kind for the first
+        # kind's pages makes its failure depend on an unrelated corpus size, and
+        # once the first kind spends the whole cap the second is handed
+        # page_cap <= 0 and raises "page cap exceeded" before issuing a single
+        # request -- attributing the exhaustion to the wrong kind. Wall-clock is
+        # still bounded for the pair by the shared deadline.
+        active, _used = self._bounded_sidebar_inventory_kind(
             archived=False,
             deadline=deadline,
             page_cap=page_cap,
@@ -689,7 +702,7 @@ class CodexSourceAdapter:
         archived, _ = self._bounded_sidebar_inventory_kind(
             archived=True,
             deadline=deadline,
-            page_cap=page_cap - used,
+            page_cap=page_cap,
         )
         combined: dict[str, CodexThreadSummary] = {}
         for summary in (*active, *archived):
@@ -710,7 +723,8 @@ class CodexSourceAdapter:
         if term is None or term != search_term:
             raise ValueError("Codex sidebar search term is malformed")
         self._ensure_initialized()
-        active, used = self._bounded_sidebar_search_kind(
+        # Independent page caps per kind; see list_sidebar_inventory.
+        active, _used = self._bounded_sidebar_search_kind(
             search_term=term,
             archived=False,
             deadline=deadline,
@@ -720,7 +734,7 @@ class CodexSourceAdapter:
             search_term=term,
             archived=True,
             deadline=deadline,
-            page_cap=page_cap - used,
+            page_cap=page_cap,
         )
         combined: dict[str, CodexThreadSummary] = {}
         for summary in (*active, *archived):
@@ -755,7 +769,8 @@ class CodexSourceAdapter:
         if summary is not None and summary.native_id == wanted:
             self._inventory_cache[wanted] = summary
             return summary
-        active, used = self._bounded_sidebar_inventory_kind(
+        # Independent page caps per kind; see list_sidebar_inventory.
+        active, _used = self._bounded_sidebar_inventory_kind(
             archived=False,
             deadline=deadline,
             page_cap=page_cap,
@@ -768,7 +783,7 @@ class CodexSourceAdapter:
         archived, _ = self._bounded_sidebar_inventory_kind(
             archived=True,
             deadline=deadline,
-            page_cap=page_cap - used,
+            page_cap=page_cap,
         )
         found = next(
             (summary for summary in archived if summary.native_id == wanted),
@@ -939,7 +954,7 @@ class CodexSourceAdapter:
         timeout = _REQUEST_TIMEOUT
         if deadline is not None:
             remaining = deadline - float(self._monotonic())
-            if remaining <= 0:
+            if remaining < _MIN_REQUEST_BUDGET_SECONDS:
                 raise _CodexReadBudgetExceeded("Codex sidebar deadline exhausted")
             timeout = min(timeout, remaining)
         try:
@@ -954,6 +969,18 @@ class CodexSourceAdapter:
                 )
         except CodexRequestCancelled:
             raise _VisibilityInventoryCancelled() from None
+        except TimeoutError:
+            # A timeout on a request whose limit we clamped DOWN to the leftover
+            # budget is budget exhaustion wearing a transport error's clothes.
+            # Left alone it reports the leftover as though it were the request's
+            # own cost -- "thread/list timed out after 0.062s" for a call that
+            # reliably takes ~0.4s -- which points diagnosis at the transport
+            # instead of at the deadline that actually ran out.
+            if deadline is not None and timeout < _REQUEST_TIMEOUT:
+                raise _CodexReadBudgetExceeded(
+                    "Codex sidebar deadline exhausted"
+                ) from None
+            raise
         if deadline is not None and float(self._monotonic()) > deadline:
             raise _CodexReadBudgetExceeded("Codex sidebar deadline exhausted")
         return response
