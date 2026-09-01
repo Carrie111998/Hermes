@@ -152,6 +152,7 @@ class TestForegroundTimeoutCap:
         import tools.process_registry as process_registry_mod
 
         spawn_calls = []
+        create_env_calls = []
 
         class FakeRegistry:
             pending_watchers = []
@@ -162,19 +163,29 @@ class TestForegroundTimeoutCap:
 
         mock_env = SimpleNamespace(env={})
 
+        def _fake_create_environment(**kwargs):
+            create_env_calls.append(kwargs)
+            return mock_env
+
+        # Empty environment cache so the spawn runs through _create_environment,
+        # the consumer of the raised default on the background path.
         with patch("tools.terminal_tool._get_env_config",
                     return_value=_make_env_config(timeout=900)), \
              patch("tools.terminal_tool._start_cleanup_thread"), \
-             patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-             patch("tools.terminal_tool._last_activity", {"default": 0}), \
+             patch("tools.terminal_tool._active_environments", {}), \
+             patch("tools.terminal_tool._last_activity", {}), \
              patch("tools.terminal_tool._task_env_overrides", {}), \
              patch("tools.terminal_tool._resolve_container_task_id", lambda value: value or "default"), \
+             patch("tools.terminal_tool._create_environment", side_effect=_fake_create_environment), \
              patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
              patch.object(process_registry_mod, "process_registry", FakeRegistry()):
             result = json.loads(terminal_tool(command="long-runner", background=True))
 
         assert result["exit_code"] == 0
         assert len(spawn_calls) == 1
+        # The raised default survives into the environment the background
+        # process runs in — the cap only bounds foreground waits.
+        assert create_env_calls[0]["timeout"] == 900
 
 
     def test_exactly_at_max_not_rejected(self):
