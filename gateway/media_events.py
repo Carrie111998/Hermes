@@ -52,6 +52,19 @@ def _mime_class(mime: str) -> str:
     return (mime or "").split(";", 1)[0].strip().split("/", 1)[0].lower()
 
 
+def media_kind_for_mime(mime: str) -> str:
+    """Event/media kind for a mime string (the one shared vocabulary).
+
+    AV + image classes map to their kind; everything else — including
+    ``application/octet-stream`` subclasses like zip/pdf/docx — is a
+    ``document``, mirroring how the desktop renderer treats non-av,
+    non-image media cards. Public because the history projection (D5)
+    classifies fallback rows for files whose stat failed, and it must agree
+    with the live-event classification byte-for-byte.
+    """
+    return _KIND_BY_CLASS.get(_mime_class(mime), "document")
+
+
 def describe_media_deliverable(path: str) -> Optional[Dict[str, Any]]:
     """Build the static payload fields for one deliverable file.
 
@@ -71,7 +84,7 @@ def describe_media_deliverable(path: str) -> Optional[Dict[str, Any]]:
     from gateway.platforms.media_cache import mime_for_ext
 
     mime = mime_for_ext(resolved.suffix.lower())
-    kind = _KIND_BY_CLASS.get(_mime_class(mime), "document")
+    kind = media_kind_for_mime(mime)
     try:
         size = resolved.stat().st_size
     except OSError:
@@ -103,6 +116,47 @@ def extract_media_from_reply(reply: str) -> List[str]:
         path = str(media_path)
         if path and path not in paths:
             paths.append(path)
+    return paths
+
+
+def extract_media_from_stored_text(text: str) -> List[str]:
+    """Validated absolute paths of ``MEDIA:`` tags in STORED reply text.
+
+    The D5 history-projection counterpart of :func:`extract_media_from_reply`:
+    identical extraction, but the existence requirement is relaxed so a tag
+    whose file has since vanished still projects (with fallback metadata)
+    instead of silently disappearing from a reopened transcript. Policy gates
+    are unchanged — credential/system paths and strict-mode containment are
+    rejected exactly as in live delivery.
+
+    Each extracted path is validated directly via
+    :func:`gateway.platforms.base.validate_media_delivery_path` with
+    ``require_exists=False`` rather than through
+    ``filter_media_delivery_paths``: a vanished file is the DOMINANT real
+    case in stored history (M0 evidence), and the filter's WARNING per
+    dropped path would fire on every transcript reopen for files that
+    merely aged out — noise, not signal. Deduplicated, order-preserving.
+    """
+    if not text or "MEDIA:" not in text:
+        return []
+    try:
+        from gateway.platforms.base import (
+            BasePlatformAdapter,
+            validate_media_delivery_path,
+        )
+
+        media_files, _cleaned = BasePlatformAdapter.extract_media(text)
+    except Exception:
+        logger.debug("stored-media extraction failed", exc_info=True)
+        return []
+
+    paths: List[str] = []
+    for media_path, _is_voice in media_files:
+        safe_path = validate_media_delivery_path(
+            str(media_path), require_exists=False
+        )
+        if safe_path and safe_path not in paths:
+            paths.append(safe_path)
     return paths
 
 

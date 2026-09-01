@@ -154,3 +154,35 @@ export function pruneMediaDeliverables(keepPaths?: readonly string[]): void {
 export function resetMediaDeliverables(): void {
   pruneMediaDeliverables()
 }
+
+/**
+ * Seed the registry from the history media projection (D5).
+ *
+ * A reopened transcript has no `media.deliverable` events in memory — the
+ * in-memory ring died with the old window — so the renderer falls back to
+ * capture-time href sizes and blank cards when metadata is missing. The
+ * server now derives refs from stored history (`include_media=true`), and
+ * this funnels each row into the SAME registry the live events write, before
+ * `toChatMessages` renders parts (`renderMediaTags` → `mediaCardMeta` reads
+ * it at render time). Existing-file rows land with `receivedAt: 0` — older
+ * than any live receipt, so the bounded prune keeps live rows first.
+ *
+ * Garbage rows (missing/hostile path) are skipped silently — record does
+ * the validation, and history rendering must never throw. Returns the number
+ * of rows registered.
+ */
+export function seedMediaDeliverablesFromHistory(refs: unknown): number {
+  if (!Array.isArray(refs)) {
+    return 0
+  }
+
+  let seeded = 0
+
+  for (const ref of refs) {
+    if (recordMediaDeliverable(ref, 0)) {
+      seeded += 1
+    }
+  }
+
+  return seeded
+}
