@@ -2708,9 +2708,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_api_mode = "codex_responses"
             elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
                 # Portal is dual-wire: anthropic/* must land on /v1/messages.
-                # resolve_provider_client still returns an OpenAI client for
-                # Nous; the anthropic_messages branch below rebuilds the native
-                # client from that credential + base_url.
+                # The resolver projects those catalog ids into the same
+                # Anthropic wrapper contract consumed below.
                 from hermes_cli.providers import nous_api_mode
 
                 fb_api_mode = nous_api_mode(fb_model)

@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from agent.auxiliary_client import AnthropicAuxiliaryClient
 from agent.codex_responses_adapter import _normalize_codex_response
 
 import run_agent
@@ -47,6 +48,26 @@ def _make_tool_defs(*names: str) -> list:
         }
         for n in names
     ]
+
+
+def _mock_anthropic_resolved_client(
+    *,
+    api_key: str,
+    model: str,
+    is_oauth: bool = False,
+) -> tuple[AnthropicAuxiliaryClient, MagicMock]:
+    """Build the resolver contract used by Anthropic fallback activation."""
+    request_client = MagicMock()
+    return (
+        AnthropicAuxiliaryClient(
+            request_client,
+            model,
+            api_key,
+            "https://api.anthropic.com/v1",
+            is_oauth=is_oauth,
+        ),
+        request_client,
+    )
 
 
 def test_is_destructive_command_treats_cp_as_mutating():
@@ -5829,21 +5850,23 @@ class TestFallbackAnthropicProvider:
         agent._fallback_chain = [agent._fallback_model]
         agent._fallback_index = 0
 
-        mock_client = MagicMock()
-        mock_client.base_url = "https://api.anthropic.com/v1"
-        mock_client.api_key = "sk-ant-api03-test"
+        resolved_client, request_client = _mock_anthropic_resolved_client(
+            api_key="sk-ant-api03-test",
+            model="claude-sonnet-4-20250514",
+        )
 
         with (
-            patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)),
-            patch("agent.anthropic_adapter.build_anthropic_client") as mock_build,
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(resolved_client, None),
+            ),
             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value=None),
         ):
-            mock_build.return_value = MagicMock()
             result = agent._try_activate_fallback()
 
         assert result is True
         assert agent.api_mode == "anthropic_messages"
-        assert agent._anthropic_client is not None
+        assert agent._anthropic_client is request_client
         assert agent.client is None
 
     def test_fallback_to_anthropic_enables_prompt_caching(self, agent):
@@ -5852,18 +5875,22 @@ class TestFallbackAnthropicProvider:
         agent._fallback_chain = [agent._fallback_model]
         agent._fallback_index = 0
 
-        mock_client = MagicMock()
-        mock_client.base_url = "https://api.anthropic.com/v1"
-        mock_client.api_key = "sk-ant-api03-test"
+        resolved_client, request_client = _mock_anthropic_resolved_client(
+            api_key="sk-ant-api03-test",
+            model="claude-sonnet-4-20250514",
+        )
 
         with (
-            patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)),
-            patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(resolved_client, None),
+            ),
             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value=None),
         ):
             agent._try_activate_fallback()
 
         assert agent._use_prompt_caching is True
+        assert agent._anthropic_client is request_client
 
 
 
@@ -7001,15 +7028,17 @@ class TestFallbackSetsOAuthFlag:
         agent._fallback_chain = [agent._fallback_model]
         agent._fallback_index = 0
 
-        mock_client = MagicMock()
-        mock_client.base_url = "https://api.anthropic.com/v1"
-        mock_client.api_key = "sk-ant-setup-oauth-token"
+        resolved_client, request_client = _mock_anthropic_resolved_client(
+            api_key="sk-ant-setup-oauth-token",
+            model="claude-sonnet-4-6",
+            is_oauth=True,
+        )
 
         with (
-            patch("agent.auxiliary_client.resolve_provider_client",
-                  return_value=(mock_client, None)),
-            patch("agent.anthropic_adapter.build_anthropic_client",
-                  return_value=MagicMock()),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(resolved_client, None),
+            ),
             patch("agent.anthropic_adapter.resolve_anthropic_token",
                   return_value=None),
         ):
@@ -7017,6 +7046,7 @@ class TestFallbackSetsOAuthFlag:
 
         assert result is True
         assert agent._is_anthropic_oauth is True
+        assert agent._anthropic_client is request_client
 
     def test_fallback_to_anthropic_api_key_clears_flag(self, agent):
         agent._fallback_activated = False
@@ -7024,15 +7054,16 @@ class TestFallbackSetsOAuthFlag:
         agent._fallback_chain = [agent._fallback_model]
         agent._fallback_index = 0
 
-        mock_client = MagicMock()
-        mock_client.base_url = "https://api.anthropic.com/v1"
-        mock_client.api_key = "sk-ant-api03-regular-key"
+        resolved_client, request_client = _mock_anthropic_resolved_client(
+            api_key="sk-ant-api03-regular-key",
+            model="claude-sonnet-4-6",
+        )
 
         with (
-            patch("agent.auxiliary_client.resolve_provider_client",
-                  return_value=(mock_client, None)),
-            patch("agent.anthropic_adapter.build_anthropic_client",
-                  return_value=MagicMock()),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(resolved_client, None),
+            ),
             patch("agent.anthropic_adapter.resolve_anthropic_token",
                   return_value=None),
         ):
@@ -7040,6 +7071,7 @@ class TestFallbackSetsOAuthFlag:
 
         assert result is True
         assert agent._is_anthropic_oauth is False
+        assert agent._anthropic_client is request_client
 
 
 class TestMemoryNudgeCounterPersistence:
