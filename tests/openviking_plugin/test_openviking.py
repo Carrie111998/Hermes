@@ -968,9 +968,38 @@ class TestEnsureClientReloadsEnv:
         assert instances[1].posts[0][0] == "/api/v1/content/write"
         assert instances[1].posts[0][1]["content"] == "stable fact"
         assert instances[1].posts[0][1]["mode"] == "create"
-        assert instances[1].posts[0][1]["uri"].startswith(
+        written_uri = instances[1].posts[0][1]["uri"]
+        assert written_uri.startswith(
             "viking://user/default/peers/hermes/memories/"
         )
+        assert out["uri"] == written_uri
+
+    def test_remember_write_failure_does_not_return_uri(self, monkeypatch):
+        class _StubClient:
+            def __init__(self, endpoint, api_key="", account="", user="", agent=""):
+                self.endpoint = endpoint
+                self.api_key = api_key
+
+            def health(self):
+                return True
+
+            def post(self, path, payload=None, **kwargs):
+                assert path == "/api/v1/content/write"
+                raise RuntimeError("write rejected")
+
+        monkeypatch.setattr("plugins.memory.openviking._VikingClient", _StubClient)
+        monkeypatch.setenv("OPENVIKING_ENDPOINT", "https://openviking.example")
+        monkeypatch.setenv("OPENVIKING_API_KEY", "sk-test")
+
+        provider = OpenVikingMemoryProvider()
+        provider.initialize("session-1")
+        out = json.loads(provider.handle_tool_call(
+            "viking_remember",
+            {"content": "stable fact"},
+        ))
+
+        assert out == {"error": "Failed to store memory: write rejected"}
+        assert "uri" not in out
 
     def test_concurrent_refresh_does_not_return_stale_client(self, monkeypatch):
         refresh_entered = threading.Event()

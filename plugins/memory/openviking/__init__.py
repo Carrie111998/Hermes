@@ -625,7 +625,8 @@ REMEMBER_SCHEMA = {
     "description": (
         "Explicitly store a fact or memory in the OpenViking knowledge base. "
         "Use for important information the agent should remember long-term. "
-        "The system automatically categorizes and indexes the memory."
+        "The system automatically categorizes and indexes the memory. "
+        "Successful calls return the canonical URI of the created memory."
     ),
     "parameters": {
         "type": "object",
@@ -5286,6 +5287,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
             written = result.get("result", {}).get("written_bytes", 0)
             return json.dumps({
                 "status": "stored",
+                "uri": uri,
                 "message": f"Memory stored ({written}b) and queued for vector indexing.",
             })
         except Exception as e:
