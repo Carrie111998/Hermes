@@ -181,7 +181,13 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     monkeypatch.setitem(
         sys.modules,
         "hermes_cli.config",
-        mod("hermes_cli.config", load_config=lambda: {"model": {"default": "m"}}),
+        mod(
+            "hermes_cli.config",
+            load_config=lambda: {"model": {"default": "m"}},
+            # None (no agent.max_turns, no HERMES_MAX_ITERATIONS) resolves
+            # to TURN_LIMIT_UNLIMITED == sys.maxsize in the real helper.
+            resolve_turn_limit=lambda _raw: sys.maxsize,
+        ),
     )
     monkeypatch.setitem(
         sys.modules,
