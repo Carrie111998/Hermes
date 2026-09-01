@@ -25,6 +25,7 @@ function render(activeGatewayProfile: string, activeConnectionId: string, refres
         refreshCurrentModel: noop,
         refreshHermesConfig: noop,
         refreshMessagingSessions: noop,
+        refreshProjectTree: noop,
         refreshSessions,
         requestGateway
       })

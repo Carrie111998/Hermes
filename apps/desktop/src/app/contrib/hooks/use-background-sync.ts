@@ -461,6 +461,7 @@ interface BackgroundSyncParams {
   refreshCurrentModel: (force?: boolean) => Promise<unknown> | unknown
   refreshHermesConfig: () => Promise<unknown> | unknown
   refreshMessagingSessions: () => Promise<unknown> | unknown
+  refreshProjectTree: () => Promise<unknown> | unknown
   refreshSessions: () => Promise<unknown> | unknown
   requestGateway: GatewayRequester
   updateSessionState: (
@@ -534,6 +535,7 @@ export function useBackgroundSync({
   refreshCurrentModel,
   refreshHermesConfig,
   refreshMessagingSessions,
+  refreshProjectTree,
   refreshSessions,
   requestGateway,
   updateSessionState
@@ -691,6 +693,12 @@ export function useBackgroundSync({
       lastRunAt = Date.now()
       void refreshSessions()
       void refreshMessagingSessions()
+      // The authoritative project tree is a separate cache from the flat
+      // session list (#100354): an external create/rename/delete/cwd-move
+      // advances $sessionsChangeTick but never touched projects.tree without
+      // this, so Home/Project membership, counts, and preview rows went stale
+      // until Desktop restarted.
+      void refreshProjectTree()
       requestActiveTranscriptRefresh(true)
       // Bot canonical chats live in workspace tiles, never in the main-pane
       // selection — without this they never see background deliveries
@@ -766,6 +774,7 @@ export function useBackgroundSync({
     changeEventsAvailable,
     gatewayState,
     refreshMessagingSessions,
+    refreshProjectTree,
     refreshSessions,
     requestActiveTranscriptRefresh,
     updateSessionState

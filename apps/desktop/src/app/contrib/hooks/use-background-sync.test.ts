@@ -91,12 +91,14 @@ function useSyncHarness({
   activeIsMessaging = false,
   activeSessionId,
   activeStoredSessionId,
-  refreshActiveTranscript
+  refreshActiveTranscript,
+  refreshProjectTree = vi.fn()
 }: {
   activeIsMessaging?: boolean
   activeSessionId: string | null
   activeStoredSessionId: string | null
   refreshActiveTranscript: () => Promise<void>
+  refreshProjectTree?: () => Promise<void>
 }) {
   const updateSessionState: Parameters<typeof useBackgroundSync>[0]['updateSessionState'] = vi.fn(
     (sessionId, updater) => {
@@ -119,6 +121,7 @@ function useSyncHarness({
     refreshCurrentModel: vi.fn(),
     refreshHermesConfig: vi.fn(),
     refreshMessagingSessions: vi.fn(),
+    refreshProjectTree,
     refreshSessions: vi.fn(),
     updateSessionState,
     requestGateway: vi.fn(async () => ({ sessions: [] })) as never
@@ -127,7 +130,12 @@ function useSyncHarness({
 
 function renderSync(
   refreshActiveTranscript: () => Promise<void>,
-  options: { activeIsMessaging?: boolean; activeSessionId?: null | string; activeStoredSessionId?: null | string } = {}
+  options: {
+    activeIsMessaging?: boolean
+    activeSessionId?: null | string
+    activeStoredSessionId?: null | string
+    refreshProjectTree?: () => Promise<void>
+  } = {}
 ) {
   return renderHook(() =>
     useSyncHarness({
@@ -413,6 +421,17 @@ describe('active transcript refresh', () => {
 
     expect(refresh).toHaveBeenCalledTimes(1)
   })
+
+  it('refreshes the authoritative project tree on the same coalesced sessions.changed pass (#100354)', async () => {
+    vi.useFakeTimers()
+    $changeEventsAvailable.set(true)
+    const refreshProjectTree = vi.fn(async () => undefined)
+
+    renderSync(async () => undefined, { refreshProjectTree })
+
+    act(() => notifySessionsChanged())
+    expect(refreshProjectTree).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('reconcileActiveTranscript', () => {
@@ -653,6 +672,7 @@ describe('typing-aware sessions.changed deferral', () => {
       refreshCurrentModel: vi.fn(),
       refreshHermesConfig: vi.fn(),
       refreshMessagingSessions: vi.fn(),
+      refreshProjectTree: vi.fn(),
       requestGateway: vi.fn(async () => ({ sessions: [] })) as never,
       // Required by the hook's params. This harness never drives the
       // transcript path, so the updater just runs against a throwaway state —
