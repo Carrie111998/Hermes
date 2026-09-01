@@ -1089,6 +1089,29 @@ class GatewayAuthorizationMixin:
                 return None
             return bool(dm_check(uid))
 
+        def _adapter_resolved_allowlist_user_ids(
+            platform: Optional[Platform], profile: Optional[str]
+        ):
+            """Live adapter's resolved numeric allowlist, or None.
+
+            Best-effort: an adapter mid-reconnect (or any resolver error)
+            must not break authorization for senders the env allowlist
+            already covers, so a raise here is swallowed rather than
+            propagated (mirrors the pre-extraction inline body's own
+            try/except around both the adapter lookup and the resolver call).
+            """
+            try:
+                adapter = self._adapter_for_source(source)
+            except Exception:
+                return None
+            resolver = getattr(adapter, "resolved_allowlist_user_ids", None)
+            if not callable(resolver):
+                return None
+            try:
+                return resolver()
+            except Exception:
+                return None
+
         return is_authorized(
             source,
             # Route through the per-profile PairingStore lookup (multiplex
@@ -1184,14 +1207,7 @@ class GatewayAuthorizationMixin:
             # the operator is wrongly dropped as "Unauthorized user". Duck-
             # typed + isinstance-guarded against mock adapters in the pure
             # function itself.
-            adapter_resolved_allowlist_user_ids=lambda platform, profile: (
-                lambda adapter: (
-                    adapter.resolved_allowlist_user_ids()
-                    if adapter is not None
-                    and callable(getattr(adapter, "resolved_allowlist_user_ids", None))
-                    else None
-                )
-            )(self._adapter_for_source(source)),
+            adapter_resolved_allowlist_user_ids=_adapter_resolved_allowlist_user_ids,
             # Live-adapter DM allowlist re-check upstream added to the inline
             # method after this extraction was originally written (#34515):
             # without it, revoking the sole allowlist entry keeps authorizing
