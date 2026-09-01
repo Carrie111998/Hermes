@@ -3434,6 +3434,38 @@ def switch_model(
             )
 
 
+def billing_provider_identity(agent) -> str:
+    """Routable provider identity for billing/display records.
+
+    All user-defined ``providers:`` entries resolve to the *billing class*
+    ``custom`` at runtime (hermes_cli/runtime_provider.py). Writing that bare
+    class into ``billing_provider`` loses which configured provider actually
+    served the session — the dashboard then shows "custom" instead of the
+    configured name (GitHub #98739), and resume can't re-route. The configured
+    identity is preserved on the agent as ``requested_provider`` (mirrored
+    from the resolved runtime's ``requested_provider`` field). Prefer it
+    whenever the active provider is the bare class; built-in providers pass
+    through unchanged.
+    """
+    provider = (getattr(agent, "provider", "") or "").strip()
+    if provider.lower() != "custom":
+        return provider
+    requested = (getattr(agent, "requested_provider", "") or "").strip()
+    if requested and requested.lower() not in {"custom", "auto", ""}:
+        return requested
+    # Last resort: the live main runtime's requested_provider (set by
+    # resolve_runtime_provider / set_runtime_main for custom providers).
+    try:
+        from agent.auxiliary_client import _runtime_main_value
+
+        runtime_requested = str(_runtime_main_value("requested_provider") or "").strip()
+        if runtime_requested.lower() not in {"custom", "auto", ""}:
+            return runtime_requested
+    except Exception:
+        pass
+    return provider
+
+
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list = None,
                  pre_tool_block_checked: bool = False,

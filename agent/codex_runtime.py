@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.agent_runtime_helpers import billing_provider_identity
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +140,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                 agent._session_db.queue_token_counts(
                     agent.session_id,
                     model=agent.model,
-                    billing_provider=agent.provider,
+                    billing_provider=billing_provider_identity(agent),
                     billing_base_url=agent.base_url,
                     billing_mode="subscription_included",
                     api_call_count=1,
@@ -228,7 +229,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                 if cost_result.amount_usd is not None else None,
                 cost_status=cost_result.status,
                 cost_source=cost_result.source,
-                billing_provider=agent.provider,
+                billing_provider=billing_provider_identity(agent),
                 billing_base_url=agent.base_url,
                 billing_mode="subscription_included"
                 if cost_result.status == "included" else None,
