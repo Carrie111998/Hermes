@@ -291,14 +291,28 @@ def default_downgrade_notice() -> Optional[str]:
 
 
 def _managed_bin_dir() -> Optional[str]:
-    """Hermes' own bin dir ($HERMES_HOME/bin) — where install.sh puts uv/uvx
-    and where install_cli() links the browser-use binary."""
+    """Hermes' own bin dir ($HERMES_HOME/bin) — where install_cli() links
+    the browser-use binary via UV_TOOL_BIN_DIR (and legacy installs used to
+    keep the managed uv/uvx before the uv-isolation change)."""
     try:
         from hermes_constants import get_hermes_home
 
         return str(Path(get_hermes_home()) / "bin")
     except Exception as e:  # pragma: no cover — defensive
         logger.debug("Could not resolve managed bin dir: %s", e)
+        return None
+
+
+def _managed_uv_dir() -> Optional[str]:
+    """Hermes' private managed uv dir ($HERMES_HOME/uv) — where install.sh /
+    install.ps1 and the runtime updater keep the managed uv + uvx binaries,
+    never on PATH.  Mirrors managed_uv_path() in hermes_cli/managed_uv.py."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return str(Path(get_hermes_home()) / "uv")
+    except Exception as e:  # pragma: no cover — defensive
+        logger.debug("Could not resolve managed uv dir: %s", e)
         return None
 
 
@@ -329,7 +343,9 @@ def _find_cli() -> Optional[List[str]]:
     (~/.local/bin / %APPDATA%\\uv\\bin, where a manual ``uv tool install``
     links binaries) are fallbacks for setups that never ran our install,
     and cover Desktop/TUI workers that spawn with a minimal PATH. The uvx
-    zero-install path (same probe order) is the final fallback.
+    zero-install path probes the managed uv dir first ($HERMES_HOME/uv —
+    uvx lives next to the managed uv there), then the legacy bin/ copy,
+    then PATH and the user-level tool dir, as the final fallback.
     """
     probe_paths = (_managed_bin_dir(), None, _user_local_bin_dir())
     for probe_path in probe_paths:
@@ -337,7 +353,12 @@ def _find_cli() -> Optional[List[str]]:
             direct = shutil.which("browser-use", path=probe_path)
             if direct:
                 return [direct]
-    for probe_path in probe_paths:
+    # uvx ships alongside the managed uv in the private uv/ dir (the astral
+    # installer drops both there); the pre-isolation bin/ copy is probed too
+    # until a legacy install migrates.  Appended after the browser-use probe
+    # so a real install always wins over the zero-install runner.
+    uvx_probe_paths = (_managed_uv_dir(), _managed_bin_dir(), None, _user_local_bin_dir())
+    for probe_path in uvx_probe_paths:
         if probe_path is None or probe_path:
             uvx = shutil.which("uvx", path=probe_path)
             if uvx:

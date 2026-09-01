@@ -65,7 +65,7 @@ _ALLOWED: dict[tuple[str, str], str] = {
     ),
     ("hermes_cli/update_cmd.py", "uv"): (
         "Termux fallback: a pkg-installed uv lands on PATH but not in the "
-        "managed bin dir, and it is checked only after resolve_uv() misses."
+        "managed dir, and it is checked only after resolve_uv() misses."
     ),
     ("hermes_cli/update_cmd.py", "npm"): (
         "WSL diagnostic: deliberately inspects what PATH resolves so it can "
@@ -188,7 +188,7 @@ def test_no_unreviewed_bare_managed_runtime_lookups():
     assert not unexpected, (
         "Bare PATH lookup for a Hermes-managed runtime.\n\n"
         + "\n".join(f"  {rel}:{lineno}  which({cmd!r})" for rel, cmd, lineno in unexpected)
-        + "\n\n$HERMES_HOME/bin (uv) and $HERMES_HOME/node are not on an "
+        + "\n\n$HERMES_HOME/uv (uv) and $HERMES_HOME/node are not on an "
         "arbitrary process's PATH, so this resolves a system copy — or nothing "
         "— on an install that has a managed one.\n"
         "Use instead:\n"

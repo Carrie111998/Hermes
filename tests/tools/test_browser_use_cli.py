@@ -918,6 +918,32 @@ class TestFindCliManagedBin:
         uvx.chmod(uvx.stat().st_mode | stat.S_IXUSR)
         assert bu_cli._find_cli_unpatched() == [str(uvx), "browser-use"]
 
+    def test_managed_uv_dir_uvx_found(self, tmp_path, monkeypatch):
+        """The managed uvx lives next to the managed uv in the private uv/
+        dir (post-isolation layout) — the zero-install probe must find it
+        there even though it is never on PATH."""
+        uv_dir = tmp_path / "home" / "uv"
+        uv_dir.mkdir(parents=True)
+        uvx = uv_dir / "uvx"
+        uvx.write_text("#!/bin/sh\n")
+        uvx.chmod(uvx.stat().st_mode | stat.S_IXUSR)
+        assert bu_cli._find_cli_unpatched() == [str(uvx), "browser-use"]
+
+    def test_managed_uv_dir_uvx_precedes_legacy_bin(self, tmp_path, monkeypatch):
+        """Current layout wins: the private uv/ copy is probed before the
+        pre-isolation bin/ copy."""
+        uv_dir = tmp_path / "home" / "uv"
+        uv_dir.mkdir(parents=True)
+        uvx = uv_dir / "uvx"
+        uvx.write_text("#!/bin/sh\n")
+        uvx.chmod(uvx.stat().st_mode | stat.S_IXUSR)
+        legacy = tmp_path / "home" / "bin"
+        legacy.mkdir(parents=True)
+        legacy_uvx = legacy / "uvx"
+        legacy_uvx.write_text("#!/bin/sh\n")
+        legacy_uvx.chmod(legacy_uvx.stat().st_mode | stat.S_IXUSR)
+        assert bu_cli._find_cli_unpatched() == [str(uvx), "browser-use"]
+
     def test_nothing_found(self, tmp_path, monkeypatch):
         assert bu_cli._find_cli_unpatched() is None
 

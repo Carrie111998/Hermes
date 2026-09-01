@@ -1598,8 +1598,8 @@ def _install_uv(target: Path) -> None:
     """Bootstrap uv into *target* using the official standalone installer.
 
     Uses ``UV_UNMANAGED_INSTALL`` (POSIX) or ``UV_INSTALL_DIR`` (Windows)
-    so the astral installer writes the binary directly into
-    ``$HERMES_HOME/bin/`` instead of ``~/.local/bin/``.
+    so the astral installer writes the binary directly into the private
+    managed dir (``$HERMES_HOME/uv``) instead of ``~/.local/bin/``.
     """
     system = platform.system()
     env = {

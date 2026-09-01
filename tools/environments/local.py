@@ -1297,9 +1297,13 @@ def _managed_runtime_path_entries() -> list[str]:
     - ``$HERMES_HOME/node`` (+ ``/bin``) — installed to satisfy the desktop and
       browser toolchain. ``tools/browser_tool.py`` already does this for its own
       subprocesses; the agent's shell deserves the same.
-    - ``$HERMES_HOME/bin`` — the managed ``uv``. ``install.sh`` writes it there
-      and nothing has ever put that directory on PATH, so an install whose only
-      uv is the managed one looks uv-less to both the agent and the model.
+    - ``$HERMES_HOME/uv`` — the managed ``uv``/``uvx`` (the private location the
+      installers and the runtime updater keep them in; nothing has ever put it
+      on the user's PATH). Appended here so a managed-only install looks
+      uv-capable to the agent's shell, while a user's own uv on their PATH
+      still wins (first-occurrence-wins, see ``_append_missing_sane_path_entries``).
+    - ``$HERMES_HOME/bin`` — the browser-use CLI (``UV_TOOL_BIN_DIR``) and
+      other Hermes-managed CLIs.
 
     Resolved per call rather than cached in a module constant because
     ``get_hermes_home()`` is profile-scoped and a managed tree can appear
@@ -1308,7 +1312,11 @@ def _managed_runtime_path_entries() -> list[str]:
     try:
         from hermes_constants import get_hermes_home, iter_hermes_node_dirs
 
-        candidates = [*iter_hermes_node_dirs(), get_hermes_home() / "bin"]
+        candidates = [
+            *iter_hermes_node_dirs(),
+            get_hermes_home() / "uv",
+            get_hermes_home() / "bin",
+        ]
         return [str(d) for d in candidates if d.is_dir()]
     except Exception:
         return []
