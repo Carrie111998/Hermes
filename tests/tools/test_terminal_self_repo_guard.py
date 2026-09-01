@@ -80,6 +80,16 @@ class TestSelfRepoGuardWiring:
         assert result["status"] == "blocked"
         env.execute.assert_not_called()
 
+    def test_force_cannot_bypass_parser_limit(self, repo, monkeypatch):
+        config = _make_env_config(cwd=str(repo))
+        payload = "${x:-a}" * 257 + "; git reset --hard"
+
+        result, env = _run(payload, config, monkeypatch, repo, force=True)
+
+        assert result["status"] == "blocked"
+        assert "parser safety limit" in result["error"]
+        env.execute.assert_not_called()
+
     def test_workdir_targeting_repo_is_blocked(self, repo, monkeypatch, tmp_path):
         config = _make_env_config(cwd=str(tmp_path))
         result, env = _run("git pull", config, monkeypatch, repo, workdir=str(repo))

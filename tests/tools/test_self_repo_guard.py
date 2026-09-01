@@ -25,6 +25,14 @@ def _detect(command, cwd, root):
 
 
 class TestBlocksMutationsInSourceRepo:
+    def test_parser_limit_fails_closed(self, repo):
+        payload = "${x:-a}" * 257 + "; git reset --hard"
+
+        hit, msg = _detect(payload, repo, repo)
+
+        assert hit is True
+        assert "parser safety limit" in msg
+
     @pytest.mark.parametrize(
         "sub",
         [

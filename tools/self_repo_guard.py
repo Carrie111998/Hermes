@@ -11,6 +11,7 @@ from pathlib import Path
 
 from tools.approval import (
     _bash_exec_payload,
+    _command_parser_limit_exceeded,
     _deobfuscate_shell_word_for_detection,
     _iter_shell_command_starts,
     _read_shell_word,
@@ -719,6 +720,12 @@ def detect_self_repo_git_mutation(
         return False, None
 
     root = _resolve(str(root), Path("/"))
+    if _command_parser_limit_exceeded(command):
+        return True, (
+            "Blocked: command exceeded the parser safety limit while checking "
+            f"whether it would rewrite Hermes's live source checkout ({root}). "
+            "Split the command into smaller operations and retry."
+        )
     base = _resolve(cwd, Path("/")) if cwd else Path("/")
     operation = _find_mutation(command, base, root)
     if operation is None:
