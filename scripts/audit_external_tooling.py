@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from collections.abc import Sequence
+import csv
 import hashlib
 import json
 import os
@@ -17,6 +18,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any, Callable, Protocol, cast
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +39,7 @@ class AuditCommand:
     name: str
     argv: tuple[str, ...]
     expected_version: str
+    distribution_name: str | None = None
 
     @property
     def version_argv(self) -> tuple[str, ...]:
@@ -88,6 +91,7 @@ def build_commands(
         AuditCommand(
             name="import-linter",
             expected_version="2.14",
+            distribution_name="import-linter",
             argv=(
                 str(tool_root / "lint-imports"),
                 "--config",
@@ -99,6 +103,7 @@ def build_commands(
         AuditCommand(
             name="pip-audit",
             expected_version="2.10.1",
+            distribution_name="pip-audit",
             argv=(
                 str(tool_root / "pip-audit"),
                 "-r",
@@ -180,6 +185,70 @@ def _file_sha256(path: Path) -> str | None:
         return None
 
 
+def _distribution_realization_digest(
+    tool_root: Path, distribution_name: str
+) -> str | None:
+    """Hash every recorded file in one installed Python distribution.
+
+    Console-script launchers are only entry points; their imported package can
+    change without changing the launcher bytes.  Bind the receipt to the
+    complete RECORD-described realization inside the tool venv instead.
+    """
+    tool_root = tool_root.expanduser().resolve()
+    venv_root = tool_root.parent
+    expected_name = re.sub(r"[-_.]+", "-", distribution_name).casefold()
+    for site_packages in sorted(venv_root.glob("lib/python*/site-packages")):
+        for metadata_dir in sorted(site_packages.glob("*.dist-info")):
+            metadata_path = metadata_dir / "METADATA"
+            try:
+                metadata = metadata_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                continue
+            actual_name = next(
+                (
+                    line.split(":", 1)[1].strip()
+                    for line in metadata.splitlines()
+                    if line.casefold().startswith("name:")
+                ),
+                None,
+            )
+            if actual_name is None:
+                continue
+            normalized_name = re.sub(r"[-_.]+", "-", actual_name).casefold()
+            if normalized_name != expected_name:
+                continue
+            record_path = metadata_dir / "RECORD"
+            try:
+                with record_path.open(newline="", encoding="utf-8") as stream:
+                    rows = list(csv.reader(stream))
+            except (OSError, UnicodeError, csv.Error):
+                return None
+            files: list[tuple[str, str]] = []
+            venv_root_resolved = venv_root.resolve()
+            for row in rows:
+                if not row or not row[0]:
+                    return None
+                relative = PurePosixPath(row[0])
+                file_path = (site_packages / Path(*relative.parts)).resolve()
+                try:
+                    relative_to_venv = file_path.relative_to(venv_root_resolved)
+                except ValueError:
+                    return None
+                digest = _file_sha256(file_path)
+                if digest is None:
+                    return None
+                files.append((relative_to_venv.as_posix(), digest))
+            if not files:
+                return None
+            serialized = json.dumps(
+                {"distribution": normalized_name, "files": sorted(files)},
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return _sha256(serialized)
+    return None
+
+
 def _resolve_executable(path: str | Path) -> Path | None:
     candidate = Path(path).expanduser()
     try:
@@ -207,6 +276,9 @@ def _load_tool_lock(repo_root: Path) -> tuple[dict[str, Any] | None, str | None]
     for entry in [uv, *[tools.get(name) for name in ("zizmor", "import-linter", "pip-audit")]]:
         if not isinstance(entry, dict) or not isinstance(entry.get("version"), str) or not isinstance(entry.get("sha256"), str):
             return None, f"invalid {_LOCKFILE_NAME} pin"
+    for name in ("import-linter", "pip-audit"):
+        if not isinstance(tools.get(name, {}).get("distribution_sha256"), str):
+            return None, f"invalid {_LOCKFILE_NAME} distribution pin for {name}"
     return payload, None
 
 
@@ -359,6 +431,21 @@ def run_audits(
             resolved_executable = _resolve_executable(command.argv[0])
             executable_digest = _file_sha256(resolved_executable) if resolved_executable else None
             pin = lock.get("tools", {}).get(command.name, {}) if lock else {}
+            distribution_digest = (
+                _distribution_realization_digest(tool_root, command.distribution_name)
+                if command.distribution_name is not None
+                else None
+            )
+            expected_distribution_digest = (
+                pin.get("distribution_sha256")
+                if command.distribution_name is not None
+                else None
+            )
+            distribution_realization_ok = (
+                None
+                if command.distribution_name is None
+                else distribution_digest == expected_distribution_digest
+            )
             if resolved_executable is None:
                 version_result: AuditProcessResult = SkippedAuditResult(1, "", "executable unavailable")
             else:
@@ -374,6 +461,10 @@ def run_audits(
                 resolved_executable
                 and executable_digest == pin.get("sha256")
                 and version_matches
+                and (
+                    command.distribution_name is None
+                    or distribution_realization_ok is True
+                )
             )
             if command.name == "pip-audit" and export_result.returncode != 0:
                 result: AuditProcessResult = SkippedAuditResult(
@@ -398,6 +489,10 @@ def run_audits(
                 "observed_version": observed_version,
                 "version_matches": version_matches,
                 "realization_ok": realization_ok,
+                "distribution_name": command.distribution_name,
+                "distribution_sha256": distribution_digest,
+                "expected_distribution_sha256": expected_distribution_digest,
+                "distribution_realization_ok": distribution_realization_ok,
                 "audit_invoked": realization_ok and not (command.name == "pip-audit" and export_result.returncode != 0),
                 "executable_path": str(resolved_executable) if resolved_executable else None,
                 "executable_sha256": executable_digest,

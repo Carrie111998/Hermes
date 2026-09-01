@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 from scripts.audit_external_tooling import (
     _summarize_json_output,
+    _distribution_realization_digest,
     build_commands,
     build_uv_export_command,
     run_audits,
@@ -22,8 +23,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 def _fixture(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
-    tool_root = tmp_path / "bin"
-    tool_root.mkdir()
+    tool_root = tmp_path / "venv" / "bin"
+    tool_root.mkdir(parents=True)
+    site_packages = tool_root.parent / "lib" / "python3.13" / "site-packages"
+    site_packages.mkdir(parents=True)
     versions = {
         "zizmor": "1.30.0",
         "lint-imports": "2.14",
@@ -38,6 +41,29 @@ def _fixture(tmp_path):
             "version": version,
             "sha256": f"sha256:{hashlib.sha256(executable.read_bytes()).hexdigest()}",
         }
+        if name in {"lint-imports", "pip-audit"}:
+            distribution_name = "import-linter" if name == "lint-imports" else "pip-audit"
+            distribution_dir = site_packages / (
+                "import_linter-2.14.dist-info"
+                if name == "lint-imports"
+                else "pip_audit-2.10.1.dist-info"
+            )
+            distribution_dir.mkdir()
+            (distribution_dir / "METADATA").write_text(
+                f"Metadata-Version: 2.1\nName: {distribution_name}\nVersion: {version}\n",
+                encoding="utf-8",
+            )
+            package_name = "import_linter.py" if name == "lint-imports" else "pip_audit.py"
+            (site_packages / package_name).write_text(
+                f"# {distribution_name}\n", encoding="utf-8"
+            )
+            (distribution_dir / "RECORD").write_text(
+                f"{package_name},,\n"
+                f"{distribution_dir.name}/METADATA,,\n"
+                f"{distribution_dir.name}/RECORD,,\n"
+                f"../../../bin/{name},,\n",
+                encoding="utf-8",
+            )
     uv = tmp_path / "uv"
     uv.write_text("#!/bin/sh\n# uv\n", encoding="utf-8")
     uv.chmod(0o755)
@@ -45,6 +71,10 @@ def _fixture(tmp_path):
         "version": "0.12.6",
         "sha256": f"sha256:{hashlib.sha256(uv.read_bytes()).hexdigest()}",
     }}
+    for distribution_name in ("import-linter", "pip-audit"):
+        digest = _distribution_realization_digest(tool_root, distribution_name)
+        assert digest is not None
+        lock["tools"][distribution_name]["distribution_sha256"] = digest
     (repo / ".audit-tool-lock.json").write_text(json.dumps(lock), encoding="utf-8")
     return repo, tool_root, uv
 
@@ -178,6 +208,75 @@ def test_receipt_fails_when_observed_tool_version_differs(tmp_path):
     assert zizmor["version_matches"] is False
     assert zizmor["audit_invoked"] is False
     assert not any(call and Path(call[0]).name == "zizmor" and "--offline" in call for call in calls)
+    assert receipt["ok"] is False
+
+
+def test_python_distribution_realization_changes_when_installed_file_changes(tmp_path):
+    _repo, tool_root, _uv = _fixture(tmp_path)
+    before = _distribution_realization_digest(tool_root, "import-linter")
+
+    assert before is not None
+    package_file = (
+        tool_root.parent
+        / "lib"
+        / "python3.13"
+        / "site-packages"
+        / "import_linter.py"
+    )
+    package_file.write_text("# replaced installed package\n", encoding="utf-8")
+
+    after = _distribution_realization_digest(tool_root, "import-linter")
+
+    assert after is not None
+    assert after != before
+
+
+def test_receipt_refuses_changed_python_distribution_before_audit(tmp_path):
+    repo, tool_root, uv = _fixture(tmp_path)
+    package_file = (
+        tool_root.parent
+        / "lib"
+        / "python3.13"
+        / "site-packages"
+        / "pip_audit.py"
+    )
+    package_file.write_text("# replaced installed package\n", encoding="utf-8")
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        command = tuple(str(part) for part in argv)
+        calls.append(command)
+        if command[:2] == ("git", "rev-parse"):
+            return SimpleNamespace(returncode=0, stdout=f"{'d' * 40}\n", stderr="")
+        if command[:2] == ("git", "branch"):
+            return SimpleNamespace(returncode=0, stdout="feature/audit\n", stderr="")
+        if command[:2] == ("git", "status"):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command[-1:] == ("--version",):
+            executable = Path(command[0]).name
+            versions = {
+                "zizmor": "zizmor 1.30.0\n",
+                "lint-imports": "import-linter 2.14\n",
+                "pip-audit": "pip-audit 2.10.1\n",
+                "uv": "uv 0.12.6\n",
+            }
+            return SimpleNamespace(returncode=0, stdout=versions[executable], stderr="")
+        if Path(command[0]).name == "zizmor":
+            return SimpleNamespace(returncode=0, stdout="[]\n", stderr="")
+        if Path(command[0]).name == "pip-audit":
+            return SimpleNamespace(
+                returncode=0, stdout='{"dependencies": []}\n', stderr=""
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    receipt = run_audits(repo_root=repo, tool_root=tool_root, runner=fake_runner, uv_path=uv)
+
+    pip_audit = receipt["audits"][2]
+    assert pip_audit["distribution_realization_ok"] is False
+    assert pip_audit["audit_invoked"] is False
+    assert not any(
+        call and Path(call[0]).name == "pip-audit" and "-r" in call for call in calls
+    )
     assert receipt["ok"] is False
 
 
