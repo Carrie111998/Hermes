@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -260,6 +261,7 @@ class ToolGuardrailDecision:
     tool_name: str = ""
     count: int = 0
     signature: ToolCallSignature | None = None
+    failure_class: str = ""
 
     @property
     def allows_execution(self) -> bool:
@@ -267,7 +269,7 @@ class ToolGuardrailDecision:
 
     @property
     def should_halt(self) -> bool:
-        return self.action in {"block", "halt"}
+        return self.action == "halt"
 
     def to_metadata(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -279,6 +281,8 @@ class ToolGuardrailDecision:
         }
         if self.signature is not None:
             data["signature"] = self.signature.to_metadata()
+        if self.failure_class:
+            data["failure_class"] = self.failure_class
         return data
 
 
@@ -293,6 +297,21 @@ def canonical_tool_args(args: Mapping[str, Any]) -> str:
         separators=(",", ":"),
         default=str,
     )
+
+
+def _malformed_failure_identity(result: str | None) -> tuple[str, str] | None:
+    """Read an explicit deterministic malformed-input class from a tool result."""
+    data = safe_json_loads(result or "")
+    if not isinstance(data, dict):
+        return None
+    failure = data.get("failure")
+    if not isinstance(failure, dict) or failure.get("kind") != "malformed_input":
+        return None
+    failure_class = failure.get("class")
+    code = failure.get("code")
+    if not isinstance(failure_class, str) or not failure_class:
+        return None
+    return failure_class, code if isinstance(code, str) else ""
 
 
 def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
@@ -335,13 +354,19 @@ class ToolCallGuardrailController:
 
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
+        self._state_lock = threading.RLock()
         self.reset_for_turn()
 
     def reset_for_turn(self) -> None:
+        with self._state_lock:
+            self._reset_for_turn_unlocked()
+
+    def _reset_for_turn_unlocked(self) -> None:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
+        self._malformed_failure_counts: dict[tuple[str, str], int] = {}
         # Identical-call loop-breaker state (agent.stall_guards): tracks the
         # CONSECUTIVE streak of identical (tool, canonical args) calls whose
         # results were also identical. Any different call — or a different
@@ -372,8 +397,63 @@ class ToolCallGuardrailController:
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
 
+    def before_validated_call(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any] | None,
+        validation_result: str | None,
+    ) -> ToolGuardrailDecision:
+        """Observe pre-dispatch contract validation and gate malformed retries.
+
+        A valid corrected call clears this tool's malformed streak. An explicit
+        malformed-input envelope increments the stable tool+failure-class count;
+        with hard stops enabled, the second malformed call is blocked before
+        handler execution even when a different field is missing.
+        """
+        with self._state_lock:
+            signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+            identity = _malformed_failure_identity(validation_result)
+            if identity is None:
+                self._malformed_failure_counts = {
+                    key: count
+                    for key, count in self._malformed_failure_counts.items()
+                    if key[0] != tool_name
+                }
+                return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+
+            failure_class, _failure_code = identity
+            key = (tool_name, failure_class)
+            count = self._malformed_failure_counts.get(key, 0) + 1
+            self._malformed_failure_counts[key] = count
+            if self.config.hard_stop_enabled and count >= 2:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="structurally_equivalent_malformed_input_block",
+                    message=(
+                        f"Blocked {tool_name}: malformed input in failure class "
+                        f"{failure_class!r} already failed this turn. Correct the "
+                        "tool contract before retrying."
+                    ),
+                    tool_name=tool_name,
+                    count=count,
+                    signature=signature,
+                    failure_class=failure_class,
+                )
+                return decision
+            return ToolGuardrailDecision(
+                tool_name=tool_name,
+                count=count,
+                signature=signature,
+                failure_class=failure_class,
+            )
+
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
-        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        with self._state_lock:
+            return self._before_call_unlocked(tool_name, args)
+
+    def _before_call_unlocked(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
+        coerced_args = _coerce_args(args)
+        signature = ToolCallSignature.from_call(tool_name, coerced_args)
 
         # ── Per-turn runaway-loop caps ──────────────────────────────────
         # These are hard ceilings on how many times a runaway-prone tool may
@@ -391,7 +471,7 @@ class ToolCallGuardrailController:
         exact_count = self._exact_failure_counts.get(signature, 0)
         if exact_count >= self.config.exact_failure_block_after:
             decision = ToolGuardrailDecision(
-                action="block",
+                action="halt",
                 code="repeated_exact_failure_block",
                 message=(
                     f"Blocked {tool_name}: the same tool call failed {exact_count} "
@@ -402,7 +482,6 @@ class ToolCallGuardrailController:
                 count=exact_count,
                 signature=signature,
             )
-            self._halt_decision = decision
             return decision
 
         if self._is_idempotent(tool_name):
@@ -411,7 +490,7 @@ class ToolCallGuardrailController:
                 _result_hash, repeat_count = record
                 if repeat_count >= self.config.no_progress_block_after:
                     decision = ToolGuardrailDecision(
-                        action="block",
+                        action="halt",
                         code="idempotent_no_progress_block",
                         message=(
                             f"Blocked {tool_name}: this read-only call returned the same "
@@ -422,12 +501,24 @@ class ToolCallGuardrailController:
                         count=repeat_count,
                         signature=signature,
                     )
-                    self._halt_decision = decision
                     return decision
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
     def after_call(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any] | None,
+        result: str | None,
+        *,
+        failed: bool | None = None,
+    ) -> ToolGuardrailDecision:
+        with self._state_lock:
+            return self._after_call_unlocked(
+                tool_name, args, result, failed=failed
+            )
+
+    def _after_call_unlocked(
         self,
         tool_name: str,
         args: Mapping[str, Any] | None,
@@ -675,7 +766,7 @@ class ToolCallGuardrailController:
             cap = caps.max_web_searches
             if cap and self._turn_web_search_count >= cap:
                 decision = ToolGuardrailDecision(
-                    action="block",
+                    action="halt",
                     code="loop_web_search_cap",
                     message=(
                         f"Blocked web_search: this turn has already made {cap} "
@@ -687,7 +778,6 @@ class ToolCallGuardrailController:
                     count=self._turn_web_search_count,
                     signature=signature,
                 )
-                self._halt_decision = decision
                 return decision
             self._turn_web_search_count += 1
             return None
@@ -704,7 +794,7 @@ class ToolCallGuardrailController:
                 return None
             if self._turn_subagent_count >= cap:
                 decision = ToolGuardrailDecision(
-                    action="block",
+                    action="halt",
                     code="loop_subagent_cap",
                     message=(
                         f"Blocked delegate_task: this turn has already spawned "
@@ -716,7 +806,6 @@ class ToolCallGuardrailController:
                     count=self._turn_subagent_count,
                     signature=signature,
                 )
-                self._halt_decision = decision
                 return decision
             self._turn_subagent_count += spawn_count
             return None
