@@ -432,3 +432,46 @@ class TestConsentFlow:
         )
         assert granted is True
         console.input.assert_not_called()
+
+
+class TestCapabilityDecisionLogging:
+    """Audit-log level behavior for capability gate decisions.
+
+    ``allow`` is a meaningful authorization grant and stays at INFO.
+    ``deny`` is the fail-closed *default* state; on hosts that re-probe
+    plugin capabilities on a reload/heartbeat cycle, a denied check fires
+    every cycle, so an INFO line for the same denied grant would be pure
+    log spam.  It is logged at DEBUG instead (#plugin-capability-log-noise).
+    """
+
+    def test_allow_logs_at_info(self, caplog):
+        from hermes_cli import plugin_capabilities as pc
+
+        with caplog.at_level("INFO", logger="hermes_cli.plugin_capabilities"):
+            pc._log_capability_decision(
+                "capplug", "tools.override", True, "granted_capabilities"
+            )
+        assert caplog.records
+        for rec in caplog.records:
+            assert rec.levelname == "INFO"
+            assert "decision=allow" in rec.getMessage()
+
+    def test_deny_logs_at_debug_not_info(self, caplog):
+        from hermes_cli import plugin_capabilities as pc
+
+        with caplog.at_level("INFO", logger="hermes_cli.plugin_capabilities"):
+            pc._log_capability_decision(
+                "capplug", "tools.override", False, "not granted"
+            )
+        # At INFO level a denied decision must NOT surface (it's DEBUG-only).
+        assert not caplog.records
+
+        with caplog.at_level("DEBUG", logger="hermes_cli.plugin_capabilities"):
+            pc._log_capability_decision(
+                "capplug", "tools.override", False, "not granted"
+            )
+        assert caplog.records
+        for rec in caplog.records:
+            assert rec.levelname == "DEBUG"
+            assert "decision=deny" in rec.getMessage()
+

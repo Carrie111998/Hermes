@@ -270,11 +270,23 @@ def plugin_capability_granted(
 def _log_capability_decision(
     plugin_id: str, capability: str, allowed: bool, evidence: str
 ) -> None:
-    """Audit line for capability gate decisions (the ``checked_by`` trail)."""
-    logger.info(
+    """Audit line for capability gate decisions (the ``checked_by`` trail).
+
+    ``allow`` stays at INFO — an authorization grant is a meaningful audit
+    event. ``deny`` is the fail-closed *default* state, so it is logged at
+    DEBUG: on hosts that re-probe plugin capabilities on a reload/heartbeat
+    cycle, a denied check fires every cycle and an INFO line for the same
+    denied grant adds no audit value, only log spam.
+    """
+    message = (
         "capability_check plugin=%s capability=%s decision=%s checked_by=plugin_capability_granted evidence=%s",
         plugin_id, capability, "allow" if allowed else "deny", evidence,
     )
+    if allowed:
+        logger.info(*message)
+    else:
+        logger.debug(*message)
+
 
 
 # ---------------------------------------------------------------------------
