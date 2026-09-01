@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { currentPickerSelection, displayModelName, formatModelStatusLabel } from './model-status-label'
+import { currentPickerSelection, displayModelName, displayProviderName, formatModelStatusLabel } from './model-status-label'
 import { reasoningEffortLabel } from './reasoning-effort'
 
 describe('model-status-label', () => {
@@ -68,6 +68,30 @@ describe('model-status-label', () => {
 
     it('falls back to the store while options are still loading', () => {
       expect(currentPickerSelection(store, undefined)).toEqual(store)
+    })
+  })
+
+  describe('displayProviderName', () => {
+    it('strips the custom:<key> wrapper to the config key', () => {
+      expect(displayProviderName('custom:yjs_github_artur')).toBe('yjs_github_artur')
+      expect(displayProviderName('custom:anymodel')).toBe('anymodel')
+    })
+
+    it('drops the bare "custom" token — corrupt state with no recoverable name', () => {
+      expect(displayProviderName('custom')).toBe('')
+      expect(displayProviderName('CUSTOM')).toBe('')
+      expect(displayProviderName(' Custom ')).toBe('')
+    })
+
+    it('passes canonical provider slugs through unchanged', () => {
+      expect(displayProviderName('openai-codex')).toBe('openai-codex')
+      expect(displayProviderName('kimi-coding')).toBe('kimi-coding')
+      expect(displayProviderName('anthropic')).toBe('anthropic')
+    })
+
+    it('collapses empty and whitespace-only input to empty', () => {
+      expect(displayProviderName('')).toBe('')
+      expect(displayProviderName('   ')).toBe('')
     })
   })
 })

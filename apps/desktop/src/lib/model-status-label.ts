@@ -95,6 +95,39 @@ export function displayModelName(model: string): string {
   return modelDisplayParts(model).name
 }
 
+/** Human-readable provider label.
+ *
+ *  Identity format for custom providers is ``custom:<config-key>`` (see
+ *  ``hermes_cli.runtime_provider.canonical_custom_identity``); the legacy
+ *  spellings are the bare key and plain ``custom``. The composer pill and the
+ *  picker dialog feed raw runtime state into a user-facing label, so without
+ *  a normalizer they show the protocol token (``custom``) instead of the
+ *  provider the user actually configured (#custom-provider-label).
+ *
+ *  Behavior:
+ *  - ``custom:<key>`` → ``<key>`` (the config key IS the user-facing name).
+ *  - the bare ``custom`` → empty string. That's corrupt state from a known
+ *    backend bug where the canonical identity was lost; showing the word
+ *    "custom" carries zero information, so callers should fall back to
+ *    their no-provider wording.
+ *  - everything else (canonical provider slugs like ``openai-codex``) is
+ *    returned trimmed and unchanged.
+ */
+export function displayProviderName(provider: string): string {
+  const raw = String(provider || '').trim()
+  if (!raw) {
+    return ''
+  }
+  const lower = raw.toLowerCase()
+  if (lower === 'custom') {
+    return ''
+  }
+  if (lower.startsWith('custom:')) {
+    return raw.slice('custom:'.length).trim()
+  }
+  return raw
+}
+
 /** Status bar trigger label — model name plus the live session state (effort/fast).
  *  `defaultEffort` is the profile's configured level, used when the surface has
  *  no explicit effort so the label never advertises a default the agent won't use. */
