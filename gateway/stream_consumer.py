@@ -2934,6 +2934,28 @@ class GatewayStreamConsumer:
         self._last_sent_text = text
         if is_turn_final:
             self._final_response_sent = True
+            # Record WHAT was delivered, not just THAT something was (#95382).
+            #
+            # Without this the flag is set but ``_delivered_final_text`` stays
+            # None, so ``delivered_final_matches`` returns None ("no payload to
+            # compare") and the gateway's ``_stream_confirmed_final_delivery``
+            # takes the legacy trust branch — accepting a partial fresh-final
+            # as complete delivery. When ``text`` is a preview snapshot rather
+            # than the completed response (the drop-after-first-edit shape),
+            # the user is left with a truncated message and no recovery path
+            # ever fires: no re-send, no continuation prompt.
+            #
+            # Recording the payload makes the reconciliation real: a later
+            # ``delivered_final_matches(final_response)`` comparison returns
+            # False on a genuine mismatch, the gateway stops suppressing, and
+            # the existing queued re-send path recovers the full answer.
+            #
+            # Routed through ``_record_turn_final_payload`` (not a verbatim
+            # assignment) so split-delivery turns record the un-truncated
+            # ``_stream_ledger`` instead of a tail-only chunk — a verbatim
+            # tail would read as a mismatch and re-send on top of an answer
+            # the user already has (#78541).
+            self._record_turn_final_payload(text)
         return True
 
     async def _suppress_silence_marker(self) -> None:
