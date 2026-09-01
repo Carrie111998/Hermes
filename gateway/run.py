@@ -17257,9 +17257,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Dispatch `/wisdom` through the active profile's shared service."""
         source = event.source
         adapter = self._adapter_for_source(source)
+        raw_args = event.get_command_args()
+        if event.get_command() == "collective-wisdom-install":
+            raw_args = f"install {raw_args}".strip()
         rich_handler = getattr(adapter, "send_wisdom_command", None)
         if callable(rich_handler):
-            await rich_handler(event.get_command_args(), source=source)
+            await rich_handler(raw_args, source=source)
             return ""
 
         from gateway.wisdom_command import (
@@ -17282,7 +17285,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     in {"group", "supergroup", "channel", "forum"},
                 )
                 return WisdomCommandController().execute(
-                    event.get_command_args(), service, context
+                    raw_args, service, context
                 )
         try:
             view = await asyncio.to_thread(command_action)

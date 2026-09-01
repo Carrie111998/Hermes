@@ -8759,6 +8759,19 @@ def test_complete_slash_returns_plain_string_fields():
         assert isinstance(item["meta"], str), item
 
 
+def test_complete_slash_returns_documented_wisdom_subcommands():
+    resp = server.handle_request(
+        {"id": "1", "method": "complete.slash", "params": {"text": "/wisdom "}}
+    )
+
+    items = {item["text"]: item for item in resp["result"]["items"]}
+    assert items["show"]["display"] == "show"
+    assert items["show"]["meta"].startswith("<skill> — View its description")
+    assert items["installed"]["meta"] == (
+        "List and manage skills installed on this device"
+    )
+
+
 def test_complete_slash_includes_tui_details_command():
     resp = server.handle_request(
         {"id": "1", "method": "complete.slash", "params": {"text": "/det"}}
@@ -10998,6 +11011,11 @@ def test_commands_catalog_filters_gateway_only_commands_and_keeps_status_visible
     assert "/update" in pairs
     assert canon["/update"] == "/update"
 
+    assert "/wisdom" in pairs
+    assert canon["/wisdom"] == "/wisdom"
+    assert canon["/collective-wisdom-install"] == "/wisdom"
+    assert "/collective-wisdom-install" not in pairs
+
     assert "/topic" not in canon
     assert "/approve" not in canon
     assert "/deny" not in canon
@@ -11014,6 +11032,7 @@ def test_commands_catalog_includes_desktop_meta_without_skills():
     assert commands["/clear"]["desktop"] == "terminal"
     assert commands["/model"]["desktop"] == "hidden"
     assert commands["/compact"]["argument_mode"] == commands["/compress"]["argument_mode"]
+    assert commands["/wisdom"] == {"argument_mode": "mixed", "desktop": None}
 
     for skill in resp["result"]["skills"]:
         assert skill not in commands

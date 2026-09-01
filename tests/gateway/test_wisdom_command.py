@@ -14,6 +14,7 @@ from gateway.wisdom_command import (
     bind_view_callbacks,
     command_error_text,
     issue_continuation,
+    render_local_view,
     resolve_continuation,
 )
 
@@ -72,7 +73,7 @@ class _Service:
         return [
             {
                 "id": "skill-1",
-                "slug": "incident handoff",
+                "slug": "incident-handoff",
                 "latest_version": 2,
                 "author_description": "Summarize an incident",
             }
@@ -84,18 +85,19 @@ class _Service:
             "skill": {
                 "id": "skill-1",
                 "slug": "incident-handoff",
-                "author_description": "Summarize an incident",
-                "scan_verdict": "pass",
             },
             "versions": [{"version": 2}, {"version": 1}],
             "local_compatibility": {"outcome": "compatible"},
             "latest_version_detail": {
                 "version": {
+                    "author_description": "Summarize an incident",
+                    "scan": {"verdict": "pass"},
+                    "verified_facts": {"scan_verdict": "pass"},
                     "system_spec": {
                         "hermes": {"minimum_version": "0.20.5"},
                         "platforms": ["macOS"],
                         "runtime": {"shell": True},
-                    }
+                    },
                 }
             },
             "local_installation": {
@@ -238,11 +240,57 @@ def test_parse_supports_quoted_search_and_cli_aliases():
     )
 
 
+def test_local_action_command_resumes_bound_controller_action():
+    service = _Service()
+    context = _context(chat_id="local:session-1")
+    view = WisdomCommandController().execute("install skill-1", service, context)
+    rendered = render_local_view(view, context)
+
+    action_line = next(
+        line for line in rendered.splitlines() if line.startswith("Manual:")
+    )
+    token = action_line.rsplit(" ", 1)[-1]
+    resumed = WisdomCommandController().execute(f"action {token}", service, context)
+
+    assert resumed.title == "Confirm install"
+    assert ("install_plan", "skill-1", "MANUAL") in service.calls
+
+
+def test_local_action_command_rejects_another_session():
+    context = _context(chat_id="local:session-1")
+    view = WisdomCommandController().execute("install skill-1", _Service(), context)
+    render_local_view(view, context)
+    token = view.actions[0].callback_data.removeprefix("wi:cmd:")
+
+    with pytest.raises(PermissionError, match="another session"):
+        WisdomCommandController().execute(
+            f"action {token}",
+            _Service(),
+            _context(chat_id="local:session-2"),
+        )
+
+
 def test_unknown_keyword_returns_focused_help():
     view = WisdomCommandController().execute("wat", _Service(), _context())
 
     assert view.title == "Collective Wisdom commands"
     assert view.notice == "Unknown /wisdom keyword: wat"
+
+
+def test_help_explains_every_workflow_and_includes_examples():
+    view = WisdomCommandController().execute("help", _Service(), _context())
+    rendered = view.to_text()
+
+    assert [item.title for item in view.items] == [
+        "Discover",
+        "Contribute",
+        "Manage installed skills",
+        "Account and activity",
+        "Examples",
+    ]
+    assert "/wisdom show <skill> — View its description" in rendered
+    assert "/wisdom installed — List and manage skills installed" in rendered
+    assert "/wisdom submit my-local-skill" in rendered
 
 
 def test_group_home_does_not_read_private_counts():
@@ -257,6 +305,13 @@ def test_group_home_does_not_read_private_counts():
         "Continue in DM",
         "Help",
     ]
+
+
+def test_connected_home_includes_help_action():
+    view = WisdomCommandController().execute("", _Service(), _context())
+
+    help_action = next(action for action in view.actions if action.label == "Help")
+    assert help_action.local_command == "/wisdom help"
 
 
 def test_setup_disclosure_precedes_profile_mutation():
@@ -341,9 +396,7 @@ def test_group_versions_pagination_never_reintroduces_install_controls():
     )
 
     assert all(
-        action.label != "Install"
-        for item in second.items
-        for action in item.actions
+        action.label != "Install" for item in second.items for action in item.actions
     )
     assert any(action.label == "Continue in DM" for action in second.actions)
 
@@ -351,6 +404,8 @@ def test_group_versions_pagination_never_reintroduces_install_controls():
 def test_private_show_includes_requirements_and_installation_state():
     view = WisdomCommandController().execute("show skill-1", _Service(), _context())
 
+    assert "Summarize an incident" in view.summary
+    assert "Latest: v2 · scan: pass" in view.summary
     assert "Requirements: Hermes 0.20.5+; OS: macOS; runtime: shell" in view.summary
     assert "Installed: v1 · MANUAL" in view.summary
 
@@ -590,3 +645,31 @@ def test_text_fallback_keeps_portal_links_but_not_callback_payloads():
 
     assert "View in Portal: https://portal.example/skill-1" in rendered
     assert "private-token" not in rendered
+
+
+def test_local_text_prefers_readable_commands_without_changing_shared_fallback():
+    context = _context(chat_id="local:session-1")
+    view = command_module.WisdomView(
+        "Collective Wisdom",
+        actions=[
+            command_module.WisdomAction(
+                "Browse", "browse", local_command="/wisdom browse"
+            )
+        ],
+    )
+
+    rendered = render_local_view(view, context)
+
+    assert "Browse: /wisdom browse" in rendered
+    assert "/wisdom action" not in rendered
+    assert "wi:cmd:" not in rendered
+    assert view.to_text() == "Collective Wisdom"
+
+
+def test_local_browse_renders_show_by_skill_name_instead_of_action_token():
+    view = WisdomCommandController().execute("browse", _Service(), _context())
+
+    rendered = render_local_view(view, _context())
+
+    assert "View: /wisdom show incident-handoff" in rendered
+    assert "/wisdom action" not in rendered

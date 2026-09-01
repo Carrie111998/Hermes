@@ -9,6 +9,7 @@ from hermes_cli.commands import (
     COMMANDS_BY_CATEGORY,
     CommandDef,
     GATEWAY_KNOWN_COMMANDS,
+    SUBCOMMAND_DESCRIPTIONS,
     SUBCOMMANDS,
     SlashCommandAutoSuggest,
     SlashCommandCompleter,
@@ -30,6 +31,7 @@ from hermes_cli.commands import (
     telegram_bot_commands,
     telegram_menu_commands,
     telegram_menu_max_commands,
+    WISDOM_SUBCOMMAND_HELP,
 )
 
 
@@ -48,16 +50,19 @@ def _completions(completer: SlashCommandCompleter, text: str):
 
 class TestCommandRegistry:
 
-    def test_wisdom_is_a_busy_rejecting_gateway_command(self):
+    def test_wisdom_is_a_busy_rejecting_cross_client_command(self):
         command = resolve_command("wisdom")
 
         assert command is not None
         assert command.category == "Tools & Skills"
-        assert command.gateway_only is True
+        assert command.gateway_only is False
+        assert command.argument_mode == "mixed"
+        assert resolve_command("collective-wisdom-install") is command
         assert command.busy_policy == "reject"
         assert {"browse", "submit", "install", "update", "notifications"} <= set(
             command.subcommands
         )
+        assert command.subcommand_descriptions == WISDOM_SUBCOMMAND_HELP
 
     def test_wisdom_survives_the_default_telegram_menu_cap(self):
         menu, _hidden = telegram_menu_commands(max_commands=60)
@@ -443,11 +448,24 @@ class TestSubcommands:
         assert "/quit" not in SUBCOMMANDS
         assert "/clear" not in SUBCOMMANDS
 
+    def test_wisdom_subcommands_include_registry_owned_documentation(self):
+        assert SUBCOMMAND_DESCRIPTIONS["/wisdom"] == WISDOM_SUBCOMMAND_HELP
+
 
 # ── Subcommand tab completion ───────────────────────────────────────────
 
 
 class TestSubcommandCompletion:
+
+    def test_wisdom_subcommands_show_usage_and_descriptions(self):
+        completions = _completions(SlashCommandCompleter(), "/wisdom ")
+        by_name = {completion.text: completion for completion in completions}
+
+        assert by_name["show"].display_meta_text == WISDOM_SUBCOMMAND_HELP["show"]
+        assert (
+            by_name["installed"].display_meta_text
+            == WISDOM_SUBCOMMAND_HELP["installed"]
+        )
 
 
 

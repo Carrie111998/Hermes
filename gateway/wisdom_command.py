@@ -1,8 +1,8 @@
-"""Profile-scoped `/wisdom` command controller for messaging gateways.
+"""Profile-scoped `/wisdom` command controller shared by Hermes clients.
 
 The controller owns parsing and presentation-neutral navigation.  It calls the
 same :class:`hermes_wisdom.service.WisdomService` used by CLI, Dashboard, and
-Desktop; transports only render the returned cards and callbacks.
+Desktop; clients only render the returned cards and callbacks.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from hermes_cli.commands import WISDOM_SUBCOMMAND_HELP
 from hermes_wisdom.client import (
     WisdomAuthError,
     WisdomConflict,
@@ -61,6 +62,7 @@ class WisdomAction:
     primary: bool = False
     destructive: bool = False
     callback_data: str | None = None
+    local_command: str | None = None
 
 
 @dataclass
@@ -87,18 +89,75 @@ class WisdomView:
             if item.detail:
                 lines.append(item.detail)
             lines.extend(
-                f"{action.label}: {action.url}"
-                for action in item.actions
-                if action.url
+                f"{action.label}: {action.url}" for action in item.actions if action.url
             )
         if self.notice:
             lines.extend(("", self.notice))
         lines.extend(
-            f"{action.label}: {action.url}"
-            for action in self.actions
-            if action.url
+            f"{action.label}: {action.url}" for action in self.actions if action.url
         )
         return "\n".join(lines)
+
+    def to_local_text(self) -> str:
+        """Render a local client view with executable, bound follow-up actions.
+
+        Telegram renders these actions as inline buttons.  CLI, Dashboard, and
+        Desktop are text surfaces, so they need an equivalent way to continue
+        receipt-bound confirmation flows.  The callback tokens are scoped to
+        the local session/profile and expire after ten minutes; unlike
+        :meth:`to_text`, this renderer is never used in a shared chat.
+        """
+        lines = [self.title]
+        if self.summary:
+            lines.extend(("", self.summary))
+        for item in self.items:
+            lines.extend(("", item.title))
+            if item.detail:
+                lines.append(item.detail)
+            lines.extend(_local_action_lines(item.actions))
+        if self.notice:
+            lines.extend(("", self.notice))
+        lines.extend(_local_action_lines(self.actions))
+        return "\n".join(lines)
+
+
+def _local_action_lines(actions: list[WisdomAction]) -> list[str]:
+    lines: list[str] = []
+    for action in actions:
+        if action.url:
+            lines.append(f"{action.label}: {action.url}")
+            continue
+        if action.local_command:
+            lines.append(f"{action.label}: {action.local_command}")
+            continue
+        callback_data = str(action.callback_data or "")
+        if callback_data.startswith("wi:cmd:"):
+            token = callback_data.removeprefix("wi:cmd:")
+            lines.append(f"{action.label}: /wisdom action {token}")
+    return lines
+
+
+def _wisdom_command(keyword: str, *arguments: object) -> str:
+    """Return a pasteable local command with shell-safe arguments."""
+    parts = [keyword, *(str(argument) for argument in arguments if str(argument))]
+    return "/wisdom " + shlex.join(parts)
+
+
+def _wisdom_help_lines(*subcommands: str) -> str:
+    lines: list[str] = []
+    for subcommand in subcommands:
+        description = WISDOM_SUBCOMMAND_HELP[subcommand]
+        separator = " " if description.startswith(("[", "<")) else " — "
+        lines.append(f"/wisdom {subcommand}{separator}{description}")
+    return "\n".join(lines)
+
+
+def render_local_view(
+    view: WisdomView,
+    context: WisdomCommandContext,
+) -> str:
+    """Bind a view's actions and render it for CLI-family local clients."""
+    return bind_view_callbacks(view, context).to_local_text()
 
 
 @dataclass(frozen=True)
@@ -243,14 +302,23 @@ class WisdomCommandController:
         context: WisdomCommandContext,
     ) -> WisdomView:
         keyword, args = self.parse(raw_args)
+        if keyword == "action":
+            if len(args) != 1:
+                raise ValueError("Usage: /wisdom action <control>")
+            return self.execute_token(args[0], service, context)
         if context.is_group and keyword == "home":
             return WisdomView(
                 "Collective Wisdom",
                 "Browse skills published by your team. Private skills and device changes continue in a direct message.",
                 actions=[
-                    WisdomAction("Browse", "browse", primary=True),
+                    WisdomAction(
+                        "Browse",
+                        "browse",
+                        primary=True,
+                        local_command=_wisdom_command("browse"),
+                    ),
                     WisdomAction("Continue in DM", "continue_dm", {"raw_args": ""}),
-                    WisdomAction("Help", "help"),
+                    WisdomAction("Help", "help", local_command=_wisdom_command("help")),
                 ],
             )
         if context.is_group and keyword in _PRIVATE_COMMANDS:
@@ -402,7 +470,13 @@ class WisdomCommandController:
                 WisdomView(
                     "Skill installed",
                     f"{result.get('skill_id')} · v{result.get('version')}",
-                    actions=[WisdomAction("Installed skills", "installed")],
+                    actions=[
+                        WisdomAction(
+                            "Installed skills",
+                            "installed",
+                            local_command=_wisdom_command("installed"),
+                        )
+                    ],
                 )
             )
         if operation == "update_plan":
@@ -418,7 +492,13 @@ class WisdomCommandController:
                 WisdomView(
                     "Skill updated",
                     f"{result.get('skill_id')} · v{result.get('version')}",
-                    actions=[WisdomAction("Installed skills", "installed")],
+                    actions=[
+                        WisdomAction(
+                            "Installed skills",
+                            "installed",
+                            local_command=_wisdom_command("installed"),
+                        )
+                    ],
                 )
             )
         if operation == "check":
@@ -430,7 +510,11 @@ class WisdomCommandController:
                 "Remove managed skill?",
                 "The validated managed copy will move to recoverable Wisdom trash.",
                 actions=[
-                    WisdomAction("Cancel", "installed"),
+                    WisdomAction(
+                        "Cancel",
+                        "installed",
+                        local_command=_wisdom_command("installed"),
+                    ),
                     WisdomAction(
                         "Uninstall",
                         "uninstall_apply",
@@ -494,9 +578,16 @@ class WisdomCommandController:
                 "Collective Wisdom",
                 "Set up this profile to share and install team skills.",
                 actions=[
-                    WisdomAction("Set up", "setup", primary=True),
-                    WisdomAction("Status", "status"),
-                    WisdomAction("Help", "help"),
+                    WisdomAction(
+                        "Set up",
+                        "setup",
+                        primary=True,
+                        local_command=_wisdom_command("setup"),
+                    ),
+                    WisdomAction(
+                        "Status", "status", local_command=_wisdom_command("status")
+                    ),
+                    WisdomAction("Help", "help", local_command=_wisdom_command("help")),
                 ],
             )
         if not status.get("gateway_available"):
@@ -509,7 +600,9 @@ class WisdomCommandController:
                 if authentication
                 else "Your local skills remain unchanged. Try again shortly.",
                 actions=[
-                    WisdomAction("Status", "status"),
+                    WisdomAction(
+                        "Status", "status", local_command=_wisdom_command("status")
+                    ),
                     WisdomAction("Open Nous Portal ↗", url=portal_base_url()),
                 ],
             )
@@ -522,7 +615,9 @@ class WisdomCommandController:
                 "Collective Wisdom access is not enabled",
                 "This profile does not currently have access to your team's Collective Wisdom plane.",
                 actions=[
-                    WisdomAction("Status", "status"),
+                    WisdomAction(
+                        "Status", "status", local_command=_wisdom_command("status")
+                    ),
                     WisdomAction("Open Nous Portal ↗", url=portal_base_url()),
                 ],
             )
@@ -536,12 +631,31 @@ class WisdomCommandController:
             "Collective Wisdom",
             summary,
             actions=[
-                WisdomAction("Browse", "browse"),
-                WisdomAction("Suggested", "candidates"),
-                WisdomAction("Drafts", "drafts"),
-                WisdomAction("Installed", "installed"),
-                WisdomAction("Updates", "check"),
-                WisdomAction("Notifications", "notifications"),
+                WisdomAction(
+                    "Browse", "browse", local_command=_wisdom_command("browse")
+                ),
+                WisdomAction(
+                    "Suggested",
+                    "candidates",
+                    local_command=_wisdom_command("candidates"),
+                ),
+                WisdomAction(
+                    "Drafts", "drafts", local_command=_wisdom_command("drafts")
+                ),
+                WisdomAction(
+                    "Installed",
+                    "installed",
+                    local_command=_wisdom_command("installed"),
+                ),
+                WisdomAction(
+                    "Updates", "check", local_command=_wisdom_command("check")
+                ),
+                WisdomAction(
+                    "Notifications",
+                    "notifications",
+                    local_command=_wisdom_command("notifications"),
+                ),
+                WisdomAction("Help", "help", local_command=_wisdom_command("help")),
             ],
         )
 
@@ -551,17 +665,30 @@ class WisdomCommandController:
             "Use /wisdom <keyword>. Private state and changes are available in DM.",
             items=[
                 WisdomItem(
-                    "Discover", "browse [query] · show <skill> · versions <skill>"
+                    "Discover",
+                    _wisdom_help_lines("browse", "show", "versions"),
                 ),
                 WisdomItem(
                     "Contribute",
-                    "candidates [all|query] · submit <local-skill> · drafts · review <draft>",
+                    _wisdom_help_lines("candidates", "submit", "drafts", "review"),
                 ),
                 WisdomItem(
-                    "Manage",
-                    "install <id|URL|id@vN> · installed · check · update <skill|all> · uninstall <skill>",
+                    "Manage installed skills",
+                    _wisdom_help_lines(
+                        "install", "installed", "check", "update", "uninstall"
+                    ),
                 ),
-                WisdomItem("Account", "setup · status · notifications · help"),
+                WisdomItem(
+                    "Account and activity",
+                    _wisdom_help_lines("setup", "status", "notifications", "help"),
+                ),
+                WisdomItem(
+                    "Examples",
+                    "/wisdom browse incident\n"
+                    "/wisdom show incident-handoff\n"
+                    "/wisdom installed\n"
+                    "/wisdom submit my-local-skill",
+                ),
             ],
         )
 
@@ -645,11 +772,19 @@ class WisdomCommandController:
 
     def _skill_item(self, item: dict[str, Any]) -> WisdomItem:
         skill_id = str(item.get("id") or "")
+        skill_name = str(item.get("slug") or skill_id)
         version = item.get("latest_version")
         return WisdomItem(
-            str(item.get("slug") or skill_id),
+            skill_name,
             f"v{version or '?'} · {item.get('author_description') or 'No description'}",
-            actions=[WisdomAction("View", "show", {"skill": skill_id})],
+            actions=[
+                WisdomAction(
+                    "View",
+                    "show",
+                    {"skill": skill_id},
+                    local_command=_wisdom_command("show", skill_name),
+                )
+            ],
         )
 
     def _show(
@@ -677,6 +812,19 @@ class WisdomCommandController:
         latest_version = latest_detail.get("version") or {}
         specification = latest_version.get("system_spec") or {}
         requirements = self._requirements_summary(specification)
+        description = (
+            latest_version.get("author_description")
+            or skill.get("author_description")
+            or "No description"
+        )
+        verified_facts = latest_version.get("verified_facts") or {}
+        scan = latest_version.get("scan") or {}
+        scan_verdict = (
+            verified_facts.get("scan_verdict")
+            or scan.get("verdict")
+            or skill.get("scan_verdict")
+            or "not reported"
+        )
         installation = detail.get("local_installation") or {}
         installation_text = (
             f"Installed: v{installation.get('version')} · "
@@ -684,20 +832,30 @@ class WisdomCommandController:
             if installation
             else "Installed: no"
         )
+        skill_name = str(skill.get("slug") or skill_id)
         return WisdomView(
-            str(skill.get("slug") or skill_id),
+            skill_name,
             "\n".join([
-                str(skill.get("author_description") or "No description"),
-                f"Latest: v{latest or '?'} · scan: {skill.get('scan_verdict') or 'not reported'}",
+                str(description),
+                f"Latest: v{latest or '?'} · scan: {scan_verdict}",
                 f"Compatibility: {compatibility.get('outcome') or 'review on install'}",
                 f"Requirements: {requirements}",
                 installation_text,
             ]),
             actions=[
                 WisdomAction(
-                    "Install", "install_modes", {"reference": skill_id}, primary=True
+                    "Install",
+                    "install_modes",
+                    {"reference": skill_id},
+                    primary=True,
+                    local_command=_wisdom_command("install", skill_id),
                 ),
-                WisdomAction("Versions", "versions", {"skill": skill_id}),
+                WisdomAction(
+                    "Versions",
+                    "versions",
+                    {"skill": skill_id},
+                    local_command=_wisdom_command("versions", skill_name),
+                ),
                 WisdomAction(
                     "View in Portal ↗", url=self._portal_skill_url(service, skill_id)
                 ),
@@ -755,6 +913,9 @@ class WisdomCommandController:
                             "Install",
                             "install_modes",
                             {"reference": f"{skill_id}@v{item.get('version')}"},
+                            local_command=_wisdom_command(
+                                "install", f"{skill_id}@v{item.get('version')}"
+                            ),
                         )
                     ],
                 )
@@ -785,6 +946,7 @@ class WisdomCommandController:
                             "submit",
                             {"skill_name": item["name"]},
                             primary=True,
+                            local_command=_wisdom_command("submit", item["name"]),
                         )
                     ],
                 )
@@ -793,7 +955,12 @@ class WisdomCommandController:
             actions=[]
             if show_all
             else [
-                WisdomAction("View all local skills", "candidates", {"query": "all"})
+                WisdomAction(
+                    "View all local skills",
+                    "candidates",
+                    {"query": "all"},
+                    local_command=_wisdom_command("candidates", "all"),
+                )
             ],
             notice=None if candidates else "No local skills currently match.",
         )
@@ -830,7 +997,14 @@ class WisdomCommandController:
     def _draft_item(self, service: WisdomService, draft: dict[str, Any]) -> WisdomItem:
         draft_id = str(draft["id"])
         state = str(draft.get("state") or "unknown")
-        actions = [WisdomAction("Review", "review", {"draft_id": draft_id})]
+        actions = [
+            WisdomAction(
+                "Review",
+                "review",
+                {"draft_id": draft_id},
+                local_command=_wisdom_command("review", draft_id),
+            )
+        ]
         if state in {"ready", "owner_approved", "publishing"}:
             actions.append(
                 WisdomAction(
@@ -1001,12 +1175,18 @@ class WisdomCommandController:
                             "Check update",
                             "update_plan",
                             {"skill_id": item["skill_id"]},
+                            local_command=_wisdom_command(
+                                "update", item.get("slug") or item["skill_id"]
+                            ),
                         ),
                         WisdomAction(
                             "Uninstall",
                             "uninstall_confirm",
                             {"skill_id": item["skill_id"]},
                             destructive=True,
+                            local_command=_wisdom_command(
+                                "uninstall", item.get("slug") or item["skill_id"]
+                            ),
                         ),
                     ],
                 )
@@ -1031,6 +1211,9 @@ class WisdomCommandController:
                             "Review update",
                             "update_plan",
                             {"skill_id": item["skill_id"]},
+                            local_command=_wisdom_command(
+                                "update", item.get("slug") or item["skill_id"]
+                            ),
                         )
                     ]
                     if item.get("state") == "update_available"
