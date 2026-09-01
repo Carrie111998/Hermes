@@ -12320,6 +12320,55 @@ def test_close_boundaries_cancel_claimed_prompt_before_dispatch(monkeypatch, bou
         server._sessions.pop("queue-close", None)
 
 
+def test_close_waits_for_claimed_dispatch_ownership(monkeypatch):
+    entered_dispatch = threading.Event()
+    release_dispatch = threading.Event()
+    close_finished = threading.Event()
+    session = _session(
+        queued_prompt={"text": "admit once", "transport": None},
+        preserve_running_on_disconnect=True,
+        running=False,
+    )
+    server._sessions["queue-gated-close"] = session
+
+    def _fake_dispatch(*args, **kwargs):
+        entered_dispatch.set()
+        assert release_dispatch.wait(timeout=2)
+        return True
+
+    monkeypatch.setattr(server, "_dispatch_queued_claim", _fake_dispatch)
+    drain_thread = threading.Thread(
+        target=server._drain_queued_prompt,
+        args=("rid", "queue-gated-close", session),
+    )
+
+    def _close():
+        server._pop_session_by_id("queue-gated-close")
+        close_finished.set()
+
+    close_thread = threading.Thread(target=_close)
+    try:
+        drain_thread.start()
+        assert entered_dispatch.wait(timeout=1)
+        close_thread.start()
+        assert not close_finished.wait(timeout=0.05)
+
+        release_dispatch.set()
+        drain_thread.join(timeout=1)
+        close_thread.join(timeout=1)
+
+        assert not drain_thread.is_alive()
+        assert not close_thread.is_alive()
+        assert close_finished.is_set()
+        assert "queue-gated-close" not in server._sessions
+        assert session["_closing"] is True
+    finally:
+        release_dispatch.set()
+        drain_thread.join(timeout=1)
+        close_thread.join(timeout=1)
+        server._sessions.pop("queue-gated-close", None)
+
+
 def test_session_redirect_queues_during_agent_build_window(monkeypatch):
     # A fresh turn flips running=True and builds the agent asynchronously, so
     # session["agent"] is briefly None. A correction landing here must queue

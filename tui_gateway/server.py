@@ -1129,6 +1129,15 @@ def _attach_worker(sid: str, session: dict, worker) -> None:
     worker.close()
 
 
+def _queued_dispatch_gate(session: dict) -> threading.RLock:
+    """Return the per-session gate for queue dispatch vs lifecycle claims."""
+
+    gate = session.get("_queued_dispatch_gate")
+    if gate is None:
+        gate = session.setdefault("_queued_dispatch_gate", threading.RLock())
+    return gate
+
+
 def _pop_session_by_id(sid: str) -> dict | None:
     """Atomically detach one live session from the registry.
 
@@ -1141,9 +1150,13 @@ def _pop_session_by_id(sid: str) -> dict | None:
     """
     with _sessions_lock:
         session = _sessions.get(sid)
-        if session is not None:
-            session["_closing"] = True
-            _sessions.pop(sid, None)
+    if session is not None:
+        with _queued_dispatch_gate(session):
+            with _sessions_lock:
+                if _sessions.get(sid) is not session:
+                    return None
+                session["_closing"] = True
+                _sessions.pop(sid, None)
     if session is None:
         return None
     # The session is already out of _sessions here, so downstream teardown
@@ -1261,14 +1274,15 @@ def _interrupt_session_turn(
         run_thread = session.get("_run_thread")
         run_thread_alive = run_thread is not None and run_thread.is_alive()
 
-    with session["history_lock"]:
-        session["_turn_cancel_requested"] = True
-        session.pop("_queued_prompt_claimed", None)
-        session["queued_prompt"] = None
-        session.pop("queued_prompts", None)
-        session["_queued_prompt_generation"] = int(
-            session.get("_queued_prompt_generation", 0)
-        ) + 1
+    with _queued_dispatch_gate(session):
+        with session["history_lock"]:
+            session["_turn_cancel_requested"] = True
+            session.pop("_queued_prompt_claimed", None)
+            session["queued_prompt"] = None
+            session.pop("queued_prompts", None)
+            session["_queued_prompt_generation"] = int(
+                session.get("_queued_prompt_generation", 0)
+            ) + 1
 
     if not use_compute_host:
         if should_interrupt:
@@ -1427,16 +1441,22 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
             current = _sessions.get(sid)
             if current is None or not _ws_session_is_detached(current):
                 return
+            history_lock = current.get("history_lock")
+            if history_lock is not None:
+                with history_lock:
+                    preserved_work = bool(
+                        current.get("preserve_running_on_disconnect")
+                        and (
+                            current.get("running")
+                            or isinstance(current.get("queued_prompt"), dict)
+                            or current.get("_queued_prompt_claimed") is True
+                        )
+                    )
+            else:
+                preserved_work = False
             if _session_has_active_delegations(sid, current):
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
-            elif (
-                current.get("preserve_running_on_disconnect")
-                and (
-                    current.get("running")
-                    or isinstance(current.get("queued_prompt"), dict)
-                    or current.get("_queued_prompt_claimed") is True
-                )
-            ):
+            elif preserved_work:
                 # Bot Mode owns both the active turn and an acknowledged next
                 # turn. The current turn briefly clears ``running`` before it
                 # claims ``queued_prompt``; reaping in that handoff loses work
@@ -7254,6 +7274,24 @@ def _sync_session_key_after_compress(
     clear_pending_title: bool = True,
     restart_slash_worker: bool = True,
 ) -> None:
+    """Serialize compression re-anchor against a claimed queued dispatch."""
+
+    with _queued_dispatch_gate(session):
+        _sync_session_key_after_compress_gated(
+            sid,
+            session,
+            clear_pending_title=clear_pending_title,
+            restart_slash_worker=restart_slash_worker,
+        )
+
+
+def _sync_session_key_after_compress_gated(
+    sid: str,
+    session: dict,
+    *,
+    clear_pending_title: bool = True,
+    restart_slash_worker: bool = True,
+) -> None:
     """Re-anchor session_key when AIAgent._compress_context rotates session_id.
 
     AIAgent._compress_context ends the current SessionDB session and creates
@@ -7333,9 +7371,10 @@ def _sync_session_key_after_compress(
     # claimed envelope is restored to the queue (see ``_drain_queued_prompt``)
     # so legitimate follow-ups still survive. Complements self-duplicate
     # scrubbing on redirect.
-    session["_queued_prompt_generation"] = int(
-        session.get("_queued_prompt_generation", 0)
-    ) + 1
+    with _queued_dispatch_gate(session):
+        session["_queued_prompt_generation"] = int(
+            session.get("_queued_prompt_generation", 0)
+        ) + 1
 
     if clear_pending_title:
         session["pending_title"] = None
@@ -10395,9 +10434,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         # Publish ownership before removing the head envelope. The orphan
-        # reaper does not take history_lock, so without this marker it can see
-        # both ``queued_prompt`` empty and ``running`` false in the claim
-        # handoff and tear down already-accepted Bot work.
+        # reaper snapshots this marker with the queue/running state under the
+        # same lock, so accepted Bot work has one atomic ownership view.
         session["_queued_prompt_claimed"] = True
         queued_prompts = session.get("queued_prompts") or []
         session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
@@ -10406,6 +10444,26 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
+    with _queued_dispatch_gate(session):
+        return _dispatch_queued_claim(
+            rid,
+            sid,
+            session,
+            queued,
+            queue_generation=queue_generation,
+        )
+
+
+def _dispatch_queued_claim(
+    rid,
+    sid: str,
+    session: dict,
+    queued: dict,
+    *,
+    queue_generation: int,
+) -> bool:
+    """Dispatch one claimed queue head while lifecycle mutations are gated."""
+
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if session.get("_closing") or session.get("_turn_cancel_requested"):
