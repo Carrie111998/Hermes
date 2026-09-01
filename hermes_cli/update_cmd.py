@@ -1349,6 +1349,41 @@ def _branch_head_suffix(git_cmd=None, cwd=None) -> str:
     return f" [{label}]" if label else ""
 
 
+def _unfinished_git_operation(git_cmd: list[str], cwd: Path) -> str | None:
+    """Return the first in-progress Git operation, if any.
+
+    A dirty maintained branch may be auto-stashed for an in-place update, but
+    an interrupted merge/rebase/cherry-pick must never be normalized by the
+    stash helper's legacy conflict cleanup.
+    """
+    for state in (
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+    ):
+        result = subprocess.run(
+            git_cmd + ["rev-parse", "--git-path", state],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0:
+            return "unverifiable"
+        raw_path = result.stdout.strip()
+        if not raw_path:
+            return "unverifiable"
+        state_path = Path(raw_path)
+        if not state_path.is_absolute():
+            state_path = cwd / state_path
+        if state_path.exists():
+            return state
+    return None
+
+
 def _assess_parked_branch_switch(
     git_cmd: list[str], cwd: Path, current_branch: str, target_branch: str
 ) -> tuple[bool, str]:
@@ -8496,11 +8531,54 @@ def _cmd_update_impl(args, gateway_mode: bool):
         #                    stale tree.
         parked_branch_switched = False
         in_place_update = False
+        auto_stash_ref = None
+        _in_place_configured = False
+        try:
+            from hermes_cli.config import load_config as _load_cfg
+
+            _upd_cfg = (_load_cfg() or {}).get("updates", {})
+            _in_place_configured = (
+                isinstance(_upd_cfg, dict)
+                and _upd_cfg.get("parked_branch_strategy", "switch")
+                == "update_in_place"
+            )
+        except Exception as exc:
+            logger.debug("Could not read updates.parked_branch_strategy: %s", exc)
+
         if current_branch != branch and current_branch != "HEAD":
+            # A deliberately maintained custom branch may carry both committed
+            # overlays and ordinary tracked/untracked edits. Park the latter
+            # before branch assessment so committed history can be proven.
+            # Never touch an interrupted Git operation.
+            if _in_place_configured and not switch_branch:
+                unfinished = _unfinished_git_operation(git_cmd, _m().PROJECT_ROOT)
+                if unfinished:
+                    print(
+                        "✗ Update stopped: the maintained branch has an unfinished "
+                        f"Git operation ({unfinished})."
+                    )
+                    print("  Finish or abort it, then rerun `hermes update`.")
+                    _m()._resume_windows_gateways_after_update(
+                        _windows_gateway_resume
+                    )
+                    sys.exit(1)
+                auto_stash_ref = _m()._stash_local_changes_if_needed(
+                    git_cmd, _m().PROJECT_ROOT
+                )
+
             switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
                 git_cmd, _m().PROJECT_ROOT, current_branch, branch
             )
             if not switch_safe:
+                if auto_stash_ref is not None:
+                    _m()._restore_stashed_changes(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=False,
+                        input_fn=gw_input_fn,
+                    )
+                    auto_stash_ref = None
                 _m()._print_parked_branch_skip_warning(
                     git_cmd,
                     _m().PROJECT_ROOT,
@@ -8518,20 +8596,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 )
                 sys.exit(1)
             if switch_block_reason.startswith("unmerged:"):
-                _in_place_configured = False
-                try:
-                    from hermes_cli.config import load_config as _load_cfg
-
-                    _upd_cfg = (_load_cfg() or {}).get("updates", {})
-                    _in_place_configured = (
-                        isinstance(_upd_cfg, dict)
-                        and _upd_cfg.get("parked_branch_strategy", "switch")
-                        == "update_in_place"
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Could not read updates.parked_branch_strategy: %s", exc
-                    )
                 if _in_place_configured and not switch_branch:
                     # The merge source must exist upstream; --branch typos
                     # previously surfaced through the checkout failing, which
@@ -8558,6 +8622,29 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         switch_block_reason.split(":", 1)[1],
                     )
             else:
+                # A dirty branch with no unique commits is not a maintained
+                # overlay. Do not carry its edits across a branch switch merely
+                # because update_in_place is configured globally.
+                if auto_stash_ref is not None:
+                    _m()._restore_stashed_changes(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        auto_stash_ref,
+                        prompt_user=False,
+                        input_fn=gw_input_fn,
+                    )
+                    auto_stash_ref = None
+                    _m()._print_parked_branch_skip_warning(
+                        git_cmd,
+                        _m().PROJECT_ROOT,
+                        current_branch,
+                        branch,
+                        "dirty",
+                    )
+                    _m()._resume_windows_gateways_after_update(
+                        _windows_gateway_resume
+                    )
+                    sys.exit(1)
                 parked_branch_switched = True
                 print(
                     f"  ⚠ Checkout was parked on '{current_branch}' "
@@ -8570,8 +8657,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     f"  ⚠ Currently on detached HEAD — switching to {branch} "
                     "for update..."
                 )
-            # Stash before checkout so uncommitted work isn't lost
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            # Stash before checkout so uncommitted work isn't lost. A
+            # maintained custom branch may already have been stashed above.
+            if auto_stash_ref is None:
+                auto_stash_ref = _m()._stash_local_changes_if_needed(
+                    git_cmd, _m().PROJECT_ROOT
+                )
             checkout_result = subprocess.run(
                 git_cmd + ["checkout", branch],
                 cwd=_m().PROJECT_ROOT,
@@ -8605,7 +8696,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
         else:
-            auto_stash_ref = _m()._stash_local_changes_if_needed(git_cmd, _m().PROJECT_ROOT)
+            if auto_stash_ref is None:
+                auto_stash_ref = _m()._stash_local_changes_if_needed(
+                    git_cmd, _m().PROJECT_ROOT
+                )
 
         prompt_for_restore = (
             auto_stash_ref is not None
