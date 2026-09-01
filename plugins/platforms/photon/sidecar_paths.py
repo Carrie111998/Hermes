@@ -48,12 +48,47 @@ SOURCE_SIDECAR_DIR = Path(__file__).parent / "sidecar"
 # The files that define the sidecar. Mirrored into the writable runtime dir
 # when the install tree is read-only. node_modules is deliberately absent —
 # it is either baked (managed image) or installed by npm in the mirror.
-_MIRROR_FILES = (
+#
+# The set is derived from index.mjs's relative import specifiers so it can't
+# drift from the actual module graph — unlisted sidecar modules caused crash-
+# loops on read-only installs (#100031).
+_MIRROR_FILES_BASE = (
     "index.mjs",
     "package.json",
     "package-lock.json",
     "patch-spectrum-mixed-attachments.mjs",
 )
+
+
+def _derive_sidecar_imports() -> frozenset:
+    """Parse index.mjs for relative import specifiers and return them.
+
+    The hardcoded ``_MIRROR_FILES_BASE`` can drift from the actual module graph
+    when a new relative import is added to index.mjs. This parses the real
+    import statements so the mirror set always matches what index.mjs actually
+    loads. Non-relative imports (node:*, bare package names) are excluded.
+    """
+    index_path = SOURCE_SIDECAR_DIR / "index.mjs"
+    if not index_path.exists():
+        return frozenset()
+    try:
+        content = index_path.read_text(encoding="utf-8")
+    except OSError:
+        return frozenset()
+    # Match: from "./foo.mjs" or from './foo.mjs' (relative only — ./ or ../)
+    return frozenset(re.findall(r"""from\s+["'](\.\/[^"']+)["']""", content))
+
+
+def _mirror_files() -> tuple:
+    """Full set of sidecar files to mirror.
+
+    Base files plus every relative import found in index.mjs. Deduplicated
+    and sorted for deterministic copy order.
+    """
+    imports = _derive_sidecar_imports()
+    files = set(_MIRROR_FILES_BASE)
+    files.update(imports)
+    return tuple(sorted(files))
 
 
 def dir_writable(path: Path) -> bool:
@@ -122,7 +157,7 @@ def resolve_sidecar_dir(source_dir: Optional[Path] = None) -> Path:
     mirror = get_hermes_home() / "photon" / "sidecar"
     try:
         mirror.mkdir(parents=True, exist_ok=True)
-        for name in _MIRROR_FILES:
+        for name in _mirror_files():
             src = source / name
             if not src.exists():
                 continue
