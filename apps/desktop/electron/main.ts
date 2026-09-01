@@ -44,7 +44,6 @@ import {
   probeStartMarker,
   processStartMarker
 } from './backend-claim'
-import { createBenignStderrSink } from './subprocess-stderr-noise'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { BackendDialClaims } from './backend-dial-claim'
@@ -350,6 +349,7 @@ import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstra
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
 import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
+import { createBenignStderrSink } from './subprocess-stderr-noise'
 import { registerTerminalIpc } from './terminal-ipc'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import {

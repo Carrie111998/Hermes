@@ -22,6 +22,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from hermes_cli.subprocess_noise import is_benign_darwin_malloc_stack_logging_line
 from hermes_constants import get_hermes_home
 from tools.environments.local import hermes_subprocess_env
 
@@ -427,10 +428,6 @@ class HostSupervisor:
 
     def _drain_stderr(self, proc: subprocess.Popen[str]) -> None:
         assert proc.stderr is not None
-        from hermes_cli.subprocess_noise import (
-            is_benign_darwin_malloc_stack_logging_line,
-        )
-
         for raw in proc.stderr:
             text = raw.rstrip("\n")
             if text and not is_benign_darwin_malloc_stack_logging_line(text):

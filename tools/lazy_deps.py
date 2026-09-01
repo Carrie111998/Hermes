@@ -80,6 +80,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli.subprocess_noise import filter_benign_darwin_subprocess_stderr
 
 logger = logging.getLogger(__name__)
 
@@ -765,10 +766,6 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 if r.returncode == 0:
                     if target is not None:
                         _activate_target_on_syspath(target)
-                    from hermes_cli.subprocess_noise import (
-                        filter_benign_darwin_subprocess_stderr,
-                    )
-
                     return _InstallResult(
                         True, r.stdout or "",
                         filter_benign_darwin_subprocess_stderr(r.stderr or ""),
@@ -777,10 +774,6 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 # A resolver failure is authoritative. Falling through to pip
                 # here would silently discard uv policy such as exclude-newer
                 # and could install a release that the project quarantined.
-                from hermes_cli.subprocess_noise import (
-                    filter_benign_darwin_subprocess_stderr,
-                )
-
                 return _InstallResult(
                     False, r.stdout or "",
                     filter_benign_darwin_subprocess_stderr(r.stderr or ""),
@@ -826,10 +819,6 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
             )
             if r.returncode == 0 and target is not None:
                 _activate_target_on_syspath(target)
-            from hermes_cli.subprocess_noise import (
-                filter_benign_darwin_subprocess_stderr,
-            )
-
             return _InstallResult(
                 r.returncode == 0,
                 r.stdout or "",

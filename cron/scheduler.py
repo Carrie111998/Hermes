@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli.subprocess_noise import filter_benign_darwin_subprocess_stderr
 from hermes_cli.config import (
     _expand_env_vars,
     cron_model_drift_axes,
@@ -2697,10 +2698,6 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str) -> Optional[str]
             creationflags=windows_hide_flags(),
         )
         if result.returncode != 0:
-            from hermes_cli.subprocess_noise import (
-                filter_benign_darwin_subprocess_stderr,
-            )
-
             # Never filter stdout: only the stderr source is sanitized before
             # the fallback to stdout. (#54833)
             stderr_clean = filter_benign_darwin_subprocess_stderr(
@@ -4452,10 +4449,6 @@ def _run_job_script(
         stderr = (stderr_raw or "").strip()
         # #54833: benign Darwin libmalloc teardown noise must not become the
         # only reported error for a failing script (falls back to exit code).
-        from hermes_cli.subprocess_noise import (
-            filter_benign_darwin_subprocess_stderr,
-        )
-
         stderr = filter_benign_darwin_subprocess_stderr(stderr).strip()
 
         # Redact secrets from both stdout and stderr before any return path.

@@ -58,6 +58,7 @@ from typing import Callable, Dict, Any, Iterator, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli.subprocess_noise import filter_benign_darwin_subprocess_stderr
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -2844,10 +2845,6 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
 
     result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, stdin=subprocess.DEVNULL)
     if result.returncode != 0:
-        from hermes_cli.subprocess_noise import (
-            filter_benign_darwin_subprocess_stderr,
-        )
-
         stderr = filter_benign_darwin_subprocess_stderr(
             result.stderr.strip()
         ).strip()
@@ -2965,10 +2962,6 @@ def _resolve_piper_voice_path(voice: str, download_dir: Path) -> str:
         ) from exc
 
     if result.returncode != 0:
-        from hermes_cli.subprocess_noise import (
-            filter_benign_darwin_subprocess_stderr,
-        )
-
         stderr = filter_benign_darwin_subprocess_stderr(
             (result.stderr or "").strip()
         ).strip() or "no stderr output"

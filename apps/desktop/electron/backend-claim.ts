@@ -18,10 +18,10 @@
  */
 
 import { execFile } from 'node:child_process'
-import { createBenignStderrSink } from './subprocess-stderr-noise'
 import fs from 'node:fs'
 
 import { electronProcessStartMarker } from './parent-process-identity'
+import { createBenignStderrSink } from './subprocess-stderr-noise'
 import { hiddenWindowsChildOptions } from './windows-child-options'
 
 export function execText(command: string, args: string[], { timeout = 3000 } = {}): Promise<string> {
