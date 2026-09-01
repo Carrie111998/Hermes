@@ -3605,6 +3605,113 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
     }
 
 
+def _collect_single_profile_gateway_topology(
+    name: str, home: Path
+) -> Dict[str, Any]:
+    """Build the ``/api/status`` topology for exactly one pinned profile home.
+
+    An isolated server uses this instead of the machine-wide
+    ``_collect_profile_gateway_topology``: the latter enumerates *every* profile
+    home via ``profiles_to_serve`` and reads each one's ``gateway_state.json``,
+    which on a gated/network bind is pre-auth sibling enumeration
+    (#91381 re-review). The isolation invariant is that an isolated principal
+    must never exercise sibling read authority in the first place — not collect
+    machine-wide and then redact. This scoped collector touches only the
+    pinned ``home``, so the isolation boundary is enforced by *which* data is
+    read, not by post-hoc filtering.
+    """
+    from hermes_cli.profiles import _check_gateway_running
+    from gateway.status import read_runtime_status
+
+    gateways: List[Dict[str, Any]] = []
+    profile_platforms: Dict[str, dict] = {}
+    served: List[str] = []
+    try:
+        running = _check_gateway_running(home)
+    except Exception:
+        running = False
+
+    if running:
+        try:
+            runtime = read_runtime_status(home / "gateway_state.json")
+        except Exception:
+            runtime = None
+        served = [str(p) for p in ((runtime or {}).get("served_profiles") or [])]
+        plats = (runtime or {}).get("platforms")
+        if isinstance(plats, dict) and plats:
+            owned = _owned_profile_platforms(
+                _profile_gateway_writer_identity(home, runtime), plats
+            )
+            if owned:
+                profile_platforms[name] = owned
+        entry: Dict[str, Any] = {
+            "profile": name,
+            "ports": _profile_platform_ports(home, runtime),
+        }
+        if served:
+            entry["served_profiles"] = served
+        gateways.append(entry)
+
+    # Multiplex detection reads only the pinned gateway's OWN runtime status
+    # (served_profiles from its home) — not sibling enumeration — so an
+    # isolated default-profile multiplex gateway still reports "multiplex"
+    # rather than "single" (#91381 re-review, codex P2).
+    if name == "default" and len(served) > 1:
+        mode = "multiplex"
+    elif len(gateways) > 1:
+        mode = "multiple"
+    elif len(gateways) == 1:
+        mode = "single"
+    else:
+        mode = "none"
+
+    return {
+        "profiles": [name],
+        "gateway_mode": mode,
+        "gateways": gateways,
+        "profile_platforms": profile_platforms,
+    }
+
+
+# /api/status is polled ~1/s by the desktop app while it waits for the backend
+# (and again by the dashboard badge). The machine-wide collector is cached for
+# exactly that reason (#_TOPOLOGY_CACHE_TTL below — concurrent polls piling up
+# on profile-home walks starve the event loop). The isolated scoped collector
+# reads only one profile home, so it is cheap, but it is still real file/psutil
+# I/O on a high-frequency route; cache it the same way, keyed by the pinned
+# home so an isolated server never re-scans its own home on every poll
+# (#91381 re-review P2).
+_SCOPED_TOPOLOGY_CACHE: Dict[str, Any] = {"ts": 0.0, "home": None, "data": None}
+_SCOPED_TOPOLOGY_CACHE_TTL = 10.0
+
+
+def _collect_single_profile_gateway_topology_cached(
+    name: str, home: Path
+) -> Dict[str, Any]:
+    """Cached wrapper around :func:`_collect_single_profile_gateway_topology`.
+
+    Keyed by the pinned home so the (single, process-stable) isolated scope
+    reuses one 10s entry instead of re-walking the profile home on every
+    desktop status poll. Shares the topology cache lock so a concurrent
+    isolated and machine-wide collection cannot interleave.
+    """
+    key = str(home)
+    now = time.monotonic()
+    entry = _SCOPED_TOPOLOGY_CACHE
+    if entry["home"] == key and entry["data"] is not None and now - entry["ts"] < _SCOPED_TOPOLOGY_CACHE_TTL:
+        return entry["data"]
+    with _TOPOLOGY_CACHE_LOCK:
+        entry = _SCOPED_TOPOLOGY_CACHE
+        now = time.monotonic()
+        if entry["home"] == key and entry["data"] is not None and now - entry["ts"] < _SCOPED_TOPOLOGY_CACHE_TTL:
+            return entry["data"]
+        data = _collect_single_profile_gateway_topology(name, home)
+        _SCOPED_TOPOLOGY_CACHE["home"] = key
+        _SCOPED_TOPOLOGY_CACHE["data"] = data
+        _SCOPED_TOPOLOGY_CACHE["ts"] = now
+        return data
+
+
 # /api/status is polled ~1/s by the desktop app while it waits for the backend
 # (and again by the dashboard badge). Each uncached call above walks 7+ profile
 # homes (yaml.safe_load with the pure-Python loader + psutil process-table
@@ -3969,14 +4076,20 @@ async def get_status(profile: Optional[str] = None):
         # ``<profile>:<platform>`` grammar so fleet health sees them (OOF-3).
         # A ``?profile=`` request targets one profile's view and is left
         # unmerged.
-        topology = await run_in_threadpool(_collect_profile_gateway_topology_cached)
-        # Isolated backends: even with the pin above, the final response
-        # publishes topology["profiles"]/["gateway_mode"]/["gateways"]
-        # unconditionally, so narrow the collection itself to the pinned
-        # principal — an isolated server must never publish sibling profile
-        # names, gateway mode, or host ports from a plain no-query
-        # /api/status (reachable pre-auth via PUBLIC_API_PATHS, #76932-class).
-        topology = _scope_topology_for_isolated(topology)
+        if _is_isolated_server():
+            # Isolation invariant (#91381 re-review): an isolated principal
+            # must never exercise sibling read authority — not run the
+            # machine-wide collector and then redact. Use the scoped
+            # collector that reads ONLY the pinned profile's home, so the
+            # plain no-query /api/status (pre-auth via PUBLIC_API_PATHS,
+            # #76932-class) cannot enumerate sibling profile names, gateway
+            # mode, or host ports in the first place.
+            topology = await run_in_threadpool(
+                _collect_single_profile_gateway_topology_cached, pinned, scope
+            )
+        else:
+            topology = await run_in_threadpool(_collect_profile_gateway_topology_cached)
+            topology = _scope_topology_for_isolated(topology)
         if not requested_profile:
             gateway_platforms = _merge_profile_gateway_platforms(
                 gateway_platforms, topology.get("profile_platforms") or {}

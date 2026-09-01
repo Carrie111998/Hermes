@@ -868,38 +868,51 @@ class TestIsolatedAggregateScope:
         assert r.status_code == 403, r.text
         assert not any("bob" in p for p in opened), f"Bob's DB opened: {opened}"
 
-    def test_status_no_query_isolated_scopes_topology(self, tmp_path, monkeypatch):
-        """Unit-level witness for the post-collection scope filter: even when
-        the machine-wide topology collector runs, a plain no-query /api/status
-        on an isolated server must publish only the pinned profile's names,
-        ports, and platforms (#91381 review)."""
+    def test_status_no_query_isolated_uses_scoped_collector(self, tmp_path, monkeypatch):
+        """Unit-level witness for the isolation invariant (#91381 re-review,
+        P1): a plain no-query /api/status on an isolated server must NOT run
+        the machine-wide topology collector at all — it reads only the pinned
+        profile's home through the scoped collector. This test FAILS if
+        sibling topology I/O (the machine-wide cached collector) is invoked
+        for an isolated /api/status."""
         from hermes_cli import web_server
 
-        def _machine_wide_topology():
+        machine_wide_called = []
+
+        def _machine_wide_must_not_run():
+            machine_wide_called.append(True)
+            raise AssertionError(
+                "machine-wide topology collector invoked on isolated /api/status"
+            )
+
+        def _scoped(name, home):
             return {
-                "profiles": ["alice", "bob", "default"],
-                "gateway_mode": "multiple",
-                "gateways": [
-                    {"profile": "alice", "ports": [4000]},
-                    {"profile": "bob", "ports": [4001]},
-                    {"profile": "default", "ports": [4002]},
-                ],
-                "profile_platforms": {
-                    "alice": {"telegram": {"state": "connected"}},
-                    "bob": {"discord": {"state": "connected"}},
-                },
+                "profiles": [name],
+                "gateway_mode": "single",
+                "gateways": [{"profile": name, "ports": [4000]}],
+                "profile_platforms": {name: {"telegram": {"state": "connected"}}},
             }
+
+        monkeypatch.setattr(
+            web_server, "_collect_profile_gateway_topology_cached",
+            _machine_wide_must_not_run,
+        )
+        monkeypatch.setattr(
+            web_server, "_collect_single_profile_gateway_topology_cached", _scoped
+        )
 
         profiles_root = self._seed(tmp_path)
         alice = profiles_root / "alice"
-        monkeypatch.setattr(
-            web_server, "_collect_profile_gateway_topology", _machine_wide_topology
-        )
 
         with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
             r = c.get("/api/status")
 
         assert r.status_code == 200, r.text
+        # The machine-wide collector must never run on an isolated plain
+        # /api/status — that is the point of the scoped collector.
+        assert not machine_wide_called, (
+            "isolated /api/status must not enumerate sibling topology"
+        )
         body = r.json()
         # Only the pinned profile's name/ports/platforms surface.
         assert body["profiles"] == ["alice"], f"leaked: {body['profiles']}"
@@ -910,6 +923,42 @@ class TestIsolatedAggregateScope:
         ]
         assert not leaked_platforms, f"bob platforms leaked: {leaked_platforms}"
         assert "default" not in body["profiles"]
+
+    def test_status_isolated_scoped_collector_cached(self, tmp_path, monkeypatch):
+        """The isolated scoped topology collector is cached (TTL), so repeated
+        desktop polls don't re-walk the pinned profile home on every request
+        (#91381 re-review P2)."""
+        from hermes_cli import web_server
+
+        # Reset any scoped-cache entry a prior test may have left for this home.
+        web_server._SCOPED_TOPOLOGY_CACHE["home"] = None
+        web_server._SCOPED_TOPOLOGY_CACHE["data"] = None
+        web_server._SCOPED_TOPOLOGY_CACHE["ts"] = 0.0
+
+        calls = []
+
+        def _scoped(name, home):
+            calls.append(name)
+            return {
+                "profiles": [name],
+                "gateway_mode": "single",
+                "gateways": [{"profile": name, "ports": [4000]}],
+                "profile_platforms": {},
+            }
+
+        monkeypatch.setattr(
+            web_server, "_collect_single_profile_gateway_topology", _scoped
+        )
+
+        profiles_root = self._seed(tmp_path)
+        alice = profiles_root / "alice"
+
+        with self._client(monkeypatch, isolated=True, hermes_home=str(alice)) as c:
+            for _ in range(3):
+                r = c.get("/api/status")
+                assert r.status_code == 200, r.text
+
+        assert calls == ["alice"], f"scoped collector re-ran per poll: {calls}"
 
     def test_status_no_query_non_isolated_machine_wide(self, tmp_path, monkeypatch):
         """Control: with isolation off, plain /api/status keeps reporting the
