@@ -78,6 +78,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "max_retries": t.max_retries,
         "model_override": t.model_override,
         "provider_override": t.provider_override,
+        "task_contract": t.task_contract,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -431,6 +432,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           metavar="N", dest="goal_max_turns",
                           help="Turn budget for --goal workers (default 20). "
                                "Ignored without --goal.")
+    p_create.add_argument("--task-contract-json", default=None,
+                          help="JSON object with task capability/evidence contract. "
+                               "When the assignee profile enables "
+                               "profile_contract.enforce_task_contract, "
+                               "required_capabilities are checked before "
+                               "claim/spawn.")
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
@@ -1662,6 +1669,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    task_contract = None
+    if getattr(args, "task_contract_json", None):
+        try:
+            task_contract = json.loads(args.task_contract_json)
+        except json.JSONDecodeError as exc:
+            print(f"kanban: --task-contract-json: {exc}", file=sys.stderr)
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1686,6 +1700,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            task_contract=task_contract,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):

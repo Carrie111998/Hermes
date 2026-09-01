@@ -36,6 +36,7 @@ def _run_terminal(
     invoke_hook=_UNSET,
     approval=None,
     command="echo hello",
+    raw_output=False,
 ):
     mock_env = MagicMock()
     mock_env.execute.return_value = {"output": output, "returncode": returncode}
@@ -55,7 +56,9 @@ def _run_terminal(
     if invoke_hook is not _UNSET:
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
 
-    result = json.loads(terminal_tool_module.terminal_tool(command=command))
+    result = json.loads(
+        terminal_tool_module.terminal_tool(command=command, raw_output=raw_output)
+    )
     return result, mock_env
 
 
@@ -167,6 +170,64 @@ def test_terminal_output_transform_does_not_change_approval_or_exit_code_meaning
         "Command required approval (dangerous command) and was approved by the user."
     )
     assert result["exit_code_meaning"] == "No matches found (not an error)"
+
+
+def test_raw_output_bypasses_terminal_transform_for_reviewer_evidence(monkeypatch, tmp_path):
+    calls = []
+
+    result, _mock_env = _run_terminal(
+        monkeypatch,
+        tmp_path,
+        output="exact raw evidence",
+        raw_output=True,
+        invoke_hook=lambda hook_name, **kwargs: calls.append((hook_name, kwargs)) or [
+            "compressed"
+        ],
+    )
+
+    assert result["output"] == "exact raw evidence"
+    assert result["output_mode"] == "raw"
+    assert calls == []
+
+
+def test_profile_can_disable_raw_output_bypass(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: {"rtk": {"raw_bypass": False}}
+    )
+
+    result, _mock_env = _run_terminal(
+        monkeypatch,
+        tmp_path,
+        output="exact raw evidence",
+        raw_output=True,
+        invoke_hook=lambda hook_name, **kwargs: ["compressed"],
+    )
+
+    assert result["output"] == "compressed"
+    assert result["raw_bypass_denied"] is True
+    assert "output_mode" not in result
+
+
+def test_compressed_output_is_not_recorded_as_exact_verification_evidence(
+    monkeypatch, tmp_path
+):
+    recorded = []
+    monkeypatch.setattr(
+        "agent.verification_evidence.record_terminal_result",
+        lambda **kwargs: recorded.append(kwargs),
+    )
+
+    result, _mock_env = _run_terminal(
+        monkeypatch,
+        tmp_path,
+        output="raw failing diagnostic",
+        returncode=1,
+        command="python -m pytest tests/example.py",
+        invoke_hook=lambda hook_name, **kwargs: ["1 test failed"],
+    )
+
+    assert result["output"] == "1 test failed"
+    assert recorded[0]["output"] == "raw failing diagnostic"
 
 
 def test_terminal_output_transform_integration_with_real_plugin(monkeypatch, tmp_path):

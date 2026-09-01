@@ -2187,6 +2187,37 @@ DEFAULT_CONFIG = {
         # Set to true to restore delivery of child process notifications
         # (with subagent attribution lines).
         "surface_child_process_notifications": False,
+        # Optional third-party Delegate Skills adapters.  These are capability
+        # declarations only; Hermes must not expose a blanket adapter surface.
+        # Keep disabled until a canary profile explicitly enables one.
+        "adapters": {
+            "codex": {
+                "enabled": False,
+                "capability": "delegate.codex",
+            },
+            "claude": {
+                "enabled": False,
+                "capability": "delegate.claude",
+            },
+        },
+    },
+
+    # Optional Agent Reach public-source acquisition.  Canonical project
+    # connectors remain authoritative when present; Agent Reach is a read-only
+    # fallback with explicit provenance.  Social mutation is absent by default.
+    "agent_reach": {
+        "canonical_connectors_preferred": True,
+        "social_mutation_enabled": False,
+        "mutation_capabilities": [],
+        "sources": {
+            "web": {"enabled": False, "capability": "agent_reach.web.read"},
+            "youtube": {"enabled": False, "capability": "agent_reach.youtube.read"},
+            "rss": {"enabled": False, "capability": "agent_reach.rss.read"},
+            "github": {"enabled": False, "capability": "agent_reach.github.read"},
+            "reddit": {"enabled": False, "capability": "agent_reach.reddit.read"},
+            "x": {"enabled": False, "capability": "agent_reach.x.read"},
+            "linkedin": {"enabled": False, "capability": "agent_reach.linkedin.read"},
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -2265,6 +2296,39 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Optional Skill Retrieval integration. Profile-local and fail-closed: an
+    # installed package is not usable until this profile opts in and its prompt
+    # corpus regression passes. ``source.revision`` must be a reviewed release
+    # tag or full commit SHA; floating ``latest``/branch installs are rejected by
+    # the canary control plane.
+    "skill_retrieval": {
+        "enabled": False,
+        "plugin": "skill-retrieval",
+        "top_k": 8,
+        "source": {"repository": "moonlight-lupin/agent-skills", "revision": ""},
+        "regression": {
+            "status": "not_run",
+            "minimum_recall": 0.95,
+            "corpus": "",
+            "receipt": "",
+        },
+        "promotion": "canary",
+    },
+
+    # Optional RTK terminal-output compression. Routine filtering is off until
+    # a profile canary passes all required command classes. The explicit raw
+    # bypass remains on so reviewers can skip transform hooks for exact evidence;
+    # compressed output is never authoritative for source, diffs, or diagnostics.
+    "rtk": {
+        "enabled": False,
+        "plugin": "rtk-rewrite",
+        "routine_filter": False,
+        "raw_bypass": True,
+        "source": {"repository": "ogallotti/rtk-hermes", "revision": ""},
+        "regression": {"status": "not_run", "receipt": ""},
+        "promotion": "canary",
+    },
+
     # Skills — external skill directories for sharing skills across tools/agents.
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.
@@ -2337,6 +2401,86 @@ DEFAULT_CONFIG = {
         # and single-mutation `hermes curator rollback <entry-id>`.
         # Telemetry, never a gate: ledger failures cannot block a mutation.
         "ledger": True,
+    },
+
+    # Optional third-party extension inventory. Entries are metadata and
+    # health inputs only: Hermes does not download or activate these projects.
+    # A blank ref/version plus promotion.state=disabled is deliberately
+    # fail-closed until an operator records a reviewed pin and receipt.
+    "extensions": {
+        "schema_version": 1,
+        "registry": {
+            "planning-with-files": {
+                "repo": "https://github.com/OthmanAdi/planning-with-files",
+                "ref": "",
+                "version": "",
+                "scope": ["dispatcher", "worker", "reviewer"],
+                "capabilities": ["planning.files", "planning.resume"],
+                "promotion": {"state": "disabled", "canary_profiles": [], "review_receipt": ""},
+                "rollback": {"strategy": "disable", "preserve_data": True},
+            },
+            "delegate-skills": {
+                "repo": "https://github.com/amElnagdy/delegate-skills",
+                "ref": "",
+                "version": "",
+                "scope": ["dispatcher", "worker"],
+                "capabilities": ["delegate.codex", "delegate.claude"],
+                "promotion": {"state": "disabled", "canary_profiles": [], "review_receipt": ""},
+                "rollback": {"strategy": "disable", "preserve_data": True},
+            },
+            "rtk": {
+                "repo": "https://github.com/rtk-ai/rtk",
+                "ref": "",
+                "version": "",
+                "scope": ["worker"],
+                "capabilities": ["terminal.compressed", "terminal.raw"],
+                "promotion": {"state": "disabled", "canary_profiles": [], "review_receipt": ""},
+                "rollback": {"strategy": "disable", "preserve_data": True},
+            },
+            "mantis": {
+                "repo": "https://github.com/google/mantis",
+                "ref": "",
+                "version": "",
+                "scope": ["isolated-security-runner"],
+                "capabilities": ["security.analyze", "runtime.isolated"],
+                "promotion": {"state": "disabled", "canary_profiles": [], "review_receipt": ""},
+                "rollback": {"strategy": "disable", "preserve_data": True},
+            },
+            "agent-reach": {
+                "repo": "https://github.com/Panniantong/Agent-Reach",
+                "ref": "",
+                "version": "",
+                "scope": ["research-canary"],
+                "capabilities": ["research.public-read", "research.source-health"],
+                "promotion": {"state": "disabled", "canary_profiles": [], "review_receipt": ""},
+                "rollback": {"strategy": "disable", "preserve_data": True},
+            },
+            "skill-retrieval": {
+                "repo": "https://github.com/moonlight-lupin/agent-skills",
+                "ref": "",
+                "version": "",
+                "scope": ["canary-profile"],
+                "capabilities": ["skills.retrieve", "skills.index"],
+                "promotion": {"state": "disabled", "canary_profiles": [], "review_receipt": ""},
+                "rollback": {"strategy": "disable", "preserve_data": True},
+            },
+        },
+        # Runtime integrations update these read-only diagnostic inputs. Empty
+        # values are reported as unconfigured rather than guessed or probed
+        # over the network by `hermes doctor`.
+        "health": {
+            "omh": {"command": "omh"},
+            "skill_retrieval": {"index_path": "", "top_k": 8},
+            "rtk": {"command": "rtk", "raw_bypass": True},
+            "planning_files": {"current_plan": ""},
+            "planning_plane": {"status": "unconfigured", "projection_hash": ""},
+            "delegate": {"adapters": []},
+            "agent_reach": {"command": "agent-reach", "doctor_status": "unconfigured", "sources": {}},
+            "mantis": {"command": "mantis", "isolation_ready": False},
+            "profile_capabilities": {"expected": [], "actual": []},
+            "reviewer_raw_evidence": {"capability": "terminal.raw", "available": True},
+            "production_cron_requires_extensions": False,
+        },
     },
 
     # Curator — background skill maintenance.
@@ -2630,6 +2774,49 @@ DEFAULT_CONFIG = {
     "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only)
     "quick_commands": {},
+
+    # Profile/task route-compatibility contract. Profiles opt into dispatch
+    # preflight by setting enforce_task_contract true and listing typed
+    # capabilities they can safely satisfy. The Kanban dispatcher compares these
+    # against task_contract.required_capabilities before claim/spawn.
+    "profile_contract": {
+        "enforce_task_contract": False,
+        "capabilities": [],
+        "capability_catalog": [
+            "planning_files",
+            "plane_projection",
+            "skill_retrieval",
+            "rtk",
+            "delegate",
+            "agent_reach",
+            "mantis",
+            "isolated_runtime",
+            "production_credentials",
+            "internal_network",
+        ],
+    },
+
+    # State-authority v2: no single system is the universal source of truth.
+    # Planning files are the canonical agent working state; Plane is a concise
+    # human-visible project projection; Kanban is execution/review ledger;
+    # receipts/raw readbacks are execution proof; OMH Memory is reviewed durable
+    # knowledge only. BAU cron stays outside Planning Files unless it creates a
+    # material project blocker/incident/change request/owner decision.
+    "state_authority": {
+        "version": 2,
+        "omh_workflow": "workflow_executor_authority",
+        "planning_files": "canonical_agent_working_state",
+        "plane": "human_visible_project_projection",
+        "kanban": "execution_dispatch_review_ledger",
+        "receipts_raw_readbacks": "execution_proof_authority",
+        "omh_memory": "reviewed_durable_knowledge_only",
+        "production_cron_requires_planning_files": False,
+        "bau_plane_boundary": (
+            "Plane is for durable project/client/new-development state, not "
+            "ordinary BAU recurring operations unless a material blocker, "
+            "incident, change request, or owner planning decision appears."
+        ),
+    },
 
     # Per-platform system-prompt hint overrides. Lets an admin append to or
     # replace Hermes' built-in platform hint for a single messaging platform
@@ -2953,6 +3140,19 @@ DEFAULT_CONFIG = {
         # 'target_busy' error. Deliveries are serialized per profile with a
         # cross-process file lock so two turns never race one Bot Chat.
         "turn_wait_seconds": 120,
+    },
+
+    # Mantis security-analysis runner. Disabled and capability-empty by
+    # default. Executable stages (reproduce/patch) additionally require all
+    # three isolation assertions to be explicit; missing values fail closed.
+    "mantis": {
+        "enabled": False,
+        "capabilities": [],
+        "isolated_runtime": False,
+        # None means "not asserted" and fails executable-stage health.
+        # An isolated security profile must set both values explicitly false.
+        "production_credentials": None,
+        "internal_network": None,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

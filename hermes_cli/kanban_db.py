@@ -134,6 +134,164 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+STATE_AUTHORITY_CONTRACT_V2 = {
+    "omh_workflow": "workflow_executor_authority",
+    "planning_files": "canonical_agent_working_state",
+    "plane": "human_visible_project_projection",
+    "kanban": "execution_dispatch_review_ledger",
+    "receipts_raw_readbacks": "execution_proof_authority",
+    "omh_memory": "reviewed_durable_knowledge_only",
+    "bau_boundary": (
+        "Plane is for durable project/client/new-development state, not "
+        "ordinary BAU recurring operations unless a material blocker, incident, "
+        "change request, or owner planning decision appears."
+    ),
+}
+
+EXTENSION_CAPABILITIES = frozenset({
+    "planning_files",
+    "plane_projection",
+    "skill_retrieval",
+    "rtk",
+    "delegate",
+    "agent_reach",
+    "mantis",
+    "isolated_runtime",
+    "production_credentials",
+    "internal_network",
+})
+
+
+def _normalise_capability_id(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _normalise_string_list(value: Any, *, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        raise ValueError(f"{field_name} must be a string or list of strings")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        normalised = _normalise_capability_id(item)
+        if not normalised or normalised in seen:
+            continue
+        seen.add(normalised)
+        cleaned.append(normalised)
+    return cleaned
+
+
+def normalize_task_contract(contract: Optional[Any]) -> Optional[dict[str, Any]]:
+    """Validate and canonicalise a task compatibility contract.
+
+    The manifest is intentionally permissive for forward-compatibility, but the
+    compatibility fields used by the dispatcher are normalised so profiles can
+    reliably compare typed capability ids regardless of hyphen/underscore/case.
+    """
+    if contract is None or contract == "":
+        return None
+    if isinstance(contract, str):
+        try:
+            contract = json.loads(contract)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"task_contract must be JSON object: {exc}") from exc
+    if not isinstance(contract, Mapping):
+        raise ValueError("task_contract must be a JSON object")
+    normalised = dict(contract)
+    for key in (
+        "required_capabilities",
+        "allowed_actions",
+        "forbidden_actions",
+        "required_evidence",
+        "hard_stop_conditions",
+        "recoverable_conditions",
+    ):
+        if key in normalised:
+            normalised[key] = _normalise_string_list(normalised[key], field_name=key)
+    return normalised
+
+
+def _parse_task_contract(raw: Any) -> Optional[dict[str, Any]]:
+    if not raw:
+        return None
+    try:
+        return normalize_task_contract(raw)
+    except ValueError:
+        return None
+
+
+def _profile_contract_for_assignee(assignee: Optional[str]) -> dict[str, Any]:
+    """Load the assignee profile's route-compatibility declaration.
+
+    Missing config is non-enforcing for backward compatibility. Profiles opt in
+    by setting ``profile_contract.enforce_task_contract: true`` and listing
+    typed ``capabilities`` in their config.yaml.
+    """
+    if not assignee:
+        return {"enforce_task_contract": False, "capabilities": []}
+    try:
+        from hermes_cli.profiles import resolve_profile_env
+        import yaml
+
+        cfg_path = Path(resolve_profile_env(assignee)) / "config.yaml"
+        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+    except Exception:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raw = {}
+    contract = raw.get("profile_contract") or {}
+    if not isinstance(contract, Mapping):
+        contract = {}
+    return {
+        "enforce_task_contract": bool(contract.get("enforce_task_contract", False)),
+        "capabilities": _normalise_string_list(
+            contract.get("capabilities"), field_name="profile_contract.capabilities"
+        ),
+    }
+
+
+def task_contract_incompatibility(
+    task_contract: Optional[Mapping[str, Any]], assignee: Optional[str]
+) -> Optional[dict[str, Any]]:
+    contract = normalize_task_contract(task_contract) if task_contract else None
+    if not contract:
+        return None
+    profile_contract = _profile_contract_for_assignee(assignee)
+    if not profile_contract.get("enforce_task_contract"):
+        return None
+    required = set(contract.get("required_capabilities") or [])
+    available = set(profile_contract.get("capabilities") or [])
+    missing = sorted(required - available)
+    if not missing:
+        return None
+    return {
+        "reason": "missing_required_capabilities",
+        "assignee": assignee,
+        "missing_capabilities": missing,
+        "required_capabilities": sorted(required),
+        "available_capabilities": sorted(available),
+    }
+
+
+def _block_task_contract_incompatible(
+    conn: sqlite3.Connection,
+    task_id: str,
+    detail: Mapping[str, Any],
+) -> None:
+    missing = ", ".join(detail.get("missing_capabilities") or [])
+    error = f"task_contract incompatible: missing required capabilities: {missing}"
+    conn.execute(
+        "UPDATE tasks SET status = 'blocked', last_failure_error = ?, "
+        "block_kind = 'capability' WHERE id = ? AND status IN ('ready', 'review')",
+        (error[:500], task_id),
+    )
+    payload = dict(detail)
+    payload["error"] = error
+    _append_event(conn, task_id, "contract_rejected", payload)
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -1141,6 +1299,14 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Optional machine-readable capability/evidence/route compatibility
+    # manifest. The dispatcher validates required_capabilities against the
+    # assignee profile before claim/spawn when that profile opts into contract
+    # enforcement.
+    task_contract: Optional[dict[str, Any]] = None
+    # Optional first-class Mantis stage. Routing metadata is kept separate
+    # from ``skills`` so it is never force-loaded into the worker.
+    mantis_capability: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1400,14 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            task_contract=(
+                _parse_task_contract(row["task_contract"])
+                if "task_contract" in keys and row["task_contract"]
+                else None
+            ),
+            mantis_capability=(
+                row["mantis_capability"] if "mantis_capability" in keys else None
             ),
         )
 
@@ -1422,7 +1596,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Optional capability/safety/evidence contract for this task. JSON object;
+    -- the dispatcher treats required_capabilities as a typed pre-claim gate
+    -- when the assignee profile enables profile_contract.enforce_task_contract.
+    task_contract        TEXT,
+    -- First-class Mantis stage. NULL means an ordinary task.
+    mantis_capability    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2689,6 +2869,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "mantis_capability" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "mantis_capability", "mantis_capability TEXT"
+        )
+
+    if "task_contract" not in cols:
+        # Optional JSON contract for route/capability/evidence requirements.
+        # Existing tasks keep NULL, preserving dispatch behavior until a task
+        # explicitly opts into contract checks and its profile enforces them.
+        _add_column_if_missing(conn, "tasks", "task_contract", "task_contract TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -3191,9 +3381,11 @@ def create_task(
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
+    task_contract: Optional[Mapping[str, Any]] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    mantis_capability: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3237,8 +3429,17 @@ def create_task(
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
+    task_contract = normalize_task_contract(task_contract)
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
+    if mantis_capability is not None:
+        from hermes_cli.mantis_security import MANTIS_CAPABILITIES
+
+        mantis_capability = str(mantis_capability).strip() or None
+        if mantis_capability not in MANTIS_CAPABILITIES:
+            raise ValueError(
+                f"mantis_capability must be one of {list(MANTIS_CAPABILITIES)}"
+            )
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -3508,8 +3709,9 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, task_contract,
+                        mantis_capability
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3535,6 +3737,8 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        json.dumps(task_contract, sort_keys=True) if task_contract else None,
+                        mantis_capability,
                     ),
                 )
                 for pid in parents:
@@ -3563,6 +3767,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "task_contract": task_contract,
+                        "mantis_capability": mantis_capability,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4625,6 +4831,44 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _reject_unsafe_mantis_task(
+    conn: sqlite3.Connection,
+    task: Optional[Task],
+    *,
+    stage: str,
+) -> bool:
+    """Block a Mantis task when its assigned profile fails health checks."""
+    if task is None:
+        return False
+    from hermes_cli.mantis_security import task_mantis_health
+
+    try:
+        health = task_mantis_health(task.mantis_capability, task.assignee)
+    except (TypeError, ValueError) as exc:
+        capability = "invalid"
+        blockers = (str(exc),)
+    else:
+        if health is None or health.ready:
+            return False
+        capability = health.capability
+        blockers = health.blockers
+    reason = f"Mantis {capability} blocked: " + "; ".join(blockers)
+    if not block_task(conn, task.id, reason=reason, kind="capability"):
+        return False
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task.id,
+            "mantis_isolation_rejected",
+            {
+                "capability": capability,
+                "stage": stage,
+                "blockers": list(blockers),
+            },
+        )
+    return True
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4637,6 +4881,8 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    if _reject_unsafe_mantis_task(conn, get_task(conn, task_id), stage="claim"):
+        return None
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -4666,6 +4912,18 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        contract_row = conn.execute(
+            "SELECT assignee, task_contract FROM tasks WHERE id = ? AND status = 'ready'",
+            (task_id,),
+        ).fetchone()
+        if contract_row is not None:
+            incompat = task_contract_incompatibility(
+                _parse_task_contract(contract_row["task_contract"]),
+                contract_row["assignee"],
+            )
+            if incompat is not None:
+                _block_task_contract_incompatible(conn, task_id, incompat)
+                return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -4786,6 +5044,18 @@ def claim_review_task(
                     },
                 )
             return None
+        contract_row = conn.execute(
+            "SELECT assignee, task_contract FROM tasks WHERE id = ? AND status = 'review'",
+            (task_id,),
+        ).fetchone()
+        if contract_row is not None:
+            incompat = task_contract_incompatibility(
+                _parse_task_contract(contract_row["task_contract"]),
+                contract_row["assignee"],
+            )
+            if incompat is not None:
+                _block_task_contract_incompatible(conn, task_id, incompat)
+                return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -10240,6 +10510,12 @@ def _dispatch_once_locked(
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            continue
+        # Re-check immediately before any workspace or process execution.
+        # This closes the claim→spawn window if the profile config changed
+        # after the claim-time check.
+        if _reject_unsafe_mantis_task(conn, claimed, stage="execute"):
+            result.auto_blocked.append(claimed.id)
             continue
         try:
             resolved_branch_name = None

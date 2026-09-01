@@ -162,6 +162,33 @@ def show_status(args):
     print(f"  Model:        {_configured_model_label(config)}")
     print(f"  Provider:     {_effective_provider_label()}")
 
+    # Optional extensions are reported as lifecycle states rather than a
+    # misleading enabled/disabled boolean. Manifest inspection is import-free:
+    # status must never execute unreviewed third-party plugin code.
+    print()
+    print(color("◆ Extension Canaries", Colors.CYAN, Colors.BOLD))
+    try:
+        from hermes_cli.extension_canaries import extension_health
+
+        extension_states = extension_health(config)
+        retrieval_cfg = config.get("skill_retrieval", {})
+        rtk_cfg = config.get("rtk", {})
+        top_k = retrieval_cfg.get("top_k", 8) if isinstance(retrieval_cfg, dict) else 8
+        raw_bypass = (
+            rtk_cfg.get("raw_bypass") is True if isinstance(rtk_cfg, dict) else False
+        )
+        print(
+            f"  Skill Retrieval: {extension_states['skill_retrieval']} "
+            f"(top-K: {top_k})"
+        )
+        print(
+            f"  RTK:             {extension_states['rtk']} "
+            f"(reviewer raw bypass: {'available' if raw_bypass else 'disabled'})"
+        )
+        print("  Evidence:        compressed output is non-authoritative")
+    except Exception:
+        print("  Status:          unavailable")
+
     # =========================================================================
     # API Keys
     # =========================================================================

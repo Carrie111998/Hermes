@@ -2828,6 +2828,7 @@ def terminal_tool(
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
     _host_local: bool = False,
+    raw_output: bool = False,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -2843,6 +2844,8 @@ def terminal_tool(
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
         notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row — or after a small lifetime cap of delivered matches, however cleanly spaced — watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
+        raw_output: Skip terminal-output transform hooks for reviewer evidence.
+            Capture bounds, ANSI stripping, and secret redaction still apply.
 
     Returns:
         str: JSON string with output, exit_code, and error fields
@@ -3652,6 +3655,11 @@ def terminal_tool(
 
             # Extract output
             output = result.get("output", "")
+            # Preserve the bounded process readback before any plugin may
+            # compress or canonicalize it. Verification classification below
+            # uses this copy (after the normal ANSI/redaction pass), because a
+            # transformed summary is useful display but never exact evidence.
+            evidence_output = output
             returncode = result.get("returncode", 0)
             # Spill metadata from the bounded collector: present only when
             # output overflowed the capture window (see _wait_for_process).
@@ -3682,22 +3690,35 @@ def terminal_tool(
             # run. Plugins may replace that bounded string; replacements are
             # still subject to the final output limit below.
             # The hook is fail-open, and the first valid string return wins.
-            try:
-                from hermes_cli.lifecycle import invoke_hook
-                hook_results = invoke_hook(
-                    "transform_terminal_output",
-                    command=command,
-                    output=output,
-                    returncode=returncode,
-                    task_id=effective_task_id or "",
-                    env_type=env_type,
-                )
-                for hook_result in hook_results:
-                    if isinstance(hook_result, str):
-                        output = hook_result
-                        break
-            except Exception:
-                pass
+            raw_bypass = False
+            if raw_output:
+                try:
+                    from hermes_cli.config import cfg_get, load_config
+
+                    raw_bypass = cfg_get(
+                        load_config(), "rtk", "raw_bypass", default=True
+                    ) is True
+                except Exception:
+                    # Config load failures must not erase the reviewer escape
+                    # hatch; DEFAULT_CONFIG keeps this profile setting on.
+                    raw_bypass = True
+            if not raw_bypass:
+                try:
+                    from hermes_cli.lifecycle import invoke_hook
+                    hook_results = invoke_hook(
+                        "transform_terminal_output",
+                        command=command,
+                        output=output,
+                        returncode=returncode,
+                        task_id=effective_task_id or "",
+                        env_type=env_type,
+                    )
+                    for hook_result in hook_results:
+                        if isinstance(hook_result, str):
+                            output = hook_result
+                            break
+                except Exception:
+                    pass
             
             # Truncate output if too long, keeping both head and tail
             from tools.tool_output_limits import get_max_bytes
@@ -3764,6 +3785,10 @@ def terminal_tool(
                 "exit_code": returncode,
                 "error": None,
             }
+            if raw_bypass:
+                result_dict["output_mode"] = "raw"
+            elif raw_output:
+                result_dict["raw_bypass_denied"] = True
             # cwd echo: when the command changed the session's working
             # directory (cd, pushd, ...), tell the model where it ended up.
             # Production mining shows 60% of terminal calls carry a
@@ -3825,7 +3850,13 @@ def terminal_tool(
                     cwd=command_cwd,
                     session_id=session_id or task_id or effective_task_id or "default",
                     exit_code=returncode,
-                    output=output,
+                    output=(
+                        redact_terminal_output(
+                            strip_ansi(evidence_output).strip(), command
+                        )
+                        if evidence_output
+                        else ""
+                    ),
                 )
                 if evidence:
                     result_dict["verification_evidence"] = {
@@ -4143,6 +4174,16 @@ TERMINAL_SCHEMA = {
                     {"type": "boolean"},
                     {"type": "array", "items": {"type": "string"}}
                 ]
+            },
+            "watch_patterns": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Strings to watch for in background output. ONLY for rare, one-shot mid-process signals on long-lived processes (e.g. ['Application startup complete'] on a server). NOT for end-of-run markers (use notify_on_complete) and NOT for per-iteration patterns like 'ERROR' in loops — rate-limited to 1 notification/15s; repeated over-firing auto-disables it and falls back to notify-on-exit. When in doubt, use notify_on_complete. MUTUALLY EXCLUSIVE with notify_on_complete."
+            },
+            "raw_output": {
+                "type": "boolean",
+                "description": "Skip terminal-output transform/compression hooks for reviewer evidence. Capture bounds, ANSI stripping, and secret redaction still apply. Requires rtk.raw_bypass=true (default).",
+                "default": False
             }
             # Legacy aliases (unadvertised, still accepted): notify_on_complete
             # (bool) and watch_patterns (list). notify=true|[...] maps onto
@@ -4209,6 +4250,7 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=notify_on_complete,
         watch_patterns=watch_patterns,
+        raw_output=args.get("raw_output", False),
     )
 
 

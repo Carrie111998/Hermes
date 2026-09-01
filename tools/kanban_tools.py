@@ -503,6 +503,8 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "task_contract": task.task_contract,
+        "mantis_capability": task.mantis_capability,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -549,6 +551,8 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "task_contract": t.task_contract,
+                    "mantis_capability": t.mantis_capability,
                 }
 
             def _run_dict(r):
@@ -1375,6 +1379,7 @@ def _handle_create(args: dict, **kw) -> str:
         or _current_origin_session_id()
         or os.environ.get("HERMES_SESSION_ID")
     )
+    task_contract = args.get("task_contract")
     priority = args.get("priority")
     # Resolve workspace. Workspace sharing is always explicit: omitted fields
     # mean a fresh scratch workspace, even when a dispatcher-spawned worker
@@ -1411,6 +1416,7 @@ def _handle_create(args: dict, **kw) -> str:
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
+    mantis_capability = args.get("mantis_capability")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
@@ -1454,6 +1460,7 @@ def _handle_create(args: dict, **kw) -> str:
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
+                mantis_capability=mantis_capability,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -1461,6 +1468,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                task_contract=task_contract,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1470,6 +1478,9 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
+                mantis_capability=(
+                    new_task.mantis_capability if new_task else None
+                ),
                 subscribed=subscribed,
             )
         finally:
@@ -2301,6 +2312,38 @@ KANBAN_CREATE_SCHEMA = {
                     "provider — a model name alone is resolved against "
                     "the profile's provider and will fail if it belongs "
                     "to a different one. Requires 'model'."
+                ),
+            },
+            "task_contract": {
+                "type": "object",
+                "description": (
+                    "Optional machine-readable capability/acceptance manifest. "
+                    "When the assignee profile enables route-compatibility "
+                    "checks, the dispatcher validates required_capabilities "
+                    "before claim/spawn. Include explicit fields for "
+                    "required_capabilities, allowed_actions, forbidden_actions, "
+                    "required_evidence, safety_acceptance, outcome_acceptance, "
+                    "recoverable_conditions, hard_stop_conditions, "
+                    "evidence_hierarchy, status_fields (prepared, implemented, "
+                    "verified, reviewed, ci_pr_merge_observed, production_executed, "
+                    "business_outcome, gaps), and "
+                    "plane_for_bau_process_tracking=false for ordinary BAU runs."
+                ),
+            },
+            "mantis_capability": {
+                "type": "string",
+                "enum": [
+                    "architecture",
+                    "threat_model",
+                    "research",
+                    "review",
+                    "reproduce",
+                    "patch",
+                ],
+                "description": (
+                    "Optional Mantis security-analysis stage. Reproduce and "
+                    "patch tasks dispatch only to profiles whose Mantis "
+                    "isolation health assertions pass."
                 ),
             },
             "board": _board_schema_prop(),

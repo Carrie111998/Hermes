@@ -1231,6 +1231,22 @@ def check_macos_full_disk_access() -> None:
         "and restart them once. With Hermes' stable signing identities the "
         "grant survives every update."
     )
+def _report_extension_health(config=None, hermes_home: Path | None = None) -> None:
+    """Render optional extension state without turning absence into failure."""
+    from hermes_cli.extension_health import collect_extension_health
+
+    if config is None:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    home = hermes_home if hermes_home is not None else HERMES_HOME
+    for row in collect_extension_health(config, hermes_home=home):
+        if row.status == "ok":
+            check_ok(row.label, row.detail)
+        elif row.status == "info":
+            check_info(f"{row.label}: {row.detail}")
+        else:
+            check_warn(row.label, row.detail)
 
 
 def run_doctor(args):
@@ -3200,6 +3216,13 @@ def run_doctor(args):
             issues.append("Run 'hermes setup' to configure missing API keys for full tool access")
     except Exception as e:
         check_warn("Could not check tool availability", f"({e})")
+
+    _section("Extension Health")
+    try:
+        _report_extension_health()
+    except Exception as e:
+        # Third-party diagnostics are optional and must never make doctor fail.
+        check_warn("Could not check extension health", f"({e})")
     
     _section("Skills Hub")
     hub_dir = HERMES_HOME / "skills" / ".hub"
