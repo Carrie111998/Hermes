@@ -4133,14 +4133,21 @@ def compress_context(
         ):
             messages[:] = copy.deepcopy(messages_before_compression)
         # Record after restore so rollback cannot wipe a stall backoff, and
-        # while the lease is still held so the next turn cannot race it.
-        _stall_backoff = _record_stall_interrupted_backoff(
-            agent,
-            commit_fence=commit_fence,
-            started_at=_attempt_started_at,
-            messages=messages,
-            approx_tokens=approx_tokens,
+        # while the lease is still held so the next turn cannot race it. A
+        # detached primary that has been superseded by the local fallback must
+        # not publish another cooldown onto the successor-owned compressor.
+        _attempt_still_current = _compressor_attempt_is_current(
+            agent.context_compressor, _attempt_generation
         )
+        _stall_backoff = False
+        if _attempt_still_current:
+            _stall_backoff = _record_stall_interrupted_backoff(
+                agent,
+                commit_fence=commit_fence,
+                started_at=_attempt_started_at,
+                messages=messages,
+                approx_tokens=approx_tokens,
+            )
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression cancelled")
             _activity_heartbeat = None

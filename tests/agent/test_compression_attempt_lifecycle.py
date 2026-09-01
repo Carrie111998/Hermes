@@ -68,6 +68,86 @@ def _messages():
 
 
 class TestWorkerTeardownOnCeiling:
+    def test_late_production_worker_cannot_republish_stall_backoff(
+        self, tmp_path: Path
+    ):
+        _db, agent = _build_agent(tmp_path, "STATIC_PRODUCTION_OVERLAP")
+        # Exercise the production compress_context ownership/cancellation path
+        # without the durable lease obscuring the shared-compressor race.
+        agent._session_db = None
+        compressor = agent.context_compressor
+        compressor.summary_model = "test/summary-model"
+        compressor._summary_model_fallen_back = False
+        original = [
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"message {i}: " + ("context " * 300),
+            }
+            for i in range(20)
+        ]
+        remote_started = threading.Event()
+        release_remote = threading.Event()
+        remote_finished = threading.Event()
+        successor_claimed = threading.Event()
+        llm_calls: list[str] = []
+
+        def blocked_summary(**_kwargs):
+            llm_calls.append("summary")
+            remote_started.set()
+            assert release_remote.wait(timeout=10)
+            raise RuntimeError("late provider failure")
+
+        def release_after_successor_claims_compressor():
+            assert remote_started.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if getattr(compressor, "_compression_attempt_generation", 0) >= 2:
+                    successor_claimed.set()
+                    release_remote.set()
+                    return
+                time.sleep(0.01)
+            release_remote.set()
+
+        releaser = threading.Thread(
+            target=release_after_successor_claims_compressor,
+            name="release-stale-compressor",
+            daemon=True,
+        )
+        releaser.start()
+
+        def worker(fence: CompressionCommitFence):
+            try:
+                return compress_context(
+                    agent,
+                    copy.deepcopy(original),
+                    "sys",
+                    approx_tokens=500_000,
+                    commit_fence=fence,
+                )
+            finally:
+                remote_finished.set()
+
+        with patch("agent.context_compressor.call_llm", side_effect=blocked_summary):
+            result, _prompt = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=1.0,
+                total_ceiling_seconds=4.0,
+                telemetry_agent=agent,
+            )
+            assert remote_started.is_set()
+            assert successor_claimed.wait(timeout=1)
+            assert remote_finished.wait(timeout=2)
+
+        releaser.join(timeout=1)
+        assert not releaser.is_alive()
+        assert result != original
+        assert llm_calls == ["summary"]
+        assert compressor._consecutive_timeout_failures == 1
+        assert "local fallback after summary" in (compressor._last_summary_error or "")
+        assert compressor._summary_failure_cooldown_until > time.monotonic()
+
     def test_cooperative_worker_joined_within_grace(self):
         """A worker that exits promptly after cancel is joined on the
         total-ceiling path; the lease is released normally (no retention) —
