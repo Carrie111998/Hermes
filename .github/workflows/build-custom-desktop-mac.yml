@@ -48,6 +48,15 @@ jobs:
           lipo -archs "$PTY" | grep -F "${{ matrix.arch }}"
           codesign --force --deep --sign - "$APP_DIR"
           codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+          "$APP_DIR/Contents/MacOS/Hermes" --disable-gpu > /tmp/hermes-smoke.log 2>&1 &
+          APP_PID=$!
+          sleep 15
+          if ! kill -0 "$APP_PID" 2>/dev/null; then
+            cat /tmp/hermes-smoke.log
+            exit 1
+          fi
+          kill "$APP_PID" || true
+          wait "$APP_PID" || true
           rm -f release/*.zip
           ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "release/Hermes-Voice-Agent-0.17.0-mac-${{ matrix.arch }}-adhoc.zip"
       - uses: actions/upload-artifact@v4
