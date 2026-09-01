@@ -19,7 +19,6 @@ import dns from 'node:dns'
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { imageMime, toDataUrl } from './favicon'
 import {
   fetchWithGuardedRedirects,
   HostRateLimiter,

@@ -389,8 +389,8 @@ describe('resolveLinkPreview', () => {
   })
 
   test('og:image thumbnail is fetched main-process-side and returned as a data URL', async () => {
-    // 1x1 PNG so the sniff accepts the bytes.
-    const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a49444154789c6300010000050001od', 'hex').subarray(0, 68)
+    // A minimal PNG-shaped header so the data URL is plainly an image.
+    const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489', 'hex')
     const dataUrl = `data:image/png;base64,${PNG.toString('base64')}`
     const io = fakeIo({
       html: '<meta property="og:title" content="Hello"><meta property="og:image" content="https://cdn.example.com/pic.png">',

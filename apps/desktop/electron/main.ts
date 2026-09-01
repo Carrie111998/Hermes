@@ -1,6 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process'
 import crypto from 'node:crypto'
-import dns from 'node:dns'
 import fs from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'

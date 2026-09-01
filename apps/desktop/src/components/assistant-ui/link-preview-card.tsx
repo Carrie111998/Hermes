@@ -16,6 +16,8 @@ export interface LinkPreviewMeta {
   title: string
   description: string
   imageUrl: string
+  /** Thumbnail as a main-process-validated data URL ('' when unprovable). */
+  image: string
   fetchedAt: number
 }
 
@@ -116,18 +118,23 @@ function LinkPreviewBody({ meta }: { meta: LinkPreviewMeta }) {
 
   return (
     <span className="mt-2 block">
-      {meta.imageUrl && (
+      {/*
+        The thumbnail is a data URL fetched and validated by the main process
+        (same per-hop SSRF admission as the page itself). The renderer NEVER
+        GETs meta.imageUrl — an <img src> to a private/redirecting address
+        would bypass every guard the main process applies.
+      */}
+      {meta.image && (
         <img
           alt=""
           className="mb-2 max-h-48 rounded-lg border border-(--ui-stroke-tertiary) object-cover"
           loading="lazy"
-          referrerPolicy="no-referrer"
-          src={meta.imageUrl}
+          src={meta.image}
         />
       )}
       {meta.title && <span className="mb-0.5 block font-medium text-foreground">{meta.title}</span>}
       {meta.description && <span className="block text-xs leading-5 text-muted-foreground">{meta.description}</span>}
-      {!meta.title && !meta.description && !meta.imageUrl && (
+      {!meta.title && !meta.description && !meta.image && (
         <span className="block text-xs text-muted-foreground">{t.assistant.thread.linkPreviewUnavailable}</span>
       )}
     </span>
