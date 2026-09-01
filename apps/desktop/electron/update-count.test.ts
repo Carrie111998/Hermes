@@ -9,10 +9,10 @@ import { test } from 'vitest'
 import {
   compareApiUrl,
   parseCompareBehindCount,
-  resolveBehindCount,
   resolveAncestry,
-  resolveSshBehindCount,
+  resolveBehindCount,
   resolveCommitLogSelection,
+  resolveSshBehindCount,
   shouldCountCommits
 } from './update-count'
 

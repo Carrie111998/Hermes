@@ -367,9 +367,9 @@ import {
 import {
   compareApiUrl,
   parseCompareBehindCount,
+  resolveAncestry,
   resolveBehindCount,
   resolveCommitLogSelection,
-  resolveAncestry,
   resolveSshBehindCount,
   shouldCountCommits
 } from './update-count'
@@ -3030,10 +3030,16 @@ async function checkUpdates() {
 
   // A positive directional ancestry result remains trustworthy in a shallow
   // graph and prevents a local commit on top of origin from looking outdated.
-  const targetIsAncestorOfHead =
-    isShallow &&
-    currentSha !== targetSha &&
-    (await runGit(['merge-base', '--is-ancestor', `origin/${branch}`, 'HEAD'], { cwd: updateRoot })).code === 0
+  // Keep execution failures distinct from a valid non-ancestor result, as in
+  // the passive SSH path above.
+  const targetIsAncestorOfHead = isShallow
+    ? await resolveAncestry({
+        currentSha,
+        runGit: (args: string[]) => runGit(args, { cwd: updateRoot }),
+        targetSha,
+        tipsEqual: currentSha === targetSha
+      })
+    : false
 
   let behind = resolveBehindCount({
     countStr,
