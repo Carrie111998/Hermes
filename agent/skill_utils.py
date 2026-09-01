@@ -706,10 +706,12 @@ def get_all_skills_dirs() -> List[Path]:
 # and Codex (.codex/skills/, .agents/skills/) do: a project checkout can carry
 # its own skills, active only for sessions started inside that project.
 #
-# Two candidate roots at the project root (found by walking up from cwd to the
+# Candidate roots at the project root (found by walking up from cwd to the
 # first directory containing ``.git``):
 #   <root>/.hermes/skills/   — Hermes-native location
 #   <root>/.agents/skills/   — cross-tool convention shared with other harnesses
+#   <root>/.codex/skills/    — Codex project-local location
+#   <root>/.claude/skills/   — Claude project-local location
 #
 # TRUST GATE: unlike AGENTS.md (plain instruction text), skills are load-on-
 # demand procedure documents an agent will follow — auto-sourcing them from any
@@ -733,6 +735,8 @@ def get_all_skills_dirs() -> List[Path]:
 PROJECT_SKILLS_SUBDIRS = (
     os.path.join(".hermes", "skills"),
     os.path.join(".agents", "skills"),
+    os.path.join(".codex", "skills"),
+    os.path.join(".claude", "skills"),
 )
 
 # Walk-up bound: don't scan the whole filesystem on pathological cwds.
@@ -991,15 +995,12 @@ def normalize_skill_lookup_name(identifier: str) -> str:
     if not identifier_path.is_absolute():
         return raw_identifier.lstrip("/")
 
-    # Look the primary skills root up on tools.skills_tool at CALL time
-    # (not via get_skills_dir()): callers and tests patch
-    # ``tools.skills_tool.SKILLS_DIR`` and skill_view() itself resolves
-    # against that module attribute, so normalization must agree with the
-    # exact root skill_view() will enforce.  Import deferred to avoid a
-    # module cycle (tools.skills_tool imports agent.skill_utils).
+    # Look the primary skills root up on tools.skills_tool at CALL time.
+    # Import deferred to avoid a module cycle (tools.skills_tool imports
+    # agent.skill_utils).
     try:
         from tools import skills_tool as _skills_tool
-        primary_root = Path(_skills_tool.SKILLS_DIR)
+        primary_root = _skills_tool.get_active_skills_dir()
     except Exception:
         primary_root = get_skills_dir()
 
