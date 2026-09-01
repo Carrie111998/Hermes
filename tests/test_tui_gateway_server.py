@@ -5073,8 +5073,20 @@ def test_ws_orphan_reap_preserves_opted_in_running_turn_until_it_settles(monkeyp
         assert "bot-sid" in server._sessions
         assert len(callbacks) == 1
 
-        # Once the turn settles, the detached runtime is still reclaimed.
+        # An accepted next turn remains protected during the brief handoff
+        # after the current turn clears ``running``.
         session["running"] = False
+        session["queued_prompt"] = {
+            "text": "accepted next turn",
+            "transport": None,
+        }
+        callbacks.pop(0)()
+        assert "bot-sid" in server._sessions
+        assert len(callbacks) == 1
+
+        # Once both the active and queued work settle, the detached runtime is
+        # still reclaimed normally.
+        session["queued_prompt"] = None
         callbacks.pop(0)()
         assert "bot-sid" not in server._sessions
         assert torn_down == [(session, "ws_orphan_reap")]
@@ -5119,6 +5131,36 @@ def test_prompt_submit_adopts_bot_disconnect_policy_before_turn_slot(monkeypatch
         )
     finally:
         server._sessions.pop("bot-submit", None)
+
+    assert response["error"]["code"] == 4090
+    assert session["preserve_running_on_disconnect"] is True
+
+
+def test_old_client_prompt_adopts_pending_bot_title_before_agent_build(monkeypatch):
+    session = _session(
+        agent=None,
+        pending_title="Bot Chat",
+        preserve_running_on_disconnect=False,
+    )
+    server._sessions["legacy-bot-submit"] = session
+    monkeypatch.setattr(
+        server,
+        "_ensure_active_session_slot",
+        lambda *_args, **_kwargs: "test stop before turn",
+    )
+    try:
+        response = server.handle_request(
+            {
+                "id": "legacy-submit",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "legacy-bot-submit",
+                    "text": "continue working",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("legacy-bot-submit", None)
 
     assert response["error"]["code"] == 4090
     assert session["preserve_running_on_disconnect"] is True
@@ -18539,8 +18581,58 @@ def test_session_create_records_preserve_running_on_disconnect_flag(monkeypatch)
         off = server.handle_request(
             {"id": "2", "method": "session.create", "params": {}}
         )["result"]["session_id"]
+        legacy_bot = server.handle_request(
+            {
+                "id": "3",
+                "method": "session.create",
+                "params": {"title": "Bot Chat"},
+            }
+        )["result"]["session_id"]
         assert server._sessions[on]["preserve_running_on_disconnect"]
         assert not server._sessions[off]["preserve_running_on_disconnect"]
+        assert server._sessions[legacy_bot]["preserve_running_on_disconnect"]
+    finally:
+        server._sessions.clear()
+
+
+def test_old_client_cold_bot_resume_adopts_disconnect_policy_before_build(monkeypatch):
+    class FakeDB:
+        def get_session(self, target):
+            return {"id": target, "title": "Bot Chat", "message_count": 0}
+
+        def get_compression_tip(self, target):
+            return target
+
+        def get_conversation_root(self, target):
+            return target
+
+        def get_session_title(self, target):
+            return "Bot Chat"
+
+        def assert_resume_safe(self, target):
+            return None
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_schedule_resume_hydration", lambda *args, **kwargs: None)
+    server._sessions.clear()
+    try:
+        response = server.handle_request(
+            {
+                "id": "legacy-resume",
+                "method": "session.resume",
+                "params": {
+                    "session_id": "stored-bot",
+                    "defer_history": True,
+                },
+            }
+        )
+
+        assert "error" not in response
+        sid = response["result"]["session_id"]
+        assert server._sessions[sid]["agent"] is None
+        assert server._sessions[sid]["preserve_running_on_disconnect"] is True
     finally:
         server._sessions.clear()
 

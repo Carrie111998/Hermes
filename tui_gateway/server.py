@@ -1428,44 +1428,49 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
                 return
             if _session_has_active_delegations(sid, current):
                 reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
+            elif (
+                current.get("preserve_running_on_disconnect")
+                and (
+                    current.get("running")
+                    or isinstance(current.get("queued_prompt"), dict)
+                )
+            ):
+                # Bot Mode owns both the active turn and an acknowledged next
+                # turn. The current turn briefly clears ``running`` before it
+                # claims ``queued_prompt``; reaping in that handoff loses work
+                # the gateway already accepted. Explicit interrupt/close still
+                # clears the queue and remains authoritative.
+                if not current.get("_client_gone_preserve_logged"):
+                    current["_client_gone_preserve_logged"] = True
+                    logger.info(
+                        "client_gone sid=%s action=preserve_running", sid
+                    )
+                reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
             elif current.get("running"):
-                if current.get("preserve_running_on_disconnect"):
-                    # Bot Mode owns long-lived, backend-resident work. Losing
-                    # its viewing socket (switching bots/gateways, navigating,
-                    # or quitting Desktop) is not a stop request: let the turn
-                    # finish, then reap the detached idle runtime normally.
-                    # Explicit session.interrupt/close remains authoritative.
-                    if not current.get("_client_gone_preserve_logged"):
-                        current["_client_gone_preserve_logged"] = True
-                        logger.info(
-                            "client_gone sid=%s action=preserve_running", sid
-                        )
-                    reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
+                # Mid-turn detached sessions must never drop the single
+                # Timer (#85578): after the reconnect grace the turn is
+                # interrupted once, then the reap keeps polling until the
+                # normal turn-finalization path settles.
+                polls = int(current.get("_client_gone_interrupt_polls") or 0) + 1
+                current["_client_gone_interrupt_polls"] = polls
+                if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
+                    # The interrupted turn never settled inside the budget —
+                    # force-reap rather than parking the session + a timer
+                    # chain forever. Loud by design: this only fires when a
+                    # turn is genuinely stuck past interrupt.
+                    logger.error(
+                        "client_gone sid=%s: turn did not settle after %d "
+                        "interrupt polls (%.0fs) — force-reaping detached "
+                        "session",
+                        sid, polls - 1,
+                        (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S,
+                    )
+                    session = _pop_session_by_id(sid)
                 else:
-                    # Mid-turn detached sessions must never drop the single
-                    # Timer (#85578): after the reconnect grace the turn is
-                    # interrupted once, then the reap keeps polling until the
-                    # normal turn-finalization path settles.
-                    polls = int(current.get("_client_gone_interrupt_polls") or 0) + 1
-                    current["_client_gone_interrupt_polls"] = polls
-                    if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
-                        # The interrupted turn never settled inside the budget —
-                        # force-reap rather than parking the session + a timer
-                        # chain forever. Loud by design: this only fires when a
-                        # turn is genuinely stuck past interrupt.
-                        logger.error(
-                            "client_gone sid=%s: turn did not settle after %d "
-                            "interrupt polls (%.0fs) — force-reaping detached "
-                            "session",
-                            sid, polls - 1,
-                            (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S,
-                        )
-                        session = _pop_session_by_id(sid)
-                    else:
-                        if not current.get("_client_gone_interrupt_requested"):
-                            current["_client_gone_interrupt_requested"] = True
-                            interrupt_session = current
-                        reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
+                    if not current.get("_client_gone_interrupt_requested"):
+                        current["_client_gone_interrupt_requested"] = True
+                        interrupt_session = current
+                    reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
             else:
                 session = _pop_session_by_id(sid)
 

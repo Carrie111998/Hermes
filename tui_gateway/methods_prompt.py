@@ -423,7 +423,16 @@ def _(rid, params: dict) -> dict:
                             )
                             + "Update Hermes Desktop to continue it.",
                         )
-    if is_truthy_value(params.get("preserve_running_on_disconnect", False)):
+    preserve_running_on_disconnect = is_truthy_value(
+        params.get("preserve_running_on_disconnect", False)
+    )
+    if not preserve_running_on_disconnect:
+        from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+        preserve_running_on_disconnect = (
+            str(session.get("pending_title") or "").strip() == BOT_CHAT_TITLE
+        )
+    if preserve_running_on_disconnect:
         # The prompt is the final authority for a Bot turn. Session routing can
         # rebuild/rebind a runtime between open and send, so adopting the
         # policy here closes every warm-cache and recovery path before the

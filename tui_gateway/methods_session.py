@@ -36,6 +36,10 @@ def _(rid, params: dict) -> dict:
     preserve_running_on_disconnect = is_truthy_value(
         params.get("preserve_running_on_disconnect", False)
     )
+    if not preserve_running_on_disconnect and title:
+        from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+        preserve_running_on_disconnect = title == BOT_CHAT_TITLE
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -466,6 +470,13 @@ def _(rid, params: dict) -> dict:
                 live_sid = _find_live_unpersisted(target, profile_home)
                 live = _sessions.get(live_sid) if live_sid else None
                 if live is not None:
+                    if not preserve_running_on_disconnect:
+                        from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+                        preserve_running_on_disconnect = (
+                            str(live.get("pending_title") or "").strip()
+                            == BOT_CHAT_TITLE
+                        )
                     if owns_db:
                         with contextlib.suppress(Exception):
                             db.close()
@@ -573,6 +584,17 @@ def _(rid, params: dict) -> dict:
         # registry row — stay on a proven compression edge so an unmarked
         # side chat cannot steal the open (the title-lookup / profiles.list
         # contract). Other sessions keep the legacy unmarked-child walker.
+        canonical_bot_chat = False
+        if found:
+            try:
+                from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+                canonical_bot_chat = (
+                    str(found.get("title") or "").strip() == BOT_CHAT_TITLE
+                )
+            except Exception:
+                canonical_bot_chat = False
+
         if found and not is_truthy_value(params.get("lazy", False)):
             try:
                 from tools.bot_mode_probe import BOT_CHAT_TITLE
@@ -586,6 +608,20 @@ def _(rid, params: dict) -> dict:
             if tip and tip != target:
                 target = tip
                 found = db.get_session(target) or found
+
+        if found and not canonical_bot_chat:
+            try:
+                from tools.bot_mode_probe import BOT_CHAT_TITLE
+
+                root = db.get_conversation_root(target)
+                canonical_bot_chat = (
+                    str(db.get_session_title(root) or "").strip()
+                    == BOT_CHAT_TITLE
+                )
+            except Exception:
+                pass
+        if canonical_bot_chat:
+            preserve_running_on_disconnect = True
 
         # Todo snapshots are derived from each path's already-loaded history
         # (see _todo_state_from_history) — no extra transcript read here.
