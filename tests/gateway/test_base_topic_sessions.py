@@ -70,6 +70,26 @@ def _make_event(chat_id: str, thread_id: str, message_id: str = "1") -> MessageE
 class TestBasePlatformTopicSessions:
 
     @pytest.mark.asyncio
+    async def test_plugin_control_message_bypasses_busy_session_without_merging(self):
+        adapter = DummyTelegramAdapter()
+        handler = AsyncMock(return_value=None)
+        adapter.set_message_handler(handler)
+        event = _make_event("-1001", "17585", message_id="control")
+        session_key = build_session_key(event.source)
+        active_guard = asyncio.Event()
+        adapter._active_sessions[session_key] = active_guard
+
+        with patch(
+            "hermes_cli.plugins.is_gateway_control_message",
+            return_value=True,
+        ):
+            await adapter.handle_message(event)
+
+        handler.assert_awaited_once_with(event)
+        assert adapter._pending_messages == {}
+        assert adapter._active_sessions[session_key] is active_guard
+
+    @pytest.mark.asyncio
     async def test_handle_message_interrupts_same_topic(self, monkeypatch):
         adapter = DummyTelegramAdapter()
         adapter.set_message_handler(lambda event: asyncio.sleep(0, result=None))
@@ -198,4 +218,3 @@ class TestTelegramAutoTtsCaptionDelivery:
                 "metadata": {"thread_id": "17585", "notify": True},
             }
         ]
-

@@ -244,6 +244,27 @@ class TestReplyToText:
         assert event.reply_to_message_id is None
         assert event.reply_to_text is None
 
+    @pytest.mark.asyncio
+    async def test_plugin_excluded_reference_keeps_id_but_drops_reply_text(
+        self, reply_text_adapter, monkeypatch
+    ):
+        resolved_msg = SimpleNamespace(
+            id=555,
+            content="✅ 종료됨\n명령: control list",
+        )
+        ref = SimpleNamespace(message_id=555, resolved=resolved_msg)
+        message = _make_message(reference=ref)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.should_exclude_gateway_history_message",
+            lambda **kwargs: kwargs["message_id"] == "555",
+        )
+
+        await reply_text_adapter._handle_message(message)
+
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_message_id == "555"
+        assert event.reply_to_text is None
+
 
     @pytest.mark.asyncio
     async def test_reference_with_empty_resolved_content(self, reply_text_adapter):

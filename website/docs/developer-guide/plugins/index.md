@@ -910,6 +910,22 @@ override check).
 
 ### Register multiple hooks
 
+Plugins that require a particular host fire site can probe it before
+activating fail-closed functionality:
+
+```python
+def register(ctx):
+    required = ("pre_gateway_dispatch", "gateway_control_message")
+    missing = [name for name in required if not ctx.supports_hook(name)]
+    if missing:
+        raise RuntimeError(f"Hermes host is missing hooks: {', '.join(missing)}")
+```
+
+`ctx.supports_hook(name)` reports official hooks implemented by the running
+host. This is intentionally different from `register_hook()`, which continues
+to accept unknown names so a plugin can be installed on an older host without
+failing during discovery.
+
 ```python
 def register(ctx):
     ctx.register_hook("pre_tool_call", before_any_tool)
@@ -936,6 +952,9 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 | [`on_session_end`](/user-guide/features/hooks#on_session_end) | End of every `run_conversation` call + CLI exit | `session_id: str, completed: bool, interrupted: bool, model: str, platform: str` | ignored |
 | [`on_session_finalize`](/user-guide/features/hooks#on_session_finalize) | CLI/gateway tears down an active session | `session_id: str \| None, platform: str` | ignored |
 | [`on_session_reset`](/user-guide/features/hooks#on_session_reset) | Gateway swaps in a new session key (`/new`, `/reset`) | `session_id: str, platform: str` | ignored |
+| [`pre_gateway_dispatch`](/user-guide/features/hooks#pre_gateway_dispatch) | After the gateway computes authorization but before it enforces auth/pairing or starts an agent | `event, gateway, session_store, adapter, is_authorized: bool` | optional `skip` / `rewrite` / `allow` directive |
+| [`gateway_control_message`](/user-guide/features/hooks#gateway_control_message) | Before adapter text batching or busy-session merging | `platform: str, event: MessageEvent` | synchronous `True` / `{"control": true}` claims the intact event |
+| [`gateway_history_message`](/user-guide/features/hooks#gateway_history_message) | Before a platform history message enters reconstructed agent context | normalized message, author, chat, and authorization fields | synchronous `True` / `{"exclude": true}` omits the message |
 | [`gateway_platform_event`](/user-guide/features/hooks#gateway_platform_event) | An authorized platform-native event is normalized at the gateway boundary (Telegram reactions currently) | `platform: str, event_type: str, payload: dict` | ignored |
 | `kanban_task_claimed` | A kanban task is claimed (dispatcher process, before the worker spawns) | `task_id: str, board: str \| None, assignee: str \| None, run_id: int \| None, profile_name: str` | ignored |
 | `kanban_task_completed` | A kanban task completes (worker process) | `task_id, board, assignee, run_id, profile_name, summary: str \| None` | ignored |
@@ -1358,6 +1377,21 @@ def register(ctx):
 
     ctx.register_platform_handler("discord", _wire)
 ```
+
+#### Discord thread inventory and delivery helpers
+
+The Discord adapter passed to a native handler exposes these stable helpers for
+plugins that maintain thread inventories or deliver scheduled summaries:
+
+| Method | Contract |
+|--------|----------|
+| `participating_thread_ids()` | Stable tuple containing the complete durable set of Discord thread IDs Hermes has participated in. New Discord tracking is not truncated to a recent-N cache. |
+| `resolve_thread_metadata(thread_id, include_activity_history=True)` | Async metadata lookup returning accessibility, guild/parent/name, archive policy/state, and Discord/Hermes activity timestamps. It never returns message content. Set `include_activity_history=False` for a lightweight refresh. |
+| `validate_delivery_target(channel_id)` | Async existence and view/send-permission check returning `{"ok": true, ...}` or `{"ok": false, "error": ...}`. |
+
+Use the adapter's existing async `send(...)` method after validation. These
+methods return structured failure results instead of requiring plugins to
+reach into private Discord adapter fields.
 
 :::tip
 This guide covers **general plugins** (tools, hooks, slash commands, CLI commands). The sections below sketch the authoring pattern for each specialized plugin type; each links to its full guide for field reference and examples.

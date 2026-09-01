@@ -118,3 +118,24 @@ async def test_hook_fires_without_session_store_attribute(monkeypatch):
     # Hook actually fired (skip short-circuited before auth) with a None store.
     assert seen == {"session_store": None}
     adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hook_receives_cached_authorization_decision_and_public_adapter(monkeypatch):
+    observed = {}
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            observed.update(kwargs)
+            return [{"action": "skip", "reason": "probe"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+    runner._is_user_authorized_for_source = MagicMock(return_value=True)
+
+    await runner._handle_message(_make_event("hi"))
+
+    assert observed["is_authorized"] is True
+    assert observed["adapter"] is adapter
+    runner._is_user_authorized_for_source.assert_called_once()

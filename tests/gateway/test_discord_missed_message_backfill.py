@@ -140,6 +140,17 @@ async def test_configured_bot_sender_is_left_for_shared_ingress_policy(adapter, 
 
 
 @pytest.mark.asyncio
+async def test_plugin_excluded_message_never_enters_recovery_dispatch(adapter, monkeypatch):
+    message = make_message(message_id=73, content="!c")
+    monkeypatch.setattr(
+        "hermes_cli.plugins.should_exclude_gateway_history_message",
+        lambda **kwargs: kwargs["message_id"] == "73",
+    )
+
+    assert await adapter._should_backfill_discord_message(message) is False
+
+
+@pytest.mark.asyncio
 async def test_should_not_backfill_message_with_non_down_bot_response(adapter):
     bot_reply = SimpleNamespace(
         id=2,
@@ -456,5 +467,4 @@ async def test_iter_candidates_keeps_latest_messages_when_window_exceeds_limit(a
         got.append(msg.id)
 
     assert got == [2, 3, 4]
-
 

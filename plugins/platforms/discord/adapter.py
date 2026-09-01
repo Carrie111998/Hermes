@@ -1116,7 +1116,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
-        self._threads = ThreadParticipationTracker("discord")
+        # Keep the complete durable Discord participation inventory. Plugins
+        # can process it in bounded batches, but a fixed recent-N cache would
+        # make older still-relevant threads undiscoverable after installation.
+        self._threads = ThreadParticipationTracker("discord", max_tracked=None)
         # Persistent typing indicator loops per channel (DMs don't reliably
         # show the standard typing gateway event for bots)
         self._typing_tasks: Dict[str, asyncio.Task] = {}
@@ -1179,6 +1182,136 @@ class DiscordAdapter(BasePlatformAdapter):
         # Mirrors the Telegram #58563 fix. Entries are dropped on finalize.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+
+    # ------------------------------------------------------------------
+    # Public plugin integration surface
+    # ------------------------------------------------------------------
+
+    def participating_thread_ids(self) -> tuple[str, ...]:
+        """Return the durable Discord participation snapshot."""
+
+        return self._threads.ids()
+
+    async def validate_delivery_target(self, channel_id: str) -> Dict[str, Any]:
+        """Validate that this bot can view and send to one Discord target."""
+
+        client = getattr(self, "_client", None)
+        if client is None or getattr(client, "user", None) is None:
+            return {"ok": False, "error": "Discord client is not connected"}
+        try:
+            target = client.get_channel(int(channel_id))
+            if target is None:
+                fetch_channel = getattr(client, "fetch_channel", None)
+                if callable(fetch_channel):
+                    target = await fetch_channel(int(channel_id))
+            if target is None:
+                return {"ok": False, "error": "Discord channel not found"}
+
+            guild = getattr(target, "guild", None)
+            member = getattr(guild, "me", None) or client.user
+            permissions_for = getattr(target, "permissions_for", None)
+            if callable(permissions_for):
+                permissions = permissions_for(member)
+                can_view = bool(
+                    getattr(permissions, "view_channel", False)
+                    or getattr(permissions, "read_messages", False)
+                )
+                can_send = bool(getattr(permissions, "send_messages", False))
+                if self._get_parent_channel_id(target) is not None:
+                    can_send = can_send or bool(
+                        getattr(permissions, "send_messages_in_threads", False)
+                    )
+                if not can_view or not can_send:
+                    return {
+                        "ok": False,
+                        "error": "Discord bot lacks view/send permission",
+                    }
+            if not callable(getattr(target, "send", None)):
+                return {"ok": False, "error": "Discord target cannot receive messages"}
+            return {
+                "ok": True,
+                "channel_id": str(getattr(target, "id", channel_id)),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": type(exc).__name__}
+
+    async def resolve_thread_metadata(
+        self,
+        thread_id: str,
+        *,
+        include_activity_history: bool = True,
+    ) -> Dict[str, Any]:
+        """Resolve one Discord thread without returning message content."""
+
+        client = getattr(self, "_client", None)
+        if client is None:
+            return {"accessible": False, "thread_id": str(thread_id)}
+        try:
+            channel = client.get_channel(int(thread_id))
+            if channel is None:
+                fetch_channel = getattr(client, "fetch_channel", None)
+                if callable(fetch_channel):
+                    channel = await fetch_channel(int(thread_id))
+            parent_id = self._get_parent_channel_id(channel) if channel is not None else None
+            if channel is None or parent_id is None:
+                return {"accessible": False, "thread_id": str(thread_id)}
+
+            guild = getattr(channel, "guild", None)
+            auto_archive_minutes = getattr(channel, "auto_archive_duration", None)
+            created_at = getattr(channel, "created_at", None)
+            last_discord_activity_at = None
+            last_message_id = getattr(channel, "last_message_id", None)
+            if last_message_id:
+                try:
+                    candidate = discord.utils.snowflake_time(int(last_message_id))
+                    if isinstance(candidate, dt.datetime):
+                        last_discord_activity_at = candidate
+                except Exception:
+                    pass
+            if last_discord_activity_at is None:
+                last_discord_activity_at = created_at
+
+            # Inspect only author IDs and timestamps. The bounded scan never
+            # exposes or returns message content.
+            last_hermes_activity_at = None
+            history = getattr(channel, "history", None)
+            if include_activity_history and callable(history):
+                try:
+                    bot_id = getattr(getattr(client, "user", None), "id", None)
+                    async for message in history(limit=100, oldest_first=False):
+                        if getattr(getattr(message, "author", None), "id", None) == bot_id:
+                            last_hermes_activity_at = getattr(message, "created_at", None)
+                            break
+                except Exception:
+                    last_hermes_activity_at = None
+            if last_hermes_activity_at is None:
+                # Durable participation proves Hermes engaged at some point;
+                # created_at is a conservative lower bound when that message is
+                # outside the bounded scan.
+                last_hermes_activity_at = created_at
+
+            archive_at = None
+            if isinstance(last_discord_activity_at, dt.datetime) and auto_archive_minutes:
+                archive_at = last_discord_activity_at + dt.timedelta(
+                    minutes=int(auto_archive_minutes)
+                )
+            if getattr(channel, "archived", False):
+                archive_at = getattr(channel, "archive_timestamp", None) or archive_at
+
+            return {
+                "accessible": True,
+                "thread_id": str(getattr(channel, "id", thread_id)),
+                "scope_id": str(getattr(guild, "id", "") or "") or None,
+                "parent_channel_id": str(parent_id),
+                "thread_name": str(getattr(channel, "name", "") or "") or None,
+                "last_discord_activity_at": last_discord_activity_at,
+                "last_hermes_activity_at": last_hermes_activity_at,
+                "archived": bool(getattr(channel, "archived", False)),
+                "auto_archive_minutes": auto_archive_minutes,
+                "archive_at": archive_at,
+            }
+        except Exception:
+            return {"accessible": False, "thread_id": str(thread_id)}
 
     def _config_value(
         self, key: str, default: Any, *, env_key: Optional[str] = None
@@ -2617,6 +2750,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 scanned += 1
                 message_id = str(getattr(message, "id", ""))
                 self._record_discord_message_seen(message, status="discovered")
+                if self._plugin_excludes_history_message(message):
+                    self._record_discord_message_seen(message, status="excluded")
+                    channel_id, _thread_id, _parent_id = self._message_channel_ids(message)
+                    self._advance_discord_recovery_cursor(channel_id, message_id)
+                    continue
                 # A live gateway event may race this REST scan. Check without
                 # claiming the ID; the shared ingress helper owns the dedup
                 # write immediately before normal auth/filter dispatch.
@@ -2846,6 +2984,8 @@ class DiscordAdapter(BasePlatformAdapter):
     async def _should_backfill_discord_message(self, message: Any) -> bool:
         """Return True when a recent Discord message still needs Hermes work."""
         if not self._client or not getattr(self._client, "user", None):
+            return False
+        if self._plugin_excludes_history_message(message):
             return False
         if getattr(getattr(message, "author", None), "id", None) == getattr(self._client.user, "id", None):
             return False
@@ -3357,7 +3497,12 @@ class DiscordAdapter(BasePlatformAdapter):
         """Add an in-progress reaction and record durable handling state."""
         message = event.raw_message
         acked = False
-        if self._reactions_enabled() and hasattr(message, "add_reaction"):
+        plugin_managed = self._plugin_marks_control_message(event)
+        if (
+            not plugin_managed
+            and self._reactions_enabled()
+            and hasattr(message, "add_reaction")
+        ):
             acked = await self._add_reaction(message, "👀")
         await asyncio.to_thread(
             self._record_discord_processing_start,
@@ -3372,6 +3517,8 @@ class DiscordAdapter(BasePlatformAdapter):
             event,
             outcome,
         )
+        if self._plugin_marks_control_message(event):
+            return
         if not self._reactions_enabled():
             return
         message = event.raw_message
@@ -6912,6 +7059,63 @@ class DiscordAdapter(BasePlatformAdapter):
         except (ValueError, TypeError):
             return 50
 
+    def _plugin_excludes_history_message(self, message: Any) -> bool:
+        """Apply generic plugin policy to one Discord history message."""
+
+        channel = getattr(message, "channel", None)
+        channel_id = str(getattr(channel, "id", "") or "")
+        parent_id = self._get_parent_channel_id(channel)
+        is_thread = parent_id is not None
+        guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+        author = getattr(message, "author", None)
+        author_id = str(getattr(author, "id", "") or "")
+        client = getattr(self, "_client", None)
+        self_user = getattr(client, "user", None) if client is not None else None
+        author_is_self = bool(
+            self_user is not None
+            and getattr(author, "id", None) == getattr(self_user, "id", None)
+        )
+        author_is_bot = bool(getattr(author, "bot", False))
+        author_is_authorized = None
+        if author_id and not author_is_bot:
+            try:
+                author_is_authorized = self._is_sender_authorized(
+                    author_id,
+                    chat_type="dm" if guild is None else ("thread" if is_thread else "group"),
+                    chat_id=channel_id,
+                )
+            except Exception:
+                author_is_authorized = None
+        try:
+            from hermes_cli.plugins import should_exclude_gateway_history_message
+
+            return should_exclude_gateway_history_message(
+                platform="discord",
+                message_id=str(getattr(message, "id", "") or ""),
+                content=(
+                    getattr(message, "clean_content", None)
+                    or getattr(message, "content", "")
+                    or ""
+                ),
+                chat_type="dm" if guild is None else ("thread" if is_thread else "group"),
+                chat_id=channel_id,
+                thread_id=channel_id if is_thread else None,
+                parent_chat_id=parent_id,
+                scope_id=str(getattr(guild, "id", "") or "") or None,
+                author_id=author_id or None,
+                author_is_bot=author_is_bot,
+                author_is_self=author_is_self,
+                author_is_authorized=author_is_authorized,
+            )
+        except Exception:
+            logger.warning(
+                "[%s] Plugin history boundary failed; excluding Discord message %s",
+                self.name,
+                getattr(message, "id", "unknown"),
+                exc_info=True,
+            )
+            return True
+
     async def _fetch_channel_context(
         self,
         channel: Any,
@@ -6982,6 +7186,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if (
                     str(getattr(msg, "id", "")) in self._nonconversational_messages
                     or _looks_like_nonconversational_history_message(content)
+                    or self._plugin_excludes_history_message(msg)
                 ):
                     return None
                 # Respect DISCORD_ALLOW_BOTS for other bots.  For history
@@ -7048,6 +7253,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 if (
                     str(getattr(msg, "id", "")) in self._nonconversational_messages
                     or _looks_like_nonconversational_history_message(_content)
+                    or self._plugin_excludes_history_message(msg)
                 ):
                     continue
                 # Stop at our own (conversational) message — this is the
@@ -8550,7 +8756,9 @@ class DiscordAdapter(BasePlatformAdapter):
         if message.reference:
             reply_to_id = str(message.reference.message_id)
             if message.reference.resolved:
-                reply_to_text = getattr(message.reference.resolved, "content", None) or None
+                resolved_reply = message.reference.resolved
+                if not self._plugin_excludes_history_message(resolved_reply):
+                    reply_to_text = getattr(resolved_reply, "content", None) or None
 
         event = MessageEvent(
             text=event_text,
@@ -8580,6 +8788,7 @@ class DiscordAdapter(BasePlatformAdapter):
             not recovered
             and msg_type == MessageType.TEXT
             and self._text_batch_delay_seconds > 0
+            and not self._plugin_marks_control_message(event)
         ):
             self._enqueue_text_event(event)
         else:

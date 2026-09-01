@@ -1585,6 +1585,17 @@ class TestThreadToolWhitelist:
 class TestPluginContext:
     """Tests for the PluginContext facade."""
 
+    def test_supports_hook_distinguishes_real_host_contracts(self):
+        manager = PluginManager()
+        context = PluginContext(
+            PluginManifest(name="probe", source="user"),
+            manager,
+        )
+
+        assert context.supports_hook("pre_gateway_dispatch") is True
+        assert context.supports_hook("gateway_control_message") is True
+        assert context.supports_hook("future_unimplemented_hook") is False
+
 
 
 
@@ -2324,3 +2335,59 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+
+
+class TestGatewayMessagePolicyHooks:
+    def test_history_filter_excludes_explicit_result_and_fails_closed(self, caplog):
+        manager = PluginManager()
+        manager._hooks["gateway_history_message"] = [
+            lambda message_id: {"exclude": message_id == "1"}
+        ]
+
+        assert manager.should_exclude_gateway_history_message(message_id="1") is True
+        assert manager.should_exclude_gateway_history_message(message_id="2") is False
+
+        def broken(**_kwargs):
+            raise RuntimeError("ledger unavailable")
+
+        manager._hooks["gateway_history_message"] = [broken]
+        with caplog.at_level(logging.WARNING):
+            assert manager.should_exclude_gateway_history_message(message_id="3") is True
+        assert "excluding message" in caplog.text
+
+    def test_async_history_filter_is_rejected_fail_closed(self, caplog):
+        manager = PluginManager()
+
+        async def invalid_filter(**_kwargs):
+            return False
+
+        manager._hooks["gateway_history_message"] = [invalid_filter]
+        with caplog.at_level(logging.WARNING):
+            assert manager.should_exclude_gateway_history_message(message_id="1") is True
+        assert "must be synchronous" in caplog.text
+
+    def test_control_classifier_claims_only_explicit_result_and_fails_open(self, caplog):
+        manager = PluginManager()
+        manager._hooks["gateway_control_message"] = [
+            lambda **_kwargs: {"control": True}
+        ]
+        assert manager.is_gateway_control_message(message_id="1") is True
+
+        def broken(**_kwargs):
+            raise RuntimeError("parser unavailable")
+
+        manager._hooks["gateway_control_message"] = [broken]
+        with caplog.at_level(logging.WARNING):
+            assert manager.is_gateway_control_message(message_id="2") is False
+        assert "control-message callback" in caplog.text
+
+    def test_async_control_classifier_is_rejected_without_claiming(self, caplog):
+        manager = PluginManager()
+
+        async def invalid_classifier(**_kwargs):
+            return True
+
+        manager._hooks["gateway_control_message"] = [invalid_classifier]
+        with caplog.at_level(logging.WARNING):
+            assert manager.is_gateway_control_message(message_id="1") is False
+        assert "must be synchronous" in caplog.text

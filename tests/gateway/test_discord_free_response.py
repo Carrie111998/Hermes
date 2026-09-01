@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.platforms.base import ProcessingOutcome
 
 
 def _ensure_discord_mock():
@@ -333,6 +334,54 @@ async def test_fetch_channel_context_stops_at_self_message_and_reverses_to_chron
         "[Gemini [bot]] latest bot note\n"
         "[Alice] latest human note"
     )
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_context_applies_plugin_history_exclusion(adapter, monkeypatch):
+    adapter.config.extra["history_backfill_limit"] = 10
+    human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
+    channel = FakeHistoryChannel(
+        [
+            make_history_message(author=human, content="keep me", msg_id=4),
+            make_history_message(author=human, content="!c", msg_id=3),
+        ],
+        channel_id=123,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.should_exclude_gateway_history_message",
+        lambda **kwargs: kwargs["message_id"] == "3",
+    )
+
+    result = await adapter._fetch_channel_context(
+        channel, before=make_message(channel=channel, content="trigger")
+    )
+
+    assert "keep me" in result
+    assert "!c" not in result
+
+
+@pytest.mark.asyncio
+async def test_fetch_channel_context_fails_closed_when_plugin_boundary_breaks(adapter, monkeypatch):
+    adapter.config.extra["history_backfill_limit"] = 10
+    human = SimpleNamespace(id=56, display_name="Alice", name="Alice", bot=False)
+    channel = FakeHistoryChannel(
+        [make_history_message(author=human, content="candidate", msg_id=3)],
+        channel_id=123,
+    )
+
+    def broken(**_kwargs):
+        raise RuntimeError("plugin manager unavailable")
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.should_exclude_gateway_history_message",
+        broken,
+    )
+
+    result = await adapter._fetch_channel_context(
+        channel, before=make_message(channel=channel, content="trigger")
+    )
+
+    assert result == ""
 
 
 @pytest.mark.asyncio
@@ -827,3 +876,29 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
     )
 
 
+@pytest.mark.asyncio
+async def test_plugin_control_message_owns_discord_reaction_lifecycle(adapter):
+    raw_message = SimpleNamespace(
+        add_reaction=AsyncMock(),
+        remove_reaction=AsyncMock(),
+    )
+    event = SimpleNamespace(raw_message=raw_message)
+    adapter._plugin_marks_control_message = MagicMock(return_value=True)
+    adapter._record_discord_processing_start = MagicMock()
+    adapter._record_discord_processing_complete = MagicMock()
+    adapter._add_reaction = AsyncMock(return_value=True)
+    adapter._remove_reaction = AsyncMock(return_value=True)
+
+    await adapter.on_processing_start(event)
+    await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
+
+    adapter._record_discord_processing_start.assert_called_once_with(
+        event,
+        emoji_ack=False,
+    )
+    adapter._record_discord_processing_complete.assert_called_once_with(
+        event,
+        ProcessingOutcome.FAILURE,
+    )
+    adapter._add_reaction.assert_not_awaited()
+    adapter._remove_reaction.assert_not_awaited()

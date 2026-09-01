@@ -3808,6 +3808,35 @@ class BasePlatformAdapter(ABC):
                     self.name, plugin_name, exc, exc_info=True,
                 )
 
+    def _plugin_marks_control_message(self, event: MessageEvent) -> bool:
+        """Classify a plugin-owned event before any text coalescing."""
+
+        cached = getattr(event, "_hermes_plugin_control_message", None)
+        if isinstance(cached, bool):
+            return cached
+        source = getattr(event, "source", None)
+        platform = (
+            getattr(source, "platform", None)
+            or getattr(self, "platform", None)
+            or getattr(self, "_platform", None)
+        )
+        try:
+            from hermes_cli.plugins import is_gateway_control_message
+
+            claimed = is_gateway_control_message(
+                platform=_platform_name(platform),
+                event=event,
+            )
+        except Exception:
+            logger.warning(
+                "[%s] Plugin control-message classification failed",
+                self.name,
+                exc_info=True,
+            )
+            claimed = False
+        setattr(event, "_hermes_plugin_control_message", bool(claimed))
+        return bool(claimed)
+
     @property
     def name(self) -> str:
         """Human-readable name for this adapter."""
@@ -6294,6 +6323,45 @@ class BasePlatformAdapter(ABC):
 
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
+            # A plugin control message must reach pre_gateway_dispatch as one
+            # intact event. Dispatch it inline without merging it into ordinary
+            # pending text; the claiming plugin is responsible for returning a
+            # skip directive before any agent work starts.
+            if self._plugin_marks_control_message(event):
+                self._discard_text_debounce(session_key)
+                logger.debug(
+                    "[%s] Plugin control message bypassing active-session queue for %s",
+                    self.name,
+                    session_key,
+                )
+                try:
+                    response = await self._message_handler(event)
+                    text, ephemeral_ttl = self._unwrap_ephemeral(response)
+                    if text:
+                        thread_meta = _thread_metadata_for_source(
+                            event.source, _reply_anchor_for_event(event)
+                        )
+                        result = await self._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text,
+                            reply_to=_reply_anchor_for_event(event),
+                            metadata=_mark_notify_metadata(thread_meta),
+                        )
+                        if ephemeral_ttl > 0 and result.success and result.message_id:
+                            self._schedule_ephemeral_delete(
+                                chat_id=event.source.chat_id,
+                                message_id=result.message_id,
+                                ttl_seconds=ephemeral_ttl,
+                            )
+                except Exception as exc:
+                    logger.error(
+                        "[%s] Plugin control-message dispatch failed: %s",
+                        self.name,
+                        exc,
+                        exc_info=True,
+                    )
+                return
+
             # Certain commands must bypass the active-session guard and be
             # dispatched directly to the gateway runner.  Without this, they
             # are queued as pending messages and either:

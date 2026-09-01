@@ -9,7 +9,7 @@ Telegram and Feishu.
 """
 
 import asyncio
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -58,6 +58,18 @@ def _make_discord_adapter():
 
 
 class TestDiscordTextBatching:
+    def test_plugin_policy_can_keep_control_event_out_of_batch(self):
+        adapter = _make_discord_adapter()
+        event = _make_event("!c", Platform.DISCORD)
+
+        with patch(
+            "hermes_cli.plugins.is_gateway_control_message",
+            return_value=True,
+        ) as boundary:
+            assert adapter._plugin_marks_control_message(event) is True
+
+        boundary.assert_called_once_with(platform="discord", event=event)
+
     @pytest.mark.asyncio
     async def test_single_message_dispatched_after_delay(self):
         adapter = _make_discord_adapter()
@@ -272,5 +284,4 @@ class TestFeishuAdaptiveDelay:
 
         await asyncio.sleep(0.15)
         adapter._handle_message_with_guards.assert_called_once()
-
 

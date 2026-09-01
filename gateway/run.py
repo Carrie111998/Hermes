@@ -18156,12 +18156,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not is_internal:
             self._scale_to_zero_note_real_inbound()
 
+        # Compute the ordinary authorization result once. The hook receives the
+        # immutable decision before enforcement, so an ingest plugin may still
+        # deliberately consume unauthorized input without duplicating private
+        # allowlist logic or triggering the pairing flow.
+        is_authorized = (
+            True
+            if is_internal
+            else self._is_user_authorized_for_source(source)
+        )
+
         # Fire pre_gateway_dispatch plugin hook for user-originated messages.
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
         #   {"action": "allow"}   /   None          -> normal dispatch
-        # Hook runs BEFORE auth so plugins can handle unauthorized senders
+        # Hook runs before auth enforcement so plugins can inspect the cached
+        # authorization decision without causing a second policy lookup.
         # (e.g. customer handover ingest) without triggering the pairing flow.
         if not is_internal:
             try:
@@ -18174,6 +18185,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # object.__new__ without __init__ (pitfall #17), and the
                     # hook must not fail dispatch over a missing attribute.
                     session_store=getattr(self, "session_store", None),
+                    adapter=self._adapter_for_source(source),
+                    is_authorized=is_authorized,
                 )
             except Exception as _hook_exc:
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
@@ -18209,10 +18222,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # chat-scoped allowlist (e.g. TELEGRAM_GROUP_ALLOWED_CHATS
             # authorizes every member of the listed chat regardless of
             # sender). Defer to _is_user_authorized so that path runs.
-            if not self._is_user_authorized_for_source(source):
+            if not is_authorized:
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
-        elif not self._is_user_authorized_for_source(source):
+        elif not is_authorized:
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
