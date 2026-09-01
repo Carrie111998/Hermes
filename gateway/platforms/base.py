@@ -5036,7 +5036,13 @@ class BasePlatformAdapter(ABC):
             if safe_path:
                 safe_media.append((safe_path, bool(is_voice)))
             else:
-                logger.warning("Skipping unsafe MEDIA directive path: %s", _log_safe_path(raw))
+                # Don't say "unsafe" — validate rejects for many reasons
+                # (not absolute, file not found, symlink failure, etc.),
+                # only some of which are security decisions.
+                logger.warning(
+                    "Skipping undeliverable MEDIA directive path: %s",
+                    _log_safe_path(raw),
+                )
         return safe_media
 
     @staticmethod
@@ -5049,7 +5055,13 @@ class BasePlatformAdapter(ABC):
             if safe_path:
                 safe_paths.append(safe_path)
             else:
-                logger.warning("Skipping unsafe local file path: %s", _log_safe_path(raw))
+                # Don't say "unsafe" — validate rejects for many reasons
+                # (not absolute, file not found, symlink failure, etc.),
+                # only some of which are security decisions.
+                logger.warning(
+                    "Skipping undeliverable local file path: %s",
+                    _log_safe_path(raw),
+                )
         return safe_paths
 
 
