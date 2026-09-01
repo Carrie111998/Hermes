@@ -575,7 +575,12 @@ def _write_task_script() -> Path:
     # into string literals (HERMES_HOME with é/ü/CJK usernames), so the
     # launcher's own FileExists guard silently quits at every logon. Same
     # reasoning as the utf-16 task XML below.
-    vbs_tmp.write_text(vbs_content, encoding="utf-16", newline="")
+    #
+    # utf-16-LE + an explicit BOM rather than bare "utf-16": the latter follows
+    # the WRITING platform's native byte order, so the \xff\xfe guarantee would
+    # depend on the host that generated the file. Every Windows target is
+    # little-endian, so pin it (#94391 review).
+    vbs_tmp.write_text("\ufeff" + vbs_content, encoding="utf-16-le", newline="")
     vbs_tmp.replace(vbs_path)
     return script_path
 
@@ -712,9 +717,14 @@ def _install_startup_entry(script_path: Path) -> Path:
     entry = get_startup_entry_path()
     entry.parent.mkdir(parents=True, exist_ok=True)
     tmp = entry.with_suffix(".tmp")
-    # utf-16 with BOM so wscript decodes non-ASCII path literals correctly
-    # (see the comment in _write_task_script).
-    tmp.write_text(_build_startup_launcher(script_path), encoding="utf-16", newline="")
+    # utf-16-LE + explicit BOM so wscript decodes non-ASCII path literals
+    # correctly regardless of the writing platform's byte order (see the
+    # comment in _write_task_script).
+    tmp.write_text(
+        "\ufeff" + _build_startup_launcher(script_path),
+        encoding="utf-16-le",
+        newline="",
+    )
     tmp.replace(entry)
     legacy_entry = _legacy_startup_entry_path()
     try:

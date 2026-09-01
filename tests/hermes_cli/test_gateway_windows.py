@@ -344,17 +344,30 @@ def test_generated_vbs_launchers_carry_utf16_bom(monkeypatch, tmp_path):
 
     script = gateway_windows._write_task_script()
     task_raw = script.with_suffix(".vbs").read_bytes()
-    assert task_raw.startswith(b"\xff\xfe"), "task .vbs must carry a UTF-16 BOM"
+    # Little-endian BOM specifically: the writer pins utf-16-LE so the byte
+    # order does not depend on the platform that generated the file.
+    assert task_raw.startswith(b"\xff\xfe"), "task .vbs must carry a UTF-16LE BOM"
     task_text = task_raw.decode("utf-16")
+    # THE regression assertion: the non-ASCII HERMES_HOME segment must survive
+    # inside the embedded string literal. The script path alone sits under an
+    # all-ASCII tmp_path, so asserting on it would pass even with a BOM-less
+    # writer mangling the home path (#94391 review nit 1).
+    assert "hömè-höme" in task_text, (
+        "non-ASCII HERMES_HOME must survive in the task launcher's literals"
+    )
     assert str(script.with_suffix(".vbs")) in gateway_windows._build_startup_launcher(script)
 
     entry = gateway_windows._install_startup_entry(script)
     entry_raw = entry.read_bytes()
-    assert entry_raw.startswith(b"\xff\xfe"), "startup .vbs must carry a UTF-16 BOM"
+    assert entry_raw.startswith(b"\xff\xfe"), "startup .vbs must carry a UTF-16LE BOM"
     entry_text = entry_raw.decode("utf-16")
     assert 'target = "' in entry_text
     assert str(script.with_suffix(".vbs")) in entry_text
-    assert task_text  # decoded cleanly
+    # Exactly one BOM, not a doubled one — the writer prepends U+FEFF and
+    # encodes with utf-16-LE (which adds none), so a future switch back to
+    # bare "utf-16" would show up here as b"\xff\xfe\xff\xfe".
+    assert not task_raw.startswith(b"\xff\xfe\xff\xfe")
+    assert not entry_raw.startswith(b"\xff\xfe\xff\xfe")
 
 
 def test_gateway_vbs_script_is_console_less(monkeypatch):
