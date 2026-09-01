@@ -196,7 +196,10 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     const rawDisplayContent = transcriptContent(
       message.display_kind,
-      timelineDisplayContent(message, displayContentForMessage(message.role, content))
+      timelineDisplayContent(
+        message,
+        displayContentForMessage(message.display_kind === 'internal_notification' ? 'system' : message.role, content)
+      )
     )
 
     const displayRole =

@@ -450,6 +450,22 @@ describe('toChatMessages', () => {
     ])
   })
 
+  it('preserves opaque internal-notification content that resembles user attachment context', () => {
+    const content = '[SYSTEM: Background process finished]\n\n--- Attached Context ---\n\n@file:diagnostics.log'
+
+    const [message] = toChatMessages([
+      {
+        role: 'user',
+        content,
+        display_kind: 'internal_notification',
+        timestamp: 1
+      }
+    ])
+
+    expect(message.role).toBe('system')
+    expect(chatMessageText(message)).toBe(content)
+  })
+
   // A backend older than this app serves display_metadata as unparsed JSON
   // text. Indexing into that string used to throw and fail the whole resume.
   it.each([
