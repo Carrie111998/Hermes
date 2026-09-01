@@ -252,6 +252,36 @@ def _run_and_exit_oneshot(
         _exit_after_oneshot(rc)
 
 
+def _apply_oneshot_working_dir(args) -> None:
+    """Apply the explicit ``--in`` directory before one-shot startup.
+
+    Top-level ``-z`` bypasses :func:`cmd_chat`; keeping this in a small helper
+    makes the workspace boundary testable and prevents file tools from seeing
+    a different cwd than prompt/plugin discovery.
+    """
+    in_dir = getattr(args, "in_dir", None)
+    if not in_dir:
+        return
+    from tools.environments.local import _msys_to_windows_path
+
+    target = os.path.abspath(os.path.expanduser(_msys_to_windows_path(in_dir)))
+    if not os.path.isdir(target):
+        print(f"Error: --in directory not found: {in_dir}")
+        raise SystemExit(1)
+    try:
+        os.chdir(target)
+    except OSError as exc:
+        print(f"Error: cannot enter --in directory {in_dir}: {exc}")
+        raise SystemExit(1)
+    # Cwd-aware tools consult these explicit runtime anchors rather than only
+    # ``os.getcwd()``. Seed both so one-shot prompt context and terminal/file
+    # execution resolve the same workspace even when config was imported
+    # before the CLI parsed ``--in``.
+    os.environ["TERMINAL_CWD"] = target
+    os.environ["HERMES_CWD"] = target
+    args.no_restore_cwd = True
+
+
 def _project_root_str_fast() -> str:
     return _startup_fast.project_root_str()
 
@@ -12862,6 +12892,8 @@ def _try_fast_chat_launch() -> bool:
 
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
+    if getattr(args, "oneshot", None) and getattr(args, "in_dir", None):
+        _apply_oneshot_working_dir(args)
     _prepare_agent_startup(args)
 
     if getattr(args, "oneshot", None):
@@ -12920,6 +12952,9 @@ def _try_termux_fast_cli_launch() -> bool:
     if getattr(args, "version", False):
         _print_version_info(check_updates=True)
         return True
+
+    if getattr(args, "oneshot", None) and getattr(args, "in_dir", None):
+        _apply_oneshot_working_dir(args)
 
     if getattr(args, "oneshot", None):
         _prepare_agent_startup(args)
@@ -14915,6 +14950,13 @@ def main():
     # so introspection/management commands (hermes hooks list, cron
     # list, gateway status, mcp add, ...) don't pay discovery cost or
     # trigger consent prompts for hooks the user is still inspecting.
+    # One-shot mode bypasses cmd_chat, so apply its explicit workspace before
+    # plugin discovery and prompt construction. Without this, ``-z --in DIR``
+    # can discover tools in one cwd while file tools resolve writes in the
+    # process cwd (a dangerous workspace-confinement mismatch).
+    if getattr(args, "oneshot", None) and getattr(args, "in_dir", None):
+        _apply_oneshot_working_dir(args)
+
     _prepare_agent_startup(args)
 
     # Handle top-level --oneshot / -z: single-shot mode, stdout = final
