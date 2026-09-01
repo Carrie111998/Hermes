@@ -127,6 +127,7 @@ def healthy_inputs() -> dict[str, Any]:
             },
         },
         "catalog_scan_seconds": 30,
+        "sidebar_enabled": True,
         "hydration_enabled": True,
         "claude_visibility_enabled": True,
     }
@@ -461,6 +462,7 @@ def test_active_hydration_lease_is_a_fact_not_a_defect() -> None:
 @pytest.mark.parametrize(
     ("flag", "queue_name"),
     [
+        ("sidebar_enabled", "sidebar_registration"),
         ("hydration_enabled", "sidebar_hydration"),
         ("claude_visibility_enabled", "claude_visibility"),
     ],
@@ -479,6 +481,7 @@ def test_disabled_optional_feature_is_explicit_not_failure(
 @pytest.mark.parametrize(
     ("flag", "timestamp", "queue_name"),
     [
+        ("sidebar_enabled", "sidebar_observed_at", "sidebar_registration"),
         ("hydration_enabled", "hydration_observed_at", "sidebar_hydration"),
         (
             "claude_visibility_enabled",
@@ -839,6 +842,7 @@ def test_invalid_source_observation_poison_owned_axes_and_summaries(
 @pytest.mark.parametrize(
     ("flag", "queue_name"),
     [
+        ("sidebar_enabled", "sidebar_registration"),
         ("hydration_enabled", "sidebar_hydration"),
         ("claude_visibility_enabled", "claude_visibility"),
     ],
@@ -855,6 +859,44 @@ def test_malformed_optional_feature_flag_remains_required_unknown(
     assert work["code"] == "invalid_feature_flag"
     assert work["required_for_service_impact"] is True
     assert evidence["service_impact_summary"]["state"] == "unknown"
+
+
+def test_disabled_sidebar_lane_reports_retired_not_readable_backlog() -> None:
+    # 2026-09-01 regression: with the lane retired, the ~517 rows parked in
+    # state.db can never drain, and the pre-fix hardcoded feature_flag=True
+    # rendered that permanent backlog as "work_state_readable" -- green because
+    # the counts were readable, not because anything knew the lane was off.
+    inputs = healthy_inputs()
+    inputs["sidebar_enabled"] = False
+    inputs["sidebar_status"]["counts"]["sidebar_pending"] = 517
+    queue = build_session_health_evidence(**inputs)["queues"]["sidebar_registration"]
+    work = queue["work_state"]
+    assert work["state"] == "healthy"
+    assert work["code"] == "optional_feature_disabled"
+    assert work["required_for_service_impact"] is False
+    assert work["lifecycle_context"] == "not_applicable"
+    # The parked counts stay legible -- the tray detail string is built from them,
+    # so the retirement must not blank the numbers it renders.
+    assert work["counts"]["sidebar_pending"]["value"] == 517
+    ledger = queue["ledger_integrity"]
+    assert ledger["state"] == "healthy"
+    assert ledger["code"] == "optional_feature_disabled"
+    assert ledger["required_for_service_impact"] is False
+
+
+def test_disabled_sidebar_lane_outranks_blocking_failures() -> None:
+    # feature_flag False is evaluated BEFORE _queue_current_failure, so a retired
+    # lane never raises the queue row to error. Same semantics sidebar_hydration
+    # already has; pinned so the precedence is a decision, not an accident.
+    inputs = healthy_inputs()
+    inputs["sidebar_enabled"] = False
+    inputs["sidebar_status"]["blocking_failed_count"] = 2
+    inputs["sidebar_status"]["counts"]["sidebar_failed"] = 2
+    work = build_session_health_evidence(**inputs)["queues"][
+        "sidebar_registration"
+    ]["work_state"]
+    assert work["state"] == "healthy"
+    assert work["code"] == "optional_feature_disabled"
 
 
 def test_sidebar_blocking_count_is_current_without_synthetic_blocker() -> None:

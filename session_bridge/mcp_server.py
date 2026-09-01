@@ -539,6 +539,7 @@ def create_app(
             hydration_status=hydration_status,
             claude_visibility_status=visibility_status,
             catalog_scan_seconds=config.service.catalog_scan_seconds,
+            sidebar_enabled=config.sidebar.enabled,
             hydration_enabled=config.sidebar.legacy_hydration_enabled,
             claude_visibility_enabled=visibility.enabled,
         )
