@@ -34,8 +34,13 @@ export const WS_HEARTBEAT_INTERVAL_MS = Math.max(
   5000,
   parseInt(process.env.HERMES_TUI_HEARTBEAT_INTERVAL_MS ?? '15000', 10) || 15000
 )
+// The dead window must exceed the interval: a pairing like interval=20000 with
+// dead=15000 would let every ack expire before the next heartbeat is sent,
+// tripping the dead check on a healthy socket. Keep a 15s floor and otherwise
+// derive the floor from the interval so the pairing stays self-consistent.
 export const WS_HEARTBEAT_DEAD_MS = Math.max(
   15000,
+  WS_HEARTBEAT_INTERVAL_MS + 5000,
   parseInt(process.env.HERMES_TUI_HEARTBEAT_DEAD_MS ?? '45000', 10) || 45000
 )
 // Exponential backoff for reconnect attempts after a transport drop.
