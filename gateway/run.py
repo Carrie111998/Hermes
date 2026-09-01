@@ -9876,7 +9876,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         while self._running:
             try:
-                if drain_requested():
+                # drain_requested() does a synchronous read_text() on the
+                # marker file. At this 1s cadence that puts a blocking disk
+                # read on the event loop ~86k times a day; when the host is
+                # under I/O pressure a single read can stall for 30s+ and
+                # take every platform heartbeat down with it. Off-thread it.
+                if await asyncio.to_thread(drain_requested):
                     self._enter_external_drain()
                     # API and cron work live outside messaging's
                     # _running_agents map. Refresh the aggregate while an
@@ -33424,8 +33429,34 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     return True
 
 
+def _guard_corrupt_user_config() -> None:
+    """Fail closed when the active profile's config.yaml cannot be parsed.
+
+    The gateway is a fully non-interactive surface: nobody is present to
+    repair a corrupt ``config.yaml``, and silently continuing on built-in
+    defaults lets provider auto-detection adopt credentials from ``.env``
+    that the config never named (issue #81952). Same policy and escape
+    hatch (``HERMES_IGNORE_USER_CONFIG=1``) as the non-interactive CLI
+    guard in ``hermes_cli/main.py``.
+    """
+    from hermes_cli.config import (
+        InvalidUserConfigError,
+        require_parseable_user_config,
+    )
+
+    try:
+        require_parseable_user_config()
+    except InvalidUserConfigError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+
 def main():
     """CLI entry point for the gateway."""
+    # Refuse to start on a corrupt config.yaml — before any config-dependent
+    # startup (watchdog, DB opens, provider resolution). See _guard docstring.
+    _guard_corrupt_user_config()
+
     # Advertise the agent harness to child processes (AI_AGENT is the
     # cross-agent standard; HERMES_AGENT the Hermes-specific marker — see
     # _advertise_agent_env in hermes_cli/main.py, kept inline here to avoid
