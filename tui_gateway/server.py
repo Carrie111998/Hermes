@@ -11927,7 +11927,7 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
             provenance += f" — reviewer @{reviewer}"
         if implementer:
             provenance += f" → implementer @{implementer}"
-        return f"🛑 {board_tag}Kanban {task_id} review requested changes/BLOCK: {reason_text}{provenance}"
+        return f"🛑 {board_tag}{tag}Kanban {task_id} review requested changes/BLOCK: {reason_text}{provenance}"
     if kind == "block_loop_detected":
         reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
         recurrences = payload.get("recurrences")

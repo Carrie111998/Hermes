@@ -313,6 +313,7 @@ class TestFormatKanbanEventText:
         assert "missing tests" in text
         assert "reviewer @reviewer" in text
         assert "implementer @worker" in text
+        assert "@worker" in text  # assignee tag, like every sibling branch
 
     def test_changes_requested_without_reason_falls_back(self):
         ev = SimpleNamespace(kind="changes_requested", payload={})
