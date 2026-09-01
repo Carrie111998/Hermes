@@ -1409,3 +1409,62 @@ class TestApiServerEnvOverride:
         assert config.platforms[Platform.API_SERVER].enabled is False
         # The key is still wired through for the shared listener.
         assert config.platforms[Platform.API_SERVER].extra.get("key") == api_server_key
+
+
+class TestEnvCredentialDoesNotOverrideExplicitDisable:
+    """Credential env vars must not force-enable a platform the user disabled.
+
+    Telegram/Slack/API-server already honoured the ``_enabled_explicit``
+    marker; the SMS / Home Assistant / Email / WeCom / WeCom-callback / Weixin
+    blocks set ``enabled = True`` unconditionally whenever their credential
+    env var was present, silently overriding an explicit
+    ``platforms.<name>.enabled: false`` in config.yaml (#96499). All six now
+    route through the same ``_enable_from_env`` guard.
+    """
+
+    CASES = [
+        (Platform.SMS, {"TWILIO_ACCOUNT_SID": "AC123", "TWILIO_AUTH_TOKEN": "tok"}),
+        (Platform.HOMEASSISTANT, {"HASS_TOKEN": "tok"}),
+        (
+            Platform.EMAIL,
+            {
+                "EMAIL_ADDRESS": "a@b.c",
+                "EMAIL_PASSWORD": "pw",
+                "EMAIL_IMAP_HOST": "imap.b.c",
+                "EMAIL_SMTP_HOST": "smtp.b.c",
+            },
+        ),
+        (Platform.WECOM, {"WECOM_BOT_ID": "id", "WECOM_SECRET": "sec"}),
+        (
+            Platform.WECOM_CALLBACK,
+            {"WECOM_CALLBACK_CORP_ID": "cid", "WECOM_CALLBACK_CORP_SECRET": "sec"},
+        ),
+        (Platform.WEIXIN, {"WEIXIN_TOKEN": "tok", "WEIXIN_ACCOUNT_ID": "acc"}),
+    ]
+
+    def test_explicit_disabled_stays_disabled_with_credentials_present(self):
+        for platform, env in self.CASES:
+            config = GatewayConfig(
+                platforms={
+                    platform: PlatformConfig(
+                        enabled=False, extra={"_enabled_explicit": True}
+                    )
+                }
+            )
+            with patch.dict(os.environ, env, clear=True):
+                _apply_env_overrides(config)
+
+            assert config.platforms[platform].enabled is False, (
+                f"{platform.value}: credential env vars must not override an "
+                "explicit enabled: false"
+            )
+
+    def test_non_explicit_platform_still_auto_enables_from_env(self):
+        # Control: without the explicit-disable marker, env credentials keep
+        # auto-enabling the platform (pre-existing behaviour).
+        for platform, env in self.CASES:
+            config = GatewayConfig(platforms={platform: PlatformConfig(enabled=False)})
+            with patch.dict(os.environ, env, clear=True):
+                _apply_env_overrides(config)
+
+            assert config.platforms[platform].enabled is True, platform.value

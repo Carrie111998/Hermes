@@ -2248,10 +2248,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     # Home Assistant
     hass_token = getenv("HASS_TOKEN")
     if hass_token:
-        if Platform.HOMEASSISTANT not in config.platforms:
-            config.platforms[Platform.HOMEASSISTANT] = PlatformConfig()
-        config.platforms[Platform.HOMEASSISTANT].enabled = True
-        config.platforms[Platform.HOMEASSISTANT].token = hass_token
+        hass_cfg = _enable_from_env(Platform.HOMEASSISTANT)
+        hass_cfg.token = hass_token
         hass_url = getenv("HASS_URL")
         if hass_url:
             config.platforms[Platform.HOMEASSISTANT].extra["url"] = hass_url
@@ -2262,10 +2260,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     email_imap = getenv("EMAIL_IMAP_HOST")
     email_smtp = getenv("EMAIL_SMTP_HOST")
     if all([email_addr, email_pwd, email_imap, email_smtp]):
-        if Platform.EMAIL not in config.platforms:
-            config.platforms[Platform.EMAIL] = PlatformConfig()
-        config.platforms[Platform.EMAIL].enabled = True
-        config.platforms[Platform.EMAIL].extra.update({
+        email_cfg = _enable_from_env(Platform.EMAIL)
+        email_cfg.extra.update({
             "address": email_addr,
             "imap_host": email_imap,
             "smtp_host": email_smtp,
@@ -2282,10 +2278,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     # SMS (Twilio)
     twilio_sid = getenv("TWILIO_ACCOUNT_SID")
     if twilio_sid:
-        if Platform.SMS not in config.platforms:
-            config.platforms[Platform.SMS] = PlatformConfig()
-        config.platforms[Platform.SMS].enabled = True
-        config.platforms[Platform.SMS].api_key = getenv("TWILIO_AUTH_TOKEN", "")
+        sms_cfg = _enable_from_env(Platform.SMS)
+        sms_cfg.api_key = getenv("TWILIO_AUTH_TOKEN", "")
     sms_home = getenv("SMS_HOME_CHANNEL")
     if sms_home and Platform.SMS in config.platforms:
         config.platforms[Platform.SMS].home_channel = HomeChannel(
@@ -2458,10 +2452,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     wecom_bot_id = getenv("WECOM_BOT_ID")
     wecom_secret = getenv("WECOM_SECRET")
     if wecom_bot_id and wecom_secret:
-        if Platform.WECOM not in config.platforms:
-            config.platforms[Platform.WECOM] = PlatformConfig()
-        config.platforms[Platform.WECOM].enabled = True
-        config.platforms[Platform.WECOM].extra.update({
+        wecom_cfg = _enable_from_env(Platform.WECOM)
+        wecom_cfg.extra.update({
             "bot_id": wecom_bot_id,
             "secret": wecom_secret,
         })
@@ -2481,10 +2473,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     wecom_callback_corp_id = getenv("WECOM_CALLBACK_CORP_ID")
     wecom_callback_corp_secret = getenv("WECOM_CALLBACK_CORP_SECRET")
     if wecom_callback_corp_id and wecom_callback_corp_secret:
-        if Platform.WECOM_CALLBACK not in config.platforms:
-            config.platforms[Platform.WECOM_CALLBACK] = PlatformConfig()
-        config.platforms[Platform.WECOM_CALLBACK].enabled = True
-        config.platforms[Platform.WECOM_CALLBACK].extra.update({
+        wecom_callback_cfg = _enable_from_env(Platform.WECOM_CALLBACK)
+        wecom_callback_cfg.extra.update({
             "corp_id": wecom_callback_corp_id,
             "corp_secret": wecom_callback_corp_secret,
             "agent_id": getenv("WECOM_CALLBACK_AGENT_ID", ""),
@@ -2501,9 +2491,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     weixin_token = getenv("WEIXIN_TOKEN")
     weixin_account_id = getenv("WEIXIN_ACCOUNT_ID")
     if weixin_token or weixin_account_id:
-        if Platform.WEIXIN not in config.platforms:
-            config.platforms[Platform.WEIXIN] = PlatformConfig()
-        config.platforms[Platform.WEIXIN].enabled = True
+        weixin_cfg = _enable_from_env(Platform.WEIXIN)
         if weixin_token:
             config.platforms[Platform.WEIXIN].token = weixin_token
         extra = config.platforms[Platform.WEIXIN].extra
