@@ -5,6 +5,7 @@ import {
   SiHomeassistant,
   SiLine,
   SiMattermost,
+  SiNtfy,
   SiQq,
   SiSignal,
   SiTelegram,
@@ -16,14 +17,11 @@ import { forwardRef, memo } from 'react'
 
 import bluebubblesIconUrl from '@/assets/brand/bluebubbles-icon.svg'
 import dingtalkIconUrl from '@/assets/brand/dingtalk-icon.png'
-import feishuIconUrl from '@/assets/brand/feishu-icon.png'
+import larkIconUrl from '@/assets/brand/lark-icon.svg'
 import matrixIconUrl from '@/assets/brand/matrix-icon.svg'
-import ntfyIconUrl from '@/assets/brand/ntfy-icon.png'
-import raftIconUrl from '@/assets/brand/raft-icon.svg'
 import slackIconUrl from '@/assets/brand/slack-logo.svg'
 import teamsIconUrl from '@/assets/brand/teams-icon.svg'
 import wecomIconUrl from '@/assets/brand/wecom-official.svg'
-import yuanbaoIconUrl from '@/assets/brand/yuanbao-official.png'
 import { AvatarChip } from '@/components/ui/avatar-chip'
 import { Globe, Link as LinkIcon, MessageSquareText } from '@/lib/icons'
 
@@ -33,6 +31,23 @@ function PhotonIcon(props: React.SVGProps<SVGSVGElement>) {
       <rect height="10" rx="1.25" transform="rotate(15 14 7.5)" width="2.5" x="12.75" y="2.5" />
       <rect height="10" rx="1.25" transform="rotate(15 8 13)" width="2.5" x="6.75" y="8" />
       <rect height="10" rx="1.25" transform="rotate(15 16 18)" width="2.5" x="14.75" y="13" />
+    </svg>
+  )
+}
+
+// Raft's official mark is two offset workspace panels bridged by a diagonal
+// handoff. This compact one-color redraw preserves that silhouette at 14px
+// without bundling the proprietary website asset or its wordmark treatment.
+function RaftIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg fill="none" viewBox="0 0 24 24" {...props}>
+      <path
+        d="M5.25 5.75 17.8 3.55c1.05-.18 2 .62 2 1.68v4.1c0 .83-.6 1.54-1.42 1.68l-2.4.42M18.75 18.25 6.2 20.45a1.7 1.7 0 0 1-2-1.68v-4.1c0-.83.6-1.54 1.42-1.68l2.4-.42M8.25 16.75l7.5-9.5"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="2.2"
+      />
     </svg>
   )
 }
@@ -126,17 +141,24 @@ function GraphWebhookIcon(props: React.SVGProps<SVGSVGElement>) {
   )
 }
 
+function YuanbaoIcon(props: React.SVGProps<SVGSVGElement>) {
+  return (
+    <svg fill="currentColor" fillRule="evenodd" viewBox="0 0 24 24" {...props}>
+      <path d="M12.014.648c-6.628 0-12 5.09-12 11.367 0 6.277 5.372 11.366 12 11.366s12-5.09 12-11.366c0-6.277-5.372-11.367-12-11.367zm5.849 15.481c-4.305 3.1-10.584 2.523-13.481-1.444-2.86-3.918-1.351-9.703 2.685-13.02-1.866 1.676-2.67 5.01-1.282 6.909 1.471 2.015 4.794 1.746 6.958.113 2.435-1.84 6.036-1.794 7.234.954.91 2.208.067 4.93-2.114 6.487v.001z" />
+      <path d="M14.81 14.914a.669.669 0 0 1-.536-.269l-1.02-1.37a.67.67 0 0 1 .005-.807l1.021-1.328a.669.669 0 0 1 1.06.814l-.713.926.72.964a.67.67 0 0 1-.534 1.067l-.002.003zM10.877 12.913c0 1.797-.357 2.135-1.162 2.135-.805 0-1.162-.338-1.162-2.135 0-1.798.357-2.136 1.162-2.136.805 0 1.162.338 1.162 2.136z" />
+    </svg>
+  )
+}
+
 type IconKind = 'brand' | 'generic'
 
 interface PlatformIconSpec {
   Icon?: ComponentType<SVGProps<SVGSVGElement>>
-  asset?: string
-  assetClassName?: string
-  assetMask?: boolean
   color: string
   backgroundColor?: string
   glyphColor?: string
   kind: IconKind
+  mask?: string
   monochrome?: boolean
   monogram?: string
 }
@@ -144,51 +166,48 @@ interface PlatformIconSpec {
 const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   telegram: { Icon: SiTelegram, color: '#26A5E4', kind: 'brand' },
   discord: { Icon: SiDiscord, color: '#5865F2', kind: 'brand' },
-  slack: { asset: slackIconUrl, color: '#4A154B', kind: 'brand' },
-  mattermost: { Icon: SiMattermost, color: '#0058CC', kind: 'brand' },
+  slack: { color: '#6B5870', kind: 'brand', mask: slackIconUrl },
+  mattermost: { Icon: SiMattermost, color: '#496FA6', kind: 'brand' },
   matrix: {
-    asset: matrixIconUrl,
-    assetClassName: 'dark:invert',
     backgroundColor: '#F7F7F5',
     color: '#000000',
     kind: 'brand',
+    mask: matrixIconUrl,
     monochrome: true
   },
   signal: { Icon: SiSignal, color: '#3A76F0', kind: 'brand' },
   whatsapp: { Icon: SiWhatsapp, color: '#25D366', kind: 'brand' },
-  bluebubbles: { asset: bluebubblesIconUrl, color: '#27AE60', kind: 'brand' },
-  photon: { Icon: PhotonIcon, color: '#6366F1', kind: 'brand' },
-  homeassistant: { Icon: SiHomeassistant, color: '#18BCF2', kind: 'brand' },
-  google_chat: { Icon: SiGooglechat, color: '#34A853', kind: 'brand' },
+  bluebubbles: { color: '#5F8292', kind: 'brand', mask: bluebubblesIconUrl },
+  photon: { Icon: PhotonIcon, color: '#6D759E', kind: 'brand' },
+  homeassistant: { Icon: SiHomeassistant, color: '#4C9AB0', kind: 'brand' },
+  google_chat: { Icon: SiGooglechat, color: '#5C916B', kind: 'brand' },
   irc: { Icon: IrcIcon, color: '#64748B', kind: 'generic' },
-  line: { Icon: SiLine, color: '#00C300', kind: 'brand' },
-  ntfy: { asset: ntfyIconUrl, color: '#317F6F', kind: 'brand' },
-  raft: { asset: raftIconUrl, color: '#19CBD2', kind: 'brand' },
-  simplex: { Icon: SimplexChannelIcon, color: '#1484FF', kind: 'generic' },
-  teams: { asset: teamsIconUrl, color: '#6264A7', kind: 'brand' },
+  line: { Icon: SiLine, color: '#4E9B79', kind: 'brand' },
+  ntfy: { Icon: SiNtfy, color: '#5D8E84', kind: 'brand' },
+  raft: { Icon: RaftIcon, color: '#7A685D', kind: 'brand' },
+  simplex: { Icon: SimplexChannelIcon, color: '#668BB2', kind: 'generic' },
+  teams: { color: '#74789E', kind: 'brand', mask: teamsIconUrl },
   email: { Icon: SiGmail, color: '#EA4335', kind: 'brand' },
   sms: { Icon: MessageSquareText, color: '#F43F5E', kind: 'generic' },
   webhook: { Icon: LinkIcon, color: '#71717A', kind: 'generic' },
   api_server: { Icon: Globe, color: '#64748B', kind: 'generic' },
-  weixin: { Icon: SiWechat, color: '#07C160', kind: 'brand' },
-  wecom: { asset: wecomIconUrl, color: '#2BAD13', kind: 'brand' },
-  wecom_callback: { asset: wecomIconUrl, color: '#2BAD13', kind: 'brand' },
+  weixin: { Icon: SiWechat, color: '#3A9B6D', kind: 'brand' },
+  wecom: { color: '#5B9A63', kind: 'brand', mask: wecomIconUrl },
+  wecom_callback: { color: '#5B9A63', kind: 'brand', mask: wecomIconUrl },
   dingtalk: {
-    asset: dingtalkIconUrl,
-    assetMask: true,
-    backgroundColor: '#0089FF',
-    color: '#0089FF',
-    glyphColor: '#FFFFFF',
-    kind: 'brand'
+    color: '#5F89B5',
+    glyphColor: '#5F89B5',
+    kind: 'brand',
+    mask: dingtalkIconUrl
   },
-  qqbot: { Icon: SiQq, color: '#EB1923', kind: 'brand' },
-  yuanbao: { asset: yuanbaoIconUrl, color: '#3370FF', kind: 'brand' },
+  qqbot: { Icon: SiQq, color: '#B45D66', kind: 'brand' },
+  yuanbao: { Icon: YuanbaoIcon, color: '#63A886', kind: 'brand' },
   a2a: { Icon: A2AIcon, color: '#64748B', kind: 'generic' },
-  buzz: { Icon: BuzzIcon, color: '#E0A31A', kind: 'generic' },
-  feishu: { asset: feishuIconUrl, color: '#3370FF', kind: 'brand' },
+  buzz: { Icon: BuzzIcon, color: '#B28A4C', kind: 'generic' },
+  feishu: { color: '#6689B2', kind: 'brand', mask: larkIconUrl },
   relay: { Icon: RelayIcon, color: '#64748B', kind: 'generic' },
-  whatsapp_cloud: { Icon: SiWhatsapp, color: '#25D366', kind: 'brand' },
-  msgraph_webhook: { Icon: GraphWebhookIcon, color: '#6264A7', kind: 'generic' }
+  whatsapp_cloud: { Icon: SiWhatsapp, color: '#5A9B78', kind: 'brand' },
+  msgraph_webhook: { Icon: GraphWebhookIcon, color: '#74789E', kind: 'generic' }
 }
 
 interface PlatformAvatarProps extends Omit<ComponentPropsWithoutRef<'span'>, 'children'> {
@@ -205,31 +224,23 @@ export const PlatformAvatar = memo(
 
     return (
       <AvatarChip brand={spec} className={className} name={platformName} ref={ref} {...rest}>
-        {spec?.asset ? (
-          spec.assetMask ? (
-            <span
-              aria-hidden
-              className="size-[58%] bg-white"
-              data-dingtalk-wing=""
-              style={{
-                maskImage: `url(${spec.asset})`,
-                WebkitMaskImage: `url(${spec.asset})`,
-                maskPosition: 'center',
-                WebkitMaskPosition: 'center',
-                maskRepeat: 'no-repeat',
-                WebkitMaskRepeat: 'no-repeat',
-                maskSize: 'contain',
-                WebkitMaskSize: 'contain'
-              }}
-            />
-          ) : (
-            <img
-              alt=""
-              aria-hidden
-              className={`size-[58%] object-contain ${spec.assetClassName ?? ''}`}
-              src={spec.asset}
-            />
-          )
+        {spec?.mask ? (
+          <span
+            aria-hidden
+            className="size-[58%]"
+            data-platform-glyph="mask"
+            style={{
+              backgroundColor: spec.glyphColor ?? spec.color,
+              maskImage: `url(${spec.mask})`,
+              WebkitMaskImage: `url(${spec.mask})`,
+              maskPosition: 'center',
+              WebkitMaskPosition: 'center',
+              maskRepeat: 'no-repeat',
+              WebkitMaskRepeat: 'no-repeat',
+              maskSize: 'contain',
+              WebkitMaskSize: 'contain'
+            }}
+          />
         ) : undefined}
       </AvatarChip>
     )

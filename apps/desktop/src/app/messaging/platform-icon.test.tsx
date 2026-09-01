@@ -30,8 +30,8 @@ describe('PlatformAvatar brand glyphs', () => {
   ])('renders a real mark for %s', (platformId, platformName) => {
     const { container } = render(<PlatformAvatar platformId={platformId} platformName={platformName} />)
 
-    expect(container.querySelector('svg, img, [data-dingtalk-wing]')).toBeTruthy()
-    expect(screen.queryByText(platformName.charAt(0))).toBeNull()
+    expect(container.querySelector('svg, [data-platform-glyph="mask"]')).toBeTruthy()
+    expect(container.querySelector('img')).toBeNull()
   })
 
   it('keeps the initial fallback for an unknown platform', () => {
@@ -41,12 +41,12 @@ describe('PlatformAvatar brand glyphs', () => {
     expect(screen.getByText('C')).toBeTruthy()
   })
 
-  it('uses a solid blue field and only the DingTalk wing', () => {
+  it('uses the shared low-saturation field and colored DingTalk mark', () => {
     const { container } = render(<PlatformAvatar platformId="dingtalk" platformName="DingTalk" />)
     const chip = container.querySelector('span')
 
-    expect(chip?.getAttribute('style')).toContain('background-color: rgb(0, 137, 255)')
-    expect(chip?.querySelector('span')).toBeTruthy()
+    expect(chip?.getAttribute('style')).not.toContain('background-color: rgb(0, 137, 255)')
+    expect(chip?.querySelector('[data-platform-glyph="mask"]')).toBeTruthy()
     expect(chip?.querySelector('img')).toBeNull()
   })
 
@@ -55,6 +55,6 @@ describe('PlatformAvatar brand glyphs', () => {
     const chip = container.querySelector('span')
 
     expect(chip?.getAttribute('style')).toContain('background-color: rgb(247, 247, 245)')
-    expect(chip?.querySelector('img')).toBeTruthy()
+    expect(chip?.querySelector('[data-platform-glyph="mask"]')).toBeTruthy()
   })
 })
