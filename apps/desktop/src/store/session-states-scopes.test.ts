@@ -45,6 +45,13 @@ describe('liveSessionScopes', () => {
     expect(liveSessionScopes()).toEqual(new Set(['conn:local::default']))
   })
 
+  it('keeps an awaiting-response session before the backend reports busy', () => {
+    recordSessionEventScope({ connectionId: 'local', profile: 'chiefy', session_id: 'rt-awaiting' })
+    publishSessionState('rt-awaiting', state({ busy: false, awaitingResponse: true }))
+
+    expect(liveSessionScopes()).toEqual(new Set(['conn:local::chiefy']))
+  })
+
   it('includes needs-input sessions and drops settled ones', () => {
     recordSessionEventScope({ connectionId: 'homelab', profile: 'default', session_id: 'rt-1' })
     publishSessionState('rt-1', state({ busy: false, needsInput: true }))

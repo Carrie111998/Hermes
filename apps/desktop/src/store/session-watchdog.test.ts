@@ -216,6 +216,15 @@ describe('computed $workingSessionIds', () => {
     expect($workingSessionIds.get()).toEqual([])
   })
 
+  it('treats an awaiting response as working before busy arrives', () => {
+    publishSessionState(
+      'rt-awaiting',
+      state({ awaitingResponse: true, busy: false, storedSessionId: 's-awaiting' })
+    )
+
+    expect($workingSessionIds.get()).toContain('s-awaiting')
+  })
+
   it('reflects busy sessions under the id their surfaces key on', () => {
     publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
     publishSessionState('rt2', state({ busy: false, storedSessionId: 's2' }))
