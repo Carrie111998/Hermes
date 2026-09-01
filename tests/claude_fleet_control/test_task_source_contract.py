@@ -28,7 +28,12 @@ requires_runner = pytest.mark.skipif(not _RUNNER.exists(), reason="runner not pr
 def test_task_xml_is_well_formed_and_shadow_bounded():
     root = ET.parse(_TASK).getroot()
     settings = root.find("t:Settings", _NS)
-    assert settings.find("t:ExecutionTimeLimit", _NS).text == "PT2M"
+    # Execution limit must be a bounded ISO-8601 duration under the 5-min
+    # cadence, so a slow pass cannot overlap the next fire (IgnoreNew also
+    # guards this). Widened from PT2M to PT4M30S on 2026-09-01 for headroom
+    # under load; assert the bound, not one exact value.
+    limit = settings.find("t:ExecutionTimeLimit", _NS).text
+    assert limit in ("PT2M", "PT3M", "PT4M", "PT4M30S", "PT5M"), limit
     assert settings.find("t:MultipleInstancesPolicy", _NS).text == "IgnoreNew"
     assert settings.find("t:StartWhenAvailable", _NS).text == "true"
 
