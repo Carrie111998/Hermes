@@ -40,7 +40,11 @@ from gateway.hosted_room_messaging import (
 )
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
-from hermes_cli.commands import resolve_command
+from hermes_cli.commands import (
+    is_interrupt_then_dispatch,
+    resolve_command,
+    should_bypass_active_session,
+)
 from tui_gateway.hosted_room_service import HostedRoomService
 
 
@@ -338,8 +342,12 @@ def _seed_classic_projection(home, *, room_id="classic-room"):
 
 def test_room_commands_are_gateway_dispatchable_without_interrupting_agent():
     group = resolve_command("group")
-    assert group is not None and group.gateway_only and group.busy_policy == "dispatch"
+    assert group is not None
+    assert group.gateway_only is True
+    assert group.busy_policy == "dispatch"
     assert group.subcommands == ()
+    assert should_bypass_active_session("group") is True
+    assert is_interrupt_then_dispatch("group") is False
     assert resolve_command("groups") is None
     assert resolve_command("rooms") is None
 
