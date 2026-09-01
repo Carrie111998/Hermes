@@ -12,6 +12,8 @@ Covers the fail-closed contract end to end without network access:
 
 import asyncio
 import json
+import os
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -387,10 +389,12 @@ class StubBridgeClient:
 
     def __init__(self, delivered=True, status=200):
         self.calls = []
+        self.apis = []
         self._result = (delivered, status)
 
-    async def reply(self, session_id, permission_id, response):
+    async def reply(self, session_id, permission_id, response, api="legacy"):
         self.calls.append((session_id, permission_id, response))
+        self.apis.append(api)
         return self._result
 
     async def aclose(self):
@@ -613,3 +617,383 @@ class TestDiscordPromptFlow:
         # exec-approval prompt contract.
         assert "rm -rf build/" in sent["content"]
         assert sent["view"] is not None
+
+
+# ---------------------------------------------------------------------------
+# OpenCode >= 1.18: permission.asked / v2 reply endpoint
+# ---------------------------------------------------------------------------
+
+
+def _asked_event(permission_id="req-1", session_id="ses-abc", **overrides):
+    props = {
+        "id": permission_id,
+        "sessionID": session_id,
+        "permission": "bash",
+        "patterns": ["cat ~/foo"],
+        "always": ["cat *"],
+        "metadata": {"command": "cat ~/foo"},
+    }
+    props.update(overrides)
+    return {"type": "permission.asked", "properties": props}
+
+
+class TestPermissionAskedEvent:
+    def test_asked_event_parses_as_v2(self):
+        request = parse_permission_event(_asked_event())
+        assert request is not None
+        assert request.reply_api == "v2"
+        assert request.kind == "bash"
+        assert request.title == "cat ~/foo"
+        assert request.pattern == "cat ~/foo"
+        assert request.is_guard is False
+
+    def test_asked_event_without_command_uses_patterns(self):
+        request = parse_permission_event(_asked_event(metadata={}, patterns=["a", "b"]))
+        assert request.title == "a, b"
+
+    @pytest.mark.asyncio
+    async def test_v2_reply_uses_permission_endpoint(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(204)
+
+        client = OpenCodeBridgeClient("http://127.0.0.1:4096", transport=httpx.MockTransport(handler))
+        delivered, status = await client.reply("ses-1", "req-1", "once", "v2")
+        await client.aclose()
+        assert delivered is True
+        assert status == 204
+        assert seen["path"] == "/permission/req-1/reply"
+        assert seen["body"] == {"reply": "once"}
+
+    @pytest.mark.asyncio
+    async def test_bridge_routes_v2_request_to_v2_api(self):
+        bridge, channel, stub = _make_bridge()
+        request = parse_permission_event(_asked_event())
+        await bridge._post_prompt(request)
+        outcome = await bridge.resolve(request, "once", "discord")
+        assert outcome == "delivered"
+        assert stub.apis == ["v2"]
+
+
+# ---------------------------------------------------------------------------
+# Command-guard spool (befehlswaechter.js / Claude Code hook counterpart)
+# ---------------------------------------------------------------------------
+
+from plugins.platforms.discord.opencode_bridge import (  # noqa: E402
+    GUARD_DECISION_TTL_SECONDS,
+    GuardSpool,
+    parse_guard_request,
+)
+
+NOW = 1_800_000_000.0
+
+
+def _guard_payload(**overrides):
+    payload = {
+        "version": 1,
+        "id": "abcdef12-3456",
+        "agent": "opencode",
+        "created_at": NOW,
+        "expires_at": NOW + 300,
+        "session_id": "ses-guard-1",
+        "project": "/Users/me/Projekt",
+        "command": "cat ~/Notizen/todo.md",
+        "path": "/Users/me/Notizen/todo.md",
+        "access": "lesen",
+    }
+    payload.update(overrides)
+    return payload
+
+
+class TestGuardRequestParsing:
+    def test_valid_request_parses(self):
+        request = parse_guard_request(_guard_payload(), now=NOW)
+        assert request is not None
+        assert request.is_guard is True
+        assert request.permission_id == "abcdef12-3456"
+        assert request.session_id == "ses-guard-1"
+        assert request.command == "cat ~/Notizen/todo.md"
+        assert request.path == "/Users/me/Notizen/todo.md"
+        assert request.project == "/Users/me/Projekt"
+        assert request.access == "lesen"
+        assert request.agent == "opencode"
+        assert request.expires_at == NOW + 300
+
+    def test_missing_session_becomes_dash(self):
+        payload = _guard_payload()
+        del payload["session_id"]
+        assert parse_guard_request(payload, now=NOW).session_id == "-"
+
+    @pytest.mark.parametrize("overrides", [
+        {"version": 2},
+        {"id": "short"},
+        {"id": "has space in it"},
+        {"id": "../../etc/passwd"},
+        {"agent": "unknown-agent"},
+        {"command": ""},
+        {"command": 42},
+        {"path": ""},
+        {"access": "alles"},
+        {"expires_at": NOW - 1},
+        {"expires_at": NOW + 7200},
+        {"expires_at": NOW - 10, "created_at": NOW - 20},
+        {"created_at": True, "expires_at": True},
+        {"created_at": "now"},
+    ])
+    def test_unclear_requests_are_refused(self, overrides):
+        assert parse_guard_request(_guard_payload(**overrides), now=NOW) is None
+
+    def test_non_dict_refused(self):
+        assert parse_guard_request("nope", now=NOW) is None
+        assert parse_guard_request(None, now=NOW) is None
+
+
+def _write_request(spool, payload, name=None):
+    spool.ensure()
+    target = spool.requests_dir / f"{name or payload['id']}.json"
+    target.write_text(json.dumps(payload), encoding="utf-8")
+    return target
+
+
+class TestGuardSpool:
+    def test_scan_returns_valid_request(self, tmp_path):
+        spool = GuardSpool(str(tmp_path))
+        _write_request(spool, _guard_payload())
+        found = spool.scan(now=NOW)
+        assert [r.permission_id for r in found] == ["abcdef12-3456"]
+
+    def test_scan_ignores_malformed_and_logs_once(self, tmp_path, caplog):
+        spool = GuardSpool(str(tmp_path))
+        _write_request(spool, _guard_payload(access="alles"))
+        with caplog.at_level("WARNING"):
+            assert spool.scan(now=NOW) == []
+            assert spool.scan(now=NOW) == []
+        assert sum("malformed guard request" in r.message for r in caplog.records) == 1
+        # the file stays (the guard removes it after its own timeout)
+        assert (spool.requests_dir / "abcdef12-3456.json").exists()
+
+    def test_scan_ignores_id_mismatch(self, tmp_path):
+        spool = GuardSpool(str(tmp_path))
+        _write_request(spool, _guard_payload(), name="zzzzzzzz-0000")
+        assert spool.scan(now=NOW) == []
+
+    def test_scan_drops_expired_file(self, tmp_path):
+        spool = GuardSpool(str(tmp_path))
+        target = _write_request(spool, _guard_payload(expires_at=NOW - 5, created_at=NOW - 60))
+        assert spool.scan(now=NOW) == []
+        assert not target.exists()
+
+    def test_scan_skips_non_json_and_bad_names(self, tmp_path):
+        spool = GuardSpool(str(tmp_path))
+        spool.ensure()
+        (spool.requests_dir / ".tmp-abcdef12-3456").write_text("{}", encoding="utf-8")
+        (spool.requests_dir / "bad name.json").write_text(json.dumps(_guard_payload()), encoding="utf-8")
+        (spool.requests_dir / "notes.txt").write_text("hi", encoding="utf-8")
+        assert spool.scan(now=NOW) == []
+
+    def test_scan_ignores_symlinked_request(self, tmp_path):
+        spool = GuardSpool(str(tmp_path))
+        spool.ensure()
+        real = tmp_path / "outside.json"
+        real.write_text(json.dumps(_guard_payload()), encoding="utf-8")
+        (spool.requests_dir / "abcdef12-3456.json").symlink_to(real)
+        assert spool.scan(now=NOW) == []
+
+    def test_scan_skips_already_decided(self, tmp_path):
+        spool = GuardSpool(str(tmp_path))
+        _write_request(spool, _guard_payload())
+        spool.write_decision("abcdef12-3456", "once", "discord", now=NOW)
+        assert spool.scan(now=NOW) == []
+
+    def test_write_decision_is_json_with_contract(self, tmp_path):
+        spool = GuardSpool(str(tmp_path))
+        spool.write_decision("abcdef12-3456", "once", "discord", now=NOW)
+        decision = json.loads((spool.decisions_dir / "abcdef12-3456.json").read_text())
+        assert decision == {
+            "version": 1,
+            "id": "abcdef12-3456",
+            "decision": "once",
+            "source": "discord",
+            "decided_at": NOW,
+        }
+        assert not any(n.startswith(".tmp-") for n in os.listdir(spool.decisions_dir))
+
+    def test_write_decision_never_emits_always(self, tmp_path):
+        spool = GuardSpool(str(tmp_path))
+        spool.write_decision("abcdef12-3456", "always", "discord", now=NOW)
+        decision = json.loads((spool.decisions_dir / "abcdef12-3456.json").read_text())
+        assert decision["decision"] == "reject"
+
+    def test_write_decision_refuses_bad_id(self, tmp_path):
+        spool = GuardSpool(str(tmp_path))
+        with pytest.raises(ValueError):
+            spool.write_decision("../escape", "once", "discord")
+
+    def test_sweep_removes_orphaned_decisions(self, tmp_path):
+        spool = GuardSpool(str(tmp_path))
+        spool.write_decision("abcdef12-3456", "reject", "timeout", now=NOW)
+        target = spool.decisions_dir / "abcdef12-3456.json"
+        old = time.time() - GUARD_DECISION_TTL_SECONDS - 10
+        os.utime(target, (old, old))
+        spool.sweep()
+        assert not target.exists()
+
+    def test_sweep_keeps_fresh_decisions(self, tmp_path):
+        spool = GuardSpool(str(tmp_path))
+        spool.write_decision("abcdef12-3456", "reject", "timeout")
+        spool.sweep()
+        assert (spool.decisions_dir / "abcdef12-3456.json").exists()
+
+
+def _make_guard_bridge(tmp_path):
+    channel = FakeChannel()
+    stub = StubBridgeClient()
+    config = _bridge_config(guard_dir=str(tmp_path))
+    assert config.guard_enabled and config.guard_dir == str(tmp_path)
+    bridge = OpenCodeBridge(FakeAdapter(channel), config, client=stub)
+    return bridge, channel, stub
+
+
+def _read_decision(bridge, request_id):
+    path = bridge.spool.decisions_dir / f"{request_id}.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
+
+class TestGuardPromptFlow:
+    @pytest.mark.asyncio
+    async def test_request_file_becomes_german_prompt(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _guard_payload(expires_at=time.time() + 300, created_at=time.time()))
+        posted = await bridge.poll_guard_spool_once()
+        await _drain()
+
+        assert posted == 1
+        sent = channel.sent[0]
+        content = sent["content"]
+        assert "Befehlswächter" in content
+        assert "cat ~/Notizen/todo.md" in content
+        assert "/Users/me/Notizen/todo.md" in content
+        assert "/Users/me/Projekt" in content
+        assert "lesen" in content
+        assert "OpenCode" in content
+        labels = [child.label for child in sent["view"].children]
+        assert labels == ["Einmal erlauben", "Ablehnen"]
+        assert sent["view"].timeout <= 300
+
+    @pytest.mark.asyncio
+    async def test_second_poll_does_not_repost(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _guard_payload(expires_at=time.time() + 300, created_at=time.time()))
+        await bridge.poll_guard_spool_once()
+        await bridge.poll_guard_spool_once()
+        assert len(channel.sent) == 1
+
+    @pytest.mark.asyncio
+    async def test_accept_writes_once_decision_and_never_calls_api(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _guard_payload(expires_at=time.time() + 300, created_at=time.time()))
+        await bridge.poll_guard_spool_once()
+        view = channel.sent[0]["view"]
+        interaction = _interaction("111", message=FakeMessage(embeds=[channel.sent[0]["embed"]]))
+        from plugins.platforms.discord.opencode_bridge import _get_view_class
+        await _get_view_class().accept(view, interaction, None)
+        await _drain()
+
+        decision = _read_decision(bridge, "abcdef12-3456")
+        assert decision["decision"] == "once"
+        assert decision["source"] == "discord"
+        assert stub.calls == []
+        assert all(child.disabled for child in view.children)
+        assert interaction.response.calls[0][1]["embed"].footer.text == "Einmal erlaubt"
+
+    @pytest.mark.asyncio
+    async def test_reject_writes_reject_decision(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _guard_payload(expires_at=time.time() + 300, created_at=time.time()))
+        await bridge.poll_guard_spool_once()
+        view = channel.sent[0]["view"]
+        interaction = _interaction("111", message=FakeMessage(embeds=[channel.sent[0]["embed"]]))
+        from plugins.platforms.discord.opencode_bridge import _get_view_class
+        await _get_view_class().reject(view, interaction, None)
+        await _drain()
+
+        assert _read_decision(bridge, "abcdef12-3456")["decision"] == "reject"
+        assert interaction.response.calls[0][1]["embed"].footer.text == "Abgelehnt"
+
+    @pytest.mark.asyncio
+    async def test_timeout_writes_reject(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _guard_payload(expires_at=time.time() + 300, created_at=time.time()))
+        await bridge.poll_guard_spool_once()
+        view = channel.sent[0]["view"]
+        await view.on_timeout()
+        await _drain()
+
+        decision = _read_decision(bridge, "abcdef12-3456")
+        assert decision["decision"] == "reject"
+        assert decision["source"] == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_click_writes_nothing(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _guard_payload(expires_at=time.time() + 300, created_at=time.time()))
+        await bridge.poll_guard_spool_once()
+        view = channel.sent[0]["view"]
+        interaction = _interaction("999", message=FakeMessage())
+        from plugins.platforms.discord.opencode_bridge import _get_view_class
+        await _get_view_class().accept(view, interaction, None)
+        await _drain()
+
+        assert _read_decision(bridge, "abcdef12-3456") is None
+        assert interaction.response.calls[0][0] == "send"
+
+    @pytest.mark.asyncio
+    async def test_double_click_writes_exactly_one_decision(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _guard_payload(expires_at=time.time() + 300, created_at=time.time()))
+        await bridge.poll_guard_spool_once()
+        view = channel.sent[0]["view"]
+        embeds = [channel.sent[0]["embed"]]
+        from plugins.platforms.discord.opencode_bridge import _get_view_class
+        await _get_view_class().reject(view, _interaction("111", message=FakeMessage(embeds=embeds)), None)
+        second = _interaction("111", message=FakeMessage(embeds=embeds))
+        await _get_view_class().accept(view, second, None)
+        await _drain()
+
+        assert _read_decision(bridge, "abcdef12-3456")["decision"] == "reject"
+        assert second.response.calls[0][0] == "send"
+
+    @pytest.mark.asyncio
+    async def test_malformed_request_is_never_answered(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _guard_payload(access="alles", expires_at=time.time() + 300, created_at=time.time()))
+        posted = await bridge.poll_guard_spool_once()
+        assert posted == 0
+        assert channel.sent == []
+        assert _read_decision(bridge, "abcdef12-3456") is None
+
+    @pytest.mark.asyncio
+    async def test_parallel_guard_requests_are_independent(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        now = time.time()
+        _write_request(bridge.spool, _guard_payload(id="aaaaaaaa-0001", expires_at=now + 300, created_at=now))
+        _write_request(bridge.spool, _guard_payload(id="bbbbbbbb-0002", expires_at=now + 300, created_at=now, access="schreiben"))
+        await bridge.poll_guard_spool_once()
+        assert len(channel.sent) == 2
+        from plugins.platforms.discord.opencode_bridge import _get_view_class
+        views = {sent["view"]._request.permission_id: sent["view"] for sent in channel.sent}
+        await _get_view_class().accept(views["aaaaaaaa-0001"], _interaction("111", message=FakeMessage(embeds=[channel.sent[0]["embed"]])), None)
+        await _get_view_class().reject(views["bbbbbbbb-0002"], _interaction("111", message=FakeMessage(embeds=[channel.sent[1]["embed"]])), None)
+        await _drain()
+        assert _read_decision(bridge, "aaaaaaaa-0001")["decision"] == "once"
+        assert _read_decision(bridge, "bbbbbbbb-0002")["decision"] == "reject"
+
+    @pytest.mark.asyncio
+    async def test_guard_disabled_config_has_no_spool(self, tmp_path):
+        channel = FakeChannel()
+        config = _bridge_config(guard_dir=str(tmp_path), guard_enabled=False)
+        bridge = OpenCodeBridge(FakeAdapter(channel), config, client=StubBridgeClient())
+        assert bridge.spool is None

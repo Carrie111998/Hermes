@@ -37,6 +37,41 @@ Out-of-repo counterpart: a small OpenCode plugin is only needed when the
 TUI is not attached; any OpenCode client (TUI, IDE, this bridge) answers
 through the same documented API above.  The bridge never writes OpenCode
 configuration and never bypasses OpenCode's own permission engine.
+
+OpenCode >= 1.18 additionally publishes the newer ``permission.asked``
+event (``{id, sessionID, permission, patterns, metadata, always}``) and
+answers on ``POST /permission/{requestID}/reply`` with ``{"reply": ..}``;
+both shapes are accepted and each is answered on its own endpoint.
+
+Command-guard spool (second request source)
+-------------------------------------------
+
+The out-of-repo OpenCode plugin ``befehlswaechter.js`` (and the matching
+Claude Code PreToolUse hook) cannot use OpenCode's permission engine for
+"path outside the project" decisions: a TUI running in auto mode answers
+every native permission with ``once`` before Discord ever sees it.  The
+guard therefore blocks the tool call itself and asks this bridge through a
+local, user-private spool directory (default ``$HERMES_HOME/opencode_bridge``):
+
+- ``requests/<id>.json`` — written atomically by the guard::
+
+      {"version": 1, "id": "<[A-Za-z0-9_-]{8,64}>", "agent": "opencode",
+       "created_at": <epoch s>, "expires_at": <epoch s>, "session_id": "..",
+       "project": "/abs/project", "command": "cat ~/x", "path": "/Users/..",
+       "access": "lesen" | "schreiben" | "ausführen" | "unklar"}
+
+- ``decisions/<id>.json`` — written atomically by this bridge::
+
+      {"version": 1, "id": "<id>", "decision": "once" | "reject",
+       "source": "discord" | "timeout" | "drop", "decided_at": <epoch s>}
+
+The guard polls for its decision file and denies on timeout, on a missing
+or malformed decision, and when the gateway is not running at all.  The
+bridge never answers a malformed or expired request (fail-closed: the
+guard's own timeout then blocks the command), only ever writes ``once`` or
+``reject``, and removes stale files on its scan cycle.  Only the request
+metadata the guard chose to send (command, path, project, access kind) is
+displayed; nothing is executed or read on the guard's behalf.
 """
 
 from __future__ import annotations
@@ -44,7 +79,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
+import tempfile
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from urllib.parse import urlsplit
 
@@ -78,8 +118,30 @@ SSE_RECONNECT_MAX_SECONDS = 60.0
 _TITLE_BUDGET = 400
 _PATTERN_BUDGET = 200
 _METADATA_BUDGET = 500
+_COMMAND_BUDGET = 600
+_PATH_BUDGET = 300
 
 _TRUNCT_SUFFIX = "... [truncated]"
+
+# Command-guard spool (see module docstring).
+GUARD_SPOOL_DIRNAME = "opencode_bridge"
+GUARD_REQUESTS_SUBDIR = "requests"
+GUARD_DECISIONS_SUBDIR = "decisions"
+GUARD_PROTOCOL_VERSION = 1
+GUARD_SCAN_INTERVAL_SECONDS = 1.0
+GUARD_MAX_LIFETIME_SECONDS = 3600  # a request may not ask to live longer
+GUARD_DECISION_TTL_SECONDS = 3600  # orphaned decisions are swept after this
+GUARD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+GUARD_AGENTS = {"opencode": "OpenCode", "claude-code": "Claude Code"}
+GUARD_ACCESS_KINDS = frozenset({"lesen", "schreiben", "ausführen", "unklar"})
+GUARD_SOURCE = "guard"
+SSE_SOURCE = "sse"
+
+
+def default_guard_dir() -> str:
+    """Spool root: ``$HERMES_HOME/opencode_bridge`` (or ``~/.hermes/...``)."""
+    home = os.environ.get("HERMES_HOME") or os.path.join(os.path.expanduser("~"), ".hermes")
+    return os.path.join(home, GUARD_SPOOL_DIRNAME)
 
 
 def _truncate(text: str, budget: int) -> str:
@@ -117,6 +179,11 @@ class OpenCodeBridgeConfig:
     allowed_user_ids: frozenset = frozenset()
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
     disabled_reason: str = ""
+    # Command-guard spool: on by default once the bridge itself is enabled;
+    # ``guard_enabled: false`` keeps only the SSE path, ``guard_dir``
+    # overrides the spool root.
+    guard_enabled: bool = True
+    guard_dir: str = ""
 
 
 def parse_bridge_config(extra: Any) -> OpenCodeBridgeConfig:
@@ -164,18 +231,30 @@ def parse_bridge_config(extra: Any) -> OpenCodeBridgeConfig:
         timeout_seconds = DEFAULT_TIMEOUT_SECONDS
     timeout_seconds = max(TIMEOUT_MIN_SECONDS, min(TIMEOUT_MAX_SECONDS, timeout_seconds))
 
+    guard_enabled = section.get("guard_enabled", True)
+    guard_enabled = guard_enabled if isinstance(guard_enabled, bool) else True
+    guard_dir = str(section.get("guard_dir") or "").strip() or default_guard_dir()
+
     return OpenCodeBridgeConfig(
         enabled=True,
         base_url=base_url,
         channel_id=channel_id,
         allowed_user_ids=allowed_user_ids,
         timeout_seconds=timeout_seconds,
+        guard_enabled=guard_enabled,
+        guard_dir=guard_dir,
     )
 
 
 @dataclass(frozen=True)
 class OpenCodePermissionRequest:
-    """One OpenCode permission request, parsed from ``permission.updated``."""
+    """One permission request awaiting a Discord decision.
+
+    ``source`` says where it came from and therefore how the decision is
+    delivered: ``"sse"`` requests are answered on the OpenCode server API
+    (``reply_api`` picks the legacy or the v2 endpoint), ``"guard"``
+    requests are answered through the spool's decisions directory.
+    """
 
     permission_id: str
     session_id: str
@@ -183,14 +262,27 @@ class OpenCodePermissionRequest:
     pattern: str = ""
     title: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
+    source: str = SSE_SOURCE
+    reply_api: str = "legacy"
+    # Guard-only display fields.
+    agent: str = "opencode"
+    command: str = ""
+    path: str = ""
+    project: str = ""
+    access: str = ""
+    expires_at: float = 0.0
 
     @property
     def short_session_id(self) -> str:
         return self.session_id[:12]
 
+    @property
+    def is_guard(self) -> bool:
+        return self.source == GUARD_SOURCE
+
 
 def parse_permission_event(payload: Any) -> Optional[OpenCodePermissionRequest]:
-    """Parse a ``permission.updated`` SSE payload into a request.
+    """Parse a ``permission.updated`` / ``permission.asked`` SSE payload.
 
     Returns None for anything that is not a well-formed permission
     request — malformed events are dropped (fail-closed), never guessed
@@ -198,7 +290,8 @@ def parse_permission_event(payload: Any) -> Optional[OpenCodePermissionRequest]:
     """
     if not isinstance(payload, dict):
         return None
-    if payload.get("type") != "permission.updated":
+    event_type = payload.get("type")
+    if event_type not in ("permission.updated", "permission.asked"):
         return None
     props = payload.get("properties")
     if not isinstance(props, dict):
@@ -209,21 +302,235 @@ def parse_permission_event(payload: Any) -> Optional[OpenCodePermissionRequest]:
         return None
     if not isinstance(session_id, str) or not session_id:
         return None
+    metadata = props.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+
+    if event_type == "permission.asked":
+        patterns = props.get("patterns")
+        if not isinstance(patterns, list):
+            patterns = []
+        pattern = ", ".join(str(p) for p in patterns)
+        command = metadata.get("command")
+        title = command if isinstance(command, str) and command.strip() else pattern
+        return OpenCodePermissionRequest(
+            permission_id=permission_id,
+            session_id=session_id,
+            kind=str(props.get("permission") or ""),
+            pattern=pattern,
+            title=title,
+            metadata=metadata,
+            reply_api="v2",
+        )
+
     pattern = props.get("pattern")
     if pattern is not None and not isinstance(pattern, str):
         if isinstance(pattern, list):
             pattern = ", ".join(str(p) for p in pattern)
         else:
             pattern = json.dumps(pattern)
-    metadata = props.get("metadata")
     return OpenCodePermissionRequest(
         permission_id=permission_id,
         session_id=session_id,
         kind=str(props.get("type") or ""),
         pattern=str(pattern) if pattern else "",
         title=str(props.get("title") or ""),
-        metadata=metadata if isinstance(metadata, dict) else {},
+        metadata=metadata,
     )
+
+
+def parse_guard_request(
+    payload: Any, *, now: Optional[float] = None
+) -> Optional[OpenCodePermissionRequest]:
+    """Validate one spool request file's JSON into a guard request.
+
+    Strict on purpose: anything unclear (wrong version, bad id, unknown
+    agent or access kind, missing command/path, implausible lifetime,
+    already expired) yields None and is never shown or answered — the
+    guard's own timeout then keeps the command blocked.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("version") != GUARD_PROTOCOL_VERSION:
+        return None
+    request_id = payload.get("id")
+    if not isinstance(request_id, str) or not GUARD_ID_RE.match(request_id):
+        return None
+    agent = payload.get("agent")
+    if agent not in GUARD_AGENTS:
+        return None
+    command = payload.get("command")
+    path = payload.get("path")
+    if not isinstance(command, str) or not command.strip():
+        return None
+    if not isinstance(path, str) or not path.strip():
+        return None
+    project = payload.get("project")
+    project = project if isinstance(project, str) else ""
+    access = payload.get("access")
+    if access not in GUARD_ACCESS_KINDS:
+        return None
+    created_at = payload.get("created_at")
+    expires_at = payload.get("expires_at")
+    if isinstance(created_at, bool) or isinstance(expires_at, bool):
+        return None
+    if not isinstance(created_at, (int, float)) or not isinstance(expires_at, (int, float)):
+        return None
+    if expires_at <= created_at or expires_at - created_at > GUARD_MAX_LIFETIME_SECONDS:
+        return None
+    current = time.time() if now is None else now
+    if expires_at <= current:
+        return None
+    session_id = payload.get("session_id")
+    session_id = session_id if isinstance(session_id, str) and session_id else "-"
+    return OpenCodePermissionRequest(
+        permission_id=request_id,
+        session_id=session_id,
+        kind="befehlswaechter",
+        title=command,
+        source=GUARD_SOURCE,
+        agent=str(agent),
+        command=command,
+        path=path,
+        project=project,
+        access=str(access),
+        expires_at=float(expires_at),
+    )
+
+
+class GuardSpool:
+    """Filesystem mailbox between the command guard and this bridge.
+
+    ``scan`` returns valid, unexpired, not-yet-seen requests; ``write_decision``
+    publishes exactly one decision file atomically (temp file + rename) so
+    the guard never reads a half-written JSON.  Everything lives under a
+    user-private (0700) directory; the bridge never follows symlinks out of
+    it and never executes anything it finds there.
+    """
+
+    def __init__(self, root: str) -> None:
+        self.root = Path(root)
+        self.requests_dir = self.root / GUARD_REQUESTS_SUBDIR
+        self.decisions_dir = self.root / GUARD_DECISIONS_SUBDIR
+        self._invalid: Set[str] = set()
+
+    def ensure(self) -> None:
+        for directory in (self.root, self.requests_dir, self.decisions_dir):
+            directory.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(directory, 0o700)
+            except OSError:  # pragma: no cover - best effort on odd filesystems
+                pass
+
+    def _request_path(self, request_id: str) -> Path:
+        return self.requests_dir / f"{request_id}.json"
+
+    def _decision_path(self, request_id: str) -> Path:
+        return self.decisions_dir / f"{request_id}.json"
+
+    def scan(self, *, now: Optional[float] = None) -> List[OpenCodePermissionRequest]:
+        """Return valid pending requests; drop expired files, remember bad ones."""
+        current = time.time() if now is None else now
+        found: List[OpenCodePermissionRequest] = []
+        try:
+            names = sorted(os.listdir(self.requests_dir))
+        except FileNotFoundError:
+            return found
+        present = set(names)
+        self._invalid &= present
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            request_id = name[: -len(".json")]
+            if not GUARD_ID_RE.match(request_id):
+                continue
+            file_path = self.requests_dir / name
+            if name in self._invalid:
+                continue
+            if file_path.is_symlink() or not file_path.is_file():
+                self._invalid.add(name)
+                continue
+            try:
+                payload = json.loads(file_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                # Possibly mid-write; a stale unreadable file is dropped once
+                # its own deadline (or the max lifetime) has passed.
+                self._drop_if_stale(file_path, current)
+                continue
+            request = parse_guard_request(payload, now=current)
+            if request is None or request.permission_id != request_id:
+                expires = payload.get("expires_at") if isinstance(payload, dict) else None
+                if isinstance(expires, (int, float)) and not isinstance(expires, bool) and expires <= current:
+                    self._unlink(file_path)
+                else:
+                    if name not in self._invalid:
+                        logger.warning("OpenCode bridge: ignoring malformed guard request %s", name)
+                    self._invalid.add(name)
+                continue
+            if self._decision_path(request_id).exists():
+                continue  # already answered, guard has not collected it yet
+            found.append(request)
+        return found
+
+    def _drop_if_stale(self, file_path: Path, now: float) -> None:
+        try:
+            age = now - file_path.stat().st_mtime
+        except OSError:
+            return
+        if age > GUARD_MAX_LIFETIME_SECONDS:
+            self._unlink(file_path)
+
+    def write_decision(
+        self, request_id: str, decision: str, source: str, *, now: Optional[float] = None
+    ) -> None:
+        if decision not in ("once", "reject"):
+            decision = "reject"
+        if not GUARD_ID_RE.match(request_id):
+            raise ValueError(f"invalid guard request id: {request_id!r}")
+        self.ensure()
+        payload = {
+            "version": GUARD_PROTOCOL_VERSION,
+            "id": request_id,
+            "decision": decision,
+            "source": source,
+            "decided_at": time.time() if now is None else now,
+        }
+        fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=self.decisions_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, self._decision_path(request_id))
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    def sweep(self, *, now: Optional[float] = None) -> None:
+        """Remove decisions nobody collected and leftover temp files."""
+        current = time.time() if now is None else now
+        try:
+            names = os.listdir(self.decisions_dir)
+        except FileNotFoundError:
+            return
+        for name in names:
+            file_path = self.decisions_dir / name
+            try:
+                age = current - file_path.stat().st_mtime
+            except OSError:
+                continue
+            if name.startswith(".tmp-") and age > 60:
+                self._unlink(file_path)
+            elif age > GUARD_DECISION_TTL_SECONDS:
+                self._unlink(file_path)
+
+    @staticmethod
+    def _unlink(file_path: Path) -> None:
+        try:
+            file_path.unlink()
+        except OSError:
+            pass
 
 
 class SseAssembler:
@@ -347,17 +654,24 @@ class OpenCodeBridgeClient:
             backoff = min(SSE_RECONNECT_MAX_SECONDS, backoff * 2)
 
     async def reply(
-        self, session_id: str, permission_id: str, response: str
+        self, session_id: str, permission_id: str, response: str, api: str = "legacy"
     ) -> tuple[bool, int]:
         """POST a permission reply. Returns (delivered, status_code).
 
+        ``api`` selects the endpoint the request was observed on: the
+        legacy session-scoped route (``permission.updated``) or the v2
+        ``/permission/{id}/reply`` route (``permission.asked``).
         ``delivered`` is False when OpenCode answered 4xx (notably 404 —
         the request was already answered by another client, e.g. the TUI).
         """
-        url = f"/session/{session_id}/permissions/{permission_id}"
-        resp = await self._client.post(url, json={"response": response})
-        if resp.status_code == 200:
-            return True, 200
+        if api == "v2":
+            url = f"/permission/{permission_id}/reply"
+            resp = await self._client.post(url, json={"reply": response})
+        else:
+            url = f"/session/{session_id}/permissions/{permission_id}"
+            resp = await self._client.post(url, json={"response": response})
+        if resp.status_code in (200, 204):
+            return True, resp.status_code
         logger.warning(
             "OpenCode bridge: reply %s/%s -> %s rejected (%s)",
             session_id, permission_id, response, resp.status_code,
@@ -383,12 +697,20 @@ class OpenCodeBridge:
         adapter: Any,
         config: OpenCodeBridgeConfig,
         client: Optional[OpenCodeBridgeClient] = None,
+        spool: Optional[GuardSpool] = None,
     ) -> None:
         self._adapter = adapter
         self._config = config
         self._client = client or OpenCodeBridgeClient(config.base_url)
         self._registry = BridgePendingRegistry()
         self._task: Optional[asyncio.Task] = None
+        self._guard_task: Optional[asyncio.Task] = None
+        if spool is not None:
+            self._spool: Optional[GuardSpool] = spool
+        elif config.guard_enabled and config.guard_dir:
+            self._spool = GuardSpool(config.guard_dir)
+        else:
+            self._spool = None
 
     @property
     def config(self) -> OpenCodeBridgeConfig:
@@ -398,9 +720,62 @@ class OpenCodeBridge:
     def registry(self) -> BridgePendingRegistry:
         return self._registry
 
+    @property
+    def spool(self) -> Optional[GuardSpool]:
+        return self._spool
+
     def start(self) -> None:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self.run())
+        if self._spool is not None and (self._guard_task is None or self._guard_task.done()):
+            self._guard_task = asyncio.create_task(self.run_guard_spool())
+
+    async def run_guard_spool(self) -> None:
+        """Poll the guard spool until cancelled; one prompt per new request."""
+        assert self._spool is not None
+        try:
+            self._spool.ensure()
+        except OSError as exc:
+            logger.warning("OpenCode bridge: guard spool %s unusable: %s", self._spool.root, exc)
+            return
+        logger.info(
+            "OpenCode bridge: watching guard spool %s for Discord channel %s",
+            self._spool.root, self._config.channel_id,
+        )
+        try:
+            while True:
+                await self.poll_guard_spool_once()
+                await asyncio.sleep(GUARD_SCAN_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            pass
+
+    async def poll_guard_spool_once(self) -> int:
+        """One scan cycle; returns how many prompts were posted."""
+        assert self._spool is not None
+        posted = 0
+        try:
+            requests = self._spool.scan()
+        except Exception as exc:  # pragma: no cover - defensive: keep polling
+            logger.warning("OpenCode bridge: guard spool scan failed: %s", exc)
+            return 0
+        for request in requests:
+            if self._registry.is_pending(request.permission_id):
+                continue
+            try:
+                if await self._post_prompt(request):
+                    posted += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "OpenCode bridge: failed to post guard prompt for %s: %s",
+                    request.permission_id, exc,
+                )
+        try:
+            self._spool.sweep()
+        except Exception:  # pragma: no cover - best effort housekeeping
+            pass
+        return posted
 
     async def run(self) -> None:
         """Consume the event stream until cancelled."""
@@ -426,21 +801,47 @@ class OpenCodeBridge:
             pass
 
     async def aclose(self) -> None:
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+        for task in (self._task, self._guard_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         self._task = None
+        self._guard_task = None
         await self._client.aclose()
 
     # ------------------------------------------------------------------
     # Discord prompt
     # ------------------------------------------------------------------
 
+    def _guard_prompt_text(self, request: OpenCodePermissionRequest) -> tuple[str, str]:
+        """German prompt for a command-guard request (command, path, project, access)."""
+        command = _truncate(request.command, _COMMAND_BUDGET).replace("```", "'''")
+        agent_label = GUARD_AGENTS.get(request.agent, request.agent)
+        remaining = max(1, int(round((request.expires_at - time.time()) / 60))) if request.expires_at else None
+        lines = [
+            "🛡️ **Befehlswächter: Zugriff außerhalb des Projekts**",
+            "",
+            f"**Agent:** {agent_label}",
+            "**Befehl:**",
+            f"```bash\n{command}\n```",
+            f"**Pfad:** `{_truncate(request.path, _PATH_BUDGET)}`",
+            f"**Projektordner:** `{_truncate(request.project or '-', _PATH_BUDGET)}`",
+            f"**Zugriff:** {request.access}",
+            f"**Session:** `{request.short_session_id}`",
+            "",
+            "**Einmal erlauben** lässt genau diesen Befehl einmal durch, **Ablehnen** blockiert ihn. "
+            + (f"Ohne Antwort innerhalb von etwa {remaining} min wird automatisch abgelehnt. " if remaining else "Ohne Antwort wird automatisch abgelehnt. ")
+            + "Dauerhafte Freigaben gibt es nicht.",
+        ]
+        return "\n".join(lines), f"```bash\n{command}\n```"
+
     def _prompt_text(self, request: OpenCodePermissionRequest) -> tuple[str, str]:
         """Return (plain content, embed description) for the request."""
+        if request.is_guard:
+            return self._guard_prompt_text(request)
         title = _truncate(request.title or "(no title)", _TITLE_BUDGET)
         kind = request.kind or "permission"
         lines = [
@@ -460,13 +861,14 @@ class OpenCodeBridge:
         embed_desc = f"```bash\n{title}\n```"
         return content, embed_desc
 
-    async def _post_prompt(self, request: OpenCodePermissionRequest) -> None:
+    async def _post_prompt(self, request: OpenCodePermissionRequest) -> bool:
+        """Post one Accept/Reject prompt; True when a message went out."""
         if not self._registry.register(request.permission_id):
-            return
+            return False
         client = self._adapter._client
         if client is None:
             self._registry.resolve(request.permission_id, "drop")
-            return
+            return False
         channel = client.get_channel(int(self._config.channel_id))
         if channel is None:
             channel = await client.fetch_channel(int(self._config.channel_id))
@@ -476,28 +878,52 @@ class OpenCodeBridge:
                 "OpenCode bridge: channel %s not found, dropping %s",
                 self._config.channel_id, request.permission_id,
             )
-            return
+            return False
 
         content, embed_desc = self._prompt_text(request)
-        metadata_line = ""
-        if request.metadata:
-            metadata_line = _truncate(json.dumps(request.metadata, default=str), _METADATA_BUDGET)
-        embed = discord.Embed(
-            title="🔐 OpenCode Permission",
-            description=embed_desc,
-            color=discord.Color.gold(),
-        )
-        if metadata_line:
-            embed.add_field(name="Details", value=f"```json\n{metadata_line}\n```", inline=False)
+        if request.is_guard:
+            embed = discord.Embed(
+                title="🛡️ Befehlswächter",
+                description=embed_desc,
+                color=discord.Color.gold(),
+            )
+            embed.add_field(name="Pfad", value=_truncate(request.path, _PATH_BUDGET), inline=False)
+            embed.add_field(name="Projektordner", value=_truncate(request.project or "-", _PATH_BUDGET), inline=False)
+            embed.add_field(name="Zugriff", value=request.access, inline=True)
+            embed.add_field(name="Agent", value=GUARD_AGENTS.get(request.agent, request.agent), inline=True)
+        else:
+            metadata_line = ""
+            if request.metadata:
+                metadata_line = _truncate(json.dumps(request.metadata, default=str), _METADATA_BUDGET)
+            embed = discord.Embed(
+                title="🔐 OpenCode Permission",
+                description=embed_desc,
+                color=discord.Color.gold(),
+            )
+            if metadata_line:
+                embed.add_field(name="Details", value=f"```json\n{metadata_line}\n```", inline=False)
 
+        timeout = self._config.timeout_seconds
+        if request.is_guard and request.expires_at:
+            # Never keep buttons alive past the guard's own deadline: the
+            # command is already denied by then, a late click must not
+            # look like it did anything.
+            timeout = max(1, min(timeout, int(request.expires_at - time.time())))
         view = _get_view_class()(
             bridge=self,
             request=request,
             allowed_user_ids=self._config.allowed_user_ids,
-            timeout=self._config.timeout_seconds,
+            timeout=timeout,
         )
-        msg = await channel.send(content=content, embed=embed, view=view)
+        try:
+            msg = await channel.send(content=content, embed=embed, view=view)
+        except BaseException:
+            # Nothing reached Discord: free the slot so the request is not
+            # stuck "pending" forever (the guard's own timeout denies it).
+            self._registry.resolve(request.permission_id, "drop")
+            raise
         view._message = msg
+        return True
 
     # ------------------------------------------------------------------
     # Resolution
@@ -520,9 +946,25 @@ class OpenCodeBridge:
             response = "reject"
         if not self._registry.resolve(request.permission_id, response):
             return "already-resolved"
+        if request.is_guard:
+            if self._spool is None:
+                return "reply-failed"
+            try:
+                self._spool.write_decision(request.permission_id, response, source)
+            except Exception as exc:
+                logger.error(
+                    "OpenCode bridge: writing guard decision for %s failed: %s",
+                    request.permission_id, exc,
+                )
+                return "reply-failed"
+            logger.info(
+                "OpenCode bridge: guard request %s answered %s (%s)",
+                request.permission_id, response, source,
+            )
+            return "delivered"
         try:
             delivered, status = await self._client.reply(
-                request.session_id, request.permission_id, response
+                request.session_id, request.permission_id, response, request.reply_api
             )
         except Exception as exc:
             logger.error(
@@ -573,6 +1015,12 @@ def _get_view_class():
             self._allowed_user_ids = allowed_user_ids
             self._message = None
             self._finished = False
+            if request.is_guard:
+                labels = {"Accept (once)": "Einmal erlauben", "Reject": "Ablehnen"}
+                for child in self.children:
+                    label = getattr(child, "label", None)
+                    if label in labels:
+                        child.label = labels[label]
 
         def _authorized(self, interaction: discord.Interaction) -> bool:
             user = getattr(interaction, "user", None)
@@ -582,14 +1030,19 @@ def _get_view_class():
         async def _answer(self, interaction: discord.Interaction, response: str) -> None:
             if not self._authorized(interaction):
                 await interaction.response.send_message(
-                    "You're not allowed to answer OpenCode permission requests~",
+                    "Du darfst diese Anfrage nicht beantworten."
+                    if self._request.is_guard
+                    else "You're not allowed to answer OpenCode permission requests~",
                     ephemeral=True,
                 )
                 return
             outcome = await self._bridge.resolve(self._request, response, "discord")
             if outcome == "already-resolved":
                 await interaction.response.send_message(
-                    "This request was already resolved~", ephemeral=True
+                    "Diese Anfrage wurde bereits beantwortet."
+                    if self._request.is_guard
+                    else "This request was already resolved~",
+                    ephemeral=True,
                 )
                 return
             await self._finalize(interaction, response, outcome)
@@ -617,11 +1070,17 @@ def _get_view_class():
                         if outcome == "delivered"
                         else discord.Color.dark_grey()
                     )
-                footer = {
-                    "delivered": f"{'Accepted (once)' if response == 'once' else 'Rejected'}",
-                    "resolved-elsewhere": "Already resolved by another OpenCode client",
-                    "reply-failed": "Reply to OpenCode failed — answer in OpenCode directly",
-                }.get(outcome, outcome)
+                if self._request.is_guard:
+                    footer = {
+                        "delivered": "Einmal erlaubt" if response == "once" else "Abgelehnt",
+                        "reply-failed": "Antwort konnte nicht abgelegt werden — der Befehl bleibt blockiert",
+                    }.get(outcome, outcome)
+                else:
+                    footer = {
+                        "delivered": f"{'Accepted (once)' if response == 'once' else 'Rejected'}",
+                        "resolved-elsewhere": "Already resolved by another OpenCode client",
+                        "reply-failed": "Reply to OpenCode failed — answer in OpenCode directly",
+                    }.get(outcome, outcome)
                 embed.set_footer(text=footer)
             try:
                 await interaction.response.edit_message(embed=embed, view=self)
@@ -639,7 +1098,11 @@ def _get_view_class():
             embed = msg.embeds[0] if msg.embeds else None
             if embed:
                 embed.color = discord.Color.dark_grey()
-                embed.set_footer(text="⏱ Timed out — rejected (fail-closed)")
+                embed.set_footer(
+                    text="⏱ Zeit abgelaufen — abgelehnt"
+                    if self._request.is_guard
+                    else "⏱ Timed out — rejected (fail-closed)"
+                )
             try:
                 await msg.edit(embed=embed, view=self)
             except Exception:
