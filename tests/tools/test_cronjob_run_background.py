@@ -45,6 +45,16 @@ def test_manual_run_delivery_lines_are_truthful_and_fail_closed():
     assert "saved locally only" in _manual_run_delivery_line("local", "suppressed")
 
 
+def test_manual_run_delivery_line_reports_acknowledged_incident_suppression():
+    from tools.cronjob_tools import _manual_run_delivery_line
+
+    line = _manual_run_delivery_line("matrix:room", "suppressed_acked")
+
+    assert "operator acknowledged the incident" in line
+    assert "failure alert was suppressed" in line
+    assert "outcome was not reported" not in line
+
+
 def test_manual_run_delivery_target_is_single_line_and_bounded():
     from tools.cronjob_tools import _manual_run_delivery_line
 
