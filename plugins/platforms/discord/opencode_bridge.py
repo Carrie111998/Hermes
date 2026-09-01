@@ -133,9 +133,21 @@ GUARD_MAX_LIFETIME_SECONDS = 3600  # a request may not ask to live longer
 GUARD_DECISION_TTL_SECONDS = 3600  # orphaned decisions are swept after this
 GUARD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 GUARD_AGENTS = {"opencode": "OpenCode", "claude-code": "Claude Code"}
-GUARD_ACCESS_KINDS = frozenset({"lesen", "schreiben", "ausführen", "unklar"})
+GUARD_ACCESS_KINDS = frozenset({"lesen", "schreiben", "ausführen", "netz", "unklar"})
 GUARD_SOURCE = "guard"
 SSE_SOURCE = "sse"
+# Request kinds: "permission" = one Accept/Reject decision (the original
+# command-guard shape, also used for Claude Code's own permission prompts);
+# "question" = a multiple-choice question set (Claude Code's AskUserQuestion)
+# answered with labels or free text.
+GUARD_KIND_PERMISSION = "permission"
+GUARD_KIND_QUESTION = "question"
+GUARD_MAX_QUESTIONS = 4
+GUARD_MAX_OPTIONS = 8
+_DETAILS_BUDGET = 900
+_QUESTION_BUDGET = 600
+_OPTION_LABEL_BUDGET = 80  # Discord button label limit
+_FREE_TEXT_BUDGET = 1500
 
 
 def default_guard_dir() -> str:
@@ -271,6 +283,10 @@ class OpenCodePermissionRequest:
     project: str = ""
     access: str = ""
     expires_at: float = 0.0
+    guard_kind: str = GUARD_KIND_PERMISSION
+    tool: str = ""
+    details: str = ""
+    questions: tuple = ()
 
     @property
     def short_session_id(self) -> str:
@@ -279,6 +295,10 @@ class OpenCodePermissionRequest:
     @property
     def is_guard(self) -> bool:
         return self.source == GUARD_SOURCE
+
+    @property
+    def is_question(self) -> bool:
+        return self.is_guard and self.guard_kind == GUARD_KIND_QUESTION
 
 
 def parse_permission_event(payload: Any) -> Optional[OpenCodePermissionRequest]:
@@ -358,17 +378,32 @@ def parse_guard_request(
     agent = payload.get("agent")
     if agent not in GUARD_AGENTS:
         return None
-    command = payload.get("command")
-    path = payload.get("path")
-    if not isinstance(command, str) or not command.strip():
-        return None
-    if not isinstance(path, str) or not path.strip():
+    kind = payload.get("kind", GUARD_KIND_PERMISSION)
+    if kind not in (GUARD_KIND_PERMISSION, GUARD_KIND_QUESTION):
         return None
     project = payload.get("project")
     project = project if isinstance(project, str) else ""
-    access = payload.get("access")
-    if access not in GUARD_ACCESS_KINDS:
-        return None
+    tool = payload.get("tool", "")
+    tool = tool if isinstance(tool, str) else ""
+    details = payload.get("details", "")
+    details = details if isinstance(details, str) else ""
+    questions: tuple = ()
+    if kind == GUARD_KIND_QUESTION:
+        questions = _parse_questions(payload.get("questions"))
+        if not questions:
+            return None
+        command = "; ".join(q["question"] for q in questions)
+        path, access = "-", "unklar"
+    else:
+        command = payload.get("command")
+        path = payload.get("path")
+        if not isinstance(command, str) or not command.strip():
+            return None
+        if not isinstance(path, str) or not path.strip():
+            return None
+        access = payload.get("access")
+        if access not in GUARD_ACCESS_KINDS:
+            return None
     created_at = payload.get("created_at")
     expires_at = payload.get("expires_at")
     if isinstance(created_at, bool) or isinstance(expires_at, bool):
@@ -394,7 +429,53 @@ def parse_guard_request(
         project=project,
         access=str(access),
         expires_at=float(expires_at),
+        guard_kind=str(kind),
+        tool=tool,
+        details=details,
+        questions=questions,
     )
+
+
+def _parse_questions(raw: Any) -> tuple:
+    """Validate an AskUserQuestion-style question list; () when unclear."""
+    if not isinstance(raw, list) or not 1 <= len(raw) <= GUARD_MAX_QUESTIONS:
+        return ()
+    out = []
+    seen: Set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            return ()
+        question = item.get("question")
+        if not isinstance(question, str) or not question.strip() or question in seen:
+            return ()
+        seen.add(question)
+        header = item.get("header", "")
+        header = header if isinstance(header, str) else ""
+        options_raw = item.get("options")
+        if not isinstance(options_raw, list) or not 1 <= len(options_raw) <= GUARD_MAX_OPTIONS:
+            return ()
+        options = []
+        labels: Set[str] = set()
+        for opt in options_raw:
+            if not isinstance(opt, dict):
+                return ()
+            label = opt.get("label")
+            if not isinstance(label, str) or not label.strip() or label in labels:
+                return ()
+            labels.add(label)
+            description = opt.get("description", "")
+            options.append({
+                "label": label,
+                "description": description if isinstance(description, str) else "",
+            })
+        multi = item.get("multiSelect", False)
+        out.append({
+            "question": question,
+            "header": header,
+            "options": tuple(options),
+            "multiSelect": multi if isinstance(multi, bool) else False,
+        })
+    return tuple(out)
 
 
 class GuardSpool:
@@ -480,20 +561,31 @@ class GuardSpool:
             self._unlink(file_path)
 
     def write_decision(
-        self, request_id: str, decision: str, source: str, *, now: Optional[float] = None
+        self,
+        request_id: str,
+        decision: str,
+        source: str,
+        *,
+        answers: Optional[Dict[str, Any]] = None,
+        now: Optional[float] = None,
     ) -> None:
-        if decision not in ("once", "reject"):
+        """Publish one decision: ``once``/``reject``, or ``answer`` with answers."""
+        if decision == "answer" and not isinstance(answers, dict):
+            decision = "reject"
+        if decision not in ("once", "reject", "answer"):
             decision = "reject"
         if not GUARD_ID_RE.match(request_id):
             raise ValueError(f"invalid guard request id: {request_id!r}")
         self.ensure()
-        payload = {
+        payload: Dict[str, Any] = {
             "version": GUARD_PROTOCOL_VERSION,
             "id": request_id,
             "decision": decision,
             "source": source,
             "decided_at": time.time() if now is None else now,
         }
+        if decision == "answer":
+            payload["answers"] = answers
         fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=self.decisions_dir)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -816,27 +908,83 @@ class OpenCodeBridge:
     # Discord prompt
     # ------------------------------------------------------------------
 
+    def _with_mentions(self, content: str) -> str:
+        """Prefix the allowlisted users so Discord notifies them.
+
+        A guard prompt that nobody notices simply times out and blocks the
+        agent's command (this happened in practice while the user was busy
+        in a thread); the ping is the cheapest fix.
+        """
+        mentions = " ".join(f"<@{uid}>" for uid in sorted(self._config.allowed_user_ids) if uid.isdigit())
+        return f"{mentions}\n{content}" if mentions else content
+
+    def _allowed_mentions(self) -> Any:
+        if not DISCORD_AVAILABLE:
+            return None
+        return discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=False)
+
+    @staticmethod
+    def _remaining_minutes(request: OpenCodePermissionRequest) -> Optional[int]:
+        if not request.expires_at:
+            return None
+        return max(1, int(round((request.expires_at - time.time()) / 60)))
+
     def _guard_prompt_text(self, request: OpenCodePermissionRequest) -> tuple[str, str]:
-        """German prompt for a command-guard request (command, path, project, access)."""
+        """German prompt for a command-guard / permission request."""
         command = _truncate(request.command, _COMMAND_BUDGET).replace("```", "'''")
         agent_label = GUARD_AGENTS.get(request.agent, request.agent)
-        remaining = max(1, int(round((request.expires_at - time.time()) / 60))) if request.expires_at else None
-        lines = [
-            "🛡️ **Befehlswächter: Zugriff außerhalb des Projekts**",
-            "",
-            f"**Agent:** {agent_label}",
-            "**Befehl:**",
-            f"```bash\n{command}\n```",
-            f"**Pfad:** `{_truncate(request.path, _PATH_BUDGET)}`",
-            f"**Projektordner:** `{_truncate(request.project or '-', _PATH_BUDGET)}`",
-            f"**Zugriff:** {request.access}",
+        remaining = self._remaining_minutes(request)
+        if request.tool:
+            heading = f"🛡️ **{agent_label} bittet um Erlaubnis: {_truncate(request.tool, 60)}**"
+        else:
+            heading = "🛡️ **Befehlswächter: Zugriff außerhalb des Projekts**"
+        lines = [heading, "", f"**Agent:** {agent_label}"]
+        if request.tool:
+            lines.append(f"**Werkzeug:** `{_truncate(request.tool, 60)}`")
+        lines += ["**Befehl:**", f"```bash\n{command}\n```"]
+        if request.details:
+            details = _truncate(request.details, _DETAILS_BUDGET).replace("```", "'''")
+            lines += ["**Details:**", f"```\n{details}\n```"]
+        if request.path and request.path != "-":
+            lines.append(f"**Pfad:** `{_truncate(request.path, _PATH_BUDGET)}`")
+        lines.append(f"**Projektordner:** `{_truncate(request.project or '-', _PATH_BUDGET)}`")
+        if request.access and request.access != "-":
+            lines.append(f"**Zugriff:** {request.access}")
+        lines += [
             f"**Session:** `{request.short_session_id}`",
             "",
-            "**Einmal erlauben** lässt genau diesen Befehl einmal durch, **Ablehnen** blockiert ihn. "
+            "**Einmal erlauben** lässt genau diese Aktion einmal durch, **Ablehnen** blockiert sie. "
             + (f"Ohne Antwort innerhalb von etwa {remaining} min wird automatisch abgelehnt. " if remaining else "Ohne Antwort wird automatisch abgelehnt. ")
             + "Dauerhafte Freigaben gibt es nicht.",
         ]
         return "\n".join(lines), f"```bash\n{command}\n```"
+
+    def _question_prompt_text(self, request: OpenCodePermissionRequest, index: int) -> str:
+        """German prompt for question ``index`` of a question request."""
+        q = request.questions[index]
+        agent_label = GUARD_AGENTS.get(request.agent, request.agent)
+        remaining = self._remaining_minutes(request)
+        total = len(request.questions)
+        counter = f" ({index + 1}/{total})" if total > 1 else ""
+        header = f" · {_truncate(q['header'], 60)}" if q.get("header") else ""
+        lines = [
+            f"❓ **{agent_label} fragt{counter}{header}**",
+            "",
+            _truncate(q["question"], _QUESTION_BUDGET),
+            "",
+        ]
+        for opt in q["options"]:
+            desc = f" — {_truncate(opt['description'], 200)}" if opt.get("description") else ""
+            lines.append(f"• **{_truncate(opt['label'], _OPTION_LABEL_BUDGET)}**{desc}")
+        lines += [
+            "",
+            f"**Projektordner:** `{_truncate(request.project or '-', _PATH_BUDGET)}` · **Session:** `{request.short_session_id}`",
+            "",
+            ("Mehrere Antworten möglich: anklicken und mit **Fertig** abschließen. " if q.get("multiSelect") else "Eine Antwort anklicken. ")
+            + "**Andere Antwort…** öffnet ein Textfeld. "
+            + (f"Ohne Antwort innerhalb von etwa {remaining} min wird die Frage abgebrochen." if remaining else "Ohne Antwort wird die Frage abgebrochen."),
+        ]
+        return "\n".join(lines)
 
     def _prompt_text(self, request: OpenCodePermissionRequest) -> tuple[str, str]:
         """Return (plain content, embed description) for the request."""
@@ -880,16 +1028,21 @@ class OpenCodeBridge:
             )
             return False
 
+        if request.is_question:
+            return await self._post_question_prompts(channel, request)
+
         content, embed_desc = self._prompt_text(request)
         if request.is_guard:
             embed = discord.Embed(
-                title="🛡️ Befehlswächter",
+                title="🛡️ Befehlswächter" if not request.tool else f"🛡️ Erlaubnis: {_truncate(request.tool, 60)}",
                 description=embed_desc,
                 color=discord.Color.gold(),
             )
-            embed.add_field(name="Pfad", value=_truncate(request.path, _PATH_BUDGET), inline=False)
+            if request.path and request.path != "-":
+                embed.add_field(name="Pfad", value=_truncate(request.path, _PATH_BUDGET), inline=False)
             embed.add_field(name="Projektordner", value=_truncate(request.project or "-", _PATH_BUDGET), inline=False)
-            embed.add_field(name="Zugriff", value=request.access, inline=True)
+            if request.access and request.access != "-":
+                embed.add_field(name="Zugriff", value=request.access, inline=True)
             embed.add_field(name="Agent", value=GUARD_AGENTS.get(request.agent, request.agent), inline=True)
         else:
             metadata_line = ""
@@ -915,14 +1068,50 @@ class OpenCodeBridge:
             allowed_user_ids=self._config.allowed_user_ids,
             timeout=timeout,
         )
+        if request.is_guard:
+            content = self._with_mentions(content)
         try:
-            msg = await channel.send(content=content, embed=embed, view=view)
+            msg = await channel.send(
+                content=content, embed=embed, view=view, allowed_mentions=self._allowed_mentions()
+            )
         except BaseException:
             # Nothing reached Discord: free the slot so the request is not
             # stuck "pending" forever (the guard's own timeout denies it).
             self._registry.resolve(request.permission_id, "drop")
             raise
         view._message = msg
+        return True
+
+    async def _post_question_prompts(self, channel: Any, request: OpenCodePermissionRequest) -> bool:
+        """One message per question; the set resolves once all are answered."""
+        timeout = self._config.timeout_seconds
+        if request.expires_at:
+            timeout = max(1, min(timeout, int(request.expires_at - time.time())))
+        session = QuestionSession(self, request)
+        view_class, _ = _get_question_classes()
+        views = []
+        try:
+            for index in range(len(request.questions)):
+                view = view_class(
+                    session=session,
+                    index=index,
+                    allowed_user_ids=self._config.allowed_user_ids,
+                    timeout=timeout,
+                )
+                content = self._question_prompt_text(request, index)
+                if index == 0:
+                    content = self._with_mentions(content)
+                msg = await channel.send(
+                    content=content, view=view, allowed_mentions=self._allowed_mentions()
+                )
+                view._message = msg
+                views.append(view)
+        except BaseException:
+            self._registry.resolve(request.permission_id, "drop")
+            for view in views:
+                view.stop()
+            raise
+        session.views = views
         return True
 
     # ------------------------------------------------------------------
@@ -934,15 +1123,19 @@ class OpenCodeBridge:
         request: OpenCodePermissionRequest,
         response: str,
         source: str,
+        answers: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Resolve a request and deliver the reply to OpenCode.
+        """Resolve a request and deliver the reply.
 
-        ``response`` is ``"once"`` or ``"reject"``. Returns a short
-        outcome label the caller renders in Discord. First-wins: a late
-        click after another client (TUI) answered or the timeout fired
-        never double-posts a reply.
+        ``response`` is ``"once"`` or ``"reject"`` (``"answer"`` with
+        ``answers`` for question requests). Returns a short outcome label
+        the caller renders in Discord. First-wins: a late click after
+        another client (TUI) answered or the timeout fired never
+        double-posts a reply.
         """
-        if response not in ("once", "reject"):
+        if response == "answer" and not (request.is_question and isinstance(answers, dict)):
+            response = "reject"
+        if response not in ("once", "reject", "answer"):
             response = "reject"
         if not self._registry.resolve(request.permission_id, response):
             return "already-resolved"
@@ -950,7 +1143,7 @@ class OpenCodeBridge:
             if self._spool is None:
                 return "reply-failed"
             try:
-                self._spool.write_decision(request.permission_id, response, source)
+                self._spool.write_decision(request.permission_id, response, source, answers=answers)
             except Exception as exc:
                 logger.error(
                     "OpenCode bridge: writing guard decision for %s failed: %s",
@@ -982,7 +1175,201 @@ class OpenCodeBridge:
         return "delivered"
 
 
+class QuestionSession:
+    """Collects the answers of one question request across its messages.
+
+    First complete answer set wins; a timeout on any unanswered question
+    rejects the whole request (the agent then gets no answers at all
+    rather than a partial, misleading set).
+    """
+
+    def __init__(self, bridge: OpenCodeBridge, request: OpenCodePermissionRequest) -> None:
+        self.bridge = bridge
+        self.request = request
+        self.answers: Dict[str, Any] = {}
+        self.views: List[Any] = []
+        self.finished = False
+
+    @property
+    def complete(self) -> bool:
+        return len(self.answers) == len(self.request.questions)
+
+    async def answer(self, index: int, value: Any) -> str:
+        """Record one answer; returns the outcome once the set is complete."""
+        if self.finished:
+            return "already-resolved"
+        question = self.request.questions[index]["question"]
+        self.answers[question] = value
+        if not self.complete:
+            return "pending"
+        self.finished = True
+        outcome = await self.bridge.resolve(self.request, "answer", "discord", answers=dict(self.answers))
+        for view in self.views:
+            view.stop()
+        return outcome
+
+    async def abort(self, source: str) -> str:
+        if self.finished:
+            return "already-resolved"
+        self.finished = True
+        outcome = await self.bridge.resolve(self.request, "reject", source)
+        for view in self.views:
+            view.stop()
+        return outcome
+
+
 _VIEW_CLASS = None
+_QUESTION_CLASSES = None
+
+
+def _get_question_classes():
+    """Build (once) the question view and free-text modal; requires discord.py."""
+    global _QUESTION_CLASSES
+    if _QUESTION_CLASSES is not None:
+        return _QUESTION_CLASSES
+    if not DISCORD_AVAILABLE:
+        raise RuntimeError("discord.py is not installed")
+
+    class FreeTextModal(discord.ui.Modal):
+        """Free-text answer for one question ("Andere Antwort…")."""
+
+        def __init__(self, view: "QuestionView") -> None:
+            super().__init__(title=_truncate(view.question["header"] or "Andere Antwort", 45))
+            self._view = view
+            self.text = discord.ui.TextInput(
+                label="Antwort",
+                style=discord.TextStyle.paragraph,
+                max_length=_FREE_TEXT_BUDGET,
+                required=True,
+            )
+            self.add_item(self.text)
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            await self._view.submit(interaction, str(self.text.value).strip())
+
+    class QuestionView(discord.ui.View):
+        """Buttons for one question: one per option, plus free text / done."""
+
+        def __init__(
+            self,
+            session: QuestionSession,
+            index: int,
+            allowed_user_ids: frozenset,
+            timeout: int,
+        ) -> None:
+            super().__init__(timeout=timeout)
+            self._session = session
+            self._index = index
+            self._allowed_user_ids = allowed_user_ids
+            self._message = None
+            self._selected: List[str] = []
+            self._done = False
+            self.question = session.request.questions[index]
+            for opt in self.question["options"]:
+                button = discord.ui.Button(
+                    label=_truncate(opt["label"], _OPTION_LABEL_BUDGET),
+                    style=discord.ButtonStyle.primary,
+                )
+                button.callback = self._option_callback(button, opt["label"])
+                self.add_item(button)
+            other = discord.ui.Button(label="Andere Antwort…", style=discord.ButtonStyle.secondary)
+            other.callback = self._other_callback
+            self.add_item(other)
+            if self.question["multiSelect"]:
+                done = discord.ui.Button(label="Fertig", style=discord.ButtonStyle.success)
+                done.callback = self._done_callback
+                self.add_item(done)
+
+        def _authorized(self, interaction: discord.Interaction) -> bool:
+            user = getattr(interaction, "user", None)
+            uid = str(getattr(user, "id", "") or "")
+            return bool(uid) and uid in self._allowed_user_ids
+
+        async def _guard(self, interaction: discord.Interaction) -> bool:
+            if not self._authorized(interaction):
+                await interaction.response.send_message("Du darfst diese Frage nicht beantworten.", ephemeral=True)
+                return False
+            if self._done or self._session.finished:
+                await interaction.response.send_message("Diese Frage wurde bereits beantwortet.", ephemeral=True)
+                return False
+            return True
+
+        def _option_callback(self, button: Any, label: str) -> Callable[[Any], Awaitable[None]]:
+            async def callback(interaction: discord.Interaction) -> None:
+                if not await self._guard(interaction):
+                    return
+                if self.question["multiSelect"]:
+                    if label in self._selected:
+                        self._selected.remove(label)
+                        button.style = discord.ButtonStyle.primary
+                    else:
+                        self._selected.append(label)
+                        button.style = discord.ButtonStyle.success
+                    await self._edit(interaction)
+                    return
+                await self.submit(interaction, label)
+            return callback
+
+        async def _other_callback(self, interaction: discord.Interaction) -> None:
+            if not await self._guard(interaction):
+                return
+            await interaction.response.send_modal(FreeTextModal(self))
+
+        async def _done_callback(self, interaction: discord.Interaction) -> None:
+            if not await self._guard(interaction):
+                return
+            if not self._selected:
+                await interaction.response.send_message("Bitte erst mindestens eine Antwort anklicken.", ephemeral=True)
+                return
+            await self.submit(interaction, list(self._selected))
+
+        async def submit(self, interaction: discord.Interaction, value: Any) -> None:
+            if self._done or self._session.finished:
+                await interaction.response.send_message("Diese Frage wurde bereits beantwortet.", ephemeral=True)
+                return
+            self._done = True
+            for child in self.children:
+                child.disabled = True
+            shown = ", ".join(value) if isinstance(value, list) else str(value)
+            outcome = await self._session.answer(self._index, value)
+            suffix = {
+                "pending": "✅ Antwort gespeichert — bitte auch die anderen Fragen beantworten.",
+                "delivered": "✅ Antwort übermittelt.",
+                "reply-failed": "⚠️ Antwort konnte nicht abgelegt werden — die Frage bleibt unbeantwortet.",
+            }.get(outcome, outcome)
+            await self._edit(interaction, footer=f"**Antwort:** {_truncate(shown, 300)}\n{suffix}")
+
+        async def _edit(self, interaction: discord.Interaction, footer: Optional[str] = None) -> None:
+            content = None
+            if footer is not None:
+                base = getattr(interaction.message, "content", "") or ""
+                content = f"{base}\n\n{footer}"
+            try:
+                if content is None:
+                    await interaction.response.edit_message(view=self)
+                else:
+                    await interaction.response.edit_message(content=content, view=self)
+            except Exception:
+                logger.debug("OpenCode bridge: could not edit question message")
+
+        async def on_timeout(self) -> None:
+            if self._done or self._session.finished:
+                return
+            self._done = True
+            for child in self.children:
+                child.disabled = True
+            await self._session.abort("timeout")
+            msg = self._message
+            if msg is None:
+                return
+            try:
+                base = getattr(msg, "content", "") or ""
+                await msg.edit(content=f"{base}\n\n⏱ Zeit abgelaufen — Frage abgebrochen.", view=self)
+            except Exception:
+                pass
+
+    _QUESTION_CLASSES = (QuestionView, FreeTextModal)
+    return _QUESTION_CLASSES
 
 
 def _get_view_class():

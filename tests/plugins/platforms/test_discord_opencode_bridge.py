@@ -349,8 +349,9 @@ class TestOpenCodeBridgeClient:
 
 
 class FakeMessage:
-    def __init__(self, embeds=None):
+    def __init__(self, embeds=None, content=""):
         self.embeds = embeds or []
+        self.content = content
         self.edits = []
 
     async def edit(self, **kwargs):
@@ -365,7 +366,7 @@ class FakeChannel:
 
     async def send(self, **kwargs):
         self.sent.append(kwargs)
-        return FakeMessage(embeds=[kwargs["embed"]] if kwargs.get("embed") else [])
+        return FakeMessage(embeds=[kwargs["embed"]] if kwargs.get("embed") else [], content=kwargs.get("content", ""))
 
 
 class FakeDiscordClient:
@@ -431,6 +432,9 @@ class FakeResponse:
 
     async def edit_message(self, **kwargs):
         self.calls.append(("edit", kwargs))
+
+    async def send_modal(self, modal):
+        self.calls.append(("modal", modal))
 
 
 def _interaction(uid, message=None):
@@ -997,3 +1001,230 @@ class TestGuardPromptFlow:
         config = _bridge_config(guard_dir=str(tmp_path), guard_enabled=False)
         bridge = OpenCodeBridge(FakeAdapter(channel), config, client=StubBridgeClient())
         assert bridge.spool is None
+
+
+# ---------------------------------------------------------------------------
+# Mentions, permission requests from Claude Code, question requests
+# ---------------------------------------------------------------------------
+
+from plugins.platforms.discord.opencode_bridge import _get_question_classes  # noqa: E402
+
+
+def _fresh(**overrides):
+    now = time.time()
+    return _guard_payload(expires_at=now + 300, created_at=now, **overrides)
+
+
+def _question_payload(**overrides):
+    payload = _fresh(
+        id="frage000-0001",
+        agent="claude-code",
+        kind="question",
+        questions=[
+            {
+                "question": "Welche Farbe?",
+                "header": "Farbe",
+                "options": [
+                    {"label": "Rot", "description": "warm"},
+                    {"label": "Blau", "description": "kalt"},
+                ],
+                "multiSelect": False,
+            },
+            {
+                "question": "Welche Kapitel?",
+                "header": "Kapitel",
+                "options": [{"label": "1"}, {"label": "2"}, {"label": "3"}],
+                "multiSelect": True,
+            },
+        ],
+    )
+    for key in ("command", "path", "access"):
+        payload.pop(key, None)
+    payload.update(overrides)
+    return payload
+
+
+class TestMentionsAndToolPermissions:
+    @pytest.mark.asyncio
+    async def test_guard_prompt_mentions_allowlisted_user(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _fresh())
+        await bridge.poll_guard_spool_once()
+        sent = channel.sent[0]
+        assert sent["content"].startswith("<@111>")
+        assert sent["allowed_mentions"] is not None
+
+    def test_permission_request_with_tool_and_details(self):
+        request = parse_guard_request(
+            _fresh(agent="claude-code", tool="Edit", details="{\"file_path\": \"x\"}", path="-", access="schreiben"),
+            now=time.time(),
+        )
+        assert request is not None
+        assert request.tool == "Edit"
+        assert request.details.startswith("{")
+        assert request.is_question is False
+
+    @pytest.mark.asyncio
+    async def test_tool_permission_prompt_shows_tool_and_hides_dash_path(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _fresh(agent="claude-code", tool="WebFetch", details="https://example.org", path="-", access="netz", command="WebFetch https://example.org"))
+        await bridge.poll_guard_spool_once()
+        content = channel.sent[0]["content"]
+        assert "Claude Code bittet um Erlaubnis: WebFetch" in content
+        assert "https://example.org" in content
+        assert "**Pfad:**" not in content
+        assert "netz" in content
+
+    def test_unknown_access_kind_still_refused(self):
+        assert parse_guard_request(_fresh(access="egal"), now=time.time()) is None
+
+
+class TestQuestionParsing:
+    def test_valid_question_request(self):
+        request = parse_guard_request(_question_payload(), now=time.time())
+        assert request is not None
+        assert request.is_question is True
+        assert len(request.questions) == 2
+        assert request.questions[0]["options"][1]["label"] == "Blau"
+        assert request.questions[1]["multiSelect"] is True
+        assert request.command == "Welche Farbe?; Welche Kapitel?"
+
+    @pytest.mark.parametrize("questions", [
+        [],
+        "nope",
+        [{"question": "", "options": [{"label": "a"}]}],
+        [{"question": "q", "options": []}],
+        [{"question": "q", "options": [{"label": ""}]}],
+        [{"question": "q", "options": [{"label": "a"}, {"label": "a"}]}],
+        [{"question": "q", "options": [{"label": "a"}]}] * 5,
+        [{"question": "q", "options": [{"label": str(i)} for i in range(9)]}],
+        [{"question": "q", "options": [{"label": "a"}]}, {"question": "q", "options": [{"label": "b"}]}],
+    ])
+    def test_unclear_questions_refused(self, questions):
+        assert parse_guard_request(_question_payload(questions=questions), now=time.time()) is None
+
+    def test_unknown_kind_refused(self):
+        assert parse_guard_request(_fresh(kind="wunsch"), now=time.time()) is None
+
+
+def _click(view, label):
+    for child in view.children:
+        if getattr(child, "label", None) == label:
+            return child.callback
+    raise AssertionError(f"no button {label!r} in {[c.label for c in view.children]}")
+
+
+class TestQuestionFlow:
+    @pytest.mark.asyncio
+    async def test_questions_become_one_message_each(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _question_payload())
+        posted = await bridge.poll_guard_spool_once()
+        assert posted == 1
+        assert len(channel.sent) == 2
+        first, second = channel.sent
+        assert first["content"].startswith("<@111>")
+        assert "Welche Farbe?" in first["content"] and "**Rot** — warm" in first["content"]
+        assert [c.label for c in first["view"].children] == ["Rot", "Blau", "Andere Antwort…"]
+        assert [c.label for c in second["view"].children] == ["1", "2", "3", "Andere Antwort…", "Fertig"]
+        # a second poll must not repost
+        await bridge.poll_guard_spool_once()
+        assert len(channel.sent) == 2
+
+    @pytest.mark.asyncio
+    async def test_answers_are_written_once_all_questions_answered(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _question_payload())
+        await bridge.poll_guard_spool_once()
+        v1, v2 = channel.sent[0]["view"], channel.sent[1]["view"]
+
+        i1 = _interaction("111", message=FakeMessage(content="f1"))
+        await _click(v1, "Blau")(i1)
+        assert _read_decision(bridge, "frage000-0001") is None
+        assert all(c.disabled for c in v1.children)
+        assert "Antwort gespeichert" in i1.response.calls[0][1]["content"]
+
+        i2 = _interaction("111", message=FakeMessage(content="f2"))
+        await _click(v2, "1")(i2)
+        await _click(v2, "3")(_interaction("111", message=FakeMessage(content="f2")))
+        assert _read_decision(bridge, "frage000-0001") is None
+        i3 = _interaction("111", message=FakeMessage(content="f2"))
+        await _click(v2, "Fertig")(i3)
+        decision = _read_decision(bridge, "frage000-0001")
+        assert decision["decision"] == "answer"
+        assert decision["answers"] == {"Welche Farbe?": "Blau", "Welche Kapitel?": ["1", "3"]}
+        assert stub.calls == []
+        assert "Antwort übermittelt" in i3.response.calls[0][1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_multiselect_toggle_and_empty_done(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _question_payload())
+        await bridge.poll_guard_spool_once()
+        v2 = channel.sent[1]["view"]
+        await _click(v2, "2")(_interaction("111", message=FakeMessage()))
+        await _click(v2, "2")(_interaction("111", message=FakeMessage()))  # abwählen
+        i = _interaction("111", message=FakeMessage())
+        await _click(v2, "Fertig")(i)
+        assert i.response.calls[0][0] == "send"  # Hinweis: erst auswählen
+        assert not v2._done
+
+    @pytest.mark.asyncio
+    async def test_free_text_via_modal(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _question_payload(questions=[{
+            "question": "Wie heißt die Datei?", "options": [{"label": "a.typ"}], "multiSelect": False,
+        }]))
+        await bridge.poll_guard_spool_once()
+        view = channel.sent[0]["view"]
+        i = _interaction("111", message=FakeMessage())
+        await _click(view, "Andere Antwort…")(i)
+        assert i.response.calls[0][0] == "modal"
+        modal = i.response.calls[0][1]
+        modal.text._value = "  b.typ  "
+        i2 = _interaction("111", message=FakeMessage(content="frage"))
+        await modal.on_submit(i2)
+        assert _read_decision(bridge, "frage000-0001")["answers"] == {"Wie heißt die Datei?": "b.typ"}
+
+    @pytest.mark.asyncio
+    async def test_timeout_of_one_question_rejects_all(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _question_payload())
+        await bridge.poll_guard_spool_once()
+        v1, v2 = channel.sent[0]["view"], channel.sent[1]["view"]
+        await _click(v1, "Rot")(_interaction("111", message=FakeMessage()))
+        await v2.on_timeout()
+        decision = _read_decision(bridge, "frage000-0001")
+        assert decision["decision"] == "reject" and decision["source"] == "timeout"
+        assert "answers" not in decision
+
+    @pytest.mark.asyncio
+    async def test_unauthorized_user_cannot_answer_questions(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _question_payload())
+        await bridge.poll_guard_spool_once()
+        v1 = channel.sent[0]["view"]
+        i = _interaction("999", message=FakeMessage())
+        await _click(v1, "Rot")(i)
+        assert i.response.calls[0][0] == "send"
+        assert not v1._done
+        assert _read_decision(bridge, "frage000-0001") is None
+
+    @pytest.mark.asyncio
+    async def test_second_answer_to_same_question_is_ignored(self, tmp_path):
+        bridge, channel, stub = _make_guard_bridge(tmp_path)
+        _write_request(bridge.spool, _question_payload(questions=[{
+            "question": "Nur eine", "options": [{"label": "A"}, {"label": "B"}],
+        }]))
+        await bridge.poll_guard_spool_once()
+        view = channel.sent[0]["view"]
+        await _click(view, "A")(_interaction("111", message=FakeMessage()))
+        late = _interaction("111", message=FakeMessage())
+        await _click(view, "B")(late)
+        assert late.response.calls[0][0] == "send"
+        assert _read_decision(bridge, "frage000-0001")["answers"] == {"Nur eine": "A"}
+
+    def test_write_decision_answer_without_answers_becomes_reject(self, tmp_path):
+        spool = GuardSpool(str(tmp_path))
+        spool.write_decision("frage000-0001", "answer", "discord", now=NOW)
+        assert json.loads((spool.decisions_dir / "frage000-0001.json").read_text())["decision"] == "reject"
