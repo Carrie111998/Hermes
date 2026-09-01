@@ -18281,6 +18281,34 @@ def _normalise_theme_definition(data: Dict[str, Any]) -> Optional[Dict[str, Any]
         result["customCSS"] = custom_css
     if component_styles:
         result["componentStyles"] = component_styles
+
+    # Terminal pane colors, chart accents, and picker swatch. The frontend
+    # reads these from the applied theme definition and falls back to
+    # #000000/#f0e6d2 when absent (web/src/themes/context.tsx,
+    # ChatPage.tsx, HermesConsoleModal.tsx). Built-ins define them in
+    # presets.ts; without this passthrough user themes silently dropped
+    # them — e.g. the embedded terminal rendered as a black pane inside
+    # a light/pastel theme.
+    for key in ("terminalBackground", "terminalForeground"):
+        val = data.get(key)
+        if isinstance(val, str) and val.strip():
+            result[key] = val
+    series_src = data.get("seriesColors")
+    if isinstance(series_src, dict):
+        series_out = {
+            k: v
+            for k, v in series_src.items()
+            if k in ("inputTokenAccent", "outputTokenAccent")
+            and isinstance(v, str)
+            and v.strip()
+        }
+        if series_out:
+            result["seriesColors"] = series_out
+    swatch_src = data.get("swatchColors")
+    if isinstance(swatch_src, list) and len(swatch_src) == 3 and all(
+        isinstance(c, str) and c.strip() for c in swatch_src
+    ):
+        result["swatchColors"] = list(swatch_src)
     return result
 
 
