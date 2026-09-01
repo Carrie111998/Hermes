@@ -604,7 +604,7 @@ def _inspect_git(
     if subcommand in _KNOWN_GIT_BUILTINS:
         return None
     if depth >= _MAX_RECURSION:
-        return None
+        return _PARSER_LIMIT_OPERATION
 
     alias = inline_aliases.get(subcommand)
     if alias is None:
@@ -643,9 +643,9 @@ def _inspect_github_cli(
 
 
 def _find_mutation(command: str, cwd: Path, root: Path, depth: int = 0) -> str | None:
-    if depth > _MAX_RECURSION:
-        return None
     if _command_parser_limit_exceeded(command):
+        return _PARSER_LIMIT_OPERATION
+    if depth > _MAX_RECURSION:
         return _PARSER_LIMIT_OPERATION
 
     masked_command, heredoc_scripts = _mask_heredocs(command)

@@ -146,6 +146,30 @@ class TestBlocksMutationsInSourceRepo:
         assert hit is True
         assert "parser safety limit" in msg
 
+    def test_deep_configured_alias_parser_limit_fails_closed(self, repo):
+        for index in range(6):
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    f"alias.deep{index}",
+                    f"!git deep{index + 1}",
+                ],
+                check=True,
+            )
+        payload = "${x:-a}" * 257 + "; git reset --hard"
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "alias.deep6", f"!{payload}"],
+            check=True,
+        )
+
+        hit, msg = _detect("git deep0", repo, repo)
+
+        assert hit is True
+        assert "parser safety limit" in msg
+
     def test_mutation_in_command_substitution(self, repo):
         hit, _ = _detect('echo "$(git checkout main)"', repo, repo)
         assert hit is True
