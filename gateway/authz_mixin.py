@@ -984,7 +984,8 @@ class GatewayAuthorizationMixin:
            or ``GATEWAY_ALLOWED_USERS``) is configured, default to ``"ignore"`` —
            the allowlist signals that the owner has deliberately restricted
            access; spamming unknown contacts with pairing codes is both noisy
-           and a potential info-leak. (#9337)
+           and a potential info-leak. (#9337) Plugin-provided platforms resolve
+           their allowlist env var through the platform registry.
         6. No allowlist and no explicit config → ``"pair"`` (open-gateway default).
         """
         config = getattr(self, "config", None)
@@ -1057,6 +1058,21 @@ class GatewayAuthorizationMixin:
                 ),
                 Platform.QQBOT: ("QQ_GROUP_ALLOWED_USERS",),
             }
+            # Plugin-provided platforms are not in the static map above, so ask
+            # the registry for the allowlist env var they declared. Without this
+            # a plugin platform with a configured allowlist falls through to the
+            # "pair" default and SMSes/DMs pairing codes to unknown senders —
+            # the same failure #9337 fixed for built-in platforms. Mirrors the
+            # registry lookup ``is_authorized()`` already performs.
+            if platform not in platform_env_map:
+                try:
+                    from gateway.platform_registry import platform_registry
+
+                    entry = platform_registry.get(platform.value)
+                    if entry and entry.allowed_users_env:
+                        platform_env_map[platform] = entry.allowed_users_env
+                except Exception:
+                    pass
             if _platform_gate_env(platform_env_map.get(platform, "")).strip():
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):

@@ -396,3 +396,93 @@ def test_qqbot_with_allowlist_ignores_unauthorized_dm(monkeypatch):
 
     behavior = runner._get_unauthorized_dm_behavior(Platform.QQBOT)
     assert behavior == "ignore"
+
+
+def test_plugin_platform_with_allowlist_ignores_unauthorized_dm(monkeypatch):
+    """Plugin platforms must honor the allowlist-aware default too.
+
+    Regression guard, same class of bug as the QQBOT case above but for
+    plugin-provided platforms.  ``_get_unauthorized_dm_behavior`` resolved the
+    allowlist env var from a hardcoded map of BUILT-IN platforms only, so a
+    plugin platform (registered via ``platform_registry`` with its own
+    ``allowed_users_env``) missed the lookup and fell through to the ``"pair"``
+    default -- even with its allowlist configured.
+
+    Found in production on an SMS plugin platform: unknown senders were
+    answered with a pairing-code text.  On SMS that is billable outbound to
+    strangers and discloses that the number fronts an AI gateway, which is
+    exactly the outcome #9337 set out to prevent for built-in platforms.
+    """
+    _clear_auth_env(monkeypatch)
+    monkeypatch.delenv("PLUGINSMS_ALLOWED_USERS", raising=False)
+    monkeypatch.setenv("PLUGINSMS_ALLOWED_USERS", "+15550001111")
+
+    from gateway.platform_registry import platform_registry, PlatformEntry
+    platform_registry.register(PlatformEntry(
+        name="pluginsms",
+        label="Plugin SMS",
+        adapter_factory=lambda cfg: None,
+        check_fn=lambda: True,
+        allowed_users_env="PLUGINSMS_ALLOWED_USERS",
+        allow_all_env="PLUGINSMS_ALLOW_ALL_USERS",
+    ))
+
+    pluginsms = Platform("pluginsms")
+    config = GatewayConfig(platforms={pluginsms: PlatformConfig(enabled=True)})
+    runner, _adapter = _make_runner(pluginsms, config)
+
+    assert runner._get_unauthorized_dm_behavior(pluginsms) == "ignore"
+
+
+def test_plugin_platform_without_allowlist_still_pairs(monkeypatch):
+    """The registry lookup must not turn every plugin platform into "ignore".
+
+    With no allowlist configured, a plugin platform keeps the open-gateway
+    ``"pair"`` default (rule 6) exactly like a built-in one.
+    """
+    _clear_auth_env(monkeypatch)
+    monkeypatch.delenv("PLUGINOPEN_ALLOWED_USERS", raising=False)
+
+    from gateway.platform_registry import platform_registry, PlatformEntry
+    platform_registry.register(PlatformEntry(
+        name="pluginopen",
+        label="Plugin Open",
+        adapter_factory=lambda cfg: None,
+        check_fn=lambda: True,
+        allowed_users_env="PLUGINOPEN_ALLOWED_USERS",
+        allow_all_env="PLUGINOPEN_ALLOW_ALL_USERS",
+    ))
+
+    pluginopen = Platform("pluginopen")
+    config = GatewayConfig(platforms={pluginopen: PlatformConfig(enabled=True)})
+    runner, _adapter = _make_runner(pluginopen, config)
+
+    assert runner._get_unauthorized_dm_behavior(pluginopen) == "pair"
+
+
+def test_plugin_platform_without_declared_env_still_pairs(monkeypatch):
+    """A plugin that declares no ``allowed_users_env`` must resolve, not explode.
+
+    The registry lookup is best-effort: an entry with an empty
+    ``allowed_users_env`` contributes nothing to the map and the platform falls
+    through to the documented default rather than raising out of the
+    authorization path.
+
+    (A platform missing from the registry entirely is unreachable here --
+    ``Platform("...")`` rejects unknown names before this code runs.)
+    """
+    _clear_auth_env(monkeypatch)
+
+    from gateway.platform_registry import platform_registry, PlatformEntry
+    platform_registry.register(PlatformEntry(
+        name="pluginnoenv",
+        label="Plugin No Env",
+        adapter_factory=lambda cfg: None,
+        check_fn=lambda: True,
+    ))
+
+    pluginnoenv = Platform("pluginnoenv")
+    config = GatewayConfig(platforms={pluginnoenv: PlatformConfig(enabled=True)})
+    runner, _adapter = _make_runner(pluginnoenv, config)
+
+    assert runner._get_unauthorized_dm_behavior(pluginnoenv) == "pair"
