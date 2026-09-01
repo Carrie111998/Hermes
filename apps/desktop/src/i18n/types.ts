@@ -2837,6 +2837,7 @@ export interface Translations {
       sendFailed: string
       run: string
       command: string
+      rule: string
       moreOptions: string
       allowSession: string
       alwaysAllowMenu: string
