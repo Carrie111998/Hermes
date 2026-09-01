@@ -11887,7 +11887,11 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
-def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[str]]:
+def _resolve_worker_cli_toolsets(
+    hermes_home: Optional[str],
+    *,
+    allow_code_execution: bool = True,
+) -> Optional[list[str]]:
     """Return the assigned profile's effective CLI toolsets for a worker.
 
     Dispatcher-spawned workers are launched from a long-lived gateway process,
@@ -11917,6 +11921,7 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
                 name
                 for name in _get_platform_tools(cfg, "cli")
                 if name not in {"all", "*"}
+                and (allow_code_execution or name != "code_execution")
             )
         finally:
             reset_hermes_home_override(token)
@@ -12357,7 +12362,15 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    worker_toolsets = _resolve_worker_cli_toolsets(
+        env.get("HERMES_HOME"),
+        # The local provider path already has repository-scoped terminal/file
+        # execution. Do not advertise the separate Python kernel to local
+        # workers: when that optional kernel is unavailable, models can repeat
+        # the rejected call until same_tool_failure_halt blocks the whole
+        # repair. Remote/ordinary workers retain the configured surface.
+        allow_code_execution=selected_local_route is None,
+    )
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend([
