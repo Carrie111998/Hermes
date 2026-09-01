@@ -1172,6 +1172,26 @@ def _teardown_popped_session(
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
+    sid = str(session.get("_sid") or "")
+    if sid and _session_uses_compute_host(session) and (
+        session.get("running") or session.get("_compute_host_active")
+    ):
+        # A compute-host turn outlives its parent process unless the owning
+        # gateway explicitly forwards teardown. Reuse Stop's fenced cancel
+        # path so close, close_on_disconnect, and shutdown cannot leave a
+        # worker consuming resources after its session record is gone.
+        try:
+            _interrupt_session_turn(sid, session)
+        except Exception:
+            # Teardown is the final resource-release boundary. A dead worker
+            # channel must not strand the parent session, nor abort shutdown
+            # before later sessions are finalized.
+            logger.warning(
+                "compute-host interrupt failed during session teardown sid=%s reason=%s",
+                sid,
+                end_reason,
+                exc_info=True,
+            )
     run_thread = session.get("_run_thread")
     if (
         end_reason != "tui_shutdown"
@@ -2646,14 +2666,17 @@ def _turn_isolation_enabled(cfg: dict | None = None) -> bool:
 
 
 def _session_uses_compute_host(session: dict, cfg: dict | None = None) -> bool:
+    # An admitted isolated turn keeps compute-host ownership even if process
+    # isolation is disabled while it is running. Lifecycle actions must still
+    # reach that worker instead of silently falling back to the local agent.
+    if session.get("_compute_host_active"):
+        return True
     if not _turn_isolation_enabled(cfg):
         return False
     # Phase 1 routes lazy/dashboard sessions whose live AIAgent has not been
     # built inside the serving process. Already-built in-process sessions keep
     # the historical path unless a prior isolated turn marked host ownership.
-    return bool(session.get("_compute_host_active")) or (
-        session.get("agent") is None and session.get("agent_ready") is not None
-    )
+    return session.get("agent") is None and session.get("agent_ready") is not None
 
 
 def _get_compute_host_supervisor(cfg: dict | None = None):
