@@ -558,6 +558,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -585,6 +586,7 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                profile_adapters=profile_adapters,
             )
             return
 
@@ -656,6 +658,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        profile_adapters=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -664,6 +667,11 @@ class InProcessCronScheduler(CronScheduler):
         agent execution to that profile's home — mirroring how
         ``_profile_runtime_scope`` scopes the multiplexed inbound path and
         ``web_server.py`` scopes per-profile cron API calls.
+
+        When ``profile_adapters`` is provided (a ``{profile_name: adapters_dict}``
+        mapping), each profile's tick uses THAT profile's adapters for delivery
+        instead of the shared default adapters.  This ensures secondary-profile
+        cron jobs deliver via their own Telegram bot, not the default profile's.
         """
         import logging
         from cron.scheduler import tick as cron_tick
@@ -681,6 +689,22 @@ class InProcessCronScheduler(CronScheduler):
             len(profile_homes),
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
+
+        def _adapters_for_profile(entry):
+            """Resolve the delivery adapters for a profile_homes entry.
+
+            When a per-profile adapters mapping is available, use it so each
+            profile's cron delivery routes through THAT profile's bot — not
+            the default profile's.  Falls back to the global ``adapters``
+            when no profile-specific mapping exists (legacy callers,
+            single-profile gateway).
+            """
+            if not profile_adapters:
+                return adapters
+            name = entry[0] if isinstance(entry, tuple) else None
+            if name and name in profile_adapters:
+                return profile_adapters[name]
+            return adapters
 
         # Recovery + initial heartbeat for every profile.
         # A profile may have been deleted since this snapshot was taken;
@@ -717,7 +741,7 @@ class InProcessCronScheduler(CronScheduler):
                             with use_cron_store(home):
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=_adapters_for_profile(entry),
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,

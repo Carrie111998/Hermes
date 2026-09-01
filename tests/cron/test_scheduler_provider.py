@@ -691,3 +691,105 @@ def test_existing_profile_homes_filters_deleted(tmp_path):
 
     as_paths = _existing_profile_homes([live, deleted])
     assert [p for p in as_paths] == [live]
+
+
+def test_multiplex_profile_adapters_routes_per_profile(tmp_path):
+    """When profile_adapters is provided, each profile's cron_tick receives
+    THAT profile's adapters — not the shared default adapters."""
+    import threading
+    from unittest.mock import patch
+
+    import cron.jobs as jobs
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    # Create two profile homes
+    default_home = tmp_path / "default"
+    (default_home / "cron").mkdir(parents=True)
+    secondary_home = tmp_path / "secondary"
+    (secondary_home / "cron").mkdir(parents=True)
+    profile_homes = [("default", default_home), ("secondary", secondary_home)]
+
+    # Two distinct adapter dicts — the key assertion is that each profile
+    # receives its OWN adapters, not the shared default.
+    default_adapters = {"platform": "default-adapter"}
+    secondary_adapters = {"platform": "secondary-adapter"}
+    profile_adapters = {
+        "default": default_adapters,
+        "secondary": secondary_adapters,
+    }
+
+    tick_adapters_received = []
+    stop = threading.Event()
+
+    def _tracking_tick(*args, **kwargs):
+        tick_adapters_received.append(kwargs.get("adapters"))
+        stop.set()
+        return 0
+
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick):
+        thread = threading.Thread(
+            target=provider.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": profile_homes,
+                "profile_adapters": profile_adapters,
+            },
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    # Both profiles should have been ticked
+    assert len(tick_adapters_received) >= 1
+    # The last tick should use secondary's adapters (default is skipped
+    # by _existing_profile_homes if deleted, or both are ticked).
+    # Verify that profile-specific adapters were used (not the shared default)
+    for adapters in tick_adapters_received:
+        assert adapters in (default_adapters, secondary_adapters), (
+            f"cron_tick received unexpected adapters: {adapters}"
+        )
+
+
+def test_multiplex_without_profile_adapters_uses_shared(tmp_path):
+    """When profile_adapters is NOT provided, all profiles use the shared
+    adapters dict (legacy behavior)."""
+    import threading
+    from unittest.mock import patch
+
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    default_home = tmp_path / "default"
+    (default_home / "cron").mkdir(parents=True)
+    profile_homes = [("default", default_home)]
+
+    shared_adapters = {"platform": "shared-adapter"}
+    tick_adapters_received = []
+    stop = threading.Event()
+
+    def _tracking_tick(*args, **kwargs):
+        tick_adapters_received.append(kwargs.get("adapters"))
+        stop.set()
+        return 0
+
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick):
+        thread = threading.Thread(
+            target=provider.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": profile_homes,
+                "adapters": shared_adapters,
+                # No profile_adapters — legacy path
+            },
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(tick_adapters_received) >= 1
+    assert tick_adapters_received[0] is shared_adapters

@@ -32672,6 +32672,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         try:
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
+                # Build a per-profile adapters mapping so each profile's cron
+                # delivery uses THAT profile's Telegram bot (not the default
+                # profile's).  runner.adapters holds the default/active
+                # profile's adapters; runner._profile_adapters holds each
+                # secondary profile's adapters (populated by
+                # _start_secondary_profile_adapters).  Cron delivery resolves
+                # the adapter for the ticked profile's home, so secondary
+                # profile cron jobs now send via their own bot.
+                from hermes_cli.profiles import get_active_profile_name
+                _profile_adapters_map: Dict[str, Dict] = {}
+                active_name = get_active_profile_name() or "default"
+                _profile_adapters_map[active_name] = runner.adapters
+                for _p_name, _p_adapters in (getattr(runner, "_profile_adapters", None) or {}).items():
+                    _profile_adapters_map[_p_name] = _p_adapters
+                cron_start_kwargs["profile_adapters"] = _profile_adapters_map
                 cron_start_kwargs["profile_homes"] = profile_homes
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
