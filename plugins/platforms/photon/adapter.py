@@ -2175,7 +2175,7 @@ class PhotonAdapter(BasePlatformAdapter):
                 {"spaceId": chat_id, "text": text.strip(), "effect": effect.strip()},
             )
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         return SendResult(success=True, message_id=data.get("messageId"))
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -2513,7 +2513,7 @@ class PhotonAdapter(BasePlatformAdapter):
                 "/send-richlink", {"spaceId": space_id, "url": url}
             )
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
         return SendResult(success=True, message_id=data.get("messageId"))
 
@@ -2559,7 +2559,7 @@ class PhotonAdapter(BasePlatformAdapter):
                 retryable=e.retryable,
             )
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
         return SendResult(success=True, message_id=data.get("messageId"))
 
@@ -2585,7 +2585,7 @@ class PhotonAdapter(BasePlatformAdapter):
         try:
             data = await self._sidecar_call("/send-poll", body)
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
         return SendResult(success=True, message_id=data.get("messageId"))
 
@@ -2644,7 +2644,7 @@ class PhotonAdapter(BasePlatformAdapter):
                 retryable=e.retryable,
             )
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=f"{type(e).__name__}: {e}")
         self._record_sent_message(data.get("messageId"))
         return SendResult(success=True, message_id=data.get("messageId"))
 
