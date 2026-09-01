@@ -211,6 +211,8 @@ _SANE_PATH_DIRS = (
     "/data/data/com.termux/files/usr/sbin",
     "/opt/homebrew/bin",
     "/opt/homebrew/sbin",
+    "/home/linuxbrew/.linuxbrew/bin",
+    "/home/linuxbrew/.linuxbrew/sbin",
     "/usr/local/sbin",
     "/usr/local/bin",
     "/usr/sbin",
