@@ -162,6 +162,12 @@ function activePreviewTab(): PreviewTab | null {
   return resolveActiveTab($previewTabs.get(), $rightRailActiveTabId.get())
 }
 
+/** The id of the tab the rail is showing — what a caller with no focus to key
+ *  off (the agent's `drive_preview`) is acting on. Null when the rail is empty. */
+export function activePreviewTabId(): null | string {
+  return activePreviewTab()?.id ?? null
+}
+
 // A restored active id whose tab didn't survive validation would leave the rail
 // pointing at nothing.
 selectRightRailTab(activePreviewTab()?.id ?? null)
@@ -325,6 +331,28 @@ export function markBrowserTabPopped(tabId: string, popped: boolean) {
 export const $dockedPreviewTabs = computed([$previewTabs, $poppedBrowserTabIds], (tabs, popped) =>
   popped.size === 0 ? tabs : tabs.filter(tab => !popped.has(tab.id))
 )
+
+/**
+ * The Browser tab currently filling the window, or null. Presentation only —
+ * the pane keeps its place in the layout tree and only changes how it is
+ * positioned, so the guest webview is never torn down and rebuilt (which would
+ * drop the page's history and whatever is typed into it).
+ *
+ * Memory-only: a relaunch should hand back the user's layout, not a window
+ * silently owned by one page.
+ */
+export const $browserFullscreenTabId = atom<null | string>(null)
+
+export function toggleBrowserFullscreen(tabId: string) {
+  $browserFullscreenTabId.set($browserFullscreenTabId.get() === tabId ? null : tabId)
+}
+
+/** Leave fullscreen — for `tabId` only when given (a closing tab), else always. */
+export function exitBrowserFullscreen(tabId?: string) {
+  if (!tabId || $browserFullscreenTabId.get() === tabId) {
+    $browserFullscreenTabId.set(null)
+  }
+}
 
 export const $previewReloadRequest = atom(0)
 export const $previewServerRestart = atom<PreviewServerRestart | null>(null)

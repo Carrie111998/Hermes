@@ -351,3 +351,93 @@ describe('PreviewBrowserBar', () => {
     expect(onPopIn).toHaveBeenCalledOnce()
   })
 })
+
+describe('PreviewBrowserBar control hand-off', () => {
+  // Non-Browser panes (a file peek, an artifact) have no agent channel, so
+  // there is nothing to hand over and the bar must not offer a dead switch.
+  it('shows no control chip when no mode is given', () => {
+    const rendered = render(<PreviewBrowserBar {...baseProps} />)
+
+    expect(rendered.queryByRole('button', { name: 'Take manual control' })).toBeNull()
+    expect(rendered.queryByRole('button', { name: 'Return control to Hermes' })).toBeNull()
+  })
+
+  it('offers manual takeover while Hermes has control', () => {
+    const onToggleControlMode = vi.fn()
+
+    const rendered = render(
+      <PreviewBrowserBar {...baseProps} controlMode="agent" onToggleControlMode={onToggleControlMode} />
+    )
+
+    const chip = rendered.getByRole('button', { name: 'Take manual control' })
+
+    expect(chip.getAttribute('aria-pressed')).toBe('false')
+    expect(chip.textContent).toContain('Hermes can drive')
+
+    fireEvent.click(chip)
+
+    expect(onToggleControlMode).toHaveBeenCalledOnce()
+  })
+
+  // The badge tracks a real in-flight action, not merely permission — "Hermes
+  // is driving" must not be lit on an idle page.
+  it('says Hermes is driving only while an action is in flight', () => {
+    const rendered = render(<PreviewBrowserBar {...baseProps} controlMode="agent" onToggleControlMode={vi.fn()} />)
+
+    expect(rendered.getByRole('button', { name: 'Take manual control' }).textContent).toContain('Hermes can drive')
+
+    rendered.rerender(<PreviewBrowserBar {...baseProps} controlMode="agent" driving onToggleControlMode={vi.fn()} />)
+
+    expect(rendered.getByRole('button', { name: 'Take manual control' }).textContent).toContain('Hermes is driving')
+  })
+
+  it('offers the way back once the user has taken over', () => {
+    const onToggleControlMode = vi.fn()
+
+    const rendered = render(
+      <PreviewBrowserBar {...baseProps} controlMode="manual" onToggleControlMode={onToggleControlMode} />
+    )
+
+    const chip = rendered.getByRole('button', { name: 'Return control to Hermes' })
+
+    expect(chip.getAttribute('aria-pressed')).toBe('true')
+    expect(chip.textContent).toContain('Manual control')
+
+    fireEvent.click(chip)
+
+    expect(onToggleControlMode).toHaveBeenCalledOnce()
+  })
+})
+
+describe('PreviewBrowserBar window controls', () => {
+  it('hides fullscreen and new-tab unless the pane offers them', () => {
+    const rendered = render(<PreviewBrowserBar {...baseProps} />)
+
+    expect(rendered.queryByRole('button', { name: 'Fill the window' })).toBeNull()
+    expect(rendered.queryByRole('button', { name: 'New browser tab' })).toBeNull()
+  })
+
+  it('toggles fullscreen and labels it by current state', () => {
+    const onToggleFullscreen = vi.fn()
+    const rendered = render(<PreviewBrowserBar {...baseProps} onToggleFullscreen={onToggleFullscreen} />)
+
+    fireEvent.click(rendered.getByRole('button', { name: 'Fill the window' }))
+
+    expect(onToggleFullscreen).toHaveBeenCalledOnce()
+
+    rendered.rerender(<PreviewBrowserBar {...baseProps} fullscreen onToggleFullscreen={onToggleFullscreen} />)
+
+    const exit = rendered.getByRole('button', { name: 'Exit full window' })
+
+    expect(exit.getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('opens a new browser tab', () => {
+    const onNewTab = vi.fn()
+    const rendered = render(<PreviewBrowserBar {...baseProps} onNewTab={onNewTab} />)
+
+    fireEvent.click(rendered.getByRole('button', { name: 'New browser tab' }))
+
+    expect(onNewTab).toHaveBeenCalledOnce()
+  })
+})

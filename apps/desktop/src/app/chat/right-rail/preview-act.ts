@@ -29,6 +29,8 @@
 
 import { actEngineSource, type PreviewActAction, type PreviewActResult } from '@/lib/preview-act/act-in-page'
 import { watchInPage } from '@/lib/preview-act/watch-in-page'
+import { browserControlMode, markBrowserAgentActing } from '@/store/browser-control'
+import { activePreviewTabId } from '@/store/preview'
 
 import { clickAt, glideTo, pointerPlaced, pressKey, selectAll, typeText, wheelBy } from './preview-drive'
 import { activePreviewInput, type PreviewInputHandle } from './preview-input'
@@ -481,10 +483,41 @@ async function driveScroll(
   return { ...after.result, acted: 'scrolled the page', success: true }
 }
 
+/** Verbs that only LOOK. Manual control is about who gets to act, not about
+ *  blindfolding the agent — it may still read the page the user is driving, so
+ *  it can answer questions about what is on screen. */
+const READ_ONLY: readonly string[] = ['elements']
+
+const MANUAL_CONTROL =
+  'The in-app Browser is under manual control — the user is driving this page. Ask them to press ' +
+  '“Return control to Hermes” in the browser bar before acting on it again.'
+
 /** Run one action against the ACTIVE preview tab's page. `kind` is a bare
  *  string: the verb arrives off the wire, and the history ones never reach
- *  the in-page engine. */
+ *  the in-page engine.
+ *
+ *  The control gate lives here rather than at each verb: this is the single
+ *  door every agent-driven interaction comes through, so manual control cannot
+ *  be routed around by a path that forgot to check. */
 export async function actOnActivePreview(
+  action: Omit<PreviewActAction, 'kind'> & { kind: string }
+): Promise<PreviewActResult> {
+  const tabId = activePreviewTabId()
+
+  if (browserControlMode(tabId) === 'manual' && READ_ONLY.indexOf(action.kind) === -1) {
+    return { error: MANUAL_CONTROL, success: false }
+  }
+
+  const done = markBrowserAgentActing(tabId)
+
+  try {
+    return await runOnActivePreview(action)
+  } finally {
+    done()
+  }
+}
+
+async function runOnActivePreview(
   action: Omit<PreviewActAction, 'kind'> & { kind: string }
 ): Promise<PreviewActResult> {
   const nav = NAV_ACTIONS.find(verb => verb === action.kind)

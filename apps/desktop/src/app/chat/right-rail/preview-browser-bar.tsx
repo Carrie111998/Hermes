@@ -12,6 +12,10 @@
  * THIS page, so they belong beside its address, not on the strip where they
  * were ambiguous the moment a second tab opened. They stay `PaneStripGlyph`
  * buttons, so a glyph here and a glyph on the strip are still the same button.
+ *
+ * The control chip is here for that same reason once more: who is driving is a
+ * property of THIS page, and the hand-off has to be reachable from wherever the
+ * page is — docked beside chat, filling the window, or popped out.
  */
 
 import { useEffect, useState } from 'react'
@@ -20,24 +24,35 @@ import { Codicon } from '@/components/ui/codicon'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
 import { PaneStripGlyph } from '@/components/ui/pane-tab'
+import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { cn } from '@/lib/utils'
+import type { BrowserControlMode } from '@/store/browser-control'
 
 interface PreviewBrowserBarProps {
   canGoBack: boolean
   canGoForward: boolean
   consoleOpen: boolean
+  /** Who is allowed to drive this page. Absent on panes with no agent channel,
+   *  which have no hand-off to offer. */
+  controlMode?: BrowserControlMode
   devToolsOpen: boolean
+  /** True while an agent action is actually in flight on THIS page. */
+  driving?: boolean
+  fullscreen?: boolean
   loading: boolean
   onBack: () => void
   onForward: () => void
   onNavigate: (url: string) => void
+  onNewTab?: () => void
   onOpenExternal?: () => void
   onPopIn?: () => void
   onPopOut?: () => void
   onReload: () => void
   onToggleConsole: () => void
+  onToggleControlMode?: () => void
   onToggleDevTools: () => void
+  onToggleFullscreen?: () => void
   /** The page's CURRENT address (it moves as the user navigates), not the
    *  target the tab was opened with. */
   url: string
@@ -88,21 +103,80 @@ export function normalizePreviewAddress(value: string): null | string {
   }
 }
 
+/**
+ * WHO IS DRIVING — one chip, and the switch that changes it.
+ *
+ * It is a button rather than a label because the state it reports is the state
+ * you want to change: the only thing anyone wants after reading "AI操作中" is a
+ * way to stop it. The dot carries the LIVE signal — it pulses only while an
+ * action is actually in flight — so a glance answers "is it doing something
+ * right now", not merely "is it allowed to".
+ */
+function BrowserControlChip({
+  driving,
+  mode,
+  onToggle
+}: {
+  driving: boolean
+  mode: BrowserControlMode
+  onToggle: () => void
+}) {
+  const { t } = useI18n()
+  const copy = t.preview.web
+  const manual = mode === 'manual'
+  const label = manual ? copy.manualControl : driving ? copy.agentDriving : copy.agentIdle
+  const action = manual ? copy.returnControlToHermes : copy.takeManualControl
+
+  return (
+    <Tip label={action}>
+      <button
+        aria-label={action}
+        aria-pressed={manual}
+        className={cn(
+          'flex shrink-0 items-center gap-1.5 rounded-full border px-2 py-0.5 text-[0.6875rem] font-medium transition-colors',
+          manual
+            ? 'border-border bg-muted/60 text-muted-foreground hover:text-foreground'
+            : 'border-primary/30 bg-primary/10 text-primary hover:bg-primary/15'
+        )}
+        onClick={onToggle}
+        onPointerDown={event => event.stopPropagation()}
+        type="button"
+      >
+        <span
+          aria-hidden
+          className={cn(
+            'size-1.5 rounded-full',
+            manual ? 'bg-muted-foreground/70' : 'bg-primary',
+            driving && !manual && 'animate-pulse'
+          )}
+        />
+        <span className="whitespace-nowrap">{label}</span>
+      </button>
+    </Tip>
+  )
+}
+
 export function PreviewBrowserBar({
   canGoBack,
   canGoForward,
   consoleOpen,
+  controlMode,
   devToolsOpen,
+  driving = false,
+  fullscreen = false,
   loading,
   onBack,
   onForward,
   onNavigate,
+  onNewTab,
   onOpenExternal,
   onPopIn,
   onPopOut,
   onReload,
   onToggleConsole,
+  onToggleControlMode,
   onToggleDevTools,
+  onToggleFullscreen,
   url
 }: PreviewBrowserBarProps) {
   const { t } = useI18n()
@@ -206,6 +280,20 @@ export function PreviewBrowserBar({
           text={url}
         />
       </div>
+      {controlMode && onToggleControlMode && (
+        <BrowserControlChip driving={driving} mode={controlMode} onToggle={onToggleControlMode} />
+      )}
+      {onNewTab && (
+        <PaneStripGlyph icon={<Codicon name="add" size="0.8125rem" />} label={copy.newBrowserTab} onSelect={onNewTab} />
+      )}
+      {onToggleFullscreen && (
+        <PaneStripGlyph
+          active={fullscreen}
+          icon={<Codicon name={fullscreen ? 'screen-normal' : 'screen-full'} size="0.8125rem" />}
+          label={fullscreen ? copy.exitFullscreen : copy.enterFullscreen}
+          onSelect={onToggleFullscreen}
+        />
+      )}
       {onPopIn ? (
         <PaneStripGlyph
           icon={<Codicon name="screen-normal" size="0.8125rem" />}

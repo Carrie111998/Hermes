@@ -293,6 +293,7 @@ export interface Translations {
     resetHudLayout: string
     layoutEditor: string
     layoutEditorTitle: (modifier: string) => string
+    openBrowser: string
   }
 
   keybinds: {
@@ -2674,6 +2675,14 @@ export interface Translations {
       unreachableDescription: string
       openTarget: (url: string) => string
       fallbackTitle: string
+      agentDriving: string
+      agentIdle: string
+      takeManualControl: string
+      returnControlToHermes: string
+      manualControl: string
+      enterFullscreen: string
+      exitFullscreen: string
+      newBrowserTab: string
     }
   }
 

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { $browserAgentActingTabId, $browserControlModes, setBrowserControlMode } from '@/store/browser-control'
 import { $rightRailActiveTabId } from '@/store/layout'
 import { closeRightRail, openPreview, type PreviewTarget } from '@/store/preview'
 
@@ -312,5 +313,93 @@ describe('actOnActivePreview (drive_preview tool)', () => {
 
   it('reports history verbs with no pane to drive', async () => {
     expect((await actOnActivePreview({ kind: 'reload' })).error).toContain('open_preview')
+  })
+})
+
+describe('manual control', () => {
+  let cleanups: Array<() => void> = []
+
+  const openBrowserTab = () => {
+    openPreview(urlTarget('https://example.com'), 'tool-result')
+
+    return $rightRailActiveTabId.get()!
+  }
+
+  beforeEach(() => {
+    for (const cleanup of cleanups) {
+      cleanup()
+    }
+
+    cleanups = []
+    closeRightRail()
+    $browserControlModes.set({})
+    $browserAgentActingTabId.set(null)
+    window.localStorage.clear()
+  })
+
+  // The safety invariant: once the user has taken the wheel, nothing the agent
+  // sends may reach the page — and it must be TOLD, not silently ignored, or
+  // it will keep retrying against a page it cannot move.
+  it('refuses to act on a page the user has taken over', async () => {
+    const runner = vi.fn()
+    const back = vi.fn()
+    const tabId = openBrowserTab()
+
+    cleanups.push(registerPreviewScriptRunner(tabId, runner))
+    cleanups.push(registerPreviewNav(tabId, { back, forward: vi.fn(), reload: vi.fn() }))
+    setBrowserControlMode(tabId, 'manual')
+
+    for (const kind of ['click', 'type', 'scroll', 'back']) {
+      const result = await actOnActivePreview({ kind, ref: 'a1' })
+
+      expect(result.success).toBe(false)
+      expect(result.error).toContain('manual control')
+    }
+
+    expect(runner).not.toHaveBeenCalled()
+    expect(back).not.toHaveBeenCalled()
+  })
+
+  // Manual control is about who ACTS. The agent may still look, so it can
+  // answer questions about the page the user is driving.
+  it('still lets the agent read the page', async () => {
+    const tabId = openBrowserTab()
+
+    cleanups.push(
+      registerPreviewScriptRunner(tabId, () => Promise.resolve(JSON.stringify({ acted: 'read', success: true })))
+    )
+    setBrowserControlMode(tabId, 'manual')
+
+    expect((await actOnActivePreview({ kind: 'elements' })).success).toBe(true)
+  })
+
+  // The default has to keep Browser Use working untouched.
+  it('acts normally while Hermes has control', async () => {
+    const tabId = openBrowserTab()
+
+    cleanups.push(
+      registerPreviewScriptRunner(tabId, () => Promise.resolve(JSON.stringify({ acted: 'read', success: true })))
+    )
+
+    expect((await actOnActivePreview({ kind: 'elements' })).success).toBe(true)
+  })
+
+  // The badge must be lit DURING the action and dark once it returns.
+  it('marks the tab as being driven for the life of the action', async () => {
+    const tabId = openBrowserTab()
+    let duringAction: null | string = null
+
+    cleanups.push(
+      registerPreviewScriptRunner(tabId, () => {
+        duringAction = $browserAgentActingTabId.get()
+
+        return Promise.resolve(JSON.stringify({ acted: 'read', success: true }))
+      })
+    )
+
+    await actOnActivePreview({ kind: 'elements' })
+
+    expect(duringAction).toBe(tabId)
+    expect($browserAgentActingTabId.get()).toBeNull()
   })
 })
