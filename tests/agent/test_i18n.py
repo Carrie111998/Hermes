@@ -71,6 +71,36 @@ def test_catalog_placeholders_match_english(lang: str):
 
 
 # ---------------------------------------------------------------------------
+# Escaping -- catalog values must never contain literal escape sequences.
+# Regression for #100321: the /fast and /reasoning picker titles were written
+# with doubled backslashes ("\\n") in every non-English catalog, so Telegram
+# printed the two characters backslash-n instead of rendering a newline.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("lang", list(i18n.SUPPORTED_LANGUAGES))
+def test_catalog_values_have_no_literal_escape_sequences(lang: str):
+    """No catalog value may contain a literal backslash-n or backslash-quote.
+
+    In YAML double-quoted scalars ``\\n`` decodes to the two characters ``\\``
+    + ``n`` (which users see printed verbatim), while ``\\n`` written once is a
+    real newline.  Doubled backslashes are always a translation-pipeline
+    escaping bug here -- no catalog string legitimately needs a literal
+    backslash-n or backslash-quote.
+    """
+    flat = _flatten(_load_raw(lang))
+    for key, value in flat.items():
+        assert "\\n" not in value, (
+            f"{lang}.yaml key={key!r}: contains a literal backslash-n "
+            f"(doubled backslash in the YAML source); users see '\\n' printed"
+        )
+        assert "\\'" not in value, (
+            f"{lang}.yaml key={key!r}: contains a literal backslash-quote "
+            f"(doubled backslash in the YAML source); users see '\\' printed"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Language resolution
 # ---------------------------------------------------------------------------
 
