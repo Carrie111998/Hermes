@@ -33,6 +33,16 @@ jobs:
       - name: Build unsigned macOS app
         working-directory: apps/desktop
         run: npm run dist:mac:zip -- --${{ matrix.arch }}
+      - name: Ad-hoc sign and repackage for local installation
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          APP_DIR="$(find release -maxdepth 2 -type d -name Hermes.app -print -quit)"
+          test -n "$APP_DIR"
+          codesign --force --deep --sign - "$APP_DIR"
+          codesign --verify --deep --strict --verbose=2 "$APP_DIR"
+          rm -f release/*.zip
+          ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "release/Hermes-Voice-Agent-0.17.0-mac-${{ matrix.arch }}-adhoc.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: Hermes-Voice-Agent-mac-${{ matrix.arch }}
