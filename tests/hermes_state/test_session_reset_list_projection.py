@@ -48,6 +48,8 @@ def test_session_reset_list_projects_to_live_tip(db):
     assert ids == ["tip"], ids
     assert rows[0]["title"] == "Live tip after /new"
     assert rows[0].get("_lineage_root_id") == "root"
+    assert db.get_list_surface_tip("root") == "tip"
+    assert db.get_compression_tip("root") == "root"
 
 
 def test_new_session_end_reason_also_projects(db):
@@ -55,6 +57,8 @@ def test_new_session_end_reason_also_projects(db):
 
     rows = db.list_sessions_rich(order_by_last_active=True)
     assert [s["id"] for s in rows] == ["tip"]
+    assert db.get_list_surface_tip("root") == "tip"
+    assert db.get_compression_tip("root") == "root"
 
 
 def test_marked_reset_child_stays_its_own_conversation(db):

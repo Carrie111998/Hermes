@@ -11123,8 +11123,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         current = session_id
         seen = {current} if current else set()
         for _ in range(100):
-            with self._lock:
-                cursor = self._conn.execute(
+            with self._read_ctx() as conn:
+                cursor = conn.execute(
                     f"""
                     SELECT child.id
                     FROM sessions parent
