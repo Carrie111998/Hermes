@@ -69,14 +69,14 @@ def test_slack_bot_authorized_when_allow_bots_all(monkeypatch):
 
 
 @pytest.mark.parametrize("allow_bots", ["mentions", "all"])
-def test_identified_slack_bot_still_requires_sender_authorization(
+def test_identified_slack_bot_cannot_fall_back_to_human_allowlist(
     monkeypatch, allow_bots
 ):
     runner = _make_bare_runner()
     monkeypatch.setenv("SLACK_ALLOW_BOTS", allow_bots)
     monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_TRUSTED_BOT")
 
-    assert runner._is_user_authorized(_make_slack_bot_source("U_TRUSTED_BOT")) is True
+    assert runner._is_user_authorized(_make_slack_bot_source("U_TRUSTED_BOT")) is False
     assert runner._is_user_authorized(_make_slack_bot_source("U_OTHER_BOT")) is False
 
 

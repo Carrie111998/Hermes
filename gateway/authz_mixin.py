@@ -613,15 +613,29 @@ class GatewayAuthorizationMixin:
                 if allow_bots_var
                 else "none"
             )
+            # Slack's bot policy is adapter-scoped so multiplexed profiles do
+            # not inherit the first profile's YAML→env bridge.  ``build_source``
+            # retains the receiving adapter for this exact final auth lookup.
+            allowed_bot_ids = set()
+            if source.platform == Platform.SLACK:
+                adapter = self._adapter_for_source(source)
+                extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+                if "allow_bots" in extra:
+                    allow_bots = str(extra["allow_bots"]).lower().strip()
+                if "allowed_bots" in extra:
+                    allowed_bot_ids = _coerce_allow_set(extra["allowed_bots"])
+                else:
+                    allowed_bot_ids = _coerce_allow_set(
+                        _platform_gate_env("SLACK_ALLOWED_BOTS", "")
+                    )
+
             # Identified Slack bots must pass the exact bot-ID ACL at both the
             # adapter prefetch boundary and this final authorization boundary.
             # Broad allow_bots remains only for identity-less app/workflow events.
             if source.platform == Platform.SLACK and user_id:
-                allowed_bot_ids = _coerce_allow_set(
-                    _platform_gate_env("SLACK_ALLOWED_BOTS", "")
+                return allow_bots in {"mentions", "all"} and (
+                    "*" in allowed_bot_ids or user_id in allowed_bot_ids
                 )
-                if allow_bots in {"mentions", "all"} and user_id in allowed_bot_ids:
-                    return True
             allow_class_grant = source.platform != Platform.SLACK or not user_id
             if allow_class_grant and allow_bots in {"mentions", "all"}:
                 return True

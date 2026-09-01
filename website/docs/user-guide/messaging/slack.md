@@ -451,6 +451,13 @@ platforms:
       # prevent self-echoes.
       allow_bots: "none"
 
+      # Exact stable IDs admitted for peer-bot traffic. Use bot_id (B…),
+      # app_id (A…), or bot user ID (U…); display names are never trusted.
+      allowed_bots: []
+
+      # Optional channels where an allowlisted bot need not @mention Hermes.
+      bot_auto_response_channels: []
+
       # Continuable-cron delivery surface (default: "thread").
       # "in_channel" delivers a continuable cron job FLAT into the channel
       # (no dedicated thread); pair with reply_in_thread: false (and
@@ -471,7 +478,9 @@ platforms:
 | `platforms.slack.extra.native_task_cards` | `false` | When `true`, renders live tool calls as Slack-native plan/task cards. This is an explicit progress opt-in independent of Slack's default `tool_progress: off`; native API failures fall back to one continuously edited text update. |
 | `platforms.slack.extra.suggested_prompts` | `[]` | Up to four `{title, message}` prompts for Agent/Assistant DM entry points; accepts either a list or `{title, prompts}`. |
 | `platforms.slack.extra.assistant_thread_titles` | `true` | When `true`, names Agent/Assistant DM threads from the first user message. |
-| `platforms.slack.extra.allow_bots` | `"none"` | Controls messages from other Slack bots: `"none"` ignores them, `"mentions"` accepts an authorized bot message only when **that message itself** @mentions Hermes, and `"all"` accepts all authorized bots. Identified bots must also satisfy sender authorization; app events without a user ID use this bot opt-in directly. Use `"mentions"` for the safest bot-to-bot collaboration mode. See [Accepting messages from other bots](#accepting-messages-from-other-bots-allow_bots). |
+| `platforms.slack.extra.allow_bots` | `"none"` | Controls messages from other Slack bots: `"none"` ignores them, `"mentions"` accepts an allowlisted bot only when **that message itself** @mentions Hermes, and `"all"` accepts all allowlisted bots. Identity-less Workflow Builder events use this opt-in directly. See [Accepting messages from other bots](#accepting-messages-from-other-bots-allow_bots). |
+| `platforms.slack.extra.allowed_bots` | `[]` | Exact Slack bot (`B…`), app (`A…`), or bot-user (`U…`) IDs admitted when `allow_bots` is enabled. Display names and usernames are never authorization identities. `"*"` explicitly allows any identified bot. |
+| `platforms.slack.extra.bot_auto_response_channels` | `[]` | Channel IDs where an already allowlisted bot may bypass normal mention routing. This does not bypass `allowed_bots`. |
 | `platforms.slack.extra.cron_continuable_surface` | `"thread"` | Delivery surface for [continuable cron jobs](../features/cron.md#flat-in-channel-continuation-slack). `"thread"` opens a dedicated thread per delivery (default); `"in_channel"` delivers flat into the channel timeline. Pair `in_channel` with `reply_in_thread: false` (and `require_mention: false`) so a plain channel reply continues the job. |
 
 The equivalent environment variable is `SLACK_ALLOW_BOTS=none|mentions|all`.
@@ -688,16 +697,24 @@ platforms:
       # "all"            — accept every allowlisted bot message
       #                    (except the bot's own)
       allow_bots: mentions
+      # Exact stable identities; any matching B…, A…, or U… ID is accepted.
+      allowed_bots: [B0123456789]
+      # Optional: allow admitted bots to trigger without a mention here.
+      bot_auto_response_channels: []
 ```
 
-Env equivalent: `SLACK_ALLOW_BOTS=none|mentions|all` (the config key wins when both are set). Unknown values are treated as `none`.
+Environment equivalents are `SLACK_ALLOW_BOTS=none|mentions|all`,
+`SLACK_ALLOWED_BOTS` (comma-separated IDs), and
+`SLACK_BOT_AUTO_RESPONSE_CHANNELS` (comma-separated channel IDs). Per-profile
+YAML values remain attached to that Slack adapter under gateway multiplexing;
+they do not inherit another profile's process-level policy.
 
-For bot messages that carry a Slack user ID, `allow_bots` controls whether the
-message is considered, while the existing sender authorization still applies:
-add each peer bot's user ID to `SLACK_ALLOWED_USERS` (or use an explicit
-allow-all sender policy). Workflow Builder and app events without a matchable
-user ID continue to use the `allow_bots` opt-in because they cannot be matched
-against the sender allowlist.
+Identified bot messages must match `allowed_bots` by a stable Slack bot ID,
+app ID, or bot-user ID. Usernames and display names are never used for this
+check. An explicit `"*"` allows any identified bot. The only identity-less
+fallback is a bot/app event such as a Workflow Builder `subtype=bot_message`
+that carries none of those stable IDs; such an event is governed directly by
+`allow_bots` because there is no identity to match.
 
 How `mentions` mode gates:
 
@@ -762,6 +779,7 @@ slack:
   require_mention: true
   strict_mention: true
   allow_bots: mentions
+  allowed_bots: [B0123456789]
   allowed_channels: ""
 ```
 
