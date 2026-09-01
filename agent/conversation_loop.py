@@ -100,7 +100,7 @@ from agent.prompt_caching import (
     strip_anthropic_cache_control,
     strip_anthropic_tool_cache_control,
 )
-from agent.provider_projection import splice_provider_projection
+from agent.turn_response import normalize_turn_response
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
@@ -5953,86 +5953,21 @@ def run_conversation(
             break
 
         try:
-            _transport = agent._get_transport()
-            _normalize_kwargs = {}
-            if agent.api_mode == "anthropic_messages":
-                _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
-            normalized = _transport.normalize_response(response, **_normalize_kwargs)
-            assistant_message = normalized
-            finish_reason = normalized.finish_reason
-            
-            # Normalize content to string — some OpenAI-compatible servers
-            # (llama-server, etc.) return content as a dict or list instead
-            # of a plain string, which crashes downstream .strip() calls.
-            if assistant_message.content is not None and not isinstance(assistant_message.content, str):
-                raw = assistant_message.content
-                if isinstance(raw, dict):
-                    assistant_message.content = raw.get("text", "") or raw.get("content", "") or json.dumps(raw)
-                elif isinstance(raw, list):
-                    # Multimodal content list — extract text parts
-                    parts = []
-                    for part in raw:
-                        if isinstance(part, str):
-                            parts.append(part)
-                        elif isinstance(part, dict) and part.get("type") == "text":
-                            parts.append(part.get("text", ""))
-                        elif isinstance(part, dict) and "text" in part:
-                            parts.append(str(part["text"]))
-                    assistant_message.content = "\n".join(parts)
-                else:
-                    assistant_message.content = str(raw)
-
-            # ── Agent-as-provider projection ──────────────────────────────
-            # A provider that IS an agent ran its own tools inside its own
-            # session before we got here: splice that work into the transcript
-            # as completed call/result rows and tick the skill-review nudge
-            # with the iterations Hermes never saw. Appended before this turn's
-            # assistant message, so the order reads call → result → answer.
-            # No-op for ordinary providers; see agent/provider_projection.py.
-            splice_provider_projection(agent, response, messages)
-
-            try:
-                from hermes_cli.lifecycle import (
-                    has_hook,
-                    invoke_hook as _invoke_hook,
-                )
-                if has_hook("post_api_request"):
-                    _assistant_tool_calls = (
-                        getattr(assistant_message, "tool_calls", None) or []
-                    )
-                    _assistant_text = assistant_message.content or ""
-                    _api_ended_at = api_start_time + api_duration
-                    _invoke_hook(
-                        "post_api_request",
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        api_duration=api_duration,
-                        started_at=api_start_time,
-                        ended_at=_api_ended_at,
-                        finish_reason=finish_reason,
-                        message_count=len(api_messages),
-                        response_model=getattr(response, "model", None),
-                        response=agent._api_response_payload_for_hook(
-                            response,
-                            assistant_message,
-                            finish_reason=finish_reason,
-                        ),
-                        usage=agent._usage_summary_for_api_request_hook(response),
-                        assistant_message=assistant_message,
-                        assistant_content_chars=len(_assistant_text),
-                        assistant_tool_call_count=len(_assistant_tool_calls),
-                        moa_references=_moa_reference_metrics_for_hook(agent),
-                    )
-            except Exception:
-                pass
+            normalized_response = normalize_turn_response(
+                agent,
+                response,
+                messages,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                api_call_count=api_call_count,
+                api_start_time=api_start_time,
+                api_duration=api_duration,
+                api_message_count=len(api_messages),
+                moa_references=_moa_reference_metrics_for_hook(agent),
+            )
+            assistant_message = normalized_response.assistant_message
+            finish_reason = normalized_response.finish_reason
 
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:
