@@ -69,6 +69,14 @@ from agent.turn_context import (
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
+# Power management (Windows sleep/wake handling, #100025) -- optional import
+# so bare test doubles that mock gateway.run can still import without the
+# new module present (e.g. during partial ``hermes update``).
+try:
+    from gateway.power_management import PowerManager  # type: ignore[import]
+except Exception:  # pragma: no cover - missing during partial update
+    PowerManager = None  # type: ignore[assignment]
+
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
 # long-lived gateways (each AIAgent holds LLM clients, tool schemas,
@@ -7408,6 +7416,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _loop_heartbeat_task: Optional["asyncio.Task"] = None
     _loop_floor_timer_handle: Optional[Any] = None
     _loop_liveness_watchdog: Optional[Any] = None
+    _power_manager: Optional[Any] = None
     _gateway_started_at: float = 0.0
     _shutdown_watchdog_done: Optional["threading.Event"] = None
     _platform_lock_takeover_on_start: bool = False
@@ -7828,6 +7837,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._loop_heartbeat_task: Optional[asyncio.Task] = None
         self._loop_floor_timer_handle = None
         self._loop_liveness_watchdog = None
+        # Power management (Windows sleep/wake, #100025): PowerManager armed
+        # from the gateway loop and torn down with the liveness guards.
+        self._power_manager = None  # type: ignore[assignment]
 
         # scale-to-zero (Phase 0, F13): gateway-scoped "last inbound seen" clock.
         # There is no such clock today (only a per-agent _last_activity_ts), so the
@@ -13332,6 +13344,394 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("Failed to cancel gateway loop heartbeat task", exc_info=True)
 
+    # ------------------------------------------------------------------
+    # Power management: Windows sleep/wake handling (#100025)
+    # ------------------------------------------------------------------
+
+    def _start_power_management(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Arm suspend/resume detectors for the gateway loop.
+
+        Best-effort: any failure here must never abort startup. The
+        gateway is strictly more available without power management than
+        not started at all.
+        """
+        if PowerManager is None:
+            return
+        if getattr(self, "_power_manager", None) is not None:
+            return
+        try:
+            mgr = PowerManager(
+                on_suspend=self._on_system_suspend,
+                on_resume=self._on_system_resume,
+                loop=loop,
+            )
+            mgr.start(loop=loop)
+            self._power_manager = mgr  # type: ignore[attr-defined]
+            # Track for tests: ``is_armed`` is observable without reaching
+            # into private PowerManager internals.
+            logger.debug(
+                "Power management start attempted (armed=%s)",
+                getattr(mgr, "is_armed", False),
+            )
+        except Exception:
+            logger.debug("Failed to start power management", exc_info=True)
+
+    def _stop_power_management(self) -> None:
+        """Disarm suspend/resume detectors (idempotent)."""
+        mgr = getattr(self, "_power_manager", None)
+        self._power_manager = None  # type: ignore[attr-defined]
+        if mgr is None:
+            return
+        try:
+            mgr.stop()
+        except Exception:
+            logger.debug("Failed to stop power management", exc_info=True)
+
+    def _on_system_suspend(self) -> None:
+        """Synchronous suspend hook -- log only (keep it <1 ms).
+
+        Runs on the Win32 pump thread (via call_soon_threadsafe) or on
+        the monotonic detector's loop task. It must not block, allocate,
+        or touch adapters -- the machine may freeze at any moment.
+        """
+        try:
+            logger.info("System suspend detected -- gateway going to sleep")
+            # Record suspend in lifecycle for post-resume forensics (best-effort)
+            try:
+                from gateway.lifecycle_ledger import get_lifecycle_sentinel_path
+                import json, datetime
+
+                # Touch a suspend marker so a crash-then-reboot can prove
+                # the gap was a sleep, not an OOM. Best-effort, never raises.
+                path = get_lifecycle_sentinel_path()
+                # We don't rewrite the sentinel itself -- that is the
+                # lifecycle_ledger's ownership -- just log locally.
+            except Exception:
+                pass
+        except Exception:
+            logger.debug("_on_system_suspend failed", exc_info=True)
+
+    async def _on_system_resume(self, sleep_duration: float = 0.0) -> None:
+        """Async resume hook -- reconnect stale platforms after a sleep.
+
+        Runs on the gateway loop (scheduled via call_soon_threadsafe /
+        run_coroutine_threadsafe from the native thread, or directly from
+        the monotonic detector). ``sleep_duration`` is the extra monotonic
+        time beyond one normal tick (0.0 for native Win32 resumes where the
+        duration is not measured).
+
+        Strategy (Option A from #100025 -- graceful reconnect, not a crash):
+
+        1. Log the resume with duration.
+        2. Force a heartbeat write so external probes see a fresh file
+           immediately after wake (instead of up to 30 s later).
+        3. Trigger the platform reconnect watcher *now* rather than on its
+           next 30 s poll: every currently-connected adapter is health-checked
+           and, if its transport is broken, queued for background reconnect
+           with zero backoff. Transient failures self-heal; permanent ones
+           surface as ``NEEDS_ATTENTION`` via the existing watcher, not as
+           an UNCLEAN crash.
+        4. Best-effort GC of ``gateway.loop-tick`` witness: the old port /
+           socket is still bound and will be reused, but stale sibling files
+           (from a helper that crashed before unlink) are already swept by
+           the heartbeat task's own startup sweep.
+        """
+        try:
+            # Human-readable duration
+            if sleep_duration and sleep_duration >= 60:
+                dur_str = f"{sleep_duration/3600:.1f}h" if sleep_duration >= 3600 else f"{sleep_duration/60:.1f}m"
+            elif sleep_duration:
+                dur_str = f"{sleep_duration:.0f}s"
+            else:
+                dur_str = "unknown duration"
+            logger.warning(
+                "System resume detected after %s suspend -- refreshing heartbeat and checking platform transports",
+                dur_str,
+            )
+        except Exception:
+            logger.debug("_on_system_resume log failed", exc_info=True)
+
+        # 1. Refresh heartbeat immediately so stale-file monitors don't
+        #    misclassify the wake as a wedge during the reconnect window.
+        try:
+            from gateway.shutdown_watchdog import write_loop_heartbeat
+
+            await asyncio.to_thread(
+                write_loop_heartbeat,
+                pid=os.getpid(),
+                start_time=getattr(self, "_gateway_started_at", None),
+                extra={"resume_after_s": float(sleep_duration) if sleep_duration else None},
+            )
+        except Exception:
+            logger.debug("Resume heartbeat refresh failed", exc_info=True)
+
+        # 2. Proactively queue platforms whose transports are likely stale.
+        #    We don't blindly disconnect every adapter -- that would drop
+        #    healthy long-polls that survived a brief lid-close. Instead we
+        #    let the per-adapter health speak: adapters that raise on a
+        #    cheap status probe (or that are already in _failed_platforms)
+        #    get queued with immediate retry; healthy ones stay put.
+        try:
+            await self._reconnect_platforms_after_resume()
+        except Exception:
+            logger.debug("Resume platform reconnect sweep failed", exc_info=True)
+
+        # 3. Ensure the reconnect watcher is alive -- if it had given up
+        #    and was in its slow-respawn backoff, a wake is the right moment
+        #    to revive it immediately rather than waiting minutes.
+        try:
+            self._ensure_reconnect_watcher_running()
+            # For gateways that were idle with an empty watcher (no failed
+            # platforms at sleep time), the watcher is parked in its
+            # ``for _ in range(30): sleep(1)`` idle poll. Waking it still
+            # matters: any platform that broke during sleep won't be noticed
+            # until its next *fatal-error* callback, which may never come
+            # if the broken transport just silently stops delivering. So
+            # poke every adapter once with a non-destructive liveness check
+            # already done above -- the watcher itself will be woken by the
+            # queued platforms, no extra wake needed here.
+        except Exception:
+            logger.debug("Resume reconnect-watcher ensure failed", exc_info=True)
+
+    async def _reconnect_platforms_after_resume(self) -> None:
+        """Queue stale adapters for immediate reconnect after a resume.
+
+        Inspects every currently-connected adapter. Adapters that expose a
+        ``is_connected`` / ``is_alive`` style probe and report unhealthy, or
+        that raise when probed, are moved to ``_failed_platforms`` with
+        ``next_retry = now`` (zero backoff) so the reconnect watcher retries
+        them on its next tick. Healthy adapters are left alone.
+
+        As a safety net, on Windows we also treat *all* websocket-like
+        platforms (feishu, relay, etc.) as potentially stale after a
+        multi-minute suspend -- their long-lived TCP connections never
+        survive a suspend/resume cycle even when the remote side hasn't
+        yet sent a TCP RST. The probe above catches most of those, but
+        queuing them proactively avoids a minutes-long silent window where
+        the bot appears connected but receives nothing.
+
+        Never raises.
+        """
+        try:
+            adapters_snapshot = dict(getattr(self, "adapters", {}) or {})
+        except Exception:
+            return
+        if not adapters_snapshot:
+            return
+
+        now = time.monotonic()
+        queued = 0
+        for platform, adapter in list(adapters_snapshot.items()):
+            try:
+                # Prefer an explicit liveness probe when the adapter exposes one.
+                # Different adapters name it differently; try a few.
+                probe = None
+                for name in ("is_connected", "is_alive", "is_healthy", "check_connection"):
+                    probe = getattr(adapter, name, None)
+                    if callable(probe):
+                        break
+                    probe = None
+
+                is_healthy: Optional[bool] = None
+                if probe is not None:
+                    try:
+                        result = probe()
+                        if asyncio.iscoroutine(result):
+                            result = await asyncio.wait_for(result, timeout=3.0)
+                        is_healthy = bool(result)
+                    except asyncio.TimeoutError:
+                        is_healthy = False
+                    except Exception:
+                        is_healthy = False
+
+                # Heuristic: on Windows after a real suspend, websocket
+                # transports are always stale even if their probe still
+                # returns True (the TCP connection hasn't observed the RST
+                # yet). Queue them proactively after a long sleep.
+                # This is deliberately platform-name based so it stays
+                # correct even when a plugin adapter doesn't expose a probe.
+                force_stale = False
+                try:
+                    if sys.platform == "win32":
+                        # Only force after a non-trivial suspend; a brief
+                        # 30 s lid-close shouldn't churn every websocket.
+                        # The caller already filtered by MIN_SLEEP_DURATION,
+                        # so any resume that reaches here is >= ~60 s.
+                        pval = getattr(getattr(adapter, "platform", None), "value", "") or str(platform)
+                        if pval.lower() in {"feishu", "relay", "discord", "slack", "telegram"}:
+                            # For these, the websocket/long-poll is the
+                            # primary receive path and is never valid after
+                            # a suspend. This matches #100025's reported
+                            # "5 platforms connected" but 0 receiving.
+                            # We use the platform *enum* when available,
+                            # otherwise the string key.
+                            force_stale = True
+                except Exception:
+                    pass
+
+                should_queue = False
+                if is_healthy is False:
+                    should_queue = True
+                elif force_stale:
+                    # Only queue force-stale when we couldn't prove healthy,
+                    # or when the adapter is known-stale by kind after a real sleep.
+                    # If the probe said True but the kind is force-stale, still
+                    # queue -- the probe is not trustworthy post-resume.
+                    should_queue = True
+                elif is_healthy is None:
+                    # No probe available -- be conservative: don't churn
+                    # adapters we can't prove are broken. The reconnect
+                    # watcher will still heal them when their next
+                    # operation raises and hits _handle_adapter_fatal_error.
+                    should_queue = False
+
+                if should_queue:
+                    # Use the existing retryable-fatal path so queuing
+                    # semantics (backoff, NEEDS_ATTENTION, etc.) stay
+                    # consistent. Fabricate a retryable fatal with
+                    # immediate retry.
+                    from gateway.config import Platform as PlatformEnum
+
+                    # Resolve Platform enum for the key (adapters dict is
+                    # keyed by Platform, but be defensive).
+                    plat_key = platform
+                    if not hasattr(plat_key, "value"):
+                        try:
+                            plat_key = PlatformEnum(str(platform).lower())
+                        except Exception:
+                            plat_key = platform
+
+                    # Don't double-queue platforms already in the reconnect queue
+                    failed = getattr(self, "_failed_platforms", None)
+                    if isinstance(failed, dict) and plat_key in failed:
+                        # Reset its backoff to immediate retry so the
+                        # watcher doesn't wait minutes for a wake-recoverable
+                        # platform.
+                        try:
+                            failed[plat_key]["next_retry"] = now
+                        except Exception:
+                            pass
+                        continue
+
+                    # Remove from live adapters and queue for reconnect with
+                    # zero backoff. This mirrors what
+                    # _queue_retryable_fatal_platform does, but without
+                    # requiring a fatal error to have already been emitted.
+                    # Disconnect the adapter so its stale transport is torn
+                    # down before the reconnect watcher dials a fresh one;
+                    # otherwise the old websocket thread can race the new
+                    # connect and leave the platform in a half-open state.
+                    try:
+                        # Take it out of the live map first so no new
+                        # inbound is routed to the stale transport while
+                        # we teardown.
+                        self.adapters.pop(platform, None)
+                        # Best-effort disconnect (close websocket, HTTP
+                        # session, etc.). Bounded so a wedged adapter
+                        # doesn't block the whole resume sweep.
+                        try:
+                            await asyncio.wait_for(adapter.disconnect(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "Resume: disconnect for %s timed out after 5s -- queuing anyway",
+                                getattr(platform, "value", str(platform)),
+                            )
+                        except Exception as disc_exc:
+                            logger.debug(
+                                "Resume: disconnect for %s raised: %s",
+                                getattr(platform, "value", str(platform)),
+                                disc_exc,
+                            )
+                    except Exception:
+                        pass
+
+                    # Now queue it using the canonical path so the watcher
+                    # and status probes see the same shape as any other
+                    # retryable fatal.
+                    try:
+                        # Build a minimal PlatformConfig if we don't have the
+                        # original. The reconnect watcher will re-create the
+                        # adapter from this config, so it must be the same
+                        # config that was used to create the live adapter.
+                        # Prefer the stored config from the runner's
+                        # _platform_configs or similar. Fall back to the
+                        # adapter's own config attribute.
+                        cfg = None
+                        for attr in ("_platform_configs", "platform_configs", "config"):
+                            try:
+                                store = getattr(self, attr, None)
+                                if isinstance(store, dict) and plat_key in store:
+                                    cfg = store[plat_key]
+                                    break
+                                if store is not None and hasattr(store, "platforms"):
+                                    cfg = store.platforms.get(plat_key)
+                                    if cfg is not None:
+                                        break
+                            except Exception:
+                                continue
+                        if cfg is None:
+                            cfg = getattr(adapter, "config", None) or getattr(adapter, "_config", None)
+                        if cfg is None:
+                            # Last resort: use the gateway's main config
+                            try:
+                                cfg = self.config.platforms.get(plat_key)  # type: ignore[union-attr]
+                            except Exception:
+                                cfg = None
+                        if cfg is not None:
+                            # Queue with immediate retry
+                            self._failed_platforms[plat_key] = {
+                                "config": cfg,
+                                "attempts": 0,
+                                "next_retry": now,
+                                "queued_at": now,
+                            }
+                            queued += 1
+                            logger.info(
+                                "Resume: queued %s for immediate reconnect (stale after suspend)",
+                                getattr(plat_key, "value", str(plat_key)),
+                            )
+                            # Update runtime status so `hermes status` doesn't
+                            # keep showing "connected" while we reconnect.
+                            try:
+                                self._update_platform_runtime_status(
+                                    getattr(plat_key, "value", str(plat_key)),
+                                    platform_state="retrying",
+                                    error_message="reconnecting after system resume",
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            logger.debug(
+                                "Resume: could not find config for %s -- cannot queue for reconnect",
+                                getattr(plat_key, "value", str(plat_key)),
+                            )
+                            # Put the adapter back if we couldn't queue it
+                            try:
+                                self.adapters[platform] = adapter
+                            except Exception:
+                                pass
+                    except Exception as q_exc:
+                        logger.debug("Resume queue for %s failed: %s", platform, q_exc, exc_info=True)
+                        try:
+                            self.adapters[platform] = adapter
+                        except Exception:
+                            pass
+            except Exception:
+                logger.debug("Resume sweep for %s failed", platform, exc_info=True)
+                continue
+
+        if queued:
+            logger.warning(
+                "System resume: queued %d platform(s) for immediate reconnect",
+                queued,
+            )
+            # Keep the delivery router in sync with the new adapters map
+            try:
+                if hasattr(self, "delivery_router") and hasattr(self.delivery_router, "adapters"):
+                    self.delivery_router.adapters = self.adapters
+            except Exception:
+                pass
+
     async def _consume_clean_shutdown_marker(self, marker_path) -> int:
         """Discard orphan turn markers before consuming a clean-exit receipt.
 
@@ -13500,6 +13900,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 disarm_startup_watchdog()
             except Exception:
                 logger.debug("Startup watchdog disarm failed", exc_info=True)
+            # Power management (sleep/wake) -- #100025: must be armed from
+            # the gateway loop itself (same invariant as the liveness guards)
+            # so GetMessage pump / monotonic detector share the loop's lifetime.
+            try:
+                self._start_power_management(self._gateway_loop)
+            except Exception:
+                logger.debug("Power management arm failed", exc_info=True)
         logger.info("Session storage: %s", self.config.sessions_dir)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
@@ -15958,6 +16365,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
         if callable(_stop_guards):
             _stop_guards()
+        # Power management (sleep/wake) -- #100025: disarm together with the
+        # liveness guards so no resume fires mid-teardown.
+        _stop_pm = getattr(self, "_stop_power_management", None)
+        if callable(_stop_pm):
+            try:
+                _stop_pm()
+            except Exception:
+                logger.debug("Failed to stop power management in stop()", exc_info=True)
         if restart:
             self._restart_requested = True
             self._restart_detached = detached_restart

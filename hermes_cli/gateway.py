@@ -455,6 +455,47 @@ def _probe_loop_tick_socket(
       None  — no socket node for this PID (legacy producer), or the path
               could not be resolved. Not evidence either way.
     """
+    # Windows: TCP loopback witness (asyncio.start_server on 127.0.0.1)
+    # Unix: AF_UNIX socket file
+    if sys.platform == "win32":
+        try:
+            from gateway.shutdown_watchdog import get_loop_heartbeat_path
+
+            hb_path = get_loop_heartbeat_path(home)
+            payload = json.loads(hb_path.read_text(encoding="utf-8"))
+            port = payload.get("loop_tick_port")
+            if port is None:
+                return None
+            try:
+                port = int(port)
+            except (TypeError, ValueError):
+                return None
+            if port <= 0 or port > 65535:
+                return None
+            try:
+                hb_pid = int(payload.get("pid", 0))
+            except (TypeError, ValueError):
+                return None
+            if hb_pid != int(pid):
+                return None
+            sock = None
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(max(float(timeout), 0.0))
+                sock.connect(("127.0.0.1", port))
+                return sock.recv(1) == b"1"
+            except Exception:
+                # ECONNREFUSED (no listener), timeout (loop not answering)
+                return False
+            finally:
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+        except Exception:
+            return None
+        return None
     try:
         from gateway.shutdown_watchdog import get_loop_tick_socket_path
 
