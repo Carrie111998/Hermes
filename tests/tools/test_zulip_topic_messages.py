@@ -109,10 +109,14 @@ def test_send_topic_message_creates_session_and_seeds_transcript(_isolated_zulip
 
 
 def test_zulip_origin_infers_user_and_preserves_profile(_isolated_zulip_tool_env):
+    from hermes_cli.profiles import get_profile_dir
     from gateway.session import SessionSource, SessionStore
     from gateway.session_context import clear_session_vars, set_session_vars
     from plugins.platforms.zulip.topic_tool import zulip_send_topic_message
 
+    # SessionStore fail-closes named-profile keys whose home is missing.
+    # Provision the profile so seed and recovery share one state.db.
+    get_profile_dir("research").mkdir(parents=True, exist_ok=True)
     _isolated_zulip_tool_env.multiplex_profiles = True
     tokens = set_session_vars(
         platform="zulip",

@@ -7,6 +7,7 @@ import logging
 import time
 import uuid
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,26 @@ def _load_zulip_tool_config() -> tuple[str, str, str, Any, Any]:
     return site_url, bot_email, api_key, config, send_config
 
 
+def _session_db_for_profile(profile: Optional[str]):
+    """Open the SessionDB inbound recovery will look in.
+
+    Multiplexed named profiles live under ``profiles/<name>/state.db``.
+    Seeding the ambient store splits one session identity across two files.
+    """
+    from hermes_state import SessionDB
+
+    if not profile:
+        return SessionDB()
+    from hermes_cli.profiles import get_profile_dir, profile_exists
+
+    if not profile_exists(profile):
+        raise RuntimeError(
+            f"profile {profile!r} has no resolvable home; "
+            "refusing to seed into the ambient store"
+        )
+    return SessionDB(db_path=Path(get_profile_dir(profile)) / "state.db")
+
+
 def _seed_topic_session(
     *,
     config: Any,
@@ -82,7 +103,6 @@ def _seed_topic_session(
 ) -> str:
     """Create/reuse the inbound topic session and record the sent seed text."""
     from gateway.session import SessionSource, build_session_key
-    from hermes_state import SessionDB
 
     source = SessionSource(
         platform=_zulip_platform(),
@@ -100,7 +120,9 @@ def _seed_topic_session(
         thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         profile=profile if getattr(config, "multiplex_profiles", False) else None,
     )
-    db = SessionDB()
+    db = _session_db_for_profile(
+        profile if getattr(config, "multiplex_profiles", False) else None
+    )
     existing = db.find_latest_gateway_session_for_peer(
         source="zulip",
         user_id=user_email,
