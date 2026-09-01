@@ -475,7 +475,7 @@ class TestClientTools:
             description="finds things",
             skills=[{"id": "s", "name": "search", "description": "web search"}],
         )
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: card)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, ao=(): card)
         out = tools.a2a_discover({"url": "http://localhost:9999"})
         assert "researcher" in out
         assert "search" in out
@@ -485,11 +485,11 @@ class TestClientTools:
         """Outbound params: contextId inside the message, v1.0 role, no kind."""
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"r": {"url": "http://localhost:9999"}}})
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, ao=(): None)
 
         captured = {}
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
             captured["body"] = body
             ctx = body["params"]["message"].get("contextId", "c1")
             return protocol.jsonrpc_result(
@@ -515,9 +515,9 @@ class TestClientTools:
     def test_call_reports_input_required(self, monkeypatch):
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"r": {"url": "http://localhost:9999"}}})
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, ao=(): None)
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
             return protocol.jsonrpc_result(
                 body["id"],
                 protocol.build_task("t", "ctx-q", protocol.STATE_INPUT_REQUIRED, "Which repo?"),
@@ -575,15 +575,42 @@ class TestRegistryDispatchConvention:
         out = registry.dispatch("a2a_list", {})
         assert "No peers configured" in out
 
+    def test_registered_schemas_are_flat_not_double_wrapped(self, monkeypatch, tmp_path):
+        """The registry stores schemas as-is and ``get_definitions()`` wraps
+        them in {"type": "function", "function": ...}. ``register_tools``
+        must unwrap ``_SCHEMAS``'s OpenAI-style wrapper first — otherwise the
+        model gets a nested {"function": {"function": {...}}} with no
+        parameters and tool calls fail validation."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(tools, "_load_config", lambda: {})
+        from tools.registry import registry
+
+        class _Ctx:
+            def register_tool(self, name, toolset, schema, handler, **kw):
+                registry.register(name=name, toolset=toolset, schema=schema,
+                                  handler=handler, override=True, **kw)
+
+        tools.register_tools(_Ctx())
+
+        defs = registry.get_definitions({"a2a_call", "a2a_discover"})
+        by_name = {d["function"].get("name"): d for d in defs}
+        assert set(by_name) == {"a2a_call", "a2a_discover"}
+        call_fn = by_name["a2a_call"]["function"]
+        assert "function" not in call_fn  # double-wrap would nest one here
+        assert "agent" in call_fn["parameters"]["properties"]
+        assert call_fn["description"]
+        assert by_name["a2a_discover"]["function"]["description"]
+
+
     def test_a2a_call_accepts_agent_name_alias(self, monkeypatch):
         """Models reach for 'agent_name' (observed live). Accept it as an
         alias for 'agent' so the call doesn't fail the required-arg guard."""
         monkeypatch.setattr(tools, "_load_config",
                             lambda: {"a2a_agents": {"peer": {"url": "http://localhost:9999"}}})
-        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t, ao=(): None)
         captured = {}
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
             captured["sent"] = True
             return protocol.jsonrpc_result(
                 body["id"],
@@ -1387,7 +1414,7 @@ class TestClientTenantAndDiscovery:
     def test_rpc_body_echoes_tenant_from_agent_card(self, monkeypatch):
         posted = {}
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers, timeout, allowed_origins=()):
             assert url.endswith("/.well-known/agent-card.json")
             return protocol.build_agent_card(
                 name="dev",
@@ -1396,7 +1423,7 @@ class TestClientTenantAndDiscovery:
                 tenant="dev-team",
             )
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
             posted["url"] = url
             posted["body"] = body
             return {"jsonrpc": "2.0", "id": body["id"], "result": protocol.build_task(
@@ -1415,7 +1442,7 @@ class TestClientTenantAndDiscovery:
     def test_discovery_falls_back_to_legacy_agent_json(self, monkeypatch):
         calls = []
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers, timeout, allowed_origins=()):
             calls.append(url)
             if url.endswith("agent-card.json"):
                 raise urllib.error.HTTPError(url, 404, "not found", {}, None)
@@ -1465,11 +1492,11 @@ class TestV1SpecRegressionFixes:
     def test_client_sends_v1_method_and_unwraps_response(self, monkeypatch):
         posted = {}
 
-        def fake_get(url, headers, timeout):
+        def fake_get(url, headers, timeout, allowed_origins=()):
             return protocol.build_agent_card(
                 name="dev", url="http://peer.example/dev/", description="dev", tenant="dev-team")
 
-        def fake_post(url, body, headers, timeout):
+        def fake_post(url, body, headers, timeout, retry_524=False, allowed_origins=()):
             posted["headers"] = headers
             posted["body"] = body
             return {"jsonrpc": "2.0", "id": body["id"], "result": {"task": protocol.build_task(
@@ -1618,3 +1645,9 @@ print('fake reply')
         title = con.execute("SELECT title FROM sessions WHERE id='sess-1'").fetchone()[0]
         con.close()
         assert title == "a2a-dev-ctx-unsafe-value"
+
+
+# --------------------------------------------------------------------------
+# Client HTTP edge cases: GET-layer headers, collision precedence,
+# 524 retry budget
+# --------------------------------------------------------------------------

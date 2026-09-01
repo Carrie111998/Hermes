@@ -40,6 +40,30 @@ The agent gets five tools:
 - `a2a_orchestrate(capability, message, mode?)` — fan-out a task to every
   peer advertising a capability (`all` / `first` / `best`).
 
+### Streaming fallback and the indeterminate-outcome contract
+
+When a peer advertises streaming, Hermes sends `SendStreamingMessage` (SSE)
+and, on a **zero-frame** transport failure (404/405/501 from the endpoint, a
+connection refused/reset before any frame arrives), falls back to
+`message/send` — the task provably never reached the peer's engine, so the
+fallback is a clean first dispatch.
+
+If the stream **produces frames and then dies without a terminal state**, the
+outcome is *indeterminate*: the peer may have already run the task. Hermes
+does **not** resubmit in that case (a client must not replay a mutating
+request without a retry-safe idempotency contract). Instead `a2a_call` returns
+an explanation naming the peer and the frame count, and keeps the stream's
+contextId so a follow-up lands in the same conversation.
+
+There is deliberately **no configuration to re-enable the mid-stream
+fallback**: no Hermes release (and no currently proposed change) provides the
+server-side idempotency contract that would make replaying a mutating send
+safe. Recovery for an indeterminate outcome is explicit — re-send only if the
+operation is safe to repeat, or poll the task by id once task-identity
+polling composes upstream. Zero-frame failures still fall back — the task
+provably never reached the peer's engine, so `message/send` is a clean
+first dispatch.
+
 ## Inbound — be callable
 
 When the `a2a` platform is enabled, Hermes serves a v1.0 Agent Card at
