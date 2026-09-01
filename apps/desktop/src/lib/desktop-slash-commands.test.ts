@@ -262,6 +262,31 @@ describe('desktop slash command curation', () => {
     expect(filterDesktopSubcommandCompletions('/memory ', hubItems)).toHaveLength(hubItems.length)
   })
 
+  it('uses the backend arg-stage flag instead of re-parsing the query', () => {
+    expect(
+      filterDesktopSubcommandCompletions('/skills ', [{ text: '/skills' }], { isArgCompletion: false }).map(
+        item => item.text
+      )
+    ).toEqual(['/skills'])
+    expect(
+      filterDesktopSubcommandCompletions('/skills', [{ text: 'install' }, { text: 'pending' }], {
+        isArgCompletion: true
+      }).map(item => item.text)
+    ).toEqual(['pending'])
+  })
+
+  it('skips a malformed completion row instead of wiping the list', () => {
+    expect(() =>
+      filterDesktopSubcommandCompletions('/skills ', [{ text: undefined as unknown as string }, { text: 'pending' }])
+    ).not.toThrow()
+    expect(
+      filterDesktopSubcommandCompletions('/skills ', [
+        { text: undefined as unknown as string },
+        { text: 'pending' }
+      ]).map(item => item.text)
+    ).toEqual(['pending'])
+  })
+
   it('normalizes the raw command prefix before filtering subcommands', () => {
     const hubItems = [
       { text: 'install' },
