@@ -34,6 +34,16 @@ describe('PlatformAvatar brand glyphs', () => {
     expect(container.querySelector('img')).toBeNull()
   })
 
+  it('keeps the official Raft two-tone icon-only geometry', () => {
+    const { container } = render(<PlatformAvatar platformId="raft" platformName="Raft" />)
+    const icon = container.querySelector('svg')
+
+    expect(icon?.getAttribute('viewBox')).toBe('0 0 113 104')
+    expect(icon?.querySelectorAll('path')).toHaveLength(3)
+    expect(icon?.querySelector('[fill="#141111"]')).toBeTruthy()
+    expect(icon?.querySelectorAll('[fill="#FFFAEF"]')).toHaveLength(2)
+  })
+
   it('keeps the initial fallback for an unknown platform', () => {
     const { container } = render(<PlatformAvatar platformId="custom_chat" platformName="Custom Chat" />)
 
