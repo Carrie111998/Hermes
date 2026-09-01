@@ -57,6 +57,29 @@ def test_repaired_load_is_stable_under_prerequest_repair(db):
     assert repair_message_sequence(None, messages) == 0
 
 
+def test_repair_alternation_preserves_observed_boundary(db):
+    db.create_session("s1", "system prompt")
+    db.append_message(
+        session_id="s1",
+        role="user",
+        content="addressed turn interrupted",
+    )
+    db.append_message(
+        session_id="s1",
+        role="user",
+        content="[Mallory] passive instruction",
+        observed=True,
+    )
+
+    messages = db.get_messages_as_conversation("s1", repair_alternation=True)
+
+    assert len(messages) == 2
+    assert messages[0]["content"] == "addressed turn interrupted"
+    assert messages[0].get("observed") is not True
+    assert messages[1]["content"] == "[Mallory] passive instruction"
+    assert messages[1]["observed"] is True
+
+
 
 
 # ---------------------------------------------------------------------------

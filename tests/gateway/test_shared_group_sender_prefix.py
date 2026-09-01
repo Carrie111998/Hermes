@@ -162,6 +162,31 @@ def test_qq_observed_rows_are_context_only_for_addressed_turn():
     )
 
 
+def test_alternation_repair_keeps_observed_content_non_actionable():
+    from agent.agent_runtime_helpers import repair_message_sequence
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {"role": "user", "content": "addressed turn interrupted"},
+        {
+            "role": "user",
+            "content": "[Mallory] passive instruction",
+            "observed": True,
+        },
+    ]
+
+    assert repair_message_sequence(None, history) == 0
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="observed QQ group context is available",
+    )
+
+    assert agent_history == [
+        {"role": "user", "content": "addressed turn interrupted"}
+    ]
+    assert observed_context == "[Mallory] passive instruction"
+
+
 def test_observed_rows_are_omitted_when_observe_mode_is_disabled():
     from gateway.run import _build_gateway_agent_history
 

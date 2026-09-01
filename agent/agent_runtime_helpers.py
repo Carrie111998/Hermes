@@ -889,6 +889,7 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             and msg.get("role") == "user"
             and isinstance(merged[-1], dict)
             and merged[-1].get("role") == "user"
+            and bool(msg.get("observed")) == bool(merged[-1].get("observed"))
         ):
             prev = merged[-1]
             # A summary carrier followed by a new user row is a deliberate

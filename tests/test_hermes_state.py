@@ -1061,6 +1061,58 @@ class TestCounts:
         assert active_count == 1
         assert total_count == 2
 
+    def test_discard_observed_message_rejects_active_foreign_turn_lease(self, db):
+        db.create_session(session_id="s1", source="qqbot")
+        db.append_message(
+            "s1",
+            role="user",
+            content="passive observation",
+            platform_message_id="msg-observed",
+            observed=True,
+        )
+        holder = f"pid={hermes_state.os.getpid()}:turn=foreign"
+        assert db.try_acquire_session_turn_lease("s1", holder, ttl_seconds=5)
+
+        with pytest.raises(
+            hermes_state.SessionTurnLeaseLostError,
+            match="active turn lease",
+        ):
+            db.discard_observed_platform_message("s1", "msg-observed")
+
+        rows = db.get_messages("s1")
+        assert [row["platform_message_id"] for row in rows] == ["msg-observed"]
+        assert db.get_session("s1")["message_count"] == 1
+        db.release_session_turn_lease("s1", holder)
+
+    def test_discard_observed_message_rejects_active_compression_lock(
+        self, db, monkeypatch
+    ):
+        monkeypatch.setattr(SessionDB, "_COMPRESSION_BUSY_WAIT_S", 0.0)
+        db.create_session(session_id="s1", source="qqbot")
+        db.append_message(
+            "s1",
+            role="user",
+            content="passive observation",
+            platform_message_id="msg-observed",
+            observed=True,
+        )
+        compression_holder = (
+            f"pid={hermes_state.os.getpid()}:compression=foreign"
+        )
+        assert db.try_acquire_compression_lock(
+            "s1",
+            compression_holder,
+            ttl_seconds=60,
+        )
+
+        with pytest.raises(hermes_state.SessionCompressionInProgressError):
+            db.discard_observed_platform_message("s1", "msg-observed")
+
+        rows = db.get_messages("s1")
+        assert [row["platform_message_id"] for row in rows] == ["msg-observed"]
+        assert db.get_session("s1")["message_count"] == 1
+        db.release_compression_lock("s1", compression_holder)
+
 
 
 # =========================================================================

@@ -14149,6 +14149,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         passive row existed.
         """
         def _do(conn):
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                None,
+                reject_active_turn_lease=True,
+                reject_active_compression_lock=True,
+            )
             cursor = conn.execute(
                 "DELETE FROM messages "
                 "WHERE session_id = ? AND platform_message_id = ? "
