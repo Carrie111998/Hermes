@@ -3385,10 +3385,12 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # damage can be segment-state dependent (#100227) — a probe whose
         # trigram tokens land in a healthy segment succeeds while real user
         # messages whose terms hit the corrupt (segid, term) key range fail
-        # with IntegrityError. The variants cover high-frequency English
-        # trigrams (most likely present in any populated segment) plus a
-        # per-run unique token, spanning the token space real messages draw
-        # from.
+        # with IntegrityError. The variants widen which segments get
+        # exercised: high-frequency English trigrams are the most likely to
+        # be populated, and the per-run unique token samples a fresh key
+        # range each run. Content probing stays heuristic — it narrows this
+        # corruption class without eliminating it; an inspection-based
+        # shadow-table consistency check is the deterministic complement.
         probe_variants = (
             "_fts_health_probe",
             "the quick brown fox jumps over the lazy dog and then the team "
