@@ -38,6 +38,46 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Browser-built-in placeholder pages a fresh Chrome opens on its own (the
+# New Tab the user left open, DevTools frontends). CDP target ordering does
+# not promise the Hermes-navigated page comes first, so picking the first
+# ``type == "page"`` entry can wedge every supervisor-backed eval onto
+# ``chrome://new-tab-page`` while the real page sits later in the list.
+_INTERNAL_PAGE_URL_PREFIXES = (
+    "about:",
+    "chrome://",
+    "chrome-error://",
+    "devtools://",
+    "edge://",
+    "view-source:about:",
+)
+
+
+def _is_internal_page_url(url: object) -> bool:
+    url = str(url or "")
+    return any(url.startswith(prefix) for prefix in _INTERNAL_PAGE_URL_PREFIXES)
+
+
+def _select_initial_page_target(
+    targets: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Pick the page target the supervisor should attach to.
+
+    Deterministic preference order:
+      1. The last real (non-internal) page target — with a New Tab lingering
+         from startup plus pages Hermes navigated afterwards, the real page
+         is the freshest entry; targetInfo ordering puts newer targets last.
+      2. The last internal page target (fresh browser, only a New Tab open) —
+         still a usable page session; navigation later replaces its content.
+      3. ``None`` — no page targets at all; the caller creates one.
+    """
+    pages = [t for t in targets if t.get("type") == "page"]
+    real_pages = [t for t in pages if not _is_internal_page_url(t.get("url"))]
+    if real_pages:
+        return real_pages[-1]
+    return pages[-1] if pages else None
+
+
 def _redact_cdp_error_text(exc: object) -> str:
     """Redact any CDP endpoint credentials from an error's string form.
 
@@ -742,7 +782,7 @@ class CDPSupervisor:
         """Find a page target, attach flattened session, enable domains, install dialog bridge."""
         resp = await self._cdp("Target.getTargets")
         targets = resp.get("result", {}).get("targetInfos", [])
-        page_target = next((t for t in targets if t.get("type") == "page"), None)
+        page_target = _select_initial_page_target(targets)
         if page_target is None:
             created = await self._cdp("Target.createTarget", {"url": "about:blank"})
             target_id = created["result"]["targetId"]
