@@ -10934,13 +10934,22 @@ def _call_llm_impl(
             except Exception:
                 logger.debug("Auxiliary: cache eviction after connection error failed",
                              exc_info=True)
-        if _quarantined_exc is not None:
+        if _quarantined_exc is not None and (
+            task == "compression" or route_callback is not None
+        ):
             # The last physical wire attempt was a fallback candidate whose
             # credential was dead. The route snapshot already identifies that
             # fallback, so propagate ITS terminal auth error (chained to the
             # primary origin for context) instead of re-raising the primary's
             # earlier error — otherwise the compression diagnostic pairs the
             # fallback's endpoint with the primary's failure class (#72636).
+            #
+            # Scoped to the attribution path only (compression, or any caller
+            # that registered a route_callback): every other auxiliary task —
+            # vision, web_extract, title generation, ... — keeps the
+            # pre-existing exception contract, where a swallowed fallback 401
+            # leaves the PRIMARY error (e.g. a 429 that upper layers key
+            # backoff decisions on) as the one callers observe.
             raise _quarantined_exc from first_err
         raise
 
