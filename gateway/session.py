@@ -1255,6 +1255,14 @@ class SessionStore:
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
+        # Adapter-declared session-scope overrides, keyed (profile, platform
+        # value). Populated by register_platform_session_scope() when an
+        # adapter is accepted; consulted before the gateway-config defaults so
+        # plugin/out-of-tree platforms absent from config.platforms still key
+        # sessions the way their adapter's config.extra asks.
+        self._platform_session_scope: Dict[
+            tuple[Optional[str], str], tuple[bool, bool]
+        ] = {}
         self._loaded = False
         # A fallback-only initial load must be reconciled with state.db after
         # the handle recovers, before a whole-index save can replace DB rows.
@@ -2215,13 +2223,67 @@ class SessionStore:
 
         return recovered_profile == self._active_profile_name()
 
+    def register_platform_session_scope(
+        self,
+        platform: str,
+        *,
+        group_sessions_per_user: bool,
+        thread_sessions_per_user: bool,
+        profile: Optional[str] = None,
+    ) -> None:
+        """Record a platform adapter's resolved session-scope flags.
+
+        Called once per adapter when it is accepted, with the final values of
+        its ``config.extra`` (falling back to the gateway defaults), so the
+        store — the owner of routing keys — agrees with the adapter about key
+        shape for that platform's sources. This is what makes per-platform
+        isolation work for plugin/out-of-tree platforms that have no entry in
+        the gateway's ``config.platforms`` map. Keyed per (profile, platform):
+        under ``multiplex_profiles`` each profile configures its own adapter
+        for a platform, and one profile's override must not leak into
+        another's key shape. ``profile=None`` registers a default that applies
+        to any profile without its own registration for the platform.
+        """
+        self._platform_session_scope[(profile, platform)] = (
+            bool(group_sessions_per_user),
+            bool(thread_sessions_per_user),
+        )
+
+    def resolve_session_scope(
+        self, source: SessionSource, profile: Optional[str] = None
+    ) -> tuple[bool, bool]:
+        """(group_sessions_per_user, thread_sessions_per_user) for a source.
+
+        Resolution order: the (profile, platform) scope the owning adapter
+        registered, else the gateway-config defaults. Every key derivation —
+        and any guard that must stay in lock-step with key shape — should
+        resolve through here rather than reading the config directly.
+        ``profile`` lets a caller that already resolved the source's profile
+        pass it in instead of resolving twice.
+        """
+        platform_value = getattr(source.platform, "value", str(source.platform))
+        if profile is None:
+            profile = self._resolve_profile_for_key(source)
+        for profile_key in (profile, None):
+            scope = self._platform_session_scope.get((profile_key, platform_value))
+            if scope is not None:
+                return scope
+        return (
+            getattr(self.config, "group_sessions_per_user", True),
+            getattr(self.config, "thread_sessions_per_user", False),
+        )
+
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
+        profile = self._resolve_profile_for_key(source)
+        group_per_user, thread_per_user = self.resolve_session_scope(
+            source, profile=profile
+        )
         return build_session_key(
             source,
-            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
-            profile=self._resolve_profile_for_key(source),
+            group_sessions_per_user=group_per_user,
+            thread_sessions_per_user=thread_per_user,
+            profile=profile,
         )
 
     def _legacy_slack_session_key(self, source: SessionSource) -> Optional[str]:
@@ -4513,12 +4575,16 @@ class SessionStore:
 def build_session_context(
     source: SessionSource,
     config: GatewayConfig,
-    session_entry: Optional[SessionEntry] = None
+    session_entry: Optional[SessionEntry] = None,
+    session_store: Optional["SessionStore"] = None,
 ) -> SessionContext:
     """
     Build a full session context from a source and config.
-    
+
     This is used to inject context into the agent's system prompt.
+    ``session_store`` lets the shared-session flag resolve adapter-declared
+    scope overrides so it stays in lock-step with the session key; without
+    it the gateway-config defaults apply.
     """
     connected = config.get_connected_platforms()
     
@@ -4527,15 +4593,21 @@ def build_session_context(
         home = config.get_home_channel(platform)
         if home:
             home_channels[platform] = home
-    
+
+    if isinstance(session_store, SessionStore):
+        group_per_user, thread_per_user = session_store.resolve_session_scope(source)
+    else:
+        group_per_user = getattr(config, "group_sessions_per_user", True)
+        thread_per_user = getattr(config, "thread_sessions_per_user", False)
+
     context = SessionContext(
         source=source,
         connected_platforms=connected,
         home_channels=home_channels,
         shared_multi_user_session=is_shared_multi_user_session(
             source,
-            group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
-            thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
+            group_sessions_per_user=group_per_user,
+            thread_sessions_per_user=thread_per_user,
         ),
     )
     

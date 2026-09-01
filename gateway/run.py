@@ -8129,6 +8129,58 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             enabled_chats.discard(chat_id)
 
+    def _register_adapter_session_scope(
+        self,
+        platform: Platform,
+        adapter: "BasePlatformAdapter",
+        profile: Optional[str] = None,
+    ) -> None:
+        """Register an accepted adapter's session scope with the store.
+
+        Reads the adapter's post-``__init__`` ``config.extra`` (plugin and
+        out-of-tree adapters override ``group_sessions_per_user`` /
+        ``thread_sessions_per_user`` there), so the session store — which owns
+        routing keys — derives the same key shape as the adapter even for
+        platforms with no entry in the gateway's ``config.platforms`` map.
+        Called only at adapter-acceptance points, after credential/listener
+        checks — a created-but-rejected adapter must not leave a live
+        registration behind. Secondary-profile acceptance points pass their
+        ``profile`` explicitly; primary points omit it.
+        """
+        extra = getattr(getattr(adapter, "config", None), "extra", None)
+        store = getattr(self, "session_store", None)
+        if store is not None and isinstance(extra, dict):
+            # An explicit None in extra means "no override" — fall back to
+            # the gateway default rather than bool-coercing None to False.
+            group = extra.get("group_sessions_per_user")
+            thread = extra.get("thread_sessions_per_user")
+            if group is None:
+                group = getattr(self.config, "group_sessions_per_user", True)
+            if thread is None:
+                thread = getattr(self.config, "thread_sessions_per_user", False)
+            store.register_platform_session_scope(
+                platform.value,
+                group_sessions_per_user=group,
+                thread_sessions_per_user=thread,
+                profile=profile,
+            )
+
+    def _resolve_session_scope_for(self, source: SessionSource) -> tuple[bool, bool]:
+        """Session scope for a source: store-resolved, config fallback.
+
+        The real store honors adapter-declared overrides; anything else
+        (bare/legacy standalone runners and test doubles) keeps the
+        gateway-config defaults. A live gateway always has a real
+        ``self.session_store``.
+        """
+        store = getattr(self, "session_store", None)
+        if isinstance(store, SessionStore):
+            return store.resolve_session_scope(source)
+        return (
+            getattr(self.config, "group_sessions_per_user", True),
+            getattr(self.config, "thread_sessions_per_user", False),
+        )
+
     def _sync_voice_mode_state_to_adapter(self, adapter) -> None:
         """Restore persisted /voice state into a live platform adapter.
 
@@ -14040,6 +14092,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             if outcome == "ok":
                 self.adapters[platform] = adapter
+                self._register_adapter_session_scope(platform, adapter)
                 self._sync_voice_mode_state_to_adapter(adapter)
                 # Wire voice input callback at connect time so voice
                 # transcription is forwarded without requiring /voice join.
@@ -15754,6 +15807,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if success:
                         self.adapters[platform] = adapter
+                        self._register_adapter_session_scope(platform, adapter)
                         self._sync_voice_mode_state_to_adapter(adapter)
                         # Wire voice input callback on reconnect as well (#60623).
                         if hasattr(adapter, "_voice_input_callback"):
@@ -16831,6 +16885,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 if success:
                     profile_map[platform] = adapter
+                    self._register_adapter_session_scope(
+                        platform, adapter, profile=profile_name
+                    )
                     if credential_claim is not None:
                         claimed[credential_claim] = profile_name
                     if listener_claim is not None:
@@ -16933,6 +16990,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         profile_map = self._profile_adapters.setdefault(profile_name, {})
                         if platform not in profile_map:
                             profile_map[platform] = adapter
+                            self._register_adapter_session_scope(
+                                platform, adapter, profile=profile_name
+                            )
                             self._sync_voice_mode_state_to_adapter(adapter)
                             logger.info(
                                 "✓ %s reconnected (profile: %s)",
@@ -19767,8 +19827,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _pending_stt_prepared
             else event.text
         ) or ""
-        _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
-        _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
+        _group_sessions_per_user, _thread_sessions_per_user = (
+            self._resolve_session_scope_for(source)
+        )
         # Prefer the already resolved session key from the caller so this write
         # key matches the consume key at the run_conversation site. Fall back
         # to deriving it here for tests and legacy standalone callers.
@@ -20640,7 +20701,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             })
         
         # Build session context
-        context = build_session_context(source, self.config, session_entry)
+        context = build_session_context(
+            source, self.config, session_entry, session_store=self.session_store
+        )
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
