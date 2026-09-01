@@ -108,7 +108,21 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "desktop_preview", "drive_preview", "annotate_preview", "read_window_below", "setup_mcp", "tour", "delegate_task"}
+    {
+        "todo",
+        "session_search",
+        "memory",
+        "clarify",
+        "read_terminal",
+        "desktop_preview",
+        "drive_preview",
+        "annotate_preview",
+        "read_window_below",
+        "setup_mcp",
+        "tour",
+        "delegate_task",
+        "multi_agent_orchestrate",
+    }
 )
 
 
@@ -3703,6 +3717,23 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     elif function_name == "delegate_task":
         def _execute(next_args: dict) -> Any:
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
+    elif function_name == "multi_agent_orchestrate":
+        def _execute(next_args: dict) -> Any:
+            from tools.multi_agent_tool import multi_agent_orchestrate as _multi_agent_orchestrate
+            return _finish_agent_tool(
+                _multi_agent_orchestrate(
+                    objective=next_args.get("objective", ""),
+                    task_context=next_args.get("task_context") or {},
+                    max_correction_loops=next_args.get("max_correction_loops"),
+                    run_reviewer=next_args.get("run_reviewer"),
+                    developer_toolsets=next_args.get("developer_toolsets"),
+                    tester_toolsets=next_args.get("tester_toolsets"),
+                    reviewer_toolsets=next_args.get("reviewer_toolsets"),
+                    debugger_toolsets=next_args.get("debugger_toolsets"),
+                    parent_agent=agent,
+                ),
+                next_args,
+            )
     else:
         def _execute(next_args: dict) -> Any:
             dispatch_kwargs = dict(
