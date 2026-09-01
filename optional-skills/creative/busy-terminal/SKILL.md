@@ -1,7 +1,7 @@
 ---
 name: busy-terminal
 description: "Joke screensaver: fake coding or Hollywood hacking."
-version: 1.2.0
+version: 1.3.0
 author: "Luke The Dev (@iamlukethedev), Hermes Agent"
 license: MIT
 platforms: [linux, macos, windows]
@@ -95,7 +95,7 @@ The user can also run it themselves in any terminal, without `--window`.
 | `tests` | developer | Pytest-style dots, pass–fail summary, occasional flake retry |
 | `git` | developer | Commit, push with delta compression, CI checks going green |
 | `matrix` | hacker | Digital rain with bright heads and dimming trails |
-| `warroom` | hacker | Rain behind several live panes, password dialog floating on top |
+| `warroom` | hacker | Rain behind live panes (red/green accents), four floating dialogs |
 | `intrusion` | hacker | Port scan, brute-force, ACCESS GRANTED banner, exfil bar |
 | `crack` | hacker | Hex spray, then an AES key locking in byte by byte |
 
@@ -131,7 +131,9 @@ played, so the cycle reads as varied rather than random-looking.
 - The matrix rain and the war room need ANSI cursor addressing; piped or
   `--no-color` output degrades them to scrolling lines on purpose.
 - The war room shines at generous sizes — panes that would come out under
-  14×4 cells are dropped, so a tiny terminal shows fewer windows.
+  14×4 cells are dropped, and the three corner dialogs (perimeter alert,
+  proxy chain, exfil meter) only appear at 70×20 or larger. The password
+  centerpiece always shows.
 - The hacker profile is theatre, not technique — keep targets and loot inside
   the shipped fictional pools if you ever extend the pools.
 

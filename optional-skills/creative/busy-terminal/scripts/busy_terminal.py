@@ -786,12 +786,23 @@ def warroom_layout(width: int, height: int) -> dict[str, Rect]:
         height=5,
     )
 
+    # The three corner dialogs only exist on generous terminals, in bands the
+    # password dialog never reaches, so the four floaters stay readable.
+    if width >= 70 and height >= 20:
+        rects["alert"] = Rect(top=3, left=width - 28, width=24, height=4)
+        rects["proxy"] = Rect(top=height - 5, left=4, width=26, height=4)
+        rects["exfil"] = Rect(top=height - 5, left=width - 32, width=26, height=4)
+
     return rects
 
 
 @dataclass
 class Pane:
-    """One live window: a box, a text tone, and a feed that fills it."""
+    """One live window: a box, a text tone, and a feed that fills it.
+
+    Lines carry their own tone so an accent rolled at append time survives
+    every repaint — re-rolling on repaint would make old rows flicker.
+    """
 
     rect: Rect
     title: str
@@ -799,7 +810,18 @@ class Pane:
     feed: Callable[[random.Random, int], str]
     period: int
     reveal: int
-    lines: list[str]
+    lines: list[tuple[str, str]]
+    accent: str = ""
+    accent_chance: float = 0.0
+
+
+def roll_tone(rng: random.Random, pane: Pane) -> str:
+    """The tone for a freshly appended line — usually the pane's, sometimes
+    its accent."""
+    if pane.accent and rng.random() < pane.accent_chance:
+        return pane.accent
+
+    return pane.tone
 
 
 def feed_hex(rng: random.Random, width: int) -> str:
@@ -847,13 +869,13 @@ def interior_stamp(console: Console, pane: Pane) -> str:
     inner_rows = pane.rect.height - 2
     inner_width = pane.rect.width - 4
     visible = pane.lines[-inner_rows:]
-    padded = [""] * (inner_rows - len(visible)) + visible
+    padded = [("", pane.tone)] * (inner_rows - len(visible)) + visible
 
     parts = []
-    for offset, line in enumerate(padded):
+    for offset, (line, tone) in enumerate(padded):
         parts.append(
             move_to(pane.rect.top + 1 + offset, pane.rect.left + 2)
-            + console.tint(fit(line, inner_width), pane.tone)
+            + console.tint(fit(line, inner_width), tone)
         )
 
     return "".join(parts)
@@ -893,6 +915,55 @@ def dialog_stamp(
     )
 
 
+def alert_stamp(console: Console, rect: Rect, age: int) -> str:
+    """The red corner alarm: a countdown that reads like consequences."""
+    urgent = (age // 6) % 2 == 0
+    tone = BOLD + RED if urgent else RED
+    seconds = max(0, 45 - age // 18)
+    inner = rect.width - 4
+
+    return (
+        box_stamp(console, rect, "PERIMETER", tone)
+        + move_to(rect.top + 1, rect.left + 2)
+        + console.tint(fit("⚠ trace detected", inner), RED)
+        + move_to(rect.top + 2, rect.left + 2)
+        + console.tint(fit(f"lockout in 00:{seconds:02d}", inner), tone)
+    )
+
+
+def proxy_stamp(console: Console, rect: Rect, age: int) -> str:
+    """The green corner status: relay hops securing one by one."""
+    hops = min(5, 1 + age // 22)
+    chain = " ▸ ".join(f"{relay:02d}" for relay in (3, 7, 12, 19, 22)[:hops])
+    secured = hops == 5
+    status = "chain secured" if secured else f"{hops}/5 hops secured"
+    inner = rect.width - 4
+
+    return (
+        box_stamp(console, rect, "PROXY CHAIN", GREEN)
+        + move_to(rect.top + 1, rect.left + 2)
+        + console.tint(fit(f"relay {chain}", inner), GREEN)
+        + move_to(rect.top + 2, rect.left + 2)
+        + console.tint(fit(status, inner), BOLD + GREEN if secured else GREY)
+    )
+
+
+def exfil_stamp(console: Console, rect: Rect, age: int, total: float) -> str:
+    """The amber corner meter: bytes leaving the building."""
+    fraction = min(1.0, age / 90.0)
+    inner = rect.width - 4
+    bar = progress_bar(fraction, 1.0, max(6, inner - 6))
+    counter = f"{human_bytes(total * fraction)} / {human_bytes(total)}"
+
+    return (
+        box_stamp(console, rect, "EXFIL", ORANGE)
+        + move_to(rect.top + 1, rect.left + 2)
+        + console.tint(bar, ORANGE) + console.tint(f" {int(fraction * 100):>3}%", GREY)
+        + move_to(rect.top + 2, rect.left + 2)
+        + console.tint(fit(counter, inner), GREY)
+    )
+
+
 def scene_warroom(console: Console, rng: random.Random) -> None:
     """The full movie set: rain behind several live panes, dialog on top."""
     if not console.color:
@@ -914,15 +985,18 @@ def scene_warroom(console: Console, rng: random.Random) -> None:
     console.clear()
     layout = warroom_layout(console.width, console.height)
     dialog_rect = layout.pop("dialog")
+    alert_rect = layout.pop("alert", None)
+    proxy_rect = layout.pop("proxy", None)
+    exfil_rect = layout.pop("exfil", None)
 
     dressing = {
-        "memdump": (feed_hex, GREY),
-        "uplink": (feed_intercept, GREEN),
-        "intercept": (feed_trace, CYAN),
+        "memdump": (feed_hex, GREY, RED, 0.22),
+        "uplink": (feed_intercept, GREEN, BOLD + GREEN, 0.12),
+        "intercept": (feed_trace, CYAN, GREEN, 0.30),
     }
     panes = []
     for index, name in enumerate(sorted(layout)):
-        feed, tone = dressing[name]
+        feed, tone, accent, chance = dressing[name]
         panes.append(
             Pane(
                 rect=layout[name],
@@ -932,6 +1006,8 @@ def scene_warroom(console: Console, rng: random.Random) -> None:
                 period=rng.randint(3, 6),
                 reveal=6 + index * rng.randint(6, 10),
                 lines=[],
+                accent=accent,
+                accent_chance=chance,
             )
         )
 
@@ -940,11 +1016,18 @@ def scene_warroom(console: Console, rng: random.Random) -> None:
     dialog_at = rng.randint(40, 60)
     lock_every = rng.randint(7, 11)
     locked = 0
+    alert_at = rng.randint(18, 26)
+    proxy_at = rng.randint(28, 38)
+    exfil_at = rng.randint(46, 58)
+    exfil_total = rng.uniform(2e7, 8e7)
     total = dialog_at + lock_every * len(password) + 24
 
     for tick in range(total):
         parts = []
         shown = [pane.rect for pane in panes if tick >= pane.reveal]
+        for rect, since in ((alert_rect, alert_at), (proxy_rect, proxy_at), (exfil_rect, exfil_at)):
+            if rect is not None and tick >= since:
+                shown.append(rect)
         if tick >= dialog_at:
             shown.append(dialog_rect)
         parts.append(rain_step(drops, console.height, rng, avoid=shown))
@@ -953,14 +1036,20 @@ def scene_warroom(console: Console, rng: random.Random) -> None:
             if tick == pane.reveal:
                 parts.append(box_stamp(console, pane.rect, pane.title, pane.tone))
             elif tick > pane.reveal and (tick - pane.reveal) % pane.period == 0:
-                pane.lines.append(pane.feed(rng, pane.rect.width - 4))
+                pane.lines.append((pane.feed(rng, pane.rect.width - 4), roll_tone(rng, pane)))
                 pane.lines = pane.lines[-(pane.rect.height - 2):]
                 parts.append(interior_stamp(console, pane))
 
+        # Floaters re-stamp every tick; the password dialog goes last, on top.
+        if alert_rect is not None and tick >= alert_at:
+            parts.append(alert_stamp(console, alert_rect, tick - alert_at))
+        if proxy_rect is not None and tick >= proxy_at:
+            parts.append(proxy_stamp(console, proxy_rect, tick - proxy_at))
+        if exfil_rect is not None and tick >= exfil_at:
+            parts.append(exfil_stamp(console, exfil_rect, tick - exfil_at, exfil_total))
         if tick >= dialog_at:
             if locked < len(password) and tick > dialog_at and (tick - dialog_at) % lock_every == 0:
                 locked += 1
-            # Stamped last, every tick — that is what lets it float over panes.
             parts.append(dialog_stamp(console, dialog_rect, password, locked, rng))
 
         console.paint("".join(parts))

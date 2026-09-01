@@ -375,14 +375,25 @@ class TestWarroomLayout:
             assert rect.bottom <= height, name
             assert rect.right <= width, name
 
+    FLOATERS = ("dialog", "alert", "proxy", "exfil")
+
     @pytest.mark.parametrize("width,height", SIZES)
     def test_panes_never_overlap_each_other(self, width, height):
-        """Only the dialog may float — nothing re-stamps on the panes' cadence."""
+        """Only floaters may overlap panes — nothing re-stamps on the panes'
+        cadence."""
         layout = busy_terminal.warroom_layout(width, height)
-        layout.pop("dialog")
-        panes = list(layout.items())
+        panes = [(n, r) for n, r in layout.items() if n not in self.FLOATERS]
         for i, (name_a, rect_a) in enumerate(panes):
             for name_b, rect_b in panes[i + 1:]:
+                assert not rect_a.overlaps(rect_b), f"{name_a} overlaps {name_b}"
+
+    @pytest.mark.parametrize("width,height", SIZES)
+    def test_the_four_dialogs_never_cover_each_other(self, width, height):
+        """Floaters may sit on panes, but every dialog must stay readable."""
+        layout = busy_terminal.warroom_layout(width, height)
+        floaters = [(n, layout[n]) for n in self.FLOATERS if n in layout]
+        for i, (name_a, rect_a) in enumerate(floaters):
+            for name_b, rect_b in floaters[i + 1:]:
                 assert not rect_a.overlaps(rect_b), f"{name_a} overlaps {name_b}"
 
     @pytest.mark.parametrize("width,height", SIZES)
@@ -391,10 +402,15 @@ class TestWarroomLayout:
         assert dialog.width >= 30
         assert dialog.height == 5
 
-    def test_a_generous_terminal_gets_all_three_panes(self):
+    def test_a_generous_terminal_gets_every_window(self):
         assert set(busy_terminal.warroom_layout(120, 35)) == {
-            "memdump", "uplink", "intercept", "dialog",
+            "memdump", "uplink", "intercept", "dialog", "alert", "proxy", "exfil",
         }
+
+    def test_a_small_terminal_drops_the_corner_dialogs_not_the_centerpiece(self):
+        layout = busy_terminal.warroom_layout(60, 16)
+        assert "dialog" in layout
+        assert not set(layout) & {"alert", "proxy", "exfil"}
 
 
 class TestRainAvoidance:
@@ -461,9 +477,64 @@ class TestSceneArcs:
         console, rec = make_console(color=True)
         busy_terminal.scene_warroom(console, random.Random(34))
         layout = busy_terminal.warroom_layout(console.width, console.height)
-        layout.pop("dialog")
+        for floater in ("dialog", "alert", "proxy", "exfil"):
+            layout.pop(floater, None)
         for name in layout:
             assert name in rec.text
+
+    def test_the_warroom_shows_all_four_dialogs_on_a_roomy_terminal(self):
+        console, rec = make_console(color=True)
+        assert console.width >= 70 and console.height >= 20
+        busy_terminal.scene_warroom(console, random.Random(36))
+        for title in ("MATCHING PASSWORD", "PERIMETER", "PROXY CHAIN", "EXFIL"):
+            assert title in rec.text
+
+    def test_an_accented_line_keeps_its_tone_across_repaints(self):
+        """The accent is rolled once at append time, not re-rolled per frame."""
+        console, rec = make_console(color=True)
+        pane = busy_terminal.Pane(
+            rect=busy_terminal.Rect(top=2, left=2, width=20, height=4),
+            title="memdump",
+            tone=busy_terminal.GREY,
+            feed=busy_terminal.feed_hex,
+            period=3,
+            reveal=0,
+            lines=[("corrupt row", busy_terminal.RED), ("normal row", busy_terminal.GREY)],
+        )
+        for _ in range(2):
+            rec.chunks.clear()
+            console.paint(busy_terminal.interior_stamp(console, pane))
+            assert busy_terminal.RED + "corrupt row" in rec.text
+            assert busy_terminal.GREY + "normal row" in rec.text
+
+
+class TestRollTone:
+    def test_a_certain_accent_always_lands_and_a_zero_chance_never_does(self):
+        pane_kwargs = dict(
+            rect=busy_terminal.Rect(top=1, left=1, width=20, height=4),
+            title="x", tone=busy_terminal.GREY, feed=busy_terminal.feed_hex,
+            period=3, reveal=0, lines=[],
+        )
+        always = busy_terminal.Pane(accent=busy_terminal.RED, accent_chance=1.0, **pane_kwargs)
+        never = busy_terminal.Pane(accent=busy_terminal.RED, accent_chance=0.0, **pane_kwargs)
+        plain = busy_terminal.Pane(**pane_kwargs)
+
+        rng = random.Random(50)
+        for _ in range(50):
+            assert busy_terminal.roll_tone(rng, always) == busy_terminal.RED
+            assert busy_terminal.roll_tone(rng, never) == busy_terminal.GREY
+            assert busy_terminal.roll_tone(rng, plain) == busy_terminal.GREY
+
+    def test_a_partial_chance_produces_both_tones(self):
+        pane = busy_terminal.Pane(
+            rect=busy_terminal.Rect(top=1, left=1, width=20, height=4),
+            title="x", tone=busy_terminal.CYAN, feed=busy_terminal.feed_trace,
+            period=3, reveal=0, lines=[],
+            accent=busy_terminal.GREEN, accent_chance=0.3,
+        )
+        rng = random.Random(51)
+        tones = {busy_terminal.roll_tone(rng, pane) for _ in range(200)}
+        assert tones == {busy_terminal.CYAN, busy_terminal.GREEN}
 
     def test_the_warroom_fallback_still_tells_the_story(self):
         console, rec = make_console(color=False)
