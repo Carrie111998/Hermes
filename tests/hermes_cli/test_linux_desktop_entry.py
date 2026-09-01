@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import stat
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -69,6 +71,131 @@ def test_install_writes_entry_with_absolute_exec_and_icon(
     icon_path = Path(values["Icon"])
     assert icon_path.is_absolute()
     assert icon_path == lde.icon_path(root)
+
+
+def test_install_migrates_scalable_png_to_fixed_size_hicolor(
+    tmp_path, xdg_home, monkeypatch
+):
+    """Raster icons belong in an indexed fixed-size directory, not scalable/."""
+    root = _make_project(tmp_path)
+    linux_icon = root / "apps" / "desktop" / "assets" / "icon-256.png"
+    linux_icon.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
+        + (256).to_bytes(4, "big")
+        + (256).to_bytes(4, "big")
+    )
+    hermes_bin = tmp_path / "bin" / "hermes"
+    hermes_bin.parent.mkdir()
+    hermes_bin.write_text("", encoding="utf-8")
+    monkeypatch.setattr(
+        "hermes_cli.relaunch.resolve_hermes_bin", lambda: str(hermes_bin)
+    )
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+    legacy = xdg_home / "icons" / "hicolor" / "scalable" / "apps" / "hermes.png"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"legacy 1024px icon")
+
+    entry = lde.install_desktop_entry(root)
+
+    values = _parse(entry.read_text(encoding="utf-8"))
+    assert values["Icon"] == "hermes"
+    dest = xdg_home / "icons" / "hicolor" / "256x256" / "apps" / "hermes.png"
+    assert dest.read_bytes() == linux_icon.read_bytes()
+    assert not legacy.exists()
+
+
+def test_icon_migration_touches_hicolor_theme_directory(tmp_path, xdg_home):
+    """Cached icon lookups notice changes even when the size dir already exists."""
+    icon = tmp_path / "icon-256.png"
+    icon.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
+        + (256).to_bytes(4, "big")
+        + (256).to_bytes(4, "big")
+    )
+    theme_dir = xdg_home / "icons" / "hicolor"
+    dest = theme_dir / "256x256" / "apps" / "hermes.png"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(icon.read_bytes())
+    legacy = theme_dir / "scalable" / "apps" / "hermes.png"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"legacy 1024px icon")
+    os.utime(theme_dir, (1, 1))
+
+    assert lde._install_icon_to_hicolor(icon) is True
+
+    assert theme_dir.stat().st_mtime > 1
+
+
+def test_icon_migration_retries_pending_cache_invalidation(
+    tmp_path, xdg_home, monkeypatch
+):
+    """A failed cache invalidation remains explicitly retryable."""
+    icon = tmp_path / "icon-256.png"
+    icon.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
+        + (256).to_bytes(4, "big")
+        + (256).to_bytes(4, "big")
+    )
+    theme_dir = xdg_home / "icons" / "hicolor"
+    dest = theme_dir / "256x256" / "apps" / "hermes.png"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"old fixed-size icon")
+    legacy = theme_dir / "scalable" / "apps" / "hermes.png"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"legacy 1024px icon")
+    pending = theme_dir / ".hermes-icon-update-pending"
+    real_unlink = Path.unlink
+    attempts = 0
+
+    def flaky_unlink(path, *args, **kwargs):
+        nonlocal attempts
+        if path == pending:
+            attempts += 1
+            if attempts == 1:
+                raise OSError("cannot finalize cache invalidation")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+
+    assert lde._install_icon_to_hicolor(icon) is False
+    assert dest.read_bytes() == icon.read_bytes()
+    assert not legacy.exists()
+    assert pending.exists()
+    assert lde._install_icon_to_hicolor(icon) is True
+    assert attempts == 2
+    assert not pending.exists()
+
+
+def test_concurrent_icon_migrations_are_serialized(tmp_path, xdg_home):
+    """Concurrent launchers share a persistent cross-process lock file."""
+    icon = tmp_path / "icon-256.png"
+    icon.write_bytes(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
+        + (256).to_bytes(4, "big")
+        + (256).to_bytes(4, "big")
+    )
+    theme_dir = xdg_home / "icons" / "hicolor"
+    dest = theme_dir / "256x256" / "apps" / "hermes.png"
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"old fixed-size icon")
+    legacy = theme_dir / "scalable" / "apps" / "hermes.png"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"legacy 1024px icon")
+    start = threading.Barrier(2)
+
+    def install():
+        start.wait(timeout=5)
+        return lde._install_icon_to_hicolor(icon)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = [pool.submit(install), pool.submit(install)]
+        results = [future.result(timeout=5) for future in results]
+
+    assert results == [True, True]
+    assert dest.read_bytes() == icon.read_bytes()
+    assert not legacy.exists()
+    assert (theme_dir / ".hermes-icon-update.lock").is_file()
+    assert not (theme_dir / ".hermes-icon-update-pending").exists()
 
 
 def test_install_prefers_themed_icon_from_hicolor(tmp_path, xdg_home, monkeypatch):

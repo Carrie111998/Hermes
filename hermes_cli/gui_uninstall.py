@@ -154,6 +154,9 @@ def packaged_gui_app_paths() -> "list[Path]":
             desktop_entry_path(),
             # Some packaged builds emit this casing.
             data_base / "applications" / "Hermes.desktop",
+            # A failed icon migration leaves this marker so the next run can
+            # finish cache invalidation. Uninstall owns and removes it too.
+            data_base / "icons" / "hicolor" / ".hermes-icon-update-pending",
             data_base / "icons" / "hicolor" / "scalable" / "apps" / "hermes.png",
         ]
         # Fixed-size hicolor dirs: the icon is copied at its native size

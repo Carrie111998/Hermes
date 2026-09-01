@@ -88,6 +88,9 @@ def test_uninstall_removes_launcher_entry_and_refreshes_cache(tmp_path, monkeypa
     entry = lde.desktop_entry_path()
     entry.parent.mkdir(parents=True, exist_ok=True)
     entry.write_text("x", encoding="utf-8")
+    pending = tmp_path / "xdg" / "icons" / "hicolor" / ".hermes-icon-update-pending"
+    pending.parent.mkdir(parents=True, exist_ok=True)
+    pending.touch()
 
     refreshed: list[Path] = []
     monkeypatch.setattr(
@@ -104,6 +107,7 @@ def test_uninstall_removes_launcher_entry_and_refreshes_cache(tmp_path, monkeypa
     removed = gu.uninstall_gui(hermes_home)
 
     assert entry in removed and not entry.exists()
+    assert pending in removed and not pending.exists()
     assert refreshed == [entry.parent]
     # The icon lives in the checkout. A GUI uninstall must not delete it.
     assert lde.icon_path(hermes_home / "hermes-agent").exists()

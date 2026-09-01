@@ -5,14 +5,14 @@ freshly-built app has no launcher presence: no menu item, no icon. This
 module writes the XDG desktop entry that gives it one.
 ``hermes uninstall --gui`` removes the entry again.
 
-Two values must be absolute for the entry to work:
+Two values must be absolute or independently installed for the entry to work:
 
   - ``Exec`` — the launcher runs without shell ``PATH`` customizations, so
     a bare ``hermes desktop`` fails when hermes lives in ``~/.local/bin``
     or a venv. Resolve the real binary and write its full path.
-  - ``Icon`` — an unqualified icon name needs an indexed icon theme. The
-    spec allows an absolute path instead, so point at the app icon in the
-    checkout. Do not copy the icon: ``Exec`` already depends on that tree.
+  - ``Icon`` — copy the fixed-size Linux PNG into the user's hicolor
+    fallback theme and use its themed name. Fall back to the absolute app
+    icon path when that copy is unavailable.
 
 Cache refresh is best-effort and tool-gated: ``update-desktop-database``
 for the freedesktop menu cache, and ``kbuildsycoca6``/``kbuildsycoca5``
@@ -25,15 +25,39 @@ this without loading the full CLI.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import struct
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
 DESKTOP_ENTRY_NAME = "hermes.desktop"
+_ICON_INSTALL_THREAD_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _hicolor_install_lock(theme_dir: Path):
+    """Serialize icon-tree mutations across threads and Linux processes."""
+    with _ICON_INSTALL_THREAD_LOCK:
+        theme_dir.mkdir(parents=True, exist_ok=True)
+        # Keep the lock file persistent: unlinking a held POSIX lock would let
+        # another process create a new inode and bypass the existing lock.
+        lock_path = theme_dir / ".hermes-icon-update.lock"
+        with lock_path.open("a+b") as handle:
+            use_flock = os.name != "nt"
+            if use_flock:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if use_flock:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def is_supported() -> bool:
@@ -54,8 +78,15 @@ def desktop_entry_path() -> Path:
 
 
 def icon_path(project_root: Path) -> Path:
-    """The app icon shipped in the desktop workspace."""
-    return project_root / "apps" / "desktop" / "assets" / "icon.png"
+    """The raster icon used by the Linux desktop entry.
+
+    Fixed-size icon-theme directories require a bitmap with matching pixel
+    dimensions. Keep Electron's 1024px source for application packaging, but
+    prefer the derived 256px asset for the XDG hicolor installation.
+    """
+    assets = project_root / "apps" / "desktop" / "assets"
+    linux_icon = assets / "icon-256.png"
+    return linux_icon if linux_icon.is_file() else assets / "icon.png"
 
 
 def _running_interpreter() -> str:
@@ -633,9 +664,13 @@ def _install_icon_to_hicolor(icon: Path) -> bool:
     be one the theme actually indexes (hicolor's index.theme lists
     fixed sizes and ``scalable`` — an unindexed dir like ``1024x1024``
     would never be found), so the icon lands in ``scalable`` unless the
-    source is exactly 256x256, which goes to the fixed-size dir.
-    Idempotent via content-compare; OSError caught internally (False) —
-    the caller then falls back to the absolute path.
+    source is exactly 256x256, which goes to the fixed-size dir. Installing
+    that fixed-size asset also removes the legacy PNG that older versions
+    placed under ``scalable`` so upgrades cannot keep resolving the bad copy.
+    A transient marker keeps cache invalidation retryable after partial I/O
+    failures, while a kernel-backed lock serializes concurrent launchers.
+    Idempotent via content-compare; OSError caught internally (False) — the
+    caller then falls back to the absolute path.
     """
     try:
         raw = icon.read_bytes()
@@ -644,12 +679,27 @@ def _install_icon_to_hicolor(icon: Path) -> bool:
             width, height = struct.unpack(">II", raw[16:24])
             is_256 = (width, height) == (256, 256)
         subdir = "256x256" if is_256 else "scalable"
-        dest = _xdg_data_home() / "icons" / "hicolor" / subdir / "apps" / "hermes.png"
-        if dest.is_file() and dest.read_bytes() == raw:
+        theme_dir = _xdg_data_home() / "icons" / "hicolor"
+        with _hicolor_install_lock(theme_dir):
+            dest = theme_dir / subdir / "apps" / "hermes.png"
+            dest_current = dest.is_file() and dest.read_bytes() == raw
+            legacy = theme_dir / "scalable" / "apps" / "hermes.png"
+            legacy_exists = is_256 and legacy.exists()
+            pending = theme_dir / ".hermes-icon-update-pending"
+            if dest_current and not legacy_exists and not pending.exists():
+                return True
+
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            # The marker makes a partial migration retryable. Removing it only
+            # after all icon writes updates the theme root's mtime after the
+            # mutation, invalidating caches per the freedesktop spec.
+            pending.touch()
+            if not dest_current:
+                shutil.copyfile(icon, dest)
+            if legacy_exists:
+                legacy.unlink(missing_ok=True)
+            pending.unlink()
             return True
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(icon, dest)
-        return True
     except OSError:
         return False
 
