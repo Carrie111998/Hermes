@@ -3459,6 +3459,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "responses_api": True,
                 "responses_streaming": True,
                 "run_submission": True,
+                "runs_session_history": True,
                 "runs_idempotency": _api_runs._idempotency_capabilities(
                     self,
                     store_type=RunIdempotencyStore,
@@ -4342,6 +4343,64 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
+
+    async def _conversation_history_for_existing_session(
+        self,
+        session_id: str,
+    ) -> tuple[List[Dict[str, Any]], Optional["web.Response"]]:
+        """Load one existing session's history or return a controlled failure.
+
+        Stateless compatibility callers retain the older best-effort helper
+        above. Body-``session_id`` Runs continuation is an explicit claim that
+        canonical server history owns the turn, so absence or unreadable state
+        must fail before admitting agent work.
+        """
+        try:
+            session, error = await self._get_existing_session_or_404(session_id)
+        except Exception as exc:
+            logger.warning(
+                "Failed to resolve session before run admission for %s: %s",
+                session_id,
+                exc,
+            )
+            return [], web.json_response(
+                _openai_error(
+                    "Session database unavailable",
+                    code="session_db_unavailable",
+                ),
+                status=503,
+            )
+        if error is not None:
+            return [], error
+        assert session is not None
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return [], web.json_response(
+                _openai_error(
+                    "Session database unavailable",
+                    code="session_db_unavailable",
+                ),
+                status=503,
+            )
+        try:
+            history = await asyncio.to_thread(
+                db.get_messages_as_conversation,
+                session_id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to load required run history for %s: %s",
+                session_id,
+                exc,
+            )
+            return [], web.json_response(
+                _openai_error(
+                    "Session database unavailable",
+                    code="session_db_unavailable",
+                ),
+                status=503,
+            )
+        return history, None
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
