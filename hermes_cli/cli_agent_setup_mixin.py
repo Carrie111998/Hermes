@@ -648,6 +648,7 @@ class CLIAgentSetupMixin:
         from hermes_state import (
             SessionExportTooLargeError,
             SessionResumeTooLargeError,
+            logger,
             resolved_max_resume_messages,
         )
 
