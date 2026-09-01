@@ -105,6 +105,20 @@ _EXCLUDED_DIRS = {
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
+    # JS package-manager caches. With ``terminal.home_mode`` pointing a
+    # profile's subprocess HOME at ``{HERMES_HOME}/home``, every npm/npx/bun
+    # invocation the agent runs populates ``.npm/`` and ``.bun/`` inside the
+    # walked tree (#93760) — regenerable caches that otherwise ship in every
+    # backup (measured at 82% of one install's payload).
+    #
+    # Intent: caches, not configuration. Matching below is by path
+    # component (same semantics as every name in this set): any directory
+    # named ``.npm``/``.bun`` at any depth is skipped — a stray *file* with
+    # that name is skipped too, since component matching cannot tell them
+    # apart. Don't extend this set with user-data dirs (e.g. ``.vscode``)
+    # without measuring payload share like #93760 did.
+    ".npm",
+    ".bun",
 }
 
 # File-name suffixes to skip

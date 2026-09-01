@@ -158,6 +158,22 @@ class TestShouldExclude:
         # The .db itself is still included (and safe-copied separately)
         assert not _should_exclude(Path("state.db"))
 
+    def test_excludes_js_package_manager_caches(self):
+        """npm/bun caches must not ship: with terminal.home_mode pointing a
+        profile subprocess HOME at {HERMES_HOME}/home, every npm/npx/bun
+        invocation populates .npm/ and .bun/ inside the walked tree (#93760)
+        — regenerable caches, not state."""
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path(".npm/_cacache/content-v2/ab/cd/entry"))
+        assert _should_exclude(Path("home/.npm/_logs/2026-08-24.log"))
+        assert _should_exclude(Path(".bun/install/cache/zstd"))
+        assert _should_exclude(Path("profiles/coder/.bun/install/cache/x"))
+        # Matching is by path component, so a stray file *named* like the
+        # cache dir is skipped as well — component checks can't tell a
+        # dotfile from a dot-directory. A near-miss component stays included.
+        assert _should_exclude(Path("docs/.npm"))
+        assert not _should_exclude(Path("npm/notes.txt"))
+
 
 # ---------------------------------------------------------------------------
 # Backup tests
