@@ -8,15 +8,15 @@ test('atomic spawn script: write-lock via stdin pipe parses and executes cleanly
   const command = atomicWindowsSpawnCommand(
     {
       // SANDBOX: temp HERMES_HOME resolved by the helper itself
-      hermesHome: 'C:\\Users\\PCCamaras\\AppData\\Local\\Temp\\ssh-probe-home',
-      python: 'C:\\Users\\PCCamaras\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe'
+      hermesHome: 'C:\\Users\\TestUser\\AppData\\Local\\Temp\\ssh-probe-home',
+      python: 'C:\\Users\\TestUser\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe'
     },
     {
       ownershipId: '0123456789abcdef0123456789abcdef',
       spawnNonce: '0123456789abcdef',
       profile: 'default',
-      hermesPath: 'C:\\Users\\PCCamaras\\AppData\\Local\\Temp\\ssh-probe-home\\fake-hermes.exe',
-      hermesHome: 'C:\\Users\\PCCamaras\\AppData\\Local\\Temp\\ssh-probe-home',
+      hermesPath: 'C:\\Users\\TestUser\\AppData\\Local\\Temp\\ssh-probe-home\\fake-hermes.exe',
+      hermesHome: 'C:\\Users\\TestUser\\AppData\\Local\\Temp\\ssh-probe-home',
       tokenFingerprint: 'a'.repeat(32),
       startedAt: '2026-08-27T14:00:00.000Z'
     }
@@ -38,6 +38,7 @@ test('atomic spawn script: write-lock via stdin pipe parses and executes cleanly
     ],
     { encoding: 'utf8', timeout: 60000 }
   )
+
   assert.match(parseCheck, /PARSE_OK/)
 
   // 2. The lock must be piped into the helper's stdin, not passed as argv

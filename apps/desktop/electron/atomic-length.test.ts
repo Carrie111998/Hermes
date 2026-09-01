@@ -5,15 +5,15 @@ import { atomicWindowsSpawnCommand } from './windows-remote-lifecycle'
 test('atomic spawn command stays under the cmd.exe length budget', () => {
   const command = atomicWindowsSpawnCommand(
     {
-      hermesHome: 'C:\\Users\\PCCamaras\\AppData\\Local\\Temp\\ssh-probe-home',
-      python: 'C:\\Users\\PCCamaras\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe'
+      hermesHome: 'C:\\Users\\TestUser\\AppData\\Local\\Temp\\ssh-probe-home',
+      python: 'C:\\Users\\TestUser\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe'
     },
     {
       ownershipId: '0123456789abcdef0123456789abcdef',
       spawnNonce: '0123456789abcdef',
       profile: 'default',
-      hermesPath: 'C:\\Users\\PCCamaras\\AppData\\Local\\Temp\\ssh-probe-home\\fake-hermes.exe',
-      hermesHome: 'C:\\Users\\PCCamaras\\AppData\\Local\\Temp\\ssh-probe-home',
+      hermesPath: 'C:\\Users\\TestUser\\AppData\\Local\\Temp\\ssh-probe-home\\fake-hermes.exe',
+      hermesHome: 'C:\\Users\\TestUser\\AppData\\Local\\Temp\\ssh-probe-home',
       tokenFingerprint: 'a'.repeat(32),
       startedAt: '2026-08-27T14:00:00.000Z'
     }
