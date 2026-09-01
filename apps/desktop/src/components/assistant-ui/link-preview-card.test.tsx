@@ -115,10 +115,12 @@ describe('LinkPreviewChipCard', () => {
     await waitFor(() => expect(screen.getByText(/Preview unavailable/)).toBeTruthy())
   })
 
-  it('meta with no readable fields renders the unavailable note inside a loaded card', async () => {
+  it('meta with no readable fields renders the thumbnail data URL inside a loaded card', async () => {
+    // The renderer paints the main-process-validated data URL — it NEVER
+    // GETs meta.imageUrl itself (that would bypass every SSRF guard).
     const bridge = vi.fn().mockResolvedValue({
       ok: true,
-      meta: { url: URL, title: '', description: '', imageUrl: 'https://cdn.example.com/x.png', fetchedAt: 1_000 }
+      meta: { url: URL, title: '', description: '', imageUrl: 'https://cdn.example.com/x.png', image: 'data:image/png;base64,AAAA', fetchedAt: 1_000 }
     })
 
     installBridge(bridge)
@@ -127,9 +129,26 @@ describe('LinkPreviewChipCard', () => {
     fireEvent.click(screen.getByRole('button'))
 
     await waitFor(() => {
-      const img = document.querySelector('img[data-link-preview-image], img[src="https://cdn.example.com/x.png"]')
+      const img = document.querySelector('img[data-link-preview-image], img[src^="data:image/png;base64,"]')
 
       expect(img).toBeTruthy()
     })
+
+    expect(document.querySelector('img[src="https://cdn.example.com/x.png"]')).toBeNull()
+  })
+
+  it('an unprovable thumbnail (image: \'\') renders the unavailable note, not a remote img', async () => {
+    const bridge = vi.fn().mockResolvedValue({
+      ok: true,
+      meta: { url: URL, title: '', description: '', imageUrl: 'https://cdn.example.com/x.png', image: '', fetchedAt: 1_000 }
+    })
+
+    installBridge(bridge)
+
+    render(<LinkPreviewChipCard href={URL} />)
+    fireEvent.click(screen.getByRole('button'))
+
+    await waitFor(() => expect(screen.getByText(/Preview unavailable/)).toBeTruthy())
+    expect(document.querySelector('img')).toBeNull()
   })
 })
