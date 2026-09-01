@@ -117,6 +117,13 @@ def media_roots(config: Optional[Dict[str, Any]] = None) -> List[Path]:
     are silent — no file can live under a not-yet-existing directory, so the
     policy outcome is identical — while drops of *configured* entries are
     logged so an operator typo can't become silent 403s.
+
+    Concurrency note: the policy is re-read and re-resolved on every request,
+    so a config edit can flip a root set between two requests. Each request
+    is judged against one internally-consistent snapshot (this function's
+    return value), which is the guarantee callers need; there is no
+    cross-request atomicity, by design — the config file is not a transaction
+    surface.
     """
     raw_roots = configured_roots(config)
     explicit = raw_roots is not None
