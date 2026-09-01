@@ -5806,6 +5806,14 @@ class BasePlatformAdapter(ABC):
                 error_str = result.error or ""
                 if result.retry_after is not None:
                     server_retry_after = result.retry_after
+                # The failure kind can change between attempts (a transient
+                # error may later surface as a flood/rate-limit, or a
+                # rate-limited send may give way to a permanent formatting
+                # error). Reclassify from the refreshed error_str on every
+                # retry instead of reusing the first attempt's classification,
+                # so the break/continue decision below reflects the current
+                # attempt — not a stale value.
+                is_rate_limited = classify_send_error(None, error_str) == "rate_limited"
                 if not (
                     result.retryable
                     or is_rate_limited
