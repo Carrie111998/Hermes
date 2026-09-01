@@ -204,6 +204,29 @@ class TestQQGroupSenderAttribution:
         event = adapter.handle_message.await_args.args[0]
         assert "群昵称=Alice Group" in event.source.user_name
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "event_type",
+        ["GUILD_MESSAGE_CREATE", "GUILD_AT_MESSAGE_CREATE"],
+    )
+    @pytest.mark.parametrize("author", [None, {}, {"id": None}, {"id": " "}])
+    async def test_guild_message_without_author_id_is_rejected(
+        self, tmp_path, event_type, author
+    ):
+        adapter = self._make(tmp_path / "identities.json")
+        payload = {
+            "id": "msg-1",
+            "guild_id": "group-1",
+            "channel_id": "channel-1",
+            "content": "hello",
+        }
+        if author is not None:
+            payload["author"] = author
+
+        await adapter._on_message(event_type, payload)
+
+        adapter.handle_message.assert_not_awaited()
+
 
 # ---------------------------------------------------------------------------
 # _coerce_list

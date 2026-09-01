@@ -1474,7 +1474,15 @@ class QQAdapter(BasePlatformAdapter):
         # Without this check any member of any guild the bot is in could
         # bypass the configured allowlist.
         guild_id = str(d.get("guild_id", ""))
-        author_id = str(author.get("id", ""))
+        raw_author_id = author.get("id")
+        author_id = str(raw_author_id).strip() if raw_author_id is not None else ""
+        if not author_id:
+            logger.warning(
+                "[%s] Guild message missing author id: channel=%s",
+                self._log_tag,
+                channel_id,
+            )
+            return
         if not self._is_group_allowed(guild_id or channel_id, author_id):
             logger.debug(
                 "[%s] Guild message blocked by ACL: channel=%s user=%s",
@@ -1518,7 +1526,7 @@ class QQAdapter(BasePlatformAdapter):
         event = MessageEvent(
             source=self.build_source(
                 chat_id=channel_id,
-                user_id=str(author.get("id", "")),
+                user_id=author_id,
                 user_name=nick or None,
                 chat_type="group",
             ),

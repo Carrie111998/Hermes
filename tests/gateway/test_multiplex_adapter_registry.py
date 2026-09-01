@@ -18,6 +18,69 @@ class _FakeAdapter:
         self.config = config
 
 
+class TestProfileIsolationDefaults:
+    def test_create_adapter_uses_owning_profile_defaults(self):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+        )
+        owner = GatewayConfig(
+            group_sessions_per_user=True,
+            thread_sessions_per_user=True,
+        )
+        platform_config = PlatformConfig(
+            enabled=True,
+            extra={"app_id": "app", "client_secret": "secret"},
+        )
+
+        adapter = runner._create_adapter(
+            Platform.QQBOT,
+            platform_config,
+            owner_config=owner,
+        )
+
+        assert adapter is not None
+        assert adapter.config.extra["group_sessions_per_user"] is True
+        assert adapter.config.extra["thread_sessions_per_user"] is True
+
+    @pytest.mark.asyncio
+    async def test_secondary_startup_passes_owning_profile_config(self, monkeypatch):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            multiplex_profiles=True,
+            group_sessions_per_user=False,
+        )
+        runner._profile_adapters = {}
+        runner._snapshot_profile_busy_modes = lambda *_args: None
+        owner = GatewayConfig(
+            multiplex_profiles=True,
+            group_sessions_per_user=True,
+            platforms={
+                Platform.QQBOT: PlatformConfig(
+                    enabled=True,
+                    extra={"app_id": "app", "client_secret": "secret"},
+                )
+            },
+        )
+        captured = {}
+
+        def fake_create(platform, platform_config, owner_config=None):
+            captured["platform"] = platform
+            captured["platform_config"] = platform_config
+            captured["owner_config"] = owner_config
+            return None
+
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: owner)
+        monkeypatch.setattr(runner, "_create_adapter", fake_create)
+
+        await runner._start_one_profile_adapters("secondary", Path("/tmp/x"), {})
+
+        assert captured["platform"] is Platform.QQBOT
+        assert captured["platform_config"] is owner.platforms[Platform.QQBOT]
+        assert captured["owner_config"] is owner
+
+
 class TestCredentialFingerprint:
     def test_none_without_token(self):
         assert GatewayRunner._adapter_credential_fingerprint(_FakeAdapter()) is None
@@ -204,7 +267,7 @@ def _install_secondary_reconnect_context(monkeypatch, runner, adapter, scoped_ho
             },
         ),
     )
-    monkeypatch.setattr(runner, "_create_adapter", lambda platform, config: adapter)
+    monkeypatch.setattr(runner, "_create_adapter", lambda platform, config, **_kwargs: adapter)
 
 
 class TestSecondaryProfileFatalRecovery:
@@ -309,7 +372,7 @@ class TestSecondaryStartupFailureRecovery:
         # Startup creates `failed`; the reconnect runner creates `replacement`.
         created = [failed, replacement]
         monkeypatch.setattr(
-            runner, "_create_adapter", lambda platform, config: created.pop(0)
+            runner, "_create_adapter", lambda platform, config, **_kwargs: created.pop(0)
         )
 
         async def fail_initial_connect(adapter, platform):
@@ -372,7 +435,7 @@ class TestSecondaryStartupFailureRecovery:
 
         created = [failed, replacement]
         monkeypatch.setattr(
-            runner, "_create_adapter", lambda platform, config: created.pop(0)
+            runner, "_create_adapter", lambda platform, config, **_kwargs: created.pop(0)
         )
 
         async def explode(adapter, platform):
@@ -417,7 +480,7 @@ class TestSecondaryStartupFailureRecovery:
         _install_secondary_reconnect_context(
             monkeypatch, runner, _SecondaryRecoveryAdapter()
         )
-        monkeypatch.setattr(runner, "_create_adapter", lambda platform, config: failed)
+        monkeypatch.setattr(runner, "_create_adapter", lambda platform, config, **_kwargs: failed)
 
         async def fail_initial_connect(adapter, platform):
             return False
@@ -444,7 +507,7 @@ class TestSecondaryStartupFailureRecovery:
         _install_secondary_reconnect_context(
             monkeypatch, runner, _SecondaryRecoveryAdapter()
         )
-        monkeypatch.setattr(runner, "_create_adapter", lambda platform, config: failed)
+        monkeypatch.setattr(runner, "_create_adapter", lambda platform, config, **_kwargs: failed)
 
         async def fail_initial_connect(adapter, platform):
             return False
@@ -545,7 +608,7 @@ class TestSecondaryProfileConfigHandling:
         writes = []
 
         monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
-        monkeypatch.setattr(runner, "_create_adapter", lambda _p, _c: adapter)
+        monkeypatch.setattr(runner, "_create_adapter", lambda _p, _c, **_kwargs: adapter)
         monkeypatch.setattr(
             runner,
             "_update_platform_runtime_status",
@@ -593,7 +656,7 @@ class TestSecondaryProfileConfigHandling:
         writes = []
 
         monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
-        monkeypatch.setattr(runner, "_create_adapter", lambda _p, _c: adapter)
+        monkeypatch.setattr(runner, "_create_adapter", lambda _p, _c, **_kwargs: adapter)
         monkeypatch.setattr(
             runner,
             "_update_platform_runtime_status",
@@ -748,7 +811,7 @@ class TestSecondaryProfileConfigHandling:
             return True
 
         monkeypatch.setattr("gateway.config.load_gateway_config", lambda: reviewer_cfg)
-        monkeypatch.setattr(runner, "_create_adapter", lambda p, c: secondary)
+        monkeypatch.setattr(runner, "_create_adapter", lambda p, c, **_kwargs: secondary)
         monkeypatch.setattr(runner, "_connect_adapter_with_timeout", _connect)
         monkeypatch.setattr(
             runner, "_make_adapter_auth_check", lambda p, **kwargs: None
@@ -806,7 +869,7 @@ class TestSecondaryProfileConfigHandling:
             return adapter.should_connect
 
         monkeypatch.setattr("gateway.config.load_gateway_config", lambda: profile_cfg)
-        monkeypatch.setattr(runner, "_create_adapter", lambda p, c: next(adapters))
+        monkeypatch.setattr(runner, "_create_adapter", lambda p, c, **_kwargs: next(adapters))
         monkeypatch.setattr(runner, "_connect_adapter_with_timeout", _connect)
         monkeypatch.setattr(
             runner, "_make_adapter_auth_check", lambda p, **kwargs: None
@@ -842,7 +905,7 @@ class TestFeishuPortBindingConditional:
             ),
         }
         monkeypatch.setattr("gateway.config.load_gateway_config", lambda: reviewer_cfg)
-        monkeypatch.setattr(runner, "_create_adapter", lambda p, c: None)
+        monkeypatch.setattr(runner, "_create_adapter", lambda p, c, **_kwargs: None)
 
         connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         assert connected == 0  # no error, just nothing connected

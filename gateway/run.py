@@ -16816,7 +16816,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             try:
                 with _profile_runtime_scope(profile_home):
-                    adapter = self._create_adapter(platform, platform_config)
+                    adapter = self._create_adapter(
+                        platform,
+                        platform_config,
+                        owner_config=profile_cfg,
+                    )
             except Exception as e:
                 logger.error(
                     "[MULTIPLEX] Profile '%s': _create_adapter('%s') raised %s",
@@ -16985,10 +16989,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     profile_home = get_profile_dir(profile_name)
                     with _profile_runtime_scope(profile_home):
-                        profile_config = load_gateway_config().platforms.get(platform)
+                        profile_gateway_config = load_gateway_config()
+                        profile_config = profile_gateway_config.platforms.get(platform)
                         if profile_config is None or not profile_config.enabled:
                             return
-                        adapter = self._create_adapter(platform, profile_config)
+                        adapter = self._create_adapter(
+                            platform,
+                            profile_config,
+                            owner_config=profile_gateway_config,
+                        )
                         if adapter is None:
                             logger.warning(
                                 "Secondary %s reconnect skipped: adapter unavailable (profile: %s)",
@@ -17468,23 +17477,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return hashlib.sha256(("hermes-mux:" + token).encode("utf-8")).hexdigest()[:16]
 
     def _create_adapter(
-        self, 
-        platform: Platform, 
-        config: Any
+        self,
+        platform: Platform,
+        config: Any,
+        *,
+        owner_config: Optional[GatewayConfig] = None,
     ) -> Optional[BasePlatformAdapter]:
         """Create the appropriate adapter for a platform.
 
         Checks the platform_registry first (plugin adapters), then falls
         through to the built-in if/elif chain for core platforms.
         """
+        owning_config = owner_config or self.config
         if hasattr(config, "extra") and isinstance(config.extra, dict):
             config.extra.setdefault(
                 "group_sessions_per_user",
-                self.config.group_sessions_per_user,
+                owning_config.group_sessions_per_user,
             )
             config.extra.setdefault(
                 "thread_sessions_per_user",
-                getattr(self.config, "thread_sessions_per_user", False),
+                getattr(owning_config, "thread_sessions_per_user", False),
             )
 
         # ── Plugin-registered platforms (checked first) ───────────────────
