@@ -134,5 +134,8 @@ describe('never-silent media cards (M4)', () => {
     expect(await screen.findByRole('button', { name: /save as/i })).toBeTruthy()
     expect(screen.getByText('hero-shot.png')).toBeTruthy()
     expect(screen.getByText(/media.roots/i)).toBeTruthy()
+    // Unknown size must be ABSENT, not rendered as a junk label: the size
+    // element only appears when formatMediaSize returns a string.
+    expect(screen.queryByText(/^B$|NaN|undefined/i)).toBeNull()
   })
 })
