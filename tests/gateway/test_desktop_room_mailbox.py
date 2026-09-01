@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 
 import pytest
 
@@ -55,6 +56,10 @@ def test_enqueue_is_idempotent_and_rejects_key_reuse(tmp_path):
         )
 
 
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="POSIX mode bits are not enforced on Windows",
+)
 def test_enqueue_moves_the_cross_process_pending_signal(tmp_path):
     db = tmp_path / "desktop_room_mailbox.db"
     signal = mailbox.pending_signal_path(db)
