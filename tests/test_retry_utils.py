@@ -5,7 +5,14 @@ import threading
 import agent.retry_utils as retry_utils
 from types import SimpleNamespace
 
-from agent.retry_utils import adaptive_rate_limit_backoff, is_zai_coding_overload_error, jittered_backoff
+from agent.retry_utils import (
+    adaptive_rate_limit_backoff,
+    is_upstream_capacity_error,
+    is_zai_coding_overload_error,
+    jittered_backoff,
+    upstream_capacity_backoff,
+    upstream_capacity_retry_ceiling,
+)
 
 
 def test_backoff_is_exponential():
@@ -208,3 +215,128 @@ class TestParseRetryAfterSeconds:
                 raise RuntimeError("boom")
 
         assert parse_retry_after_seconds(Explosive()) is None
+
+
+# ---------------------------------------------------------------------------
+# Upstream-capacity (model "temporarily at capacity") backoff
+# ---------------------------------------------------------------------------
+
+
+def _capacity_error(msg="The requested model is temporarily at capacity upstream. This is not your API key's rate limit — please retry shortly."):
+    """Build a SimpleNamespace error mimicking a Nous Portal 429 capacity error."""
+    return SimpleNamespace(
+        status_code=429,
+        body={"error": {"message": msg}},
+    )
+
+
+class TestIsUpstreamCapacityError:
+    def test_nous_capacity_message_is_detected(self):
+        assert is_upstream_capacity_error(error=_capacity_error()) is True
+
+    def test_generic_at_capacity_429_is_detected(self):
+        err = SimpleNamespace(
+            status_code=429,
+            body={"error": {"message": "The server is at capacity"}},
+        )
+        assert is_upstream_capacity_error(error=err) is True
+
+    def test_plain_rate_limit_is_not_detected(self):
+        err = SimpleNamespace(
+            status_code=429,
+            body={"error": {"message": "rate limit exceeded"}},
+        )
+        assert is_upstream_capacity_error(error=err) is False
+
+    def test_non_429_status_is_not_detected(self):
+        err = SimpleNamespace(
+            status_code=503,
+            body={"error": {"message": "at capacity"}},
+        )
+        assert is_upstream_capacity_error(error=err) is False
+
+    def test_no_status_code_is_not_detected(self):
+        err = SimpleNamespace(
+            body={"error": {"message": "temporarily at capacity upstream"}},
+        )
+        assert is_upstream_capacity_error(error=err) is False
+
+
+class TestUpstreamCapacityRetryCeiling:
+    def test_ceiling_exceeds_default_max_retries(self):
+        # Default api_max_retries is 3; the upstream-capacity ceiling must be
+        # strictly larger so the long backoff tier is actually reachable.
+        ceiling = upstream_capacity_retry_ceiling()
+        assert ceiling > 3
+
+    def test_ceiling_covers_all_long_tier_entries(self):
+        # The loop gives up at retry_count >= ceiling, so ceiling - 1 is the
+        # last attempt that gets backoff. Every long-tier entry must be
+        # reachable.
+        from agent.retry_utils import _UPSTREAM_CAPACITY_LONG_BACKOFF, _UPSTREAM_CAPACITY_SHORT_ATTEMPTS
+
+        ceiling = upstream_capacity_retry_ceiling()
+        last_attempt_with_backoff = ceiling - 1
+        assert last_attempt_with_backoff - _UPSTREAM_CAPACITY_SHORT_ATTEMPTS >= len(_UPSTREAM_CAPACITY_LONG_BACKOFF)
+
+
+class TestUpstreamCapacityBackoff:
+    def test_short_tier_is_exponential(self):
+        # First 3 attempts use jittered_backoff with base_delay=2.0.
+        # jitter_ratio=0.5 means jitter is uniform in [0, 0.5*delay],
+        # so the mean is base + 0.25*base = 1.25*base.
+        for attempt in (1, 2, 3):
+            delays = [
+                upstream_capacity_backoff(attempt)
+                for _ in range(500)
+            ]
+            mean = sum(delays) / len(delays)
+            base = min(2.0 * (2 ** (attempt - 1)), 60.0)
+            # Mean should be ~1.25 * base (base + half the jitter range).
+            assert abs(mean - base * 1.25) < 0.5, (
+                f"attempt {attempt}: short-tier mean {mean:.1f} vs expected {base * 1.25:.1f}"
+            )
+
+    def test_long_tier_grows_progressively(self):
+        # Long tier (attempts 4+) walks 10, 30, 60, 120, 180, 300 with small jitter.
+        # jitter_ratio=0.2 means jitter is uniform in [0, 0.2*base],
+        # so the mean is base + 0.1*base = 1.1*base.
+        means = []
+        for attempt in range(4, 10):
+            delays = [
+                upstream_capacity_backoff(attempt)
+                for _ in range(500)
+            ]
+            means.append(sum(delays) / len(delays))
+
+        # Each long-tier mean should be ~1.1 * base.
+        expected_long = [10.0, 30.0, 60.0, 120.0, 180.0, 300.0]
+        for mean, exp in zip(means, expected_long):
+            assert abs(mean - exp * 1.1) < 2.0, (
+                f"long-tier mean {mean:.1f} vs expected {exp * 1.1:.1f}"
+            )
+
+    def test_long_tier_stays_within_jitter_bounds(self):
+        # With 0.2 jitter ratio, each long-tier value is in [base, base + 0.2*base].
+        for attempt in range(4, 10):
+            delays = [
+                upstream_capacity_backoff(attempt)
+                for _ in range(500)
+            ]
+            min_d = min(delays)
+            max_d = max(delays)
+            idx = attempt - 4
+            expected_base = [10.0, 30.0, 60.0, 120.0, 180.0, 300.0][idx]
+            assert min_d >= expected_base, (
+                f"attempt {attempt}: min {min_d:.1f} below base {expected_base}"
+            )
+            assert max_d <= expected_base * 1.2, (
+                f"attempt {attempt}: max {max_d:.1f} above cap {expected_base * 1.2:.1f}"
+            )
+
+    def test_ceiling_minus_1_reaches_final_long_tier(self):
+        # The last attempt that gets backoff should hit the 300s tier.
+        ceiling = upstream_capacity_retry_ceiling()
+        last_delay = upstream_capacity_backoff(ceiling - 1)
+        # 300s base with 0.2 jitter → [300, 360]
+        assert 295 < last_delay <= 360, f"last delay {last_delay:.1f} should be ~300s"
