@@ -14,6 +14,30 @@ export interface ResolveUpdateScriptHandoffDeps {
   fileExists?: (candidate: string) => boolean
 }
 
+export type MacUpdateTargetResolution =
+  | { ok: true; target: string }
+  | { ok: false; reason: 'invalid-home-directory' }
+
+/**
+ * Resolve the only macOS app bundle the updater may replace.
+ *
+ * Build outputs are artifacts, never installations. A Desktop started from a
+ * checkout, release directory, worktree, or copied artifact still updates into
+ * the stable per-user contract: ~/Applications/Hermes.app. This migration is
+ * what repairs old installs without teaching the updater another transient
+ * path.
+ */
+export function resolveMacUpdateTarget(
+  _runningBundle: string | null,
+  homeDir: string
+): MacUpdateTargetResolution {
+  const resolvedHome = path.resolve(homeDir)
+  if (!resolvedHome || resolvedHome === path.parse(resolvedHome).root) {
+    return { ok: false, reason: 'invalid-home-directory' }
+  }
+  return { ok: true, target: path.join(resolvedHome, 'Applications', 'Hermes.app') }
+}
+
 export interface UpdateScriptHandoff {
   command: string
   args: string[]

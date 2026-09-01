@@ -8,6 +8,7 @@ import {
   collectRelaunchArgs,
   MARKER_SELF_ADOPT_EPOCH_MS,
   observeUpdaterHandoff,
+  resolveMacUpdateTarget,
   resolvePosixScriptHandoff,
   resolveStagedUpdaterBinary,
   resolveUpdateScriptHandoff,
@@ -18,6 +19,41 @@ import {
 } from './updater-process'
 
 const DAY_MS = 24 * 60 * 60 * 1000
+
+test('resolveMacUpdateTarget always selects the stable per-user Applications install', () => {
+  const home = '/Users/rohit'
+  const canonical = path.join(home, 'Applications', 'Hermes.app')
+
+  assert.deepEqual(resolveMacUpdateTarget(canonical, home), {
+    ok: true,
+    target: canonical
+  })
+})
+
+test('resolveMacUpdateTarget migrates release, artifact, worktree, and hidden-home copies', () => {
+  const home = '/Users/rohit'
+  const canonical = path.join(home, 'Applications', 'Hermes.app')
+  const unstable = [
+    path.join(home, '.hermes', 'hermes-agent', 'apps', 'desktop', 'release', 'mac-arm64', 'Hermes.app'),
+    path.join(home, '.claude', 'orchestrate', 'incident', 'artifacts', 'Hermes.app'),
+    path.join(home, 'worktree', 'apps', 'desktop', 'release', 'mac-arm64', 'Hermes.app')
+  ]
+
+  for (const candidate of unstable) {
+    assert.deepEqual(resolveMacUpdateTarget(candidate, home), { ok: true, target: canonical })
+  }
+})
+
+test('resolveMacUpdateTarget allows first install and rejects a root home', () => {
+  assert.deepEqual(resolveMacUpdateTarget('/tmp/Hermes.app', '/Users/rohit'), {
+    ok: true,
+    target: '/Users/rohit/Applications/Hermes.app'
+  })
+  assert.deepEqual(resolveMacUpdateTarget('/tmp/Hermes.app', '/'), {
+    ok: false,
+    reason: 'invalid-home-directory'
+  })
+})
 
 test('stagedUpdaterSupportsPrewrittenMarker rejects installers predating the self-adopt fix', () => {
   // The real-world trap: an installer staged at first install months ago, never
