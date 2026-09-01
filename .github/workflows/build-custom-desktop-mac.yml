@@ -55,7 +55,7 @@ jobs:
             cat /tmp/hermes-smoke.log
             exit 1
           fi
-          kill "$APP_PID" || true
+          kill -9 "$APP_PID" || true
           wait "$APP_PID" || true
           rm -f release/*.zip
           ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "release/Hermes-Voice-Agent-0.17.0-mac-${{ matrix.arch }}-adhoc.zip"
