@@ -274,7 +274,7 @@ def _corrupt_fts_index_data(db_path: Path) -> None:
 
 
 def test_fts_write_corruption_detected_by_write_probe(tmp_path):
-    """_db_opens_cleanly's rolled-back write probe flags FTS write corruption."""
+    """_db_opens_cleanly's committed write probe flags FTS write corruption."""
     from hermes_state import _db_opens_cleanly
 
     db_path = tmp_path / "state.db"
