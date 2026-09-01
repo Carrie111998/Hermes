@@ -48,6 +48,37 @@ class TestIsOAuthToken:
 class TestBuildAnthropicClient:
 
 
+    def test_custom_provider_ca_bundle_is_applied_to_http_client(self):
+        verify_context = object()
+        http_client = MagicMock(name="custom_ca_http_client")
+        tls_settings = {"ssl_ca_cert": "/custom/provider-ca.pem"}
+
+        with (
+            patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk,
+            patch(
+                "hermes_cli.config.get_custom_provider_tls_settings",
+                return_value=tls_settings,
+            ),
+            patch(
+                "agent.ssl_verify.resolve_httpx_verify",
+                return_value=verify_context,
+            ) as mock_resolve_verify,
+            patch("httpx.Client", return_value=http_client) as mock_httpx_client,
+        ):
+            build_anthropic_client(
+                "custom-key",
+                base_url="https://gateway.example/anthropic/v1",
+            )
+
+        mock_resolve_verify.assert_called_once_with(
+            ca_bundle="/custom/provider-ca.pem",
+            ssl_verify=None,
+            base_url="https://gateway.example/anthropic/v1",
+        )
+        assert mock_httpx_client.call_args.kwargs["verify"] is verify_context
+        assert mock_sdk.Anthropic.call_args.kwargs["http_client"] is http_client
+
+
     def test_api_key_uses_api_key(self):
         with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
             build_anthropic_client("sk-ant-api03-something")

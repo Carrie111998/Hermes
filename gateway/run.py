@@ -2217,6 +2217,29 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
 # ---------------------------------------------------------------------------
+_COMMON_CA_BUNDLE_PATHS = (
+    "/etc/ssl/certs/ca-certificates.crt",               # Debian/Ubuntu/Gentoo
+    "/etc/pki/tls/certs/ca-bundle.crt",                 # RHEL/CentOS 7
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", # RHEL/CentOS 8+
+    "/etc/ssl/ca-bundle.pem",                            # SUSE/OpenSUSE
+    "/etc/ssl/cert.pem",                                 # Alpine / macOS
+    "/etc/pki/tls/cert.pem",                             # Fedora
+    "/usr/local/etc/openssl@1.1/cert.pem",               # macOS Homebrew Intel
+    "/opt/homebrew/etc/openssl@1.1/cert.pem",            # macOS Homebrew ARM
+)
+
+
+def _ordered_ca_bundle_candidates(platform_name, default_paths, certifi_bundle):
+    """Return CA candidates in host-appropriate preference order."""
+    compiled_defaults = [default_paths.cafile, default_paths.openssl_cafile]
+    if platform_name == "darwin":
+        candidates = [certifi_bundle, *compiled_defaults]
+    else:
+        candidates = [*compiled_defaults, certifi_bundle]
+    candidates.extend(_COMMON_CA_BUNDLE_PATHS)
+    return tuple(dict.fromkeys(candidate for candidate in candidates if candidate))
+
+
 def _ensure_ssl_certs() -> None:
     """Set SSL_CERT_FILE if the system doesn't expose CA certs to Python.
 
@@ -2238,32 +2261,15 @@ def _ensure_ssl_certs() -> None:
 
     import ssl
 
-    # 1. Python's compiled-in defaults
-    paths = ssl.get_default_verify_paths()
-    for candidate in (paths.cafile, paths.openssl_cafile):
-        if candidate and os.path.exists(candidate):
-            os.environ["SSL_CERT_FILE"] = candidate
-            return
-
-    # 2. certifi (ships its own Mozilla bundle)
+    certifi_bundle = None
     try:
         import certifi
-        os.environ["SSL_CERT_FILE"] = certifi.where()
-        return
+        certifi_bundle = certifi.where()
     except ImportError:
         pass
 
-    # 3. Common distro / macOS locations
-    for candidate in (
-        "/etc/ssl/certs/ca-certificates.crt",               # Debian/Ubuntu/Gentoo
-        "/etc/pki/tls/certs/ca-bundle.crt",                 # RHEL/CentOS 7
-        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", # RHEL/CentOS 8+
-        "/etc/ssl/ca-bundle.pem",                            # SUSE/OpenSUSE
-        "/etc/ssl/cert.pem",                                 # Alpine / macOS
-        "/etc/pki/tls/cert.pem",                             # Fedora
-        "/usr/local/etc/openssl@1.1/cert.pem",               # macOS Homebrew Intel
-        "/opt/homebrew/etc/openssl@1.1/cert.pem",            # macOS Homebrew ARM
-    ):
+    paths = ssl.get_default_verify_paths()
+    for candidate in _ordered_ca_bundle_candidates(sys.platform, paths, certifi_bundle):
         if os.path.exists(candidate):
             os.environ["SSL_CERT_FILE"] = candidate
             return

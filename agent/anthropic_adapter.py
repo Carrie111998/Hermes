@@ -610,6 +610,30 @@ def _common_betas_for_base_url(
     return betas
 
 
+def _resolve_custom_provider_httpx_verify(base_url: str):
+    """Resolve a route-scoped TLS override for an Anthropic HTTP client."""
+    if not base_url:
+        return None
+    try:
+        from agent.ssl_verify import resolve_httpx_verify
+        from hermes_cli.config import get_custom_provider_tls_settings
+
+        tls = get_custom_provider_tls_settings(base_url)
+        if not tls:
+            return None
+        return resolve_httpx_verify(
+            ca_bundle=tls.get("ssl_ca_cert"),
+            ssl_verify=tls.get("ssl_verify"),
+            base_url=base_url,
+        )
+    except Exception:
+        logger.debug(
+            "custom-provider TLS resolution skipped for Anthropic client",
+            exc_info=True,
+        )
+        return None
+
+
 def _build_anthropic_client_with_bearer_hook(
     token_provider,
     base_url: str = None,
@@ -654,7 +678,11 @@ def _build_anthropic_client_with_bearer_hook(
         import re as _re
         normalized_base_url = _re.sub(r"/v1/?$", "", normalized_base_url.rstrip("/"))
 
-    http_client = build_bearer_http_client(token_provider, timeout=timeout_obj)
+    httpx_kwargs = {"timeout": timeout_obj}
+    httpx_verify = _resolve_custom_provider_httpx_verify(base_url)
+    if httpx_verify is not None:
+        httpx_kwargs["verify"] = httpx_verify
+    http_client = build_bearer_http_client(token_provider, **httpx_kwargs)
 
     kwargs = {
         "timeout": timeout_obj,
@@ -741,7 +769,7 @@ def build_anthropic_client(
 
     normalize_proxy_env_vars()
 
-    from httpx import Timeout
+    from httpx import Client, Timeout
 
     normalized_base_url = _normalize_base_url_text(base_url)
     if normalized_base_url:
@@ -757,6 +785,12 @@ def build_anthropic_client(
         # refill for minutes. (#26293)
         "max_retries": 0,
     }
+    httpx_verify = _resolve_custom_provider_httpx_verify(base_url)
+    if httpx_verify is not None:
+        kwargs["http_client"] = Client(
+            timeout=kwargs["timeout"],
+            verify=httpx_verify,
+        )
     if normalized_base_url:
         # Azure Anthropic endpoints require an ``api-version`` query parameter.
         # Pass it via default_query so the SDK appends it to every request URL
