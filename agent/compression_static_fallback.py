@@ -93,6 +93,13 @@ def run_static_compression_fallback(
     if result_msgs is messages:
         return True, None
 
+    clear = getattr(compressor, "_clear_compression_failure_cooldown", None)
+    if callable(clear):
+        try:
+            clear()
+        except Exception:
+            logger.debug("failed to reset superseded timeout cooldown", exc_info=True)
+
     record = getattr(compressor, "record_timeout_failure", None)
     if callable(record):
         try:

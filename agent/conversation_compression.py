@@ -711,6 +711,8 @@ class CompressionCommitFence:
         self._lock_release_guard = threading.Lock()
         self._cancelled_lock_release: Optional[Callable[[], None]] = None
         self._cancelled_lock_release_requested = False
+        self._precompress_checkpoint_required = False
+        self._precompress_checkpoint_complete = threading.Event()
         # Forward-progress telemetry: the compression worker touches this
         # whenever the streamed summary call produces a token (see
         # ContextCompressor._call_summary_llm). Waiters use it to distinguish
@@ -844,6 +846,22 @@ class CompressionCommitFence:
     def retain_compression_lock_until_worker_done(self) -> None:
         """Prevent a timed-out live worker from overlapping a retry."""
         self._retain_cancelled_lock_until_worker_done = True
+
+    def require_precompress_checkpoint(self) -> None:
+        """Mark this attempt as requiring a durable pre-compress checkpoint."""
+        self._precompress_checkpoint_required = True
+
+    def mark_precompress_checkpoint_complete(self) -> None:
+        """Publish successful completion of the required checkpoint."""
+        self._precompress_checkpoint_complete.set()
+
+    @property
+    def required_checkpoint_incomplete(self) -> bool:
+        """Whether fallback would bypass an unfinished required checkpoint."""
+        return (
+            self._precompress_checkpoint_required
+            and not self._precompress_checkpoint_complete.is_set()
+        )
 
     def allow_cancelled_lock_release(self) -> None:
         """Undo :meth:`retain_compression_lock_until_worker_done`.
@@ -1225,6 +1243,31 @@ def _record_stall_interrupted_backoff(
         error,
     )
     return True
+
+
+def _record_stall_backoff_if_attempt_current(
+    agent: Any,
+    *,
+    attempt_generation: int,
+    commit_fence: Optional[CompressionCommitFence],
+    started_at: float,
+    messages: Any,
+    approx_tokens: Optional[int],
+) -> bool:
+    """Atomically publish backoff only while this attempt owns the compressor."""
+    compressor = getattr(agent, "context_compressor", None)
+    with _COMPRESSOR_ATTEMPT_LOCK:
+        if attempt_generation and int(
+            getattr(compressor, "_compression_attempt_generation", 0) or 0
+        ) != attempt_generation:
+            return False
+        return _record_stall_interrupted_backoff(
+            agent,
+            commit_fence=commit_fence,
+            started_at=started_at,
+            messages=messages,
+            approx_tokens=approx_tokens,
+        )
 
 
 def resolve_compression_fallback_route() -> Optional[dict]:
@@ -1741,7 +1784,7 @@ def run_compress_context_with_progress_timeout(
         # acquire it immediately. Run it BEFORE on_timeout: that callback
         # records the summary-failure cooldown, which would make the retry's
         # own summary call a no-op.
-        if stall_fallback:
+        if stall_fallback and not fence.required_checkpoint_incomplete:
             reason = (
                 "exceeded its total ceiling"
                 if total_exhausted
@@ -3930,6 +3973,8 @@ def compress_context(
         # providers inside MemoryManager.on_pre_compress().
         evidence_messages = _direct_messages_for_pre_compress_memory(messages)
         if checkpoint_required and not _static_fallback_attempt:
+            if commit_fence is not None:
+                commit_fence.require_precompress_checkpoint()
             supports_checkpoint = getattr(
                 memory_manager, "supports_pre_compress_checkpoint", None
             )
@@ -3966,6 +4011,8 @@ def compress_context(
                 ) from exc
             if isinstance(_maybe_ctx, str):
                 memory_context = sanitize_memory_context(_maybe_ctx)
+            if commit_fence is not None:
+                commit_fence.mark_precompress_checkpoint_complete()
         elif memory_manager and not _static_fallback_attempt:
             try:
                 _maybe_ctx = memory_manager.on_pre_compress(
@@ -4136,18 +4183,14 @@ def compress_context(
         # while the lease is still held so the next turn cannot race it. A
         # detached primary that has been superseded by the local fallback must
         # not publish another cooldown onto the successor-owned compressor.
-        _attempt_still_current = _compressor_attempt_is_current(
-            agent.context_compressor, _attempt_generation
+        _stall_backoff = _record_stall_backoff_if_attempt_current(
+            agent,
+            attempt_generation=_attempt_generation,
+            commit_fence=commit_fence,
+            started_at=_attempt_started_at,
+            messages=messages,
+            approx_tokens=approx_tokens,
         )
-        _stall_backoff = False
-        if _attempt_still_current:
-            _stall_backoff = _record_stall_interrupted_backoff(
-                agent,
-                commit_fence=commit_fence,
-                started_at=_attempt_started_at,
-                messages=messages,
-                approx_tokens=approx_tokens,
-            )
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression cancelled")
             _activity_heartbeat = None
@@ -4367,8 +4410,9 @@ def compress_context(
                     agent.session_id or "none",
                 )
                 agent._last_compaction_in_place = False
-                _stall_backoff = _record_stall_interrupted_backoff(
+                _stall_backoff = _record_stall_backoff_if_attempt_current(
                     agent,
+                    attempt_generation=_attempt_generation,
                     commit_fence=commit_fence,
                     started_at=_attempt_started_at,
                     messages=messages,

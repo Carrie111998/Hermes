@@ -280,6 +280,42 @@ class TestRunCompressContextWithProgressTimeout:
             "telemetry": dict(compressor._last_compression_telemetry or {}),
         } == fallback_state
 
+    def test_required_checkpoint_timeout_never_compacts_without_checkpoint(
+        self, monkeypatch
+    ):
+        original = [{"role": "user", "content": "keep"}]
+        release = threading.Event()
+        started = threading.Event()
+        static_fallback = MagicMock()
+        provider_retry = MagicMock()
+
+        def worker(fence: CompressionCommitFence):
+            fence.require_precompress_checkpoint()
+            started.set()
+            assert release.wait(timeout=2)
+            return original, "late"
+
+        monkeypatch.setattr(cc, "run_static_compression_fallback", static_fallback)
+        monkeypatch.setattr(
+            cc, "_retry_compression_on_fallback_chain", provider_retry
+        )
+        try:
+            result = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.05,
+                total_ceiling_seconds=1.0,
+                telemetry_agent=SimpleNamespace(),
+            )
+        finally:
+            release.set()
+
+        assert started.wait(timeout=1)
+        assert result == (original, "fallback")
+        static_fallback.assert_not_called()
+        provider_retry.assert_not_called()
+
     def test_builtin_static_fallback_failure_does_not_retry_provider(
         self, monkeypatch
     ):
