@@ -70,6 +70,40 @@ def test_multi_profile_homes_passed_to_builtin(monkeypatch, _providers, tmp_path
     assert builtin.start_kwargs["profile_homes"] == homes
 
 
+
+def test_secondary_profile_with_running_gateway_excluded_from_desktop_ticker(
+    monkeypatch, _providers, tmp_path
+):
+    """Secondary profiles running their own live gateway must not be ticked by Desktop (#100489)."""
+    _sp, builtin = _providers
+    root_home = tmp_path / "root"
+    coder_home = tmp_path / "profiles" / "coder"
+    idle_home = tmp_path / "profiles" / "idle"
+    homes = [
+        ("default", root_home),
+        ("coder", coder_home),
+        ("idle", idle_home),
+    ]
+    import hermes_cli.profiles as profiles_mod
+
+    monkeypatch.setattr(profiles_mod, "profiles_to_serve", lambda **_kw: list(homes))
+    # coder has a live independent gateway running; idle does not
+    monkeypatch.setattr(
+        profiles_mod,
+        "_check_gateway_running",
+        lambda home: home == coder_home,
+    )
+
+    ws._start_desktop_cron_ticker(threading.Event(), interval=7)
+
+    assert builtin.start_kwargs is not None
+    assert builtin.start_kwargs["interval"] == 7
+    # "coder" is excluded because its own gateway ticks its store; "default" and "idle" are kept
+    assert builtin.start_kwargs["profile_homes"] == [
+        ("default", root_home),
+        ("idle", idle_home),
+    ]
+
 def test_single_profile_keeps_legacy_path(monkeypatch, _providers, tmp_path):
     _sp, builtin = _providers
     import hermes_cli.profiles as profiles_mod

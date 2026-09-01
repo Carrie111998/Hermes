@@ -298,9 +298,14 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     start_kwargs: dict = {"interval": interval}
     if isinstance(provider, InProcessCronScheduler):
         try:
-            from hermes_cli.profiles import profiles_to_serve
+            from hermes_cli.profiles import profiles_to_serve, _check_gateway_running
 
-            profile_homes = list(profiles_to_serve(multiplex=True))
+            all_profile_homes = list(profiles_to_serve(multiplex=True))
+            profile_homes = [
+                (name, home)
+                for name, home in all_profile_homes
+                if name == "default" or not _check_gateway_running(home)
+            ]
             if len(profile_homes) > 1:
                 start_kwargs["profile_homes"] = profile_homes
                 from hermes_logging import enable_profile_log_routing
