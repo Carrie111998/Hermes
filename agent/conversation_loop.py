@@ -82,6 +82,7 @@ from agent.model_metadata import (
     get_context_length_from_provider_error,
     is_output_cap_error,
     parse_available_output_tokens_from_error,
+    persist_usage_anchor,
     save_context_length,
 )
 from agent.process_bootstrap import _install_safe_stdio
@@ -4415,6 +4416,7 @@ def run_conversation(
                     )
                     if _new_anchor is not None:
                         agent._usage_anchor = _new_anchor
+                        persist_usage_anchor(agent, _new_anchor)
                     _compression_threshold = int(
                         getattr(agent.context_compressor, "threshold_tokens", 0)
                         or 0

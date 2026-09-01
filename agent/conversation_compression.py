@@ -73,8 +73,10 @@ from agent.context_engine import (
 )
 from agent.memory_provider import PRE_COMPRESS_CHECKPOINT_API_VERSION
 from agent.model_metadata import (
+    USAGE_ANCHOR_MODEL_CONFIG_KEY,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
+    persist_usage_anchor,
 )
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 
@@ -4713,6 +4715,7 @@ def compress_context(
                         compressed,
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
+                            USAGE_ANCHOR_MODEL_CONFIG_KEY: None,
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
@@ -5310,6 +5313,7 @@ def compress_context(
         # the next response with usage re-anchors (its structural id/index
         # check would also fail closed, but explicit is safer).
         agent._usage_anchor = None
+        persist_usage_anchor(agent, None)
         # Arm the effectiveness verdict only after a completed rewrite crosses
         # the full compaction boundary. Exceptions, aborts, and no-op attempts
         # leave this false, so unrelated later usage cannot be charged to an

@@ -37,6 +37,7 @@ from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
     fetch_model_metadata,
+    init_agent_usage_anchor,
     is_local_endpoint,
     query_ollama_num_ctx,
 )
@@ -3007,10 +3008,12 @@ def init_agent(
     agent._is_user_initiated_turn = False
 
     # Usage-anchored context accounting (agent/model_metadata.py): the last
-    # main-loop provider response's exact usage + transcript snapshot. None
-    # until the first response with usage; invalidated on compaction and
-    # session switches so stale anchors can never suppress compression.
-    agent._usage_anchor = None
+    # main-loop provider response's exact usage + transcript snapshot.
+    # Restored from the session row when the durable transcript still
+    # matches the content fingerprint so a per-turn process spawn
+    # (desktop group-chat) can still skip the estimator. Compaction and
+    # session reset clear the blob; a mismatch leaves None (fail closed).
+    init_agent_usage_anchor(agent)
 
     # Cumulative token usage for the session
     agent.session_prompt_tokens = 0

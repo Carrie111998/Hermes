@@ -3873,10 +3873,60 @@ def estimate_request_tokens_rough(
 #       captured response is NOT yet appended at the capture site; when it
 #       appears at index base_count its cost is covered by completion_tokens,
 #       so the delta walk skips it).
-#   base_last_id / base_last_role — identity fingerprint of the last message
-#       at capture time. Compaction, splices, and history rewrites shift or
-#       replace that element, failing the check and falling back to full
-#       estimation. Belt-and-braces on top of explicit invalidation.
+#   base_last_id / base_last_role — in-process identity of the last message
+#       at capture time. ``id()`` is the fast path and fails closed on any
+#       rewrite that produced new dicts (compaction, splice) even when
+#       values look the same.
+#   base_last_fp — content fingerprint (role + content digest, plus tool
+#       call identity when present). Survives process restart; restore
+#       drops ``base_last_id`` and matches on this instead. Compaction and
+#       session reset clear the persisted blob so a rewritten transcript
+#       cannot suppress compression.
+#
+# Desktop group-chat can spawn a fresh ``--profile <name> serve`` process
+# per turn (#99421). The blob lives on the session row's ``model_config``
+# JSON (same slot as the proactive-prune runway) keyed by session_id.
+
+
+USAGE_ANCHOR_MODEL_CONFIG_KEY = "_usage_anchor"
+
+
+def _stable_json_bytes(value: Any) -> bytes:
+    """Canonical JSON bytes for fingerprinting; never raises."""
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            default=str,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError):
+        return repr(value).encode("utf-8", errors="replace")
+
+
+def usage_anchor_message_fingerprint(msg: Any) -> Optional[str]:
+    """Stable hash of one transcript message (role + content digest).
+
+    Persistence-only fields (timestamp, row markers) are omitted so a
+    DB-reloaded dict with the same role/content matches the in-memory
+    capture. Tool-call identity is included so empty-content tool turns
+    do not collide.
+    """
+    if not isinstance(msg, dict):
+        return None
+    payload: Dict[str, Any] = {
+        "role": msg.get("role"),
+        "content": msg.get("content"),
+    }
+    tool_call_id = msg.get("tool_call_id")
+    if tool_call_id:
+        payload["tool_call_id"] = tool_call_id
+    tool_calls = msg.get("tool_calls")
+    if tool_calls:
+        payload["tool_calls"] = tool_calls
+    return hashlib.sha256(_stable_json_bytes(payload)).hexdigest()
 
 
 def capture_usage_anchor(
@@ -3896,13 +3946,145 @@ def capture_usage_anchor(
         return None
     base_count = len(messages)
     last = messages[-1] if base_count else None
+    last_dict = last if isinstance(last, dict) else None
     return {
         "prompt_tokens": pt,
         "completion_tokens": max(0, ct),
         "base_count": base_count,
         "base_last_id": id(last) if last is not None else None,
-        "base_last_role": last.get("role") if isinstance(last, dict) else None,
+        "base_last_role": last_dict.get("role") if last_dict is not None else None,
+        "base_last_fp": usage_anchor_message_fingerprint(last),
     }
+
+
+def serialize_usage_anchor(anchor: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Disk-safe subset of an anchor. Drops process-local ``base_last_id``."""
+    if not isinstance(anchor, dict):
+        return None
+    try:
+        pt = int(anchor.get("prompt_tokens") or 0)
+        ct = int(anchor.get("completion_tokens") or 0)
+        base_count = int(anchor.get("base_count") or 0)
+    except (TypeError, ValueError):
+        return None
+    fp = anchor.get("base_last_fp")
+    if pt <= 0 or base_count <= 0 or not isinstance(fp, str) or not fp:
+        return None
+    role = anchor.get("base_last_role")
+    if role is not None and not isinstance(role, str):
+        role = None
+    return {
+        "prompt_tokens": pt,
+        "completion_tokens": max(0, ct),
+        "base_count": base_count,
+        "base_last_role": role,
+        "base_last_fp": fp,
+    }
+
+
+def restore_usage_anchor(blob: Any) -> Optional[Dict[str, Any]]:
+    """Parse a persisted blob into an in-memory anchor.
+
+    Never carries ``base_last_id``: that value is process-local and a
+    coincidental reuse in a new process must not count as a match.
+    """
+    serialized = serialize_usage_anchor(blob if isinstance(blob, dict) else None)
+    if serialized is None:
+        return None
+    serialized["base_last_id"] = None
+    return serialized
+
+
+def _usage_anchor_base_matches(
+    messages: List[Dict[str, Any]],
+    anchor: Dict[str, Any],
+) -> bool:
+    """True when ``messages`` still has the captured prefix at ``base_count``.
+
+    In-process anchors carry ``base_last_id`` (``id()`` of the last message
+    at capture) — the fast path, fail-closed on new dicts. Restored anchors
+    have ``base_last_id is None`` and match on the content fingerprint.
+    """
+    try:
+        base_count = int(anchor.get("base_count") or 0)
+    except (TypeError, ValueError):
+        return False
+    if base_count <= 0 or len(messages) < base_count:
+        return False
+    base_msg = messages[base_count - 1]
+    stored_id = anchor.get("base_last_id")
+    if stored_id is not None:
+        if id(base_msg) != stored_id:
+            return False
+    else:
+        expected_fp = anchor.get("base_last_fp")
+        if not isinstance(expected_fp, str) or not expected_fp:
+            return False
+        if usage_anchor_message_fingerprint(base_msg) != expected_fp:
+            return False
+    base_role = base_msg.get("role") if isinstance(base_msg, dict) else None
+    if base_role != anchor.get("base_last_role"):
+        return False
+    return True
+
+
+def persist_usage_anchor(agent: Any, anchor: Optional[Dict[str, Any]]) -> None:
+    """Write or clear the session-row usage-anchor blob. Best-effort."""
+    if agent is None or getattr(agent, "_persist_disabled", False):
+        return
+    session_id = getattr(agent, "session_id", None)
+    session_db = getattr(agent, "_session_db", None)
+    patcher = getattr(session_db, "patch_session_model_config", None)
+    if not session_id or not callable(patcher):
+        return
+    blob = serialize_usage_anchor(anchor) if anchor is not None else None
+    try:
+        patcher(session_id, {USAGE_ANCHOR_MODEL_CONFIG_KEY: blob})
+    except Exception:
+        logger.debug("usage anchor persist failed", exc_info=True)
+
+
+def load_persisted_usage_anchor(agent: Any) -> Optional[Dict[str, Any]]:
+    """Read the session-row blob and restore it if the transcript matches.
+
+    Fail closed: missing blob, unreadable store, or a durable transcript
+    that no longer matches the fingerprint (compaction, splice, /new)
+    returns None so preflight estimates.
+    """
+    if agent is None or getattr(agent, "_persist_disabled", False):
+        return None
+    session_id = getattr(agent, "session_id", None)
+    session_db = getattr(agent, "_session_db", None)
+    getter = getattr(session_db, "get_session_model_config_value", None)
+    if not session_id or not callable(getter):
+        return None
+    try:
+        blob = getter(session_id, USAGE_ANCHOR_MODEL_CONFIG_KEY, None)
+    except Exception:
+        logger.debug("usage anchor load failed", exc_info=True)
+        return None
+    restored = restore_usage_anchor(blob)
+    if restored is None:
+        return None
+    msgs_fn = getattr(session_db, "get_messages_as_conversation", None)
+    if callable(msgs_fn):
+        try:
+            msgs = msgs_fn(session_id)
+        except Exception:
+            logger.debug("usage anchor transcript lookup failed", exc_info=True)
+            msgs = None
+        if isinstance(msgs, list) and not _usage_anchor_base_matches(msgs, restored):
+            persist_usage_anchor(agent, None)
+            return None
+    return restored
+
+
+def init_agent_usage_anchor(agent: Any) -> None:
+    """Restore a persisted usage anchor at agent_init, or leave None."""
+    agent._usage_anchor = None
+    restored = load_persisted_usage_anchor(agent)
+    if restored is not None:
+        agent._usage_anchor = restored
 
 
 def anchored_context_tokens(
@@ -3920,15 +4102,9 @@ def anchored_context_tokens(
     """
     if not isinstance(anchor, dict) or not isinstance(messages, list):
         return None
-    base_count = anchor.get("base_count") or 0
-    if base_count <= 0 or len(messages) < base_count:
+    if not _usage_anchor_base_matches(messages, anchor):
         return None
-    base_msg = messages[base_count - 1]
-    if id(base_msg) != anchor.get("base_last_id"):
-        return None
-    base_role = base_msg.get("role") if isinstance(base_msg, dict) else None
-    if base_role != anchor.get("base_last_role"):
-        return None
+    base_count = int(anchor.get("base_count") or 0)
     total = int(anchor["prompt_tokens"]) + int(anchor.get("completion_tokens") or 0)
     delta = messages[base_count:]
     if delta:

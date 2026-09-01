@@ -13,17 +13,27 @@ since. These tests cover:
     id/index check fails closed) and on explicit reset sites;
   * the preflight consumer (_preflight_request_tokens) preferring the
     anchor, plus a sabotage check proving the anchored path (not the
-    heuristic) produces the number.
+    heuristic) produces the number;
+  * persist/restore via a content fingerprint so a restarted agent_init
+    can reuse provider usage when the transcript is unchanged, and reject
+    restore when the last message or history length no longer matches.
 """
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from agent.model_metadata import (
+    USAGE_ANCHOR_MODEL_CONFIG_KEY,
     anchored_context_tokens,
     capture_usage_anchor,
     estimate_messages_tokens_rough,
+    init_agent_usage_anchor,
+    persist_usage_anchor,
+    restore_usage_anchor,
+    serialize_usage_anchor,
+    usage_anchor_message_fingerprint,
 )
 from agent.turn_context import _preflight_request_tokens
 
@@ -206,6 +216,175 @@ class TestCompressionTriggerUsesAnchor:
         anchored = anchored_context_tokens(messages, anchor)
         assert heuristic >= threshold  # old behavior: spurious compression
         assert anchored is not None and anchored < threshold
+
+
+def _plain_history():
+    return [
+        _msg("user", "start"),
+        _msg("assistant", "hello"),
+        _msg("user", "do the thing"),
+        _msg("assistant", "done looking"),
+    ]
+
+
+def _namespace_agent(session_id, db):
+    return SimpleNamespace(
+        session_id=session_id,
+        _session_db=db,
+        _persist_disabled=False,
+        _usage_anchor=None,
+    )
+
+
+class TestUsageAnchorPersist:
+    def test_capture_includes_content_fingerprint(self):
+        messages = _plain_history()
+        anchor = capture_usage_anchor(10_000, 20, messages)
+        assert anchor is not None
+        assert isinstance(anchor["base_last_fp"], str)
+        assert len(anchor["base_last_fp"]) == 64
+        assert anchor["base_last_fp"] == usage_anchor_message_fingerprint(messages[-1])
+        assert anchor["base_last_id"] == id(messages[-1])
+
+    def test_serialize_drops_process_local_id(self):
+        messages = _history_with_images(2)
+        captured = capture_usage_anchor(12_000, 100, messages)
+        blob = serialize_usage_anchor(captured)
+        assert blob is not None
+        assert "base_last_id" not in blob
+        assert blob["base_last_fp"] == captured["base_last_fp"]
+        assert blob["prompt_tokens"] == 12_000
+        restored = restore_usage_anchor(blob)
+        assert restored is not None
+        assert restored["base_last_id"] is None
+
+    def test_restore_strips_stale_id_from_blob(self):
+        messages = _plain_history()
+        captured = capture_usage_anchor(8_000, 40, messages)
+        blob = serialize_usage_anchor(captured)
+        blob["base_last_id"] = 123456789
+        restored = restore_usage_anchor(blob)
+        assert restored["base_last_id"] is None
+        rebuilt = [dict(m) for m in messages]
+        assert anchored_context_tokens(rebuilt, restored) == 8_000 + 40
+
+    def test_round_trip_new_objects_returns_provider_total(self):
+        messages = _history_with_images(4)
+        captured = capture_usage_anchor(30_000, 50, messages)
+        restored = restore_usage_anchor(serialize_usage_anchor(captured))
+        rebuilt = [dict(m) for m in messages]
+        assert anchored_context_tokens(rebuilt, restored) == 30_000 + 50
+        # In-process capture still requires id() — compaction-style rebuilds
+        # of the same values must not suppress compression in-process.
+        assert anchored_context_tokens(rebuilt, captured) is None
+
+    def test_restore_rejected_on_last_message_change(self):
+        messages = _history_with_images(4)
+        captured = capture_usage_anchor(30_000, 50, messages)
+        restored = restore_usage_anchor(serialize_usage_anchor(captured))
+        changed = [dict(m) for m in messages]
+        changed[-1] = _msg("assistant", "different last message")
+        assert anchored_context_tokens(changed, restored) is None
+
+    def test_restore_rejected_on_shorter_history(self):
+        messages = _history_with_images(4)
+        captured = capture_usage_anchor(30_000, 50, messages)
+        restored = restore_usage_anchor(serialize_usage_anchor(captured))
+        assert anchored_context_tokens(messages[:2], restored) is None
+
+    def test_sessiondb_round_trip_via_agent_init(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "usage-anchor-roundtrip"
+        messages = _plain_history()
+        db.create_session(sid, source="cli")
+        db.append_messages_batch(sid, messages)
+
+        captured = capture_usage_anchor(40_000, 120, messages)
+        persist_usage_anchor(_namespace_agent(sid, db), captured)
+        stored = json.loads(db.get_session(sid)["model_config"] or "{}")
+        assert USAGE_ANCHOR_MODEL_CONFIG_KEY in stored
+        assert "base_last_id" not in stored[USAGE_ANCHOR_MODEL_CONFIG_KEY]
+
+        resumed = _namespace_agent(sid, db)
+        init_agent_usage_anchor(resumed)
+        rebuilt = [dict(m) for m in messages]
+        rebuilt.append(_msg("user", "next turn"))
+        got = anchored_context_tokens(rebuilt, resumed._usage_anchor)
+        assert got is not None
+        delta = estimate_messages_tokens_rough([rebuilt[-1]])
+        assert got == 40_000 + 120 + delta
+
+    def test_sessiondb_mismatch_last_message_rejected(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "usage-anchor-mismatch"
+        original = _plain_history()
+        db.create_session(sid, source="cli")
+        captured = capture_usage_anchor(10_000, 10, original)
+        persist_usage_anchor(_namespace_agent(sid, db), captured)
+
+        changed = [dict(m) for m in original]
+        changed[-1] = _msg("assistant", "CHANGED")
+        db.append_messages_batch(sid, changed)
+
+        resumed = _namespace_agent(sid, db)
+        init_agent_usage_anchor(resumed)
+        assert resumed._usage_anchor is None
+        stored = json.loads(db.get_session(sid)["model_config"] or "{}")
+        assert USAGE_ANCHOR_MODEL_CONFIG_KEY not in stored
+
+    def test_sessiondb_shorter_history_rejected(self, tmp_path):
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "usage-anchor-short"
+        original = _plain_history()
+        db.create_session(sid, source="cli")
+        db.append_messages_batch(sid, original[:1])
+        captured = capture_usage_anchor(10_000, 10, original)
+        persist_usage_anchor(_namespace_agent(sid, db), captured)
+
+        resumed = _namespace_agent(sid, db)
+        init_agent_usage_anchor(resumed)
+        assert resumed._usage_anchor is None
+
+    def test_fresh_agent_init_restores_anchor(self, tmp_path, monkeypatch):
+        """A new AIAgent for the same session_id restores the persisted blob."""
+        import os
+        from unittest.mock import patch
+
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "USAGE_ANCHOR_AGENT_INIT"
+        messages = _plain_history()
+        db.create_session(sid, source="cli")
+        db.append_messages_batch(sid, messages)
+        persist_usage_anchor(
+            _namespace_agent(sid, db),
+            capture_usage_anchor(22_000, 80, messages),
+        )
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            from run_agent import AIAgent
+
+            resumed = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=db,
+                session_id=sid,
+                platform="cli",
+                skip_context_files=True,
+                skip_memory=True,
+            )
+        rebuilt = [dict(m) for m in messages]
+        assert anchored_context_tokens(rebuilt, resumed._usage_anchor) == 22_000 + 80
 
 
 if __name__ == "__main__":
