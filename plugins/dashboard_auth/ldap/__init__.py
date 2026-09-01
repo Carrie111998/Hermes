@@ -373,7 +373,10 @@ class LdapAuthProvider(DashboardAuthProvider):
             user=user or None,
             password=password or None,
             client_strategy=ldap3.SYNC,
-            receive_timeout=self._timeout,
+            # Must be an int: on POSIX ldap3 2.9.1 packs this with
+            # struct.pack('LL', ...) for SO_RCVTIMEO, and a float raises
+            # struct.error before the connection ever opens.
+            receive_timeout=max(1, int(self._timeout)),
             raise_exceptions=False,
             auto_bind=False,
             # never replay credentials to a host named by directory data

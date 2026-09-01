@@ -371,7 +371,10 @@ class TestDefaultFactory:
         assert patched["server"]["connect_timeout"] == 7.0
         assert patched["server"]["get_info"] is ldap3.NONE
         assert patched["conn"]["client_strategy"] is ldap3.SYNC
-        assert patched["conn"]["receive_timeout"] == 7.0
+        # int, not float: ldap3 2.9.1 struct.pack('LL', ...)s this value on
+        # POSIX, so a float breaks every real connection at open().
+        assert patched["conn"]["receive_timeout"] == 7
+        assert isinstance(patched["conn"]["receive_timeout"], int)
         assert patched["conn"]["raise_exceptions"] is False
         assert patched["conn"]["auto_bind"] is False
         assert patched["conn"]["auto_referrals"] is False
