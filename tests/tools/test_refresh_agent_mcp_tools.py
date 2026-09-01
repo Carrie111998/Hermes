@@ -9,6 +9,7 @@ freezing any particular tool list.
 """
 
 import threading
+import time
 import types
 
 from tools import mcp_tool
@@ -201,6 +202,227 @@ def test_refresh_is_thread_safe_under_concurrent_calls(monkeypatch):
 
     assert not errors
     assert agent.valid_tool_names in ({"a", "b"}, {"a", "c"})
+
+
+# ── SEP-2549 TTL-driven re-list (connected servers) ──────────────────────────
+
+
+class _FakeListResult:
+    """Stand-in for an MCP ``tools/list`` page with an optional ttlMs hint."""
+
+    def __init__(self, tools, ttl_ms=None):
+        self.tools = tools
+        if ttl_ms is not None:
+            self.ttlMs = ttl_ms
+
+
+def _fake_mcp_tool(name):
+    return types.SimpleNamespace(name=name, description="", inputSchema={})
+
+
+def _fake_server(name, tool_names, *, ttl_ms=300000, listed_at_age_s=0.0):
+    """A connected MCPServerTask stand-in whose session serves ``tool_names``.
+
+    The served list is the MUTABLE ``tools`` list the test can extend or
+    shrink to simulate a server-side tool-list change between lists.
+    ``_discover_tools`` mirrors the real method's observable contract: fresh
+    list → ``_tools`` replaced, cache meta repopulated, TTL anchor advanced.
+    """
+    import asyncio
+
+    tools = [_fake_mcp_tool(n) for n in tool_names]
+
+    async def list_tools():
+        return _FakeListResult(tools, ttl_ms=ttl_ms)
+
+    srv = types.SimpleNamespace(
+        name=name,
+        initialize_result=None,  # no capability info → tools advertised
+        session=types.SimpleNamespace(list_tools=list_tools),
+        _rpc_lock=asyncio.Lock(),
+        _ready=types.SimpleNamespace(is_set=lambda: True),
+        _config={},
+        _tools=tools,
+        _registered_tool_names=list(tool_names),
+        _list_cache_meta={
+            "ttl_ms": ttl_ms,
+            "listed_at": time.time() - listed_at_age_s,
+        },
+    )
+
+    async def _discover_tools():
+        async with srv._rpc_lock:
+            srv._list_cache_meta = {}
+            result = await srv.session.list_tools()
+            srv._tools = list(getattr(result, "tools", None) or [])
+            fresh_ttl = getattr(result, "ttlMs", None)
+            if fresh_ttl is not None:
+                srv._list_cache_meta["ttl_ms"] = fresh_ttl
+            srv._list_cache_meta["listed_at"] = time.time()
+
+    srv._discover_tools = _discover_tools
+    return srv
+
+
+def _patch_ttl_test_harness(monkeypatch, server):
+    """Shared patches for the TTL re-list tests: run the re-list inline on a
+    throwaway loop, isolate ``_servers``, stub registration, and record
+    deregistrations."""
+    import asyncio
+
+    def _run_on_loop(coro_or_factory, timeout=None):
+        coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+        return asyncio.run(coro)
+
+    monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", _run_on_loop)
+    monkeypatch.setattr(mcp_tool, "_servers", {server.name: server})
+    # Registration stub: the live manifest is whatever the re-list snapshot
+    # holds — the real _register_server_tools would need real SDK objects.
+    monkeypatch.setattr(
+        mcp_tool, "_register_server_tools",
+        lambda name, srv, config: [t.name for t in srv._tools],
+        raising=False,
+    )
+    deregistered = []
+    from tools import registry as registry_mod
+
+    monkeypatch.setattr(
+        registry_mod.registry, "deregister", lambda n: deregistered.append(n)
+    )
+    monkeypatch.setattr(
+        mcp_tool, "_forget_mcp_tool_server", lambda n: deregistered.append(n)
+    )
+    return deregistered
+
+
+def test_ttl_refresh_relists_expired_server_and_adds_new_tool(monkeypatch):
+    """A connected server whose tools/list TTL expired is re-probed; the new
+    server-side tool lands in the registry-backed agent snapshot."""
+    import model_tools
+
+    server = _fake_server(
+        "dev_sitepro_server",
+        ["mcp__dev_sitepro_server__get_site_languages"],
+        listed_at_age_s=600.0,  # 10 min > 5 min TTL → expired
+    )
+    # The server gained a tool since the last list.
+    server._tools.append(_fake_mcp_tool("mcp__dev_sitepro_server__get_site_countries"))
+
+    deregistered = _patch_ttl_test_harness(monkeypatch, server)
+    monkeypatch.setattr(
+        model_tools, "get_tool_definitions",
+        lambda **kw: [_tool(n) for n in (
+            "read_file",
+            "mcp__dev_sitepro_server__get_site_languages",
+            "mcp__dev_sitepro_server__get_site_countries",
+        )],
+    )
+
+    agent = _agent(["read_file", "mcp__dev_sitepro_server__get_site_languages"])
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert "mcp__dev_sitepro_server__get_site_countries" in added
+    assert "mcp__dev_sitepro_server__get_site_countries" in agent.valid_tool_names
+    assert set(server._registered_tool_names) == {
+        "mcp__dev_sitepro_server__get_site_languages",
+        "mcp__dev_sitepro_server__get_site_countries",
+    }
+    assert deregistered == []  # nothing removed — the old tool is still served
+    # The re-list advanced the TTL anchor so the next refresh is a no-op.
+    assert abs(server._list_cache_meta["listed_at"] - time.time()) < 5.0
+
+
+def test_ttl_refresh_deregisters_phantom_tools_no_longer_served(monkeypatch):
+    """A tool the server stopped serving is deregistered after the re-list, so
+    the model stops seeing a tool that can never succeed."""
+    import model_tools
+
+    server = _fake_server(
+        "dev_sitepro_server",
+        [
+            "mcp__dev_sitepro_server__get_site_languages",
+            "mcp__dev_sitepro_server__test_connection",
+        ],
+        listed_at_age_s=600.0,  # expired
+    )
+    # The server dropped test_connection since the last list.
+    server._tools[:] = [_fake_mcp_tool("mcp__dev_sitepro_server__get_site_languages")]
+
+    deregistered = _patch_ttl_test_harness(monkeypatch, server)
+    monkeypatch.setattr(
+        model_tools, "get_tool_definitions",
+        lambda **kw: [_tool("read_file"),
+                      _tool("mcp__dev_sitepro_server__get_site_languages")],
+    )
+
+    agent = _agent([
+        "read_file",
+        "mcp__dev_sitepro_server__get_site_languages",
+        "mcp__dev_sitepro_server__test_connection",
+    ])
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert "mcp__dev_sitepro_server__test_connection" in deregistered
+    assert "mcp__dev_sitepro_server__test_connection" not in agent.valid_tool_names
+    assert server._registered_tool_names == [
+        "mcp__dev_sitepro_server__get_site_languages"
+    ]
+
+
+def test_ttl_refresh_skips_server_within_ttl(monkeypatch):
+    """A server whose tools/list TTL still holds is NOT re-probed — the whole
+    point of the cache hint."""
+    import model_tools
+
+    server = _fake_server(
+        "dev_sitepro_server",
+        ["mcp__dev_sitepro_server__get_site_languages"],
+        listed_at_age_s=60.0,  # 1 min < 5 min TTL → still valid
+    )
+    calls = []
+
+    async def list_tools():
+        calls.append(1)
+        return _FakeListResult(server._tools, ttl_ms=300000)
+
+    server.session.list_tools = list_tools
+    _patch_ttl_test_harness(monkeypatch, server)
+    monkeypatch.setattr(
+        model_tools, "get_tool_definitions",
+        lambda **kw: [_tool("read_file")],
+    )
+
+    mcp_tool.refresh_agent_mcp_tools(_agent(["read_file"]))
+
+    assert calls == []  # tools/list never hit the server
+
+
+def test_ttl_refresh_skips_server_without_ttl_hint(monkeypatch):
+    """A pre-SEP-2549 server (no ttlMs) keeps the old never-expires behavior."""
+    import model_tools
+
+    server = _fake_server(
+        "dev_sitepro_server",
+        ["mcp__dev_sitepro_server__get_site_languages"],
+        ttl_ms=None,
+        listed_at_age_s=99999.0,
+    )
+    calls = []
+
+    async def list_tools():
+        calls.append(1)
+        return _FakeListResult(server._tools)
+
+    server.session.list_tools = list_tools
+    _patch_ttl_test_harness(monkeypatch, server)
+    monkeypatch.setattr(
+        model_tools, "get_tool_definitions",
+        lambda **kw: [_tool("read_file")],
+    )
+
+    mcp_tool.refresh_agent_mcp_tools(_agent(["read_file"]))
+
+    assert calls == []
 
 
 # ── discovery-wait bound (mcp_discovery_timeout config) ──────────────────────
