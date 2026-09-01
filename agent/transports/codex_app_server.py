@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import psutil
+
 from tools.environments.local import hermes_subprocess_env
 
 # Default minimum codex version we test against. The PR sets this from the
@@ -61,41 +63,70 @@ def _terminate_app_server_process(
     timeout: float,
     platform: str = os.name,
 ) -> None:
-    """Terminate the exact app-server process tree and reap its root."""
+    """Terminate the exact app-server process tree and reap its root.
 
-    if process.poll() is not None:
-        process.wait(timeout=max(0.1, timeout))
-        return
+    The descendant snapshot must happen while the root is still alive: on
+    Windows `codex` resolves to npm's codex.cmd, so the spawned root is a
+    cmd.exe shim whose node/codex.exe children survive a root-only
+    TerminateProcess -- and once the root is dead the tree is unwalkable.
+    That is exactly how app-server pairs leaked (one per deadline-exhausted
+    transport replacement): close() gets only a ~100ms teardown slice there,
+    `taskkill /T` cannot start-and-finish inside it (subprocess.run kills
+    taskkill at the timeout), and the root-only terminate() fallback then
+    orphaned the children. Killing the snapshotted PIDs directly completes
+    in milliseconds, so even the minimum slice suffices.
+    """
+
+    deadline = time.monotonic() + max(0.1, timeout)
+    children: list[psutil.Process] = []
+    if process.poll() is None:
+        try:
+            children = psutil.Process(process.pid).children(recursive=True)
+        except psutil.Error:
+            children = []
     if platform == "nt":
         try:
-            subprocess.run(
-                [
-                    "taskkill",
-                    "/PID",
-                    str(process.pid),
-                    "/T",
-                    "/F",
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=max(0.1, timeout),
-                check=False,
-            )
-            process.wait(timeout=max(0.1, min(timeout, 1.0)))
-            if process.poll() is not None:
-                return
+            process.kill()
+        except OSError:
+            pass
+        for member in children:
+            try:
+                member.kill()
+            except psutil.Error:
+                pass
+        try:
+            process.wait(timeout=max(0.1, deadline - time.monotonic()))
         except (OSError, subprocess.SubprocessError):
             pass
-    try:
-        process.terminate()
-        process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+    else:
         try:
-            process.kill()
-            process.wait(timeout=1.0)
-        except Exception:
+            process.terminate()
+            process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+                process.wait(timeout=1.0)
+            except Exception:
+                pass
+        except OSError:
             pass
+        for member in children:
+            try:
+                member.kill()
+            except psutil.Error:
+                pass
+    if children:
+        try:
+            _, alive = psutil.wait_procs(
+                children, timeout=max(0.1, deadline - time.monotonic())
+            )
+        except psutil.Error:
+            alive = [m for m in children if m.is_running()]
+        for member in alive:
+            try:
+                member.kill()
+            except psutil.Error:
+                pass
 
 
 class CodexAppServerClient:

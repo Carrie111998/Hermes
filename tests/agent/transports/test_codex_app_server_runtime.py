@@ -7,8 +7,11 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import os
 import queue
+import subprocess
 import threading
+import time
 from threading import Event, Lock, Thread
 
 import pytest
@@ -344,7 +347,7 @@ class TestCodexAppServerShutdown:
     def test_windows_shutdown_kills_the_exact_process_tree(self, monkeypatch) -> None:
         from agent.transports import codex_app_server as cas
 
-        calls: list[list[str]] = []
+        killed: list[str] = []
 
         class FakeProcess:
             pid = 4242
@@ -366,25 +369,111 @@ class TestCodexAppServerShutdown:
                 self.terminated = True
 
             def kill(self):
-                raise AssertionError("tree kill should not need root-only fallback")
+                self.exited = True
+                killed.append("root")
 
         process = FakeProcess()
 
-        def fake_run(argv, **kwargs):
-            calls.append(list(argv))
-            assert kwargs["stdin"] is cas.subprocess.DEVNULL
-            assert kwargs["stdout"] is cas.subprocess.DEVNULL
-            assert kwargs["stderr"] is cas.subprocess.DEVNULL
-            assert kwargs["check"] is False
-            process.exited = True
-            return object()
+        class FakeChild:
+            def __init__(self, name: str) -> None:
+                self._name = name
+                self._alive = True
 
-        monkeypatch.setattr(cas.subprocess, "run", fake_run)
+            def kill(self) -> None:
+                self._alive = False
+                killed.append(self._name)
+
+            def is_running(self) -> bool:
+                return self._alive
+
+        children = [FakeChild("shim-node"), FakeChild("shim-codex")]
+
+        class FakePsutilProcess:
+            def __init__(self, pid: int) -> None:
+                assert pid == 4242
+                # The snapshot only works while the root is alive; taking it
+                # after the root dies is the leak this fix removes.
+                assert not process.exited, "tree snapshot must precede root kill"
+
+            def children(self, recursive: bool = False):
+                assert recursive is True
+                return list(children)
+
+        class FakePsutil:
+            Error = RuntimeError
+            Process = FakePsutilProcess
+
+            @staticmethod
+            def wait_procs(procs, timeout=None):
+                assert timeout is not None
+                gone = [p for p in procs if not p.is_running()]
+                alive = [p for p in procs if p.is_running()]
+                return gone, alive
+
+        monkeypatch.setattr(cas, "psutil", FakePsutil)
 
         cas._terminate_app_server_process(process, timeout=3.0, platform="nt")
 
-        assert calls == [["taskkill", "/PID", "4242", "/T", "/F"]]
+        assert killed == ["root", "shim-node", "shim-codex"]
         assert process.terminated is False
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows cmd-shim tree shape")
+    @pytest.mark.live_system_guard_bypass  # real tree teardown IS the subject
+    def test_starved_teardown_slice_still_kills_shim_children(
+        self, tmp_path
+    ) -> None:
+        """Reproduces the leaked app-server pairs: a cmd.exe shim root (the
+        shape `codex` -> npm codex.cmd takes on Windows) killed under the
+        100ms deadline-exhausted teardown slice must not orphan its child."""
+        import sys
+
+        import psutil
+
+        from agent.transports import codex_app_server as cas
+
+        script = tmp_path / "sleeper.py"
+        script.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+        proc = subprocess.Popen(
+            ["cmd.exe", "/c", sys.executable, str(script)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        child_pids: list[int] = []
+        try:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not child_pids:
+                try:
+                    child_pids = [
+                        c.pid
+                        for c in psutil.Process(proc.pid).children(recursive=True)
+                    ]
+                except psutil.Error:
+                    break
+                if not child_pids:
+                    time.sleep(0.05)
+            assert child_pids, "shim never spawned its child"
+
+            cas._terminate_app_server_process(proc, timeout=0.1, platform="nt")
+
+            assert proc.poll() is not None, "shim root survived teardown"
+            settle = time.monotonic() + 5.0
+            while time.monotonic() < settle and any(
+                psutil.pid_exists(pid) for pid in child_pids
+            ):
+                time.sleep(0.05)
+            leaked = [pid for pid in child_pids if psutil.pid_exists(pid)]
+            assert not leaked, f"shim children leaked: {leaked}"
+        finally:
+            for pid in child_pids:
+                try:
+                    psutil.Process(pid).kill()
+                except psutil.Error:
+                    pass
+            try:
+                proc.kill()
+            except OSError:
+                pass
 
 
 class TestSpawnEnvIsolation:
