@@ -595,7 +595,16 @@ class CLIAgentSetupMixin:
                 ),
                 reasoning_callback=self._current_reasoning_callback(),
 
-                fallback_model=self._fallback_model,
+                # A dispatcher-pinned local worker must not inherit the
+                # profile's remote fallback chain.  The child marker is set
+                # by kanban_db._default_spawn and is intentionally scoped to
+                # that subprocess; ordinary CLI sessions keep their normal
+                # configured fallbacks.
+                fallback_model=(
+                    []
+                    if os.environ.get("HERMES_KANBAN_LOCAL_ONLY") == "1"
+                    else self._fallback_model
+                ),
                 thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,

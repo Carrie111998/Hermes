@@ -1401,12 +1401,20 @@ def init_agent(
                 _explicit = (agent.provider or "").strip().lower()
                 # --- Init-time fallback (#17929) ---
                 _fb_entries = []
-                if isinstance(fallback_model, list):
+                if (
+                    os.environ.get("HERMES_KANBAN_LOCAL_ONLY") != "1"
+                    and isinstance(fallback_model, list)
+                ):
                     _fb_entries = [
                         f for f in fallback_model
                         if isinstance(f, dict) and f.get("provider") and f.get("model")
                     ]
-                elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
+                elif (
+                    os.environ.get("HERMES_KANBAN_LOCAL_ONLY") != "1"
+                    and isinstance(fallback_model, dict)
+                    and fallback_model.get("provider")
+                    and fallback_model.get("model")
+                ):
                     _fb_entries = [fallback_model]
                 _fb_resolved = False
                 for _fb in _fb_entries:
@@ -1583,7 +1591,9 @@ def init_agent(
     # when the primary is exhausted (rate-limit, overload, connection
     # failure).  Supports both legacy single-dict ``fallback_model`` and
     # new list ``fallback_providers`` format.
-    if isinstance(fallback_model, list):
+    if os.environ.get("HERMES_KANBAN_LOCAL_ONLY") == "1":
+        agent._fallback_chain = []
+    elif isinstance(fallback_model, list):
         agent._fallback_chain = [
             f for f in fallback_model
             if isinstance(f, dict) and f.get("provider") and f.get("model")
