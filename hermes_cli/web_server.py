@@ -286,10 +286,11 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     providers keep the single-store behavior — their registries are not
     profile-scoped (see _notify_cron_provider_for_profile).
 
-    Cross-process safe: the built-in provider's ``cron.scheduler.tick`` takes
-    the per-store ``cron/.tick.lock`` file lock, so this never double-fires
-    alongside a real gateway or a live pool backend on the same profile home —
-    whichever process grabs the lock first wins the tick.
+    The Desktop ticker is a fallback owner. The built-in provider defers each
+    profile to a live gateway and honors ``cron.desktop_fallback: false`` for
+    service-owned profiles that must fail closed instead of executing from a
+    reduced Desktop environment. The per-store tick lock remains the final
+    at-most-once fence during owner handoff.
     """
     from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
 
@@ -297,6 +298,7 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
 
     start_kwargs: dict = {"interval": interval}
     if isinstance(provider, InProcessCronScheduler):
+        start_kwargs["desktop_owner_guard"] = True
         try:
             from hermes_cli.profiles import profiles_to_serve
 

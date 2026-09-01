@@ -2745,6 +2745,12 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Desktop normally provides a fallback scheduler for installs that do
+        # not run a gateway. Set this false for service-owned profiles whose
+        # cron jobs must run only inside the canonical gateway process. The
+        # desktop remains a management surface but never dispatches that
+        # profile's cron store.
+        "desktop_fallback": True,
         # Allow cron-spawned agents to use the cronjob toolset (create/edit/
         # remove scheduled jobs from within a cron run — the "cron-librarian"
         # pattern). Off by default: the cronjob toolset is policy-denied in

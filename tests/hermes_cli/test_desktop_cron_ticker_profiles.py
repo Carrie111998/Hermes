@@ -67,6 +67,7 @@ def test_multi_profile_homes_passed_to_builtin(monkeypatch, _providers, tmp_path
 
     assert builtin.start_kwargs is not None
     assert builtin.start_kwargs["interval"] == 7
+    assert builtin.start_kwargs["desktop_owner_guard"] is True
     assert builtin.start_kwargs["profile_homes"] == homes
 
 
@@ -82,7 +83,7 @@ def test_single_profile_keeps_legacy_path(monkeypatch, _providers, tmp_path):
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=9)
 
-    assert builtin.start_kwargs == {"interval": 9}
+    assert builtin.start_kwargs == {"interval": 9, "desktop_owner_guard": True}
 
 
 def test_enumeration_failure_fails_open(monkeypatch, _providers):
@@ -97,7 +98,7 @@ def test_enumeration_failure_fails_open(monkeypatch, _providers):
 
     ws._start_desktop_cron_ticker(threading.Event(), interval=11)
 
-    assert builtin.start_kwargs == {"interval": 11}
+    assert builtin.start_kwargs == {"interval": 11, "desktop_owner_guard": True}
 
 
 def test_external_provider_never_gets_profile_homes(monkeypatch, tmp_path):

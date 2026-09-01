@@ -7846,6 +7846,43 @@ def _maybe_run_worktree_maintenance() -> None:
     ).start()
 
 
+def desktop_scheduler_may_dispatch() -> bool:
+    """Return whether this profile's Desktop ticker may own a cron tick.
+
+    Desktop is a fallback scheduler, not a peer scheduler. A live gateway for
+    the same profile is authoritative. Service-owned profiles can also set
+    ``cron.desktop_fallback: false`` to make Desktop management-only even while
+    the gateway is temporarily unavailable.
+
+    The gateway-lock probe deliberately uses the context-scoped Hermes home so
+    multiplex Desktop tickers compare each profile with its own gateway lock.
+    Probe failures fail open only for the default Desktop-only behavior; an
+    explicit ``desktop_fallback: false`` remains fail-closed.
+    """
+    try:
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron") if isinstance(cfg, dict) else None
+        if isinstance(cron_cfg, dict) and cron_cfg.get("desktop_fallback", True) is False:
+            logger.debug("Desktop cron dispatch disabled for this profile")
+            return False
+    except Exception as exc:
+        logger.debug("Could not read Desktop cron fallback policy: %s", exc)
+
+    try:
+        from gateway.status import is_gateway_runtime_lock_active
+
+        lock_path = get_hermes_home() / "gateway.lock"
+        if is_gateway_runtime_lock_active(lock_path):
+            logger.debug("Desktop cron deferred to the live gateway owner")
+            return False
+    except Exception as exc:
+        logger.debug(
+            "Could not inspect gateway cron ownership; preserving Desktop fallback: %s",
+            exc,
+        )
+    return True
+
+
 def tick(
     verbose: bool = True,
     adapters=None,
@@ -7853,6 +7890,7 @@ def tick(
     sync: bool = True,
     *,
     can_dispatch=None,
+    desktop_owner_guard: bool = False,
 ):
     """
     Check and run all due jobs.
@@ -7866,6 +7904,9 @@ def tick(
         loop: Optional asyncio event loop (from gateway) for live adapter sends
         can_dispatch: Optional synchronous gate; false leaves due jobs untouched
             for the next allowed tick
+        desktop_owner_guard: Apply Desktop fallback and gateway-ownership policy
+            before touching due jobs. Gateway and manual tick callers leave
+            this false.
 
     Returns:
         Number of jobs executed (0 if another tick is already running)
@@ -7933,6 +7974,9 @@ def tick(
         raise
 
     try:
+        if desktop_owner_guard and not desktop_scheduler_may_dispatch():
+            return 0
+
         # Global emergency stop (`hermes pause`): skip dispatch entirely while
         # the ESTOP sentinel exists. Never touches in-flight runs — due jobs
         # simply wait for the next tick after `hermes resume`. Logged once per
