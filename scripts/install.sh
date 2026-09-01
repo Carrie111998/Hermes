@@ -1382,7 +1382,7 @@ clone_repo() {
             fi
 
             local branch_ref_status=0
-            git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null || branch_ref_status=$?
+            git ls-remote --exit-code origin "refs/heads/$BRANCH" >/dev/null || branch_ref_status=$?
             if [ "$branch_ref_status" -eq 0 ]; then
                 # Fetch only the target branch. A bare `git fetch origin` pulls
                 # every ref, and this repo carries thousands of auto-generated

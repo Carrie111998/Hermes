@@ -54,7 +54,15 @@ def _make_remote_with_unfetched_tag(tmp_path: Path) -> tuple[Path, Path, str]:
     remote = tmp_path / "origin.git"
     _git(tmp_path, "init", "-q", "--bare", str(remote))
     _git(seed, "remote", "add", "origin", str(remote))
-    _git(seed, "push", "-q", "origin", "main", "refs/tags/release-test")
+    _git(
+        seed,
+        "push",
+        "-q",
+        "origin",
+        "main",
+        "main:refs/heads/nested/release-test",
+        "refs/tags/release-test",
+    )
     _git(remote, "symbolic-ref", "HEAD", "refs/heads/main")
 
     managed = tmp_path / "hermes-agent"
