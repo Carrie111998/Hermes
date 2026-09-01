@@ -1211,7 +1211,7 @@ def test_find_windows_gateway_services_rejects_shared_service_host_pid(monkeypat
             self.pid = pid
 
         def parents(self):
-            return [FakeProcess(100)]
+            return [FakeProcess(200), FakeProcess(100)]
 
         def children(self, recursive=False):
             return [FakeProcess(300)]
@@ -1229,6 +1229,39 @@ def test_find_windows_gateway_services_rejects_shared_service_host_pid(monkeypat
             psutil_module=fake_psutil,
             profile_processes=[profile],
         )
+
+
+def test_find_windows_gateway_services_ignores_task_scheduler_host(monkeypatch):
+    """Task Scheduler's shared host is an ancestor, not the gateway's owner."""
+    monkeypatch.setattr(gateway.sys, "platform", "win32")
+    profile = SimpleNamespace(profile="default", pid=300, create_time=300.0)
+
+    class FakeService:
+        def __init__(self, name):
+            self.name = name
+
+        def as_dict(self):
+            return {"name": self.name, "pid": 100, "status": "running"}
+
+    class FakeProcess:
+        def __init__(self, pid):
+            self.pid = pid
+
+        def parents(self):
+            return [FakeProcess(200), FakeProcess(100)]
+
+        def create_time(self):
+            return float(self.pid)
+
+    fake_psutil = SimpleNamespace(
+        win_service_iter=lambda: [FakeService("Schedule"), FakeService("RpcSs")],
+        Process=FakeProcess,
+    )
+
+    assert gateway.find_windows_gateway_services(
+        psutil_module=fake_psutil,
+        profile_processes=[profile],
+    ) == []
 
 
 def test_find_windows_gateway_services_fails_closed_on_service_access_error(

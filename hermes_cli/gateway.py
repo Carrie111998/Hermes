@@ -1131,6 +1131,10 @@ def find_windows_gateway_services(
                 pid
                 for pid in ancestor_pids
                 if len(service_names_by_pid.get(pid, set())) > 1
+                # The standard Hermes Scheduled Task descends from the
+                # Task Scheduler service's shared svchost. That host is a
+                # launcher, not an SCM owner of the gateway process.
+                and "Schedule" not in service_names_by_pid[pid]
             ]
             if shared_service_pids:
                 raise RuntimeError(
