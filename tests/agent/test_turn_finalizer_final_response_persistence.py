@@ -216,6 +216,44 @@ def test_delivery_order_is_transform_candidate_gate_commit_receipt(monkeypatch):
     assert order == ["transform", "candidate", "persist_gate", "commit", "receipt"]
 
 
+def test_candidate_row_is_updated_before_persist_gate(monkeypatch):
+    order: list[str] = []
+    from agent import turn_finalizer as finalizer
+
+    original_ensure = finalizer._ensure_authorized_assistant_row
+
+    def ensure(*args, **kwargs):
+        order.append("row")
+        return original_ensure(*args, **kwargs)
+
+    def required(name, **_kwargs):
+        if name == "assistant_final_candidate_gate":
+            order.append("candidate")
+            return {"action": "REPLACE", "content": "authorized body"}
+        if name == "assistant_persist_gate":
+            order.append("persist_gate")
+            return None
+        if name == "assistant_persist_receipt":
+            return {"action": "COMMITTED"}
+        return None
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_required_hook", required)
+    monkeypatch.setattr(finalizer, "_ensure_authorized_assistant_row", ensure)
+    agent = FakeAgent()
+    finalize_turn(
+        agent, final_response="model body", api_call_count=1,
+        interrupted=False, failed=False,
+        messages=[{"role": "user", "content": "q"},
+                  {"role": "assistant", "content": "model body"}],
+        conversation_history=[], effective_task_id="task", turn_id="turn",
+        user_message="q", original_user_message="q",
+        _should_review_memory=False, _turn_exit_reason="text_response(final)",
+    )
+
+    assert order[:3] == ["candidate", "row", "persist_gate"]
+
+
 def test_fallback_timestamp_survives_delayed_sqlite_persistence(
     monkeypatch, tmp_path
 ):

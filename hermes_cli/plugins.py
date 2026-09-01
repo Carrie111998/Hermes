@@ -3406,6 +3406,8 @@ class PluginContext:
         Unknown hook names produce a warning but are still stored so
         forward-compatible plugins don't break.
         """
+        if delivery_critical and applies is None:
+            raise ValueError("delivery-critical hooks require an applies predicate")
         if applies is not None and not callable(applies):
             raise TypeError("hook applies predicate must be callable")
         if hook_name not in VALID_HOOKS:

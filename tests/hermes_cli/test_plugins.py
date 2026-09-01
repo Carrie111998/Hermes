@@ -2008,6 +2008,21 @@ class TestPluginCommands:
         assert mgr._plugin_commands["lcm"]["argument_mode"] == "text"
         assert mgr._plugin_commands["ping"]["argument_mode"] is None
 
+    def test_delivery_critical_hook_requires_an_applies_predicate(self):
+        mgr = PluginManager()
+        ctx = PluginContext(PluginManifest(name="test-plugin", source="user"), mgr)
+
+        with pytest.raises(ValueError, match="require an applies predicate"):
+            ctx.register_hook(
+                "assistant_persist_gate", lambda **_kwargs: None,
+                delivery_critical=True,
+            )
+
+        ctx.register_hook(
+            "assistant_persist_gate", lambda **_kwargs: None,
+            delivery_critical=True, applies=lambda **_kwargs: False,
+        )
+
 
 
 

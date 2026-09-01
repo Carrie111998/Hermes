@@ -533,6 +533,18 @@ def finalize_turn(
             if "content" in _candidate:
                 final_response = _sanitize_surrogates(_candidate["content"])
 
+    # A candidate replacement is part of the persisted assistant row, not a
+    # post-persistence decoration. Prepare that exact row before the required
+    # persistence gate so the Host always authorizes the body it will receipt.
+    if final_response and not interrupted and _candidate_gate_applied:
+        _ensure_authorized_assistant_row(
+            agent,
+            messages,
+            final_response,
+            hard_gate=True,
+            replace_blank_tail=_recovered_from_stream,
+        )
+
     # Optional Host-owned persistence gate. Callback and ownership failures
     # are fatal. The Host may omit content/hash when it accepts the exact
     # candidate supplied here; Hermes computes and verifies the real hash.
