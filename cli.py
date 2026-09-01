@@ -12459,16 +12459,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 Platform.DISCORD: ("Discord", "DISCORD_BOT_TOKEN"),
                 Platform.SLACK: ("Slack", "SLACK_BOT_TOKEN"),
                 Platform.WHATSAPP: ("WhatsApp", "WHATSAPP_ENABLED"),
+                Platform.SIGNAL: ("Signal", "SIGNAL_SIGNALING_KEY"),
             }
-            
-            for platform, (name, env_var) in platform_status.items():
-                pconfig = config.platforms.get(platform)
+
+            # Show all configured platforms first (including Signal, A2A, and
+            # any plugin adapter), then fall back to listing the well-known
+            # four for users who have nothing configured yet.
+            seen = set()
+            for platform, pconfig in config.platforms.items():
+                entry = platform_status.get(platform)
+                if entry:
+                    pname = entry[0]
+                else:
+                    pname = platform.value.upper() if len(platform.value) <= 6 else platform.value.title()
                 if pconfig and pconfig.enabled:
                     home = config.get_home_channel(platform)
                     home_str = f" → {home.name}" if home else ""
-                    print(f"    ✓ {name:<12} Enabled{home_str}")
+                    print(f"    ✓ {pname:<12} Enabled{home_str}")
                 else:
-                    print(f"    ○ {name:<12} Not configured ({env_var})")
+                    label = f" ({entry[1]})" if entry else ""
+                    print(f"    ○ {pname:<12} Not configured{label}")
+                seen.add(platform)
+
+            # Show well-known platforms not in config.platforms
+            for platform, (pname, env_var) in platform_status.items():
+                if platform not in seen:
+                    print(f"    ○ {pname:<12} Not configured ({env_var})")
             
             print()
             print("  Session Reset Policy:")
