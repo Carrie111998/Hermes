@@ -1277,12 +1277,20 @@ class TestStopRun:
 
         def make_agent(**kwargs):
             mock_agent = MagicMock()
-            mock_agent.run_conversation.side_effect = lambda **_run_kwargs: {
-                "final_response": kwargs["clarify_callback"](
+
+            def run_conversation(**_run_kwargs):
+                answer = kwargs["clarify_callback"](
                     "Q" * 2500,
                     ["X" * 600, "Y" * 600, "Z" * 600, "W" * 600, "extra"],
                 )
-            }
+                # Stop clears the pending clarify and resumes the worker; main's
+                # cancel path only seals cancelled when interrupted=True.
+                return {
+                    "final_response": answer,
+                    "interrupted": True,
+                }
+
+            mock_agent.run_conversation.side_effect = run_conversation
             mock_agent.session_prompt_tokens = 0
             mock_agent.session_completion_tokens = 0
             mock_agent.session_total_tokens = 0
