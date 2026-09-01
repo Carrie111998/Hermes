@@ -37,6 +37,7 @@ from __future__ import annotations
 import filecmp
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Optional
