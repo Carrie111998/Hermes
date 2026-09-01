@@ -69,6 +69,32 @@ async def test_admitted_bot_without_user_uses_stable_identity(adapter):
 
 
 @pytest.mark.asyncio
+async def test_admitted_bot_in_auto_response_channel_bypasses_mentions_mode(adapter):
+    adapter.config.extra.update(
+        {
+            "allow_bots": "mentions",
+            "allowed_bots": "B_BACKEND",
+            "bot_auto_response_channels": "C_BOTS",
+        }
+    )
+    event = {
+        "channel": "C_BOTS",
+        "channel_type": "channel",
+        "subtype": "bot_message",
+        "bot_id": "B_BACKEND",
+        "username": "backend-bot",
+        "text": "Investigate this alert",
+        "ts": "1700000000.000009",
+    }
+
+    await adapter._handle_slack_message(event)
+
+    message = adapter.handle_message.await_args.args[0]
+    assert message.source.user_id == "B_BACKEND"
+    assert message.source.is_bot is True
+
+
+@pytest.mark.asyncio
 async def test_admitted_bot_passes_early_auth_with_exact_id(adapter):
     seen = []
 

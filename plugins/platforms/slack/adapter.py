@@ -6135,9 +6135,19 @@ class SlackAdapter(BasePlatformAdapter):
             if allow_bots == "none":
                 return
             elif allow_bots == "mentions":
-                # Include Block-Kit-only mentions, not just the flat text (#52387)
+                # Include Block-Kit-only mentions, not just the flat text (#52387).
+                # An exact-allowlisted bot in a dedicated automation channel may
+                # intentionally trigger without a mention; the identity ACL below
+                # still runs before dispatch.
                 text_check = _slack_mention_detection_text(event)
-                if self._bot_user_id and f"<@{self._bot_user_id}>" not in text_check:
+                bot_auto_channel = str(event.get("channel") or "") in (
+                    self._slack_bot_auto_response_channels()
+                )
+                if (
+                    self._bot_user_id
+                    and f"<@{self._bot_user_id}>" not in text_check
+                    and not bot_auto_channel
+                ):
                     logger.debug(
                         "[Slack] Dropping bot message under allow_bots=mentions: "
                         "no <@%s> mention in flat text or blocks",
@@ -6472,7 +6482,11 @@ class SlackAdapter(BasePlatformAdapter):
                 allow_bots = self._slack_allow_bots()
                 if allow_bots == "none":
                     return
-                if allow_bots == "mentions" and not is_mentioned:
+                if (
+                    allow_bots == "mentions"
+                    and not is_mentioned
+                    and channel_id not in self._slack_bot_auto_response_channels()
+                ):
                     return
 
         if not is_one_to_one_dm and bot_uid:
