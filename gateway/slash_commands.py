@@ -5268,15 +5268,21 @@ class GatewaySlashCommandsMixin:
 
         if source.platform == Platform.MATRIX:
             target_origin = self._gateway_session_origin_for_id(target_id)
-            if not self._same_matrix_room(source, target_origin) and not allow_cross_room:
-                if target_origin is None:
-                    pass  # allow resume of completed sessions with no origin
-                else:
-                    return t(
-                        "gateway.resume.matrix_blocked_other_room",
-                        room=target_origin.chat_name or target_origin.chat_id,
-                        name=name,
-                    )
+            if target_origin is not None and not self._same_matrix_room(source, target_origin) and not allow_cross_room:
+                return t(
+                    "gateway.resume.matrix_blocked_other_room",
+                    room=target_origin.chat_name or target_origin.chat_id,
+                    name=name,
+                )
+            if target_origin is None and not allow_cross_room:
+                # Origin garbage-collected (completed session). Fall through
+                # to DB-level ownership check instead of blocking or blindly
+                # allowing — prevents IDOR while still permitting the caller
+                # to resume their own completed sessions.
+                if not await self._resume_target_allowed(
+                    source, target_id, allow_override=False
+                ):
+                    return t("gateway.resume.matrix_blocked_no_origin", name=name)
         elif not await self._resume_target_allowed(
             source, target_id, allow_override=(allow_all or allow_cross_room)
         ):
