@@ -571,6 +571,22 @@ class TestVerifySession:
         with pytest.raises(ProviderError, match="JWKS"):
             provider.verify_session(access_token=token)
 
+    def test_unparseable_foreign_token_returns_none_not_503(
+        self, provider, rsa_keypair
+    ):
+        """#97361 — an opaque token minted by another stacked provider (e.g.
+        the basic provider's HMAC blob left in the cookie jar) fails PyJWT's
+        header parse locally, before any JWKS fetch. The provider contract
+        says "not our token" → None (middleware: next provider / 401), not
+        ProviderError (middleware: 503 "IDP unreachable")."""
+        bad_client = MagicMock()
+        bad_client.get_signing_key_from_jwt.side_effect = jwt.DecodeError(
+            "Not enough segments"
+        )
+        provider._jwks_client = bad_client
+        foreign_cookie_value = "opaque-hmac-blob"
+        assert provider.verify_session(access_token=foreign_cookie_value) is None
+
     def test_jwks_client_sends_explicit_http_headers(self):
         provider = oidc_plugin.SelfHostedOIDCProvider(
             issuer=_ISSUER, client_id=_CLIENT_ID

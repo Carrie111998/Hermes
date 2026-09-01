@@ -617,6 +617,13 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
             signing_key = self._get_jwks_client().get_signing_key_from_jwt(
                 id_token
             )
+        except jwt.InvalidTokenError as exc:
+            # A token PyJWT cannot even parse (e.g. an opaque session blob
+            # minted by another stacked provider) fails locally, before any
+            # JWKS fetch — that is "not our token", not an unreachable IDP.
+            # The verify_session contract maps it to None (→ 401/next
+            # provider), never ProviderError (→ 503).
+            raise InvalidCodeError(f"token not parseable as a JWT: {exc}") from exc
         except jwt.PyJWKClientError as exc:
             raise ProviderError(f"JWKS lookup failed: {exc}") from exc
         except Exception as exc:  # pragma: no cover - defensive
