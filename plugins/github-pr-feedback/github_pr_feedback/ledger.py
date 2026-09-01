@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -13,6 +14,41 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .policy import FeedbackReceipt
+
+
+_SQLITE_BUSY_TIMEOUT_MS = 5_000
+_SQLITE_WAL_RETRY_DELAYS = (0.05, 0.1, 0.2, 0.4)
+
+
+def _enable_wal_with_bounded_retry(connection: sqlite3.Connection) -> None:
+    """Enable WAL without losing startup to a concurrent opener.
+
+    SQLite can report ``unable to open database file`` while another process
+    is changing the journal mode.  Install the busy timeout before the mode
+    change, retry only that bounded initialization step, and still fail closed
+    for a persistent or unrelated SQLite error.
+    """
+
+    connection.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+    delays = (0.0, *_SQLITE_WAL_RETRY_DELAYS)
+    last_error: sqlite3.OperationalError | None = None
+    for delay in delays:
+        if delay:
+            time.sleep(delay)
+        try:
+            mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()
+        except sqlite3.OperationalError as error:
+            if "unable to open database file" not in str(error).casefold():
+                raise
+            last_error = error
+            continue
+        if not mode or str(mode[0]).casefold() != "wal":
+            raise sqlite3.OperationalError(
+                f"SQLite WAL initialization returned {mode!r}"
+            )
+        return
+    assert last_error is not None
+    raise last_error
 
 try:  # Hermes supplies the profile-aware source of truth at runtime.
     from hermes_constants import get_hermes_home
@@ -79,9 +115,8 @@ class FeedbackLedger:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(self.path, isolation_level=None, timeout=5.0)
-        self._connection.execute("PRAGMA journal_mode=WAL")
+        _enable_wal_with_bounded_retry(self._connection)
         self._connection.execute("PRAGMA foreign_keys=ON")
-        self._connection.execute("PRAGMA busy_timeout=5000")
         self._connection.execute("PRAGMA wal_autocheckpoint=1000")
         self._connection.execute("""
             CREATE TABLE IF NOT EXISTS feedback_receipts (

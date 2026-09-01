@@ -1143,6 +1143,33 @@ def test_ledger_enables_bounded_busy_waits_and_wal_autocheckpoint(
     ledger.close()
 
 
+def test_ledger_retries_transient_wal_open_failure(monkeypatch) -> None:
+    import github_pr_feedback.ledger as ledger_module
+
+    class Cursor:
+        def fetchone(self):
+            return ("wal",)
+
+    class Connection:
+        def __init__(self):
+            self.wal_attempts = 0
+
+        def execute(self, sql):
+            if sql == "PRAGMA journal_mode=WAL":
+                self.wal_attempts += 1
+                if self.wal_attempts == 1:
+                    raise sqlite3.OperationalError("unable to open database file")
+                return Cursor()
+            return Cursor()
+
+    connection = Connection()
+    monkeypatch.setattr(ledger_module.time, "sleep", lambda _delay: None)
+
+    ledger_module._enable_wal_with_bounded_retry(connection)
+
+    assert connection.wal_attempts == 2
+
+
 def test_worktree_policy_allows_ten_seconds_for_local_git_probe(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
