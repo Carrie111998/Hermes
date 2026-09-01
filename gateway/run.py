@@ -27110,7 +27110,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # server's own /v1/chat/completions entry point instead of
             # dropping the event.
             raw_sid = str(evt.get("origin_session_id") or "").strip()
-            if not raw_sid:
+            if not raw_sid and evt.get("type") != "async_delegation":
+                # Async delegations capture their owning API session explicitly
+                # at dispatch.  Their session_key may be a legacy/stale gateway
+                # route and is not sufficient ownership evidence for a self-post.
+                # Generic process events predate that field and retain the raw-key
+                # compatibility fallback.
                 _sk = str(evt.get("session_key") or "").strip()
                 if _sk and _parse_session_key(_sk) is None:
                     raw_sid = _sk
@@ -27396,6 +27401,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 exc_info=True,
                             )
                     return False
+            if (
+                durable_claim_id
+                and not str(evt.get("origin_session_id") or "").strip()
+                and await asyncio.to_thread(self._build_process_event_source, evt) is None
+            ):
+                # A delegation without either its dispatch-captured API session
+                # or a structured gateway route can never acquire a delivery
+                # target.  Release would make restart recovery replay the same
+                # permanently unroutable row forever, so give the held durable
+                # claim the same honest terminal disposition as a gone parent.
+                logger.warning(
+                    "Async delegation %s has no verified wake target; "
+                    "terminally dropping delivery (result remains in the "
+                    "delegation records).",
+                    durable_delegation_id,
+                )
+                try:
+                    from tools.async_delegation import drop_completion_delivery
+
+                    drop_completion_delivery(
+                        durable_delegation_id, durable_claim_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not drop unroutable durable completion claim",
+                        exc_info=True,
+                    )
+                return None
         elif evt.get("type") == "completion":
             # Background-process completions carry only session_key (chat/
             # thread routing), so after /new the notification from the OLD
