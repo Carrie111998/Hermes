@@ -199,6 +199,46 @@ def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _get_heartbeat_route() -> Dict[str, str]:
+    """Read the heartbeat model/provider/reasoning_effort from config.
+
+    Returns a dict with keys ``model``, ``provider``, ``reasoning_effort``
+    (each may be empty string if not configured).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        hb = cfg.get("heartbeat", {}) or {}
+        return {
+            "model": str(hb.get("model", "") or ""),
+            "provider": str(hb.get("provider", "") or ""),
+            "reasoning_effort": str(hb.get("reasoning_effort", "") or ""),
+        }
+    except Exception:
+        return {"model": "", "provider": "", "reasoning_effort": ""}
+
+
+def has_heartbeat_route_config() -> bool:
+    """True when at least one heartbeat route field is configured."""
+    route = _get_heartbeat_route()
+    return bool(route["model"] or route["provider"] or route["reasoning_effort"])
+
+
+def format_heartbeat_route() -> str:
+    """Human-readable heartbeat route for /heartbeat status display."""
+    route = _get_heartbeat_route()
+    parts = []
+    if route["provider"]:
+        parts.append(f"provider={route['provider']}")
+    if route["model"]:
+        parts.append(f"model={route['model']}")
+    if route["reasoning_effort"]:
+        parts.append(f"reasoning={route['reasoning_effort']}")
+    if not parts:
+        return "inherited from session"
+    return ", ".join(parts)
+
+
 class HeartbeatManager:
     """Per-session heartbeat state + due-tick decisions.
 
@@ -228,13 +268,15 @@ class HeartbeatManager:
             return "No heartbeat. Set one with /heartbeat every <interval> <prompt>."
         every = format_interval(s.interval_seconds)
         fired = f", fired {s.fire_count}×" if s.fire_count else ""
+        route_str = format_heartbeat_route()
+        route_hint = f", route: {route_str}" if has_heartbeat_route_config() else ""
         if s.status == "active":
             anchor = s.last_fired_at or s.created_at
             next_in = max(0, int(anchor + s.interval_seconds - time.time()))
-            return f"♥ Heartbeat (every {every}, next in ~{next_in}s{fired}): {s.prompt}"
+            return f"♥ Heartbeat (every {every}, next in ~{next_in}s{fired}{route_hint}): {s.prompt}"
         if s.status == "paused":
-            return f"⏸ Heartbeat (paused, every {every}{fired}): {s.prompt}"
-        return f"Heartbeat ({s.status}, every {every}{fired}): {s.prompt}"
+            return f"⏸ Heartbeat (paused, every {every}{fired}{route_hint}): {s.prompt}"
+        return f"Heartbeat ({s.status}, every {every}{fired}{route_hint}): {s.prompt}"
 
     # --- mutation -----------------------------------------------------
 
@@ -329,6 +371,9 @@ __all__ = [
     "load_heartbeat",
     "save_heartbeat",
     "migrate_heartbeat_to_session",
+    "has_heartbeat_route_config",
+    "format_heartbeat_route",
+    "_get_heartbeat_route",
     "HEARTBEAT_PROMPT_TEMPLATE",
     "MIN_INTERVAL_SECONDS",
     "POLL_SECONDS",

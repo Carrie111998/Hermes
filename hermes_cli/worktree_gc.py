@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
+from hermes_constants import get_hermes_home
+
 logger = logging.getLogger(__name__)
 
 # Branches never considered for deletion, in any mode.
@@ -147,7 +149,7 @@ def _archive_untracked(tree: Path, untracked: List[str]) -> Optional[Path]:
     """
     stamp = time.strftime("%Y%m%d-%H%M%S")
     dest = (
-        Path.home() / ".hermes" / "archive" / "worktree-prune"
+        get_hermes_home() / "archive" / "worktree-prune"
         / f"{tree.name}-{stamp}"
     )
     try:
