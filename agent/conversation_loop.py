@@ -41,6 +41,10 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.runtime_override import (
+    apply_runtime_override,
+    consume_runtime_override,
+)
 from agent.message_metadata import append_message
 from agent.turn_context import (
     PreflightCompressionTimedOut,
@@ -2521,7 +2525,6 @@ def run_conversation(
         # every turn. ``apply_anthropic_cache_control`` may split its stable
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
-        _runtime_ov = getattr(agent, "_runtime_override", None) or {}
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
@@ -3099,6 +3102,10 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+        # Effective route of the final successful attempt; re-captured inside
+        # the override scope each iteration (see below) so the post-loop
+        # response normalization dispatches on the mode the wire actually used.
+        _attempt_api_mode = agent.api_mode
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -3123,6 +3130,7 @@ def run_conversation(
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
                         if agent._try_activate_fallback():
+                            consume_runtime_override(agent)
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -3161,37 +3169,44 @@ def run_conversation(
                 # echo-back pad for the *current* provider here (idempotent no-op
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
-                agent._reapply_reasoning_echo_for_provider(api_messages)
-                # Same story for prompt-cache decoration (#72626): try_activate_
-                # fallback refreshes the policy flags, but the decorated list
-                # still carries the primary's breakpoints (or none). Strip and
-                # re-render for the current provider before building kwargs.
-                api_messages, _moa_prepared_request, tools_for_api = (
-                    _redecorate_prompt_cache_for_provider(
-                        agent,
-                        api_messages,
-                        system_message=system_message,
-                        moa_prepared=_moa_prepared_request,
-                        tools_for_api=tools_for_api,
-                    )
-                )
-                # Two-scope design (intentional — do not consolidate into
-                # one turn-long scope): Scope 1 wraps kwargs building so
-                # model/provider/base_url flow into the wire client's
-                # kwargs.  Scope 2 (inside _perform_api_call) wraps each
-                # wire attempt as a redundant safety net.  Between the two
-                # scopes the agent identity is un-overridden — correct,
-                # non-call code sees the real identity.
-                from agent.runtime_override import (
-                    apply_runtime_override as _apply_runtime_override,
-                )
+                # ── One canonical route per attempt ────────────────
+                # The override scope wraps message shaping, kwargs
+                # building, preflight, llm_request middleware,
+                # pre_api_request, the wire dispatch, and response
+                # handling, so every stage observes the SAME effective
+                # route when a runtime_override is active.  Scope 2
+                # (inside _perform_api_call) remains as a wire-time
+                # safety net for deferred middleware execution.
                 _runtime_ov = getattr(agent, "_runtime_override", None) or {}
                 if _runtime_ov:
-                    _ro_cm = _apply_runtime_override(agent, _runtime_ov)
+                    _ro_cm = apply_runtime_override(agent, _runtime_ov)
                 else:
                     from contextlib import nullcontext as _nullcontext
                     _ro_cm = _nullcontext()
                 with _ro_cm:
+                    # The effective wire mode + transport for this attempt.
+                    # Captured under the override scope (when one is active)
+                    # and consulted by the post-loop response normalization
+                    # below, which runs after the scope has restored the agent
+                    # identity and the transport cache.  Reusing the captured
+                    # instance (not re-resolving) preserves per-instance state
+                    # (e.g. the chat_completions transport's alias map).
+                    _attempt_api_mode = agent.api_mode
+                    _attempt_transport = agent._get_transport()
+                    agent._reapply_reasoning_echo_for_provider(api_messages)
+                    # Same story for prompt-cache decoration (#72626): try_activate_
+                    # fallback refreshes the policy flags, but the decorated list
+                    # still carries the primary's breakpoints (or none). Strip and
+                    # re-render for the current provider before building kwargs.
+                    api_messages, _moa_prepared_request, tools_for_api = (
+                        _redecorate_prompt_cache_for_provider(
+                            agent,
+                            api_messages,
+                            system_message=system_message,
+                            moa_prepared=_moa_prepared_request,
+                            tools_for_api=tools_for_api,
+                        )
+                    )
                     if tools_for_api == agent.tools:
                         api_kwargs = agent._build_api_kwargs(api_messages)
                     else:
@@ -3199,518 +3214,442 @@ def run_conversation(
                             api_messages,
                             tools_for_api=tools_for_api,
                         )
-                # Outbound-request surrogate chokepoint (#50959): the messages
-                # were scrubbed above, but the rest of the request body —
-                # tool/function descriptions (session_search's ±-heavy text is
-                # the recorded repro), extra_body, system strings routed via
-                # kwargs — can still carry invalid code points that providers
-                # reject with a non-retryable HTTP 400 ("invalid unicode code
-                # point"). One in-place walk here guarantees the entire
-                # payload json.dumps()-safe regardless of which leaf produced
-                # the string. Fast no-op when the payload is clean.
-                _sanitize_structure_surrogates(api_kwargs)
-                if agent._force_ascii_payload:
-                    _sanitize_structure_non_ascii(api_kwargs)
-                if agent.api_mode == "codex_responses":
-                    api_kwargs = agent._get_transport().preflight_kwargs(
-                        api_kwargs,
-                        allow_stream=False,
-                        is_github_responses=agent._is_copilot_url(),
-                        sanitize_harmony_tokens=agent._is_codex_backend(),
-                    )
-                # OpenRouter response caching replays identical successful
-                # responses verbatim, including empty completions. An empty-
-                # response retry must reach the provider instead of replaying
-                # the response that triggered the retry.
-                if agent._empty_content_retries > 0 and agent._is_openrouter_url():
-                    _xh = dict(api_kwargs.get("extra_headers") or {})
-                    _xh["X-OpenRouter-Cache"] = "false"
-                    api_kwargs["extra_headers"] = _xh
-                # Copilot x-initiator: the first API call of a user turn is
-                # marked "user" so Copilot bills a premium request; tool-loop
-                # follow-ups keep the default "agent" header (#3040).
-                if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
-                    _xh = dict(api_kwargs.get("extra_headers") or {})
-                    _xh["x-initiator"] = "user"
-                    api_kwargs["extra_headers"] = _xh
-                    agent._is_user_initiated_turn = False
-                try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
-
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                    )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
-                except Exception:
-                    _original_api_kwargs = dict(api_kwargs)
-                    _llm_middleware_trace = []
-
-                try:
-                    from hermes_cli.lifecycle import (
-                        has_hook,
-                        invoke_hook as _invoke_hook,
-                    )
-                    if has_hook("pre_api_request"):
-                        request_messages = api_kwargs.get("messages")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_kwargs.get("input")
-                        if not isinstance(request_messages, list):
-                            request_messages = api_messages
-                        # Shallow-copy the outer list so plugins that retain the
-                        # reference for async snapshotting don't observe later
-                        # mutations of api_messages.  The inner dicts are not
-                        # mutated by the agent loop, so a shallow copy is
-                        # sufficient; a deepcopy would walk every tool result
-                        # and base64 image on every API call.
-                        #
-                        # The ``request_messages`` and ``conversation_history``
-                        # kwargs below are pre-existing raw passthroughs
-                        # consumed by the bundled langfuse plugin
-                        # (``plugins/observability/langfuse/__init__.py:_coerce_request_messages``).
-                        # They predate ``request`` and are intentionally NOT
-                        # sanitised — secrets are not expected here because
-                        # ``api_kwargs`` is the same object passed to the
-                        # provider client.  New consumers should read the
-                        # sanitised view from ``request["body"]["messages"]``.
-                        _request_payload = agent._api_request_payload_for_hook(api_kwargs)
-                        # Anthropic (``system``) and Responses/Codex
-                        # (``instructions``) move the system prompt out of
-                        # messages; pass it explicitly for observability
-                        # plugins (Langfuse).
-                        system_prompt_for_hooks = _system_prompt_for_hooks(
-                            api_kwargs, request_messages
+                    # Outbound-request surrogate chokepoint (#50959): the messages
+                    # were scrubbed above, but the rest of the request body —
+                    # tool/function descriptions (session_search's ±-heavy text is
+                    # the recorded repro), extra_body, system strings routed via
+                    # kwargs — can still carry invalid code points that providers
+                    # reject with a non-retryable HTTP 400 ("invalid unicode code
+                    # point"). One in-place walk here guarantees the entire
+                    # payload json.dumps()-safe regardless of which leaf produced
+                    # the string. Fast no-op when the payload is clean.
+                    _sanitize_structure_surrogates(api_kwargs)
+                    if agent._force_ascii_payload:
+                        _sanitize_structure_non_ascii(api_kwargs)
+                    if agent.api_mode == "codex_responses":
+                        api_kwargs = agent._get_transport().preflight_kwargs(
+                            api_kwargs,
+                            allow_stream=False,
+                            is_github_responses=agent._is_copilot_url(),
+                            sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
-                        _invoke_hook(
-                            "pre_api_request",
+                    # OpenRouter response caching replays identical successful
+                    # responses verbatim, including empty completions. An empty-
+                    # response retry must reach the provider instead of replaying
+                    # the response that triggered the retry.
+                    if agent._empty_content_retries > 0 and agent._is_openrouter_url():
+                        _xh = dict(api_kwargs.get("extra_headers") or {})
+                        _xh["X-OpenRouter-Cache"] = "false"
+                        api_kwargs["extra_headers"] = _xh
+                    # Copilot x-initiator: the first API call of a user turn is
+                    # marked "user" so Copilot bills a premium request; tool-loop
+                    # follow-ups keep the default "agent" header (#3040).
+                    if getattr(agent, "_is_user_initiated_turn", False) and agent._is_copilot_url():
+                        _xh = dict(api_kwargs.get("extra_headers") or {})
+                        _xh["x-initiator"] = "user"
+                        api_kwargs["extra_headers"] = _xh
+                        agent._is_user_initiated_turn = False
+                    try:
+                        from hermes_cli.middleware import apply_llm_request_middleware
+
+                        _llm_request_mw = apply_llm_request_middleware(
+                            api_kwargs,
                             task_id=effective_task_id,
                             turn_id=turn_id,
                             api_request_id=api_request_id,
                             session_id=agent.session_id or "",
-                            user_message=original_user_message,
-                            conversation_history=list(messages),
                             platform=agent.platform or "",
                             model=agent.model,
                             provider=agent.provider,
                             base_url=agent.base_url,
                             api_mode=agent.api_mode,
                             api_call_count=api_call_count,
-                            retry_count=retry_count,
-                            request_messages=list(request_messages)
-                            if isinstance(request_messages, list)
-                            else [],
-                            system_prompt=system_prompt_for_hooks,
-                            message_count=len(api_messages),
-                            tool_count=len(agent.tools or []),
-                            approx_input_tokens=approx_tokens,
-                            request_char_count=total_chars,
-                            max_tokens=agent.max_tokens,
-                            started_at=api_start_time,
-                            middleware_trace=list(_llm_middleware_trace),
-                            request=_request_payload,
                         )
-                except Exception:
-                    pass
+                        api_kwargs = _llm_request_mw.payload
+                        _original_api_kwargs = _llm_request_mw.original_payload
+                        _llm_middleware_trace = _llm_request_mw.trace
+                    except Exception:
+                        _original_api_kwargs = dict(api_kwargs)
+                        _llm_middleware_trace = []
 
-                if env_var_enabled("HERMES_DUMP_REQUESTS"):
-                    agent._dump_api_request_debug(api_kwargs, reason="preflight")
-
-                # This object is private to the in-process MoA facade.  Add it
-                # only after middleware, hooks, and debug dumps so none of them
-                # attempts to serialize it as part of the provider payload.
-                if _moa_prepared_request is not None and agent.provider == "moa":
-                    # Re-read the live client instead of trusting the one that
-                    # prepared the request above. Credential rotation, provider
-                    # fallback and dead-connection cleanup all rebuild
-                    # agent.client from _client_kwargs between attempts, and
-                    # pending_moa_prepared_request carries a prepared request
-                    # across exactly that boundary. The rebuilt client is a
-                    # native OpenAI client while provider stays "moa", so this
-                    # private key would reach the SDK as an unexpected keyword
-                    # — a non-retryable TypeError that kills every remaining
-                    # turn on the session.
-                    if _moa_client_consumes_prepared_request(agent.client):
-                        api_kwargs["_moa_prepared_request"] = _moa_prepared_request
-                    else:
-                        logger.warning(
-                            "MoA client replaced mid-turn (client=%s); sending the "
-                            "prepared prompt without the MoA handshake",
-                            type(agent.client).__name__,
+                    try:
+                        from hermes_cli.lifecycle import (
+                            has_hook,
+                            invoke_hook as _invoke_hook,
                         )
+                        if has_hook("pre_api_request"):
+                            request_messages = api_kwargs.get("messages")
+                            if not isinstance(request_messages, list):
+                                request_messages = api_kwargs.get("input")
+                            if not isinstance(request_messages, list):
+                                request_messages = api_messages
+                            # Shallow-copy the outer list so plugins that retain the
+                            # reference for async snapshotting don't observe later
+                            # mutations of api_messages.  The inner dicts are not
+                            # mutated by the agent loop, so a shallow copy is
+                            # sufficient; a deepcopy would walk every tool result
+                            # and base64 image on every API call.
+                            #
+                            # The ``request_messages`` and ``conversation_history``
+                            # kwargs below are pre-existing raw passthroughs
+                            # consumed by the bundled langfuse plugin
+                            # (``plugins/observability/langfuse/__init__.py:_coerce_request_messages``).
+                            # They predate ``request`` and are intentionally NOT
+                            # sanitised — secrets are not expected here because
+                            # ``api_kwargs`` is the same object passed to the
+                            # provider client.  New consumers should read the
+                            # sanitised view from ``request["body"]["messages"]``.
+                            _request_payload = agent._api_request_payload_for_hook(api_kwargs)
+                            # Anthropic (``system``) and Responses/Codex
+                            # (``instructions``) move the system prompt out of
+                            # messages; pass it explicitly for observability
+                            # plugins (Langfuse).
+                            system_prompt_for_hooks = _system_prompt_for_hooks(
+                                api_kwargs, request_messages
+                            )
+                            _invoke_hook(
+                                "pre_api_request",
+                                task_id=effective_task_id,
+                                turn_id=turn_id,
+                                api_request_id=api_request_id,
+                                session_id=agent.session_id or "",
+                                user_message=original_user_message,
+                                conversation_history=list(messages),
+                                platform=agent.platform or "",
+                                model=agent.model,
+                                provider=agent.provider,
+                                base_url=agent.base_url,
+                                api_mode=agent.api_mode,
+                                api_call_count=api_call_count,
+                                retry_count=retry_count,
+                                request_messages=list(request_messages)
+                                if isinstance(request_messages, list)
+                                else [],
+                                system_prompt=system_prompt_for_hooks,
+                                message_count=len(api_messages),
+                                tool_count=len(agent.tools or []),
+                                approx_input_tokens=approx_tokens,
+                                request_char_count=total_chars,
+                                max_tokens=agent.max_tokens,
+                                started_at=api_start_time,
+                                middleware_trace=list(_llm_middleware_trace),
+                                request=_request_payload,
+                            )
+                    except Exception:
+                        pass
 
-                # Always prefer the streaming path — even without stream
-                # consumers.  Streaming gives us fine-grained health
-                # checking (90s stale-stream detection, 60s read timeout)
-                # that the non-streaming path lacks.  Without this,
-                # subagents and other quiet-mode callers can hang
-                # indefinitely when the provider keeps the connection
-                # alive with SSE pings but never delivers a response.
-                # The streaming path is a no-op for callbacks when no
-                # consumers are registered, and falls back to non-
-                # streaming automatically if the provider doesn't
-                # support it.
-                def _stop_spinner():
-                    nonlocal thinking_spinner
-                    if thinking_spinner:
-                        thinking_spinner.stop("")
-                        thinking_spinner = None
-                    if agent.thinking_callback:
-                        agent.thinking_callback("")
+                    if env_var_enabled("HERMES_DUMP_REQUESTS"):
+                        agent._dump_api_request_debug(api_kwargs, reason="preflight")
 
-                _use_streaming = True
-                # Provider signaled "stream not supported" on a previous
-                # attempt — switch to non-streaming for the rest of this
-                # session instead of re-failing every retry.
-                if getattr(agent, "_disable_streaming", False):
-                    _use_streaming = False
-                # An ACP client communicates via subprocess stdio and returns a
-                # plain SimpleNamespace — not an iterable stream.  Keyed on the
-                # `acp://` scheme rather than one vendor, so any ACP client is
-                # excluded.  Mirror the ACP exclusion used for Responses API
-                # upgrade (lines ~1083-1085).
-                elif (
-                    agent.provider in {"copilot-acp"}
-                    or str(agent.base_url or "").lower().startswith("acp://")
-                    or str(agent.base_url or "").lower().startswith("acp+tcp://")
-                ):
-                    _use_streaming = False
-                # MoA streams only when a display/TTS consumer is present to
-                # receive the deltas. MoAChatCompletions.create() honors
-                # stream=True (runs the references, then returns the aggregator's
-                # raw token stream) and is reached here because, for provider
-                # "moa", _create_request_openai_client returns the MoA facade
-                # itself. Without consumers (quiet mode, subagents, health-check
-                # probes) we keep the complete-response path: the facade returns a
-                # whole response when stream is not requested, preserving the
-                # prior behavior for those callers.
-                elif agent.provider == "moa" and not agent._has_stream_consumers():
-                    _use_streaming = False
-                elif not agent._has_stream_consumers():
-                    # No display/TTS consumer. Still prefer streaming for
-                    # health checking, but skip for Mock clients in tests
-                    # (mocks return SimpleNamespace, not stream iterators).
-                    from unittest.mock import Mock
-                    if isinstance(getattr(agent, "client", None), Mock):
+                    # This object is private to the in-process MoA facade.  Add it
+                    # only after middleware, hooks, and debug dumps so none of them
+                    # attempts to serialize it as part of the provider payload.
+                    if _moa_prepared_request is not None and agent.provider == "moa":
+                        # Re-read the live client instead of trusting the one that
+                        # prepared the request above. Credential rotation, provider
+                        # fallback and dead-connection cleanup all rebuild
+                        # agent.client from _client_kwargs between attempts, and
+                        # pending_moa_prepared_request carries a prepared request
+                        # across exactly that boundary. The rebuilt client is a
+                        # native OpenAI client while provider stays "moa", so this
+                        # private key would reach the SDK as an unexpected keyword
+                        # — a non-retryable TypeError that kills every remaining
+                        # turn on the session.
+                        if _moa_client_consumes_prepared_request(agent.client):
+                            api_kwargs["_moa_prepared_request"] = _moa_prepared_request
+                        else:
+                            logger.warning(
+                                "MoA client replaced mid-turn (client=%s); sending the "
+                                "prepared prompt without the MoA handshake",
+                                type(agent.client).__name__,
+                            )
+
+                    # Always prefer the streaming path — even without stream
+                    # consumers.  Streaming gives us fine-grained health
+                    # checking (90s stale-stream detection, 60s read timeout)
+                    # that the non-streaming path lacks.  Without this,
+                    # subagents and other quiet-mode callers can hang
+                    # indefinitely when the provider keeps the connection
+                    # alive with SSE pings but never delivers a response.
+                    # The streaming path is a no-op for callbacks when no
+                    # consumers are registered, and falls back to non-
+                    # streaming automatically if the provider doesn't
+                    # support it.
+                    def _stop_spinner():
+                        nonlocal thinking_spinner
+                        if thinking_spinner:
+                            thinking_spinner.stop("")
+                            thinking_spinner = None
+                        if agent.thinking_callback:
+                            agent.thinking_callback("")
+
+                    _use_streaming = True
+                    # Provider signaled "stream not supported" on a previous
+                    # attempt — switch to non-streaming for the rest of this
+                    # session instead of re-failing every retry.
+                    if getattr(agent, "_disable_streaming", False):
                         _use_streaming = False
+                    # An ACP client communicates via subprocess stdio and returns a
+                    # plain SimpleNamespace — not an iterable stream.  Keyed on the
+                    # `acp://` scheme rather than one vendor, so any ACP client is
+                    # excluded.  Mirror the ACP exclusion used for Responses API
+                    # upgrade (lines ~1083-1085).
+                    elif (
+                        agent.provider in {"copilot-acp"}
+                        or str(agent.base_url or "").lower().startswith("acp://")
+                        or str(agent.base_url or "").lower().startswith("acp+tcp://")
+                    ):
+                        _use_streaming = False
+                    # MoA streams only when a display/TTS consumer is present to
+                    # receive the deltas. MoAChatCompletions.create() honors
+                    # stream=True (runs the references, then returns the aggregator's
+                    # raw token stream) and is reached here because, for provider
+                    # "moa", _create_request_openai_client returns the MoA facade
+                    # itself. Without consumers (quiet mode, subagents, health-check
+                    # probes) we keep the complete-response path: the facade returns a
+                    # whole response when stream is not requested, preserving the
+                    # prior behavior for those callers.
+                    elif agent.provider == "moa" and not agent._has_stream_consumers():
+                        _use_streaming = False
+                    elif not agent._has_stream_consumers():
+                        # No display/TTS consumer. Still prefer streaming for
+                        # health checking, but skip for Mock clients in tests
+                        # (mocks return SimpleNamespace, not stream iterators).
+                        from unittest.mock import Mock
+                        if isinstance(getattr(agent, "client", None), Mock):
+                            _use_streaming = False
 
-                def _perform_api_call(next_api_kwargs):
-                    from agent.runtime_override import (
-                        apply_runtime_override as _apply_runtime_override,
-                    )
-                    _runtime_ov = getattr(agent, "_runtime_override", None) or {}
-                    if _runtime_ov:
-                        with _apply_runtime_override(agent, _runtime_ov):
-                            return _perform_api_call_inner(next_api_kwargs)
-                    return _perform_api_call_inner(next_api_kwargs)
+                    def _perform_api_call(next_api_kwargs):
+                        _runtime_ov = getattr(agent, "_runtime_override", None) or {}
+                        if _runtime_ov:
+                            with apply_runtime_override(agent, _runtime_ov):
+                                return _perform_api_call_inner(next_api_kwargs)
+                        return _perform_api_call_inner(next_api_kwargs)
 
-                def _perform_api_call_inner(next_api_kwargs):
-                    if agent.api_mode == "codex_responses":
-                        next_api_kwargs = agent._get_transport().preflight_kwargs(
+                    def _perform_api_call_inner(next_api_kwargs):
+                        if agent.api_mode == "codex_responses":
+                            next_api_kwargs = agent._get_transport().preflight_kwargs(
+                                next_api_kwargs,
+                                allow_stream=False,
+                                is_github_responses=agent._is_copilot_url(),
+                                sanitize_harmony_tokens=agent._is_codex_backend(),
+                            )
+                        if _use_streaming:
+                            return agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        from agent import relay_llm
+
+                        return relay_llm.execute(
                             next_api_kwargs,
-                            allow_stream=False,
-                            is_github_responses=agent._is_copilot_url(),
-                            sanitize_harmony_tokens=agent._is_codex_backend(),
+                            agent._interruptible_api_call,
+                            session_id=str(agent.session_id or ""),
+                            name=str(agent.provider or "provider"),
+                            model_name=str(agent.model or ""),
+                            metadata={
+                                "api_mode": agent.api_mode,
+                                "api_request_id": api_request_id,
+                                "call_role": (
+                                    "delegated"
+                                    if getattr(agent, "is_subagent", False)
+                                    else "fallback"
+                                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                                    else "primary"
+                                ),
+                                "retry_count": retry_count,
+                            },
+                            defer_logical_completion=True,
                         )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    from agent import relay_llm
 
-                    return relay_llm.execute(
-                        next_api_kwargs,
-                        agent._interruptible_api_call,
-                        session_id=str(agent.session_id or ""),
-                        name=str(agent.provider or "provider"),
-                        model_name=str(agent.model or ""),
-                        metadata={
-                            "api_mode": agent.api_mode,
-                            "api_request_id": api_request_id,
-                            "call_role": (
-                                "delegated"
-                                if getattr(agent, "is_subagent", False)
-                                else "fallback"
-                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                                else "primary"
-                            ),
-                            "retry_count": retry_count,
-                        },
-                        defer_logical_completion=True,
-                    )
+                    from hermes_cli.middleware import run_llm_execution_middleware
 
-                from hermes_cli.middleware import run_llm_execution_middleware
-
-                _model_request_active = getattr(agent, "_model_request_active", None)
-                _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
-                if _redirect_lock is not None:
-                    with _redirect_lock:
-                        if _model_request_active is not None:
-                            _model_request_active.set()
-                elif _model_request_active is not None:
-                    _model_request_active.set()
-                _redirect_crossed_response = False
-                try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
-                finally:
+                    _model_request_active = getattr(agent, "_model_request_active", None)
+                    _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                     if _redirect_lock is not None:
                         with _redirect_lock:
                             if _model_request_active is not None:
+                                _model_request_active.set()
+                    elif _model_request_active is not None:
+                        _model_request_active.set()
+                    _redirect_crossed_response = False
+                    try:
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
+                    finally:
+                        if _redirect_lock is not None:
+                            with _redirect_lock:
+                                if _model_request_active is not None:
+                                    _model_request_active.clear()
+                                _redirect_crossed_response = bool(
+                                    agent._pending_redirect
+                                )
+                        else:
+                            if _model_request_active is not None:
                                 _model_request_active.clear()
-                            _redirect_crossed_response = bool(
-                                agent._pending_redirect
-                            )
-                    else:
-                        if _model_request_active is not None:
-                            _model_request_active.clear()
-                        _redirect_crossed_response = agent._has_pending_redirect()
-                if _redirect_crossed_response:
-                    # The response and redirect can cross on different threads:
-                    # redirect() observed the request as active just before this
-                    # call returned. Discard that now-stale response and rebuild
-                    # from the correction rather than silently losing it.
+                            _redirect_crossed_response = agent._has_pending_redirect()
+                    if _redirect_crossed_response:
+                        # The response and redirect can cross on different threads:
+                        # redirect() observed the request as active just before this
+                        # call returned. Discard that now-stale response and rebuild
+                        # from the correction rather than silently losing it.
+                        if thinking_spinner:
+                            thinking_spinner.stop("")
+                            thinking_spinner = None
+                        if agent.thinking_callback:
+                            agent.thinking_callback("")
+                        if agent.clear_interrupt(preserve_redirect=True):
+                            _retry.restart_with_redirected_messages = True
+                        else:
+                            interrupted = True
+                        break
+                
+                    api_duration = time.time() - api_start_time
+                
+                    # Stop thinking spinner silently -- the response box or tool
+                    # execution messages that follow are more informative.
                     if thinking_spinner:
                         thinking_spinner.stop("")
                         thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
-                    if agent.clear_interrupt(preserve_redirect=True):
-                        _retry.restart_with_redirected_messages = True
-                    else:
-                        interrupted = True
-                    break
                 
-                api_duration = time.time() - api_start_time
+                    if not agent.quiet_mode:
+                        agent._vprint(f"{agent.log_prefix}⏱️  API call completed in {api_duration:.2f}s")
                 
-                # Stop thinking spinner silently -- the response box or tool
-                # execution messages that follow are more informative.
-                if thinking_spinner:
-                    thinking_spinner.stop("")
-                    thinking_spinner = None
-                if agent.thinking_callback:
-                    agent.thinking_callback("")
+                    if agent.verbose_logging:
+                        # Log response with provider info if available
+                        resp_model = getattr(response, 'model', 'N/A') if response else 'N/A'
+                        logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
                 
-                if not agent.quiet_mode:
-                    agent._vprint(f"{agent.log_prefix}⏱️  API call completed in {api_duration:.2f}s")
-                
-                if agent.verbose_logging:
-                    # Log response with provider info if available
-                    resp_model = getattr(response, 'model', 'N/A') if response else 'N/A'
-                    logging.debug(f"API Response received - Model: {resp_model}, Usage: {response.usage if hasattr(response, 'usage') else 'N/A'}")
-                
-                # Validate response shape before proceeding
-                response_invalid = False
-                error_details = []
-                if agent.api_mode == "codex_responses":
-                    _ct_v = agent._get_transport()
-                    if not _ct_v.validate_response(response):
-                        if response is None:
-                            response_invalid = True
-                            error_details.append("response is None")
-                        else:
-                            # Provider returned a terminal failure (e.g. quota exhaustion).
-                            # Treat as invalid so the fallback chain is triggered instead of
-                            # letting the error bubble up outside the retry/fallback loop.
-                            _codex_resp_status = str(getattr(response, "status", "") or "").strip().lower()
-                            if _codex_resp_status in {"failed", "cancelled"}:
-                                _codex_error_obj = getattr(response, "error", None)
-                                _codex_error_msg = (
-                                    _codex_error_obj.get("message") if isinstance(_codex_error_obj, dict)
-                                    else str(_codex_error_obj) if _codex_error_obj
-                                    else f"Responses API returned status '{_codex_resp_status}'"
-                                )
-                                logger.warning(
-                                    "Codex response status='%s' (error=%s). Routing to fallback. %s",
-                                    _codex_resp_status, _codex_error_msg,
-                                    agent._client_log_context(),
-                                )
+                    # Validate response shape before proceeding
+                    response_invalid = False
+                    error_details = []
+                    if agent.api_mode == "codex_responses":
+                        _ct_v = agent._get_transport()
+                        if not _ct_v.validate_response(response):
+                            if response is None:
                                 response_invalid = True
-                                error_details.append(f"response.status={_codex_resp_status}: {_codex_error_msg}")
+                                error_details.append("response is None")
                             else:
-                                # output_text fallback: stream backfill may have failed
-                                # but normalize can still recover from output_text
-                                _out_text = getattr(response, "output_text", None)
-                                _out_text_stripped = _out_text.strip() if isinstance(_out_text, str) else ""
-                                if _out_text_stripped:
-                                    logger.debug(
-                                        "Codex response.output is empty but output_text is present "
-                                        "(%d chars); deferring to normalization.",
-                                        len(_out_text_stripped),
+                                # Provider returned a terminal failure (e.g. quota exhaustion).
+                                # Treat as invalid so the fallback chain is triggered instead of
+                                # letting the error bubble up outside the retry/fallback loop.
+                                _codex_resp_status = str(getattr(response, "status", "") or "").strip().lower()
+                                if _codex_resp_status in {"failed", "cancelled"}:
+                                    _codex_error_obj = getattr(response, "error", None)
+                                    _codex_error_msg = (
+                                        _codex_error_obj.get("message") if isinstance(_codex_error_obj, dict)
+                                        else str(_codex_error_obj) if _codex_error_obj
+                                        else f"Responses API returned status '{_codex_resp_status}'"
                                     )
-                                else:
-                                    _resp_status = getattr(response, "status", None)
-                                    _resp_incomplete = getattr(response, "incomplete_details", None)
                                     logger.warning(
-                                        "Codex response.output is empty after stream backfill "
-                                        "(status=%s, incomplete_details=%s, model=%s). %s",
-                                        _resp_status, _resp_incomplete,
-                                        getattr(response, "model", None),
-                                        f"api_mode={agent.api_mode} provider={agent.provider}",
+                                        "Codex response status='%s' (error=%s). Routing to fallback. %s",
+                                        _codex_resp_status, _codex_error_msg,
+                                        agent._client_log_context(),
                                     )
                                     response_invalid = True
-                                    error_details.append("response.output is empty")
-                elif agent.api_mode == "anthropic_messages":
-                    _tv = agent._get_transport()
-                    if not _tv.validate_response(response):
-                        response_invalid = True
-                        if response is None:
-                            error_details.append("response is None")
-                        else:
-                            error_details.append("response.content invalid (not a non-empty list)")
-                elif agent.api_mode == "bedrock_converse":
-                    _btv = agent._get_transport()
-                    if not _btv.validate_response(response):
-                        response_invalid = True
-                        if response is None:
-                            error_details.append("response is None")
-                        else:
-                            error_details.append("Bedrock response invalid (no output or choices)")
-                else:
-                    _ctv = agent._get_transport()
-                    if not _ctv.validate_response(response):
-                        response_invalid = True
-                        if response is None:
-                            error_details.append("response is None")
-                        elif not hasattr(response, 'choices'):
-                            error_details.append("response has no 'choices' attribute")
-                        elif response.choices is None:
-                            error_details.append("response.choices is None")
-                        else:
-                            error_details.append("response.choices is empty")
-
-                if response_invalid:
-                    agent._invoke_api_request_error_hook(
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        api_call_count=api_call_count,
-                        api_start_time=api_start_time,
-                        api_kwargs=api_kwargs,
-                        error_type="InvalidAPIResponse",
-                        error_message=", ".join(error_details) or "Invalid API response",
-                        status_code=getattr(getattr(response, "error", None), "code", None),
-                        retry_count=retry_count,
-                        max_retries=max_retries,
-                        retryable=True,
-                        reason="invalid_response",
-                    )
-                    # Stop spinner silently — retry status is now buffered
-                    # and only surfaced if every retry+fallback exhausts.
-                    if thinking_spinner:
-                        thinking_spinner.stop("")
-                        thinking_spinner = None
-                    if agent.thinking_callback:
-                        agent.thinking_callback("")
-                    
-                    # Invalid response — could be rate limiting, provider timeout,
-                    # upstream server error, or malformed response.
-                    retry_count += 1
-                    
-                    # Eager fallback: empty/malformed responses are a common
-                    # rate-limit symptom.  Switch to fallback immediately
-                    # rather than retrying with extended backoff.
-                    if agent._fallback_index < len(agent._fallback_chain):
-                        agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
-                        break
-
-                    # Check for error field in response (some providers include this)
-                    error_msg = "Unknown"
-                    provider_name = "Unknown"
-                    if response and hasattr(response, 'error') and response.error:
-                        error_msg = str(response.error)
-                        # Try to extract provider from error metadata
-                        if hasattr(response.error, 'metadata') and response.error.metadata:
-                            provider_name = response.error.metadata.get('provider_name', 'Unknown')
-                    elif response and hasattr(response, 'message') and response.message:
-                        error_msg = str(response.message)
-                    
-                    # Try to get provider from model field (OpenRouter often returns actual model used)
-                    if provider_name == "Unknown" and response and hasattr(response, 'model') and response.model:
-                        provider_name = f"model={response.model}"
-                    
-                    # Check for x-openrouter-provider or similar metadata
-                    if provider_name == "Unknown" and response:
-                        # Log all response attributes for debugging
-                        resp_attrs = {k: str(v)[:100] for k, v in vars(response).items() if not k.startswith('_')}
-                        if agent.verbose_logging:
-                            logging.debug(f"Response attributes for invalid response: {resp_attrs}")
-                    
-                    # Extract error code from response for contextual diagnostics
-                    _resp_error_code = None
-                    if response and hasattr(response, 'error') and response.error:
-                        _code_raw = getattr(response.error, 'code', None)
-                        if _code_raw is None and isinstance(response.error, dict):
-                            _code_raw = response.error.get('code')
-                        if _code_raw is not None:
-                            try:
-                                _resp_error_code = int(_code_raw)
-                            except (TypeError, ValueError):
-                                pass
-
-                    # Build a human-readable failure hint from the error code
-                    # and response time, instead of always assuming rate limiting.
-                    if _resp_error_code == 524:
-                        _failure_hint = f"upstream provider timed out (Cloudflare 524, {api_duration:.0f}s)"
-                    elif _resp_error_code == 504:
-                        _failure_hint = f"upstream gateway timeout (504, {api_duration:.0f}s)"
-                    elif _resp_error_code == 429:
-                        _failure_hint = "rate limited by upstream provider (429)"
-                    elif _resp_error_code in {500, 502}:
-                        _failure_hint = f"upstream server error ({_resp_error_code}, {api_duration:.0f}s)"
-                    elif _resp_error_code in {503, 529}:
-                        _failure_hint = f"upstream provider overloaded ({_resp_error_code})"
-                    elif _resp_error_code is not None:
-                        _failure_hint = f"upstream error (code {_resp_error_code}, {api_duration:.0f}s)"
-                    elif api_duration < 10:
-                        _failure_hint = f"fast response ({api_duration:.1f}s) — likely rate limited"
-                    elif api_duration > 60:
-                        _failure_hint = f"slow response ({api_duration:.0f}s) — likely upstream timeout"
+                                    error_details.append(f"response.status={_codex_resp_status}: {_codex_error_msg}")
+                                else:
+                                    # output_text fallback: stream backfill may have failed
+                                    # but normalize can still recover from output_text
+                                    _out_text = getattr(response, "output_text", None)
+                                    _out_text_stripped = _out_text.strip() if isinstance(_out_text, str) else ""
+                                    if _out_text_stripped:
+                                        logger.debug(
+                                            "Codex response.output is empty but output_text is present "
+                                            "(%d chars); deferring to normalization.",
+                                            len(_out_text_stripped),
+                                        )
+                                    else:
+                                        _resp_status = getattr(response, "status", None)
+                                        _resp_incomplete = getattr(response, "incomplete_details", None)
+                                        logger.warning(
+                                            "Codex response.output is empty after stream backfill "
+                                            "(status=%s, incomplete_details=%s, model=%s). %s",
+                                            _resp_status, _resp_incomplete,
+                                            getattr(response, "model", None),
+                                            f"api_mode={agent.api_mode} provider={agent.provider}",
+                                        )
+                                        response_invalid = True
+                                        error_details.append("response.output is empty")
+                    elif agent.api_mode == "anthropic_messages":
+                        _tv = agent._get_transport()
+                        if not _tv.validate_response(response):
+                            response_invalid = True
+                            if response is None:
+                                error_details.append("response is None")
+                            else:
+                                error_details.append("response.content invalid (not a non-empty list)")
+                    elif agent.api_mode == "bedrock_converse":
+                        _btv = agent._get_transport()
+                        if not _btv.validate_response(response):
+                            response_invalid = True
+                            if response is None:
+                                error_details.append("response is None")
+                            else:
+                                error_details.append("Bedrock response invalid (no output or choices)")
                     else:
-                        _failure_hint = f"response time {api_duration:.1f}s"
+                        _ctv = agent._get_transport()
+                        if not _ctv.validate_response(response):
+                            response_invalid = True
+                            if response is None:
+                                error_details.append("response is None")
+                            elif not hasattr(response, 'choices'):
+                                error_details.append("response has no 'choices' attribute")
+                            elif response.choices is None:
+                                error_details.append("response.choices is None")
+                            else:
+                                error_details.append("response.choices is empty")
 
-                    agent._buffer_vprint(f"⚠️  Invalid API response (attempt {retry_count}/{max_retries}): {', '.join(error_details)}")
-                    agent._buffer_vprint(f"   🏢 Provider: {provider_name}")
-                    cleaned_provider_error = agent._clean_error_message(error_msg)
-                    agent._buffer_vprint(f"   📝 Provider message: {cleaned_provider_error}")
-                    agent._buffer_vprint(f"   ⏱️  {_failure_hint}")
+                    if response_invalid:
+                        agent._invoke_api_request_error_hook(
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            api_call_count=api_call_count,
+                            api_start_time=api_start_time,
+                            api_kwargs=api_kwargs,
+                            error_type="InvalidAPIResponse",
+                            error_message=", ".join(error_details) or "Invalid API response",
+                            status_code=getattr(getattr(response, "error", None), "code", None),
+                            retry_count=retry_count,
+                            max_retries=max_retries,
+                            retryable=True,
+                            reason="invalid_response",
+                        )
+                        # Stop spinner silently — retry status is now buffered
+                        # and only surfaced if every retry+fallback exhausts.
+                        if thinking_spinner:
+                            thinking_spinner.stop("")
+                            thinking_spinner = None
+                        if agent.thinking_callback:
+                            agent.thinking_callback("")
                     
-                    if retry_count >= max_retries:
-                        # Try fallback before giving up
-                        if agent._has_pending_fallback():
-                            agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
+                        # Invalid response — could be rate limiting, provider timeout,
+                        # upstream server error, or malformed response.
+                        retry_count += 1
+                    
+                        # Eager fallback: empty/malformed responses are a common
+                        # rate-limit symptom.  Switch to fallback immediately
+                        # rather than retrying with extended backoff.
+                        if agent._fallback_index < len(agent._fallback_chain):
+                            agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
                         if agent._try_activate_fallback():
+                            consume_runtime_override(agent)
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -3718,637 +3657,714 @@ def run_conversation(
                             _retry.primary_recovery_attempted = False
                             _retry.restart_with_rebuilt_messages = True
                             break
-                        # Terminal — flush buffered retry trace so user sees what happened.
-                        agent._flush_status_buffer()
-                        agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
-                        logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
-                        agent._persist_session(messages, conversation_history)
-                        _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
-                        return {
-                            "final_response": _final_response,
-                            "messages": messages,
-                            "completed": False,
-                            "api_calls": api_call_count,
-                            "error": _final_response,
-                            "failed": True  # Mark as failure for filtering
-                        }
+
+                        # Check for error field in response (some providers include this)
+                        error_msg = "Unknown"
+                        provider_name = "Unknown"
+                        if response and hasattr(response, 'error') and response.error:
+                            error_msg = str(response.error)
+                            # Try to extract provider from error metadata
+                            if hasattr(response.error, 'metadata') and response.error.metadata:
+                                provider_name = response.error.metadata.get('provider_name', 'Unknown')
+                        elif response and hasattr(response, 'message') and response.message:
+                            error_msg = str(response.message)
                     
-                    # Backoff before retry — jittered exponential: 5s base, 120s cap
-                    wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
-                    agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
-                    logger.warning("Invalid API response (retry %d/%d): %s | Provider: %s", retry_count, max_retries, ', '.join(error_details), provider_name)
+                        # Try to get provider from model field (OpenRouter often returns actual model used)
+                        if provider_name == "Unknown" and response and hasattr(response, 'model') and response.model:
+                            provider_name = f"model={response.model}"
                     
-                    # Sleep in small increments to stay responsive to interrupts
-                    sleep_end = time.time() + wait_time
-                    _backoff_touch_counter = 0
-                    while time.time() < sleep_end:
-                        if agent._interrupt_requested:
-                            # A redirect uses the interrupt machinery to cancel
-                            # only the live request. Aborting the retry here
-                            # with clear_interrupt() would DESTROY the pending
-                            # correction and kill the turn with "Operation
-                            # interrupted" — the exact mid-stream steer loss
-                            # users hit when a redirect lands during provider
-                            # backoff. Rebuild from the correction instead,
-                            # mirroring the InterruptedError handler.
-                            if agent.clear_interrupt(preserve_redirect=True):
-                                _retry.restart_with_redirected_messages = True
-                                break
-                            agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
-                            _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
-                            close_interrupted_tool_sequence(messages, _interrupt_text)
-                            agent._persist_session(messages, conversation_history)
-                            agent.clear_interrupt()
-                            return {
-                                "final_response": _interrupt_text,
-                                "messages": messages,
-                                "api_calls": api_call_count,
-                                "completed": False,
-                                "interrupted": True,
-                            }
-                        time.sleep(0.2)
-                        # Touch activity every ~30s so the gateway's inactivity
-                        # monitor knows we're alive during backoff waits.
-                        _backoff_touch_counter += 1
-                        if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
-                            agent._touch_activity(
-                                f"retry backoff ({retry_count}/{max_retries}), "
-                                f"{int(sleep_end - time.time())}s remaining"
-                            )
-                    if _retry.restart_with_redirected_messages:
-                        break  # rebuild this iteration from the correction
-                    continue  # Retry the API call
+                        # Check for x-openrouter-provider or similar metadata
+                        if provider_name == "Unknown" and response:
+                            # Log all response attributes for debugging
+                            resp_attrs = {k: str(v)[:100] for k, v in vars(response).items() if not k.startswith('_')}
+                            if agent.verbose_logging:
+                                logging.debug(f"Response attributes for invalid response: {resp_attrs}")
+                    
+                        # Extract error code from response for contextual diagnostics
+                        _resp_error_code = None
+                        if response and hasattr(response, 'error') and response.error:
+                            _code_raw = getattr(response.error, 'code', None)
+                            if _code_raw is None and isinstance(response.error, dict):
+                                _code_raw = response.error.get('code')
+                            if _code_raw is not None:
+                                try:
+                                    _resp_error_code = int(_code_raw)
+                                except (TypeError, ValueError):
+                                    pass
 
-                agent._turn_received_provider_response = True
+                        # Build a human-readable failure hint from the error code
+                        # and response time, instead of always assuming rate limiting.
+                        if _resp_error_code == 524:
+                            _failure_hint = f"upstream provider timed out (Cloudflare 524, {api_duration:.0f}s)"
+                        elif _resp_error_code == 504:
+                            _failure_hint = f"upstream gateway timeout (504, {api_duration:.0f}s)"
+                        elif _resp_error_code == 429:
+                            _failure_hint = "rate limited by upstream provider (429)"
+                        elif _resp_error_code in {500, 502}:
+                            _failure_hint = f"upstream server error ({_resp_error_code}, {api_duration:.0f}s)"
+                        elif _resp_error_code in {503, 529}:
+                            _failure_hint = f"upstream provider overloaded ({_resp_error_code})"
+                        elif _resp_error_code is not None:
+                            _failure_hint = f"upstream error (code {_resp_error_code}, {api_duration:.0f}s)"
+                        elif api_duration < 10:
+                            _failure_hint = f"fast response ({api_duration:.1f}s) — likely rate limited"
+                        elif api_duration > 60:
+                            _failure_hint = f"slow response ({api_duration:.0f}s) — likely upstream timeout"
+                        else:
+                            _failure_hint = f"response time {api_duration:.1f}s"
 
-                # Check finish_reason before proceeding
-                if agent.api_mode == "codex_responses":
-                    status = getattr(response, "status", None)
-                    if isinstance(status, str):
-                        status = status.strip().lower()
-                    incomplete_details = getattr(response, "incomplete_details", None)
-                    incomplete_reason = None
-                    if isinstance(incomplete_details, dict):
-                        incomplete_reason = incomplete_details.get("reason")
-                    else:
-                        incomplete_reason = getattr(incomplete_details, "reason", None)
-                    if incomplete_reason is not None:
-                        incomplete_reason = str(incomplete_reason).strip().lower()
-                    if status == "incomplete" and incomplete_reason in {"max_output_tokens", "length"}:
-                        # Responses API max-output exhaustion is a normal
-                        # Codex incomplete turn.  Let the Codex-specific
-                        # continuation path below append the incomplete
-                        # assistant state and retry, instead of routing to
-                        # the generic chat-completions length rollback that
-                        # emits "Response truncated due to output length
-                        # limit" and stops gateway turns.
-                        finish_reason = "incomplete"
-                    elif status == "incomplete" and incomplete_reason == "content_filter":
-                        finish_reason = "content_filter"
-                    else:
-                        finish_reason = "stop"
-                elif agent.api_mode == "anthropic_messages":
-                    _tfr = agent._get_transport()
-                    finish_reason = _tfr.map_finish_reason(response.stop_reason)
-                elif agent.api_mode == "bedrock_converse":
-                    # Bedrock response already normalized at dispatch — use transport
-                    _bt_fr = agent._get_transport()
-                    _bedrock_result = _bt_fr.normalize_response(response)
-                    finish_reason = _bedrock_result.finish_reason
-                else:
-                    _cc_fr = agent._get_transport()
-                    _finish_result = _cc_fr.normalize_response(response)
-                    finish_reason = _finish_result.finish_reason
-                    assistant_message = _finish_result
-                    if agent._should_treat_stop_as_truncated(
-                        finish_reason,
-                        assistant_message,
-                        messages,
-                    ):
-                        agent._vprint(
-                            f"{agent.log_prefix}⚠️  Treating suspicious Ollama/GLM stop response as truncated",
-                            force=True,
-                        )
-                        finish_reason = "length"
-
-                # ── Content-policy refusal (HTTP 200) ──────────────────
-                # The model — or the provider's safety system — returned a
-                # *successful* response whose stop/finish reason is a refusal:
-                # Anthropic ``stop_reason="refusal"`` → ``content_filter``;
-                # OpenAI / portal ``finish_reason="content_filter"`` or a
-                # populated ``message.refusal`` (mapped in the chat_completions
-                # transport); Bedrock ``guardrail_intervened``. The content is
-                # typically empty, so without this branch the response falls
-                # through to the empty-response / invalid-response retry loops
-                # and is mis-surfaced as "rate limited" / "no content after
-                # retries" — burning paid attempts reproducing a deterministic
-                # refusal. Surface it clearly and stop. Mirrors the
-                # exception-based ``content_policy_blocked`` recovery: try a
-                # configured fallback once, otherwise return the refusal.
-                if finish_reason == "content_filter":
-                    _refusal_transport = agent._get_transport()
-                    if agent.api_mode == "anthropic_messages":
-                        _refusal_result = _refusal_transport.normalize_response(
-                            response, strip_tool_prefix=agent._is_anthropic_oauth
-                        )
-                    else:
-                        _refusal_result = _refusal_transport.normalize_response(response)
-                    _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
-                    # Some refusals carry the explanation only in the reasoning
-                    # channel; fall back to it so the user sees *something*.
-                    if not _refusal_text:
-                        _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
-
-                    agent._invoke_api_request_error_hook(
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        api_call_count=api_call_count,
-                        api_start_time=api_start_time,
-                        api_kwargs=api_kwargs,
-                        error_type="ContentPolicyBlocked",
-                        error_message=_refusal_text or "model declined to respond (content_filter)",
-                        status_code=None,
-                        retry_count=retry_count,
-                        max_retries=max_retries,
-                        retryable=False,
-                        reason=FailoverReason.content_policy_blocked.value,
-                    )
-
-                    if thinking_spinner:
-                        thinking_spinner.stop("")
-                        thinking_spinner = None
-                    if agent.thinking_callback:
-                        agent.thinking_callback("")
-
-                    # Deterministic for the unchanged prompt — never retry.
-                    # Try a configured fallback once (a different model may not
-                    # refuse); otherwise surface the refusal terminally.
-                    if agent._has_pending_fallback():
-                        agent._buffer_status(
-                            "⚠️ Model declined to respond (safety refusal) — trying fallback..."
-                        )
-                    if agent._try_activate_fallback():
-                        active_system_prompt = _sync_failover_system_message(
-                            agent, api_messages, active_system_prompt)
-                        retry_count = 0
-                        compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
-                        _retry.restart_with_rebuilt_messages = True
-                        break
-
-                    agent._flush_status_buffer()
-                    _refusal_log = (
-                        _refusal_text[:500] + "..."
-                        if len(_refusal_text) > 500
-                        else _refusal_text
-                    )
-                    logger.warning(
-                        "%sModel declined to respond (finish_reason=content_filter). "
-                        "model=%s provider=%s refusal=%s",
-                        agent.log_prefix, agent.model, agent.provider,
-                        _refusal_log or "(no text)",
-                    )
-                    agent._emit_status(
-                        "⚠️ The model declined to respond to this request (safety refusal)."
-                    )
-
-                    _refusal_detail = (
-                        f"Model's explanation: {_refusal_text}"
-                        if _refusal_text
-                        else "The model returned no explanation."
-                    )
-                    _refusal_response = (
-                        "⚠️  The model declined to respond to this request "
-                        "(safety refusal — not a Hermes/gateway failure).\n\n"
-                        f"{_refusal_detail}\n\n"
-                        f"{_CONTENT_POLICY_RECOVERY_HINT}"
-                    )
-
-                    agent._cleanup_task_resources(effective_task_id)
-                    agent._persist_session(messages, conversation_history)
-                    return _content_policy_blocked_result(
-                        messages,
-                        api_call_count,
-                        final_response=_refusal_response,
-                        error_detail=_refusal_text or "model declined (content_filter)",
-                    )
-
-                if finish_reason == "length":
-                    if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
-                        agent._vprint(
-                            f"{agent.log_prefix}⚠️  Response truncated — stream "
-                            f"ended before completion",
-                            force=True,
-                        )
-                    else:
-                        agent._vprint(
-                            f"{agent.log_prefix}⚠️  Response truncated "
-                            f"(finish_reason='length') - model hit max output tokens",
-                            force=True,
-                        )
-
-                    # Normalize the truncated response to a single OpenAI-style
-                    # message shape so text-continuation and tool-call retry
-                    # work uniformly across chat_completions, bedrock_converse,
-                    # and anthropic_messages.  For Anthropic we use the same
-                    # adapter the agent loop already relies on so the rebuilt
-                    # interim assistant message is byte-identical to what
-                    # would have been appended in the non-truncated path.
-                    _trunc_msg = None
-                    _trunc_transport = agent._get_transport()
-                    if agent.api_mode == "anthropic_messages":
-                        _trunc_result = _trunc_transport.normalize_response(
-                            response, strip_tool_prefix=agent._is_anthropic_oauth
-                        )
-                    else:
-                        _trunc_result = _trunc_transport.normalize_response(response)
-                    _trunc_msg = _trunc_result
-
-                    _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
-                    _trunc_has_tool_calls = bool(getattr(_trunc_msg, "tool_calls", None)) if _trunc_msg else False
-
-                    # ── Detect thinking-budget exhaustion ──────────────
-                    # When the model spends ALL output tokens on reasoning
-                    # and has none left for the response, continuation
-                    # retries are pointless.  Detect this early and give a
-                    # targeted error instead of wasting 3 API calls.
-                    # A response is "thinking exhausted" only when the model
-                    # actually produced reasoning blocks but no visible text after
-                    # them.  Models that do not use <think> tags (e.g. GLM-4.7 on
-                    # NVIDIA Build, minimax) may return content=None or an empty
-                    # string for unrelated reasons — treat those as normal
-                    # truncations that deserve continuation retries, not as
-                    # thinking-budget exhaustion.
-                    _has_think_tags = bool(
-                        _trunc_content and re.search(
-                            r'<(?:think|thinking|reasoning|REASONING_SCRATCHPAD)[^>]*>',
-                            _trunc_content,
-                            re.IGNORECASE,
-                        )
-                    )
-                    _thinking_exhausted = (
-                        not _trunc_has_tool_calls
-                        and _has_think_tags
-                        and (
-                            (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
-                            or _trunc_content is None
-                        )
-                    )
-
-                    if _thinking_exhausted:
-                        _exhaust_error = (
-                            "Model used all output tokens on reasoning with none left "
-                            "for the response. Try lowering reasoning effort or "
-                            "increasing max_tokens."
-                        )
-                        agent._vprint(
-                            f"{agent.log_prefix}💭 Reasoning exhausted the output token budget — "
-                            f"no visible response was produced.",
-                            force=True,
-                        )
-                        # Return a user-friendly message as the response so
-                        # CLI (response box) and gateway (chat message) both
-                        # display it naturally instead of a suppressed error.
-                        _exhaust_response = (
-                            "⚠️ **Thinking Budget Exhausted**\n\n"
-                            "The model used all its output tokens on reasoning "
-                            "and had none left for the actual response.\n\n"
-                            "To fix this:\n"
-                            "→ Lower reasoning effort: `/thinkon low` or `/thinkon minimal`\n"
-                            "→ Or switch to a larger/non-reasoning model with `/model`"
-                        )
-                        agent._cleanup_task_resources(effective_task_id)
-                        agent._persist_session(messages, conversation_history)
-                        return {
-                            "final_response": _exhaust_response,
-                            "messages": messages,
-                            "api_calls": api_call_count,
-                            "completed": False,
-                            "partial": True,
-                            "error": _exhaust_error,
-                        }
-
-                    # ── Detect repetition-dominated truncation (#86581) ──
-                    # A model in a degenerate repetition loop can spend its
-                    # ENTIRE output budget echoing one fragment.  The
-                    # continuation nudge below would then stitch the
-                    # pathological fragment into the final response — in the
-                    # #86581 incident one turn produced a 60,698-char
-                    # response delivered as 31 Discord messages.  Abort with
-                    # a clear user-facing error instead, mirroring the
-                    # _thinking_exhausted guard above.  Reasoning blocks are
-                    # stripped first (repeated scratchpad lines are not
-                    # evidence of a degenerate visible response).
-                    _visible_trunc = (
-                        agent._strip_think_blocks(_trunc_content)
-                        if isinstance(_trunc_content, str)
-                        else _trunc_content
-                    )
-                    _repetition_dominated = (
-                        not _trunc_has_tool_calls
-                        and bool(_visible_trunc)
-                        and is_repetition_dominated(_visible_trunc)
-                    )
-                    if _repetition_dominated:
-                        _rep_error = (
-                            "Model output entered a repetition loop and was "
-                            "truncated mid-loop; refusing to continue a "
-                            "degenerate response."
-                        )
-                        agent._vprint(
-                            f"{agent.log_prefix}🔁 Response dominated by "
-                            f"repeated text — stopping instead of "
-                            f"continuing a degenerate response.",
-                            force=True,
-                        )
-                        _rep_response = (
-                            "⚠️ **Response Stopped — Repetition Detected**\n\n"
-                            "The model fell into a repetition loop while "
-                            "writing this response, so continuing would only "
-                            "produce more repeated text. The partial response "
-                            "was discarded.\n\n"
-                            "→ Switch to a different model with `/model`\n"
-                            "→ Or resend your message (your conversation "
-                            "history is preserved)"
-                        )
-                        agent._cleanup_task_resources(effective_task_id)
-                        agent._persist_session(messages, conversation_history)
-                        return {
-                            "final_response": _rep_response,
-                            "messages": messages,
-                            "api_calls": api_call_count,
-                            "completed": False,
-                            "partial": True,
-                            "error": _rep_error,
-                        }
-
-                    if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
-                        assistant_message = _trunc_msg
-                        # ── Content-filter stream stall → fallback (#32421) ──
-                        # When the provider's output-layer safety filter (e.g.
-                        # MiniMax "output new_sensitive (1027)", Azure
-                        # content_filter) kills the stream mid-delivery, the
-                        # raw error was classified at the swallow point and the
-                        # stub tagged ``_content_filter_terminated``.  This
-                        # filter is content-deterministic — continuation
-                        # retries against the SAME primary just re-hit it and
-                        # burn paid attempts (the loop used to give up with
-                        # "Response remained truncated after 3 continuation
-                        # attempts" and never consult the fallback chain).
-                        # Escalate to the configured fallback BEFORE retrying.
-                        _cf_terminated = getattr(
-                            response, "_content_filter_terminated", False
-                        )
-                        if (
-                            _cf_terminated
-                            and agent._fallback_index < len(agent._fallback_chain)
-                        ):
-                            agent._vprint(
-                                f"{agent.log_prefix}🛡️  Content filter terminated "
-                                f"stream — activating fallback provider...",
-                                force=True,
-                            )
-                            agent._emit_status(
-                                "Content filter terminated stream; switching to fallback..."
-                            )
+                        agent._buffer_vprint(f"⚠️  Invalid API response (attempt {retry_count}/{max_retries}): {', '.join(error_details)}")
+                        agent._buffer_vprint(f"   🏢 Provider: {provider_name}")
+                        cleaned_provider_error = agent._clean_error_message(error_msg)
+                        agent._buffer_vprint(f"   📝 Provider message: {cleaned_provider_error}")
+                        agent._buffer_vprint(f"   ⏱️  {_failure_hint}")
+                    
+                        if retry_count >= max_retries:
+                            # Try fallback before giving up
+                            if agent._has_pending_fallback():
+                                agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
                             if agent._try_activate_fallback():
-                                # Roll the partial content (if any was already
-                                # appended in a prior continuation pass) back to
-                                # the last clean turn so the fallback provider
-                                # gets a coherent continuation point.
-                                if truncated_response_parts:
-                                    messages = agent._get_messages_up_to_last_assistant(messages)
-                                # Unmark survivors: their text left the stitched partial.
-                                for _frag in messages:
-                                    if isinstance(_frag, dict):
-                                        _frag.pop("_length_continuation_fragment", None)
-                                        _frag.pop("_length_continuation_nudge", None)
-                                agent._session_messages = messages
-                                length_continue_retries = 0
-                                truncated_response_parts = []
+                                consume_runtime_override(agent)
+                                active_system_prompt = _sync_failover_system_message(
+                                    agent, api_messages, active_system_prompt)
                                 retry_count = 0
                                 compression_attempts = 0
                                 _retry.primary_recovery_attempted = False
                                 _retry.restart_with_rebuilt_messages = True
                                 break
-                            # No fallback available — fall through to normal
-                            # continuation (best-effort, may loop).
-                            agent._vprint(
-                                f"{agent.log_prefix}⚠️  No fallback provider "
-                                f"configured — retrying with same provider "
-                                f"(may re-hit filter)...",
-                                force=True,
-                            )
-                        if assistant_message is not None and not _trunc_has_tool_calls:
-                            length_continue_retries += 1
-                            # An EMPTY partial-stream stub (stream dropped
-                            # mid tool-call before any text was delivered)
-                            # must not be appended as an interim assistant
-                            # message: it would serialize as
-                            # {"role": "assistant", "content": ""}, and
-                            # strict providers (Moonshot/Kimi via OpenRouter)
-                            # reject empty assistant content with HTTP 400
-                            # ("message ... with role 'assistant' must not be
-                            # empty") on the very next replay — permanently
-                            # poisoning the session history.  There is no
-                            # partial text to continue from anyway, so only
-                            # the continuation user-message is appended.
-                            _is_empty_partial_stub = (
-                                getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
-                                and not getattr(assistant_message, "content", None)
-                            )
-                            if not _is_empty_partial_stub:
-                                interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
-                                # Marked so the ceiling exit can drop the fragment trail.
-                                interim_msg["_length_continuation_fragment"] = True
-                                append_message(messages, interim_msg)
-                                if assistant_message.content:
-                                    truncated_response_parts.append(assistant_message.content)
-
-                            if length_continue_retries < 4:
-                                _is_partial_stream_stub = (
-                                    getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
-                                )
-                                _dropped_tools = getattr(
-                                    response, "_dropped_tool_names", None
-                                )
-
-                                if _is_partial_stream_stub and _dropped_tools:
-                                    _tool_list = ", ".join(_dropped_tools[:3])
-                                    agent._vprint(
-                                        f"{agent.log_prefix}↻ Stream interrupted mid "
-                                        f"tool-call ({_tool_list}) — requesting "
-                                        f"chunked retry "
-                                        f"({length_continue_retries}/4)..."
-                                    )
-                                elif _is_partial_stream_stub:
-                                    agent._vprint(
-                                        f"{agent.log_prefix}↻ Stream interrupted — "
-                                        f"requesting continuation "
-                                        f"({length_continue_retries}/4)..."
-                                    )
-                                else:
-                                    agent._vprint(
-                                        f"{agent.log_prefix}↻ Requesting continuation "
-                                        f"({length_continue_retries}/4)..."
-                                    )
-
-                                _continue_content = _get_continuation_prompt(
-                                    _is_partial_stream_stub, _dropped_tools
-                                )
-                                continue_msg = {
-                                    "role": "user",
-                                    "content": _continue_content,
-                                    "_length_continuation_nudge": True,
-                                }
-                                append_message(messages, continue_msg)
-                                agent._session_messages = messages
-                                _retry.restart_with_length_continuation = True
-                                break
-
-                            partial_response = agent._strip_think_blocks(_join_truncated_parts(truncated_response_parts)).strip()
-                            if partial_response:
-                                agent._vprint(
-                                    f"{agent.log_prefix}⚠️  Response still truncated "
-                                    f"after 4 continuation attempts — keeping the "
-                                    f"partial response received so far.",
-                                    force=True,
-                                )
-                            # Unanswered continue nudges made every later turn re-truncate.
-                            _turn_start = (
-                                current_turn_user_idx + 1
-                                if isinstance(current_turn_user_idx, int)
-                                and current_turn_user_idx >= 0
-                                else 0
-                            )
-                            messages[_turn_start:] = [
-                                m for m in messages[_turn_start:]
-                                if not (
-                                    isinstance(m, dict)
-                                    and (
-                                        m.get("_length_continuation_fragment")
-                                        or m.get("_length_continuation_nudge")
-                                    )
-                                )
-                            ]
-                            if partial_response:
-                                append_message(messages, {
-                                    "role": "assistant",
-                                    "content": partial_response,
-                                    "finish_reason": "length",
-                                })
-                            agent._session_messages = messages
-                            agent._cleanup_task_resources(effective_task_id)
-                            agent._persist_session(messages, conversation_history)
-                            return {
-                                "final_response": partial_response or None,
-                                "messages": messages,
-                                "api_calls": api_call_count,
-                                "completed": False,
-                                "partial": True,
-                                "error": "Response remained truncated after 4 continuation attempts",
-                            }
-
-                    if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
-                        assistant_message = _trunc_msg
-                        if assistant_message is not None and _trunc_has_tool_calls:
-                            _is_stub_stall = (
-                                getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
-                            )
-                            if truncated_tool_call_retries < 4:
-                                truncated_tool_call_retries += 1
-                                if _is_stub_stall:
-                                    # The stream broke mid tool-call (network /
-                                    # peer-closed connection), not a real output
-                                    # cap — say so instead of "max output tokens".
-                                    agent._buffer_vprint(
-                                        f"⚠️  Stream interrupted mid tool-call — "
-                                        f"retrying ({truncated_tool_call_retries}/4)..."
-                                    )
-                                else:
-                                    agent._buffer_vprint(
-                                        f"⚠️  Truncated tool call detected — "
-                                        f"retrying API call "
-                                        f"({truncated_tool_call_retries}/4)..."
-                                    )
-                                # Boost max_tokens on each retry so the model has
-                                # more room to complete the tool-call JSON. A
-                                # network stall doesn't need a bigger budget, but
-                                # a genuine output-cap truncation does, and the
-                                # boost is harmless for the stall case.
-                                _tc_boost_base = agent.max_tokens if agent.max_tokens else 4096
-                                _tc_boost = _tc_boost_base * (2 ** truncated_tool_call_retries)
-                                _tc_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
-                                if _tc_requested_cap is not None:
-                                    _tc_boost = max(_tc_boost, _tc_requested_cap)
-                                _tc_boost_cap = max(32768, _tc_requested_cap or 0)
-                                agent._ephemeral_max_output_tokens = min(_tc_boost, _tc_boost_cap)
-                                # Don't append the broken response to messages;
-                                # just re-run the same API call from the current
-                                # message state, giving the model another chance.
-                                continue
+                            # Terminal — flush buffered retry trace so user sees what happened.
                             agent._flush_status_buffer()
-                            if _is_stub_stall:
-                                agent._vprint(
-                                    f"{agent.log_prefix}⚠️  Stream kept dropping mid tool-call after 4 retries — the action was not executed.",
-                                    force=True,
-                                )
-                            else:
-                                agent._vprint(
-                                    f"{agent.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
-                                    force=True,
-                                )
-                            agent._cleanup_task_resources(effective_task_id)
-                            _final_response = (
-                                "Stream repeatedly dropped mid tool-call (network); "
-                                "the tool was not executed"
-                                if _is_stub_stall
-                                else "Response truncated due to output length limit"
-                            )
-                            # Prior successful tool batches (or injected tool
-                            # errors) can leave a tool-result tail; this path
-                            # never reaches finalize_turn (#48879 class).
-                            close_interrupted_tool_sequence(messages, _final_response)
+                            agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
+                            logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
                             agent._persist_session(messages, conversation_history)
+                            _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
                             return {
                                 "final_response": _final_response,
                                 "messages": messages,
-                                "api_calls": api_call_count,
                                 "completed": False,
-                                "partial": True,
+                                "api_calls": api_call_count,
                                 "error": _final_response,
+                                "failed": True  # Mark as failure for filtering
                             }
+                    
+                        # Backoff before retry — jittered exponential: 5s base, 120s cap
+                        wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                        agent._buffer_vprint(f"⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...")
+                        logger.warning("Invalid API response (retry %d/%d): %s | Provider: %s", retry_count, max_retries, ', '.join(error_details), provider_name)
+                    
+                        # Sleep in small increments to stay responsive to interrupts
+                        sleep_end = time.time() + wait_time
+                        _backoff_touch_counter = 0
+                        while time.time() < sleep_end:
+                            if agent._interrupt_requested:
+                                # A redirect uses the interrupt machinery to cancel
+                                # only the live request. Aborting the retry here
+                                # with clear_interrupt() would DESTROY the pending
+                                # correction and kill the turn with "Operation
+                                # interrupted" — the exact mid-stream steer loss
+                                # users hit when a redirect lands during provider
+                                # backoff. Rebuild from the correction instead,
+                                # mirroring the InterruptedError handler.
+                                if agent.clear_interrupt(preserve_redirect=True):
+                                    _retry.restart_with_redirected_messages = True
+                                    break
+                                agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
+                                _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
+                                close_interrupted_tool_sequence(messages, _interrupt_text)
+                                agent._persist_session(messages, conversation_history)
+                                agent.clear_interrupt()
+                                return {
+                                    "final_response": _interrupt_text,
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "interrupted": True,
+                                }
+                            time.sleep(0.2)
+                            # Touch activity every ~30s so the gateway's inactivity
+                            # monitor knows we're alive during backoff waits.
+                            _backoff_touch_counter += 1
+                            if _backoff_touch_counter % 150 == 0:  # 150 × 0.2s = 30s
+                                agent._touch_activity(
+                                    f"retry backoff ({retry_count}/{max_retries}), "
+                                    f"{int(sleep_end - time.time())}s remaining"
+                                )
+                        if _retry.restart_with_redirected_messages:
+                            break  # rebuild this iteration from the correction
+                        continue  # Retry the API call
 
-                    # If we have prior messages, roll back to last complete state
-                    if len(messages) > 1:
-                        agent._vprint(f"{agent.log_prefix}   ⏪ Rolling back to last complete assistant turn")
-                        rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
+                    agent._turn_received_provider_response = True
+
+                    # Check finish_reason before proceeding
+                    if agent.api_mode == "codex_responses":
+                        status = getattr(response, "status", None)
+                        if isinstance(status, str):
+                            status = status.strip().lower()
+                        incomplete_details = getattr(response, "incomplete_details", None)
+                        incomplete_reason = None
+                        if isinstance(incomplete_details, dict):
+                            incomplete_reason = incomplete_details.get("reason")
+                        else:
+                            incomplete_reason = getattr(incomplete_details, "reason", None)
+                        if incomplete_reason is not None:
+                            incomplete_reason = str(incomplete_reason).strip().lower()
+                        if status == "incomplete" and incomplete_reason in {"max_output_tokens", "length"}:
+                            # Responses API max-output exhaustion is a normal
+                            # Codex incomplete turn.  Let the Codex-specific
+                            # continuation path below append the incomplete
+                            # assistant state and retry, instead of routing to
+                            # the generic chat-completions length rollback that
+                            # emits "Response truncated due to output length
+                            # limit" and stops gateway turns.
+                            finish_reason = "incomplete"
+                        elif status == "incomplete" and incomplete_reason == "content_filter":
+                            finish_reason = "content_filter"
+                        else:
+                            finish_reason = "stop"
+                    elif agent.api_mode == "anthropic_messages":
+                        _tfr = agent._get_transport()
+                        finish_reason = _tfr.map_finish_reason(response.stop_reason)
+                    elif agent.api_mode == "bedrock_converse":
+                        # Bedrock response already normalized at dispatch — use transport
+                        _bt_fr = agent._get_transport()
+                        _bedrock_result = _bt_fr.normalize_response(response)
+                        finish_reason = _bedrock_result.finish_reason
+                    else:
+                        _cc_fr = agent._get_transport()
+                        _finish_result = _cc_fr.normalize_response(response)
+                        finish_reason = _finish_result.finish_reason
+                        assistant_message = _finish_result
+                        if agent._should_treat_stop_as_truncated(
+                            finish_reason,
+                            assistant_message,
+                            messages,
+                        ):
+                            agent._vprint(
+                                f"{agent.log_prefix}⚠️  Treating suspicious Ollama/GLM stop response as truncated",
+                                force=True,
+                            )
+                            finish_reason = "length"
+
+                    # ── Content-policy refusal (HTTP 200) ──────────────────
+                    # The model — or the provider's safety system — returned a
+                    # *successful* response whose stop/finish reason is a refusal:
+                    # Anthropic ``stop_reason="refusal"`` → ``content_filter``;
+                    # OpenAI / portal ``finish_reason="content_filter"`` or a
+                    # populated ``message.refusal`` (mapped in the chat_completions
+                    # transport); Bedrock ``guardrail_intervened``. The content is
+                    # typically empty, so without this branch the response falls
+                    # through to the empty-response / invalid-response retry loops
+                    # and is mis-surfaced as "rate limited" / "no content after
+                    # retries" — burning paid attempts reproducing a deterministic
+                    # refusal. Surface it clearly and stop. Mirrors the
+                    # exception-based ``content_policy_blocked`` recovery: try a
+                    # configured fallback once, otherwise return the refusal.
+                    if finish_reason == "content_filter":
+                        _refusal_transport = agent._get_transport()
+                        if agent.api_mode == "anthropic_messages":
+                            _refusal_result = _refusal_transport.normalize_response(
+                                response, strip_tool_prefix=agent._is_anthropic_oauth
+                            )
+                        else:
+                            _refusal_result = _refusal_transport.normalize_response(response)
+                        _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
+                        # Some refusals carry the explanation only in the reasoning
+                        # channel; fall back to it so the user sees *something*.
+                        if not _refusal_text:
+                            _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
+
+                        agent._invoke_api_request_error_hook(
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            api_call_count=api_call_count,
+                            api_start_time=api_start_time,
+                            api_kwargs=api_kwargs,
+                            error_type="ContentPolicyBlocked",
+                            error_message=_refusal_text or "model declined to respond (content_filter)",
+                            status_code=None,
+                            retry_count=retry_count,
+                            max_retries=max_retries,
+                            retryable=False,
+                            reason=FailoverReason.content_policy_blocked.value,
+                        )
+
+                        if thinking_spinner:
+                            thinking_spinner.stop("")
+                            thinking_spinner = None
+                        if agent.thinking_callback:
+                            agent.thinking_callback("")
+
+                        # Deterministic for the unchanged prompt — never retry.
+                        # Try a configured fallback once (a different model may not
+                        # refuse); otherwise surface the refusal terminally.
+                        if agent._has_pending_fallback():
+                            agent._buffer_status(
+                                "⚠️ Model declined to respond (safety refusal) — trying fallback..."
+                            )
+                        if agent._try_activate_fallback():
+                            consume_runtime_override(agent)
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            _retry.restart_with_rebuilt_messages = True
+                            break
+
+                        agent._flush_status_buffer()
+                        _refusal_log = (
+                            _refusal_text[:500] + "..."
+                            if len(_refusal_text) > 500
+                            else _refusal_text
+                        )
+                        logger.warning(
+                            "%sModel declined to respond (finish_reason=content_filter). "
+                            "model=%s provider=%s refusal=%s",
+                            agent.log_prefix, agent.model, agent.provider,
+                            _refusal_log or "(no text)",
+                        )
+                        agent._emit_status(
+                            "⚠️ The model declined to respond to this request (safety refusal)."
+                        )
+
+                        _refusal_detail = (
+                            f"Model's explanation: {_refusal_text}"
+                            if _refusal_text
+                            else "The model returned no explanation."
+                        )
+                        _refusal_response = (
+                            "⚠️  The model declined to respond to this request "
+                            "(safety refusal — not a Hermes/gateway failure).\n\n"
+                            f"{_refusal_detail}\n\n"
+                            f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                        )
 
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
+                        return _content_policy_blocked_result(
+                            messages,
+                            api_call_count,
+                            final_response=_refusal_response,
+                            error_detail=_refusal_text or "model declined (content_filter)",
+                        )
 
-                        return {
-                            "final_response": "Response truncated due to output length limit",
-                            "messages": rolled_back_messages,
-                            "api_calls": api_call_count,
-                            "completed": False,
-                            "partial": True,
-                            "error": "Response truncated due to output length limit"
-                        }
-                    else:
-                        # First message was truncated - mark as failed
-                        agent._flush_status_buffer()
-                        agent._vprint(f"{agent.log_prefix}❌ First response truncated - cannot recover", force=True)
-                        agent._persist_session(messages, conversation_history)
-                        return {
-                            "final_response": "First response truncated due to output length limit",
-                            "messages": messages,
-                            "api_calls": api_call_count,
-                            "completed": False,
-                            "failed": True,
-                            "error": "First response truncated due to output length limit"
-                        }
+                    if finish_reason == "length":
+                        if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
+                            agent._vprint(
+                                f"{agent.log_prefix}⚠️  Response truncated — stream "
+                                f"ended before completion",
+                                force=True,
+                            )
+                        else:
+                            agent._vprint(
+                                f"{agent.log_prefix}⚠️  Response truncated "
+                                f"(finish_reason='length') - model hit max output tokens",
+                                force=True,
+                            )
+
+                        # Normalize the truncated response to a single OpenAI-style
+                        # message shape so text-continuation and tool-call retry
+                        # work uniformly across chat_completions, bedrock_converse,
+                        # and anthropic_messages.  For Anthropic we use the same
+                        # adapter the agent loop already relies on so the rebuilt
+                        # interim assistant message is byte-identical to what
+                        # would have been appended in the non-truncated path.
+                        _trunc_msg = None
+                        _trunc_transport = agent._get_transport()
+                        if agent.api_mode == "anthropic_messages":
+                            _trunc_result = _trunc_transport.normalize_response(
+                                response, strip_tool_prefix=agent._is_anthropic_oauth
+                            )
+                        else:
+                            _trunc_result = _trunc_transport.normalize_response(response)
+                        _trunc_msg = _trunc_result
+
+                        _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
+                        _trunc_has_tool_calls = bool(getattr(_trunc_msg, "tool_calls", None)) if _trunc_msg else False
+
+                        # ── Detect thinking-budget exhaustion ──────────────
+                        # When the model spends ALL output tokens on reasoning
+                        # and has none left for the response, continuation
+                        # retries are pointless.  Detect this early and give a
+                        # targeted error instead of wasting 3 API calls.
+                        # A response is "thinking exhausted" only when the model
+                        # actually produced reasoning blocks but no visible text after
+                        # them.  Models that do not use <think> tags (e.g. GLM-4.7 on
+                        # NVIDIA Build, minimax) may return content=None or an empty
+                        # string for unrelated reasons — treat those as normal
+                        # truncations that deserve continuation retries, not as
+                        # thinking-budget exhaustion.
+                        _has_think_tags = bool(
+                            _trunc_content and re.search(
+                                r'<(?:think|thinking|reasoning|REASONING_SCRATCHPAD)[^>]*>',
+                                _trunc_content,
+                                re.IGNORECASE,
+                            )
+                        )
+                        _thinking_exhausted = (
+                            not _trunc_has_tool_calls
+                            and _has_think_tags
+                            and (
+                                (_trunc_content is not None and not agent._has_content_after_think_block(_trunc_content))
+                                or _trunc_content is None
+                            )
+                        )
+
+                        if _thinking_exhausted:
+                            _exhaust_error = (
+                                "Model used all output tokens on reasoning with none left "
+                                "for the response. Try lowering reasoning effort or "
+                                "increasing max_tokens."
+                            )
+                            agent._vprint(
+                                f"{agent.log_prefix}💭 Reasoning exhausted the output token budget — "
+                                f"no visible response was produced.",
+                                force=True,
+                            )
+                            # Return a user-friendly message as the response so
+                            # CLI (response box) and gateway (chat message) both
+                            # display it naturally instead of a suppressed error.
+                            _exhaust_response = (
+                                "⚠️ **Thinking Budget Exhausted**\n\n"
+                                "The model used all its output tokens on reasoning "
+                                "and had none left for the actual response.\n\n"
+                                "To fix this:\n"
+                                "→ Lower reasoning effort: `/thinkon low` or `/thinkon minimal`\n"
+                                "→ Or switch to a larger/non-reasoning model with `/model`"
+                            )
+                            agent._cleanup_task_resources(effective_task_id)
+                            agent._persist_session(messages, conversation_history)
+                            return {
+                                "final_response": _exhaust_response,
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "partial": True,
+                                "error": _exhaust_error,
+                            }
+
+                        # ── Detect repetition-dominated truncation (#86581) ──
+                        # A model in a degenerate repetition loop can spend its
+                        # ENTIRE output budget echoing one fragment.  The
+                        # continuation nudge below would then stitch the
+                        # pathological fragment into the final response — in the
+                        # #86581 incident one turn produced a 60,698-char
+                        # response delivered as 31 Discord messages.  Abort with
+                        # a clear user-facing error instead, mirroring the
+                        # _thinking_exhausted guard above.  Reasoning blocks are
+                        # stripped first (repeated scratchpad lines are not
+                        # evidence of a degenerate visible response).
+                        _visible_trunc = (
+                            agent._strip_think_blocks(_trunc_content)
+                            if isinstance(_trunc_content, str)
+                            else _trunc_content
+                        )
+                        _repetition_dominated = (
+                            not _trunc_has_tool_calls
+                            and bool(_visible_trunc)
+                            and is_repetition_dominated(_visible_trunc)
+                        )
+                        if _repetition_dominated:
+                            _rep_error = (
+                                "Model output entered a repetition loop and was "
+                                "truncated mid-loop; refusing to continue a "
+                                "degenerate response."
+                            )
+                            agent._vprint(
+                                f"{agent.log_prefix}🔁 Response dominated by "
+                                f"repeated text — stopping instead of "
+                                f"continuing a degenerate response.",
+                                force=True,
+                            )
+                            _rep_response = (
+                                "⚠️ **Response Stopped — Repetition Detected**\n\n"
+                                "The model fell into a repetition loop while "
+                                "writing this response, so continuing would only "
+                                "produce more repeated text. The partial response "
+                                "was discarded.\n\n"
+                                "→ Switch to a different model with `/model`\n"
+                                "→ Or resend your message (your conversation "
+                                "history is preserved)"
+                            )
+                            agent._cleanup_task_resources(effective_task_id)
+                            agent._persist_session(messages, conversation_history)
+                            return {
+                                "final_response": _rep_response,
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "partial": True,
+                                "error": _rep_error,
+                            }
+
+                        if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
+                            assistant_message = _trunc_msg
+                            # ── Content-filter stream stall → fallback (#32421) ──
+                            # When the provider's output-layer safety filter (e.g.
+                            # MiniMax "output new_sensitive (1027)", Azure
+                            # content_filter) kills the stream mid-delivery, the
+                            # raw error was classified at the swallow point and the
+                            # stub tagged ``_content_filter_terminated``.  This
+                            # filter is content-deterministic — continuation
+                            # retries against the SAME primary just re-hit it and
+                            # burn paid attempts (the loop used to give up with
+                            # "Response remained truncated after 3 continuation
+                            # attempts" and never consult the fallback chain).
+                            # Escalate to the configured fallback BEFORE retrying.
+                            _cf_terminated = getattr(
+                                response, "_content_filter_terminated", False
+                            )
+                            if (
+                                _cf_terminated
+                                and agent._fallback_index < len(agent._fallback_chain)
+                            ):
+                                agent._vprint(
+                                    f"{agent.log_prefix}🛡️  Content filter terminated "
+                                    f"stream — activating fallback provider...",
+                                    force=True,
+                                )
+                                agent._emit_status(
+                                    "Content filter terminated stream; switching to fallback..."
+                                )
+                                if agent._try_activate_fallback():
+                                    consume_runtime_override(agent)
+                                    # Roll the partial content (if any was already
+                                    # appended in a prior continuation pass) back to
+                                    # the last clean turn so the fallback provider
+                                    # gets a coherent continuation point.
+                                    if truncated_response_parts:
+                                        messages = agent._get_messages_up_to_last_assistant(messages)
+                                    # Unmark survivors: their text left the stitched partial.
+                                    for _frag in messages:
+                                        if isinstance(_frag, dict):
+                                            _frag.pop("_length_continuation_fragment", None)
+                                            _frag.pop("_length_continuation_nudge", None)
+                                    agent._session_messages = messages
+                                    length_continue_retries = 0
+                                    truncated_response_parts = []
+                                    retry_count = 0
+                                    compression_attempts = 0
+                                    _retry.primary_recovery_attempted = False
+                                    _retry.restart_with_rebuilt_messages = True
+                                    break
+                                # No fallback available — fall through to normal
+                                # continuation (best-effort, may loop).
+                                agent._vprint(
+                                    f"{agent.log_prefix}⚠️  No fallback provider "
+                                    f"configured — retrying with same provider "
+                                    f"(may re-hit filter)...",
+                                    force=True,
+                                )
+                            if assistant_message is not None and not _trunc_has_tool_calls:
+                                length_continue_retries += 1
+                                # An EMPTY partial-stream stub (stream dropped
+                                # mid tool-call before any text was delivered)
+                                # must not be appended as an interim assistant
+                                # message: it would serialize as
+                                # {"role": "assistant", "content": ""}, and
+                                # strict providers (Moonshot/Kimi via OpenRouter)
+                                # reject empty assistant content with HTTP 400
+                                # ("message ... with role 'assistant' must not be
+                                # empty") on the very next replay — permanently
+                                # poisoning the session history.  There is no
+                                # partial text to continue from anyway, so only
+                                # the continuation user-message is appended.
+                                _is_empty_partial_stub = (
+                                    getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                                    and not getattr(assistant_message, "content", None)
+                                )
+                                if not _is_empty_partial_stub:
+                                    interim_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                                    # Marked so the ceiling exit can drop the fragment trail.
+                                    interim_msg["_length_continuation_fragment"] = True
+                                    append_message(messages, interim_msg)
+                                    if assistant_message.content:
+                                        truncated_response_parts.append(assistant_message.content)
+
+                                if length_continue_retries < 4:
+                                    _is_partial_stream_stub = (
+                                        getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                                    )
+                                    _dropped_tools = getattr(
+                                        response, "_dropped_tool_names", None
+                                    )
+
+                                    if _is_partial_stream_stub and _dropped_tools:
+                                        _tool_list = ", ".join(_dropped_tools[:3])
+                                        agent._vprint(
+                                            f"{agent.log_prefix}↻ Stream interrupted mid "
+                                            f"tool-call ({_tool_list}) — requesting "
+                                            f"chunked retry "
+                                            f"({length_continue_retries}/4)..."
+                                        )
+                                    elif _is_partial_stream_stub:
+                                        agent._vprint(
+                                            f"{agent.log_prefix}↻ Stream interrupted — "
+                                            f"requesting continuation "
+                                            f"({length_continue_retries}/4)..."
+                                        )
+                                    else:
+                                        agent._vprint(
+                                            f"{agent.log_prefix}↻ Requesting continuation "
+                                            f"({length_continue_retries}/4)..."
+                                        )
+
+                                    _continue_content = _get_continuation_prompt(
+                                        _is_partial_stream_stub, _dropped_tools
+                                    )
+                                    continue_msg = {
+                                        "role": "user",
+                                        "content": _continue_content,
+                                        "_length_continuation_nudge": True,
+                                    }
+                                    append_message(messages, continue_msg)
+                                    agent._session_messages = messages
+                                    _retry.restart_with_length_continuation = True
+                                    break
+
+                                partial_response = agent._strip_think_blocks(_join_truncated_parts(truncated_response_parts)).strip()
+                                if partial_response:
+                                    agent._vprint(
+                                        f"{agent.log_prefix}⚠️  Response still truncated "
+                                        f"after 4 continuation attempts — keeping the "
+                                        f"partial response received so far.",
+                                        force=True,
+                                    )
+                                # Unanswered continue nudges made every later turn re-truncate.
+                                _turn_start = (
+                                    current_turn_user_idx + 1
+                                    if isinstance(current_turn_user_idx, int)
+                                    and current_turn_user_idx >= 0
+                                    else 0
+                                )
+                                messages[_turn_start:] = [
+                                    m for m in messages[_turn_start:]
+                                    if not (
+                                        isinstance(m, dict)
+                                        and (
+                                            m.get("_length_continuation_fragment")
+                                            or m.get("_length_continuation_nudge")
+                                        )
+                                    )
+                                ]
+                                if partial_response:
+                                    append_message(messages, {
+                                        "role": "assistant",
+                                        "content": partial_response,
+                                        "finish_reason": "length",
+                                    })
+                                agent._session_messages = messages
+                                agent._cleanup_task_resources(effective_task_id)
+                                agent._persist_session(messages, conversation_history)
+                                return {
+                                    "final_response": partial_response or None,
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "partial": True,
+                                    "error": "Response remained truncated after 4 continuation attempts",
+                                }
+
+                        if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
+                            assistant_message = _trunc_msg
+                            if assistant_message is not None and _trunc_has_tool_calls:
+                                _is_stub_stall = (
+                                    getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                                )
+                                if truncated_tool_call_retries < 4:
+                                    truncated_tool_call_retries += 1
+                                    if _is_stub_stall:
+                                        # The stream broke mid tool-call (network /
+                                        # peer-closed connection), not a real output
+                                        # cap — say so instead of "max output tokens".
+                                        agent._buffer_vprint(
+                                            f"⚠️  Stream interrupted mid tool-call — "
+                                            f"retrying ({truncated_tool_call_retries}/4)..."
+                                        )
+                                    else:
+                                        agent._buffer_vprint(
+                                            f"⚠️  Truncated tool call detected — "
+                                            f"retrying API call "
+                                            f"({truncated_tool_call_retries}/4)..."
+                                        )
+                                    # Boost max_tokens on each retry so the model has
+                                    # more room to complete the tool-call JSON. A
+                                    # network stall doesn't need a bigger budget, but
+                                    # a genuine output-cap truncation does, and the
+                                    # boost is harmless for the stall case.
+                                    _tc_boost_base = agent.max_tokens if agent.max_tokens else 4096
+                                    _tc_boost = _tc_boost_base * (2 ** truncated_tool_call_retries)
+                                    _tc_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
+                                    if _tc_requested_cap is not None:
+                                        _tc_boost = max(_tc_boost, _tc_requested_cap)
+                                    _tc_boost_cap = max(32768, _tc_requested_cap or 0)
+                                    agent._ephemeral_max_output_tokens = min(_tc_boost, _tc_boost_cap)
+                                    # Don't append the broken response to messages;
+                                    # just re-run the same API call from the current
+                                    # message state, giving the model another chance.
+                                    continue
+                                agent._flush_status_buffer()
+                                if _is_stub_stall:
+                                    agent._vprint(
+                                        f"{agent.log_prefix}⚠️  Stream kept dropping mid tool-call after 4 retries — the action was not executed.",
+                                        force=True,
+                                    )
+                                else:
+                                    agent._vprint(
+                                        f"{agent.log_prefix}⚠️  Truncated tool call response detected again — refusing to execute incomplete tool arguments.",
+                                        force=True,
+                                    )
+                                agent._cleanup_task_resources(effective_task_id)
+                                _final_response = (
+                                    "Stream repeatedly dropped mid tool-call (network); "
+                                    "the tool was not executed"
+                                    if _is_stub_stall
+                                    else "Response truncated due to output length limit"
+                                )
+                                # Prior successful tool batches (or injected tool
+                                # errors) can leave a tool-result tail; this path
+                                # never reaches finalize_turn (#48879 class).
+                                close_interrupted_tool_sequence(messages, _final_response)
+                                agent._persist_session(messages, conversation_history)
+                                return {
+                                    "final_response": _final_response,
+                                    "messages": messages,
+                                    "api_calls": api_call_count,
+                                    "completed": False,
+                                    "partial": True,
+                                    "error": _final_response,
+                                }
+
+                        # If we have prior messages, roll back to last complete state
+                        if len(messages) > 1:
+                            agent._vprint(f"{agent.log_prefix}   ⏪ Rolling back to last complete assistant turn")
+                            rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
+
+                            agent._cleanup_task_resources(effective_task_id)
+                            agent._persist_session(messages, conversation_history)
+
+                            return {
+                                "final_response": "Response truncated due to output length limit",
+                                "messages": rolled_back_messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "partial": True,
+                                "error": "Response truncated due to output length limit"
+                            }
+                        else:
+                            # First message was truncated - mark as failed
+                            agent._flush_status_buffer()
+                            agent._vprint(f"{agent.log_prefix}❌ First response truncated - cannot recover", force=True)
+                            agent._persist_session(messages, conversation_history)
+                            return {
+                                "final_response": "First response truncated due to output length limit",
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "failed": True,
+                                "error": "First response truncated due to output length limit"
+                            }
                 
                 # Track actual token usage from response for context management
                 if hasattr(response, 'usage') and response.usage:
@@ -5758,6 +5774,7 @@ def run_conversation(
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
                         if agent._try_activate_fallback(reason=classified.reason):
+                            consume_runtime_override(agent)
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -5792,6 +5809,7 @@ def run_conversation(
                         "switching to fallback provider..."
                     )
                     if agent._try_activate_fallback(reason=classified.reason):
+                        consume_runtime_override(agent)
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6483,6 +6501,7 @@ def run_conversation(
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
                     if agent._try_activate_fallback():
+                        consume_runtime_override(agent)
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6697,6 +6716,7 @@ def run_conversation(
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
                     if agent._try_activate_fallback():
+                        consume_runtime_override(agent)
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -7084,9 +7104,15 @@ def run_conversation(
             break
 
         try:
-            _transport = agent._get_transport()
+            # Dispatch on the mode/transport the wire actually used: with a
+            # runtime_override active the scope has restored the agent (and the
+            # transport cache) by now, so agent.api_mode would name the
+            # pre-override route.  The scope captured the effective transport
+            # per attempt instead — reusing the instance preserves its
+            # per-request state (e.g. the alias map the kwargs builder wrote).
+            _transport = _attempt_transport or agent._get_transport(_attempt_api_mode)
             _normalize_kwargs = {}
-            if agent.api_mode == "anthropic_messages":
+            if _attempt_api_mode == "anthropic_messages":
                 _normalize_kwargs["strip_tool_prefix"] = agent._is_anthropic_oauth
             normalized = _transport.normalize_response(response, **_normalize_kwargs)
             assistant_message = normalized
@@ -8336,6 +8362,7 @@ def run_conversation(
                             "switching to fallback provider..."
                         )
                         if agent._try_activate_fallback():
+                            consume_runtime_override(agent)
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             agent._empty_content_retries = 0
