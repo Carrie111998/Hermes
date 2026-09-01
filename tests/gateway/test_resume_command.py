@@ -876,20 +876,18 @@ class TestSameOriginChatGroupScoping:
                              user_id_alt=user_id_alt, thread_id=thread_id)
 
 
-    def test_same_origin_honors_adapter_registered_override(self):
+    def test_same_origin_honors_adapter_registered_override(self, tmp_path):
         """An adapter-registered shared scope must flip the IDOR guard the
         same way it flips the session key: with group_sessions_per_user=False
         registered for the platform, co-members share the session (guard
         allows); without the registration the config default (per-user)
         blocks. Exercises the real SessionStore resolution, not the mock."""
-        from pathlib import Path
-
         from gateway.session import SessionStore
 
         runner = _make_runner()
         runner.config.group_sessions_per_user = True
         runner.session_store = SessionStore(
-            sessions_dir=Path("/nonexistent"), config=runner.config
+            sessions_dir=tmp_path, config=runner.config
         )
         alice, bob = self._src("alice"), self._src("bob")
         assert runner._same_origin_chat(alice, bob) is False
