@@ -3856,7 +3856,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        # Copy the caller's context into the worker thread.
+                        # ContextVars do NOT propagate into a fresh thread, and
+                        # the multiplex cron ticker scopes each profile with
+                        # set_hermes_home_override() — a ContextVar. Submitting
+                        # bare meant _send_to_platform's load_gateway_config()
+                        # resolved get_hermes_home() back to the process-level
+                        # HERMES_HOME (the default profile) and delivered a
+                        # secondary profile's job with the DEFAULT profile's
+                        # bot token (#100489). Same guard the agent-run
+                        # submission already uses at :6160.
+                        _delivery_context = contextvars.copy_context()
+                        future = pool.submit(_delivery_context.run, asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
