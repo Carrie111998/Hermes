@@ -106,6 +106,59 @@ def test_deliver_requires_params(home):
     assert "error" in err
 
 
+def test_deliver_uses_existing_live_owner_instead_of_subprocess(home, monkeypatch):
+    monkeypatch.setattr(
+        "tools.bot_live_delivery.find_canonical_live_owner", lambda _home: "canonical"
+    )
+    monkeypatch.setattr(
+        "tools.bot_live_delivery.deliver_to_live_owner",
+        lambda *args, **kwargs: {
+            "status": "delivered",
+            "delivery_id": "d" * 32,
+            "reply": "pong from live owner",
+        },
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: pytest.fail("must not start a competing owner"),
+    )
+
+    out = _result(
+        srv._methods["bot_relay.deliver"](1, {"profile": "ops", "message": "ping"})
+    )
+
+    assert out == {
+        "reply": "pong from live owner",
+        "delivery_id": "d" * 32,
+        "delivery_status": "delivered",
+    }
+
+
+def test_deliver_returns_typed_live_owner_busy_timeout(home, monkeypatch):
+    monkeypatch.setattr(
+        "tools.bot_live_delivery.find_canonical_live_owner", lambda _home: "canonical"
+    )
+    monkeypatch.setattr(
+        "tools.bot_live_delivery.deliver_to_live_owner",
+        lambda *args, **kwargs: {
+            "status": "not_delivered",
+            "reason": "target_busy",
+            "delivery_id": "e" * 32,
+        },
+    )
+
+    envelope = srv._methods["bot_relay.deliver"](
+        1, {"profile": "ops", "message": "ping"}
+    )
+
+    assert envelope["error"]["code"] == 5096
+    assert envelope["error"]["data"] == {
+        "reason": "target_busy",
+        "delivery_id": "e" * 32,
+        "delivery_status": "not_delivered",
+    }
+
+
 def test_reply_roundtrip_and_id_validation(home):
     envelope_id = "c" * 32
     _result(srv._methods["bot_relay.reply"](1, {"id": envelope_id, "reply": "hi"}))

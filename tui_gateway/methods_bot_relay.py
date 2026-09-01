@@ -109,6 +109,40 @@ def _(rid, params: dict) -> dict:
         if resolved not in known:
             return _err(rid, 4092, f"no profile '{profile}' on this gateway")
 
+        from tools.bot_live_delivery import (
+            deliver_to_live_owner,
+            find_canonical_live_owner,
+        )
+        from tools.bot_relay import turn_wait_seconds
+
+        profile_home = root if resolved == "default" else profiles_dir / resolved
+        live_session_id = find_canonical_live_owner(profile_home)
+        if live_session_id:
+            outcome = deliver_to_live_owner(
+                profile_home,
+                live_session_id,
+                message,
+                owner_wait_seconds=turn_wait_seconds(),
+                receipt_wait_seconds=600,
+            )
+            delivery_data = {
+                "delivery_id": outcome.get("delivery_id"),
+                "delivery_status": outcome.get("status"),
+            }
+            if outcome.get("status") == "delivered":
+                return _ok(
+                    rid,
+                    {"reply": str(outcome.get("reply") or ""), **delivery_data},
+                )
+            reason = str(outcome.get("reason") or "unknown")
+            code = 5096 if reason == "target_busy" else 5097
+            return _err(
+                rid,
+                code,
+                str(outcome.get("error") or reason),
+                data={"reason": reason, **delivery_data},
+            )
+
         fd, tmp = tempfile.mkstemp(prefix="hermes-relay-dm-", suffix=".txt", text=True)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:

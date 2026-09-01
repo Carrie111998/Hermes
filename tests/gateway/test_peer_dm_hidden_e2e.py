@@ -92,6 +92,7 @@ def peer_gateway(tmp_path, monkeypatch):
             url=f"http://127.0.0.1:{state['port']}",
             db=db,
             hidden_id=hidden_id,
+            home=peer_home,
         )
     finally:
         async def _stop():
@@ -141,3 +142,31 @@ def test_hidden_lookup_requires_title_filter_e2e(peer_gateway):
     ids = [s["id"] for s in listing["data"]]
     assert peer_gateway.hidden_id not in ids
     assert "ordinary_1" in ids
+
+
+def test_peer_dm_routes_through_existing_live_owner_e2e(
+    peer_gateway, monkeypatch, capsys
+):
+    monkeypatch.setattr(peer_cmd, "_load_peers", lambda: {"spark": {"url": peer_gateway.url}})
+    monkeypatch.setattr(peer_cmd, "_peer_secret", lambda name: API_KEY)
+    monkeypatch.setattr(
+        "tools.bot_live_delivery.find_canonical_live_owner",
+        lambda home: peer_gateway.hidden_id if home == peer_gateway.home else None,
+    )
+    monkeypatch.setattr(
+        "tools.bot_live_delivery.deliver_to_live_owner",
+        lambda *args, **kwargs: {
+            "status": "delivered",
+            "delivery_id": "f" * 32,
+            "reply": "reply from desktop owner",
+        },
+    )
+
+    rc = peer_cmd.cmd_peer(
+        SimpleNamespace(peer_action="dm", target="spark", message="hello", json=True)
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reply"] == "reply from desktop owner"
+    assert payload["session_id"] == peer_gateway.hidden_id

@@ -232,10 +232,10 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
             agent=agent,
         )
     )
-    assert result["status"] == "sent"
+    assert result["status"] == "queued"
     assert result["to"] == "@researcher"
     assert result["process_id"] == "proc_test1234"
-    assert "do NOT wait" in result["detail"]
+    assert "not a delivery receipt" in result["detail"]
 
     assert len(calls) == 1
     call = calls[0]
@@ -289,7 +289,7 @@ def test_peer_delivery_command_pins_registry_profile_for_secondary_bots(
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent)
     )
-    assert result["status"] == "sent"
+    assert result["status"] == "queued"
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "stdin"
     # The registry the tool validated against is the machine root's — the
@@ -305,7 +305,7 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="spark/researcher", message="ping", agent=agent)
     )
-    assert result["status"] == "sent"
+    assert result["status"] == "queued"
     assert "spark" in result["to"]
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
     assert mode == "stdin"
@@ -315,7 +315,7 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     result2 = json.loads(
         bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent)
     )
-    assert result2["status"] == "sent"
+    assert result2["status"] == "queued"
     mode, _dm_file, transport_argv = _runner_parts(calls[1]["command"])
     assert mode == "stdin"
     assert transport_argv == ["hermes", "-p", "default", "peer", "dm", "spark"]
@@ -331,7 +331,7 @@ def test_named_profile_sender_prefix(tmp_path, monkeypatch):
     result = json.loads(
         bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
     )
-    assert result["status"] == "sent"
+    assert result["status"] == "queued"
     _mode, dm_file, _transport_argv = _runner_parts(calls[0]["command"])
     assert Path(dm_file).read_text(encoding="utf-8").startswith(
         "Message from 🤖 coder (@coder): "
@@ -419,6 +419,75 @@ def test_delivery_runner_preserves_child_failure_and_unlinks(tmp_path):
     )
 
     assert returncode == 7
+    assert not dm_file.exists()
+
+
+def test_delivery_runner_routes_to_live_owner_without_spawning_second_cli(
+    tmp_path, monkeypatch, capsys
+):
+    root = tmp_path / ".hermes"
+    target_home = root / "profiles" / "researcher"
+    target_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    dm_file = tmp_path / "dm.txt"
+    dm_file.write_text("Message from agent: hello", encoding="utf-8")
+    monkeypatch.setattr(
+        "tools.bot_live_delivery.find_canonical_live_owner",
+        lambda home: "canonical" if Path(home) == target_home else None,
+    )
+    monkeypatch.setattr(
+        "tools.bot_live_delivery.deliver_to_live_owner",
+        lambda *args, **kwargs: {
+            "status": "delivered",
+            "delivery_id": "a" * 32,
+            "reply": "received",
+        },
+    )
+    monkeypatch.setattr(
+        bot_mode_dm.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("a competing CLI owner must not start"),
+    )
+
+    rc = bot_mode_dm._run_delivery(
+        ["hermes", "-p", "researcher", "chat"],
+        str(dm_file),
+        stdin_file=False,
+    )
+
+    assert rc == 0
+    assert capsys.readouterr().out == "received\n"
+    assert not dm_file.exists()
+
+
+def test_delivery_runner_surfaces_live_owner_busy_timeout(tmp_path, monkeypatch, capsys):
+    root = tmp_path / ".hermes"
+    (root / "profiles" / "researcher").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    dm_file = tmp_path / "dm.txt"
+    dm_file.write_text("hello", encoding="utf-8")
+    monkeypatch.setattr(
+        "tools.bot_live_delivery.find_canonical_live_owner", lambda _home: "canonical"
+    )
+    monkeypatch.setattr(
+        "tools.bot_live_delivery.deliver_to_live_owner",
+        lambda *args, **kwargs: {
+            "status": "not_delivered",
+            "reason": "target_busy",
+            "delivery_id": "b" * 32,
+        },
+    )
+
+    rc = bot_mode_dm._run_delivery(
+        ["hermes", "-p", "researcher", "chat"],
+        str(dm_file),
+        stdin_file=False,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 1
+    assert payload["status"] == "not_delivered"
+    assert payload["reason"] == "target_busy"
     assert not dm_file.exists()
 
 
@@ -615,7 +684,7 @@ def test_successful_spawn_transfers_cleanup_to_runner(tmp_path, monkeypatch):
         )
     )
 
-    assert result["status"] == "sent"
+    assert result["status"] == "queued"
     assert dm_file.exists(), "the parent must not delete before the background runner reads"
 
 

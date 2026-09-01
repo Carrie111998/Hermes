@@ -4735,6 +4735,60 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        if (
+            str(session.get("title") or "").strip() == "Bot Chat"
+            and isinstance(user_message, str)
+        ):
+            db = await self._ensure_session_db_async()
+            profile_home = Path(db.db_path).parent if db is not None else None
+            if profile_home is not None:
+                from tools.bot_live_delivery import (
+                    deliver_to_live_owner,
+                    find_canonical_live_owner,
+                )
+                from tools.bot_relay import turn_wait_seconds
+
+                live_session_id = await asyncio.to_thread(
+                    find_canonical_live_owner, profile_home
+                )
+                if live_session_id == session_id:
+                    outcome = await asyncio.to_thread(
+                        deliver_to_live_owner,
+                        profile_home,
+                        session_id,
+                        user_message,
+                        owner_wait_seconds=turn_wait_seconds(),
+                        receipt_wait_seconds=600,
+                    )
+                    if outcome.get("status") == "delivered":
+                        return web.json_response(
+                            {
+                                "object": "hermes.session.chat.completion",
+                                "session_id": session_id,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": str(outcome.get("reply") or ""),
+                                },
+                                "usage": {},
+                                "runtime": {},
+                                "delivery_id": outcome.get("delivery_id"),
+                                "delivery_status": "delivered",
+                            },
+                            headers={"X-Hermes-Session-Id": session_id},
+                        )
+                    reason = str(outcome.get("reason") or "delivery_timeout")
+                    status = 409 if reason == "target_busy" else 504
+                    return web.json_response(
+                        {
+                            "error": {
+                                "message": str(outcome.get("error") or reason),
+                                "code": reason,
+                                "delivery_id": outcome.get("delivery_id"),
+                                "delivery_status": outcome.get("status"),
+                            }
+                        },
+                        status=status,
+                    )
         # Runtime selection. A backend-acknowledged Browser model lock
         # (require_model_lock in the body, or a previously confirmed lock
         # persisted on the session row) is an execution contract and wins.

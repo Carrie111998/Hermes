@@ -84,7 +84,8 @@ def message_agent_tool_schema() -> dict:
                 "asynchronous, like texting: it validates the target against the live "
                 "roster, delivers your message into that agent's own Bot Chat with your "
                 "attribution automatically prefixed, and returns immediately with a "
-                "delivery acknowledgement. It does NOT return their reply and you must "
+                "queue acknowledgement (not a delivery receipt). It does NOT return "
+                "their reply and you must "
                 "not wait or poll for one — send it, finish your turn, and the reply "
                 "arrives later as a background-process completion notification that "
                 "wakes you. COMPOSE the message yourself: write what YOU want to say to "
@@ -578,6 +579,35 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool) -> int:
     gateway's deliver path, not here.
     """
     try:
+        if not stdin_file and len(argv) >= 3 and argv[1] == "-p":
+            from tools.bot_live_delivery import (
+                deliver_to_live_owner,
+                find_canonical_live_owner,
+            )
+            from tools.bot_relay import turn_wait_seconds
+
+            ambient_home = Path(
+                os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+            )
+            root = _hermes_root(ambient_home)
+            profile = str(argv[2])
+            profile_home = root if profile == "default" else root / "profiles" / profile
+            live_session_id = find_canonical_live_owner(profile_home)
+            if live_session_id:
+                content = Path(dm_file).read_text(encoding="utf-8")
+                outcome = deliver_to_live_owner(
+                    profile_home,
+                    live_session_id,
+                    content,
+                    owner_wait_seconds=turn_wait_seconds(),
+                    receipt_wait_seconds=600,
+                )
+                if outcome.get("status") == "delivered":
+                    print(str(outcome.get("reply") or ""))
+                    return 0
+                print(json.dumps(outcome, ensure_ascii=False))
+                return 1
+
         with _delivery_lock(argv, stdin_file=stdin_file):
             if stdin_file:
                 # Keep the file open until the transport exits; cleanup occurs
@@ -704,13 +734,14 @@ def _spawn_delivery(
         transferred = True
         return json.dumps(
             {
-                "status": "sent",
+                "status": "queued",
                 "to": label,
                 "detail": (
-                    f"Message dispatched to {label}. This is asynchronous — do NOT wait "
-                    "or poll. Finish your turn now; when the delivery completes, its "
-                    "notification carries the reply — relay it then, attributed to "
-                    "that agent."
+                    f"Message queued for {label}. The background process acknowledgement "
+                    "is not a delivery receipt. This is asynchronous — do NOT wait or "
+                    "poll. Finish your turn now; the terminal notification later reports "
+                    "delivered, definitively not delivered, or transport-ambiguous, and "
+                    "carries the reply when delivery settles."
                 ),
                 **({"process_id": proc_id} if proc_id else {}),
                 "sent_at": int(time.time()),
