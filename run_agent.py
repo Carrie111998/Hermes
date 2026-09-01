@@ -2432,6 +2432,74 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
+                # Defense-in-depth content dedup (#99477).  The marker-based
+                # skip above is the primary persistence guard, but compression
+                # assembly strips _DB_PERSISTED_MARKER from fresh message
+                # copies (#57491), and the queue-drain path can preserve an
+                # outermost history_offset=0 across the entire recursive drain
+                # chain (#56391) — together they re-persist the full history
+                # on every drain cycle, producing exponential duplication (a
+                # 15-message conversation observed at 3,814 rows / 893 copies
+                # of one message).  The core feedback loop is fixed on main
+                # (marker re-stamping after in-place batch compaction,
+                # 1f2bd9e763); this tail-dedup is the independent backstop
+                # so a future marker lifecycle regression cannot corrupt the
+                # session store again.
+                #
+                # Compare (role, content) pairs of user/assistant rows against
+                # the session's existing tail; already-persisted pairs are
+                # stamped and dropped from the batch.  Only string-content
+                # rows participate (multimodal lists were already summarized
+                # above; tool rows carry call ids and replay legitimately).
+                # Best-effort by design: a probe failure never blocks a flush.
+                try:
+                    _dedup_roles = {"user", "assistant"}
+                    _probe_rows = [
+                        (r.get("role"), r.get("content"))
+                        for r in _batch_rows
+                        if r.get("role") in _dedup_roles
+                        and isinstance(r.get("content"), str)
+                        and r.get("content")
+                    ]
+                    if _probe_rows:
+                        _db_tail = self._session_db.get_messages(
+                            self.session_id,
+                            limit=max(len(_probe_rows) * 4, 64),
+                            latest=True,
+                        )
+                        if _db_tail:
+                            _existing = {
+                                (r.get("role"), r.get("content"))
+                                for r in _db_tail
+                                if r.get("role") in _dedup_roles
+                                and isinstance(r.get("content"), str)
+                            }
+                            _existing.discard((None, None))
+                            if _existing:
+                                _kept_rows, _kept_msgs = [], []
+                                _dup_count = 0
+                                for row, msg in zip(_batch_rows, _batch_msgs):
+                                    if (
+                                        row.get("role") in _dedup_roles
+                                        and (row.get("role"), row.get("content")) in _existing
+                                    ):
+                                        msg[_DB_PERSISTED_MARKER] = True
+                                        _dup_count += 1
+                                        continue
+                                    _kept_rows.append(row)
+                                    _kept_msgs.append(msg)
+                                if _dup_count:
+                                    logger.warning(
+                                        "session-db flush: dedup guard skipped %d "
+                                        "already-persisted message(s) for session %s "
+                                        "(#99477 backstop)",
+                                        _dup_count,
+                                        self.session_id,
+                                    )
+                                    _batch_rows, _batch_msgs = _kept_rows, _kept_msgs
+                except Exception:
+                    pass  # Best-effort dedup; never block a flush on it
+            if _batch_rows:
                 self._session_db.append_messages_batch(
                     session_id=self.session_id,
                     messages=_batch_rows,
