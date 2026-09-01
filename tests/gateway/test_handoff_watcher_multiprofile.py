@@ -118,7 +118,22 @@ async def test_watcher_enters_profile_scope_for_each_home(monkeypatch):
         def __exit__(self, *exc):
             return False
 
+    # The watcher now enters the async scope variant (issue #100014);
+    # the spy mirrors it as an async context manager so the watcher
+    # sees an interface it can ``async with``.
+    class _AsyncSpyScope:
+        def __init__(self, home):
+            self.home = home
+
+        async def __aenter__(self):
+            entered.append(self.home)
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
     monkeypatch.setattr(run, "_profile_runtime_scope", _SpyScope)
+    monkeypatch.setattr(run, "_profile_runtime_scope_async", _AsyncSpyScope)
 
     async def _no_sleep(_seconds):
         return None
@@ -191,7 +206,25 @@ async def test_each_scope_resolves_its_own_store_and_profile(monkeypatch):
             active["home"] = None
             return False
 
+    # Issue #100014: the watcher enters the async scope variant so a
+    # slow ``<home>/.env`` read cannot freeze the gateway event loop.
+    # The spy mirrors the new ``async with`` interface while still
+    # updating ``active`` so the per-scope ``_session_db`` resolution
+    # works exactly the same as before.
+    class _AsyncSpyScope:
+        def __init__(self, home):
+            self.home = home
+
+        async def __aenter__(self):
+            active["home"] = self.home
+            return self
+
+        async def __aexit__(self, *exc):
+            active["home"] = None
+            return False
+
     monkeypatch.setattr(run, "_profile_runtime_scope", _SpyScope)
+    monkeypatch.setattr(run, "_profile_runtime_scope_async", _AsyncSpyScope)
 
     async def _no_sleep(_seconds):
         return None

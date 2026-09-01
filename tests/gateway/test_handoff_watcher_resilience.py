@@ -215,17 +215,22 @@ async def test_reclaim_runs_per_profile_store(monkeypatch):
     ]
     monkeypatch.setattr(run, "_handoff_watch_scopes", lambda _r: scopes)
 
+    # Issue #100014: the watcher enters the async scope variant, so the
+    # spy must mirror the ``async with`` interface — patching only the
+    # sync ``_profile_runtime_scope`` here would leave the REAL scope
+    # machinery active (its ``<home>/.env`` parse would hit the test's
+    # fake profile homes under ``/h/...``).
     class _Scope:
         def __init__(self, home):
             self.home = home
 
-        def __enter__(self):
+        async def __aenter__(self):
             return self
 
-        def __exit__(self, *exc):
+        async def __aexit__(self, *exc):
             return False
 
-    monkeypatch.setattr(run, "_profile_runtime_scope", _Scope)
+    monkeypatch.setattr(run, "_profile_runtime_scope_async", _Scope)
 
     async def _no_sleep(_seconds):
         return None

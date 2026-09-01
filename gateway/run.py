@@ -2419,7 +2419,7 @@ def _current_max_iterations() -> int:
     return _resolve_turn_limit(os.getenv("HERMES_MAX_ITERATIONS"))
 
 
-from contextlib import contextmanager as _contextmanager
+from contextlib import asynccontextmanager, contextmanager as _contextmanager
 
 
 # Platforms that bind a host TCP port (HTTP/webhook listeners). In a profile
@@ -2560,6 +2560,13 @@ def _profile_runtime_scope(profile_home: "Path"):
     ``.env`` here does NOT mutate ``os.environ`` — ``build_profile_secret_scope``
     returns an isolated dict — which is what keeps subprocesses (MCP, kanban)
     from inheriting cross-profile secrets.
+
+    NOTE: this is the SYNCHRONOUS variant. Async paths that re-enter this
+    scope on a loop tick (notably ``_handoff_watcher``) MUST use
+    :func:`_profile_runtime_scope_async` instead, which runs the secret-scope
+    construction on a worker thread and serves cached results across ticks.
+    Synchronous filesystem I/O on the gateway event loop is what triggered
+    issue #100014's watchdog exit-75 outage.
     """
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     from agent.secret_scope import (
@@ -2572,6 +2579,100 @@ def _profile_runtime_scope(profile_home: "Path"):
     home_token = set_hermes_home_override(str(profile_home))
     hydrate_profile_secret_sources(Path(profile_home))
     secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+# Per-process cache for resolved profile secret scopes.
+#
+# ``_handoff_watcher`` enters ``_profile_runtime_scope`` every interval
+# seconds for every served multiplexed profile. ``build_profile_secret_scope``
+# synchronously parses ``<home>/.env`` and resolves external secret sources
+# via ``hydrate_profile_secret_sources``. On a slow filesystem (Termux+PRoot,
+# WSL2 VHDX, NFS) one such read can stall the gateway event loop long enough
+# for the loop-liveness watchdog to count three consecutive misses and
+# ``os._exit(75)`` the whole multiplexed gateway (issue #100014).
+#
+# The cache keys on the resolved home path (so symlinked profiles share a
+# cache entry) and stores ``(env_mtime, scope_dict)``. A subsequent tick
+# that finds the .env mtime unchanged returns the cached dict without
+# touching the filesystem. The cache lives for the lifetime of the
+# gateway process — profiles rewrite their ``.env`` out-of-band and rely
+# on the next tick re-reading, which is acceptable because (a) the
+# watcher's purpose is handoff polling, not credential hot-reload, and
+# (b) the cron delivery path that depends on the scope re-reads on every
+# job boundary. The cache is bounded by the number of profiles the
+# gateway serves, which is small.
+_PROFILE_SCOPE_CACHE: "dict[str, tuple[float, dict]]" = {}
+
+
+def _resolve_profile_secret_scope_cached(
+    profile_home: "Path",
+) -> "dict[str, str]":
+    """Return the resolved profile secret scope, cached by ``<home>/.env`` mtime.
+
+    Synchronous helper that performs ``Path.stat`` + dict construction —
+    both are O(1) on a healthy filesystem. The expensive operation it
+    skips (re-reading and parsing ``.env``) only runs when the file
+    mtime changes between calls. Caller is responsible for moving this
+    off the event loop when running from an async path.
+    """
+    from agent.secret_scope import build_profile_secret_scope
+
+    home = Path(profile_home)
+    env_path = home / ".env"
+    try:
+        home_key = str(home.resolve())
+        mtime = env_path.stat().st_mtime
+    except (FileNotFoundError, OSError):
+        # Mirror ``load_env_file``'s missing-file behavior: return an
+        # empty scope, but still cache it so we don't ``stat`` on every
+        # tick when the file genuinely doesn't exist.
+        home_key = str(home)
+        mtime = -1.0
+
+    cached = _PROFILE_SCOPE_CACHE.get(home_key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
+    # External secret sources have to be hydrated OUTSIDE the cache so a
+    # profile that legitimately changes its source configuration still
+    # gets a fresh snapshot on the next tick. The actual ``.env`` parse
+    # is the slow part; everything else is dict construction.
+    from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+    hydrate_profile_secret_sources(home)
+    scope = build_profile_secret_scope(home)
+    _PROFILE_SCOPE_CACHE[home_key] = (mtime, scope)
+    return scope
+
+
+@asynccontextmanager
+async def _profile_runtime_scope_async(profile_home: "Path"):
+    """Async sibling of :func:`_profile_runtime_scope`.
+
+    Same semantics — install ``HERMES_HOME`` override and profile secret
+    scope, then restore on exit — but the secret-scope construction runs
+    on a worker thread via ``asyncio.to_thread`` and reuses the process
+    cache from :func:`_resolve_profile_secret_scope_cached`.
+
+    This is the only safe way for a long-lived event-loop task to enter
+    a profile's runtime scope. Issue #100014 documented that the
+    synchronous variant freezes the gateway loop when ``<home>/.env``
+    I/O stalls (PRoot, slow VHDX, NFS), causing the loop-liveness
+    watchdog to ``os._exit(75)`` the entire multiplexed gateway.
+    """
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from agent.secret_scope import set_secret_scope, reset_secret_scope
+
+    home_token = set_hermes_home_override(str(profile_home))
+    scope = await asyncio.to_thread(
+        _resolve_profile_secret_scope_cached, Path(profile_home)
+    )
+    secret_token = set_secret_scope(scope)
     try:
         yield
     finally:
@@ -14720,7 +14821,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _phome is None:
                     await _reclaim_stale(self)
                 else:
-                    with _profile_runtime_scope(_phome):
+                    async with _profile_runtime_scope_async(_phome):
                         await _reclaim_stale(self)
             except Exception:
                 logger.debug("Stale-handoff reclaim failed", exc_info=True)
@@ -14732,7 +14833,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if profile_home is None:
                             await _tick(profile_name)
                         else:
-                            with _profile_runtime_scope(profile_home):
+                            # ``_profile_runtime_scope_async`` runs the
+                            # ``<home>/.env`` parse + external-secret hydration
+                            # on a worker thread and reuses the per-process
+                            # cache, so a slow filesystem cannot freeze the
+                            # gateway loop the way the synchronous
+                            # ``_profile_runtime_scope`` did (issue #100014).
+                            async with _profile_runtime_scope_async(profile_home):
                                 await _tick(profile_name)
                 except asyncio.CancelledError:
                     raise
