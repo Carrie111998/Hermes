@@ -4546,14 +4546,14 @@ class _SidebarStatusStore:
 
 
 def _production_sidebar_backend(
-    payload: dict[str, Any], *, grace_seconds: int = 120
+    payload: dict[str, Any], *, grace_seconds: int = 120, enabled: bool = True
 ) -> ProductionBackend:
     backend = ProductionBackend(
         replace(
             BridgeConfig(),
             sidebar=replace(
                 SidebarConfig(),
-                enabled=True,
+                enabled=enabled,
                 heartbeat_grace_seconds=grace_seconds,
             ),
         )
@@ -4605,6 +4605,87 @@ def test_sidebar_status_is_healthy_when_empty_without_a_heartbeat(
         "delivery_latency_seconds": {},
     })
     assert fresh_pending.sidebar_status()["healthy"] is True
+
+
+def _retired_lane_payload() -> dict[str, Any]:
+    """The shape the root store actually returns for the lane retired 2026-09-01.
+
+    A stale broker heartbeat plus a deep backlog of parked rows that can never
+    drain, because the delivery claim is short-circuited while the flag is off.
+    """
+
+    return {
+        "eligible_by_provider": {"claude": 537, "hermes": 9},
+        "counts": {
+            "pending": 517,
+            "leased": 0,
+            "retry": 9,
+            "visible": 20,
+            "failed": 0,
+        },
+        "oldest_pending_age_seconds": 2_027_808.0,
+        "oldest_eligible_age_seconds": 2_027_808.0,
+        "last_heartbeat_at": 100.0,
+        "last_visible_task_id": None,
+        "recent_error_codes": [],
+        "delivery_latency_seconds": {},
+    }
+
+
+def test_sidebar_status_reports_a_retired_lane_instead_of_stale_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+
+    status = _production_sidebar_backend(
+        _retired_lane_payload(), enabled=False
+    ).sidebar_status()
+
+    assert status["lane_state"] == "retired"
+    assert status["enabled"] is False
+    assert status["healthy"] is True
+    assert status["degraded_reasons"] == []
+    # The raw measurements stay factual -- suppressing the VERDICT must not
+    # erase the evidence the parked rows are audit history for.
+    assert status["heartbeat_stale"] is True
+    assert status["oldest_job_overdue"] is True
+    assert status["heartbeat_age_seconds"] == 900.0
+    assert status["counts"]["sidebar_pending"] == 517
+
+
+def test_sidebar_status_still_reports_liveness_while_the_lane_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+
+    status = _production_sidebar_backend(
+        _retired_lane_payload(), enabled=True
+    ).sidebar_status()
+
+    assert status["lane_state"] == "active"
+    assert status["enabled"] is True
+    assert status["healthy"] is False
+    assert status["degraded_reasons"] == [
+        "broker_heartbeat_stale",
+        "oldest_pending_stale",
+    ]
+
+
+def test_sidebar_status_retired_lane_still_reports_real_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retiring the lane silences staleness, never a recorded failure."""
+
+    monkeypatch.setattr("session_bridge.cli.time.time", lambda: 1_000.0)
+    payload = _retired_lane_payload()
+    payload["counts"]["failed"] = 3
+    payload["blocking_failed_count"] = 3
+
+    status = _production_sidebar_backend(payload, enabled=False).sidebar_status()
+
+    assert status["lane_state"] == "retired"
+    assert status["degraded_reasons"] == ["sidebar_failed"]
+    assert status["healthy"] is False
 
 
 def test_sidebar_status_exposes_fixed_health_counts_without_private_payloads(

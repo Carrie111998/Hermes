@@ -204,6 +204,63 @@ def enrichment_pids(records: Sequence[ProcessRecord]) -> frozenset:
     return frozenset(out)
 
 
+def census_ctime_pids(records: Sequence[ProcessRecord]) -> frozenset:
+    """PIDs whose ``create_time`` any later step actually reads.
+
+    Companion to :func:`enrichment_pids`, for the other per-handle field. On
+    Windows ``create_time`` opens a per-process handle just like
+    cmdline/exe/username/rss do -- measured on this box 2026-09-01 at ~790
+    processes, ~6.8s across the whole table, on top of the ppid cost the
+    controller's phase 1 addresses separately. Neither is huge alone; the
+    pass has a PT4M30S ExecutionTimeLimit and both were being paid per pass.
+
+    The set is the RAW-PPID closure around Claude-named seeds: every seed,
+    every descendant reachable by following ppid without validation, and
+    every ancestor reachable by walking ppid upward. It is a deliberate
+    SUPERSET of the validated sets, and that is what makes dropping the rest
+    safe: ``collect_tree`` only ever descends from a Claude-named seed and
+    the ancestry walk only ever ascends from one, both by ppid, so a record
+    outside this closure can never become a tree member or an ancestor --
+    and therefore its create_time is never compared. Validation only ever
+    REMOVES links, never adds them, so the unvalidated closure cannot miss
+    anything a validated walk would reach.
+
+    Seeding is by NAME, like enrichment_pids, so this stays pure and needs
+    no field we have not read yet.
+    """
+    by_parent: Dict[Optional[int], List[int]] = {}
+    by_pid: Dict[int, ProcessRecord] = {}
+    seeds: List[int] = []
+    for r in records:
+        by_parent.setdefault(r.ppid, []).append(r.pid)
+        by_pid[r.pid] = r
+        if os.path.basename(str(r.name or "")).lower() in _CLI_BASENAMES:
+            seeds.append(r.pid)
+
+    out: set = set()
+    stack = list(seeds)
+    while stack:                      # descendants, unvalidated
+        cur = stack.pop()
+        if cur in out:
+            continue
+        out.add(cur)
+        stack.extend(by_parent.get(cur, ()))
+
+    for seed in seeds:                # ancestors, unvalidated
+        cur: Optional[int] = seed
+        seen: set = set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            rec = by_pid.get(cur)
+            if rec is None:
+                break
+            cur = rec.ppid
+            if cur is None:
+                break
+            out.add(cur)
+    return frozenset(out)
+
+
 def collect_tree(root: ProcessRecord, records: Sequence[ProcessRecord]) -> Tuple[ProcessRecord, ...]:
     """Root plus every descendant reachable via create-time-validated ppid
     links. A child that predates its claimed parent is a recycled ppid and is
