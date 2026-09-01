@@ -700,6 +700,87 @@ class TestWhatsAppSessionKeyConsistency:
         assert second_entry.session_key == "agent:main:discord:group:guild-123"
         assert first_entry.session_id == second_entry.session_id
 
+    @pytest.mark.parametrize(
+        ("registered", "expected_shared"),
+        [
+            pytest.param(True, True, id="adapter-override-shares"),
+            pytest.param(False, False, id="unregistered-follows-global"),
+        ],
+    )
+    def test_adapter_declared_scope_beats_global_default(
+        self, store, registered, expected_shared
+    ):
+        """A platform absent from config.platforms (plugin/out-of-tree
+        adapter) keys sessions by its adapter-registered scope; without a
+        registration the global default still governs.
+
+        Regression: plugin adapters set extra.group_sessions_per_user on
+        their own PlatformConfig, but the store derived keys from the global
+        gateway config only, so a plugin group chat silently split into
+        per-user sessions and cross-contaminated multi-user context."""
+        store.config.group_sessions_per_user = True  # global default: isolated
+        if registered:
+            store.register_platform_session_scope(
+                "discord",
+                group_sessions_per_user=False,
+                thread_sessions_per_user=False,
+            )
+
+        alice = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="guild-123",
+            chat_type="group",
+            user_id="alice",
+            user_name="Alice",
+        )
+        bob = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="guild-123",
+            chat_type="group",
+            user_id="bob",
+            user_name="Bob",
+        )
+
+        alice_entry = store.get_or_create_session(alice)
+        bob_entry = store.get_or_create_session(bob)
+
+        if expected_shared:
+            assert alice_entry.session_key == "agent:main:discord:group:guild-123"
+            assert alice_entry.session_key == bob_entry.session_key
+            assert alice_entry.session_id == bob_entry.session_id
+        else:
+            assert alice_entry.session_key != bob_entry.session_key
+            assert alice_entry.session_id != bob_entry.session_id
+
+    def test_adapter_declared_scope_is_profile_keyed(self, store):
+        """One profile's override must not leak into another profile's key
+        shape: a registration for a named profile is invisible to the active
+        (default) profile, while a profile=None registration is the
+        every-profile default."""
+        store.config.group_sessions_per_user = True
+        store.register_platform_session_scope(
+            "discord",
+            group_sessions_per_user=False,
+            thread_sessions_per_user=False,
+            profile="eva",
+        )
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="guild-123",
+            chat_type="group",
+            user_id="alice",
+        )
+        # Active profile has no registration — global default (isolated) wins.
+        assert store.resolve_session_scope(source) == (True, False)
+
+        store.register_platform_session_scope(
+            "discord",
+            group_sessions_per_user=False,
+            thread_sessions_per_user=True,
+        )
+        assert store.resolve_session_scope(source) == (False, True)
+
     def test_telegram_dm_includes_chat_id(self):
         """Non-WhatsApp DMs should also include chat_id to separate users."""
         source = SessionSource(
