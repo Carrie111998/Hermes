@@ -338,6 +338,89 @@ class TestResolveAliasEdgeCases:
 
 
 # ---------------------------------------------------------------------------
+# resolve_alias: sort-key date-stamp handling
+# ---------------------------------------------------------------------------
+
+class TestResolveAliasSorting:
+    """Aliases matching multiple catalog models must NOT silently pick one —
+    resolve_alias raises AmbiguousAliasError with candidates sorted
+    best-guess-first (dated snapshots demoted below real point versions)."""
+
+    def test_anthropic_opus_ambiguous_lists_candidates(self, monkeypatch):
+        """Multiple family matches surface a choice instead of auto-picking;
+        the display ordering demotes date-stamped snapshots."""
+        import pytest
+
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr("hermes_cli.models._PROVIDER_MODELS", {})
+        monkeypatch.setattr(ms, "_ensure_direct_aliases", lambda: None)
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {})
+        monkeypatch.setattr(ms, "list_provider_models",
+                            lambda p: ["claude-opus-4-1", "claude-opus-4-7",
+                                       "claude-opus-4-8",
+                                       "claude-opus-4-20250514"])
+        with pytest.raises(ms.AmbiguousAliasError) as exc:
+            ms.resolve_alias("opus", "anthropic")
+        assert exc.value.candidates[0] == "claude-opus-4-8"
+        assert set(exc.value.candidates) == {
+            "claude-opus-4-1", "claude-opus-4-7",
+            "claude-opus-4-8", "claude-opus-4-20250514",
+        }
+
+    def test_unsynced_new_model_sorts_first(self, monkeypatch):
+        """A just-released model missing from models.dev still ranks above
+        older, dated siblings in the candidate ordering."""
+        import pytest
+
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr("hermes_cli.models._PROVIDER_MODELS", {})
+        monkeypatch.setattr(ms, "_ensure_direct_aliases", lambda: None)
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {})
+        monkeypatch.setattr(ms, "list_provider_models",
+                            lambda p: ["claude-opus-4-7", "claude-opus-4-8",
+                                       "claude-opus-4-20250514",
+                                       "claude-opus-4-9"])
+        with pytest.raises(ms.AmbiguousAliasError) as exc:
+            ms.resolve_alias("opus", "anthropic")
+        assert exc.value.candidates[0] == "claude-opus-4-9"
+
+    def test_single_match_resolves_without_error(self, monkeypatch):
+        """Exactly one family match still resolves automatically."""
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr("hermes_cli.models._PROVIDER_MODELS", {})
+        monkeypatch.setattr(ms, "_ensure_direct_aliases", lambda: None)
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {})
+        monkeypatch.setattr(ms, "list_provider_models",
+                            lambda p: ["claude-opus-4-8", "claude-sonnet-4-6"])
+        result = ms.resolve_alias("opus", "anthropic")
+        assert result is not None and result[1] == "claude-opus-4-8"
+
+    def test_switch_model_surfaces_ambiguity_message(self, monkeypatch):
+        """switch_model returns a failure result listing the candidates
+        instead of switching to a heuristic guess."""
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr("hermes_cli.models._PROVIDER_MODELS", {})
+        monkeypatch.setattr(ms, "_ensure_direct_aliases", lambda: None)
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {})
+        monkeypatch.setattr(ms, "list_provider_models",
+                            lambda p: ["claude-opus-4-8",
+                                       "claude-opus-4-20250514"])
+        result = ms.switch_model(
+            "opus",
+            current_provider="anthropic",
+            current_model="claude-sonnet-4-6",
+        )
+        assert result.success is False
+        assert "claude-opus-4-8" in result.error_message
+        assert "claude-opus-4-20250514" in result.error_message
+        assert "not switching automatically" in result.error_message
+
+
+# ---------------------------------------------------------------------------
 # switch_model: direct alias base_url override
 # ---------------------------------------------------------------------------
 
@@ -488,7 +571,7 @@ class TestSwitchModelDirectAliasOverride:
             "my-b": DirectAlias(
                 "claude-opus-4-6",
                 "custom:provider-b",
-                "https://api-b.example.com/",
+                "HTTPS://API-B.EXAMPLE.COM/",
             ),
         })
         self._stub_explicit_provider_b(monkeypatch, ms)
@@ -511,8 +594,44 @@ class TestSwitchModelDirectAliasOverride:
         )
 
         assert result.success
-        assert result.base_url == "https://api-b.example.com/"
+        assert result.base_url == "HTTPS://API-B.EXAMPLE.COM/"
         assert result.api_mode == "anthropic_messages"
+        assert result.resolved_via_alias == "my-b"
+
+    def test_different_alias_path_redetects_runtime_api_mode(self, monkeypatch):
+        """A different path is a real redirect and invalidates runtime transport."""
+        from hermes_cli.model_switch import DirectAlias
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(ms, "DIRECT_ALIASES", {
+            "my-b": DirectAlias(
+                "claude-opus-4-6",
+                "custom:provider-b",
+                "https://api-b.example.com/v2",
+            ),
+        })
+        self._stub_explicit_provider_b(monkeypatch, ms)
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda requested=None, **_kwargs: {
+                "api_key": "sk-bbb",
+                "base_url": "https://api-b.example.com/v1",
+                "api_mode": "anthropic_messages",
+                "provider": "custom:provider-b",
+            },
+        )
+
+        result = ms.switch_model(
+            "claude-opus-4-6",
+            "custom:provider-a",
+            "old-model",
+            current_base_url="https://api-a.example.com",
+            explicit_provider="custom:provider-b",
+        )
+
+        assert result.success
+        assert result.base_url == "https://api-b.example.com/v2"
+        assert result.api_mode == "chat_completions"
         assert result.resolved_via_alias == "my-b"
 
     def test_real_config_matching_alias_preserves_provider_transport(
@@ -579,7 +698,11 @@ class TestSwitchModelDirectAliasOverride:
 
         assert result.success
         assert result.target_provider == "provider-b"
-        assert result.base_url == "https://api-b.example.com/v1/"
+        from hermes_cli.route_identity import normalize_route_base_url
+
+        assert normalize_route_base_url(result.base_url) == (
+            "https://api-b.example.com/v1"
+        )
         assert result.api_mode == "anthropic_messages"
         assert result.resolved_via_alias == "shared-b"
 
