@@ -5316,6 +5316,17 @@ def generate_launchd_plist() -> str:
     <key>KeepAlive</key>
     <true/>
 
+    <!-- ProcessType=Interactive keeps launchd from classifying the gateway
+         as a daemon (3): on active multiplex installs the daemon class left
+         the child in an uninterruptible U-state startup stall for 4-6
+         minutes (main thread inside PyYAML CParser / gc_collect under
+         daemon scheduling) until the watchdog killed and restarted it —
+         cron heartbeat went STALLED and every platform profile was
+         unavailable. The interactive class (4) reaches a fresh heartbeat
+         and connects all profiles in ~8s (#99563). -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
     <!-- ThrottleInterval raises launchd's default 10s minimum respawn interval
          to 30s so a crash-looping gateway can't hammer launchd into a rapid
          respawn storm; ExitTimeOut gives the gateway 25s of graceful-drain

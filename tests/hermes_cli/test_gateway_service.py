@@ -343,6 +343,19 @@ class TestGeneratedSystemdUnits:
 
         assert "SoftResourceLimits" not in plist
 
+    def test_launchd_plist_sets_interactive_process_type(self, monkeypatch):
+        """Without ProcessType, launchd classifies the gateway as a daemon
+        (spawn type 3): on active multiplex installs the child repeatedly
+        sat in an uninterruptible U-state startup stall for 4-6 minutes
+        until the watchdog killed and restarted it — cron heartbeat went
+        STALLED and every platform profile was unavailable. The interactive
+        class (4) reaches a fresh heartbeat and connects all profiles in
+        ~8s (#99563, live-verified on macOS 26.4.1 / arm64)."""
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<key>ProcessType</key>" in plist
+        assert "<string>Interactive</string>" in plist
+
 
 
 class TestGatewayStopCleanup:
