@@ -288,7 +288,20 @@ class SSHEnvironment(BaseEnvironment):
             # existing directories (e.g. /home/<user>) with the staging
             # directory's mode.  Without this, a umask 002 produces 0775
             # dirs which breaks sshd StrictModes (refuses authorized_keys).
-            ssh_cmd.append(f"tar xf - --no-overwrite-dir -C {shlex.quote(base)}")
+            #
+            # It is a GNU tar flag.  BSD tar (macOS, FreeBSD remotes) rejects
+            # it outright, exits immediately, and the local tar then dies of
+            # SIGPIPE reporting a misleading "tar: Write error".  Let the
+            # remote shell pick: GNU takes the flag, BSD falls back without
+            # it -- BSD tar does not overwrite existing directory modes
+            # anyway, so the property is preserved either way.  Negotiating
+            # in-band keeps this a single round trip (no capability probe).
+            quoted_base = shlex.quote(base)
+            ssh_cmd.append(
+                f"if tar --no-overwrite-dir --version >/dev/null 2>&1; "
+                f"then exec tar xf - --no-overwrite-dir -C {quoted_base}; "
+                f"else exec tar xf - -C {quoted_base}; fi"
+            )
 
             tar_proc = subprocess.Popen(
                 tar_cmd,
@@ -332,9 +345,16 @@ class SSHEnvironment(BaseEnvironment):
                 )
 
             if tar_proc.returncode != 0:
+                # A remote-side rejection (bad flag, missing dir) closes the
+                # pipe and kills the local tar with SIGPIPE, so tar's own
+                # message is a misleading "Write error". Surface the remote
+                # stderr too — it carries the actual cause.
+                remote_err = ssh_stderr.decode(errors='replace').strip()
+                detail = tar_stderr_raw.decode(errors='replace').strip()
+                if remote_err:
+                    detail = f"{detail} | remote: {remote_err}"
                 raise RuntimeError(
-                    f"tar create failed (rc={tar_proc.returncode}): "
-                    f"{tar_stderr_raw.decode(errors='replace').strip()}"
+                    f"tar create failed (rc={tar_proc.returncode}): {detail}"
                 )
             if ssh_proc.returncode != 0:
                 raise EnvironmentConnectionError(
@@ -348,17 +368,38 @@ class SSHEnvironment(BaseEnvironment):
 
         logger.debug("SSH: bulk-uploaded %d file(s) via tar pipe", len(files))
 
-    def _ssh_bulk_download(self, dest: Path) -> None:
-        """Download remote .hermes/ as a tar archive."""
+    def _ssh_bulk_download(self, dest: Path, paths: list[str] | None = None) -> None:
+        """Download remote .hermes/ as a tar archive.
+
+        *paths* limits the archive to specific absolute remote paths. sync_back
+        only ever applies files it previously pushed, so restricting the tar to
+        those keeps it proportional to what was sent rather than to the size of
+        the remote ~/.hermes, which on a real install holds the Hermes checkout,
+        a bundled node, and LSP servers and runs to multiple GB.
+        """
         # Tar from / with the full path so archive entries preserve absolute
         # paths (e.g. home/user/.hermes/skills/f.py), matching _pushed_hashes keys.
         rel_base = f"{self._remote_home}/.hermes".lstrip("/")
         ssh_cmd = self._build_ssh_command()
-        ssh_cmd.append(f"tar cf - -C / {shlex.quote(rel_base)}")
+
+        stdin_data: bytes | None = None
+        if paths:
+            # Feed the explicit list on stdin (-T -). Supported by both GNU and
+            # BSD tar. Paths are relative to / to match the -C / archive root.
+            rel_paths = [p.lstrip("/") for p in paths if p]
+            if not rel_paths:
+                dest.write_bytes(b"")
+                return
+            stdin_data = ("\n".join(rel_paths) + "\n").encode()
+            ssh_cmd.append("tar cf - -C / -T -")
+        else:
+            ssh_cmd.append(f"tar cf - -C / {shlex.quote(rel_base)}")
+
         with open(dest, "wb") as f:
             result = subprocess.run(
                 ssh_cmd,
-                stdin=subprocess.DEVNULL,
+                input=stdin_data,
+                stdin=subprocess.DEVNULL if stdin_data is None else None,
                 stdout=f,
                 stderr=subprocess.PIPE,
                 timeout=120,
