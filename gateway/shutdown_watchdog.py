@@ -527,53 +527,69 @@ async def loop_heartbeat_forever(
     # no longer sufficient authority to escalate.
     #
     # Windows: asyncio.start_unix_server raises (no AF_UNIX event-loop
-    # support), so the witness is PERMANENTLY absent there — the payload
-    # records loop_tick_socket=False and every stale-file probe classifies
-    # UNKNOWN, never WEDGED. That is deliberate fail-safe: a wedged native
-    # Windows gateway keeps the graceful-drain backstop instead of an
-    # escalation verdict built on a witness that cannot exist. (WSL2 — the
-    # #90502 incident environment — is Linux and arms the socket normally.)
+    # support). On native Windows we fall back to a TCP loopback witness
+    # (127.0.0.1:0, ephemeral port) so liveness detection is not permanently
+    # degraded there. The heartbeat payload reports loop_tick_socket=True when
+    # *either* transport is armed; probes check the appropriate transport per
+    # platform. (WSL2 — the #90502 incident environment — is Linux and arms
+    # the Unix socket normally.)
     tick_server = None
     tick_socket_path = None
+    tick_tcp_port: Optional[int] = None
     try:
-        tick_socket_path = get_loop_tick_socket_path(home)
-        tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
-        # Re-bind over a leftover node from a dead process (os._exit(75) /
-        # SIGKILL skip the finally-unlink; PID reuse re-lands on this
-        # PID-suffixed path) is handled by asyncio itself:
-        # create_unix_server os.remove()s an existing socket node before
-        # binding — guarded by test_producer_rebinds_over_stale_socket_node.
-        # What asyncio does NOT do is clean up SIBLING nodes from other
-        # dead PIDs, so sweep those to keep state/ from accumulating
-        # gateway.loop-tick.*.sock nodes across crash-restart cycles.
-        # POSIX-only: os.kill(pid, 0) is a liveness probe here, but on
-        # Windows os.kill calls TerminateProcess for non-CTRL signals —
-        # and AF_UNIX server nodes are never created there anyway.
-        if os.name == "posix":
+        if sys.platform == "win32":
+            # TCP loopback witness for native Windows -- no AF_UNIX.
+            # Bind to 127.0.0.1:0 and publish the port in the heartbeat so
+            # local probes can connect without filesystem discovery.
+            tick_server = await asyncio.start_server(
+                _tick_socket_handler, host="127.0.0.1", port=0
+            )
             try:
-                for _stale in tick_socket_path.parent.glob(
-                    "gateway.loop-tick.*.sock"
-                ):
-                    if _stale == tick_socket_path:
-                        continue
-                    try:
-                        _stale_pid = int(_stale.name.split(".")[-2])
-                    except (ValueError, IndexError):
-                        _stale.unlink(missing_ok=True)
-                        continue
-                    try:
-                        os.kill(_stale_pid, 0)  # windows-footgun: ok — inside os.name == "posix" gate
-                    except OSError:
-                        _stale.unlink(missing_ok=True)
+                sockets = getattr(tick_server, "sockets", None) or []
+                if sockets:
+                    tick_tcp_port = int(sockets[0].getsockname()[1])
             except Exception:
-                logger.debug(
-                    "stale loop-tick socket sweep failed", exc_info=True
-                )
-        tick_server = await asyncio.start_unix_server(
-            _tick_socket_handler, path=str(tick_socket_path)
-        )
+                tick_tcp_port = None
+        else:
+            tick_socket_path = get_loop_tick_socket_path(home)
+            tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
+            # Re-bind over a leftover node from a dead process (os._exit(75) /
+            # SIGKILL skip the finally-unlink; PID reuse re-lands on this
+            # PID-suffixed path) is handled by asyncio itself:
+            # create_unix_server os.remove()s an existing socket node before
+            # binding — guarded by test_producer_rebinds_over_stale_socket_node.
+            # What asyncio does NOT do is clean up SIBLING nodes from other
+            # dead PIDs, so sweep those to keep state/ from accumulating
+            # gateway.loop-tick.*.sock nodes across crash-restart cycles.
+            # POSIX-only: os.kill(pid, 0) is a liveness probe here, but on
+            # Windows os.kill calls TerminateProcess for non-CTRL signals —
+            # and AF_UNIX server nodes are never created there anyway.
+            if os.name == "posix":
+                try:
+                    for _stale in tick_socket_path.parent.glob(
+                        "gateway.loop-tick.*.sock"
+                    ):
+                        if _stale == tick_socket_path:
+                            continue
+                        try:
+                            _stale_pid = int(_stale.name.split(".")[-2])
+                        except (ValueError, IndexError):
+                            _stale.unlink(missing_ok=True)
+                            continue
+                        try:
+                            os.kill(_stale_pid, 0)  # windows-footgun: ok — inside os.name == "posix" gate
+                        except OSError:
+                            _stale.unlink(missing_ok=True)
+                except Exception:
+                    logger.debug(
+                        "stale loop-tick socket sweep failed", exc_info=True
+                    )
+            tick_server = await asyncio.start_unix_server(
+                _tick_socket_handler, path=str(tick_socket_path)
+            )
     except Exception:
         tick_server = None
+        tick_tcp_port = None
         logger.warning(
             "Loop tick socket unavailable — liveness probes will have no "
             "loop-scheduling witness and will not escalate on a stale heartbeat",
@@ -584,11 +600,14 @@ async def loop_heartbeat_forever(
         # write_loop_heartbeat never raises, so a failure here is an executor
         # problem (shutdown, saturation) and must not kill the heartbeat task.
         try:
+            extra: dict = {"loop_tick_socket": tick_server is not None}
+            if tick_tcp_port is not None:
+                extra["loop_tick_port"] = tick_tcp_port
             await asyncio.to_thread(
                 write_loop_heartbeat,
                 start_time=start_time,
                 home=home,
-                extra={"loop_tick_socket": tick_server is not None},
+                extra=extra,
             )
         except asyncio.CancelledError:
             raise
