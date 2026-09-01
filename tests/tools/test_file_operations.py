@@ -421,6 +421,33 @@ class TestFileSearchPolicyHook:
         assert result.error == "canonical target denied"
         assert seen["path"] == str(restricted.resolve())
 
+    def test_allowed_search_reuses_the_core_resolved_path(self, monkeypatch):
+        self._install_hook(monkeypatch, lambda **kwargs: {"action": "allow"})
+        env = MagicMock()
+        env.cwd = "/workspace"
+        env.is_local = True
+        commands = []
+
+        def execute(command, **_kwargs):
+            commands.append(command)
+            if "realpath" in command:
+                return {"output": "/canonical/target\n", "returncode": 0}
+            if command.startswith("command -v rg"):
+                return {"output": "yes\n", "returncode": 0}
+            return {"output": "", "returncode": 1}
+
+        env.execute.side_effect = execute
+
+        ShellFileOperations(env).search("needle", path="/mutable/link")
+
+        search_command = next(
+            command
+            for command in commands
+            if "rg " in command and not command.startswith("command -v")
+        )
+        assert "/canonical/target" in search_command
+        assert "/mutable/link" not in search_command
+
 
 def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMock:
     """Mock env whose execute() runs the command in a real subprocess.

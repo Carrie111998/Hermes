@@ -2850,12 +2850,18 @@ class ShellFileOperations(FileOperations):
             if resolved.exit_code != 0 or not effective_path:
                 return (_SEARCH_POLICY_RESOLUTION_ERROR, path)
 
-            return get_file_search_policy_decision(
+            policy_error, _ = get_file_search_policy_decision(
                 path=effective_path,
                 cwd=str(cwd),
                 backend=backend,
                 is_local=is_local,
             )
+            # Reuse the backend-canonical path that was evaluated. The value
+            # comes from core resolution, not plugin output, so callbacks still
+            # cannot rewrite targets. This operational guard is not an
+            # adversarial filesystem object-identity boundary; a caller with
+            # concurrent write access can still replace canonical ancestors.
+            return policy_error, effective_path
         except Exception:
             # Plugin discovery/dispatch failures must not bypass a registered
             # search policy.  The helper itself distinguishes "no hook" from
