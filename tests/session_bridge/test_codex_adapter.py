@@ -239,7 +239,19 @@ class TestInventory:
             assert params["sortDirection"] == "desc"
             assert timeout == 30.0
 
-    def test_recent_inventory_stops_on_a_full_page_of_known_tasks(self) -> None:
+    def test_recent_inventory_pages_past_a_full_page_of_known_tasks(self) -> None:
+        """A page of already-known ids must NOT end enumeration.
+
+        Regression for the 2026-09-01 under-collection: the old
+        ``page_native_ids <= known_native_ids`` break assumed unknown threads sit
+        contiguously at the head of ``updated_at desc``. A bulk burst breaks that
+        assumption, and once 100 newer known threads accumulate above the burst,
+        page 1 alone ended the scan and the burst became permanently unreachable
+        -- 263 threads, recoverable only by ``scan --all-history``.
+
+        Here ``buried`` sits behind a full page of known ids and above the
+        cutoff, so it must be returned.
+        """
         client = FakeInitializingClient({
             "thread/list": [
                 {
@@ -250,22 +262,30 @@ class TestInventory:
                             "updatedAt": 300,
                         }
                     ],
-                    "nextCursor": "must-not-be-read",
-                }
+                    "nextCursor": "page-2",
+                },
+                {
+                    "data": [
+                        {
+                            "id": "buried",
+                            "createdAt": 190,
+                            "updatedAt": 200,
+                        }
+                    ],
+                },
             ]
         })
 
         summaries = CodexSourceAdapter(
             client,
             marker_secret=SECRET,
-        ).list_recent_inventory(
-            archived=False,
-            after=0,
-            known_native_ids=frozenset({"known"}),
-        )
+        ).list_recent_inventory(archived=False, after=0)
 
-        assert [summary.native_id for summary in summaries] == ["known"]
-        assert len(client.calls) == 1
+        assert sorted(summary.native_id for summary in summaries) == [
+            "buried",
+            "known",
+        ]
+        assert len(client.calls) == 2
 
     def test_projection_reuses_trusted_origin_snapshot_from_inventory(self) -> None:
         native_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"

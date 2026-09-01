@@ -76,6 +76,7 @@ _CLAUDE_STAGED_KEY = "session-bridge:scan:claude:staged-fingerprints"
 _CODEX_PENDING_KEY = "session-bridge:scan:codex:pending"
 _CODEX_PROGRESS_KEY = "session-bridge:scan:codex:progress"
 _CODEX_SEEN_KEY = "session-bridge:scan:codex:seen"
+_CODEX_FRONTIER_KEY = "session-bridge:scan:codex:frontier"
 _ATTEMPT_KEY_PREFIX = "session-bridge:attempt:"
 
 
@@ -2497,7 +2498,7 @@ async def test_codex_continuous_scan_uses_recent_bounded_inventory() -> None:
                 summaries_by_native_id={summary.native_id: summary},
                 operations=operations,
             )
-            self.recent_calls: list[tuple[bool, float, frozenset[str]]] = []
+            self.recent_calls: list[tuple[bool, float]] = []
 
         def list_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
             del archived
@@ -2508,9 +2509,8 @@ async def test_codex_continuous_scan_uses_recent_bounded_inventory() -> None:
             *,
             archived: bool,
             after: float,
-            known_native_ids: frozenset[str],
         ) -> list[CodexThreadSummary]:
-            self.recent_calls.append((archived, after, known_native_ids))
+            self.recent_calls.append((archived, after))
             return [] if archived else [summary]
 
     adapter = RecentCodexAdapter()
@@ -2530,11 +2530,138 @@ async def test_codex_continuous_scan_uses_recent_bounded_inventory() -> None:
 
     assert result.failed == 0
     assert result.indexed == 1
-    assert adapter.recent_calls == [
-        (False, 250.0, frozenset({"codex-known"})),
-        (True, 250.0, frozenset({"codex-known"})),
-    ]
+    # The cutoff is the frontier; with none persisted yet it falls back to the
+    # bootstrap watermark. The seen-set is no longer passed to the adapter --
+    # a page of known ids must not end enumeration.
+    assert adapter.recent_calls == [(False, 250.0), (True, 250.0)]
     assert adapter.projected_native_ids == ["codex-recent"]
+    # The cycle drained everything it staged, so the frontier advanced to the
+    # newest activity it saw and the next scan starts from there.
+    assert store.states[_CODEX_FRONTIER_KEY]["frontier"] == 300.0
+
+
+@pytest.mark.asyncio
+async def test_codex_deferred_thread_is_not_marked_seen() -> None:
+    """A deferred thread must stay stageable.
+
+    Regression for the 2026-09-01 seen-set defect: the durable seen-set was
+    saved as ``seen_ids | set(inventory_ids)``, so every id the inventory
+    RETURNED was marked seen whether or not it was ever indexed. Because
+    ``_commit_scan_batch`` also drains the whole selected prefix from pending, a
+    deferred id was dropped from pending AND marked seen in the same cycle, and
+    ``genuinely_new_ids`` could never stage it again -- despite the deferral
+    branch's own comment promising it is retried. Measured residue: 65 threads.
+    """
+    deferred = _codex_summary("codex-deferred", 300.0)
+    operations: list[tuple[object, ...]] = []
+
+    class DeferringCodexAdapter(_BacklogCodexAdapter):
+        def __init__(self) -> None:
+            super().__init__(
+                inventory_batches=[],
+                summaries_by_native_id={deferred.native_id: deferred},
+                operations=operations,
+            )
+
+        def list_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
+            del archived
+            raise AssertionError("continuous scan must not page through full inventory")
+
+        def list_recent_inventory(
+            self,
+            *,
+            archived: bool,
+            after: float,
+        ) -> list[CodexThreadSummary]:
+            del after
+            return [] if archived else [deferred]
+
+        def project_thread(self, summary: CodexThreadSummary) -> SessionProjection:
+            del summary
+            raise TimeoutError("codex app-server did not answer")
+
+    adapter = DeferringCodexAdapter()
+    store = _StateStore(operations)
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CODEX: adapter},
+    )
+    coordinator._continuous_watermark = 250.0
+    store.states[_CODEX_SEEN_KEY] = {"version": 1, "native_ids": ["codex-known"]}
+
+    result = await coordinator.scan_once(Provider.CODEX)
+
+    # A deferral describes the host, not the thread: never a scan failure.
+    assert result.failed == 0
+    assert result.indexed == 0
+    # The whole point: no durable trace that would exclude it from a later scan.
+    assert store.states[_CODEX_SEEN_KEY]["native_ids"] == ["codex-known"]
+    # And the frontier must not move past work that never finished.
+    assert _CODEX_FRONTIER_KEY not in store.states
+
+
+@pytest.mark.asyncio
+async def test_codex_partial_batch_does_not_advance_the_frontier() -> None:
+    """An undrained cycle must leave the cutoff where the next scan can re-page.
+
+    The frontier replaced the ``known_native_ids`` early break as the continuous
+    path's stopping rule. That only stays sound if it advances exclusively on a
+    cycle that finished everything it staged -- otherwise the leftovers sit below
+    the new cutoff and are never enumerated again, which is exactly how 263
+    threads were lost on 2026-08-19.
+    """
+    older = _codex_summary("codex-older", 300.0)
+    newer = _codex_summary("codex-newer", 310.0)
+    operations: list[tuple[object, ...]] = []
+
+    class TwoThreadCodexAdapter(_BacklogCodexAdapter):
+        def __init__(self) -> None:
+            super().__init__(
+                inventory_batches=[],
+                summaries_by_native_id={
+                    older.native_id: older,
+                    newer.native_id: newer,
+                },
+                operations=operations,
+            )
+
+        def list_inventory(self, *, archived: bool) -> list[CodexThreadSummary]:
+            del archived
+            raise AssertionError("continuous scan must not page through full inventory")
+
+        def list_recent_inventory(
+            self,
+            *,
+            archived: bool,
+            after: float,
+        ) -> list[CodexThreadSummary]:
+            del after
+            return [] if archived else [older, newer]
+
+    adapter = TwoThreadCodexAdapter()
+    store = _StateStore(operations)
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=store,
+        adapters={Provider.CODEX: adapter},
+        scan_batch_size=1,
+    )
+    coordinator._continuous_watermark = 250.0
+    store.states[_CODEX_SEEN_KEY] = {"version": 1, "native_ids": ["codex-known"]}
+
+    result = await coordinator.scan_once(Provider.CODEX)
+
+    # Newest first, so only `codex-newer` fits this batch.
+    assert result.indexed == 1
+    assert adapter.projected_native_ids == ["codex-newer"]
+    # `codex-older` was enumerated but never committed: it must NOT be seen, or
+    # the batch that finally reaches it could never stage it.
+    assert store.states[_CODEX_SEEN_KEY]["native_ids"] == [
+        "codex-known",
+        "codex-newer",
+    ]
+    assert _CODEX_FRONTIER_KEY not in store.states
 
 
 @pytest.mark.asyncio

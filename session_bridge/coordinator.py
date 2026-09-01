@@ -986,6 +986,10 @@ _CLAUDE_CURSOR_KEY = "session-bridge:scan:claude:cursors"
 _CLAUDE_FINGERPRINT_KEY = "session-bridge:scan:claude:fingerprints"
 _CLAUDE_STAGED_KEY = "session-bridge:scan:claude:staged-fingerprints"
 _CODEX_SEEN_KEY = "session-bridge:scan:codex:seen"
+# The newest activity timestamp a codex scan has fully DRAINED. It advances only
+# when a cycle leaves nothing staged and nothing deferred, so unfinished work is
+# always re-enumerated rather than buried under newer threads.
+_CODEX_FRONTIER_KEY = "session-bridge:scan:codex:frontier"
 _CONTINUATION_RECONCILE_CURSOR_KEY = "session-bridge:reconcile:continuation-cursor"
 _CONTINUATION_RECONCILE_BATCH_SIZE = 5
 _EXTERNAL_PROVIDERS = (Provider.CLAUDE, Provider.CODEX)
@@ -3928,6 +3932,31 @@ class SessionBridgeCoordinator:
             {"version": 1, "native_ids": sorted(native_ids)},
         )
 
+    async def _load_codex_frontier(self) -> float | None:
+        state = await asyncio.to_thread(
+            _call,
+            self._store,
+            "get_state",
+            _CODEX_FRONTIER_KEY,
+        )
+        if not isinstance(state, Mapping):
+            return None
+        value = state.get("frontier")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        frontier = float(value)
+        return frontier if math.isfinite(frontier) else None
+
+    async def _save_codex_frontier(self, frontier: float) -> None:
+        # Never moves backwards: a lower frontier would re-page history forever.
+        await asyncio.to_thread(
+            _call,
+            self._store,
+            "set_state",
+            _CODEX_FRONTIER_KEY,
+            {"version": 1, "frontier": float(frontier)},
+        )
+
     async def _cataloged_codex_rows(
         self, native_ids: Sequence[str]
     ) -> dict[str, Mapping[str, Any]]:
@@ -5049,13 +5078,19 @@ class SessionBridgeCoordinator:
         progress = await self._load_progress(provider)
         seen_ids = await self._load_codex_seen_ids()
         recent_inventory = getattr(adapter, "list_recent_inventory", None)
+        # The drained frontier, not the bootstrap watermark, is what bounds a
+        # continuous query. It only moves once a cycle finishes its staged work,
+        # so an interrupted or deferred batch is re-paged next time.
+        frontier = await self._load_codex_frontier()
+        if frontier is None:
+            frontier = self._continuous_watermark
         # An empty durable seen-set is a bootstrap or outage-recovery state.
         # The continuous watermark can be newer than every native task, so a
         # recent-only query would incorrectly declare recovery successful
         # without ever indexing the existing inventory.
         if (
             discovery_mode is DiscoveryMode.CONTINUOUS
-            and self._continuous_watermark is not None
+            and frontier is not None
             and seen_ids
             and callable(recent_inventory)
         ):
@@ -5063,8 +5098,7 @@ class SessionBridgeCoordinator:
                 _codex_recent_inventory,
                 adapter,
                 include_archived=self._config.catalog.include_archived_codex,
-                after=self._continuous_watermark,
-                known_native_ids=frozenset(seen_ids),
+                after=frontier,
             )
         else:
             discovered_summaries = await self._provider_call(
@@ -5135,6 +5169,11 @@ class SessionBridgeCoordinator:
         locally_owned = 0
         deferred = 0
         vanished = 0
+        # Ids that reached a state they can never leave: committed, unresolvable
+        # at the source, or permanently refused because a local session owns the
+        # canonical id. ONLY these may enter the durable seen-set -- see the save
+        # below for why enumerating an id is not enough.
+        terminal_ids: set[str] = set()
         for native_id in selected_ids:
             try:
                 summary = summaries_by_native_id.get(native_id)
@@ -5163,6 +5202,7 @@ class SessionBridgeCoordinator:
                     # re-staging it. Same reasoning as the LocalSessionOwnsCanonicalId /
                     # StaleExternalProjection / TimeoutError branches below.
                     vanished += 1
+                    terminal_ids.add(native_id)
                     self._record_codex_scan_diagnostic(
                         stage="persistent_project",
                         native_id=native_id,
@@ -5196,6 +5236,7 @@ class SessionBridgeCoordinator:
                 # subsequent cycle re-attempts the same thread forever and the
                 # provider never leaves the degraded state.
                 locally_owned += 1
+                terminal_ids.add(native_id)
                 continue
             except (TimeoutError, StaleExternalProjection) as exc:
                 # Same reasoning as the branch above, for the other two benign
@@ -5228,6 +5269,7 @@ class SessionBridgeCoordinator:
                     duration_ms=0,
                 )
             indexed += 1
+            terminal_ids.add(native_id)
         if vanished:
             # Counted, never silent. Unlike the timeout branch these ids are DROPPED
             # from staged rather than retried: the source cannot resolve them at all.
@@ -5257,7 +5299,32 @@ class SessionBridgeCoordinator:
             selected_ids=selected_ids,
             previous_progress=progress,
         )
-        await self._save_codex_seen_ids(seen_ids | set(inventory_ids))
+        # 2026-09-01: this used to be `seen_ids | set(inventory_ids)` -- every id
+        # the inventory RETURNED was marked seen, whether or not it was ever
+        # indexed. `genuinely_new_ids` excludes anything in seen_ids, and
+        # _commit_scan_batch drains the whole selected prefix from pending, so an
+        # id that was enumerated but deferred (app-server timeout / stale
+        # projection) was dropped from pending AND marked seen in the same cycle
+        # and could never be staged again -- despite the deferral comments above
+        # promising it is "retried next cycle". Measured residue: 65 threads.
+        # Only terminal ids may be marked seen. Deferred ids are deliberately
+        # absent, which is what makes the retry real.
+        await self._save_codex_seen_ids(seen_ids | terminal_ids)
+        # The frontier may only advance when this cycle finished everything it
+        # staged. A partial batch, a deferral or a vanished-thread drop all mean
+        # the next cycle must still be able to page back to where it started.
+        drained = (
+            len(selected_ids) == len(staged_ids)
+            and not deferred
+            and terminal_ids >= set(staged_ids)
+        )
+        if drained and inventory_ids:
+            newest = max(
+                _codex_last_active(summaries_by_native_id[native_id])
+                for native_id in inventory_ids
+            )
+            if frontier is None or newest > frontier:
+                await self._save_codex_frontier(newest)
         await self._record_backfill_successes(
             provider,
             discovery_mode,
@@ -6200,7 +6267,6 @@ def _codex_recent_inventory(
     *,
     include_archived: bool,
     after: float,
-    known_native_ids: frozenset[str],
 ) -> list[object]:
     passes = [False, True] if include_archived else [False]
     merged: dict[str, object] = {}
@@ -6210,7 +6276,6 @@ def _codex_recent_inventory(
             "list_recent_inventory",
             archived=archived,
             after=after,
-            known_native_ids=known_native_ids,
         )
         try:
             batch = list(summaries)

@@ -1095,9 +1095,14 @@ class CodexSourceAdapter:
         *,
         archived: bool,
         after: float,
-        known_native_ids: frozenset[str] = frozenset(),
     ) -> list[CodexThreadSummary]:
-        """Return recent state-DB summaries without paging full task payloads."""
+        """Return recent state-DB summaries without paging full task payloads.
+
+        ``after`` is the caller's drained frontier, and it is the ONLY stopping
+        rule. This used to also accept ``known_native_ids`` and stop at the
+        first page whose ids were all already known -- see _fetch_inventory_pages
+        for why that was unsound and what it cost.
+        """
 
         cutoff = float(after)
         if not math.isfinite(cutoff):
@@ -1108,7 +1113,6 @@ class CodexSourceAdapter:
             source_kinds=None,
             state_db_only=True,
             stop_after=cutoff,
-            known_native_ids=known_native_ids,
         )
         summaries = [
             summary for summary in summaries if summary.last_active >= cutoff
@@ -1810,7 +1814,6 @@ class CodexSourceAdapter:
         source_kinds: tuple[str, ...] | None,
         state_db_only: bool = False,
         stop_after: float | None = None,
-        known_native_ids: frozenset[str] = frozenset(),
         stop_on_native_id: str | None = None,
         deadline: float | None = None,
         stop: Any = None,
@@ -1873,12 +1876,20 @@ class CodexSourceAdapter:
             next_cursor = _first(response, "nextCursor", "next_cursor")
             if stop_on_native_id is not None and stop_on_native_id in page_native_ids:
                 break
-            if (
-                known_native_ids
-                and page_native_ids
-                and page_native_ids <= known_native_ids
-            ):
-                break
+            # 2026-09-01: there used to be a `page_native_ids <= known_native_ids`
+            # break here -- stop at the first page whose ids the caller already
+            # knows. It is only sound if unknown threads are CONTIGUOUS AT THE HEAD
+            # of the `updated_at desc` ordering, and a bulk burst violates that: the
+            # unknown cluster sits at a fixed depth while newer known threads pile up
+            # above it, and once 100 of them exist page 1 alone ends enumeration.
+            # Measured: 263 threads created 2026-08-19 19:09-23:46 became unreachable
+            # 18h later (2026-08-20 17:47, when the 100th newer thread appeared) and
+            # stayed unreachable -- they were never enumerated at all, so they never
+            # even reached the durable seen-set. Only `scan --all-history` recovered
+            # them, on 2026-09-01, as ~268 first-seen rows.
+            # `stop_after` is now the only stopping rule, and the coordinator moves
+            # it forward ONLY when a scan fully drains, so anything left unfinished
+            # is re-paged next cycle instead of being buried.
             if stop_after is not None and any(
                 summary.last_active < stop_after for summary in normalized.values()
             ):
