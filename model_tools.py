@@ -24,6 +24,7 @@ import os
 import json
 import re
 import asyncio
+from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
 import logging
@@ -1237,6 +1238,187 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+def _match_tool_arg_condition(condition: Any, args: Dict[str, Any]) -> bool:
+    """Evaluate whether an argument condition matches the supplied tool call arguments."""
+    if not condition or not isinstance(condition, dict):
+        return True
+    for key, expected in condition.items():
+        if key.endswith("!="):
+            actual_key = key[:-2].strip()
+            val = args.get(actual_key)
+            if isinstance(expected, (list, tuple, set)):
+                if val in expected:
+                    return False
+            else:
+                if val == expected:
+                    return False
+        else:
+            val = args.get(key)
+            if isinstance(expected, (list, tuple, set)):
+                if val not in expected:
+                    return False
+            else:
+                if val != expected:
+                    return False
+    return True
+
+
+# Per-turn repeat-block tracker for required-arg validation. Keyed by
+# (session_id, turn_id, tool_name, frozen missing-set) so a model that keeps
+# re-emitting the exact same malformed call accumulates an escalation even
+# though blocked calls are otherwise excluded from failure-loop accounting.
+_validation_block_counts: "OrderedDict[Any, int]" = OrderedDict()
+_VALIDATION_BLOCK_COUNTS_CAP = 200
+
+
+def _bump_validation_block_count(key: Tuple[Any, ...]) -> int:
+    """Increment the per-turn repeat counter for a blocked call shape."""
+    try:
+        count = _validation_block_counts.get(key, 0) + 1
+        _validation_block_counts[key] = count
+        # LRU: a re-hit key moves to the tail so the FIFO eviction below
+        # drops long-idle keys first (OrderedDict keeps insertion order).
+        _validation_block_counts.move_to_end(key)
+        while len(_validation_block_counts) > _VALIDATION_BLOCK_COUNTS_CAP:
+            _validation_block_counts.popitem(last=False)
+        return count
+    except Exception:
+        return 1
+
+
+def _ordinal(n: int) -> str:
+    """Format a small positive integer as an English ordinal (1st, 2nd, 3rd, 11th...)."""
+    try:
+        if 10 <= n % 100 <= 20:
+            suffix = "th"
+        else:
+            suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+        return f"{n}{suffix}"
+    except Exception:
+        return f"{n}th"
+
+
+def validate_required_tool_args(
+    tool_name: str,
+    args: Optional[Dict[str, Any]],
+    *,
+    session_id: str = "",
+    turn_id: str = "",
+    tlg: Optional[Any] = None,
+) -> Optional[str]:
+    """Return a block message if the tool call is missing required arguments, else None.
+
+    1) Schema required: Checks parameters.required from ToolRegistry.get_schema(tool_name).
+       Missing keys or None values are reported as missing.
+    2) Conditional required: Uses tool_loop_guardrails.conditional_required from the
+       resolved ToolCallGuardrailConfig (``tlg``) when provided, else falls back to the
+       bundled defaults. Conditions are matched against args; require/require_any lists
+       are checked.
+    3) Message assembly: Produces an actionable guidance string for the model:
+       "Tool {tool_name} is missing required argument(s): {missing}. {arg: description}"
+       Repeated identical block shapes within one turn escalate the message.
+    """
+    if not tool_name:
+        return None
+    args_dict = args if isinstance(args, dict) else {}
+
+    missing: List[str] = []
+    custom_hints: Dict[str, str] = {}
+    properties: Dict[str, Any] = {}
+
+    # 1) Universal: inspect registered tool schema from registry
+    try:
+        schema = registry.get_schema(tool_name)
+    except Exception:
+        schema = None
+
+    if isinstance(schema, dict):
+        fn_schema = schema.get("function") if isinstance(schema.get("function"), dict) else schema
+        params = fn_schema.get("parameters")
+        if not isinstance(params, dict):
+            params = fn_schema
+        if isinstance(params.get("properties"), dict):
+            properties = params["properties"]
+        if isinstance(params.get("required"), list):
+            for req in params["required"]:
+                if args_dict.get(req) is None and req not in missing:
+                    missing.append(req)
+
+    # 2) Conditional rules: use the resolved ToolCallGuardrailConfig when given,
+    #    otherwise fall back to the bundled defaults (keeps direct-call tests simple).
+    #    Both paths consume the same dataclass so defaults stay single-sourced.
+    if tlg is not None:
+        cond_map = getattr(tlg, "conditional_required", None) or {}
+    else:
+        try:
+            from agent.tool_guardrails import ToolCallGuardrailConfig
+
+            cond_map = ToolCallGuardrailConfig().conditional_required or {}
+        except Exception:
+            cond_map = {}
+
+    rules = cond_map.get(tool_name) if isinstance(cond_map, dict) else None
+    if rules:
+        rule_list = rules if isinstance(rules, list) else [rules]
+        for rule in rule_list:
+            if isinstance(rule, dict) and _match_tool_arg_condition(rule.get("condition"), args_dict):
+                for req in rule.get("require", []):
+                    if args_dict.get(req) is None and req not in missing:
+                        missing.append(req)
+                        if rule.get("hint") and req not in custom_hints:
+                            custom_hints[req] = rule["hint"]
+                require_any = rule.get("require_any", [])
+                if require_any and isinstance(require_any, list):
+                    if all(args_dict.get(req) is None for req in require_any):
+                        any_desc = " or ".join(require_any)
+                        if any_desc not in missing:
+                            missing.append(any_desc)
+                            if rule.get("hint") and any_desc not in custom_hints:
+                                custom_hints[any_desc] = rule["hint"]
+
+    if not missing:
+        return None
+
+    # 3) Assemble actionable message
+    hints: List[str] = []
+    for req in missing:
+        prop_desc = None
+        if req in properties and isinstance(properties[req], dict):
+            prop_desc = properties[req].get("description")
+        if prop_desc:
+            hints.append(f"{req}: {str(prop_desc).strip()}")
+        elif req in custom_hints:
+            hints.append(f"{req}: {str(custom_hints[req]).strip()}")
+        else:
+            hints.append(f"Please provide '{req}'.")
+
+    missing_str = ", ".join(missing)
+    msg = f"Tool {tool_name} is missing required argument(s): {missing_str}."
+    if hints:
+        msg += " " + " ".join(hints)
+
+    # Escalate when the exact same malformed call shape is repeated within one
+    # turn: blocked calls are excluded from failure-loop accounting, so without
+    # this a weak model could re-emit the identical call forever with no hard
+    # stop. The count is keyed per (session, turn, tool, missing-set) — only
+    # tracked when both session and turn are known, so call paths without that
+    # context (e.g. MCP servers) never collide on a shared global key.
+    try:
+        if session_id and turn_id:
+            key = (session_id, turn_id, tool_name, tuple(sorted(missing)))
+            repeat = _bump_validation_block_count(key)
+            if repeat >= 3:
+                msg += (
+                    f" This is the {_ordinal(repeat)} time this exact call was blocked this turn — "
+                    "stop retrying this shape. Read the tool schema, fix the arguments, "
+                    "or switch to an alternative tool."
+                )
+    except Exception:
+        pass
+
+    return msg
+
+
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
@@ -1465,6 +1647,46 @@ def handle_function_call(
                     middleware_trace=list(_tool_middleware_trace),
                 )
                 return result
+
+        # Pre-tool-call required-argument validation (tool_loop_guardrails.pre_tool_validation).
+        # The toggle and rule table resolve through ToolCallGuardrailConfig so there is a
+        # single authority for the feature's configuration. Runs after plugin hooks so
+        # plugins keep priority to modify/supply args; blocks before execution so broken
+        # calls never enter failure-loop accounting.
+        try:
+            from hermes_cli.config import load_config_readonly
+            from agent.tool_guardrails import ToolCallGuardrailConfig
+
+            _guardrail_cfg = ToolCallGuardrailConfig.from_mapping(
+                (load_config_readonly() or {}).get("tool_loop_guardrails") or {}
+            )
+            if _guardrail_cfg.pre_tool_validation:
+                _req_msg = validate_required_tool_args(
+                    function_name,
+                    function_args,
+                    session_id=session_id or "",
+                    turn_id=turn_id or "",
+                    tlg=_guardrail_cfg,
+                )
+                if _req_msg is not None:
+                    _req_result = tool_error(_req_msg)
+                    _emit_post_tool_call_hook(
+                        function_name=function_name,
+                        function_args=function_args,
+                        result=_req_result,
+                        task_id=task_id,
+                        session_id=session_id,
+                        tool_call_id=tool_call_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        status="blocked",
+                        error_type="missing_required_args",
+                        error_message=_req_msg,
+                        middleware_trace=list(_tool_middleware_trace),
+                    )
+                    return _req_result
+        except Exception as _req_err:
+            logger.debug("required-arg validation error: %s", _req_err)
 
         # ACP/Zed edit approval runs before any file mutation.  The requester
         # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
