@@ -270,6 +270,10 @@ describe('useComposerSubmit external request routing', () => {
 
 describe('useComposerSubmit busy-turn routing', () => {
   afterEach(() => {
+    // Reset the store seeds used by the leftover-runtime tests unconditionally,
+    // so a mid-test throw can't leak $sessions/$sessionStates into later tests.
+    $sessions.set([])
+    clearAllSessionStates()
     cleanup()
     vi.restoreAllMocks()
   })
@@ -388,6 +392,55 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(onCancel).not.toHaveBeenCalled()
 
     $sessions.set([])
+    clearAllSessionStates()
+  })
+
+  it('still steers on a busy Enter when the runtime state has no stored id yet', async () => {
+    // Runtime known busy but no storedSessionId attached — insufficient
+    // evidence to declare a scope mismatch, keep the historical steer path.
+    $sessions.set([{ id: 'stored-session', _lineage_root_id: 'stored-session' }] as never)
+    $sessionStates.set({
+      'runtime-session': { busy: true }
+    } as never)
+
+    const { hook, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      text: 'course correction mid-turn'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('course correction mid-turn'))
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
+
+    $sessions.set([])
+    clearAllSessionStates()
+  })
+
+  it('still steers on a busy Enter when the session list has not loaded yet', async () => {
+    // Same evidence gap as missing ids — refuse to demote a steer to a fresh
+    // submit without proof the runtime belongs to a different scope.
+    $sessions.set([] as never)
+    $sessionStates.set({
+      'runtime-session': { storedSessionId: 'stored-session', busy: true }
+    } as never)
+
+    const { hook, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
+      busy: true,
+      text: 'course correction mid-turn'
+    })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(onSteer).toHaveBeenCalledWith('course correction mid-turn'))
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
+
     clearAllSessionStates()
   })
 

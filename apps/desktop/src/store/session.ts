@@ -398,7 +398,10 @@ export function idsShareLineage(
  * Mid-switch the route/composer key can already be chat B while the leftover
  * busy runtime is still chat A (#59305 sibling). Steering then injects B's
  * text into A's in-flight turn. Missing either id is insufficient evidence
- * (keep historical steer). Same conversation across compression tips is yes.
+ * (keep historical steer). An unpopulated session list is the same evidence
+ * gap — the runtime may genuinely be this composer's own chat, we just can't
+ * prove lineage yet (list refetching, profile switch, first paint). Same
+ * conversation across compression tips is yes.
  */
 export function runtimeBelongsToComposerScope(
   runtimeStoredSessionId: string | null | undefined,
@@ -409,6 +412,10 @@ export function runtimeBelongsToComposerScope(
   const key = composerKey?.trim()
 
   if (!stored || !key) {
+    return true
+  }
+
+  if (sessions.length === 0) {
     return true
   }
 

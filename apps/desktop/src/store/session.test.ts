@@ -272,6 +272,13 @@ describe('runtimeBelongsToComposerScope', () => {
     expect(runtimeBelongsToComposerScope('root-a', null, [])).toBe(true)
   })
 
+  it('keeps historical steer when the session list has not loaded yet', () => {
+    // Both ids present but no lineage evidence available — treat as unknown
+    // rather than declaring a mismatch and dropping into a real submit.
+    expect(runtimeBelongsToComposerScope('root-a', 'root-b', [])).toBe(true)
+    expect(runtimeBelongsToComposerScope('tip-a', 'root-a', [])).toBe(true)
+  })
+
   it('allows the same conversation across compression tip rotation', () => {
     const sessions = [session({ id: 'tip-a', _lineage_root_id: 'root-a' })]
 

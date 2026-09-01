@@ -213,6 +213,12 @@ export function useComposerSubmit({
         // already moved to another chat — that injects B's text into A's
         // in-flight turn (observed 2026-08-31: Qwen prompt answered in the
         // still-running grok session). Start a real turn on this composer.
+        //
+        // Read the two stores imperatively here (not via useStore) — this is
+        // a one-shot decision on the submit boundary and must not subscribe
+        // the hook to $sessions / $sessionStates. Re-rendering the composer
+        // on every session-list refetch would burn cache and trigger the
+        // very race this guard exists to avoid.
         const runtimeStoredId = sessionId ? $sessionStates.get()[sessionId]?.storedSessionId : null
 
         if (runtimeBelongsToComposerScope(runtimeStoredId, activeQueueSessionKey, $sessions.get())) {
