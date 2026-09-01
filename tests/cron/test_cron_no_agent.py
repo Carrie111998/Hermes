@@ -367,3 +367,62 @@ def test_agent_job_provider_classification_unchanged(error, expected):
 
     job = {"name": "daily-digest", "no_agent": False}
     assert expected in _summarize_cron_failure_for_delivery(job, error)
+
+
+# ---------------------------------------------------------------------------
+# _run_job_script: #54833 benign Darwin malloc noise must not be the error
+# ---------------------------------------------------------------------------
+
+_MALLOC_NOISE_LINE = (
+    "python(16414) MallocStackLogging: can't turn off malloc stack logging "
+    "because it was not enabled."
+)
+
+
+def _force_darwin_noise_filter(monkeypatch):
+    from types import SimpleNamespace
+
+    from hermes_cli import subprocess_noise
+
+    monkeypatch.setattr(subprocess_noise, "sys", SimpleNamespace(platform="darwin"))
+
+
+def test_run_job_script_noise_only_falls_back_to_exit_code(hermes_env, monkeypatch, tmp_path):
+    _force_darwin_noise_filter(monkeypatch)
+    import os
+    from pathlib import Path
+    script_dir = Path(os.environ["HERMES_HOME"]) / "scripts"
+    script = script_dir / "noise_only.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.stderr.write({(_MALLOC_NOISE_LINE + chr(10))!r})\n"
+        "sys.exit(3)\n",
+        encoding="utf-8",
+    )
+    from cron.scheduler import _run_job_script
+
+    ok, output = _run_job_script(str(script))
+    assert ok is False
+    assert "MallocStackLogging" not in output
+    assert "exited with code 3" in output
+
+
+def test_run_job_script_real_stderr_survives_filtering(hermes_env, monkeypatch, tmp_path):
+    _force_darwin_noise_filter(monkeypatch)
+    import os
+    from pathlib import Path
+    script_dir = Path(os.environ["HERMES_HOME"]) / "scripts"
+    script = script_dir / "mixed.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.stderr.write({(_MALLOC_NOISE_LINE + chr(10))!r})\n"
+        "sys.stderr.write('boom: real failure\\n')\n"
+        "sys.exit(4)\n",
+        encoding="utf-8",
+    )
+    from cron.scheduler import _run_job_script
+
+    ok, output = _run_job_script(str(script))
+    assert ok is False
+    assert "MallocStackLogging" not in output
+    assert "boom: real failure" in output

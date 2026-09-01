@@ -2844,7 +2844,13 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
 
     result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, stdin=subprocess.DEVNULL)
     if result.returncode != 0:
-        stderr = result.stderr.strip()
+        from hermes_cli.subprocess_noise import (
+            filter_benign_darwin_subprocess_stderr,
+        )
+
+        stderr = filter_benign_darwin_subprocess_stderr(
+            result.stderr.strip()
+        ).strip()
         # Filter out the "OK:" line from stderr
         error_lines = [l for l in stderr.splitlines() if not l.startswith("OK:")]
         raise RuntimeError(f"NeuTTS synthesis failed: {chr(10).join(error_lines) or 'unknown error'}")
@@ -2959,7 +2965,13 @@ def _resolve_piper_voice_path(voice: str, download_dir: Path) -> str:
         ) from exc
 
     if result.returncode != 0:
-        stderr = (result.stderr or "").strip() or "no stderr output"
+        from hermes_cli.subprocess_noise import (
+            filter_benign_darwin_subprocess_stderr,
+        )
+
+        stderr = filter_benign_darwin_subprocess_stderr(
+            (result.stderr or "").strip()
+        ).strip() or "no stderr output"
         raise RuntimeError(
             f"Piper voice download failed for '{voice}': {stderr[:400]}"
         )

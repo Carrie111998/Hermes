@@ -1884,6 +1884,13 @@ def execute_code(
         stderr_reader.join(timeout=3)
 
         stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace")
+        # #54833: drop the known-benign Darwin libmalloc teardown line before
+        # ANSI stripping/redaction/hint selection can bake it into the result.
+        from hermes_cli.subprocess_noise import (
+            filter_benign_darwin_subprocess_stderr,
+        )
+
+        stderr_text = filter_benign_darwin_subprocess_stderr(stderr_text)
 
         stdout_text, stdout_metadata = _assemble_stdout_result(
             b"".join(stdout_head_chunks),
