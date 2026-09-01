@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent.agent_init import _normalize_codex_app_server_codex_home
 from hermes_cli.runtime_provider import (
     _VALID_API_MODES,
     _maybe_apply_codex_app_server_runtime,
@@ -378,3 +379,19 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
+
+
+class TestCodexHomeConfig:
+    def test_relative_codex_home_is_anchored_to_hermes_home(
+        self, monkeypatch, tmp_path
+    ):
+        profile_home = tmp_path / "profile"
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        assert _normalize_codex_app_server_codex_home("codex-home") == str(
+            (profile_home / "codex-home").resolve()
+        )
+
+    @pytest.mark.parametrize("value", [None, "", "   ", 123])
+    def test_empty_or_non_string_codex_home_preserves_codex_default(self, value):
+        assert _normalize_codex_app_server_codex_home(value) is None

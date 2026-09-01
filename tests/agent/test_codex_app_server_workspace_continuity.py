@@ -7,15 +7,20 @@ No Codex subprocess, network request, or timing wait is involved.
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
+import time
 from unittest.mock import patch
 
 import pytest
 
+import agent.codex_runtime as codex_runtime
 import agent.transports.codex_app_server_session as session_mod
 from agent.codex_runtime import (
+    _CODEX_DEADLINE_CONTINUATION_PROMPT,
     _CODEX_THREAD_MAP_KEY,
     _CODEX_THREAD_MAP_MAX_ENTRIES,
     _persist_codex_workspace_thread,
+    _try_acquire_codex_cwd_lock,
 )
 from agent.transports.codex_app_server import CodexAppServerError
 from agent.transports.codex_app_server_session import (
@@ -37,6 +42,7 @@ class _ProtocolClient:
         self.requests: list[tuple[str, dict]] = []
         self.closed = False
         self.cwd = _kwargs.get("cwd")
+        self.codex_home = _kwargs.get("codex_home")
 
     def initialize(self, **_kwargs):
         return {}
@@ -313,8 +319,219 @@ def test_default_config_keeps_implicit_cwd_behavior(tmp_path, protocol_fake):
         "codex_app_server_require_explicit_cwd"
     ] is False
     assert DEFAULT_CONFIG["agent"]["codex_app_server_workspace_roots"] == []
+    assert DEFAULT_CONFIG["agent"]["codex_app_server_exclusive_cwd"] is False
+    assert (
+        DEFAULT_CONFIG["agent"]["codex_app_server_deadline_continuation"]
+        is False
+    )
+    assert DEFAULT_CONFIG["agent"]["codex_app_server_codex_home"] is None
     assert result["completed"] is True
     assert protocol_fake == [(str(repo.resolve()), "plain handoff")]
+    _close_codex(agent)
+    db.close()
+
+
+def test_exclusive_cwd_conflict_blocks_before_spawn_and_releases(
+    tmp_path, protocol_fake, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    root = tmp_path / "repos"
+    repo = root / "repo"
+    repo.mkdir(parents=True)
+    db = SessionDB(tmp_path / "state.db")
+    agent = _make_agent(db, "exclusive-cwd", root)
+    agent.codex_app_server_require_explicit_cwd = True
+    agent.codex_app_server_workspace_roots = [str(root)]
+    agent.codex_app_server_exclusive_cwd = True
+    holder = _try_acquire_codex_cwd_lock(str(repo))
+    assert holder is not None
+
+    blocked = _run(agent, f"[HERMES_RUNTIME_CWD={repo}] work")
+    assert blocked["completed"] is False
+    assert blocked["error"] == (
+        "BLOCKED_CONCURRENT_WRITER: another Codex app-server turn "
+        "already owns this canonical CWD."
+    )
+    assert _ProtocolClient.instances == []
+
+    holder.close()
+    completed = _run(agent, f"[HERMES_RUNTIME_CWD={repo}] work")
+    assert completed["completed"] is True
+    released = _try_acquire_codex_cwd_lock(str(repo))
+    assert released is not None
+    released.close()
+    _close_codex(agent)
+    db.close()
+
+
+def test_exclusive_cwd_lock_releases_when_runtime_raises(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    agent = type("Agent", (), {})()
+    agent.session_cwd = str(repo)
+    agent.compression_checkpoint_required = False
+    agent.codex_app_server_require_explicit_cwd = False
+    agent.codex_app_server_workspace_roots = []
+    agent.codex_app_server_exclusive_cwd = True
+    agent._persist_disabled = True
+
+    def raise_from_runtime(*_args, **_kwargs):
+        raise RuntimeError("synthetic runtime failure")
+
+    monkeypatch.setattr(
+        codex_runtime,
+        "_run_codex_app_server_turn_impl",
+        raise_from_runtime,
+    )
+    with pytest.raises(RuntimeError, match="synthetic runtime failure"):
+        codex_runtime.run_codex_app_server_turn(
+            agent,
+            user_message="work",
+            original_user_message="work",
+            messages=[],
+            effective_task_id="test",
+        )
+
+    released = _try_acquire_codex_cwd_lock(str(repo))
+    assert released is not None
+    released.close()
+
+
+def test_effective_cwd_and_git_metadata_are_persisted_end_to_end(
+    tmp_path, protocol_fake
+):
+    root = tmp_path / "repos"
+    repo = root / "repo"
+    repo.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "-q", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "checkout", "-q", "-b", "feature-test"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("metadata-session", source="test")
+    agent = _make_agent(db, "metadata-session", root)
+    agent.codex_app_server_require_explicit_cwd = True
+    agent.codex_app_server_workspace_roots = [str(root)]
+
+    result = _run(agent, f"[HERMES_RUNTIME_CWD={repo}] work")
+
+    row = db.get_session("metadata-session")
+    assert result["completed"] is True
+    assert row["cwd"] == str(repo.resolve())
+    assert row["git_repo_root"] == str(repo.resolve())
+    assert row["git_branch"] == "feature-test"
+    _close_codex(agent)
+    db.close()
+
+
+def test_optional_codex_home_reaches_spawn_client(tmp_path, protocol_fake):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    db = SessionDB(tmp_path / "state.db")
+    agent = _make_agent(db, "codex-home", repo)
+    intended_home = tmp_path / "runtime" / "codex-home"
+    agent.codex_app_server_codex_home = str(intended_home)
+
+    result = _run(agent, "work")
+
+    assert result["completed"] is True
+    assert _ProtocolClient.instances[0].codex_home == str(intended_home)
+    _close_codex(agent)
+    db.close()
+
+
+@pytest.mark.parametrize(
+    "second_times_out,expected_completed,expected_timed_out",
+    [(False, True, False), (True, False, True)],
+)
+def test_deadline_continuation_runs_exactly_once_on_same_thread(
+    tmp_path,
+    protocol_fake,
+    monkeypatch,
+    second_times_out,
+    expected_completed,
+    expected_timed_out,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    db = SessionDB(tmp_path / "state.db")
+    agent = _make_agent(db, "continuation", repo)
+    agent.codex_app_server_deadline_continuation = True
+    inputs: list[str] = []
+
+    def sequenced_turn(self, user_input, **_kwargs):
+        inputs.append(user_input)
+        if len(inputs) == 1 or second_times_out:
+            return TurnResult(
+                thread_id=self._thread_id,
+                turn_id=f"turn-{len(inputs)}",
+                timed_out=True,
+                interrupted=True,
+                should_retire=True,
+                error="deadline",
+                last_liveness_at=time.monotonic(),
+            )
+        return TurnResult(
+            final_text="finished",
+            projected_messages=[{"role": "assistant", "content": "finished"}],
+            thread_id=self._thread_id,
+            turn_id="turn-2",
+        )
+
+    monkeypatch.setattr(CodexAppServerSession, "run_turn", sequenced_turn)
+    result = _run(agent, "original")
+
+    assert inputs == ["original", _CODEX_DEADLINE_CONTINUATION_PROMPT]
+    assert result["continued"] == 1
+    assert result["api_calls"] == 2
+    assert result["completed"] is expected_completed
+    assert result["timed_out"] is expected_timed_out
+    assert len(_ProtocolClient.instances) == 2
+    assert _ProtocolClient.instances[1].requests[0][0] == "thread/resume"
+    _close_codex(agent)
+    db.close()
+
+
+def test_silent_deadline_never_auto_continues(
+    tmp_path, protocol_fake, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    db = SessionDB(tmp_path / "state.db")
+    agent = _make_agent(db, "silent-deadline", repo)
+    agent.codex_app_server_deadline_continuation = True
+    inputs: list[str] = []
+
+    def silent_timeout(self, user_input, **_kwargs):
+        inputs.append(user_input)
+        return TurnResult(
+            thread_id=self._thread_id,
+            turn_id="turn-1",
+            timed_out=True,
+            interrupted=True,
+            should_retire=True,
+            error="deadline",
+            last_liveness_at=None,
+        )
+
+    monkeypatch.setattr(CodexAppServerSession, "run_turn", silent_timeout)
+    result = _run(agent, "original")
+
+    assert inputs == ["original"]
+    assert result["continued"] == 0
+    assert result["api_calls"] == 1
+    assert result["timed_out"] is True
     _close_codex(agent)
     db.close()
 

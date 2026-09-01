@@ -140,6 +140,15 @@ DEFAULT_CONFIG = {
         # Absolute directories that may contain a marked repository cwd. An
         # empty list means the normal resolved agent cwd is the sole root.
         "codex_app_server_workspace_roots": [],
+        # Opt-in single-writer advisory lock keyed by canonical CWD. False
+        # preserves parallel app-server sessions across Hermes processes.
+        "codex_app_server_exclusive_cwd": False,
+        # Opt-in one-time continuation when the absolute deadline interrupts
+        # a turn that emitted recent, turn-scoped protocol activity.
+        "codex_app_server_deadline_continuation": False,
+        # Optional Codex CLI home for the spawned app-server. Relative paths
+        # resolve below HERMES_HOME; Hermes does not create or authenticate it.
+        "codex_app_server_codex_home": None,
         # Max app-level retry attempts for API errors (connection drops,
         # provider timeouts, 5xx, etc.) before the agent surfaces the
         # failure.  The OpenAI SDK already does its own low-level retries

@@ -172,6 +172,29 @@ class TestTurnTimeoutConfiguration:
         assert agent.codex_app_server_require_explicit_cwd is True
         assert agent.codex_app_server_workspace_roots == ["/srv/repos"]
 
+    def test_generic_hardening_options_are_loaded_default_off_and_profile_neutral(
+        self, monkeypatch, tmp_path
+    ):
+        profile_home = tmp_path / "profile"
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        config = {
+            "agent": {
+                "codex_app_server_exclusive_cwd": True,
+                "codex_app_server_deadline_continuation": True,
+                "codex_app_server_codex_home": "codex-home",
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "hermes_cli.config.load_config_readonly", return_value=config
+        ):
+            agent = _make_codex_agent()
+
+        assert agent.codex_app_server_exclusive_cwd is True
+        assert agent.codex_app_server_deadline_continuation is True
+        assert agent.codex_app_server_codex_home == str(
+            (profile_home / "codex-home").resolve()
+        )
+
 
 class TestRunConversationCodexPath:
     def test_run_conversation_returns_codex_shape(self, fake_session):
@@ -235,11 +258,25 @@ class TestRunConversationCodexPath:
                 turn_id="turn-usage-1",
                 thread_id="thread-usage-1",
                 token_usage_last={
-                    "totalTokens": 130,
-                    "inputTokens": 80,
-                    "cachedInputTokens": 20,
-                    "outputTokens": 25,
-                    "reasoningOutputTokens": 5,
+                    "totalTokens": 9,
+                    "inputTokens": 4,
+                    "cachedInputTokens": 1,
+                    "outputTokens": 3,
+                    "reasoningOutputTokens": 1,
+                },
+                token_usage_total_start={
+                    "totalTokens": 1000,
+                    "inputTokens": 700,
+                    "cachedInputTokens": 200,
+                    "outputTokens": 90,
+                    "reasoningOutputTokens": 10,
+                },
+                token_usage_total={
+                    "totalTokens": 1130,
+                    "inputTokens": 780,
+                    "cachedInputTokens": 220,
+                    "outputTokens": 115,
+                    "reasoningOutputTokens": 15,
                 },
                 model_context_window=200000,
             )

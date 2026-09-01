@@ -18,6 +18,7 @@ runtime is not selected.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import subprocess
@@ -31,6 +32,10 @@ from tools.environments.local import hermes_subprocess_env
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
+_NOTIFICATION_QUEUE_MAX = 1024
+_SERVER_REQUEST_QUEUE_MAX = 128
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -145,11 +150,16 @@ class CodexAppServerClient:
             creationflags=windows_hide_flags(),
         )
         self._next_id = 1
+        self._id_lock = threading.Lock()
         self._pending: dict[int, _Pending] = {}
         self._pending_lock = threading.Lock()
         self._send_lock = threading.Lock()
-        self._notifications: queue.Queue = queue.Queue()
-        self._server_requests: queue.Queue = queue.Queue()
+        self._notifications: queue.Queue = queue.Queue(
+            maxsize=_NOTIFICATION_QUEUE_MAX
+        )
+        self._server_requests: queue.Queue = queue.Queue(
+            maxsize=_SERVER_REQUEST_QUEUE_MAX
+        )
         self._stderr_lines: list[str] = []
         self._stderr_lock = threading.Lock()
         self._closed = False
@@ -377,9 +387,10 @@ class CodexAppServerClient:
         # JSON-RPC ids only need to be unique per-connection. A simple
         # monotonically increasing int is the common choice and matches what
         # codex's own clients use.
-        rid = self._next_id
-        self._next_id += 1
-        return rid
+        with self._id_lock:
+            rid = self._next_id
+            self._next_id += 1
+            return rid
 
     def _send(self, obj: dict, *, timeout: float = 5.0) -> None:
         """Write one JSON-RPC frame without letting a full pipe block forever."""
@@ -474,11 +485,38 @@ class CodexAppServerClient:
             return
         # Server-initiated request (has id + method)
         if "id" in msg and "method" in msg:
-            self._server_requests.put(msg)
+            try:
+                self._server_requests.put_nowait(msg)
+            except queue.Full:
+                # Losing an approval request fails closed: Codex remains
+                # blocked until the bounded turn deadline. Never block the
+                # stdout reader, which must continue routing replies.
+                logger.error(
+                    "codex app-server server-request queue full; dropping "
+                    "request method=%s",
+                    msg.get("method"),
+                )
             return
         # Notification (no id)
         if "method" in msg:
-            self._notifications.put(msg)
+            try:
+                self._notifications.put_nowait(msg)
+            except queue.Full:
+                # Streaming notifications are lossy under overload. Evict the
+                # oldest entry so the newest state -- in particular an
+                # incoming turn/completed notification -- remains observable.
+                try:
+                    self._notifications.get_nowait()
+                except queue.Empty:  # pragma: no cover - concurrent consumer
+                    pass
+                try:
+                    self._notifications.put_nowait(msg)
+                except queue.Full:  # pragma: no cover - concurrent producer
+                    pass
+                logger.warning(
+                    "codex app-server notification queue full; dropped oldest "
+                    "notification"
+                )
 
     def _read_stderr(self) -> None:
         if self._proc.stderr is None:

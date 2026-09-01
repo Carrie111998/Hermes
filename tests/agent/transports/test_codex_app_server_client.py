@@ -1,5 +1,6 @@
 import threading
 import time
+import queue
 from types import SimpleNamespace
 
 import pytest
@@ -72,6 +73,7 @@ def _client_with_stdin(stdin: _BlockingStdin) -> CodexAppServerClient:
     client._poisoned = False
     setattr(client, "_proc", _Process(stdin))
     client._send_lock = threading.Lock()
+    client._id_lock = threading.Lock()
     client._pending = {}
     client._pending_lock = threading.Lock()
     client._next_id = 1
@@ -100,3 +102,48 @@ def test_request_deadline_poison_kills_reaps_and_blocks_ghost_frame():
 
     with pytest.raises(RuntimeError, match="client is closed"):
         client.notify("turn/steer", {"text": "must not be sent"})
+
+
+def test_request_ids_are_unique_under_concurrent_allocation():
+    client = _client_with_stdin(_BlockingStdin())
+    results: list[int] = []
+    result_lock = threading.Lock()
+
+    def allocate() -> None:
+        value = client._take_id()
+        with result_lock:
+            results.append(value)
+
+    threads = [threading.Thread(target=allocate) for _ in range(64)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1.0)
+
+    assert sorted(results) == list(range(1, 65))
+
+
+def test_notification_queue_keeps_newest_terminal_event(caplog):
+    client = _client_with_stdin(_BlockingStdin())
+    client._notifications = queue.Queue(maxsize=2)
+    client._server_requests = queue.Queue(maxsize=1)
+
+    client._dispatch({"method": "item/reasoning/delta"})
+    client._dispatch({"method": "item/agentMessage/delta"})
+    client._dispatch({"method": "turn/completed"})
+
+    assert client._notifications.get_nowait()["method"] == "item/agentMessage/delta"
+    assert client._notifications.get_nowait()["method"] == "turn/completed"
+    assert "dropped oldest notification" in caplog.text
+
+
+def test_server_request_queue_overflow_is_nonblocking_and_fail_closed(caplog):
+    client = _client_with_stdin(_BlockingStdin())
+    client._notifications = queue.Queue(maxsize=1)
+    client._server_requests = queue.Queue(maxsize=1)
+
+    client._dispatch({"id": "first", "method": "approval/one"})
+    client._dispatch({"id": "second", "method": "approval/two"})
+
+    assert client._server_requests.get_nowait()["id"] == "first"
+    assert "server-request queue full" in caplog.text

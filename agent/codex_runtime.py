@@ -17,6 +17,7 @@ compatibility.
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 import json
 import logging
 import os
@@ -39,6 +40,11 @@ _RUNTIME_CWD_MARKER_RE = re.compile(
     r"\[HERMES_RUNTIME_CWD=([^\[\]\r\n]+)\]"
 )
 _RUNTIME_CWD_MARKER_SCAN_BYTES = 1024
+_CODEX_DEADLINE_CONTINUATION_LIVENESS_WINDOW = 30.0
+_CODEX_DEADLINE_CONTINUATION_PROMPT = (
+    "Continue exactly where you stopped. Do not restart or repeat completed work; "
+    "finish the original request."
+)
 
 
 class _CodexRuntimeCwdError(ValueError):
@@ -249,6 +255,103 @@ def _resolve_codex_handoff_cwd(
     return str(candidate), codex_input
 
 
+def _codex_cwd_lock_path(
+    cwd: str,
+    *,
+    hermes_home: Path | None = None,
+) -> Path:
+    """Return a profile-local advisory-lock path for one canonical CWD."""
+    canonical = str(Path(cwd).resolve())
+    lock_identity = os.path.normcase(canonical)
+    readable = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(canonical).name).strip("-")
+    digest = hashlib.sha256(lock_identity.encode("utf-8")).hexdigest()[:16]
+    if hermes_home is None:
+        from hermes_constants import get_hermes_home
+
+        hermes_home = get_hermes_home()
+    return (
+        Path(hermes_home)
+        / "runtime"
+        / "codex-cwd-locks"
+        / f"{(readable or 'cwd')[:32].lower()}-{digest}.lock"
+    )
+
+
+def _try_acquire_codex_cwd_lock(cwd: str):
+    """Acquire a non-blocking advisory lock for one canonical CWD."""
+    handle = None
+    try:
+        path = _codex_cwd_lock_path(cwd)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path.parent, 0o700)
+        except OSError:
+            if os.name != "nt":
+                raise
+        handle = path.open("a+b")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            if os.name != "nt":
+                raise
+        if os.name == "nt":  # pragma: no cover - exercised on Windows CI
+            import msvcrt
+
+            if path.stat().st_size == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        if handle is not None:
+            handle.close()
+        return None
+    return handle
+
+
+def _git_metadata_for_cwd(cwd: str) -> tuple[str | None, str | None]:
+    """Return best-effort repository root and branch without mutating Git."""
+    try:
+        from hermes_cli._subprocess_compat import bounded_git_probe
+
+        repo_root = bounded_git_probe(
+            ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+            timeout=5.0,
+        )
+        if not repo_root:
+            return None, None
+        branch = bounded_git_probe(
+            ["git", "-C", cwd, "branch", "--show-current"],
+            timeout=5.0,
+        )
+    except Exception:
+        return None, None
+    return repo_root or None, branch or None
+
+
+def _persist_codex_effective_cwd(agent: Any, cwd: str) -> None:
+    """Persist the app-server's authoritative workspace through SessionDB."""
+    db, session_id = _codex_thread_store(agent)
+    updater = getattr(db, "update_session_cwd", None) if db is not None else None
+    if not callable(updater) or not session_id:
+        return
+    repo_root, branch = _git_metadata_for_cwd(cwd)
+    try:
+        updater(
+            session_id,
+            cwd,
+            git_branch=branch,
+            git_repo_root=repo_root,
+            replace_git_meta=True,
+        )
+    except Exception:
+        logger.warning("codex effective cwd metadata persistence failed", exc_info=True)
+
+
 def _codex_thread_store(agent: Any) -> tuple[Any, str] | tuple[None, None]:
     if getattr(agent, "_persist_disabled", False):
         return None, None
@@ -454,6 +557,43 @@ def _coerce_usage_int(value: Any) -> int:
     return 0
 
 
+_CODEX_USAGE_TOTAL_KEYS = (
+    "inputTokens",
+    "cachedInputTokens",
+    "outputTokens",
+    "reasoningOutputTokens",
+    "totalTokens",
+)
+_CODEX_USAGE_REQUIRED_TOTAL_KEYS = frozenset(
+    {"inputTokens", "outputTokens", "totalTokens"}
+)
+
+
+def _codex_turn_usage(turn: Any) -> dict[str, Any] | None:
+    """Prefer a monotonic cumulative-total delta; safely fall back to last."""
+    start = getattr(turn, "token_usage_total_start", None)
+    end = getattr(turn, "token_usage_total", None)
+    if isinstance(start, dict) and start and isinstance(end, dict) and end:
+        complete = _CODEX_USAGE_REQUIRED_TOTAL_KEYS.issubset(start) and (
+            _CODEX_USAGE_REQUIRED_TOTAL_KEYS.issubset(end)
+        )
+        if complete:
+            delta: dict[str, int] = {}
+            for key in _CODEX_USAGE_TOTAL_KEYS:
+                if key not in start or key not in end:
+                    continue
+                before = _coerce_usage_int(start.get(key))
+                after = _coerce_usage_int(end.get(key))
+                if after < before:
+                    delta = {}
+                    break
+                delta[key] = after - before
+            if delta:
+                return delta
+    last = getattr(turn, "token_usage_last", None)
+    return dict(last) if isinstance(last, dict) and last else None
+
+
 def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting.
 
@@ -470,7 +610,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     """
     agent.session_api_calls += 1
 
-    usage = getattr(turn, "token_usage_last", None)
+    usage = _codex_turn_usage(turn)
     if not isinstance(usage, dict) or not usage:
         compressor = getattr(agent, "context_compressor", None)
         if (
@@ -601,6 +741,44 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         "cost_status": cost_result.status,
         "cost_source": cost_result.source,
     }
+
+
+def _merge_codex_usage_results(
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Combine the at-most-two accounting receipts from continuation."""
+    populated = [item for item in results if item]
+    if not populated:
+        return {}
+    numeric_keys = {
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+    }
+    merged: dict[str, Any] = {
+        key: sum(_coerce_usage_int(item.get(key)) for item in populated)
+        for key in numeric_keys
+    }
+    merged["last_prompt_tokens"] = _coerce_usage_int(
+        populated[-1].get("last_prompt_tokens")
+    )
+    costs = [
+        float(item["estimated_cost_usd"])
+        for item in populated
+        if item.get("estimated_cost_usd") is not None
+    ]
+    merged["estimated_cost_usd"] = sum(costs) if costs else None
+    for key in ("cost_status", "cost_source"):
+        merged[key] = next(
+            (item.get(key) for item in reversed(populated) if item.get(key)),
+            None,
+        )
+    return merged
 
 
 def _record_codex_app_server_compaction(
@@ -1038,6 +1216,59 @@ def run_codex_app_server_turn(
     effective_task_id: str,
     should_review_memory: bool = False,
 ) -> Dict[str, Any]:
+    """Resolve workspace policy and hold the optional CWD writer lock."""
+    if getattr(agent, "compression_checkpoint_required", False) is True:
+        return _run_codex_app_server_turn_impl(
+            agent,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+        )
+
+    try:
+        resolved = _resolve_codex_handoff_cwd(agent, user_message)
+    except _CodexRuntimeCwdError as exc:
+        return _codex_cwd_failure_result(messages, str(exc))
+
+    effective_cwd, _codex_user_input = resolved
+    _persist_codex_effective_cwd(agent, effective_cwd)
+
+    lock_handle = None
+    if getattr(agent, "codex_app_server_exclusive_cwd", False) is True:
+        lock_handle = _try_acquire_codex_cwd_lock(effective_cwd)
+        if lock_handle is None:
+            return _codex_cwd_failure_result(
+                messages,
+                "BLOCKED_CONCURRENT_WRITER: another Codex app-server turn "
+                "already owns this canonical CWD.",
+            )
+    try:
+        return _run_codex_app_server_turn_impl(
+            agent,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+            _resolved_cwd_input=resolved,
+        )
+    finally:
+        if lock_handle is not None:
+            lock_handle.close()
+
+
+def _run_codex_app_server_turn_impl(
+    agent,
+    *,
+    user_message: str,
+    original_user_message: Any,
+    messages: List[Dict[str, Any]],
+    effective_task_id: str,
+    should_review_memory: bool = False,
+    _resolved_cwd_input: tuple[str, Any] | None = None,
+) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
     messages list so memory/skill review keep working.
@@ -1066,12 +1297,15 @@ def run_codex_app_server_turn(
     )
     from agent.transports.codex_app_server import CodexAppServerError
 
-    try:
-        effective_cwd, codex_user_input = _resolve_codex_handoff_cwd(
-            agent, user_message
-        )
-    except _CodexRuntimeCwdError as exc:
-        return _codex_cwd_failure_result(messages, str(exc))
+    if _resolved_cwd_input is None:
+        try:
+            effective_cwd, codex_user_input = _resolve_codex_handoff_cwd(
+                agent, user_message
+            )
+        except _CodexRuntimeCwdError as exc:
+            return _codex_cwd_failure_result(messages, str(exc))
+    else:
+        effective_cwd, codex_user_input = _resolved_cwd_input
 
     # One AIAgent can receive handoffs for multiple repositories. A live Codex
     # process owns exactly one cwd/thread, so a workspace change retires it and
@@ -1141,6 +1375,7 @@ def run_codex_app_server_turn(
         agent._codex_session = CodexAppServerSession(
             cwd=effective_cwd,
             prior_thread_id=prior_thread_id,
+            codex_home=getattr(agent, "codex_app_server_codex_home", None),
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -1154,6 +1389,8 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    continued_from_turn = None
+    continuation_count = 0
     try:
         turn_timeout = float(
             getattr(agent, "codex_app_server_turn_timeout", 600.0)
@@ -1194,6 +1431,80 @@ def run_codex_app_server_turn(
                 post_tool_quiet_timeout=post_tool_quiet_timeout,
                 turn_deadline=turn_deadline,
             )
+
+            last_liveness_at = getattr(turn, "last_liveness_at", None)
+            recent_liveness = (
+                isinstance(last_liveness_at, (int, float))
+                and time.monotonic() - float(last_liveness_at)
+                <= _CODEX_DEADLINE_CONTINUATION_LIVENESS_WINDOW
+            )
+            if (
+                getattr(agent, "codex_app_server_deadline_continuation", False)
+                is True
+                and getattr(turn, "timed_out", False)
+                and recent_liveness
+            ):
+                # The interrupted transport is retired. Resume the same durable
+                # Codex thread in one fresh process and issue a fixed internal
+                # continuation that is never appended to Hermes history.
+                continued_from_turn = turn
+                continuation_count = 1
+                old_session = agent._codex_session
+                approval_callback = getattr(old_session, "_approval_callback", None)
+                request_routing = getattr(old_session, "_routing", None)
+                on_event = getattr(old_session, "_on_event", None)
+                try:
+                    old_session.close()
+                except Exception:
+                    pass
+                agent._codex_session = CodexAppServerSession(
+                    cwd=effective_cwd,
+                    prior_thread_id=turn.thread_id or thread_id,
+                    codex_home=getattr(agent, "codex_app_server_codex_home", None),
+                    approval_callback=approval_callback,
+                    request_routing=request_routing,
+                    on_event=on_event,
+                )
+                agent._codex_session_cwd = effective_cwd
+                continuation_deadline = time.monotonic() + turn_timeout
+                try:
+                    resumed_thread_id = agent._codex_session.ensure_started(
+                        startup_timeout=turn_timeout
+                    )
+                    _persist_codex_workspace_thread(
+                        agent, effective_cwd, resumed_thread_id
+                    )
+                    continued_turn = agent._codex_session.run_turn(
+                        user_input=_CODEX_DEADLINE_CONTINUATION_PROMPT,
+                        turn_timeout=turn_timeout,
+                        post_tool_quiet_timeout=post_tool_quiet_timeout,
+                        turn_deadline=continuation_deadline,
+                    )
+                except TimeoutError:
+                    continued_turn = TurnResult(
+                        error=f"turn timed out after {turn_timeout}s",
+                        interrupted=True,
+                        timed_out=True,
+                        should_retire=True,
+                    )
+                except CodexAppServerError as exc:
+                    continued_turn = TurnResult(
+                        error=agent._codex_session._format_startup_error(exc),
+                        should_retire=True,
+                    )
+                except RuntimeError as exc:
+                    continued_turn = TurnResult(
+                        error=agent._codex_session._format_error_with_stderr(
+                            "codex app-server continuation startup failed", exc
+                        ),
+                        should_retire=True,
+                    )
+                continued_turn.projected_messages = (
+                    list(turn.projected_messages)
+                    + list(continued_turn.projected_messages)
+                )
+                continued_turn.tool_iterations += turn.tool_iterations
+                turn = continued_turn
     except Exception as exc:
         # Avoid traceback rendering here: a protocol exception can embed the
         # internal thread id in its message. The exception class is enough for
@@ -1331,9 +1642,16 @@ def run_codex_app_server_turn(
     agent._iters_since_skill = (
         getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     )
+    usage_results: list[dict[str, Any]] = []
+    if continued_from_turn is not None:
+        _record_codex_app_server_compaction(agent, continued_from_turn)
+        usage_results.append(
+            _record_codex_app_server_usage(agent, continued_from_turn)
+        )
     _record_codex_app_server_compaction(agent, turn)
-    usage_result = _record_codex_app_server_usage(agent, turn)
-    api_calls = 1
+    usage_results.append(_record_codex_app_server_usage(agent, turn))
+    usage_result = _merge_codex_usage_results(usage_results)
+    api_calls = 1 + continuation_count
 
     # Now check the skill nudge AFTER iters were incremented — same
     # pattern the chat_completions path uses (line ~15432).
@@ -1414,6 +1732,7 @@ def run_codex_app_server_turn(
         "agent_persisted": _codex_flush_ok is not False,
         "codex_thread_id": turn.thread_id,
         "codex_turn_id": turn.turn_id,
+        "continued": continuation_count,
         **usage_result,
     }
 

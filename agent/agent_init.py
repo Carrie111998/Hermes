@@ -28,6 +28,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
@@ -547,6 +548,21 @@ def _normalize_codex_app_server_post_tool_quiet_timeout(value: Any) -> float:
     if not math.isfinite(seconds) or seconds <= 0:
         return default
     return seconds
+
+
+def _normalize_codex_app_server_codex_home(value: Any) -> Optional[str]:
+    """Resolve an optional Codex home without creating or inspecting it.
+
+    Relative paths are anchored to the active Hermes home so the setting stays
+    profile-aware. Empty and non-string values preserve Codex's normal home
+    selection.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = Path(value.strip()).expanduser()
+    if not path.is_absolute():
+        path = get_hermes_home() / path
+    return str(path.resolve(strict=False))
 
 
 def _refuse_checkpoint_required_on_codex_app_server(
@@ -2084,6 +2100,25 @@ def init_agent(
         list(_codex_workspace_roots)
         if isinstance(_codex_workspace_roots, list)
         else _codex_workspace_roots
+    )
+    _exclusive_codex_cwd = _agent_section.get(
+        "codex_app_server_exclusive_cwd", False
+    )
+    agent.codex_app_server_exclusive_cwd = (
+        _exclusive_codex_cwd
+        if isinstance(_exclusive_codex_cwd, bool)
+        else False
+    )
+    _deadline_continuation = _agent_section.get(
+        "codex_app_server_deadline_continuation", False
+    )
+    agent.codex_app_server_deadline_continuation = (
+        _deadline_continuation
+        if isinstance(_deadline_continuation, bool)
+        else False
+    )
+    agent.codex_app_server_codex_home = _normalize_codex_app_server_codex_home(
+        _agent_section.get("codex_app_server_codex_home")
     )
 
     # Empty-response retry guard config (NS-503): additive

@@ -15,6 +15,7 @@ from typing import Any, Callable, Optional
 import pytest
 
 import agent.transports.codex_app_server_session as session_mod
+from agent.codex_runtime import _codex_turn_usage, _merge_codex_usage_results
 from agent.transports.codex_app_server import CodexAppServerError
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
@@ -169,6 +170,41 @@ class TestLifecycle:
         # thread/start should be called exactly once
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
+
+    @pytest.mark.parametrize(
+        "payload,structure",
+        [
+            (
+                {"zeta": "private-value", "turn": {}, "alpha": 1},
+                "payload keys: ['alpha', 'turn', 'zeta']",
+            ),
+            ([], "payload type: list"),
+        ],
+    )
+    def test_turn_start_missing_id_fails_fast_with_structural_diagnostic(
+        self, payload, structure
+    ):
+        client = FakeClient()
+
+        def handler(method, _params):
+            if method == "turn/start":
+                return payload
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            raise AssertionError(method)
+
+        client._request_handler = handler
+        started = time.monotonic()
+        result = make_session(client).run_turn("hi", turn_timeout=60.0)
+
+        assert time.monotonic() - started < 0.5
+        assert result.should_retire is True
+        assert result.interrupted is False
+        assert result.error == (
+            f"codex turn/start returned no turn id ({structure})"
+        )
+        assert "private-value" not in result.error
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
 
     def test_thread_start_passes_cwd_only(self):
         """thread/start carries cwd. We intentionally do NOT pass `permissions`
@@ -1338,15 +1374,11 @@ class TestSessionRetirement:
             threadId="t", turnId="tu1",
         )
         s = make_session(client)
-        monotonic_values = iter([1000.0] + [999.0] * 8 + [1000.2])
-        last_monotonic = [1000.2]
+        clock = [999.95]
 
         def fake_monotonic():
-            try:
-                last_monotonic[0] = next(monotonic_values)
-            except StopIteration:
-                pass
-            return last_monotonic[0]
+            clock[0] += 0.05
+            return clock[0]
 
         with patch.object(
             session_mod.time,
@@ -1362,6 +1394,183 @@ class TestSessionRetirement:
         assert r.interrupted is True
         assert r.should_retire is True
         assert r.error and "silent" in r.error
+
+    @pytest.mark.parametrize(
+        "method,params",
+        [
+            ("item/reasoning/delta", {"delta": "thinking"}),
+            ("item/agentMessage/delta", {"delta": "writing"}),
+            (
+                "item/started",
+                {"item": {"type": "commandExecution", "id": "ex2"}},
+            ),
+            (
+                "item/commandExecution/outputDelta",
+                {"itemId": "ex2", "delta": "building"},
+            ),
+            (
+                "thread/tokenUsage/updated",
+                {"tokenUsage": {"total": {"totalTokens": 10}}},
+            ),
+        ],
+    )
+    def test_post_tool_watchdog_refreshes_on_every_scoped_activity(
+        self, method, params
+    ):
+        class ScheduledClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self._scheduled = []
+
+            def schedule(self, delay, scheduled_method, scheduled_params):
+                self._scheduled.append(
+                    (
+                        time.monotonic() + delay,
+                        {"method": scheduled_method, "params": scheduled_params},
+                    )
+                )
+
+            def take_notification(self, timeout=0.0):
+                if self._notifications:
+                    return self._notifications.pop(0)
+                if not self._scheduled:
+                    return super().take_notification(timeout)
+                due, note = self._scheduled[0]
+                remaining = due - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(max(timeout, 0.0), remaining))
+                if time.monotonic() >= due:
+                    self._scheduled.pop(0)
+                    return note
+                return None
+
+        client = ScheduledClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution",
+                "id": "ex1",
+                "command": "echo hi",
+                "cwd": "/tmp",
+                "status": "completed",
+                "aggregatedOutput": "hi",
+                "exitCode": 0,
+                "commandActions": [],
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        scope = {
+            "threadId": "thread-fake-001",
+            "turnId": "turn-fake-001",
+        }
+        client.schedule(0.02, method, {**scope, **params})
+        client.schedule(
+            0.04,
+            "turn/completed",
+            {
+                "threadId": "thread-fake-001",
+                "turn": {
+                    "id": "turn-fake-001",
+                    "status": "completed",
+                    "error": None,
+                },
+            },
+        )
+
+        result = make_session(client).run_turn(
+            "tool then active protocol",
+            turn_timeout=1.0,
+            notification_poll_timeout=0.005,
+            post_tool_quiet_timeout=0.03,
+        )
+
+        assert result.error is None
+        assert result.should_retire is False
+        assert result.interrupted is False
+        assert result.last_liveness_at is not None
+
+    def test_total_usage_delta_spans_updates_and_reset_falls_back_to_last(self):
+        client = FakeClient()
+        session = make_session(client)
+
+        def usage(total):
+            return {
+                "inputTokens": total - 10,
+                "outputTokens": 10,
+                "totalTokens": total,
+            }
+
+        client.queue_notification(
+            "thread/tokenUsage/updated",
+            threadId="t",
+            turnId="tu1",
+            tokenUsage={"last": usage(100), "total": usage(100)},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        first = session.run_turn("first", turn_timeout=1.0)
+        assert _codex_turn_usage(first) == usage(100)
+
+        for total, last in ((150, 50), (210, 60)):
+            client.queue_notification(
+                "thread/tokenUsage/updated",
+                threadId="t",
+                turnId="tu1",
+                tokenUsage={"last": usage(last), "total": usage(total)},
+            )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        second = session.run_turn("second", turn_timeout=1.0)
+        assert second.token_usage_total_start == usage(100)
+        assert _codex_turn_usage(second) == {
+            "inputTokens": 110,
+            "outputTokens": 0,
+            "totalTokens": 110,
+        }
+
+        client.queue_notification(
+            "thread/tokenUsage/updated",
+            threadId="t",
+            turnId="tu1",
+            tokenUsage={"last": usage(20), "total": usage(20)},
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        reset = session.run_turn("reset", turn_timeout=1.0)
+        assert _codex_turn_usage(reset) == usage(20)
+
+    def test_continuation_usage_sums_turns_and_keeps_last_prompt_measurement(self):
+        merged = _merge_codex_usage_results(
+            [
+                {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 10,
+                    "total_tokens": 110,
+                    "last_prompt_tokens": 100,
+                },
+                {
+                    "prompt_tokens": 25,
+                    "completion_tokens": 5,
+                    "total_tokens": 30,
+                    "last_prompt_tokens": 25,
+                },
+            ]
+        )
+
+        assert merged["prompt_tokens"] == 125
+        assert merged["completion_tokens"] == 15
+        assert merged["total_tokens"] == 140
+        assert merged["last_prompt_tokens"] == 25
 
     def test_post_tool_watchdog_resets_on_further_activity(self):
         """A tool completion followed by an agent message should NOT trip

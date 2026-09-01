@@ -86,6 +86,7 @@ class TurnResult:
     turn_id: Optional[str] = None
     thread_id: Optional[str] = None
     token_usage_last: Optional[dict[str, Any]] = None
+    token_usage_total_start: Optional[dict[str, Any]] = None
     token_usage_total: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
@@ -93,6 +94,9 @@ class TurnResult:
     # from user interrupts and watchdog/process failures so callers can
     # withhold intermediate assistant text from terminal success handling.
     timed_out: bool = False
+    # Monotonic timestamp of the newest notification scoped to this turn.
+    # Used only by the opt-in, one-shot deadline continuation policy.
+    last_liveness_at: Optional[float] = None
     # Hint to the caller that the underlying codex subprocess is likely
     # wedged (turn-level timeout fired, post-tool watchdog tripped, or
     # token-refresh failure killed the child). The caller should retire
@@ -458,6 +462,7 @@ class CodexAppServerSession:
         # approval params don't carry the changeset, so we cache here
         # to surface a real summary in the approval prompt (quirk #4).
         self._pending_file_changes: dict[str, str] = {}
+        self._token_usage_total: Optional[dict[str, Any]] = None
         self._closed = False
 
     # ---------- lifecycle ----------
@@ -802,7 +807,13 @@ class CodexAppServerSession:
         # the same way per-turn failures do — with a TurnResult.error string
         # the caller can render — instead of bubbling raw codex exceptions
         # up to AIAgent.run_conversation.
-        result = TurnResult()
+        result = TurnResult(
+            token_usage_total_start=(
+                dict(self._token_usage_total)
+                if isinstance(self._token_usage_total, dict)
+                else None
+            )
+        )
         try:
             self.ensure_started(
                 startup_timeout=_remaining_timeout(deadline, turn_timeout)
@@ -890,7 +901,18 @@ class CodexAppServerSession:
             self._interrupt_event.clear()
             return result
 
-        result.turn_id = (ts.get("turn") or {}).get("id")
+        turn_obj = ts.get("turn") if isinstance(ts, dict) else None
+        result.turn_id = turn_obj.get("id") if isinstance(turn_obj, dict) else None
+        if not isinstance(result.turn_id, str) or not result.turn_id.strip():
+            if isinstance(ts, dict):
+                structure = f"payload keys: {sorted(str(key) for key in ts)}"
+            else:
+                structure = f"payload type: {type(ts).__name__}"
+            result.turn_id = None
+            result.error = f"codex turn/start returned no turn id ({structure})"
+            result.should_retire = True
+            self._interrupt_event.clear()
+            return result
         with self._active_turn_condition:
             self._turn_generation_counter += 1
             turn_generation = self._turn_generation_counter
@@ -906,6 +928,13 @@ class CodexAppServerSession:
         # fast-fail and retire the session.
         last_tool_completion_at: Optional[float] = None
         matching_user_projections: list[dict] = []
+
+        def _record_turn_liveness() -> None:
+            """Refresh turn liveness without disarming the quiet watchdog."""
+            nonlocal last_tool_completion_at
+            result.last_liveness_at = time.monotonic()
+            if last_tool_completion_at is not None:
+                last_tool_completion_at = result.last_liveness_at
 
         def _observe_user_projection(
             notification: dict, projected_messages: list[dict]
@@ -942,6 +971,7 @@ class CodexAppServerSession:
             if completed_turn is None:
                 return False
 
+            _record_turn_liveness()
             turn_complete = True
             turn_status = str(completed_turn.get("status") or "").strip()
             if turn_status == "completed":
@@ -1037,6 +1067,7 @@ class CodexAppServerSession:
                             pending.get("method"),
                         )
                         continue
+                    _record_turn_liveness()
                     # Mirror the main notification-handling block below so
                     # display events surface and stay in step with projector
                     # state. Without this, item/started / item/completed
@@ -1052,6 +1083,8 @@ class CodexAppServerSession:
                                 "on_event callback raised", exc_info=True
                             )
                     _apply_token_usage_notification(result, pending)
+                    if isinstance(result.token_usage_total, dict):
+                        self._token_usage_total = dict(result.token_usage_total)
                     _apply_compaction_notification(result, pending)
                     self._track_pending_file_change(pending)
                     proj = projector.project(pending)
@@ -1080,9 +1113,8 @@ class CodexAppServerSession:
                     )
                     result.should_retire = True
                     break
-                # Activity counts as live signal — reset the post-tool
-                # quiet timer so an approval round-trip doesn't trip it.
-                last_tool_completion_at = None
+                # A handled request is also evidence the subprocess is live.
+                _record_turn_liveness()
                 continue
 
             remaining = max(0.0, deadline - time.monotonic())
@@ -1109,6 +1141,8 @@ class CodexAppServerSession:
                 )
                 continue
 
+            _record_turn_liveness()
+
             if self._on_event is not None:
                 try:
                     self._on_event(note)
@@ -1116,6 +1150,8 @@ class CodexAppServerSession:
                     logger.debug("on_event callback raised", exc_info=True)
 
             _apply_token_usage_notification(result, note)
+            if isinstance(result.token_usage_total, dict):
+                self._token_usage_total = dict(result.token_usage_total)
             _apply_compaction_notification(result, note)
 
             # Track in-progress fileChange items so the approval bridge
@@ -1134,12 +1170,6 @@ class CodexAppServerSession:
                 # Arm/refresh the post-tool quiet watchdog whenever a
                 # tool-shaped item completes.
                 last_tool_completion_at = time.monotonic()
-            else:
-                # Any non-tool projected activity (assistant message,
-                # status update, etc.) means codex is still producing
-                # output — clear the quiet timer so we don't fast-fail.
-                if projection.messages or projection.final_text is not None:
-                    last_tool_completion_at = None
             if projection.final_text is not None:
                 # Codex can emit multiple agentMessage items in one turn
                 # (e.g. partial then final). Take the last one as canonical.

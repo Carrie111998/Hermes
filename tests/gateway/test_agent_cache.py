@@ -181,6 +181,23 @@ class TestExtractCacheBustingConfig:
             "/srv/repos"
         ]
 
+    def test_reads_generic_codex_app_server_hardening_options(self):
+        from gateway.run import GatewayRunner
+
+        out = GatewayRunner._extract_cache_busting_config(
+            {
+                "agent": {
+                    "codex_app_server_exclusive_cwd": True,
+                    "codex_app_server_deadline_continuation": True,
+                    "codex_app_server_codex_home": "codex-home",
+                }
+            }
+        )
+
+        assert out["agent.codex_app_server_exclusive_cwd"] is True
+        assert out["agent.codex_app_server_deadline_continuation"] is True
+        assert out["agent.codex_app_server_codex_home"] == "codex-home"
+
 
     def test_reads_compression_subkeys(self):
         from gateway.run import GatewayRunner
