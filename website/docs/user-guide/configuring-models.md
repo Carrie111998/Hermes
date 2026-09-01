@@ -286,7 +286,7 @@ A one-turn switch breaks the provider's prompt-cache prefix twice (switching out
 
 ### Custom aliases
 
-Define your own short names for models you reach for often, then use `/model <alias>` in the CLI or any messaging platform. There are two equivalent formats — pick whichever fits your workflow.
+Define your own short names for models you reach for often, then use `/model <alias>` in a running session or `hermes chat --model <alias>` at startup. There are two equivalent formats — pick whichever fits your workflow.
 
 **Canonical (top-level `model_aliases:`)** — full control over provider + base_url:
 
@@ -300,6 +300,26 @@ model_aliases:
     model: grok-4
     provider: x-ai
 ```
+
+An alias that points at its own endpoint can also carry that endpoint's
+credential, with either `api_key` (a literal, or a `"${VAR}"` reference) or
+`key_env` (the name of an environment variable). If both are set, `api_key`
+wins:
+
+```yaml
+model_aliases:
+  theta:
+    model: theta-1
+    provider: custom
+    base_url: "https://theta.example.com/v1"
+    key_env: THETA_API_KEY        # or: api_key: "${THETA_API_KEY}"
+```
+
+When an alias sets neither, the key is resolved from the alias **host** —
+`OLLAMA_API_KEY` for an `ollama.com` endpoint, `DEEPSEEK_API_KEY` for
+`api.deepseek.com`, and so on. It is never inherited from whichever provider
+happened to be active before the switch, so switching to an alias cannot send
+one provider's secret to another provider's host.
 
 **Short string form (`model.aliases.<name>: provider/model`)** — convenient from the shell because `hermes config set` writes scalars and now also parses inline list/mapping literals, though this short alias form still can't carry a custom `base_url`:
 
