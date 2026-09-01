@@ -966,8 +966,8 @@ def convert_messages_to_converse(
     converse_msgs: List[Dict] = []
 
     for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content")
+        role = msg.get("role", "") if isinstance(msg, dict) else getattr(msg, "role", "")
+        content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
 
         if role == "system":
             # System messages become the system prompt. Blank/whitespace-only
@@ -987,11 +987,11 @@ def convert_messages_to_converse(
 
         if role == "tool":
             # Tool result messages → merge into the preceding user turn
-            tool_call_id = msg.get("tool_call_id", "")
+            tool_call_id = msg.get("tool_call_id", "") if isinstance(msg, dict) else getattr(msg, "tool_call_id", "")
             result_content = content if isinstance(content, str) else json.dumps(content)
             tool_result_block = {
                 "toolResult": {
-                    "toolUseId": tool_call_id,
+                    "toolUseId": str(tool_call_id or ""),
                     "content": [{"text": _safe_text(result_content)}],
                 }
             }
@@ -1014,19 +1014,29 @@ def convert_messages_to_converse(
                 content_blocks.extend(_convert_content_to_converse(content))
 
             # Convert tool calls
-            tool_calls = msg.get("tool_calls", [])
+            tool_calls = msg.get("tool_calls", []) if isinstance(msg, dict) else getattr(msg, "tool_calls", [])
             for tc in (tool_calls or []):
-                fn = tc.get("function", {})
-                args_str = fn.get("arguments", "{}")
+                if isinstance(tc, dict):
+                    fn = tc.get("function", {}) or {}
+                    call_id = tc.get("id", "")
+                else:
+                    fn = getattr(tc, "function", {}) or {}
+                    call_id = getattr(tc, "id", "")
+                if isinstance(fn, dict):
+                    args_str = fn.get("arguments", "{}")
+                    fn_name = fn.get("name", "")
+                else:
+                    args_str = getattr(fn, "arguments", "{}")
+                    fn_name = getattr(fn, "name", "")
                 try:
                     args_dict = json.loads(args_str) if isinstance(args_str, str) else args_str
                 except (json.JSONDecodeError, TypeError):
                     args_dict = {}
                 content_blocks.append({
                     "toolUse": {
-                        "toolUseId": tc.get("id", ""),
-                        "name": fn.get("name", ""),
-                        "input": args_dict,
+                        "toolUseId": str(call_id or ""),
+                        "name": str(fn_name or ""),
+                        "input": args_dict if isinstance(args_dict, dict) else {},
                     }
                 })
 
