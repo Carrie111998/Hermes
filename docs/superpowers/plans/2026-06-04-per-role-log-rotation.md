@@ -15,7 +15,7 @@
 force-add them; they are local working docs. Commit only code + tests.
 Auto-commit hook quirks apply: scope every `git add`/`git commit` to explicit
 pathspecs, never `git add -A`. Author commits as Diego
-(`--author="Diego <diegodearagao@gmail.com>"`).
+(`--author="Diego <$(git config user.email)>"`).
 
 **Run tests with the worktree on PYTHONPATH** (editable-install finder
 hardcodes `~/.hermes/agent-src`; from a worktree you must prefix):
@@ -142,8 +142,8 @@ Expected: PASS (9 passed).
 
 ```bash
 git add hermes_logging.py tests/test_hermes_logging.py
-git -c user.name=Diego -c user.email=diegodearagao@gmail.com \
-  commit --author="Diego <diegodearagao@gmail.com>" \
+git -c user.name=Diego -c user.email=$(git config user.email) \
+  commit --author="Diego <$(git config user.email)>" \
   -m "feat(logging): infer_daemon_role() argv->role helper" \
   -- hermes_logging.py tests/test_hermes_logging.py
 ```
@@ -290,8 +290,8 @@ Expected: PASS — all tests, including the previously-existing `TestSetupLoggin
 
 ```bash
 git add hermes_logging.py tests/test_hermes_logging.py
-git -c user.name=Diego -c user.email=diegodearagao@gmail.com \
-  commit --author="Diego <diegodearagao@gmail.com>" \
+git -c user.name=Diego -c user.email=$(git config user.email) \
+  commit --author="Diego <$(git config user.email)>" \
   -m "feat(logging): role= routes catch-all logs to per-role files" \
   -- hermes_logging.py tests/test_hermes_logging.py
 ```
@@ -349,8 +349,8 @@ Expected: no traceback from the logging-init block (any unrelated downstream imp
 
 ```bash
 git add hermes_cli/main.py cli.py
-git -c user.name=Diego -c user.email=diegodearagao@gmail.com \
-  commit --author="Diego <diegodearagao@gmail.com>" \
+git -c user.name=Diego -c user.email=$(git config user.email) \
+  commit --author="Diego <$(git config user.email)>" \
   -m "feat(logging): wire daemon-role inference at CLI import sites" \
   -- hermes_cli/main.py cli.py
 ```
@@ -417,8 +417,8 @@ Expected: PASS (2 passed).
 
 ```bash
 git add hermes_cli/logs.py tests/test_hermes_logging.py
-git -c user.name=Diego -c user.email=diegodearagao@gmail.com \
-  commit --author="Diego <diegodearagao@gmail.com>" \
+git -c user.name=Diego -c user.email=$(git config user.email) \
+  commit --author="Diego <$(git config user.email)>" \
   -m "feat(logging): register per-role catch-all files in hermes logs" \
   -- hermes_cli/logs.py tests/test_hermes_logging.py
 ```
@@ -500,8 +500,8 @@ Expected (on Windows): PASS (2 passed). On non-Windows: 1 passed, 1 skipped.
 
 ```bash
 git add tests/test_hermes_logging.py
-git -c user.name=Diego -c user.email=diegodearagao@gmail.com \
-  commit --author="Diego <diegodearagao@gmail.com>" \
+git -c user.name=Diego -c user.email=$(git config user.email) \
+  commit --author="Diego <$(git config user.email)>" \
   -m "test(logging): per-role rotation isolation while shared agent.log pinned" \
   -- tests/test_hermes_logging.py
 ```
