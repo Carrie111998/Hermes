@@ -45,6 +45,7 @@ import { type PreviewInputEvent, registerPreviewInput } from './preview-input'
 import { PREVIEW_BROWSER_ATTR, registerPreviewNav } from './preview-nav'
 import { registerPreviewPageReader } from './preview-reader'
 import { registerPreviewScriptRunner } from './preview-script-runner'
+import { RealProfileConsentDialog } from './real-profile-consent-dialog'
 
 type PreviewWebview = HTMLElement & {
   canGoBack?: () => boolean
@@ -1046,6 +1047,10 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
             url={currentUrl}
           />
         )}
+
+        {/* First-open real-profile consent offer — Browser tabs only (URL
+            vessels the user browses with), never file/HTML previews. */}
+        {target.kind === 'url' && tabId && <RealProfileConsentDialog tabId={tabId} />}
 
         <div
           className="pointer-events-auto relative min-h-0 flex-1 overflow-hidden bg-transparent"
