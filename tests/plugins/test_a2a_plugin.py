@@ -36,6 +36,26 @@ def _free_port() -> int:
 
 
 # --------------------------------------------------------------------------
+# Timeouts
+# --------------------------------------------------------------------------
+
+class TestA2ATimeouts:
+    def test_orphan_timeout_never_preempts_configured_reply_timeout(self, monkeypatch):
+        from plugins.platforms.a2a import adapter
+
+        monkeypatch.setenv("A2A_REPLY_TIMEOUT", "900")
+        assert adapter._orphan_timeout() >= (
+            adapter._reply_timeout() + adapter._WATCHDOG_INTERVAL
+        )
+
+    def test_orphan_timeout_keeps_existing_five_minute_floor(self, monkeypatch):
+        from plugins.platforms.a2a import adapter
+
+        monkeypatch.setenv("A2A_REPLY_TIMEOUT", "1")
+        assert adapter._orphan_timeout() >= adapter._MIN_ORPHAN_TIMEOUT
+
+
+# --------------------------------------------------------------------------
 # Security
 # --------------------------------------------------------------------------
 
