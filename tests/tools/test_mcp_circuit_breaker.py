@@ -101,6 +101,45 @@ def _cleanup(mcp_tool_module, name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_application_errors_do_not_trip_transport_breaker(monkeypatch, tmp_path):
+    """Completed RPCs with ``isError`` keep the transport breaker closed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    responses = [True, True, True, False]
+    call_count = {"n": 0}
+
+    async def _call_tool(*a, **kw):
+        is_error = responses.pop(0)
+        call_count["n"] += 1
+        result = MagicMock()
+        result.is_error = is_error
+        block = MagicMock()
+        block.text = "invalid_input" if is_error else "ok"
+        result.content = [block]
+        result.structured_content = None
+        return result
+
+    _install_stub_server(mcp_tool, "srv", _call_tool)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD):
+            parsed = json.loads(handler({}))
+            assert parsed.get("error") == "invalid_input", parsed
+
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0
+
+        parsed = json.loads(handler({}))
+        assert parsed.get("result") == "ok", parsed
+        assert call_count["n"] == mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 1
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
 def test_circuit_breaker_half_opens_after_cooldown(monkeypatch, tmp_path):
     """After a tripped breaker's cooldown elapses, the *next* call must
     actually execute against the session (half-open probe). When the
