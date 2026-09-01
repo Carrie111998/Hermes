@@ -376,6 +376,49 @@ async def test_reset_clears_stale_reply_anchor_from_background_completion(
 
 
 @pytest.mark.asyncio
+async def test_switch_clears_stale_reply_anchor_from_background_completion(
+    monkeypatch, tmp_path
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="123",
+        chat_type="dm",
+        thread_id="24296",
+        user_id="1",
+        message_id="old-100",
+    )
+    runner.session_store.get_or_create_session(source)
+    session_key = build_session_key(source)
+    switched_entry = runner.session_store.switch_session(session_key, "target-session")
+
+    assert switched_entry is not None
+    assert switched_entry.session_id == "target-session"
+
+    await runner._inject_watch_notification(
+        "Build finished: unrelated completion output",
+        {"session_id": "proc_watch", "session_key": session_key},
+    )
+    synth_event = runner.adapters[Platform.TELEGRAM].handle_message.await_args.args[0]
+
+    delivery = _TelegramDeliveryProbe()
+    delivery.set_message_handler(lambda _event: asyncio.sleep(0, result="done"))
+    await delivery._process_message_background(synth_event, session_key)
+
+    assert delivery.sent == [{
+        "chat_id": "123",
+        "content": "done",
+        "reply_to": None,
+        "metadata": {
+            "thread_id": "24296",
+            "telegram_dm_topic_reply_fallback": True,
+            "direct_messages_topic_id": "24296",
+            "notify": True,
+        },
+    }]
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_loads_session_store_off_loop(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

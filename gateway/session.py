@@ -310,6 +310,11 @@ class SessionSource:
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
         )
+
+
+def _durable_session_origin(origin: Optional[SessionSource]) -> Optional[SessionSource]:
+    """Copy route identity without retaining an event-level reply anchor."""
+    return replace(origin, message_id=None) if origin is not None else None
     
 
 
@@ -3651,11 +3656,7 @@ class SessionStore:
             # Preserve the durable route, not the inbound event that happened
             # to establish it. Leaving message_id on the copied origin lets a
             # later synthetic event reply to the ended session (#100717).
-            reset_origin = (
-                replace(old_entry.origin, message_id=None)
-                if old_entry.origin is not None
-                else None
-            )
+            reset_origin = _durable_session_origin(old_entry.origin)
 
             now = _now()
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
@@ -3801,13 +3802,15 @@ class SessionStore:
 
             db_end_session_id = old_entry.session_id
 
+            switch_origin = _durable_session_origin(old_entry.origin)
+
             now = _now()
             new_entry = SessionEntry(
                 session_key=session_key,
                 session_id=target_session_id,
                 created_at=now,
                 updated_at=now,
-                origin=old_entry.origin,
+                origin=switch_origin,
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
@@ -3838,7 +3841,7 @@ class SessionStore:
             self._record_gateway_session_peer(
                 target_session_id,
                 session_key,
-                new_entry.origin if new_entry else None,
+                switch_origin,
                 display_name=new_entry.display_name if new_entry else None,
                 include_compression_ancestors=True,
             )
