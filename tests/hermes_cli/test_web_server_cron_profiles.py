@@ -653,6 +653,128 @@ async def test_trigger_cron_job_forces_paused_job_atomically(
 
 
 @pytest.mark.asyncio
+async def test_trigger_cron_job_forwards_relay_fronted_job_to_gateway(
+    isolated_profiles,
+    monkeypatch,
+):
+    """A relay-fronted job's dashboard "Run Now" must forward to the TARGET
+    profile's gateway api_server (POST /api/jobs/{id}/run, API_SERVER_KEY
+    bearer) instead of firing in-process — this process has no standalone
+    sender for a relay-fronted platform, only the gateway's live adapter
+    does (mirrors the CLI's own `hermes cron run` forward)."""
+    from hermes_cli import web_server
+
+    job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="deliver via relay",
+        schedule="every 1h",
+        name="relay-fronted-trigger-job",
+        deliver="discord",
+    )
+
+    monkeypatch.setattr(
+        "gateway.relay.relay_fronted_platforms", lambda: {"discord"}
+    )
+    monkeypatch.setattr(
+        "cron.scheduler._resolve_delivery_targets",
+        lambda job: [{"platform": "discord", "chat_id": "123"}],
+    )
+
+    def fire_due_must_not_run(self, *a, **kw):
+        raise AssertionError(
+            "relay-fronted trigger must forward to the gateway, not fire in-process"
+        )
+
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("relay-fronted trigger must not resolve a local scheduler")
+        ),
+    )
+
+    posted = {}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+    def fake_post(url, *, headers=None, json=None, timeout=None):
+        posted["url"] = url
+        posted["headers"] = headers
+        return _Resp()
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr(
+        "agent.secret_scope.get_secret", lambda *a, **kw: "gw-secret-key"
+    )
+
+    triggered = await web_server.trigger_cron_job(
+        job["id"],
+        profile="worker_alpha",
+    )
+
+    assert posted["url"] == f"http://127.0.0.1:8642/api/jobs/{job['id']}/run"
+    assert posted["headers"]["Authorization"] == "Bearer gw-secret-key"
+    # Forwarded, not fired in-process: no local run was ever claimed.
+    assert triggered["last_run_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_trigger_cron_job_relay_fronted_gateway_unreachable_is_503(
+    isolated_profiles,
+    monkeypatch,
+):
+    """Gateway unreachable for a relay-fronted job must fail loudly (503),
+    never silently fall back to the in-process path that cannot deliver."""
+    from fastapi import HTTPException
+    from hermes_cli import web_server
+
+    job = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "create_job",
+        prompt="deliver via relay",
+        schedule="every 1h",
+        name="relay-fronted-unreachable-job",
+        deliver="discord",
+    )
+
+    monkeypatch.setattr(
+        "gateway.relay.relay_fronted_platforms", lambda: {"discord"}
+    )
+    monkeypatch.setattr(
+        "cron.scheduler._resolve_delivery_targets",
+        lambda job: [{"platform": "discord", "chat_id": "123"}],
+    )
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("relay-fronted trigger must not resolve a local scheduler")
+        ),
+    )
+
+    def fake_post(url, *, headers=None, json=None, timeout=None):
+        raise ConnectionError("gateway down")
+
+    monkeypatch.setattr("httpx.post", fake_post)
+    monkeypatch.setattr(
+        "agent.secret_scope.get_secret", lambda *a, **kw: "gw-secret-key"
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await web_server.trigger_cron_job(job["id"], profile="worker_alpha")
+
+    assert exc.value.status_code == 503
+    assert "relay-fronted" in exc.value.detail.lower()
+    persisted = web_server._call_cron_for_profile(
+        "worker_alpha",
+        "get_job",
+        job["id"],
+    )
+    assert persisted["last_run_at"] is None
+
+
+@pytest.mark.asyncio
 async def test_trigger_paused_job_rejects_legacy_provider_without_mutating_job(
     isolated_profiles,
     monkeypatch,

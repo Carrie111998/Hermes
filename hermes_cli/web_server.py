@@ -13306,6 +13306,15 @@ def _trigger_cron_job_sync(job_id: str, profile: Optional[str] = None):
     job = _call_cron_for_profile(selected, "resolve_job_ref", job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    # Relay-fronted delivery (Discord/Telegram/etc. behind the gateway's relay
+    # connector) and E2EE rooms have no standalone sender in THIS (dashboard)
+    # process — only the gateway's live adapter can deliver. Forward there
+    # before claiming the run in-process, mirroring the CLI's own
+    # `hermes cron run` forward (tools.cronjob_tools._forward_relay_fronted_run)
+    # and the Chronos fire webhook's gateway forward just above.
+    _, home = _cron_profile_home(selected)
+    if _relay_fronted_run_platforms_for_profile(selected, home, job):
+        return _forward_relay_fronted_trigger(selected, home, job["id"])
     # Do not expose the job as due before claiming it: the built-in ticker and
     # external/manual fire paths share the same durable claim, so only one can
     # execute this selected run even if they race across processes. Active jobs
@@ -13420,8 +13429,8 @@ def _profile_env_value(home: Path, key: str) -> str:
     return ""
 
 
-def _gateway_fire_endpoint(profile: str, home: Path) -> str:
-    """Resolve the loopback URL of the gateway api_server's cron-fire route.
+def _gateway_fire_endpoint(profile: str, home: Path, *, route: str = "/api/cron/fire") -> str:
+    """Resolve the loopback URL of a gateway api_server route for TARGET profile.
 
     Port resolution mirrors gateway/config.py's api_server load order for the
     TARGET profile: ``platforms.api_server.extra.port`` in the profile's
@@ -13436,6 +13445,10 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
     the default gateway's port with that prefix; per-profile-gateway mode
     (each profile its own process/port) uses the bare path on the profile's
     own port.
+
+    ``route`` defaults to the Chronos fire webhook's path; pass a different
+    absolute path (e.g. an ``/api/jobs/{id}/run`` manual-trigger forward) to
+    resolve the same port/multiplex logic for another gateway route.
     """
     import os as _os
 
@@ -13490,8 +13503,89 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
         pass
 
     if multiplex and profile != "default":
-        return f"http://127.0.0.1:{port}/p/{profile}/api/cron/fire"
-    return f"http://127.0.0.1:{port}/api/cron/fire"
+        return f"http://127.0.0.1:{port}/p/{profile}{route}"
+    return f"http://127.0.0.1:{port}{route}"
+
+
+def _relay_fronted_run_platforms_for_profile(
+    profile: str, home: Path, job: Dict[str, Any]
+) -> set:
+    """Relay-fronted delivery platforms for ``job``, resolved under the
+    TARGET profile's config rather than the dashboard process's own active
+    profile — the profile-scoped analogue of
+    :func:`tools.cronjob_tools._relay_fronted_delivery_platforms`, needed
+    because the dashboard triggers jobs across every profile it manages, not
+    just the one it happens to be running under.
+    """
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(home))
+    try:
+        from tools.cronjob_tools import _relay_fronted_delivery_platforms
+
+        return _relay_fronted_delivery_platforms(job)
+    except Exception:
+        return set()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def _forward_relay_fronted_trigger(profile: str, home: Path, job_id: str) -> Dict[str, Any]:
+    """Forward a dashboard "Run Now" trigger to the TARGET profile's gateway.
+
+    A relay-fronted platform's only sender is the gateway's live relay
+    adapter — no standalone credential exists in the dashboard process — so
+    this process cannot deliver the run itself (the same constraint
+    :func:`_fire_cron_job_for_profile` documents). This is the dashboard
+    analogue of the CLI's own forward
+    (``tools.cronjob_tools._forward_relay_fronted_run``): it hits the
+    gateway api_server's ``POST /api/jobs/{id}/run`` (API_SERVER_KEY bearer,
+    a manual trigger — NOT the Chronos-JWT-gated ``/api/cron/fire``), which
+    marks the job due for the gateway's own ticker to fire with the live
+    adapter.
+
+    Raises ``HTTPException`` (503) when the gateway is unreachable or
+    rejects the forward, so a relay-fronted trigger fails loudly instead of
+    silently claiming the run and never delivering it.
+    """
+    url = _gateway_fire_endpoint(profile, home, route=f"/api/jobs/{job_id}/run")
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(str(home))
+    try:
+        from agent.secret_scope import get_secret
+
+        key = get_secret("API_SERVER_KEY", "") or ""
+    finally:
+        reset_hermes_home_override(token)
+
+    import httpx
+
+    try:
+        resp = httpx.post(
+            url,
+            headers={"Authorization": f"Bearer {key}"},
+            json={},
+            timeout=10.0,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "This job delivers through a relay-fronted platform, which "
+                "only the running gateway can reach, and the gateway is "
+                f"unreachable ({exc}). Start the profile's gateway and try "
+                "again."
+            ),
+        ) from exc
+    if resp.status_code >= 400:
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Gateway rejected the forwarded run: {(resp.text or '')[:300]}",
+        )
+    refreshed = _call_cron_for_profile(profile, "get_job", job_id)
+    return refreshed or {"job_id": job_id, "forwarded_to_gateway": True}
 
 
 async def _forward_cron_fire_to_gateway(
