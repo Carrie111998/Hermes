@@ -98,7 +98,7 @@ Qwen3.8: one CUDA device, no generic multi-GPU shard. Load `references/local-mod
 2. Check GPU idle state through `terminal`. Pin an idle device with `--gpus N`. Do not steal a live serve.
 3. Size the job: `obliteratus gpu-calc <ckpt> --gpu-mem <GB>`. Native BF16 surgery needs ~2 bytes/param plus activations; `--quantization 4bit` is load-time only. FP8/NVFP4 checkpoints dequantize automatically — peak VRAM is the **BF16** size; saved output is BF16.
 4. Optional: `obliteratus recommend <ckpt>` then `obliteratus info <ckpt>`.
-5. Run `obliteratus obliterate` with `--method advanced` unless `references/methods-guide.md` says otherwise (MoE → `nuclear`, reasoning/CoT → `surgical`).
+5. Run `obliteratus obliterate` with `--method advanced` unless `references/methods-guide.md` says otherwise (precision MoE → `surgical`, quality auto-tune → `optimized`).
 6. Read the printed metrics. Target refusal rate ≤ 5% (ideally ~0–3%). Fail-closed defaults: `--max-perplexity-increase 3.0` (multiple of stock), `--min-coherence-retention 0.5`, `--max-degenerate-fraction 0.2`, `--verify-sample-size 30`.
 7. If refusals remain: `obliteratus self-improve <ckpt> --audit <json> --output-dir <next>`, or rerun with `--residue-file`, more `--n-directions`, `--refinement-passes 3`, `--direction-method svd`, or `--method aggressive`.
 8. Optional capability gate: `obliteratus capability-check --abliterated <out> --stock <ckpt> --quick`.
