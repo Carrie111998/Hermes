@@ -24,6 +24,7 @@ import re
 import ssl
 import sys
 import time
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -170,6 +171,83 @@ def _midturn_request_pressure_tokens(
     return approx_tokens + (
         _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
     )
+
+
+def run_native_protected_handoff_request(
+    agent: Any,
+    snapshot: List[Dict[str, Any]],
+    handoff_prompt: str,
+) -> Optional[tuple[str, List[Dict[str, Any]]]]:
+    """Run one silent, no-tools Responses handoff request through normal plumbing.
+
+    This deliberately shares the normal ``_build_api_kwargs`` → transport
+    preflight → interruptible request → response normalization route.  It does
+    not stream, emit status, execute tools, touch retry/display state, or reach
+    through a provider client's private/raw implementation.  Any failure is a
+    non-committing ``None`` so turn-context can use its existing local
+    compression path unchanged.
+    """
+    if (
+        getattr(agent, "api_mode", None) != "codex_responses"
+        or not bool(getattr(agent, "_codex_reasoning_replay_enabled", True))
+    ):
+        return None
+    try:
+        system_prompt = getattr(agent, "_cached_system_prompt", None)
+        request_messages: List[Dict[str, Any]] = []
+        if isinstance(system_prompt, str) and system_prompt:
+            request_messages.append({"role": "system", "content": system_prompt})
+        # The isolated preparation path must not be able to mutate the durable
+        # transcript before its checkpoint/handoff pair is accepted.
+        request_messages.extend(deepcopy(snapshot))
+        request_messages.append({"role": "user", "content": handoff_prompt})
+
+        api_kwargs = agent._build_api_kwargs(request_messages, tools_for_api=[])
+        # No tool declarations means a handoff can neither ask for nor execute
+        # a tool.  The Responses transport already omits this field for [];
+        # pop is a defensive contract for custom transport doubles.
+        api_kwargs.pop("tools", None)
+        api_kwargs.pop("tool_choice", None)
+        api_kwargs.pop("parallel_tool_calls", None)
+        if not api_kwargs.get("context_management"):
+            return None
+        # Copied-state acceptance froze this isolated preparation request on
+        # Luna with reasoning disabled. Keep the main Sol route and the Sol
+        # local-compression fallback untouched; only this no-tools request uses
+        # the faster accepted tuple.
+        api_kwargs["model"] = "gpt-5.6-luna"
+        api_kwargs["reasoning"] = {"effort": "none", "summary": "auto"}
+        transport = agent._get_transport()
+        api_kwargs = transport.preflight_kwargs(
+            api_kwargs,
+            allow_stream=False,
+            is_github_responses=agent._is_copilot_url(),
+            sanitize_harmony_tokens=agent._is_codex_backend(),
+        )
+        response = agent._interruptible_api_call(api_kwargs)
+        normalized = transport.normalize_response(response)
+        provider_data = getattr(normalized, "provider_data", None)
+        items = (
+            provider_data.get("codex_reasoning_items")
+            if isinstance(provider_data, dict)
+            else None
+        )
+        if not isinstance(items, list):
+            return None
+        content = getattr(normalized, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            return None
+        return content.strip(), [dict(item) for item in items if isinstance(item, dict)]
+    except Exception as exc:  # Any isolated-request error must retain history.
+        try:
+            from agent.native_compaction import is_native_compaction_rejection
+
+            if is_native_compaction_rejection(exc, getattr(exc, "status_code", None)):
+                agent.codex_responses_native_compaction = False
+        except Exception:
+            pass
+        logger.debug("protected native handoff request declined; using local compression", exc_info=True)
+        return None
 
 
 def _review_input_budget_exhausted(agent: Any) -> bool:
@@ -2352,8 +2430,14 @@ def run_conversation(
                 and not api_msg.get("tool_calls")
             ):
                 from agent.agent_runtime_helpers import _INTERRUPTED_PLACEHOLDER
+                from agent.native_compaction import has_compaction_checkpoint
 
-                api_msg["content"] = _INTERRUPTED_PLACEHOLDER
+                # A protected native-compaction carrier is intentionally a
+                # hidden, empty assistant row. Its checkpoint plus injected
+                # handoff supply the required Responses continuation, so do
+                # not turn it into an interrupt placeholder on the wire.
+                if not has_compaction_checkpoint(api_msg.get("codex_reasoning_items")):
+                    api_msg["content"] = _INTERRUPTED_PLACEHOLDER
 
             # Durable row identity stamped by _rows_to_conversation so the
             # desktop can address a specific persisted message (reactions).

@@ -558,7 +558,7 @@ def _chat_messages_to_responses_input(
     item_sources: List[Optional[Dict[str, Any]]] = []
     seen_item_ids: set = set()
 
-    for msg in messages:
+    for message_index, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role")
@@ -589,6 +589,7 @@ def _chat_messages_to_responses_input(
                     else None
                 )
                 has_codex_reasoning = False
+                has_protected_compaction_handoff = False
                 if isinstance(codex_reasoning, list):
                     for ri in codex_reasoning:
                         if isinstance(ri, dict) and ri.get("encrypted_content"):
@@ -639,10 +640,46 @@ def _chat_messages_to_responses_input(
                             # Also strip the internal "_issuer_kind" stamp;
                             # it is a Hermes-side metadata key and not part
                             # of the Responses API schema.
-                            replay_item = {
-                                k: v for k, v in ri.items()
-                                if k not in ("id", "_issuer_kind")
-                            }
+                            if ri.get("type") == "compaction":
+                                # The provider only accepts the canonical
+                                # checkpoint fields.  Keep the protected
+                                # handoff metadata solely until the native
+                                # pruner can place its rendered user item;
+                                # `prune_pre_checkpoint_items` removes it
+                                # before the wire, and preflight is a second
+                                # canonicalization backstop.
+                                replay_item = {
+                                    "type": "compaction",
+                                    "encrypted_content": ri["encrypted_content"],
+                                }
+                                from agent.native_compaction import (
+                                    PROTECTED_HANDOFF_METADATA_KEY,
+                                )
+
+                                metadata = ri.get(PROTECTED_HANDOFF_METADATA_KEY)
+                                if isinstance(metadata, dict):
+                                    replay_item[PROTECTED_HANDOFF_METADATA_KEY] = metadata
+                                    from agent.native_compaction import (
+                                        protected_handoff_from_checkpoint,
+                                    )
+
+                                    has_protected_compaction_handoff = bool(
+                                        protected_handoff_from_checkpoint(
+                                            ri,
+                                            preceding_messages=messages[:message_index],
+                                        )
+                                    )
+                                    if not has_protected_compaction_handoff:
+                                        # Prefix drift invalidates checkpoint and
+                                        # handoff atomically. Continue with full
+                                        # local history rather than prune around
+                                        # a stale provider checkpoint.
+                                        continue
+                            else:
+                                replay_item = {
+                                    k: v for k, v in ri.items()
+                                    if k not in ("id", "_issuer_kind")
+                                }
                             items.append(replay_item)
                             item_sources.append(msg)
                             if item_id:
@@ -712,12 +749,15 @@ def _chat_messages_to_responses_input(
                 elif content_text.strip():
                     items.append({"role": "assistant", "content": content_text})
                     item_sources.append(msg)
-                elif has_codex_reasoning:
+                elif has_codex_reasoning and not has_protected_compaction_handoff:
                     # The Responses API requires a following item after each
                     # reasoning item (otherwise: missing_following_item error).
                     # When the assistant produced only reasoning with no visible
                     # content, emit an empty assistant message as the required
-                    # following item.
+                    # following item. A protected compaction checkpoint instead
+                    # receives its validated handoff immediately after pruning,
+                    # so emitting a synthetic assistant record would both be
+                    # redundant and expose an internal carrier on the wire.
                     items.append({"role": "assistant", "content": ""})
                     item_sources.append(msg)
 

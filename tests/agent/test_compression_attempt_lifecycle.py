@@ -150,7 +150,9 @@ class TestWorkerTeardownOnCeiling:
             worker=stuck_worker,
             messages=original,
             system_prompt_fallback="fallback",
-            idle_timeout_seconds=0.1,
+            # Keep the idle budget above the total ceiling so scheduler jitter
+            # cannot misclassify this as the separate idle-stall path.
+            idle_timeout_seconds=1.0,
             total_ceiling_seconds=0.3,
             fence=fence,
             stall_fallback=False,

@@ -59,6 +59,11 @@ class TurnContext:
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
     _cleanup_msg_ids: List[str] = field(default_factory=list)
+    # Direct interim sends are scheduled from the agent worker thread when no
+    # stream consumer is available. Keep their futures so cleanup snapshots
+    # every successfully delivered commentary message.
+    _direct_commentary_futures: list = field(default_factory=list)
+    _track_cleanup_result: Optional[Callable] = None
 
     # --- progress threading metadata (assigned after construction, before
     #     send_progress_messages is scheduled) ----------------------------

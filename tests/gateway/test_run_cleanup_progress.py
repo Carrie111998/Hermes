@@ -143,6 +143,88 @@ class FailingAgent:
         }
 
 
+class CommentaryAgent:
+    """Emits one interim assistant update before a normal final."""
+
+    def __init__(self, **kwargs):
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.interim_assistant_callback is not None:
+            self.interim_assistant_callback("Checking the relevant records now.")
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class PreviewedFinalCommentaryAgent(CommentaryAgent):
+    """Delivers the exact final answer through the interim callback."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.interim_assistant_callback is not None:
+            self.interim_assistant_callback("You're welcome.")
+        return {
+            "final_response": "You're welcome.",
+            "response_previewed": True,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class AmbiguousFinalStreamConsumer:
+    """Claims legacy streamed delivery without exact final-payload evidence."""
+
+    accepts_tool_progress = False
+    loop: asyncio.AbstractEventLoop | None = None
+
+    def __init__(self, *, adapter, chat_id, on_commentary_sent=None, **_kwargs):
+        self.adapter = adapter
+        self.chat_id = chat_id
+        self._on_commentary_sent = on_commentary_sent
+        loop = type(self).loop
+        if loop is None:
+            raise RuntimeError("test loop was not installed")
+        self._loop: asyncio.AbstractEventLoop = loop
+        self._done = asyncio.Event()
+        self.final_response_sent = True
+        self.final_content_delivered = True
+        self.message_id = "ambiguous-stream"
+
+    def on_commentary(self, text):
+        future = asyncio.run_coroutine_threadsafe(
+            self.adapter.send(self.chat_id, text),
+            self._loop,
+        )
+        result = future.result(timeout=5)
+        if self._on_commentary_sent is not None:
+            self._on_commentary_sent(result)
+
+    def on_segment_break(self):
+        return None
+
+    def on_delta(self, _text):
+        return None
+
+    def finish(self, *_args):
+        self._loop.call_soon_threadsafe(self._done.set)
+
+    async def run(self):
+        await self._done.wait()
+
+    def delivered_final_matches(self, _text):
+        return None
+
+    def has_delivered_text(self, _text):
+        return False
+
+
+
+def _set_final_delivery_state(adapter, session_key: str, succeeded: bool):
+    event = adapter._active_sessions.get(session_key) or asyncio.Event()
+    setattr(event, "_hermes_final_delivery_succeeded", succeeded)
+    adapter._active_sessions[session_key] = event
+    return event
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -272,6 +354,7 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     # Pre-register a callback with the same generation the run will use
     # (run_generation=None in this test path — matches the default slot).
     adapter.register_post_delivery_callback(session_key, _preexisting_callback)
+    _set_final_delivery_state(adapter, session_key, False)
 
     result = await runner._run_agent(
         message="hello",
@@ -283,6 +366,7 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     )
 
     assert result["final_response"] == "done"
+    _set_final_delivery_state(adapter, session_key, True)
     cb = adapter.pop_post_delivery_callback(session_key)
     assert callable(cb)
     await _fire_post_delivery_cb(cb)
@@ -295,3 +379,179 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     # deletes at least one progress bubble.
     assert pre_existing_fired == [True]
     assert len(adapter.deleted) >= 1
+
+
+@pytest.mark.asyncio
+async def test_success_cleanup_deletes_commentary_but_not_final(monkeypatch, tmp_path):
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, CommentaryAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+    _set_final_delivery_state(adapter, session_key, False)
+
+    result = await runner._run_agent(
+        message="hello", context_prompt="", history=[], source=source,
+        session_id="commentary-success", session_key=session_key,
+    )
+
+    commentary = next(
+        entry for entry in adapter.sent
+        if entry["content"] == "Checking the relevant records now."
+    )
+    final_send = await adapter.send("-1001", result["final_response"])
+    _set_final_delivery_state(adapter, session_key, True)
+    cb = adapter.pop_post_delivery_callback(session_key)
+    assert callable(cb)
+    await _fire_post_delivery_cb(cb)
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if adapter.deleted:
+            break
+
+    deleted_ids = {entry["message_id"] for entry in adapter.deleted}
+    assert commentary["message_id"] in deleted_ids
+    assert final_send.message_id not in deleted_ids
+
+
+@pytest.mark.asyncio
+async def test_previewed_final_commentary_is_never_deleted(monkeypatch, tmp_path):
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(
+        monkeypatch, PreviewedFinalCommentaryAgent, cleanup_on=True,
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+    delivery_event = _set_final_delivery_state(adapter, session_key, False)
+
+    result = await runner._run_agent(
+        message="hello", context_prompt="", history=[], source=source,
+        session_id="commentary-final", session_key=session_key,
+    )
+
+    assert result.get("already_sent") is True
+    assert getattr(delivery_event, "_hermes_final_delivery_preconfirmed") is True
+    setattr(delivery_event, "_hermes_final_delivery_succeeded", True)
+    final_entry = next(
+        entry for entry in adapter.sent if entry["content"] == "You're welcome."
+    )
+    cb = adapter.pop_post_delivery_callback(session_key)
+    if cb is not None:
+        await _fire_post_delivery_cb(cb)
+        await asyncio.sleep(0)
+    deleted_ids = {entry["message_id"] for entry in adapter.deleted}
+    assert final_entry["message_id"] not in deleted_ids
+
+
+@pytest.mark.asyncio
+async def test_final_delivery_failure_retains_interim_commentary(monkeypatch, tmp_path):
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, CommentaryAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+    _set_final_delivery_state(adapter, session_key, False)
+
+    await runner._run_agent(
+        message="hello", context_prompt="", history=[], source=source,
+        session_id="commentary-final-failed", session_key=session_key,
+    )
+
+    commentary = next(
+        entry for entry in adapter.sent
+        if entry["content"] == "Checking the relevant records now."
+    )
+    cb = adapter.pop_post_delivery_callback(session_key)
+    assert callable(cb)
+    await _fire_post_delivery_cb(cb)
+    await asyncio.sleep(0)
+    deleted_ids = {entry["message_id"] for entry in adapter.deleted}
+    assert commentary["message_id"] not in deleted_ids
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_partial_stream_cannot_authorize_commentary_cleanup(
+    monkeypatch, tmp_path,
+):
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(
+        monkeypatch, CommentaryAgent, cleanup_on=True,
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    stream_consumer_module = importlib.import_module("gateway.stream_consumer")
+    monkeypatch.setattr(
+        stream_consumer_module,
+        "GatewayStreamConsumer",
+        AmbiguousFinalStreamConsumer,
+    )
+    AmbiguousFinalStreamConsumer.loop = asyncio.get_running_loop()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+    delivery_event = _set_final_delivery_state(adapter, session_key, False)
+
+    result = await runner._run_agent(
+        message="hello", context_prompt="", history=[], source=source,
+        session_id="commentary-ambiguous-stream", session_key=session_key,
+    )
+
+    assert result.get("already_sent") is True
+    assert getattr(
+        delivery_event, "_hermes_final_delivery_preconfirmed", False
+    ) is False
+    commentary = next(
+        entry for entry in adapter.sent
+        if entry["content"] == "Checking the relevant records now."
+    )
+    cb = adapter.pop_post_delivery_callback(session_key)
+    assert callable(cb)
+    await _fire_post_delivery_cb(cb)
+    await asyncio.sleep(0)
+    assert commentary["message_id"] not in {
+        entry["message_id"] for entry in adapter.deleted
+    }
+
+
+@pytest.mark.asyncio
+async def test_direct_commentary_fallback_is_tracked_before_cleanup_snapshot(
+    monkeypatch, tmp_path,
+):
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, CommentaryAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    stream_consumer_module = importlib.import_module("gateway.stream_consumer")
+    monkeypatch.setattr(
+        stream_consumer_module,
+        "GatewayStreamConsumer",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("setup failed")),
+    )
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
+    session_key = "agent:main:telegram:group:-1001"
+    _set_final_delivery_state(adapter, session_key, False)
+
+    result = await runner._run_agent(
+        message="hello", context_prompt="", history=[], source=source,
+        session_id="commentary-direct-fallback", session_key=session_key,
+    )
+
+    commentary = next(
+        entry for entry in adapter.sent
+        if entry["content"] == "Checking the relevant records now."
+    )
+    await adapter.send("-1001", result["final_response"])
+    _set_final_delivery_state(adapter, session_key, True)
+    cb = adapter.pop_post_delivery_callback(session_key)
+    assert callable(cb)
+    await _fire_post_delivery_cb(cb)
+    for _ in range(20):
+        await asyncio.sleep(0.01)
+        if adapter.deleted:
+            break
+    assert commentary["message_id"] in {
+        entry["message_id"] for entry in adapter.deleted
+    }

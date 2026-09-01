@@ -832,6 +832,84 @@ class TestInterimCommentaryMessages:
         assert consumer.final_response_sent is True
 
 
+class TestCommentaryCleanupTracking:
+    @pytest.mark.asyncio
+    async def test_successful_commentary_send_reports_all_message_ids(self):
+        adapter = MagicMock()
+        commentary_result = SimpleNamespace(
+            success=True,
+            message_id="commentary_1",
+            continuation_message_ids=("commentary_2",),
+            raw_response={"message_ids": ["commentary_3"]},
+        )
+        adapter.send = AsyncMock(side_effect=[
+            commentary_result,
+            SimpleNamespace(success=True, message_id="final_1"),
+        ])
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        delivered = []
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+            on_commentary_sent=delivered.append,
+        )
+        consumer.on_commentary("Checking the records now.")
+        consumer.on_delta("Done.")
+        consumer.finish()
+        await consumer.run()
+
+        assert delivered == [commentary_result]
+        assert consumer.delivered_commentary_message_ids_for_text(
+            "Checking the records now."
+        ) == ("commentary_1", "commentary_2", "commentary_3")
+
+    def test_commentary_final_id_matching_uses_rendered_text(self):
+        consumer = GatewayStreamConsumer(
+            MagicMock(),
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+        )
+        consumer._delivered_commentary_message_ids = [
+            (
+                "[[audio_as_voice]]\nYou're welcome.",
+                ("commentary_final",),
+            )
+        ]
+
+        assert consumer.delivered_commentary_message_ids_for_text(
+            "You're welcome."
+        ) == ("commentary_final",)
+
+    @pytest.mark.asyncio
+    async def test_commentary_cleanup_callback_error_does_not_break_delivery(self):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="commentary_1"),
+            SimpleNamespace(success=True, message_id="final_1"),
+        ])
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        def fail_cleanup_tracking(_result):
+            raise RuntimeError("cleanup tracker failed")
+
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5),
+            on_commentary_sent=fail_cleanup_tracking,
+        )
+        consumer.on_commentary("Checking the records now.")
+        consumer.on_delta("Done.")
+        consumer.finish()
+        await consumer.run()
+
+        assert consumer.final_response_sent is True
+
+
 class TestCancelledConsumerSetsFlags:
     """Cancellation must set final_response_sent when already_sent is True.
 
