@@ -99,6 +99,7 @@ import contextvars
 import concurrent.futures
 import errno
 import fnmatch
+import hashlib
 import inspect
 import json
 import logging
@@ -609,6 +610,7 @@ def _jittered(seconds: float) -> float:
 # stops a misconfigured tiny interval from busy-looping the keepalive.
 _DEFAULT_KEEPALIVE_INTERVAL = 180  # seconds between liveness pings
 _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
+_MCP_KEEPALIVE_MAX_JITTER_SECONDS = 15.0
 
 # Final shutdown gives pending MCP-loop tasks one bounded cancellation cycle
 # before closing their owning loop. Cooperative parked/reconnect waiters finish
@@ -731,6 +733,22 @@ def _context_var_value(ref: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 # Security helpers
 # ---------------------------------------------------------------------------
+
+def _mcp_keepalive_jitter_seconds(server_name: str) -> float:
+    """Return a stable per-server delay before idle keepalive probes.
+
+    Laptop sleep/wake can resume every MCP server's expired keepalive timer in
+    the same event-loop tick. A small deterministic delay spreads the follow-up
+    ``list_tools`` probes and any reconnects without making behavior random.
+    """
+    if _MCP_KEEPALIVE_MAX_JITTER_SECONDS <= 0:
+        return 0.0
+    digest = hashlib.blake2s(
+        str(server_name).encode("utf-8", errors="replace"),
+        digest_size=4,
+    ).digest()
+    bucket = int.from_bytes(digest, "big") / 0xFFFFFFFF
+    return bucket * _MCP_KEEPALIVE_MAX_JITTER_SECONDS
 
 def _build_safe_env(user_env: Optional[dict]) -> dict:
     """Build a filtered environment dict for stdio subprocesses.
@@ -3069,7 +3087,11 @@ class MCPServerTask:
                     self._mark_stdio_recycled(recycle_reason)
                     return "recycle"
 
-                timeout = keepalive_interval
+                phase_jitter = min(
+                    _mcp_keepalive_jitter_seconds(self.name),
+                    keepalive_interval,
+                )
+                timeout = max(0.0, keepalive_interval - phase_jitter)
                 recycle_deadline = self._next_stdio_recycle_deadline()
                 if recycle_deadline is not None:
                     timeout = max(0.0, min(timeout, recycle_deadline - time.monotonic()))
@@ -3092,6 +3114,29 @@ class MCPServerTask:
                 # is in flight (#48069): the stdio session is a single
                 # JSON-RPC stream and a concurrent ping/list_tools can wedge
                 # the in-flight request. A busy server is provably alive.
+                # When a laptop resumes after sleep, expired keepalive timers
+                # can wake in the same loop tick. A deterministic phase spreads
+                # probes by server name, but is subtracted from the prior wait
+                # so the configured keepalive interval remains the upper bound.
+                if phase_jitter > 0:
+                    if recycle_deadline is not None:
+                        phase_jitter = max(
+                            0.0,
+                            min(phase_jitter, recycle_deadline - time.monotonic()),
+                        )
+                    done, _pending = await asyncio.wait(
+                        {shutdown_task, reconnect_task},
+                        timeout=phase_jitter,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if done:
+                        break
+
+                recycle_reason = self._stdio_recycle_reason()
+                if recycle_reason is not None:
+                    self._mark_stdio_recycled(recycle_reason)
+                    return "recycle"
+
                 if self.session:
                     if self._rpc_lock.locked() or any(
                         not t.done() for t in self._inflight_tasks
