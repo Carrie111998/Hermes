@@ -338,6 +338,13 @@ def test_cron_tool_execution_surface_is_bounded_and_redacted(monkeypatch, tmp_pa
             "at": "2026-08-22T20:00:00+00:00",
             "detail": "RAW_FIRE_SENTINEL provider payload",
         },
+        "last_dispatch": {
+            "scheduled_at": "2026-09-01T09:00:00+00:00",
+            "dispatched_at": "2026-09-01T09:31:00+00:00",
+            "lateness_seconds": 1860,
+            "kind": "catch_up",
+            "detail": "RAW_DISPATCH_SENTINEL provider payload",
+        },
     })
     serialized = json.dumps(formatted, sort_keys=True)
 
@@ -353,10 +360,17 @@ def test_cron_tool_execution_surface_is_bounded_and_redacted(monkeypatch, tmp_pa
         "at": "2026-08-22T20:00:00+00:00",
         "error_kind": "fire_forward_failed",
     }
+    assert formatted["last_dispatch"] == {
+        "scheduled_at": "2026-09-01T09:00:00+00:00",
+        "dispatched_at": "2026-09-01T09:31:00+00:00",
+        "lateness_seconds": 1860.0,
+        "kind": "catch_up",
+    }
     assert "RAW_TOOL_ERROR_SENTINEL" not in serialized
     assert "RAW_LAST_ERROR_SENTINEL" not in serialized
     assert "RAW_DELIVERY_SENTINEL" not in serialized
     assert "RAW_FIRE_SENTINEL" not in serialized
+    assert "RAW_DISPATCH_SENTINEL" not in serialized
     assert "user@example.org" not in serialized
     assert "/private/report.pdf" not in serialized
 

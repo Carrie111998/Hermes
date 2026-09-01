@@ -7,6 +7,7 @@ Compatibility wrappers remain for direct Python callers and legacy tests.
 
 import json
 import logging
+import math
 import re
 import sys
 import threading
@@ -782,6 +783,33 @@ def _public_tool_category(value: Any) -> Optional[str]:
     return value if re.fullmatch(r"[a-z][a-z0-9_]{0,31}", value) else None
 
 
+def _public_last_dispatch(value: Any) -> Optional[Dict[str, Any]]:
+    """Project one bounded, content-free scheduler dispatch stamp."""
+    if type(value) is not dict:
+        return None
+    scheduled_at = _public_timestamp(value.get("scheduled_at"))
+    dispatched_at = _public_timestamp(value.get("dispatched_at"))
+    kind = value.get("kind")
+    lateness = value.get("lateness_seconds")
+    if (
+        scheduled_at is None
+        or dispatched_at is None
+        or kind not in {"on_time", "catch_up", "late"}
+        or type(lateness) not in {int, float}
+    ):
+        return None
+    assert isinstance(lateness, (int, float))
+    lateness_value = float(lateness)
+    if not math.isfinite(lateness_value) or lateness_value < 0:
+        return None
+    return {
+        "scheduled_at": scheduled_at,
+        "dispatched_at": dispatched_at,
+        "lateness_seconds": lateness_value,
+        "kind": kind,
+    }
+
+
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     if type(job) is not dict:
         raise TypeError("cron job projection requires an object")
@@ -819,6 +847,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "mode": mode,
         "next_run_at": _public_timestamp(job.get("next_run_at")),
         "last_run_at": _public_timestamp(job.get("last_run_at")),
+        "last_dispatch": _public_last_dispatch(job.get("last_dispatch")),
         "last_status": _public_tool_category(job.get("last_status")),
         "last_delivery_error": (
             "delivery_failed" if job.get("last_delivery_error") is not None else None
