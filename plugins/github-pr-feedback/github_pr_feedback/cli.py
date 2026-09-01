@@ -441,6 +441,8 @@ def _kanban_create_argv(task: KanbanTask) -> list[str]:
         argv.extend(["--model", task.model_override])
         if task.provider_override:
             argv.extend(["--provider", task.provider_override])
+    if task.reasoning_effort:
+        argv.extend(["--reasoning", task.reasoning_effort])
     if task.initial_status not in {"ready", "blocked", "running"}:
         raise ValueError("Kanban task initial status is invalid")
     if task.initial_status != "ready":
