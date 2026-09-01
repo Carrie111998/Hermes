@@ -1258,19 +1258,7 @@ def _interrupt_session_turn(
     should_interrupt = bool(session.get("running"))
     run_thread_alive = False
 
-    if use_compute_host:
-        # The host owns the live turn. Parent `running` is only a mirror and
-        # can lag behind a blocked interactive tool (a clarify parked on its
-        # Event keeps the host turn alive after the parent flag went stale),
-        # so let the host decide whether there is work to interrupt.
-        # Gate on `_compute_host_active` too: `_session_uses_compute_host`
-        # is also true for lazy sessions that never ran a hosted turn, and
-        # `HostSupervisor.interrupt()` calls `start()` — forwarding
-        # unconditionally would spawn a compute-host child just to deliver
-        # an interrupt no session ever submitted work to.
-        if should_interrupt or session.get("_compute_host_active"):
-            _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
-    else:
+    if not use_compute_host:
         run_thread = session.get("_run_thread")
         run_thread_alive = run_thread is not None and run_thread.is_alive()
 
@@ -1284,7 +1272,14 @@ def _interrupt_session_turn(
                 session.get("_queued_prompt_generation", 0)
             ) + 1
 
-    if not use_compute_host:
+    if use_compute_host:
+        # Publish cancellation under the queue gate before interrupting. If a
+        # queued compute dispatch already owns the gate, Stop waits until the
+        # worker is admitted, then interrupts that active worker. If Stop wins,
+        # the later dispatch sees the generation/cancel latch and never sends.
+        if should_interrupt or session.get("_compute_host_active"):
+            _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
+    else:
         if should_interrupt:
             from agent.interrupt_compat import request_hard_interrupt
 
@@ -1562,6 +1557,7 @@ def _close_sessions_for_transport(
     detached = 0
     for sid, session in owned:
         claimed_for_teardown = None
+        claim_close = False
         should_schedule_reap = False
         # A session.resume fast-path rebinds its live session while holding
         # _session_resume_lock. Take that lock before re-checking the snapshot
@@ -1580,7 +1576,12 @@ def _close_sessions_for_transport(
                         viewers.pop(transport, None)
                     continue
                 if current.get("close_on_disconnect"):
-                    claimed_for_teardown = _pop_session_by_id(sid)
+                    # Claim through _pop_session_by_id after releasing the
+                    # global sessions lock. That helper takes the per-session
+                    # dispatch gate before revalidating under _sessions_lock;
+                    # calling it here inverts those locks against queue
+                    # dispatch and can deadlock the gateway.
+                    claim_close = True
                 else:
                     # Point detached sessions at the drop sentinel (NOT real
                     # stdio) so _ws_session_is_orphaned recognizes them and
@@ -1609,6 +1610,8 @@ def _close_sessions_for_transport(
                         current.pop("_client_gone_interrupt_requested", None)
                         current.pop("_client_gone_preserve_logged", None)
                         should_schedule_reap = True
+            if claim_close:
+                claimed_for_teardown = _pop_session_by_id(sid)
         if claimed_for_teardown is not None:
             if _teardown_popped_session(claimed_for_teardown, end_reason=end_reason):
                 reaped += 1
@@ -2855,33 +2858,51 @@ def _submit_prompt_to_compute_host(
     display_kind: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
-    frame = _compute_host_turn_frame(
-        rid,
-        sid,
-        session,
-        text,
-        image_paths=image_paths,
-        queued_prompt_generation=queued_prompt_generation,
-        display_kind=display_kind,
+    gate = (
+        _queued_dispatch_gate(session)
+        if queued_prompt_generation is not None
+        else contextlib.nullcontext()
     )
+    with gate:
+        with session["history_lock"]:
+            if session.get("_closing") or session.get("_turn_cancel_requested"):
+                session["running"] = False
+                return _err(rid, 4099, "queued prompt cancelled before dispatch")
+            if (
+                queued_prompt_generation is not None
+                and int(session.get("_queued_prompt_generation", 0))
+                != queued_prompt_generation
+            ):
+                session["running"] = False
+                return _err(rid, 4099, "queued prompt re-anchored before dispatch")
 
-    def _complete(done: dict) -> None:
-        # submit_turn reports a synchronous pipe failure through the callback
-        # before re-raising. Leave the parent session untouched so prompt.submit
-        # can fail open to the historical in-process path without emitting a
-        # duplicate terminal error.
-        if done.get("reason") == "send_failed":
-            return
-        _on_compute_host_turn_done(rid, sid, session, done)
+        frame = _compute_host_turn_frame(
+            rid,
+            sid,
+            session,
+            text,
+            image_paths=image_paths,
+            queued_prompt_generation=queued_prompt_generation,
+            display_kind=display_kind,
+        )
 
-    try:
-        _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
-    except Exception as exc:
-        return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
-    with session["history_lock"]:
-        session["_compute_host_active"] = True
-        if image_paths is None:
-            session["attached_images"] = []
+        def _complete(done: dict) -> None:
+            # submit_turn reports a synchronous pipe failure through the callback
+            # before re-raising. Leave the parent session untouched so prompt.submit
+            # can fail open to the historical in-process path without emitting a
+            # duplicate terminal error.
+            if done.get("reason") == "send_failed":
+                return
+            _on_compute_host_turn_done(rid, sid, session, done)
+
+        try:
+            _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
+        except Exception as exc:
+            return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
+        with session["history_lock"]:
+            session["_compute_host_active"] = True
+            if image_paths is None:
+                session["attached_images"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
 
@@ -10445,24 +10466,34 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     with _queued_dispatch_gate(session):
-        return _dispatch_queued_claim(
+        use_compute_host = _admit_queued_claim(
             rid,
             sid,
             session,
             queued,
             queue_generation=queue_generation,
         )
+    if use_compute_host is None:
+        return True
+    return _dispatch_queued_claim(
+        rid,
+        sid,
+        session,
+        queued,
+        queue_generation=queue_generation,
+        use_compute_host=use_compute_host,
+    )
 
 
-def _dispatch_queued_claim(
+def _admit_queued_claim(
     rid,
     sid: str,
     session: dict,
     queued: dict,
     *,
     queue_generation: int,
-) -> bool:
-    """Dispatch one claimed queue head while lifecycle mutations are gated."""
+) -> bool | None:
+    """Validate one queue claim while lifecycle mutations are gated."""
 
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
@@ -10472,7 +10503,7 @@ def _dispatch_queued_claim(
             # claimed envelope after the live-session owner was removed.
             session.pop("_queued_prompt_claimed", None)
             session["running"] = False
-            return True
+            return None
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
             # Compression re-anchors a legitimate follow-up and therefore
             # restores it at the head. Stop/close returned above.
@@ -10488,8 +10519,45 @@ def _dispatch_queued_claim(
                 session.pop("queued_prompts", None)
             session.pop("_queued_prompt_claimed", None)
             session["running"] = False
-            return True
+            return None
         session.pop("_queued_prompt_claimed", None)
+    return use_compute_host
+
+
+def _dispatch_queued_claim(
+    rid,
+    sid: str,
+    session: dict,
+    queued: dict,
+    *,
+    queue_generation: int,
+    use_compute_host: bool,
+) -> bool:
+    """Dispatch one admitted queue head without holding lifecycle gates."""
+
+    def _restore_after_reanchor() -> bool:
+        with _queued_dispatch_gate(session):
+            with session["history_lock"]:
+                if (
+                    session.get("_closing")
+                    or session.get("_turn_cancel_requested")
+                    or int(session.get("_queued_prompt_generation", 0))
+                    == queue_generation
+                ):
+                    return False
+                rest: list = []
+                advanced = session.get("queued_prompt")
+                if advanced:
+                    rest.append(advanced)
+                rest.extend(session.get("queued_prompts") or [])
+                session["queued_prompt"] = queued
+                if rest:
+                    session["queued_prompts"] = rest
+                else:
+                    session.pop("queued_prompts", None)
+                session["running"] = False
+                return True
+
     dispatch_failed = False
     try:
         if use_compute_host:
@@ -10507,6 +10575,8 @@ def _dispatch_queued_claim(
                     rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
                 )
             if resp.get("error"):
+                if _restore_after_reanchor():
+                    return True
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
                 with session["history_lock"]:
                     session["running"] = False
@@ -10515,7 +10585,7 @@ def _dispatch_queued_claim(
                 dispatch_failed = True
         else:
             if queued.get("image_paths"):
-                _run_prompt_submit(
+                admitted = _run_prompt_submit(
                     rid,
                     sid,
                     session,
@@ -10524,13 +10594,15 @@ def _dispatch_queued_claim(
                     queued_prompt_generation=queue_generation,
                 )
             else:
-                _run_prompt_submit(
+                admitted = _run_prompt_submit(
                     rid,
                     sid,
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
                 )
+            if admitted is False and _restore_after_reanchor():
+                return True
     except Exception as exc:
         print(
             f"[tui_gateway] queued prompt dispatch failed: "

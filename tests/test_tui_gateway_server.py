@@ -342,6 +342,71 @@ def test_compute_host_explicit_images_do_not_clear_later_attachment(monkeypatch)
     assert session["attached_images"] == ["/tmp/c.png"]
 
 
+def test_compute_host_stop_publishes_cancel_before_interrupt(monkeypatch):
+    observed = []
+    session = _session(
+        _compute_host_active=True,
+        running=True,
+        _queued_prompt_generation=7,
+    )
+
+    class _Supervisor:
+        def interrupt(self, sid, *, request_id=None):
+            observed.append(
+                {
+                    "sid": sid,
+                    "request_id": request_id,
+                    "cancelled": session.get("_turn_cancel_requested"),
+                    "generation": session.get("_queued_prompt_generation"),
+                }
+            )
+
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+    monkeypatch.setattr(server, "_clear_pending", lambda _sid: None)
+
+    assert server._interrupt_session_turn(
+        "compute-stop",
+        session,
+        request_id="stop-request",
+    ) is True
+    assert observed == [
+        {
+            "sid": "compute-stop",
+            "request_id": "stop-request",
+            "cancelled": True,
+            "generation": 8,
+        }
+    ]
+
+
+def test_compute_host_rejects_queued_submit_after_stop(monkeypatch):
+    submitted = []
+    session = _session(
+        _compute_host_active=True,
+        running=False,
+        _turn_cancel_requested=True,
+        _queued_prompt_generation=8,
+    )
+
+    class _Supervisor:
+        def submit_turn(self, frame, *, on_complete=None):
+            submitted.append(frame)
+
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
+
+    response = server._submit_prompt_to_compute_host(
+        "rid",
+        "compute-stop",
+        session,
+        "must not run",
+        queued_prompt_generation=7,
+    )
+
+    assert response["error"]["code"] == 4099
+    assert submitted == []
+
+
 def test_prompt_submit_unknown_session_logs_warning(caplog):
     """A submit against a reaped runtime id must leave a diagnosable trace.
 
@@ -12320,7 +12385,7 @@ def test_close_boundaries_cancel_claimed_prompt_before_dispatch(monkeypatch, bou
         server._sessions.pop("queue-close", None)
 
 
-def test_close_waits_for_claimed_dispatch_ownership(monkeypatch):
+def test_close_does_not_wait_for_running_queued_turn(monkeypatch):
     entered_dispatch = threading.Event()
     release_dispatch = threading.Event()
     close_finished = threading.Event()
@@ -12351,7 +12416,7 @@ def test_close_waits_for_claimed_dispatch_ownership(monkeypatch):
         drain_thread.start()
         assert entered_dispatch.wait(timeout=1)
         close_thread.start()
-        assert not close_finished.wait(timeout=0.05)
+        assert close_finished.wait(timeout=1)
 
         release_dispatch.set()
         drain_thread.join(timeout=1)
