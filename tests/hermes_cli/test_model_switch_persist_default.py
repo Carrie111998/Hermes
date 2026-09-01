@@ -4,9 +4,9 @@ Covers:
 - ``parse_model_flags`` recognises ``--session`` (and keeps ``--global``).
 - ``resolve_persist_behavior`` applies the config-gated default and the
   ``--session`` / ``--global`` overrides.
-- The default (no flags) is session-only, which is the user-facing fix: a
-  plain ``/model <name>`` affects only the current session unless the user
-  passes ``--global`` or sets ``model.persist_switch_by_default: true``.
+- the default (no flags) is session-only unless the user sets
+  ``model.persist_switch_by_default: true``; when that setting is true,
+  model-picker/provider choices persist too unless ``--session``/``--once`` is used.
 """
 
 from unittest.mock import patch
@@ -51,6 +51,16 @@ class TestResolvePersistBehavior:
         # No --provider → respects config default (True).
         with _config({"model": {"persist_switch_by_default": True}}):
             assert resolve_persist_behavior(False, False, explicit_provider="") is True
+
+    def test_provider_flag_respects_persist_default_when_true(self):
+        # Picker selections for named custom providers carry --provider internally,
+        # but users with persist_switch_by_default=True expect menu choices to stick.
+        with _config({"model": {"persist_switch_by_default": True}}):
+            assert resolve_persist_behavior(False, False, explicit_provider="custom:pgx") is True
+
+    def test_provider_flag_session_only_when_persist_default_false(self):
+        with _config({"model": {"persist_switch_by_default": False}}):
+            assert resolve_persist_behavior(False, False, explicit_provider="anthropic") is False
 
 
 # ---------------------------------------------------------------------------
