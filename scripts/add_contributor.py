@@ -66,6 +66,27 @@ def add_contributor(email: str, login: str, comment: str = "") -> int:
         print(f"error: {login!r} is not a valid GitHub login", file=sys.stderr)
         return 2
 
+    # These mapping names are email addresses, whose domain portion is
+    # case-insensitive.  More importantly, macOS and Windows commonly use
+    # case-insensitive filesystems, so two entries that differ only by case
+    # cannot coexist reliably.  Reject the second spelling before touching
+    # ``path``: ``Path.is_file()`` would otherwise resolve the alias on those
+    # filesystems and silently conceal the collision.
+    try:
+        casefolded_email = email.casefold()
+        for candidate in EMAILS_DIR.iterdir():
+            if candidate.is_file() and candidate.name.casefold() == casefolded_email:
+                if candidate.name != email:
+                    print(
+                        "error: contributor mapping already exists with different "
+                        f"casing: {candidate.name!r}; use one canonical spelling",
+                        file=sys.stderr,
+                    )
+                    return 1
+                break
+    except FileNotFoundError:
+        pass
+
     path = EMAILS_DIR / email
     existing = read_mapping_file(path) if path.is_file() else None
     if existing is None:

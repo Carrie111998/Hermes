@@ -44,6 +44,15 @@ PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 # This dict is kept only so existing history keeps resolving; the effective
 # AUTHOR_MAP below merges it with the directory (directory wins).
 LEGACY_AUTHOR_MAP = {
+    # Case-colliding pair — these two emails differ only by case, so they can
+    # never coexist as files under contributors/emails/ on the case-insensitive
+    # filesystems macOS and Windows default to (one shows as perpetually
+    # modified, breaking clean checkouts). The freeze on this dict exists to
+    # avoid merge conflicts; entries that are barred from the files directory
+    # have nowhere else to live. add_contributor.py already consults this map,
+    # so attempts to re-add either spelling as a file report "present" and stop.
+    "agent@agents-Mac-mini.local": "momomojo",  # 80b58ec7 (kanban goal_mode fix)
+    "agent@Agents-Mac-mini.local": "skip-agent",  # e6f59e5b (terminal FileProvider guard)
     "declanbatesmith@outlook.com": "cat-thats-fat",  # PR #60489 (desktop: first-run remote connection option)
     "drbs2004@me.com": "cat-thats-fat",  # PR #60489 (desktop: first-run remote connection option; historical merge email)
     "122438640+ragingbulld@users.noreply.github.com": "ragingbulld",  # PR #65606 salvage (non-finite API wait deadlines; #65746)

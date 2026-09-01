@@ -95,6 +95,32 @@ def test_add_strips_at_prefix(emails_dir):
     assert read_mapping_file(emails_dir / "z@z.com") == "zeta"
 
 
+def test_add_rejects_case_insensitive_email_alias(emails_dir, capsys):
+    existing = emails_dir / "Agent@Agents-Mac-mini.local"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text("skip-agent\n", encoding="utf-8")
+
+    assert add_contributor("agent@agents-mac-mini.local", "skip-agent") == 1
+    assert "different casing" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("email", "login"),
+    [
+        ("agent@Agents-Mac-mini.local", "skip-agent"),
+        ("agent@agents-Mac-mini.local", "momomojo"),
+    ],
+)
+def test_add_reports_present_for_legacy_case_pair(
+    emails_dir, capsys, email, login
+):
+    # The case-colliding pair lives in LEGACY_AUTHOR_MAP precisely because it
+    # cannot exist as files; re-adding must not recreate a file.
+    assert add_contributor(email, login) == 0
+    assert "present" in capsys.readouterr().out
+    assert not (emails_dir / email).exists()
+
+
 def test_cli_entrypoint_end_to_end(tmp_path):
     # Run the real script in a subprocess against a temp repo layout.
     scripts = tmp_path / "scripts"

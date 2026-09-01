@@ -21,6 +21,17 @@ jobs:
         with:
           fetch-depth: 0  # Full history needed for git log
 
+      - name: Reject case-insensitive contributor email collisions
+        run: |
+          # A same-case-folded pair works on Linux but cannot coexist on the
+          # case-insensitive filesystems macOS and Windows default to.
+          COLLISIONS=$(ls contributors/emails | awk '{ k = tolower($0); if (k in seen) print seen[k] " <-> " $0; else seen[k] = $0 }')
+          if [ -n "$COLLISIONS" ]; then
+            echo "Contributor email mapping filenames must be unique ignoring case:"
+            echo "$COLLISIONS"
+            exit 1
+          fi
+
       - name: Check for unmapped contributor emails
         id: check-emails
         run: |
