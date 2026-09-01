@@ -806,7 +806,10 @@ def _transfer_active_session_slot(
         if transfer_active_session(
             lease,
             session_id=new_session_id,
-            metadata={"live_session_id": sid},
+            metadata={
+                "live_session_id": sid,
+                "bot_live_delivery_consumer": True,
+            },
         ):
             return True
     except Exception:

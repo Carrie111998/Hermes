@@ -15,6 +15,8 @@ from hermes_cli.active_sessions import (
     active_session_registry_snapshot,
     try_acquire_active_session,
 )
+from hermes_state import SessionDB
+from tools.bot_live_delivery import find_canonical_live_owner
 from tui_gateway import server
 
 
@@ -220,6 +222,43 @@ def test_gateway_session_lease_advertises_bot_live_delivery_consumer(
         "live_session_id": "desktop-runtime",
         "bot_live_delivery_consumer": True,
     }
+    lease.release()
+
+
+def test_gateway_session_lease_keeps_delivery_consumer_after_transfer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("rotated-canonical", source="desktop")
+    db.set_session_title("rotated-canonical", "Bot Chat")
+    db.set_session_hidden("rotated-canonical", True)
+    db.close()
+
+    lease, message = server._claim_active_session_slot(
+        "pre-compression",
+        live_session_id="desktop-runtime",
+        surface="desktop",
+        profile_home=tmp_path,
+    )
+    assert lease is not None and message is None
+    session = {
+        "active_session_lease": lease,
+        "profile_home": tmp_path,
+        "source": "desktop",
+    }
+
+    assert server._transfer_active_session_slot(
+        "desktop-runtime",
+        session,
+        new_session_id="rotated-canonical",
+    )
+    entries = active_session_registry_snapshot(registry_home=tmp_path)
+    assert entries[0]["metadata"] == {
+        "live_session_id": "desktop-runtime",
+        "bot_live_delivery_consumer": True,
+    }
+    assert find_canonical_live_owner(tmp_path) == "rotated-canonical"
     lease.release()
 
 
