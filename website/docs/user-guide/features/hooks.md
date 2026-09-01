@@ -736,6 +736,41 @@ def register(ctx):
     ctx.register_hook("pre_llm_call", guardrails)
 ```
 
+**Example — runtime override (model routing):**
+
+A plugin can also return a `{"runtime_override": {...}}` dict to change the
+LLM routing parameters (`model`, `provider`, `base_url`, `api_key`,
+`api_mode`) for this turn — e.g. deterministic cost-based model switching.
+
+```python
+def route_by_time(**kwargs):
+    from datetime import datetime
+    hour = datetime.now().hour
+    if 9 <= hour < 18:   # peak hours → cheap fast model
+        return {"runtime_override": {
+            "model": "deepseek/deepseek-v4-flash",
+            "provider": "openrouter",
+            "base_url": "https://openrouter.ai/api/v1",
+        }}
+    return None
+
+def register(ctx):
+    ctx.register_hook("pre_llm_call", route_by_time)
+```
+
+Contract notes:
+
+- Supported keys: `model`, `provider`, `base_url`, `api_key`, `api_mode`.
+  Anything else is logged and ignored.
+- **`system_prompt` is intentionally NOT supported** — it is the prompt-cache
+  prefix; overriding it would invalidate caching mid-conversation.
+- The override is turn-scoped and ephemeral: applied around kwargs building
+  and each wire attempt, snapshot/restored after, never persisted.
+- **Trust implication**: overriding `base_url` (+ optional `api_key`)
+  redirects every subsequent LLM call of the turn — carrying the full session
+  context — to an arbitrary endpoint. Installing a plugin grants it this
+  authority; only install plugins you trust.
+
 ---
 
 ### `post_llm_call`

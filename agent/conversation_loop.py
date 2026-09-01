@@ -2521,6 +2521,7 @@ def run_conversation(
         # every turn. ``apply_anthropic_cache_control`` may split its stable
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
+        _runtime_ov = getattr(agent, "_runtime_override", None) or {}
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
@@ -3174,13 +3175,30 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
-                if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
+                # Two-scope design (intentional — do not consolidate into
+                # one turn-long scope): Scope 1 wraps kwargs building so
+                # model/provider/base_url flow into the wire client's
+                # kwargs.  Scope 2 (inside _perform_api_call) wraps each
+                # wire attempt as a redundant safety net.  Between the two
+                # scopes the agent identity is un-overridden — correct,
+                # non-call code sees the real identity.
+                from agent.runtime_override import (
+                    apply_runtime_override as _apply_runtime_override,
+                )
+                _runtime_ov = getattr(agent, "_runtime_override", None) or {}
+                if _runtime_ov:
+                    _ro_cm = _apply_runtime_override(agent, _runtime_ov)
                 else:
-                    api_kwargs = agent._build_api_kwargs(
-                        api_messages,
-                        tools_for_api=tools_for_api,
-                    )
+                    from contextlib import nullcontext as _nullcontext
+                    _ro_cm = _nullcontext()
+                with _ro_cm:
+                    if tools_for_api == agent.tools:
+                        api_kwargs = agent._build_api_kwargs(api_messages)
+                    else:
+                        api_kwargs = agent._build_api_kwargs(
+                            api_messages,
+                            tools_for_api=tools_for_api,
+                        )
                 # Outbound-request surrogate chokepoint (#50959): the messages
                 # were scrubbed above, but the rest of the request body —
                 # tool/function descriptions (session_search's ±-heavy text is
@@ -3387,6 +3405,16 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    from agent.runtime_override import (
+                        apply_runtime_override as _apply_runtime_override,
+                    )
+                    _runtime_ov = getattr(agent, "_runtime_override", None) or {}
+                    if _runtime_ov:
+                        with _apply_runtime_override(agent, _runtime_ov):
+                            return _perform_api_call_inner(next_api_kwargs)
+                    return _perform_api_call_inner(next_api_kwargs)
+
+                def _perform_api_call_inner(next_api_kwargs):
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
