@@ -730,14 +730,10 @@ class TestPlaceholderKeyDetection:
                     and r.name == self.LOGGER_NAME]
         assert warnings == []
 
-    def test_sdk_not_installed_still_skips_silently(self, monkeypatch, caplog):
-        """If the langfuse SDK isn't installed at all, the placeholder
-        check should never run — there's nothing the operator can do
-        about a credential mismatch when the package is missing, and
-        re-warning here would dilute the actually-actionable SDK-missing
-        signal upstream.  The ``Langfuse is None`` guard at the top of
-        ``_get_langfuse`` already handles this; this test pins that
-        behaviour."""
+    def test_sdk_not_installed_warns_without_placeholder_message(
+        self, monkeypatch, caplog
+    ):
+        """The SDK-missing path stays actionable without blaming credentials."""
         self._clear_env(monkeypatch)
         monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "placeholder")
         monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "placeholder")
@@ -749,7 +745,9 @@ class TestPlaceholderKeyDetection:
             assert plugin._get_langfuse() is None
         warnings = [r for r in caplog.records if r.levelname == "WARNING"
                     and r.name == self.LOGGER_NAME]
-        assert warnings == []
+        assert len(warnings) == 1
+        assert "SDK is unavailable" in warnings[0].getMessage()
+        assert "placeholder" not in warnings[0].getMessage()
 
     def test_valid_prefixes_do_not_trigger_placeholder_warning(self, monkeypatch, caplog, tmp_path):
         """Real Langfuse keys (``pk-lf-…`` / ``sk-lf-…``) must pass the
@@ -2011,6 +2009,7 @@ class TestAtexitFinalization(TestTurnTraceIsolation):
         )
         monkeypatch.setenv("HERMES_LANGFUSE_PUBLIC_KEY", "pk-lf-0123456789abcdef")
         monkeypatch.setenv("HERMES_LANGFUSE_SECRET_KEY", "sk-lf-0123456789abcdef")
+        monkeypatch.setattr(mod, "_require_service_name", lambda: "hermes-agent")
         mod._LANGFUSE_CLIENT = None
 
         assert mod._get_langfuse() is not None
