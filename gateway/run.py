@@ -19584,7 +19584,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 self._release_running_agent_state(_quick_key)
 
-<<<<<<< HEAD
         # #99106: durable-reaped guard.  A session whose routing row was
         # ended in state.db (e.g. ``ws_orphan_reap`` / ``agent_close``) while
         # the gateway stayed alive keeps its in-memory turn slot alive
