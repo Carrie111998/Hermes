@@ -52,6 +52,10 @@ FILE_RE = re.compile(r"(?:/home/|~/?|\./|/mnt/)[\w./-]+\.(?:py|js|ts|tsx|jsx|css
 
 TIER_NAMES = ["Copper", "Silver", "Gold", "Diamond", "Olympian"]
 
+# Bump when scan logic changes (e.g., including compacted messages).
+# Older checkpoints are discarded to force a full rescan.
+CHECKPOINT_SCHEMA_VERSION = 2
+
 
 def tiers(values: List[int]) -> List[Dict[str, Any]]:
     return [{"name": name, "threshold": threshold} for name, threshold in zip(TIER_NAMES, values)]
@@ -233,18 +237,22 @@ def save_snapshot(data: Dict[str, Any]) -> None:
 def load_checkpoint() -> Dict[str, Any]:
     path = checkpoint_path()
     if not path.exists():
-        return {"schema_version": 1, "generated_at": 0, "sessions": {}}
+        return {"schema_version": CHECKPOINT_SCHEMA_VERSION, "generated_at": 0, "sessions": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            data.setdefault("schema_version", 1)
+            # Discard checkpoints from older schema versions to force a full rescan
+            # with the new logic (e.g., including compacted messages).
+            if data.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
+                return {"schema_version": CHECKPOINT_SCHEMA_VERSION, "generated_at": 0, "sessions": {}}
+            data.setdefault("schema_version", CHECKPOINT_SCHEMA_VERSION)
             data.setdefault("generated_at", 0)
             data.setdefault("sessions", {})
             if isinstance(data.get("sessions"), dict):
                 return data
     except Exception:
         pass
-    return {"schema_version": 1, "generated_at": 0, "sessions": {}}
+    return {"schema_version": CHECKPOINT_SCHEMA_VERSION, "generated_at": 0, "sessions": {}}
 
 
 def save_checkpoint(data: Dict[str, Any]) -> None:
@@ -649,7 +657,7 @@ def scan_sessions(
                 stats = dict(cached_stats)
                 reused += 1
             else:
-                messages = db.get_messages(sid)
+                messages = db.get_messages(sid, include_compacted=True)
                 stats = analyze_messages(sid, meta.get("title") or meta.get("preview") or "Untitled", messages)
                 rescanned += 1
 
@@ -680,7 +688,7 @@ def scan_sessions(
                     pass
 
         save_checkpoint({
-            "schema_version": 1,
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
             "generated_at": int(time.time()),
             "sessions": checkpoint_sessions,
         })
