@@ -151,6 +151,10 @@ DEFAULT_CONFIG = {
             # leaves the budget untouched.
             "cost_threshold_usd": 0.25,
         },
+        # OpenAI Responses output detail for GPT-5 models. Empty preserves the
+        # provider default. Only canonical ChatGPT Codex and api.openai.com
+        # routes receive the field.
+        "text_verbosity": "",
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
