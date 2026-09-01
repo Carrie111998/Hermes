@@ -110,6 +110,42 @@ async def test_send_records_nonfinal_delivery_provenance_without_content(
     assert "private status payload" not in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_forum_send_records_nonfinal_delivery_provenance_without_content(
+    caplog, monkeypatch, tmp_path
+):
+    # Given: a Discord forum parent and a non-final status delivery.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 555
+    forum_channel.create_thread = AsyncMock(
+        return_value=SimpleNamespace(
+            id=777,
+            message=SimpleNamespace(id=888),
+            thread=SimpleNamespace(id=777, send=AsyncMock()),
+        )
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=MagicMock(return_value=forum_channel),
+        fetch_channel=AsyncMock(),
+    )
+
+    # When: the adapter creates a forum post for the non-final delivery.
+    with caplog.at_level("INFO"):
+        result = await adapter.send(
+            "555",
+            "private forum status payload",
+            metadata={"_gateway_delivery_surface": "status"},
+        )
+
+    # Then: the forum delivery has the same content-free provenance receipt.
+    assert result.success is True
+    assert "surface=status" in caplog.text
+    assert "message_ids=['888']" in caplog.text
+    assert "private forum status payload" not in caplog.text
+
+
 def _voice_adapter(reference_obj, *, native_result=None, native_error=None):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     ref_msg = SimpleNamespace(id=99, to_reference=MagicMock(return_value=reference_obj))
@@ -444,4 +480,3 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     thread_kwargs = forum_channel.create_thread.await_args.kwargs
     assert thread_kwargs.get("file") is None
     assert isinstance(thread_kwargs.get("files"), list) and len(thread_kwargs["files"]) == 1
-

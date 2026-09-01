@@ -3488,6 +3488,23 @@ class DiscordAdapter(BasePlatformAdapter):
                 or ("interim_assistant" if (metadata or {}).get("_interim_send") else "unclassified")
             )
 
+            def log_nonfinal_delivery(result: SendResult) -> None:
+                if final_delivery or not result.success:
+                    return
+                message_ids = list(
+                    (result.raw_response or {}).get("message_ids")
+                    or ([result.message_id] if result.message_id else [])
+                )
+                logger.info(
+                    "[%s] Sent non-final Discord message surface=%s chat=%s reply_to=%s message_ids=%s chars=%d",
+                    self.name,
+                    delivery_surface,
+                    chat_id,
+                    reply_to or (metadata or {}).get("reply_to_message_id"),
+                    message_ids,
+                    len(content),
+                )
+
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
                 channel = self._client.get_channel(int(thread_id))
@@ -3506,6 +3523,7 @@ class DiscordAdapter(BasePlatformAdapter):
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
+                log_nonfinal_delivery(result)
                 await asyncio.to_thread(
                     self._record_discord_response,
                     reply_to=reply_to,
@@ -3575,16 +3593,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 message_id=message_ids[0] if message_ids else None,
                 raw_response={"message_ids": message_ids}
             )
-            if not final_delivery:
-                logger.info(
-                    "[%s] Sent non-final Discord message surface=%s chat=%s reply_to=%s message_ids=%s chars=%d",
-                    self.name,
-                    delivery_surface,
-                    chat_id,
-                    reply_to or (metadata or {}).get("reply_to_message_id"),
-                    message_ids,
-                    len(content),
-                )
+            log_nonfinal_delivery(result)
             await asyncio.to_thread(
                 self._record_discord_response,
                 reply_to=reply_to,
