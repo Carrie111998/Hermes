@@ -216,7 +216,11 @@ def track(path_str: str, category: str, silent: bool = False) -> bool:
         _log(f"WARN: unknown category '{category}', using 'other'")
         category = "other"
 
-    path = Path(path_str).resolve()
+    try:
+        path = Path(path_str).resolve()
+    except (OSError, RuntimeError):
+        _log(f"REJECT: {path_str} (could not resolve path)")
+        return False
 
     if not path.exists():
         _log(f"SKIP: {path} (does not exist)")

@@ -133,6 +133,7 @@ class TestIsSafePath:
             second.symlink_to(first)
 
             assert dg.is_safe_path(first) is False
+            assert dg.track(str(first), "temp", silent=True) is False
         finally:
             shutil.rmtree(temporary)
 
