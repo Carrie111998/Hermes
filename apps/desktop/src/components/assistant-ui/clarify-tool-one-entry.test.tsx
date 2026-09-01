@@ -42,7 +42,7 @@ function oneEntryQuestionsArgs() {
   }
 }
 
-function liveProps(args: Record<string, unknown>): ToolCallMessagePartProps {
+function liveProps(args: ToolCallMessagePartProps['args']): ToolCallMessagePartProps {
   return {
     addResult: vi.fn(),
     args,
