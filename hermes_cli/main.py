@@ -5234,6 +5234,7 @@ _LAZY_COMMAND_EXPORTS = {
         "_warn_pending_fleet_restart_on_startup",
         "_web_build_toolchain_ready",
         "_web_toolchain_roots",
+        "_windows_autostart_profile_homes",
         "_write_fleet_restart_pending_marker",
         "_write_lazy_refresh_incomplete_marker",
         "_write_marker_file",

@@ -6529,8 +6529,56 @@ def _pause_windows_gateways_for_update() -> dict | None:
         raise RuntimeError(detail) from exc
 
 
+def _windows_autostart_profile_homes() -> list[tuple[str, Path]]:
+    """Enumerate profiles whose Windows gateway autostart entry is installed.
+
+    Returns ``(profile_name, hermes_home)`` pairs for every profile —
+    default and named — that has a Scheduled Task or Startup-folder entry
+    installed (``gateway_windows.is_installed()``), i.e. every profile the
+    user asked to have a gateway.
+
+    ``gateway_windows`` helpers are profile-implicit: task name, script
+    path, and Startup entry all resolve through ``get_hermes_home()``.
+    Scoping each probe with ``set_hermes_home_override`` retargets them at
+    the profile being inspected without touching ``os.environ`` (#91675).
+
+    Best-effort per profile: one unreadable profile must not hide the
+    others. Enumeration failures degrade to an empty list — the caller
+    falls back to the active profile, the pre-#91675 behavior.
+    """
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    try:
+        from hermes_cli import gateway_windows
+        from hermes_cli.profiles import list_profiles
+
+        profiles = list_profiles()
+    except Exception as exc:
+        logger.debug("Could not enumerate profiles for gateway cold-start: %s", exc)
+        return []
+
+    installed: list[tuple[str, Path]] = []
+    for profile in profiles:
+        override = set_hermes_home_override(str(profile.path))
+        try:
+            if gateway_windows.is_installed():
+                installed.append((str(profile.name), Path(profile.path)))
+        except Exception as exc:
+            logger.debug(
+                "Could not check gateway autostart for profile %s: %s",
+                profile.name,
+                exc,
+            )
+        finally:
+            reset_hermes_home_override(override)
+    return installed
+
+
 def _cold_start_windows_gateway_after_update() -> bool:
-    """Start a fresh detached gateway after update when one is installed but down.
+    """Start fresh detached gateways after update when installed but down.
 
     Invoked from ``_resume_windows_gateways_after_update`` for the
     ``cold_start_if_installed`` case: no gateway was running when the update
@@ -6540,16 +6588,28 @@ def _cold_start_windows_gateway_after_update() -> bool:
     fresh spawn via the same hidden-console + breakaway path that
     ``hermes gateway start`` uses (``gateway_windows._spawn_detached``).
 
-    Best-effort and idempotent: re-checks that nothing is running first so a
-    concurrent start (e.g. the autostart entry firing) can't produce a
-    duplicate gateway.
+    Covers EVERY profile with an installed autostart entry, not just the
+    active one (#91675): ``_spawn_detached`` builds its argv through the
+    profile-implicit ``_build_gateway_argv()``, so each spawn is scoped with
+    ``set_hermes_home_override`` to the profile being started. The liveness
+    re-check is likewise per profile — the old global
+    ``find_gateway_pids(all_profiles=True)`` guard meant a sibling profile's
+    gateway coming up first (watchdog task, login) suppressed the cold start
+    entirely, so "one of N" was really "zero or one, whichever the race
+    decided".
+
+    Best-effort and idempotent per profile: each profile re-checks that its
+    own gateway is not already running first, so a concurrent start (e.g.
+    the autostart entry firing) can't produce a duplicate gateway.
 
     A successful ``Popen`` only proves the process was created, not that it
     survived (e.g. a Windows job object denying breakaway kills it before it
     logs anything — #84185). So the success line is gated on the same
     post-spawn liveness poll every other ``_spawn_detached`` caller uses
     (``gateway_windows._report_gateway_start``), instead of being printed
-    unconditionally from the returned PID.
+    unconditionally from the returned PID. One profile's failure does not
+    stop the remaining profiles from being started; failures are aggregated
+    and raised at the end.
     """
     if not _m()._is_windows():
         return True
@@ -6559,17 +6619,6 @@ def _cold_start_windows_gateway_after_update() -> bool:
     except Exception as exc:
         raise RuntimeError(
             f"Could not load Windows gateway cold-start helpers: {exc}"
-        ) from exc
-
-    # Re-check liveness right before spawning — between pause and resume the
-    # autostart entry may have already brought a gateway up, or a leftover
-    # process may have re-registered. Don't double-start.
-    try:
-        if list(find_gateway_pids(all_profiles=True)):
-            return True
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not re-check gateway liveness before cold-start: {exc}"
         ) from exc
 
     try:
@@ -6584,23 +6633,68 @@ def _cold_start_windows_gateway_after_update() -> bool:
             f"{exc}"
         ) from exc
 
-    try:
-        pid = gateway_windows._spawn_detached()
-    except Exception as exc:
-        raise RuntimeError(f"Could not cold-start Windows gateway after update: {exc}") from exc
+    targets = _m()._windows_autostart_profile_homes()
+    if not targets:
+        # Enumeration found nothing (or failed): fall back to the active
+        # profile. The pause phase only set ``cold_start_if_installed`` after
+        # seeing an installed autostart entry for this home, so an empty
+        # enumeration here is a probe gap, not proof there is nothing to do.
+        targets = [(None, None)]
 
-    if not pid:
-        raise RuntimeError("Windows gateway cold-start did not return a process ID")
-    ready_pids = gateway_windows._wait_for_gateway_ready()
-    if not ready_pids:
-        raise RuntimeError(
-            f"Windows gateway cold-start PID {pid} did not become ready"
-        )
-    print()
-    print(
-        "✓ Gateway started via cold-start after update "
-        f"(PID: {', '.join(map(str, ready_pids))})"
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
     )
+
+    failures: list[str] = []
+    for profile_name, profile_home in targets:
+        label = profile_name or "active profile"
+        override = (
+            set_hermes_home_override(str(profile_home))
+            if profile_home is not None
+            else None
+        )
+        try:
+            # Re-check liveness right before spawning — between pause and
+            # resume the autostart entry may have already brought this
+            # profile's gateway up, or a leftover process may have
+            # re-registered. Don't double-start. Scoped to THIS profile: a
+            # live sibling must not suppress this profile's start.
+            try:
+                if list(find_gateway_pids()):
+                    continue
+            except Exception as exc:
+                raise RuntimeError(
+                    f"could not re-check gateway liveness before cold-start: {exc}"
+                ) from exc
+
+            try:
+                pid = gateway_windows._spawn_detached()
+            except Exception as exc:
+                raise RuntimeError(f"could not cold-start gateway: {exc}") from exc
+
+            if not pid:
+                raise RuntimeError("gateway cold-start did not return a process ID")
+            ready_pids = gateway_windows._wait_for_gateway_ready()
+            if not ready_pids:
+                raise RuntimeError(
+                    f"gateway cold-start PID {pid} did not become ready"
+                )
+            print()
+            print(
+                "✓ Gateway started via cold-start after update "
+                f"[{label}] (PID: {', '.join(map(str, ready_pids))})"
+            )
+        except Exception as exc:
+            failures.append(f"{label}: {exc}")
+        finally:
+            if override is not None:
+                reset_hermes_home_override(override)
+
+    if failures:
+        raise RuntimeError(
+            "Windows gateway cold-start failed for: " + "; ".join(failures)
+        )
     return True
 
 

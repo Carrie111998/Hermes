@@ -21,12 +21,18 @@ from hermes_cli import update_cmd
 def _run_cold_start(monkeypatch, capsys, *, surviving_pids):
     monkeypatch.setattr(cli_main, "_is_windows", lambda: True)
 
-    # The pre-spawn re-check (``all_profiles=True``) must find nothing
-    # running so the cold-start path proceeds and actually spawns.
+    # The per-profile pre-spawn re-check must find nothing running so the
+    # cold-start path proceeds and actually spawns (#91675: the guard is
+    # per profile now, not the old global ``all_profiles=True`` scan).
     monkeypatch.setattr(
         hermes_gateway,
         "find_gateway_pids",
-        lambda all_profiles=False: [] if all_profiles else surviving_pids,
+        lambda *a, **k: [],
+    )
+    # Profile enumeration is exercised elsewhere
+    # (test_update_cold_start_all_profiles); pin the single-target fallback.
+    monkeypatch.setattr(
+        cli_main, "_windows_autostart_profile_homes", lambda: [], raising=False
     )
     monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda: 4242)
     # Avoid the real 6s/0.4s poll loop in _report_gateway_start.
