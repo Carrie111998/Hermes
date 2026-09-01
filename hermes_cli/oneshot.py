@@ -414,23 +414,13 @@ def _run_agent(
             requested_provider=runtime.get("requested_provider"),
             api_mode=runtime.get("api_mode"),
             model=effective_model,
+            max_iterations=max_turns,
             enabled_toolsets=toolsets_list,
             quiet_mode=True,
             platform="cli",
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
-            # Interactive callbacks are intentionally NOT wired beyond this
-            # one.  In oneshot mode there's no user sitting at a terminal:
-            #   - clarify  → returns a synthetic "pick a default" instruction
-            #                so the agent continues instead of stalling on
-            #                the tool's built-in "not available" error
-            #   - sudo password prompt → terminal_tool gates on
-            #                HERMES_INTERACTIVE which we never set
-            #   - shell-hook approval → auto-approved via HERMES_ACCEPT_HOOKS=1
-            #                (set above); also falls back to deny on non-tty
-            #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
-            #   - skill secret capture → returns gracefully when no callback set
             clarify_callback=_oneshot_clarify_callback,
         )
 
