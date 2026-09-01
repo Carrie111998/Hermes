@@ -127,13 +127,13 @@ class TestFabricatedIdentityIsBlocked:
         candidate's own contact details live.
         """
         ok = GOOD_COVER + "\n" + ("Body paragraph. " * 200) + \
-            "\nPlease copy careers@acmebank.com on any response.\n"
+            "\nPlease copy careers@example.invalid on any response.\n"
         r = check_application(_package(tmp_path, cover=ok), IDENTITY)
         assert r.status is QCStatus.PASS
 
     def test_a_foreign_email_inside_the_identity_block_still_blocks(self, tmp_path):
         """The other side of the same boundary — the header is authoritative."""
-        bad = GOOD_COVER.replace("alex.reyes@example.invalid", "recruiter@agency.com")
+        bad = GOOD_COVER.replace("alex.reyes@example.invalid", "recruiter@example.invalid")
         r = check_application(_package(tmp_path, cover=bad), IDENTITY)
         assert r.status is QCStatus.BLOCKED
 
