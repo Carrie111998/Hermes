@@ -7,6 +7,7 @@
  */
 
 import {
+  atom,
   cn,
   coarseElapsed,
   Codicon,
@@ -25,6 +26,7 @@ import {
   useI18n,
   useValue
 } from '@hermes/plugin-sdk'
+import { useMemo } from 'react'
 
 import { avatarColor, botAppearance, BotFace } from './avatar'
 import { isBackfilledFacePng } from './avatar-image'
@@ -54,13 +56,15 @@ import {
 } from './data'
 import { $groupChats, $groupChatWorkspace } from './group-chat'
 import { botGroups, groupLastActivity } from './group-membership'
+import { shouldRenderGroupChatInPane } from './group-panes'
 import { fallbackSelectionAfterHide, isBotHidden, isBotPinned } from './hidden-bots'
 import { useBots } from './i18n'
-import { displayName, stripPreviewMarkdown } from './labels'
+import { displayName, slugify, stripPreviewMarkdown } from './labels'
 import { duplicateBot } from './profile-ops'
 import { openRosterBot } from './roster-actions'
 import { botRosterMeta, botWorkspaceOwnerKey, setBotsWorkspaceOwner } from './routing'
 import { A2A_PREFIX_RE, botCanonicalSessionId, botRowOwnsWorkspace, previewKind, workerActiveAt } from './row-helpers'
+import { ID } from './shared'
 import type { GroupMember, RosterRow, SidebarRowLabels } from './types'
 
 // ── bot row ──────────────────────────────────────────────────────────────────
@@ -402,12 +406,42 @@ interface GroupRowProps {
   needsYou: boolean
   onDisband: (room: { members: GroupMember[]; name: string }) => void
   onOpen: (group: string) => void
+  onSettings: (room: { members: GroupMember[]; name: string }) => void
 }
 
-export function GroupRow({ active, group, members, needsYou, onOpen, onDisband }: GroupRowProps) {
+/** Attention is useful only while its Group Chat is elsewhere. The durable
+ *  state stays set while visible, so leaving reveals it again until resolved. */
+export function showGroupAttentionMarker(needsYou: boolean, roomVisible: boolean): boolean {
+  return Boolean(needsYou && !roomVisible)
+}
+
+export function groupAttentionRoomVisible(mainVisible: boolean, active: boolean, fallbackVisible: boolean): boolean {
+  return Boolean(mainVisible || (active && fallbackVisible))
+}
+
+export function groupMainVisibilityAtom(
+  group: string,
+  paneVisibility: null | typeof host.paneVisibility = host.paneVisibility
+) {
+  if (typeof paneVisibility !== 'function') {
+    return atom(false)
+  }
+
+  try {
+    const visibility = paneVisibility(`plugin-workspace:${ID}:group:${slugify(group)}`)
+
+    return visibility && typeof visibility.get === 'function' ? visibility : atom(false)
+  } catch {
+    return atom(false)
+  }
+}
+
+export function GroupRow({ active, group, members, needsYou, onOpen, onSettings, onDisband }: GroupRowProps) {
   const { t } = useI18n()
   const b = useBots()
   const rooms = useValue($groupChats)
+  const $mainVisible = useMemo(() => groupMainVisibilityAtom(group), [group])
+  const mainVisible = useValue($mainVisible)
 
   const room = rooms[group] || {
     log: []
@@ -431,6 +465,8 @@ export function GroupRow({ active, group, members, needsYou, onOpen, onDisband }
 
   const availableMembers = members.filter(member => botSourceStatus(member).available).length
   const availabilityLabel = `${availableMembers} of ${members.length} available`
+  const roomVisible = groupAttentionRoomVisible(mainVisible, active, shouldRenderGroupChatInPane(group))
+  const showAttention = showGroupAttentionMarker(needsYou, roomVisible)
 
   const row = (
     <RowButton
@@ -479,9 +515,12 @@ export function GroupRow({ active, group, members, needsYou, onOpen, onDisband }
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline justify-between gap-2">
           <span className="min-w-0 flex-1 truncate text-[0.8125rem] font-medium">{group}</span>
-          {needsYou ? (
+          {showAttention ? (
             <Tip label={b.group.needsYourInput}>
-              <Codicon aria-label={b.roster.needsInput} className="shrink-0 text-(--ui-accent)" name="question" />
+              <span
+                aria-label={b.roster.needsInput}
+                className="size-1.5 shrink-0 self-center rounded-full bg-(--ui-accent)"
+              />
             </Tip>
           ) : null}
           {lastAt ? (
@@ -500,6 +539,7 @@ export function GroupRow({ active, group, members, needsYou, onOpen, onDisband }
       <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
       <ContextMenuContent>
         <ContextMenuItem onSelect={() => onOpen(group)}>Open Group Chat</ContextMenuItem>
+        <ContextMenuItem onSelect={() => onSettings({ members, name: group })}>{b.group.settingsTitle}</ContextMenuItem>
         <ContextMenuSeparator />
         <ContextMenuItem
           className="text-destructive focus:text-destructive"
