@@ -1033,6 +1033,17 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
+  # Per-session billed-token fuse (default: unset/null = disabled).
+  # Counts fresh input + cache read/write + output across the session
+  # (not reset per user message — unlike max_turns). When crossed, the
+  # current turn ends before the next model call with end_reason
+  # token_hard_stop. Older unused keys (gateway_usage_hard_tokens, …)
+  # are NOT implemented — setting them warns at config load.
+  # session_token_hard_stop: 5000000
+  # Optional absolute warn threshold (tokens). Unset + hard stop set
+  # => warn once at 80% of the ceiling.
+  # session_token_warn: 4000000
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.

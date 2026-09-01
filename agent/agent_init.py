@@ -605,6 +605,8 @@ def init_agent(
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
     run_budget_seconds: Optional[float] = None,
+    session_token_hard_stop: Optional[int] = None,
+    session_token_warn: Optional[int] = None,
     fallback_model: Dict[str, Any] = None,
     credential_pool=None,
     checkpoints_enabled: bool = False,
@@ -1032,6 +1034,16 @@ def init_agent(
     agent._run_budget_started_at = None
     # One-shot latch for the 80% wrap-up notice (reset each turn).
     agent._run_budget_wrapup_injected = False
+
+    # Per-session billed-token fuse (#96814). Constructor arg wins; else
+    # resolved from config.yaml further below. None = feature fully off.
+    from agent.session_token_hard_stop import normalize_session_token_limit
+
+    agent.session_token_hard_stop = normalize_session_token_limit(
+        session_token_hard_stop
+    )
+    agent.session_token_warn = normalize_session_token_limit(session_token_warn)
+    agent._session_token_warn_injected = False
 
     # Activity tracking — updated on each API call, tool execution, and
     # stream chunk.  Used by the gateway timeout handler to report what the
@@ -2011,6 +2023,18 @@ def init_agent(
     if agent.run_budget_seconds is None:
         agent.run_budget_seconds = _normalize_run_budget_seconds(
             _agent_section.get("run_budget_seconds")
+        )
+
+    # Session billed-token fuse from config — only when the constructor
+    # did not already set a positive cap (same "arg wins" shape as
+    # run_budget_seconds).
+    if agent.session_token_hard_stop is None:
+        agent.session_token_hard_stop = normalize_session_token_limit(
+            _agent_section.get("session_token_hard_stop")
+        )
+    if agent.session_token_warn is None:
+        agent.session_token_warn = normalize_session_token_limit(
+            _agent_section.get("session_token_warn")
         )
 
     # Empty-response retry guard config (NS-503): additive

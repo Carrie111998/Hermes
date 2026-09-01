@@ -2436,6 +2436,21 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Move '{key}' under the appropriate section",
             ))
 
+    # ── Unimplemented budget / fuse keys (#96814) ────────────────────
+    # These names were accepted in operator configs with no reader.
+    # Warn loudly: a silently inert safety key is worse than rejecting it.
+    from agent.session_token_hard_stop import unimplemented_budget_keys_present
+
+    for inert_key in unimplemented_budget_keys_present(config):
+        issues.append(ConfigIssue(
+            "warning",
+            f"Config key '{inert_key}' is not implemented and has no effect. "
+            "Use agent.session_token_hard_stop (billed tokens per session) "
+            "instead of the older gateway_usage_hard_* names.",
+            "Set agent.session_token_hard_stop to a positive integer; "
+            "remove the unimplemented key.",
+        ))
+
     return issues
 
 

@@ -560,6 +560,8 @@ class AIAgent:
         parent_session_id: str = None,
         iteration_budget: "IterationBudget" = None,
         run_budget_seconds: Optional[float] = None,
+        session_token_hard_stop: Optional[int] = None,
+        session_token_warn: Optional[int] = None,
         fallback_model: Dict[str, Any] = None,
         credential_pool=None,
         checkpoints_enabled: bool = False,
@@ -653,6 +655,8 @@ class AIAgent:
             parent_session_id=parent_session_id,
             iteration_budget=iteration_budget,
             run_budget_seconds=run_budget_seconds,
+            session_token_hard_stop=session_token_hard_stop,
+            session_token_warn=session_token_warn,
             fallback_model=fallback_model,
             credential_pool=credential_pool,
             checkpoints_enabled=checkpoints_enabled,
@@ -871,6 +875,7 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self._session_token_warn_injected = False
 
         # Session boundary: the usage anchor describes the OLD session's
         # transcript — a fresh/branched/resumed session must fall back to

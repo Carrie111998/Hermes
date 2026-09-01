@@ -50,6 +50,13 @@ from agent.turn_context import (
     compose_user_api_content,
     reanchor_current_turn_user_idx,
 )
+from agent.session_token_hard_stop import (
+    SESSION_TOKEN_WARN_NOTICE,
+    billed_session_tokens,
+    hard_stop_exhausted,
+    hard_stop_user_message,
+    should_emit_warn,
+)
 from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
@@ -239,6 +246,42 @@ def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) 
             )
             return True
     return False
+
+
+def _append_notice_to_newest_tool_message(
+    messages: List[Dict[str, Any]], notice: str
+) -> bool:
+    """Append ``notice`` to the newest tool message (cache-safe /steer channel)."""
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            existing = msg.get("content", "")
+            if isinstance(existing, str):
+                msg["content"] = existing + f"\n\n{notice}"
+            else:
+                try:
+                    blocks = list(existing) if existing else []
+                    blocks.append({"type": "text", "text": notice})
+                    msg["content"] = blocks
+                except Exception:
+                    return False
+            return True
+    return False
+
+
+def _maybe_inject_session_token_warn(agent: Any, messages: List[Dict[str, Any]]) -> bool:
+    """Inject the one-time session-token wind-down notice when past the warn threshold."""
+    if not should_emit_warn(agent):
+        return False
+    if not _append_notice_to_newest_tool_message(messages, SESSION_TOKEN_WARN_NOTICE):
+        return False
+    agent._session_token_warn_injected = True
+    logger.info(
+        "Session token warn notice injected (used=%d, threshold=%s)",
+        billed_session_tokens(agent),
+        getattr(agent, "session_token_warn", None),
+    )
+    return True
 
 
 def _restore_user_after_reference_handoff(
@@ -2193,6 +2236,15 @@ def run_conversation(
                     f"the review tool loop before the next provider call."
                 )
             break
+
+        # Session billed-token fuse (#96814): stop before the next provider
+        # call so crossing the cap does not spend another request.
+        if hard_stop_exhausted(agent):
+            _turn_exit_reason = "token_hard_stop"
+            final_response = hard_stop_user_message(agent)
+            if not agent.quiet_mode:
+                agent._safe_print(f"\n⏹️  {final_response}")
+            break
         
         api_call_count += 1
         agent._api_call_count = api_call_count
@@ -2302,6 +2354,7 @@ def run_conversation(
         # result); dormant when no budget is set.
         if getattr(agent, "run_budget_seconds", None):
             _maybe_inject_run_budget_wrapup(agent, messages)
+        _maybe_inject_session_token_warn(agent, messages)
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
