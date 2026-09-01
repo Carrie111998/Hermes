@@ -1055,6 +1055,47 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     return text
 
 
+def _rolling_activity_terminal_header(
+    result: Optional[Dict[str, Any]],
+    *,
+    timed_out: bool = False,
+    cancelled: bool = False,
+) -> str:
+    """Choose the final state shown by a rolling activity message."""
+    result = result or {}
+    if timed_out:
+        return "⚠️ Needs attention"
+    if cancelled or result.get("interrupted"):
+        return "⏹️ Stopped"
+    if (
+        not result
+        or result.get("failed")
+        or result.get("partial")
+        or result.get("completed") is False
+        or bool(result.get("error"))
+    ):
+        return "⚠️ Needs attention"
+    return "✅ Completed"
+
+
+def _resolve_tool_progress_mode(user_config: Any, platform_key: str) -> str:
+    """Resolve tool progress with the legacy env fallback precedence."""
+    from gateway.display_config import resolve_display_setting
+
+    resolved = resolve_display_setting(user_config, platform_key, "tool_progress")
+    env_mode = os.getenv("HERMES_TOOL_PROGRESS_MODE")
+    display = user_config.get("display", {}) if isinstance(user_config, dict) else {}
+    display = display if isinstance(display, dict) else {}
+    platform = (display.get("platforms") or {}).get(platform_key) or {}
+    legacy_overrides = display.get("tool_progress_overrides") or {}
+    configured = (
+        "tool_progress" in display
+        or (isinstance(platform, dict) and "tool_progress" in platform)
+        or (isinstance(legacy_overrides, dict) and platform_key in legacy_overrides)
+    )
+    return env_mode if env_mode and not configured else (resolved or env_mode or "all")
+
+
 def render_notice_line(notice) -> str:
     """Render an AgentNotice to a single plaintext line for messaging platforms.
 
@@ -5234,9 +5275,12 @@ class TurnRunner:
                     break
             return
 
-        progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
-        progress_msg_id = None   # ID of the current progress message to edit
+        progress_lines = []      # Complete tool entries in the CURRENT editable bubble
+        progress_msg_id = ctx.initial_progress_msg_id  # May be seeded by preflight compression.
         can_edit = ctx.progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
+        rolling_omitted_count = 0
+        rolling_header = "⏳ Working…" if ctx.progress_grouping == "rolling" else None
+        rolling_state_changed = False
         _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
         _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
@@ -5296,7 +5340,28 @@ class TurnRunner:
             return await adapter.edit_message(**kwargs)
 
         def _progress_text(lines: list) -> str:
-            return "\n".join(str(line) for line in lines)
+            rendered = [str(line) for line in lines]
+            if rolling_header:
+                rendered.insert(0, rolling_header)
+            if rolling_header and rolling_omitted_count:
+                rendered.insert(
+                    1,
+                    f"… {rolling_omitted_count} earlier activities omitted",
+                )
+            return "\n".join(rendered)
+
+        def _fit_rolling_progress_tail() -> None:
+            """Drop whole oldest entries until the rolling bubble fits."""
+            nonlocal rolling_omitted_count
+            if ctx.progress_grouping != "rolling":
+                return
+            while (
+                progress_lines
+                and _progress_len_fn(_progress_text(progress_lines))
+                > _PROGRESS_TEXT_LIMIT
+            ):
+                progress_lines.pop(0)
+                rolling_omitted_count += 1
 
         def _split_progress_groups(lines: list) -> list[list]:
             """Partition progress lines into platform-sized editable bubbles."""
@@ -5342,6 +5407,9 @@ class TurnRunner:
             nonlocal progress_msg_id, progress_lines, can_edit
             if not progress_lines or not can_edit:
                 return False
+            if ctx.progress_grouping == "rolling":
+                _fit_rolling_progress_tail()
+                return False
             groups = _split_progress_groups(progress_lines)
             if len(groups) <= 1:
                 return False
@@ -5386,6 +5454,12 @@ class TurnRunner:
                     return
 
                 raw = ctx.progress_queue.get_nowait()
+                _finish_after_flush = bool(
+                    isinstance(raw, tuple)
+                    and len(raw) >= 2
+                    and raw[0] == "__activity_finish__"
+                )
+                _finish_requested = bool(ctx.progress_finish_header[0])
 
                 # Drain silently when interrupted: events queued in the
                 # window between tool parse and interrupt processing
@@ -5394,8 +5468,10 @@ class TurnRunner:
                 # last progress-flavored bubble the user should see.
                 try:
                     _agent_for_interrupt = ctx.agent_holder[0] if ctx.agent_holder else None
-                    if _agent_for_interrupt is not None and getattr(
-                        _agent_for_interrupt, "is_interrupted", False
+                    if (
+                        not _finish_after_flush
+                        and _agent_for_interrupt is not None
+                        and getattr(_agent_for_interrupt, "is_interrupted", False)
                     ):
                         # Drop this event and continue draining.
                         await asyncio.sleep(0)
@@ -5406,10 +5482,15 @@ class TurnRunner:
                 # Handle dedup messages: update last line with repeat counter
                 if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                     _, base_msg, count = raw
-                    if progress_lines:
+                    if progress_lines and (
+                        progress_lines[-1] == base_msg
+                        or str(progress_lines[-1]).startswith(f"{base_msg} (×")
+                    ):
                         progress_lines[-1] = f"{base_msg} (×{count + 1})"
                     msg = progress_lines[-1] if progress_lines else base_msg
                 elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
+                    if ctx.progress_grouping == "rolling":
+                        continue
                     # Content bubble just landed on the platform — close off
                     # the current tool-progress bubble so the next tool
                     # starts a fresh bubble below the content. Without this,
@@ -5420,9 +5501,20 @@ class TurnRunner:
                     # linearization regression after PR #7885.)
                     progress_msg_id = None
                     progress_lines = []
+                    rolling_omitted_count = 0
                     ctx.last_progress_msg[0] = None
                     ctx.repeat_count[0] = 0
                     continue
+                elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__activity_start__":
+                    msg = rolling_header or "⏳ Working…"
+                elif isinstance(raw, tuple) and len(raw) >= 2 and raw[0] == "__activity_state__":
+                    rolling_header = str(raw[1])
+                    rolling_state_changed = True
+                    msg = rolling_header
+                elif _finish_after_flush:
+                    rolling_header = str(raw[1])
+                    rolling_state_changed = True
+                    msg = rolling_header
                 else:
                     msg = raw
                     progress_lines.append(msg)
@@ -5440,7 +5532,7 @@ class TurnRunner:
                 # instead of reacting to 429s.)
                 _now = time.monotonic()
                 _remaining = _PROGRESS_EDIT_INTERVAL - (_now - _last_edit_ts)
-                if _remaining > 0:
+                if _remaining > 0 and not _finish_requested:
                     # Wait out the throttle interval, then loop back to
                     # drain any additional queued messages before sending
                     # a single batched edit.
@@ -5452,7 +5544,7 @@ class TurnRunner:
 
                 if can_edit and progress_msg_id is not None:
                     # Try to edit the existing progress message
-                    full_text = "\n".join(progress_lines)
+                    full_text = _progress_text(progress_lines)
                     result = await _edit_progress_message(progress_msg_id, full_text)
                     if not result.success:
                         _err = (getattr(result, "error", "") or "").lower()
@@ -5492,7 +5584,7 @@ class TurnRunner:
                 else:
                     if can_edit:
                         # First tool: send all accumulated text as new message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _progress_text(progress_lines)
                         result = await adapter.send(
                             chat_id=ctx.source.chat_id,
                             content=full_text,
@@ -5514,6 +5606,9 @@ class TurnRunner:
 
                 _last_edit_ts = time.monotonic()
 
+                if _finish_after_flush:
+                    return
+
                 # Restore typing indicator
                 await asyncio.sleep(0.3)
                 if ctx._run_still_current():
@@ -5528,10 +5623,15 @@ class TurnRunner:
                         raw = ctx.progress_queue.get_nowait()
                         if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
                             _, base_msg, count = raw
-                            if progress_lines:
+                            if progress_lines and (
+                                progress_lines[-1] == base_msg
+                                or str(progress_lines[-1]).startswith(f"{base_msg} (×")
+                            ):
                                 progress_lines[-1] = f"{base_msg} (×{count + 1})"
                                 await _roll_progress_overflow_if_needed()
                         elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
+                            if ctx.progress_grouping == "rolling":
+                                continue
                             # Content-bubble marker during drain: close off
                             # the current progress bubble and start a fresh
                             # one for any tool lines that arrived after.
@@ -5544,17 +5644,34 @@ class TurnRunner:
                                     pass
                             progress_msg_id = None
                             progress_lines = []
+                            rolling_omitted_count = 0
                             ctx.last_progress_msg[0] = None
                             ctx.repeat_count[0] = 0
+                        elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__activity_start__":
+                            continue
+                        elif (
+                            isinstance(raw, tuple)
+                            and len(raw) >= 2
+                            and raw[0] in {"__activity_state__", "__activity_finish__"}
+                        ):
+                            rolling_header = str(raw[1])
+                            rolling_state_changed = True
                         else:
                             progress_lines.append(raw)
                             await _roll_progress_overflow_if_needed()
                     except Exception:
                         break
-                # Final edit with all remaining tools (only if editing works)
-                if can_edit and progress_lines and progress_msg_id:
+                # Final edit with all remaining tools (only if editing works).
+                # A rolling bubble can contain only its omission marker when a
+                # single oversized activity was dropped as one complete entry.
+                _has_final_progress = bool(
+                    progress_lines
+                    or rolling_state_changed
+                    or (rolling_header and rolling_omitted_count)
+                )
+                if can_edit and _has_final_progress and progress_msg_id:
                     await _roll_progress_overflow_if_needed()
-                if can_edit and progress_lines and progress_msg_id:
+                if can_edit and _has_final_progress and progress_msg_id:
                     full_text = _progress_text(progress_lines)
                     try:
                         await _edit_progress_message(progress_msg_id, full_text)
@@ -5930,6 +6047,15 @@ class TurnRunner:
             if not ctx._run_still_current():
                 return
             display_text = text
+            if (
+                ctx.progress_grouping == "rolling"
+                and ctx.tool_progress_enabled
+                and ctx.progress_queue is not None
+                and not already_streamed
+                and str(display_text or "").strip()
+            ):
+                ctx.progress_queue.put(f"💬 {display_text}")
+                return
             if _stream_consumer is not None:
                 if already_streamed:
                     _stream_consumer.on_segment_break()
@@ -20835,6 +20961,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
+        _hyg_progress_message_id = None
         
         # -----------------------------------------------------------------
         # Session hygiene: auto-compress pathologically large transcripts
@@ -21122,7 +21249,67 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         f"{_compress_token_threshold:,}",
                     )
 
-                    _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    _hyg_reply_to = self._reply_anchor_for_event(event)
+                    _hyg_meta = self._thread_metadata_for_source(source, _hyg_reply_to)
+                    _hyg_progress_meta = _hyg_meta
+                    if (
+                        source.platform == Platform.DISCORD
+                        and getattr(source, "delivered_via_upstream_relay", False)
+                        and getattr(source, "prospective_thread_id", None)
+                        and not getattr(source, "thread_id", None)
+                        and _hyg_reply_to
+                    ):
+                        _hyg_progress_meta = dict(_hyg_progress_meta or {})
+                        _hyg_progress_meta["reply_to_message_id"] = str(
+                            _hyg_reply_to
+                        )
+                    _hyg_progress_meta = _non_conversational_metadata(
+                        _hyg_progress_meta,
+                        platform=source.platform,
+                    )
+
+                    # Rolling activity owns one editable bubble for the whole
+                    # turn. Seed it before the potentially minutes-long hygiene
+                    # pass, then hand its ID to the normal progress sender.
+                    try:
+                        from gateway.display_config import resolve_display_setting
+
+                        _hyg_platform_key = _platform_config_key(source.platform)
+                        _hyg_progress_mode = _resolve_tool_progress_mode(
+                            _hyg_data, _hyg_platform_key
+                        )
+                        _hyg_progress_grouping = resolve_display_setting(
+                            _hyg_data,
+                            _hyg_platform_key,
+                            "tool_progress_grouping",
+                            "accumulate",
+                        )
+                        _hyg_adapter = self._adapter_for_source(source)
+                        _hyg_edit = (
+                            getattr(type(_hyg_adapter), "edit_message", None)
+                            if _hyg_adapter is not None
+                            else None
+                        )
+                        if (
+                            _hyg_progress_grouping == "rolling"
+                            and _hyg_progress_mode not in {"off", "log"}
+                            and not self._get_proxy_url()
+                            and _hyg_edit is not None
+                            and _hyg_edit is not BasePlatformAdapter.edit_message
+                        ):
+                            _hyg_send = await _hyg_adapter.send(
+                                source.chat_id,
+                                "⏳ Compressing conversation context…",
+                                reply_to=_hyg_reply_to,
+                                metadata=_hyg_progress_meta,
+                            )
+                            if _hyg_send.success and _hyg_send.message_id:
+                                _hyg_progress_message_id = str(_hyg_send.message_id)
+                    except Exception:
+                        logger.debug(
+                            "Session hygiene progress notice failed",
+                            exc_info=True,
+                        )
 
                     try:
                         from agent.conversation_compression import CompressionCommitFence
@@ -21995,6 +22182,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Session hygiene auto-compress failed: %s", e
                         )
 
+                    if (
+                        _hyg_progress_message_id
+                        and self._is_session_run_current(_quick_key, run_generation)
+                    ):
+                        try:
+                            _hyg_edit_kwargs = {
+                                "chat_id": source.chat_id,
+                                "message_id": _hyg_progress_message_id,
+                                "content": "⏳ Working…",
+                            }
+                            try:
+                                _hyg_edit_params = inspect.signature(
+                                    _hyg_adapter.edit_message
+                                ).parameters
+                                if "metadata" in _hyg_edit_params or any(
+                                    param.kind is inspect.Parameter.VAR_KEYWORD
+                                    for param in _hyg_edit_params.values()
+                                ):
+                                    _hyg_edit_kwargs["metadata"] = _hyg_progress_meta
+                            except (TypeError, ValueError):
+                                pass
+                            await _hyg_adapter.edit_message(**_hyg_edit_kwargs)
+                        except Exception:
+                            logger.debug(
+                                "Session hygiene progress edit failed",
+                                exc_info=True,
+                            )
+
         # First-message onboarding -- only on the very first interaction ever.
         # Delivered on the current user message (sidecar), NOT the ephemeral
         # system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed
@@ -22213,6 +22428,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                progress_message_id=_hyg_progress_message_id,
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -29994,6 +30210,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        progress_message_id: Optional[str] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -30015,6 +30232,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                progress_message_id=progress_message_id,
                 message_type=message_type,
             )
 
@@ -30029,6 +30247,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
+                progress_message_id=progress_message_id,
                 message_type=message_type,
             )
 
@@ -30173,6 +30392,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
+        progress_message_id: Optional[str] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -30245,29 +30465,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
 
         # Tool progress mode — resolved per-platform with env var fallback
-        _resolved_tp = resolve_display_setting(user_config, platform_key, "tool_progress")
-        _env_tp = os.getenv("HERMES_TOOL_PROGRESS_MODE")
-        _display_cfg = display_config if isinstance(display_config, dict) else {}
-        _platforms_cfg = _display_cfg.get("platforms") or {}
-        _platform_cfg = _platforms_cfg.get(platform_key) or {}
-        _legacy_tp_overrides = _display_cfg.get("tool_progress_overrides") or {}
-        _tool_progress_configured = (
-            "tool_progress" in _display_cfg
-            or (
-                isinstance(_platform_cfg, dict)
-                and "tool_progress" in _platform_cfg
-            )
-            or (
-                isinstance(_legacy_tp_overrides, dict)
-                and platform_key in _legacy_tp_overrides
-            )
-        )
-        progress_mode = (
-            _env_tp
-            if _env_tp and not _tool_progress_configured
-            else (_resolved_tp or _env_tp or "all")
-        )
-        # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
+        progress_mode = _resolve_tool_progress_mode(user_config, platform_key)
+        # Tool progress grouping: accumulated history, bounded rolling tail, or
+        # one separate message per tool.
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
         _generic_status_recent: List[str] = []
@@ -30434,6 +30634,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _cleanup_progress = False
             _cleanup_adapter = None
         _cleanup_msg_ids: List[str] = []
+        if _cleanup_progress and progress_message_id:
+            _cleanup_msg_ids.append(progress_message_id)
         # First-touch onboarding latch: fires at most once per run, even if
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
@@ -30458,6 +30660,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _LONG_TOOL_THRESHOLD_S=_LONG_TOOL_THRESHOLD_S,
             _cleanup_progress=_cleanup_progress,
             _cleanup_msg_ids=_cleanup_msg_ids,
+            initial_progress_msg_id=progress_message_id,
             message=message,
             AIAgent=AIAgent,
             resolve_display_setting=resolve_display_setting,
@@ -30678,6 +30881,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         agent_holder = [None]  # Mutable container for the agent instance
         turn_ctx.agent_holder = agent_holder
         result_holder = [None]  # Mutable container for the result
+        queued_followup_args = None
+        queued_parent_result = None
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
         # #60671 — streaming PCM audio consumer.  Created on the gateway
@@ -30797,6 +31002,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         progress_task = None
         if needs_progress_queue:
             progress_task = asyncio.create_task(send_progress_messages())
+            if progress_grouping == "rolling" and tool_progress_enabled:
+                progress_queue.put(("__activity_start__",))
 
         # Start the tool-call log writer when tool_progress == "log".
         log_task = None
@@ -30996,6 +31203,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 )
                 try:
+                    if (
+                        progress_grouping == "rolling"
+                        and tool_progress_enabled
+                        and progress_queue is not None
+                    ):
+                        progress_queue.put(_heartbeat_text)
+                        continue
                     _notify_res = None
                     if _heartbeat_msg_id:
                         try:
@@ -31061,6 +31275,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return False
             return False
 
+        _inactivity_timeout = False
         try:
             # Run in thread pool to not block.  Use an *inactivity*-based
             # timeout instead of a wall-clock limit: the agent can run for
@@ -31146,7 +31361,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
             )
 
-            _inactivity_timeout = False
             _POLL_INTERVAL = 5.0
 
             if _agent_timeout is None:
@@ -31724,24 +31938,77 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                    message_type=next_message_type,
-                )
-                return _preserve_queued_followup_history_offset(result, followup_result)
+                if progress_grouping == "rolling" and tool_progress_enabled:
+                    # Defer recursion until this turn's finally block has
+                    # flushed its terminal state and released its running slot.
+                    queued_parent_result = result
+                    queued_followup_args = {
+                        "message": next_message,
+                        "context_prompt": context_prompt,
+                        "history": updated_history,
+                        "source": next_source,
+                        "session_id": session_id,
+                        "session_key": next_session_key,
+                        "run_generation": run_generation,
+                        "_interrupt_depth": _interrupt_depth + 1,
+                        "event_message_id": next_message_id,
+                        "channel_prompt": next_channel_prompt,
+                        "message_type": next_message_type,
+                    }
+                else:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        message_type=next_message_type,
+                    )
+                    return _preserve_queued_followup_history_offset(
+                        result, followup_result
+                    )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
             if progress_task:
-                progress_task.cancel()
+                if progress_grouping == "rolling" and tool_progress_enabled:
+                    _activity_result = result_holder[0] or {}
+                    _current_task = asyncio.current_task()
+                    _activity_header = _rolling_activity_terminal_header(
+                        _activity_result,
+                        timed_out=_inactivity_timeout,
+                        cancelled=bool(
+                            _current_task and _current_task.cancelling()
+                        ),
+                    )
+                    # Graceful terminal flush: let the progress worker send or
+                    # edit the terminal header before it exits. Immediate tool
+                    # turns can otherwise cancel the worker between the initial
+                    # `⏳ Working…` send and the terminal edit, leaving a stale
+                    # activity message behind permanently.
+                    turn_ctx.progress_finish_header[0] = _activity_header
+                    progress_queue.put(("__activity_finish__", _activity_header))
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(progress_task), timeout=5.0
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        progress_task.cancel()
+                        try:
+                            await progress_task
+                        except asyncio.CancelledError:
+                            pass
+                    except Exception as _progress_finish_err:
+                        logger.warning(
+                            "Rolling activity terminal flush failed: %s",
+                            _progress_finish_err,
+                        )
+                else:
+                    progress_task.cancel()
             if log_task:
                 log_task.cancel()
             interrupt_monitor.cancel()
@@ -31817,6 +32084,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "background turn task failed during cleanup",
                             exc_info=True,
                         )
+
+        if queued_followup_args is not None:
+            followup_result = await self._run_agent(**queued_followup_args)
+            return _preserve_queued_followup_history_offset(
+                queued_parent_result or {}, followup_result
+            )
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).

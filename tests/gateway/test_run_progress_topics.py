@@ -131,6 +131,36 @@ class SmallLimitProgressAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class OrderedProgressAdapter(SmallLimitProgressAdapter):
+    """Capture send/edit chronology across queued logical turns."""
+
+    MAX_MESSAGE_LENGTH = 500
+
+    def __init__(self, platform=Platform.DISCORD):
+        super().__init__(platform=platform)
+        self.timeline = []
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.timeline.append(("send", content))
+        return await super().send(chat_id, content, reply_to, metadata)
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.timeline.append(("edit", content))
+        return await super().edit_message(chat_id, message_id, content)
+
+
+class Utf16SmallLimitProgressAdapter(SmallLimitProgressAdapter):
+    """Small adapter whose platform limit is measured in UTF-16 units."""
+
+    @property
+    def message_len_fn(self):
+        return lambda text: len(text.encode("utf-16-le")) // 2
+
+
+class TinyLimitProgressAdapter(SmallLimitProgressAdapter):
+    MAX_MESSAGE_LENGTH = 48
+
+
 class MetadataEditProgressCaptureAdapter(ProgressCaptureAdapter):
     async def edit_message(
         self, chat_id, message_id, content, *, finalize: bool = False, metadata=None
@@ -430,6 +460,30 @@ class ManyProgressLinesAgent:
         time.sleep(0.35)
         for idx in range(1, 8):
             cb("tool.started", "terminal", f"overflow-line-{idx}-" + "x" * 45, {})
+        time.sleep(0.1)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class RollingDedupAgent:
+    """Overflow the rolling tail, then repeat its newest complete entry."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        cb("tool.started", "terminal", "first-short", {})
+        time.sleep(0.35)
+        for idx in range(6):
+            cb("tool.started", "terminal", f"old-line-{idx}-" + "x" * 45, {})
+        for _ in range(3):
+            cb("tool.started", "web_search", "latest repeated query", {})
         time.sleep(0.1)
         return {
             "final_response": "done",
@@ -815,6 +869,39 @@ class CommentaryAgent:
         }
 
 
+class SlowToolAgent:
+    """Emit progress, then stay active long enough for a configured heartbeat."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback("tool.started", "terminal", "long command", {})
+        time.sleep(0.25)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class InstantToolAgent:
+    """Finish immediately after emitting one tool event."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback("tool.started", "terminal", "instant command", {})
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -930,6 +1017,25 @@ class QueuedSilenceAgent:
         }
 
 
+class QueuedLifecycleAgent:
+    """Record queued-turn execution relative to parent cleanup."""
+
+    calls = 0
+    timeline = []
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).calls += 1
+        type(self).timeline.append(f"run-{type(self).calls}")
+        return {
+            "final_response": f"response {type(self).calls}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class QueuedFailedEmptyAgent:
     """First turn fails empty; its normalized error must send before follow-up."""
 
@@ -1006,6 +1112,8 @@ async def _run_with_agent(
     adapter_cls=ProgressCaptureAdapter,
     user_id=None,
     scope_id=None,
+    progress_message_id=None,
+    runner_setup=None,
 ):
     if config_data:
         import yaml
@@ -1022,6 +1130,8 @@ async def _run_with_agent(
 
     adapter = adapter_cls(platform=platform)
     runner = _make_runner(adapter)
+    if runner_setup:
+        runner_setup(runner)
     gateway_run = importlib.import_module("gateway.run")
     if config_data and "streaming" in config_data:
         runner.config.streaming = StreamingConfig.from_dict(config_data["streaming"])
@@ -1053,6 +1163,7 @@ async def _run_with_agent(
         source=source,
         session_id=session_id,
         session_key=session_key,
+        progress_message_id=progress_message_id,
     )
     return adapter, result
 
@@ -1160,6 +1271,322 @@ async def test_retryable_overflow_edit_keeps_editable_bubble_identity(monkeypatc
     assert any(call["message_id"] == "progress-1" for call in adapter.edits[1:])
     assert adapter.oversized_sends == []
     assert adapter.oversized_edits == []
+
+
+@pytest.mark.asyncio
+async def test_rolling_progress_keeps_one_bounded_editable_tail(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ManyProgressLinesAgent,
+        session_id="sess-progress-rolling-tail",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "rolling",
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="C123",
+        chat_type="group",
+        thread_id="thread-1",
+        adapter_cls=Utf16SmallLimitProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["metadata"] is not None
+    assert adapter.edits
+    assert {call["message_id"] for call in adapter.edits} == {"progress-1"}
+    rendered = [adapter.sent[0]["content"], *(call["content"] for call in adapter.edits)]
+    effective_limit = adapter.MAX_MESSAGE_LENGTH - 64
+    assert all(adapter.message_len_fn(text) <= effective_limit for text in rendered)
+    final_progress = rendered[-1]
+    assert "earlier activities omitted" in final_progress
+    assert "overflow-line-7" in final_progress
+    assert "first-short" not in final_progress
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
+
+
+@pytest.mark.asyncio
+async def test_rolling_progress_reuses_preflight_compression_message(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        ManyProgressLinesAgent,
+        session_id="sess-progress-rolling-preflight",
+        progress_message_id="preflight-1",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "rolling",
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.DISCORD,
+        adapter_cls=Utf16SmallLimitProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+    assert adapter.edits
+    assert {call["message_id"] for call in adapter.edits} == {"preflight-1"}
+
+
+@pytest.mark.asyncio
+async def test_rolling_progress_omits_single_oversized_entry_without_splitting(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        VerboseAgent,
+        session_id="sess-progress-rolling-oversized-entry",
+        config_data={
+            "display": {
+                "tool_progress": "verbose",
+                "tool_progress_grouping": "rolling",
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.DISCORD,
+        adapter_cls=TinyLimitProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["content"] == "⏳ Working…"
+    assert adapter.edits
+    progress_text = adapter.edits[-1]["content"]
+    assert progress_text == "✅ Completed\n… 1 earlier activities omitted"
+    assert VerboseAgent.LONG_CODE not in progress_text
+    assert adapter.oversized_sends == []
+    assert adapter.oversized_edits == []
+
+
+@pytest.mark.parametrize(
+    ("result", "timed_out", "cancelled", "expected"),
+    [
+        ({}, True, False, "⚠️ Needs attention"),
+        ({"failed": True}, False, False, "⚠️ Needs attention"),
+        ({"completed": False}, False, False, "⚠️ Needs attention"),
+        ({"partial": True}, False, False, "⚠️ Needs attention"),
+        ({"error": "compression deferred"}, False, False, "⚠️ Needs attention"),
+        ({"interrupted": True}, False, False, "⏹️ Stopped"),
+        (None, False, True, "⏹️ Stopped"),
+        ({"failed": False}, False, False, "✅ Completed"),
+    ],
+)
+def test_rolling_activity_terminal_header_states(
+    result, timed_out, cancelled, expected
+):
+    gateway_run = importlib.import_module("gateway.run")
+
+    assert gateway_run._rolling_activity_terminal_header(
+        result,
+        timed_out=timed_out,
+        cancelled=cancelled,
+    ) == expected
+
+
+@pytest.mark.asyncio
+async def test_rolling_progress_preserves_dedup_after_omitting_old_entries(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        RollingDedupAgent,
+        session_id="sess-progress-rolling-dedup",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "rolling",
+                "interim_assistant_messages": False,
+            }
+        },
+        platform=Platform.DISCORD,
+        adapter_cls=SmallLimitProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    final_progress = adapter.edits[-1]["content"]
+    assert "earlier activities omitted" in final_progress
+    assert "latest repeated query" in final_progress
+    assert "(×3)" in final_progress
+
+
+@pytest.mark.asyncio
+async def test_rolling_progress_routes_interim_commentary_into_activity_bubble(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        CommentaryAgent,
+        session_id="sess-progress-rolling-commentary",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "rolling",
+                "interim_assistant_messages": True,
+            },
+            "streaming": {"enabled": False},
+        },
+        platform=Platform.DISCORD,
+        adapter_cls=SmallLimitProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    assert adapter.edits
+    rendered = adapter.edits[-1]["content"]
+    assert "✅ Completed" in rendered
+    assert "I'll inspect the repo first." in rendered
+    assert {call["message_id"] for call in adapter.edits} == {"progress-1"}
+
+
+@pytest.mark.asyncio
+async def test_rolling_progress_routes_heartbeat_into_same_activity_bubble(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.05")
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SlowToolAgent,
+        session_id="sess-progress-rolling-heartbeat",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "rolling",
+                "interim_assistant_messages": False,
+                "long_running_notifications": True,
+            }
+        },
+        platform=Platform.DISCORD,
+        adapter_cls=SmallLimitProgressAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    assert adapter.edits
+    assert "Working — 0 min" in adapter.edits[-1]["content"]
+    assert {call["message_id"] for call in adapter.edits} == {"progress-1"}
+
+
+@pytest.mark.asyncio
+async def test_rolling_progress_always_flushes_terminal_header_for_instant_turns(
+    monkeypatch, tmp_path
+):
+    for index in range(20):
+        adapter, result = await _run_with_agent(
+            monkeypatch,
+            tmp_path,
+            InstantToolAgent,
+            session_id=f"sess-progress-rolling-instant-{index}",
+            config_data={
+                "display": {
+                    "tool_progress": "all",
+                    "tool_progress_grouping": "rolling",
+                    "interim_assistant_messages": False,
+                }
+            },
+            platform=Platform.DISCORD,
+            chat_id="C123",
+            chat_type="group",
+            thread_id="thread-1",
+        )
+
+        assert result["final_response"] == "done"
+        assert len(adapter.sent) == 1
+        final_progress = (
+            adapter.edits[-1]["content"]
+            if adapter.edits
+            else adapter.sent[-1]["content"]
+        )
+        assert final_progress.startswith("✅ Completed")
+
+
+@pytest.mark.asyncio
+async def test_rolling_queued_followup_starts_after_parent_terminal_flush(
+    monkeypatch, tmp_path
+):
+    QueuedCommentaryAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-progress-rolling-queued-order",
+        pending_text="follow up",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": "rolling",
+                "interim_assistant_messages": True,
+            }
+        },
+        platform=Platform.DISCORD,
+        chat_id="C123",
+        chat_type="group",
+        thread_id="thread-1",
+        adapter_cls=OrderedProgressAdapter,
+    )
+
+    assert result["final_response"] == "final response 2"
+    parent_terminal = next(
+        index
+        for index, (_, content) in enumerate(adapter.timeline)
+        if content.startswith("✅ Completed")
+    )
+    child_start = next(
+        index
+        for index, (_, content) in enumerate(
+            adapter.timeline[parent_terminal + 1 :], parent_terminal + 1
+        )
+        if content.startswith("⏳ Working…")
+    )
+    assert parent_terminal < child_start
+
+
+@pytest.mark.parametrize("grouping", ["accumulate", "separate"])
+@pytest.mark.asyncio
+async def test_nonrolling_queued_followup_preserves_nested_recursion(
+    monkeypatch, tmp_path, grouping
+):
+    QueuedLifecycleAgent.calls = 0
+    QueuedLifecycleAgent.timeline = []
+
+    def record_cleanup(runner):
+        original = runner._release_running_agent_state
+
+        def wrapped(*args, **kwargs):
+            QueuedLifecycleAgent.timeline.append("release")
+            return original(*args, **kwargs)
+
+        runner._release_running_agent_state = wrapped
+
+    _, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedLifecycleAgent,
+        session_id=f"sess-progress-{grouping}-queued-order",
+        pending_text="follow up",
+        config_data={
+            "display": {
+                "tool_progress": "all",
+                "tool_progress_grouping": grouping,
+                "interim_assistant_messages": False,
+            }
+        },
+        runner_setup=record_cleanup,
+    )
+
+    assert result["final_response"] == "response 2"
+    assert QueuedLifecycleAgent.timeline[:2] == ["run-1", "run-2"]
 
 
 @pytest.mark.asyncio
