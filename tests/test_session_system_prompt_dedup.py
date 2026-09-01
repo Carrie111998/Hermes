@@ -86,8 +86,11 @@ def test_prompt_replacement_and_route_changes_collect_only_orphans(db):
         provider="openrouter",
         base_url="https://example.test/v1",
     )
-    assert db.get_session("s2")["system_prompt"] is None
-    assert _prompt_count(db) == 0
+    # Billing-route updates used to NULL the snapshot (forcing a full
+    # prefix rebuild on the next turn). They now keep it so identity can
+    # be patched in the volatile trailer instead (#100336).
+    assert db.get_session("s2")["system_prompt"] == shared_prompt
+    assert _prompt_count(db) == 1
 
     db.update_system_prompt("s2", "replacement")
     assert db.get_session("s2")["system_prompt"] == "replacement"

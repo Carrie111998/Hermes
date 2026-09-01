@@ -72,46 +72,74 @@ class TestStoredPromptReuse:
         _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
         assert agent._cached_system_prompt == stored
 
-    def test_present_row_with_stale_runtime_identity_rebuilds(self, caplog):
-        """Stored prompts are cache gold unless their runtime identity is stale.
+    def test_present_row_with_stale_runtime_identity_patches_trailer(self, caplog):
+        """A live /model switch updates the agent and DB model immediately.
 
-        A live /model switch updates the agent and DB model_config immediately.
-        If the old system_prompt snapshot still says the previous model,
-        blindly restoring it makes the next turn call the new model while the
-        model reads old `Model:` metadata ("what model are you?" lies).
+        The stored snapshot still carries the previous Model:/Provider:
+        trailer. Patch those last lines in place so identity is correct
+        without rebuilding the stable prefix (#100336).
         """
         stored = (
             "You are Hermes Agent.\n\n"
             "Conversation started: Tuesday, June 16, 2026\n"
             "Session ID: test-session-id\n"
             "Model: anthropic/claude-opus-4.8-fast\n"
-            "Provider: openrouter"
+            "Provider: openrouter\n"
+            "Platform: cli\n"
         )
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}
         agent = _make_agent(
             session_db=db,
-            prebuilt_prompt=(
-                "You are Hermes Agent.\n\n"
-                "Conversation started: Tuesday, June 16, 2026\n"
-                "Session ID: test-session-id\n"
-                "Model: openai/gpt-5.5\n"
-                "Provider: openrouter"
-            ),
+            prebuilt_prompt="MUST_NOT_REBUILD",
         )
         agent.model = "openai/gpt-5.5"
 
         with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
             _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
 
-        assert agent._cached_system_prompt.endswith(
-            "Model: openai/gpt-5.5\nProvider: openrouter"
+        assert agent._cached_system_prompt.startswith(
+            "You are Hermes Agent.\n\n"
+            "Conversation started: Tuesday, June 16, 2026\n"
+            "Session ID: test-session-id\n"
         )
-        agent._build_system_prompt.assert_called_once_with(None)
+        assert "Model: openai/gpt-5.5\n" in agent._cached_system_prompt
+        assert "Model: anthropic/claude-opus-4.8-fast" not in agent._cached_system_prompt
+        assert "Provider: openrouter" in agent._cached_system_prompt
+        agent._build_system_prompt.assert_not_called()
         db.update_system_prompt.assert_called_once_with(
             agent.session_id, agent._cached_system_prompt
         )
-        assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
+        assert any("stable prefix kept" in r.getMessage() for r in caplog.records)
+
+    def test_stale_cwd_still_rebuilds(self, monkeypatch):
+        """Cwd lives in the stable host-info block; a real path change
+        cannot be patched in the trailer and still requires a rebuild."""
+        stored = (
+            "You are Hermes Agent.\n"
+            "User home directory: /home/user\n"
+            "Current working directory: /old/workspace\n"
+            "Model: test-model\n"
+            "Provider: openrouter\n"
+            "Platform: cli\n"
+        )
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db, prebuilt_prompt="REBUILT_FOR_CWD")
+        monkeypatch.setattr(
+            "agent.conversation_loop.resolve_agent_cwd",
+            lambda: "/new/workspace",
+        )
+
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "hi"}]
+        )
+
+        agent._build_system_prompt.assert_called_once_with(None)
+        assert agent._cached_system_prompt == "REBUILT_FOR_CWD"
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, "REBUILT_FOR_CWD"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -445,6 +473,65 @@ class TestPerResponseSessionWritePath:
             assert second._cached_system_prompt == "GROUP_PROMPT"
             second._build_system_prompt.assert_not_called()
             assert "is null" not in caplog.text
+
+
+class TestModelSwitchKeepsPromptPrefix:
+    """#100336: /model must not throw away the persisted snapshot.
+
+    Nulling ``system_prompt_hash`` forced the next turn down the first-session
+    rebuild path, which re-evaluated skills/tools/guidance at the FRONT of
+    the prompt and collapsed implicit prefix-cache hits to ~2% on a long
+    history. Identity still has to update (#48173); do that by patching the
+    volatile trailer.
+    """
+
+    def test_update_session_model_keeps_stored_snapshot(self, tmp_path):
+        from hermes_state import SessionDB
+
+        stored = (
+            "You are Hermes Agent.\n\n"
+            "Conversation started: Tuesday, June 16, 2026\n"
+            "Session ID: sid-switch\n"
+            "Model: gx10\n"
+            "Provider: local\n"
+            "Platform: telegram\n"
+        )
+        with SessionDB(db_path=tmp_path / "state.db") as db:
+            db.create_session("sid-switch", source="telegram", model="gx10")
+            db.update_system_prompt("sid-switch", stored)
+            db.append_message("sid-switch", "user", "hi")
+            db.update_session_model("sid-switch", "zhipu", provider="zhipu")
+            db.update_session_billing_route(
+                "sid-switch",
+                provider="zhipu",
+                base_url="https://zhipu.example/v1",
+            )
+
+            row = db.get_session("sid-switch")
+            assert row["system_prompt"] == stored
+            assert row["model"] == "zhipu"
+
+            agent = _make_agent(session_db=db, prebuilt_prompt="MUST_NOT_BUILD")
+            agent.session_id = "sid-switch"
+            agent.model = "zhipu"
+            agent.provider = "zhipu"
+            agent.platform = "telegram"
+
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+            agent._build_system_prompt.assert_not_called()
+            restored = agent._cached_system_prompt
+            assert restored.startswith(
+                "You are Hermes Agent.\n\n"
+                "Conversation started: Tuesday, June 16, 2026\n"
+                "Session ID: sid-switch\n"
+            )
+            assert "Model: zhipu\n" in restored
+            assert "Provider: zhipu\n" in restored
+            assert "Model: gx10" not in restored
+            assert db.get_session("sid-switch")["system_prompt"] == restored
 
 
 if __name__ == "__main__":
