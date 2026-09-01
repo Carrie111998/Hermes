@@ -125,8 +125,10 @@ def _load_dedup_state() -> tuple[Dict[str, float], Dict[str, float]]:
         if not isinstance(seen, dict) or not isinstance(sent, dict):
             return {}, {}
         return (
-            {k: float(v) for k, v in seen.items() if isinstance(v, (int, float))},
-            {k: float(v) for k, v in sent.items() if isinstance(v, (int, float))},
+            # Reverse to oldest-first so runtime eviction (which deletes from
+            # the front of the dict) correctly keeps the most recent IDs.
+            {k: float(v) for k, v in sorted(seen.items(), key=lambda x: x[1]) if isinstance(v, (int, float))},
+            {k: float(v) for k, v in sorted(sent.items(), key=lambda x: x[1]) if isinstance(v, (int, float))},
         )
     except (OSError, ValueError, TypeError):
         return {}, {}
@@ -2243,7 +2245,14 @@ class PhotonAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             return SendResult(success=False, error=f"{type(e).__name__}: {e}")
-        return SendResult(success=True, message_id=data.get("messageId"))
+        msg_id = data.get("messageId")
+        self._record_sent_message(msg_id)
+        logger.info(
+            "[photon] outbound sent (effect=%s): message_id=%s",
+            effect,
+            msg_id or "none",
+        )
+        return SendResult(success=True, message_id=msg_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         now = time.time()
