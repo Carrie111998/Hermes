@@ -101,6 +101,7 @@ from agent.prompt_caching import (
     strip_anthropic_tool_cache_control,
 )
 from agent.turn_response import normalize_turn_response
+from agent.turn_post_tools import advance_after_tool_execution
 from agent.tool_call_validation import (
     normalize_and_validate_tool_arguments,
     validate_tool_call_names,
@@ -6603,184 +6604,30 @@ def run_conversation(
                 # entire conversation.
                 truncated_tool_call_retries = 0
 
-                # Signal that a paragraph break is needed before the next
-                # streamed text.  We don't emit it immediately because
-                # multiple consecutive tool iterations would stack up
-                # redundant blank lines.  Instead, _fire_stream_delta()
-                # will prepend a single "\n\n" the next time real text
-                # arrives.
-                agent._stream_needs_break = True
-
-                # Refund the iteration if the ONLY tool(s) called were
-                # execute_code (programmatic tool calling).  These are
-                # cheap RPC-style calls that shouldn't eat the budget.
-                _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
-                if _tc_names == {"execute_code"}:
-                    agent.iteration_budget.refund()
-                
-                # Use real token counts from the API response to decide
-                # compression.  prompt_tokens + completion_tokens is the
-                # actual context size the provider reported plus the
-                # assistant turn — a tight lower bound for the next prompt.
-                # Tool results appended above aren't counted yet, but the
-                # threshold (default 50%) leaves ample headroom; if tool
-                # results push past it, the next API call will report the
-                # real total and trigger compression then.
-                #
-                # If last_prompt_tokens is 0 (stale after API disconnect
-                # or provider returned no usage data), fall back to rough
-                # estimate to avoid missing compression.  Without this,
-                # a session can grow unbounded after disconnects because
-                # should_compress(0) never fires.  (#2153)
-                _compressor = agent.context_compressor
-                if _compressor.last_prompt_tokens > 0:
-                    # Only use prompt_tokens — completion/reasoning
-                    # tokens don't consume context window space.
-                    # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
-                    # inflate completion_tokens with reasoning,
-                    # causing premature compression.  (#12026)
-                    _real_tokens = _compressor.last_prompt_tokens
-                elif _compressor.last_prompt_tokens == -1:
-                    # Compression just ran and no API-reported prompt count
-                    # has arrived yet. Avoid treating a schema-heavy rough
-                    # post-compression estimate as real context pressure.
-                    _real_tokens = 0
-                else:
-                    # Include tool schemas — with 50+ tools enabled
-                    # these add 20-30K tokens the messages-only
-                    # estimate misses, which can skip compression
-                    # past the configured threshold (#14695).
-                    _real_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
-                    )
-
-                if (
-                    agent.compression_enabled
-                    and compression_attempts < max_compression_attempts
-                    and _compressor.should_compress(_real_tokens)
-                ):
-                    compression_attempts += 1
-                    # Compression is actually running (block cleared / was
-                    # never blocked) — reset the blocked-overflow warning
-                    # dedup so a future blocked-over-threshold turn can warn
-                    # again (silent-overflow fix #62625).
-                    # getattr guard: test doubles built via object.__new__ lack the
-                    # method (gateway test-double pitfall) — treat absence as no-op.
-                    _clear_warn = getattr(agent, "_clear_context_overflow_warn", None)
-                    if callable(_clear_warn):
-                        _clear_warn()
-                    agent._safe_print("  ⟳ compacting context…")
-                    _post_tool_input = messages
-                    # Route the overhead-aware _real_tokens (computed above) into compression, not
-                    # the bare last_prompt_tokens — which is 0 in the no-usage fallback, hiding the
-                    # true request size from the engine's overflow guard (upstream PR #77169 review).
-                    messages, active_system_prompt = agent._compress_context(
-                        messages, system_message,
-                        approx_tokens=_real_tokens,
-                        task_id=effective_task_id,
-                    )
-                    if (
-                        messages is _post_tool_input
-                        and compression_skipped_due_to_lock(agent)
-                    ):
-                        # #69870 lock-skip: this pass no-oped because another
-                        # path holds the session's compression lock — a
-                        # temporary defer, not evidence about compressibility.
-                        # Refund the attempt so a lock-loser tool loop does not
-                        # burn the shared per-turn budget toward
-                        # compression_exhausted (#9893/#35809).
-                        compression_attempts -= 1
-                    else:
-                        conversation_history = conversation_history_after_compression(
-                            agent, messages, conversation_history
-                        )
-                        if _should_skip_model_call_for_reference_handoff(
-                            messages, user_message
-                        ):
-                            logger.info(
-                                "Skipping post-tool compaction model call: "
-                                "reference-only handoff would be the sole "
-                                "active user turn (#80622)"
-                            )
-                            if not final_response:
-                                final_response = _HANDOFF_SKIP_FINAL_RESPONSE
-                            _turn_exit_reason = "compaction_handoff_not_actionable"
-                            break
-                elif agent.compression_enabled:
-                    # Over threshold but compression is blocked (summary-LLM
-                    # cooldown or anti-thrashing). Surface a deduped warning so
-                    # the user isn't left with a silently growing context that
-                    # eventually hits the hard provider limit. Mirrors the
-                    # turn-context preflight guard (silent-overflow fix #62625).
-                    _block_reason = None
-                    _info = getattr(_compressor, "should_compress_info", None)
-                    if _info is not None:
-                        try:
-                            _block_reason = _info(_real_tokens)[1]
-                        except Exception:
-                            _block_reason = None
-                    if _block_reason:
-                        agent._warn_context_overflow_blocked(
-                            _block_reason,
-                            _real_tokens,
-                            int(getattr(_compressor, "threshold_tokens", 0) or 0),
-                        )
-                    # Proactive tool-result prune: reclaim re-sent history on
-                    # large-window models long before should_compress() (≈50% of
-                    # the window) would ever fire. Deterministic, no LLM call;
-                    # protects the recent tail. No-op unless proactive_prune_tokens
-                    # is configured and _real_tokens is above it — and even then
-                    # the prune only commits when it reclaims at least
-                    # proactive_prune_min_reclaim_tokens, so prompt-cache breaks
-                    # stay episodic like compression's (the one sanctioned cache
-                    # break) instead of firing every tool iteration. See
-                    # ContextCompressor.prune_tool_results_only.
-                    # getattr guard: plugin context engines predating the hook and
-                    # minimal test doubles (SimpleNamespace compressors) lack the
-                    # method — treat absence as a no-op.
-                    _prune = getattr(_compressor, "prune_tool_results_only", None)
-                    if callable(_prune):
-                        try:
-                            _pruned_msgs, _pruned_n = _prune(
-                                messages, current_tokens=_real_tokens
-                            )
-                        except Exception:
-                            logger.debug(
-                                "proactive tool-result prune failed; skipping",
-                                exc_info=True,
-                            )
-                            _pruned_msgs, _pruned_n = messages, 0
-                        # Standard no-op caller contract: only commit when the
-                        # engine returned a NEW list object with a non-zero count.
-                        if _pruned_n and _pruned_msgs is not messages:
-                            # Do NOT rebuild conversation_history here. The compressor
-                            # atomically rewrites the active transcript with the durable
-                            # rearm threshold, then stamps every returned row with
-                            # _DB_PERSISTED_MARKER, so the marker-based flush dedup (see
-                            # _flush_messages_to_session_db) prevents duplicate writes.
-                            # Calling
-                            # conversation_history_after_compression (a compaction-only
-                            # helper keyed on the _last_compaction_in_place flag) would be
-                            # a no-op at best, and on a stale in-place flag could seed
-                            # this turn's fresh, not-yet-persisted rows into history_ids
-                            # and skip writing them.
-                            messages = _pruned_msgs
-                
-                # Save session log incrementally (so progress is visible even if interrupted)
-                agent._session_messages = messages
-                
-                # Touch activity before continuing so the gateway's
-                # inactivity monitor never sees a stale timestamp
-                # between tool completion and the start of the next
-                # API call.  Without this, a tool-call result (which
-                # takes ~0s to process) followed by slow post-tool
-                # processing (compression, persist) and a slow
-                # follow-up API call can exceed the gateway inactivity
-                # timeout (HERMES_AGENT_TIMEOUT, default 1800s) and the
-                # gateway kills the session before the next activity
-                # touch fires (#69559, #69131).
-                agent._touch_activity(f"tool results posted, continuing iteration #{api_call_count}")
-                # Continue loop for next response
+                post_tool = advance_after_tool_execution(
+                    agent,
+                    assistant_message.tool_calls,
+                    messages,
+                    conversation_history,
+                    system_message=system_message,
+                    active_system_prompt=active_system_prompt,
+                    user_message=user_message,
+                    task_id=effective_task_id,
+                    api_call_count=api_call_count,
+                    compression_attempts=compression_attempts,
+                    max_compression_attempts=max_compression_attempts,
+                    final_response=final_response,
+                    should_skip_handoff=_should_skip_model_call_for_reference_handoff,
+                    handoff_final_response=_HANDOFF_SKIP_FINAL_RESPONSE,
+                )
+                messages = post_tool.messages
+                conversation_history = post_tool.conversation_history
+                active_system_prompt = post_tool.active_system_prompt
+                compression_attempts = post_tool.compression_attempts
+                final_response = post_tool.final_response
+                if post_tool.exit_reason:
+                    _turn_exit_reason = post_tool.exit_reason
+                    break
                 continue
             
             else:
