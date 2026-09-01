@@ -145,50 +145,57 @@ class TestCLIJudgeGate:
     """
 
     def _run(self, monkeypatch, *, goal_mode=True, judge_available=True,
-             verdict="done", reason="", complete_ok=True, summary="done"):
-        import argparse
-        import types
-        from unittest.mock import MagicMock
-        from hermes_cli.kanban import _cmd_complete
+                 verdict="done", reason="", complete_ok=True, summary="done",
+                 metadata=None):
+            import argparse
+            import types
+            from unittest.mock import MagicMock
+            from hermes_cli.kanban import _cmd_complete
 
-        fake_task = types.SimpleNamespace(
-            goal_mode=goal_mode,
-            title="Finish report",
-            body="acceptance: criteria",
-        )
-        fake_conn = MagicMock()
-        complete_calls: list = []
+            fake_task = types.SimpleNamespace(
+                goal_mode=goal_mode,
+                title="Finish report",
+                body="acceptance: criteria",
+            )
+            fake_conn = MagicMock()
+            complete_calls: list = []
 
-        def fake_connect_closing():
-            from contextlib import contextmanager
-            @contextmanager
-            def _cm():
-                yield fake_conn
-            return _cm()
+            def fake_connect_closing():
+                from contextlib import contextmanager
+                @contextmanager
+                def _cm():
+                    yield fake_conn
+                return _cm()
 
-        def fake_complete_task(conn, tid, **kw):
-            complete_calls.append(tid)
-            return complete_ok
+            def fake_complete_task(conn, tid, **kw):
+                complete_calls.append(tid)
+                return complete_ok
 
-        monkeypatch.setattr("hermes_cli.kanban.kb.get_task", lambda conn, tid: fake_task)
-        monkeypatch.setattr("hermes_cli.kanban.kb.complete_task", fake_complete_task)
-        monkeypatch.setattr("hermes_cli.kanban.kb.connect_closing", fake_connect_closing)
-        monkeypatch.setattr("hermes_cli.kanban._worker_run_id_for", lambda _: None)
+            monkeypatch.setattr("hermes_cli.kanban.kb.get_task", lambda conn, tid: fake_task)
+            monkeypatch.setattr("hermes_cli.kanban.kb.complete_task", fake_complete_task)
+            monkeypatch.setattr("hermes_cli.kanban.kb.connect_closing", fake_connect_closing)
+            monkeypatch.setattr("hermes_cli.kanban._worker_run_id_for", lambda _: None)
 
-        _aux_client = (object(), "judge-model") if judge_available else (None, None)
-        monkeypatch.setattr(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            lambda name: _aux_client,
-        )
-        # Match the real judge_goal contract:
-        # (verdict, reason, parse_failed, wait_directive, transport_failed)
-        monkeypatch.setattr(
-            "hermes_cli.goals.judge_goal",
-            lambda **kw: (verdict, reason, False, None, False),
-        )
+            _aux_client = (object(), "judge-model") if judge_available else (None, None)
+            monkeypatch.setattr(
+                "agent.auxiliary_client.get_text_auxiliary_client",
+                lambda name: _aux_client,
+            )
+            # Match the real judge_goal contract:
+            # (verdict, reason, parse_failed, wait_directive, transport_failed)
+            monkeypatch.setattr(
+                "hermes_cli.goals.judge_goal",
+                lambda **kw: (verdict, reason, False, None, False),
+            )
 
-        args = argparse.Namespace(task_ids=["t1"], summary=summary, result=None, metadata=None)
-        return _cmd_complete(args), complete_calls
+            args = argparse.Namespace(
+                task_ids=["t1"],
+                summary=summary,
+                result=None,
+                metadata=metadata,
+                accept_unproven=False,
+            )
+            return _cmd_complete(args), complete_calls
 
     def test_judge_rejects_premature_completion(self, monkeypatch):
         rc, complete_calls = self._run(
@@ -201,7 +208,23 @@ class TestCLIJudgeGate:
 
 
     def test_non_goal_mode_task_skips_gate(self, monkeypatch):
-        """Plain (non-goal_mode) tasks are never sent to the judge."""
-        rc, complete_calls = self._run(monkeypatch, goal_mode=False)
+        """Plain (non-goal_mode) tasks are never sent to the judge.
+
+        Added 2026-08-30: the proof-required gate now also gates non-goal
+        tasks, so this fixture passes a valid --metadata.proof (a card
+        reference that resolves via the fake_get_task hook above).
+        The assertion under test — that the judge is skipped for
+        non-goal tasks — still holds.
+        """
+        import json
+        # Hex-only synthetic id; the proof helper regex is `^t_[0-9a-f]{6,}$`.
+        # Any id matching that pattern resolves through the patched
+        # kb.get_task hook above (which always returns fake_task).
+        metadata_json = json.dumps({"proof": ["t_deadbeefcafe"]})
+        rc, complete_calls = self._run(
+            monkeypatch,
+            goal_mode=False,
+            metadata=metadata_json,
+        )
         assert rc == 0
         assert complete_calls == ["t1"]
