@@ -521,6 +521,8 @@ def from_agent_visible_cache_path(
 def to_agent_visible_cache_path(
     host_path: str,
     container_base: str = "/root/.hermes",
+    *,
+    backend: str | None = None,
 ) -> str:
     """Translate a host cache path to its mounted path inside the sandbox.
 
@@ -546,7 +548,7 @@ def to_agent_visible_cache_path(
     Backend is identified by TERMINAL_ENV (same env var
     tools/terminal_tool.py reads in _get_environment_config).
     """
-    backend = (os.environ.get("TERMINAL_ENV") or "local").strip().lower()
+    backend = (backend or os.environ.get("TERMINAL_ENV") or "local").strip().lower()
     if backend in ("docker", "modal"):
         pass  # /root/.hermes default
     elif backend in ("ssh", "daytona", "vercel_sandbox"):
@@ -599,5 +601,4 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
-
 

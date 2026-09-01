@@ -1,9 +1,10 @@
-"""Behavioral regressions for the terminal config → env bridge.
+"""Behavioral regressions for profile-scoped terminal configuration.
 
 ``terminal_tool._get_env_config()`` reads TERMINAL_* variables.  The bridge
 must let explicitly configured terminal keys override stale launcher/.env
 values while preserving environment values for terminal keys omitted from
-config.yaml.
+config.yaml.  It must never write one Desktop session's profile config into
+the process environment used by another session.
 """
 
 import os
@@ -11,13 +12,16 @@ import os
 import pytest
 
 import tools.terminal_tool as terminal_tool
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 
 
 @pytest.fixture(autouse=True)
 def _reset_bridge_state(monkeypatch):
-    """Each test starts with an un-attempted bridge and clean mapped env."""
-    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+    """Each test starts with clean mapped process environment."""
     for name in (
         "TERMINAL_ENV",
         "TERMINAL_CWD",
@@ -45,7 +49,7 @@ def test_unset_terminal_env_backfills_backend_from_config():
 
     assert config["env_type"] == "docker"
     assert config["docker_image"] == "custom/image:1"
-    assert os.environ["TERMINAL_ENV"] == "docker"
+    assert "TERMINAL_ENV" not in os.environ
 
 
 def test_explicit_config_backend_overrides_stale_env(monkeypatch):
@@ -55,7 +59,7 @@ def test_explicit_config_backend_overrides_stale_env(monkeypatch):
     config = terminal_tool._get_env_config()
 
     assert config["env_type"] == "docker"
-    assert os.environ["TERMINAL_ENV"] == "docker"
+    assert os.environ["TERMINAL_ENV"] == "local"
 
 
 def test_partial_terminal_config_preserves_unrelated_env_values(monkeypatch):
@@ -93,7 +97,7 @@ def test_ssh_config_preserves_remote_tilde_cwd(monkeypatch):
 
     config = terminal_tool._get_env_config()
 
-    assert os.environ["TERMINAL_CWD"] == "~"
+    assert "TERMINAL_CWD" not in os.environ
     assert config["cwd"] == "~"
 
 
@@ -114,27 +118,40 @@ def test_defaults_backfill_when_neither_config_nor_env_selects_backend():
     config = terminal_tool._get_env_config()
 
     assert config["env_type"] == "local"
-    assert os.environ["TERMINAL_ENV"] == "local"
+    assert "TERMINAL_ENV" not in os.environ
 
 
-def test_bridge_only_attempted_once(monkeypatch):
-    calls = []
+def test_profile_contexts_do_not_share_docker_settings(tmp_path):
+    """A Desktop worker must read its own profile, not a prior session's."""
+    home_a = tmp_path / "profiles" / "coder"
+    home_b = tmp_path / "profiles" / "reviewer"
+    (home_a / "config.yaml").parent.mkdir(parents=True)
+    (home_b / "config.yaml").parent.mkdir(parents=True)
+    (home_a / "config.yaml").write_text(
+        "terminal:\n  backend: docker\n  docker_image: coder/image:1\n"
+        "  docker_volumes: ['~/coder:/workspace']\n"
+    )
+    (home_b / "config.yaml").write_text(
+        "terminal:\n  backend: docker\n  docker_image: reviewer/image:2\n"
+        "  docker_volumes: ['~/reviewer:/workspace']\n"
+    )
 
-    import hermes_cli.config as config_mod
+    token_a = set_hermes_home_override(home_a)
+    try:
+        coder = terminal_tool._get_env_config()
+    finally:
+        reset_hermes_home_override(token_a)
+    token_b = set_hermes_home_override(home_b)
+    try:
+        reviewer = terminal_tool._get_env_config()
+    finally:
+        reset_hermes_home_override(token_b)
 
-    real = config_mod.apply_terminal_config_to_env
-
-    def _counting(*args, **kwargs):
-        calls.append(1)
-        return real(*args, **kwargs)
-
-    monkeypatch.setattr(config_mod, "apply_terminal_config_to_env", _counting)
-    _write_config("{}\n")
-
-    terminal_tool._get_env_config()
-    terminal_tool._get_env_config()
-
-    assert len(calls) == 1
+    assert coder["docker_image"] == "coder/image:1"
+    assert coder["docker_volumes"] == ["~/coder:/workspace"]
+    assert reviewer["docker_image"] == "reviewer/image:2"
+    assert reviewer["docker_volumes"] == ["~/reviewer:/workspace"]
+    assert "TERMINAL_DOCKER_IMAGE" not in os.environ
 
 
 def test_bridge_config_failure_does_not_crash(monkeypatch):
