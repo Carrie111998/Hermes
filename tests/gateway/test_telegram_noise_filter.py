@@ -120,6 +120,32 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
         assert _prepare_gateway_status_message(Platform.TELEGRAM, "warn", message) is None
 
 
+def test_telegram_suppresses_anti_growth_compression_refusal():
+    """The automatic anti-growth refusal is a no-op diagnostic (no messages
+    dropped, conversation unchanged) that leaked internal compression
+    mechanics into shared group chats where the agent runs in observe mode
+    (#100171). It must be suppressed like the other automatic statuses."""
+    # Exact wording emitted by conversation_compression._emit_warning.
+    refusal = (
+        "⚠️ Compression refused: the generated summary "
+        "would have GROWN the conversation instead of "
+        "shrinking it. No messages were dropped — "
+        "conversation continues unchanged."
+    )
+    assert _prepare_gateway_status_message(Platform.TELEGRAM, "warn", refusal) is None
+
+
+def test_manual_compress_refusal_feedback_stays_visible():
+    """Manual /compress feedback uses the parenthesized '(summary would
+    grow the conversation): N messages preserved' wording and carries a
+    count — the anti-growth noise anchor must NOT swallow it (#100171)."""
+    feedback = (
+        "Compression refused (summary would grow the conversation): "
+        "30 messages preserved"
+    )
+    assert _prepare_gateway_status_message(Platform.TELEGRAM, "warn", feedback) is not None
+
+
 def test_programmatic_surfaces_keep_raw_status():
     """Programmatic surfaces (local/api/webhook) must keep raw diagnostics.
 

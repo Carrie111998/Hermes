@@ -134,6 +134,15 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|resumed\s+after\s+\d+s\s+idle\s+[—-]\s+compacting"
     r"|preflight\s+compression"
     r"|pre[- ]api\s+compression"
+    # Automatic anti-growth refusal: the summary would have GROWN the
+    # transcript, so nothing was dropped and the conversation continues
+    # unchanged — a no-op diagnostic that must not leak internal
+    # compression mechanics into shared group chats (#100171).  The anchor
+    # "the generated summary would have GROWN" deliberately does NOT match
+    # manual /compress feedback, which reads "Compression refused (summary
+    # would grow the conversation): N messages preserved" (different
+    # wording, parenthesized, carries a count).
+    r"|compression\s+refused[:\s]+the\s+generated\s+summary\s+would\s+have\s+GROWN"
     # Buffered attempt/overflow retry chatter replayed through _emit_status
     # when a turn exhausts retries. The ", retrying"/"— compressing" anchors
     # keep manual /compress feedback ("Compressed: 30 → 12 messages") and
