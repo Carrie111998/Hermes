@@ -1055,6 +1055,23 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     return text
 
 
+_REQUIRED_CHAT_STATUS_RE = re.compile(
+    r"(?:"
+    r"^Compressed(?:\s+with\s+fallback)?\s*:"
+    r"|^Compression\s+aborted:"
+    r"|^No\s+changes\s+from\s+compression:"
+    r"|^⚠\s*Compression\s+(?:aborted|returned\s+an\s+empty\s+transcript)"
+    r"|^⏳\s*Compression\s+(?:already\s+in\s+progress|skipped:\s+could\s+not\s+acquire)"
+    r"|^⚠\s*Context\s+is\s+over\s+the\s+compression\s+threshold"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _gateway_status_requires_delivery(message: str) -> bool:
+    return bool(_REQUIRED_CHAT_STATUS_RE.search(str(message or "").strip()))
+
+
 def render_notice_line(notice) -> str:
     """Render an AgentNotice to a single plaintext line for messaging platforms.
 
@@ -6270,7 +6287,18 @@ class TurnRunner:
         agent.step_callback = ctx._step_callback_sync if ctx._hooks_ref.loaded_hooks else None
         agent.stream_delta_callback = _stream_delta_cb
         agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
-        agent.status_callback = ctx._status_callback_sync
+        def _status_callback(event_type: str, message: str) -> None:
+            if _want_interim_messages or _gateway_status_requires_delivery(message):
+                ctx._status_callback_sync(event_type, message)
+            else:
+                logger.debug(
+                    "status_callback suppressed by interim display policy for %s/%s: %s",
+                    ctx.source.platform.value if ctx.source.platform else "unknown",
+                    event_type,
+                    _redact_gateway_user_facing_secrets(str(message or ""))[:160],
+                )
+
+        agent.status_callback = _status_callback
         # Credits / out-of-band notices (usage bands, depletion, restored).
         # Messaging has no persistent status bar, so each notice is a
         # standalone push: render to a single plaintext line and deliver via

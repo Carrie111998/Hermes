@@ -13,6 +13,7 @@ import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource
+from agent.conversation_compression import CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -815,6 +816,43 @@ class CommentaryAgent:
         }
 
 
+class StatusWarningAgent:
+    def __init__(self, **kwargs):
+        self.status_callback = kwargs.get("status_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        callback = self.status_callback
+        if callback is not None:
+            callback("warn", "Latest Mercury query failed.")
+        time.sleep(0.1)
+        return {
+            "final_response": "Traveloka payment not found.",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class RequiredStatusWarningAgent(StatusWarningAgent):
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        callback = self.status_callback
+        if callback is not None:
+            callback(
+                "warn",
+                CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+                    tokens=85_000,
+                    threshold=72_000,
+                    reason="cooldown:30",
+                ),
+            )
+        time.sleep(0.1)
+        return {
+            "final_response": "Traveloka payment not found.",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class PreviewedResponseAgent:
     def __init__(self, **kwargs):
         self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
@@ -1181,6 +1219,57 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert result.get("already_sent") is not True
     assert adapter.edits == []
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+
+
+@pytest.mark.asyncio
+async def test_disabled_interim_messages_suppress_discord_status_warnings(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StatusWarningAgent,
+        session_id="sess-discord-status-warning",
+        config_data={"display": {"interim_assistant_messages": False}},
+        platform=Platform.DISCORD,
+    )
+
+    assert result["final_response"] == "Traveloka payment not found."
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_enabled_interim_messages_deliver_discord_status_warnings(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        StatusWarningAgent,
+        session_id="sess-discord-status-warning-enabled",
+        config_data={"display": {"interim_assistant_messages": True}},
+        platform=Platform.DISCORD,
+    )
+
+    assert result["final_response"] == "Traveloka payment not found."
+    assert [call["content"] for call in adapter.sent] == ["Latest Mercury query failed."]
+
+
+@pytest.mark.asyncio
+async def test_disabled_interim_messages_keep_required_discord_status_warnings(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        RequiredStatusWarningAgent,
+        session_id="sess-discord-required-status-warning",
+        config_data={"display": {"interim_assistant_messages": False}},
+        platform=Platform.DISCORD,
+    )
+
+    assert result["final_response"] == "Traveloka payment not found."
+    assert [call["content"] for call in adapter.sent] == [
+        CONTEXT_OVERFLOW_BLOCKED_WARNING_TEMPLATE.format(
+            tokens=85_000,
+            threshold=72_000,
+            reason="cooldown:30",
+        )
+    ]
 
 
 class TransformedStreamAgent:
