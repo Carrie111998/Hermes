@@ -691,20 +691,21 @@ Once upstream is healthy, `/platform resume <name>` clears the breaker and re-ar
 
 ### Restart notifications
 
-When the gateway restarts (or is shut down with in-flight sessions), it can send a one-shot "the agent is back" / "the agent was interrupted" message to each platform's home channel. This is controlled per-platform by the `gateway_restart_notification` flag in `gateway-config.yaml`, which defaults to `true`:
+When the gateway restarts (or is shut down with in-flight sessions), it can send a direct completion/interruption message to the chat that initiated `/restart`, plus a generic "Gateway online" announcement to each configured home channel. Both controls default to `true`:
 
 ```yaml
 gateway:
   platforms:
     telegram:
       home_chat_id: "123456789"
-      gateway_restart_notification: false   # opt out for this platform
+      home_channel_startup_notification: false  # suppress only the generic home announcement
+      gateway_restart_notification: true         # still notify a direct /restart requester
     discord:
       home_chat_id: "987654321"
-      # gateway_restart_notification omitted → defaults to true
+      # both notification settings omitted → default to true
 ```
 
-Disable it on noisy or low-priority platforms while leaving it on for your primary chat. The notification is sent once per restart, regardless of how many sessions were in flight.
+Set `home_channel_startup_notification: false` on noisy or low-priority platforms while keeping direct restart completion messages. Set `gateway_restart_notification: false` when you also want to suppress direct restart and shutdown lifecycle messages for that platform. The generic home-channel announcement is sent once per planned restart, regardless of how many sessions were in flight.
 
 ### Typing indicators
 

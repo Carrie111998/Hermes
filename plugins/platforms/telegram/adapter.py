@@ -11267,7 +11267,8 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
         "reply_prefix", "reply_in_thread", "reply_to_mode",
         "unauthorized_dm_behavior", "notice_delivery", "require_mention",
         "channel_skill_bindings", "channel_prompts", "gateway_restart_notification",
-        "allow_from", "allow_admin_from", "dm_policy", "group_policy",
+        "home_channel_startup_notification", "allow_from", "allow_admin_from",
+        "dm_policy", "group_policy",
     }
     for _k, _v in _telegram_extra.items():
         if _k not in _GENERIC_MERGE_KEYS:

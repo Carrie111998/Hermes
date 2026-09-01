@@ -490,20 +490,21 @@ launchd plist 是静态的——如果你在配置网关后安装了新工具（
 
 ### 重启通知
 
-当网关重启（或在有进行中会话时关闭）时，它可以向每个平台的主频道发送一条"agent 已恢复"/"agent 被中断"的一次性消息。这由 `gateway-config.yaml` 中每个平台的 `gateway_restart_notification` 标志控制，默认为 `true`：
+当网关重启（或在有进行中会话时关闭）时，它可以向发起 `/restart` 的聊天发送直接的完成/中断消息，并向每个已配置的主频道发送通用的“Gateway online”公告。两个控制项默认都为 `true`：
 
 ```yaml
 gateway:
   platforms:
     telegram:
       home_chat_id: "123456789"
-      gateway_restart_notification: false   # 为此平台关闭
+      home_channel_startup_notification: false  # 仅关闭通用主频道公告
+      gateway_restart_notification: true         # 仍通知直接发起 /restart 的请求者
     discord:
       home_chat_id: "987654321"
-      # gateway_restart_notification 未设置 → 默认为 true
+      # 两个通知设置均未设置 → 默认为 true
 ```
 
-在嘈杂或低优先级的平台上禁用，同时在主要聊天上保持启用。无论有多少会话正在进行，每次重启只发送一次通知。
+在嘈杂或低优先级平台上设置 `home_channel_startup_notification: false`，同时保留直接重启完成消息。如果还要关闭该平台的直接重启和关闭生命周期消息，请设置 `gateway_restart_notification: false`。通用主频道公告每次计划重启只发送一次，无论有多少会话在运行。
 
 ### 正在输入指示器
 

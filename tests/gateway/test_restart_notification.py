@@ -169,6 +169,23 @@ async def test_sethome_preserves_thread_target_for_same_process_restart(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_home_channel_startup_notification_can_be_suppressed_independently():
+    runner, adapter = make_restart_runner()
+    runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="home-42",
+        name="Ops Home",
+    )
+    runner.config.platforms[Platform.TELEGRAM].home_channel_startup_notification = False
+    adapter.send = AsyncMock()
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == set()
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_send_home_channel_startup_notification_preserves_thread_metadata(
     tmp_path, monkeypatch
 ):
@@ -244,6 +261,28 @@ async def test_relay_fronted_logical_home_gets_startup_notification(tmp_path, mo
 
 
 # ── _send_restart_notification ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_direct_restart_notification_ignores_home_channel_startup_setting(
+    tmp_path, monkeypatch
+):
+    """Suppressing generic home announcements must not mute /restart completion."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    (tmp_path / ".restart_notify.json").write_text(
+        json.dumps({"platform": "telegram", "chat_id": "requester-42"})
+    )
+
+    runner, adapter = make_restart_runner()
+    platform_config = runner.config.platforms[Platform.TELEGRAM]
+    platform_config.gateway_restart_notification = True
+    platform_config.home_channel_startup_notification = False
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="restart"))
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target == ("telegram", "requester-42", None)
+    adapter.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio

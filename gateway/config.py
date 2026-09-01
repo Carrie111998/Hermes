@@ -664,6 +664,14 @@ class PlatformConfig:
     # noise; keep True for back-channels where the operator wants them.
     gateway_restart_notification: bool = True
 
+    # Whether the gateway sends the generic "Gateway online" announcement to
+    # this platform's configured home channel after a planned restart. This is
+    # deliberately separate from gateway_restart_notification so disabling
+    # operator-facing home-channel noise does not suppress the requester-facing
+    # completion message for a direct /restart. Default True preserves prior
+    # behavior.
+    home_channel_startup_notification: bool = True
+
     # Whether the gateway shows a "typing…" / "is thinking…" status indicator
     # while the agent processes a message on this platform. Default True
     # preserves prior behavior. Set False on platforms where the indicator is
@@ -694,6 +702,7 @@ class PlatformConfig:
             "extra": self.extra,
             "reply_to_mode": self.reply_to_mode,
             "gateway_restart_notification": self.gateway_restart_notification,
+            "home_channel_startup_notification": self.home_channel_startup_notification,
             "typing_indicator": self.typing_indicator,
         }
         if self.typing_status_text is not None:
@@ -726,6 +735,12 @@ class PlatformConfig:
         if _grn is None:
             _grn = extra.get("gateway_restart_notification")
 
+        # home_channel_startup_notification follows the same top-level / extra
+        # bridge as gateway_restart_notification.
+        _hcsn = data.get("home_channel_startup_notification")
+        if _hcsn is None:
+            _hcsn = extra.get("home_channel_startup_notification")
+
         # typing_indicator mirrors gateway_restart_notification: it may arrive
         # top-level or bridged into extra by the shared-key loop in
         # load_gateway_config(), so check both.
@@ -753,6 +768,7 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
+            home_channel_startup_notification=_coerce_bool(_hcsn, True),
             typing_indicator=_coerce_bool(_typing, True),
             typing_status_text=_typing_text,
             channel_overrides=channel_overrides,
@@ -1760,6 +1776,8 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = channel_prompts
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
+                if "home_channel_startup_notification" in platform_cfg:
+                    bridged["home_channel_startup_notification"] = platform_cfg["home_channel_startup_notification"]
                 if "typing_indicator" in platform_cfg:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:

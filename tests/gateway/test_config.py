@@ -83,6 +83,12 @@ class TestPlatformConfigRoundtrip:
         restored = PlatformConfig.from_dict(pc.to_dict())
         assert restored.gateway_restart_notification is False
 
+    def test_home_channel_startup_notification_roundtrip_and_default(self):
+        pc = PlatformConfig(enabled=True, home_channel_startup_notification=False)
+        restored = PlatformConfig.from_dict(pc.to_dict())
+
+        assert restored.home_channel_startup_notification is False
+        assert PlatformConfig.from_dict({}).home_channel_startup_notification is True
 
     def test_typing_status_text_resolved_from_extra(self):
         # Same bridge route as typing_indicator: the shared-key loop copies a
@@ -370,6 +376,25 @@ class TestLoadGatewayConfig:
         assert (
             config.platforms[Platform.SLACK].typing_status_text == "chasing yarn…"
         )
+
+    def test_home_channel_startup_notification_from_nested_platforms_block(
+        self, tmp_path, monkeypatch
+    ):
+        """The shared-key bridge preserves the independent home announcement flag."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    enabled: true\n"
+            "    home_channel_startup_notification: false\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.TELEGRAM].home_channel_startup_notification is False
 
     def test_multiplex_profiles_from_nested_gateway_section(self, tmp_path, monkeypatch):
         """``gateway.multiplex_profiles: true`` (the nested form written by
