@@ -21,6 +21,11 @@ vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
       sidebar: {
+        messageCount: (count: number) => `${count} messages`,
+        toolCallCount: (count: number) => `${count} tool calls`,
+        projects: {
+          home: 'Home'
+        },
         row: {
           ageMin: 'm',
           ageNow: 'now',
@@ -31,6 +36,7 @@ vi.mock('@/i18n', () => ({
           needsInput: 'Needs input',
           sessionActions: 'Session actions',
           sessionRunning: 'Running',
+          todoProgress: 'Tasks completed',
           waitingForAnswer: 'Waiting for answer'
         }
       },
@@ -150,16 +156,19 @@ const handoffAvatar = (container: HTMLElement) =>
 
 const noop = vi.fn()
 
-const renderRow = (session: SessionInfo) =>
+const renderRow = (session: SessionInfo, extra?: { card?: boolean }) =>
   render(
     <SidebarSessionRow
+      card={extra?.card}
       isPinned={false}
       isSelected={false}
       onArchive={noop}
       onDelete={noop}
       onPin={noop}
       onResume={noop}
+      onToggleUnread={noop}
       session={session}
+      unread={false}
     />
   )
 
@@ -203,7 +212,9 @@ describe('SidebarSessionRow running arc', () => {
             onDelete={noop}
             onPin={noop}
             onResume={noop}
+            onToggleUnread={noop}
             session={session}
+            unread={false}
           />
         ))}
       </>
@@ -220,6 +231,10 @@ describe('SidebarSessionRow running arc', () => {
 })
 
 describe('SidebarSessionRow', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
   it('keeps an aria-label on the kebab without wrapping it in a Tip', () => {
     render(
       <SidebarSessionRow
@@ -229,7 +244,9 @@ describe('SidebarSessionRow', () => {
         onDelete={noop}
         onPin={noop}
         onResume={noop}
+        onToggleUnread={noop}
         session={makeSession({ title: 'Hermes doctor health check results' })}
+        unread={false}
       />
     )
 
@@ -309,6 +326,17 @@ describe('SidebarSessionRow', () => {
   })
 
   it('exposes the exact session time through a focusable Tip trigger', () => {
+    // Pin the clock before deriving the timestamp.  The assertion below is
+    // about the *composition* of the label (relative age + absolute time),
+    // but "5 minutes ago" only falls on today when the run does not straddle
+    // local midnight.  Between 00:00 and 00:05 the row correctly renders
+    // "Yesterday at 11:5x PM" and this test failed for a day boundary it was
+    // never written to exercise.  Only `Date` is faked, so the component's
+    // own timers (the running arc, the tooltip open delay) keep running for
+    // real.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(2026, 2, 5, 12, 0, 0))
+
     const startedAt = Math.floor(Date.now() / 1000) - 5 * 60
 
     render(
@@ -319,7 +347,9 @@ describe('SidebarSessionRow', () => {
         onDelete={noop}
         onPin={noop}
         onResume={noop}
+        onToggleUnread={noop}
         session={makeSession({ started_at: startedAt, title: 'Timestamped session' })}
+        unread={false}
       />
     )
 
@@ -341,7 +371,9 @@ describe('SidebarSessionRow', () => {
         onDelete={noop}
         onPin={noop}
         onResume={noop}
+        onToggleUnread={noop}
         session={makeSession({ title: 'Local session' })}
+        unread={false}
       />
     )
 
@@ -357,11 +389,13 @@ describe('SidebarSessionRow', () => {
         onDelete={noop}
         onPin={noop}
         onResume={noop}
+        onToggleUnread={noop}
         session={makeSession({
           handoff_platform: 'telegram',
           handoff_state: 'active',
           title: 'Continued from Telegram'
         })}
+        unread={false}
       />
     )
 
@@ -374,5 +408,34 @@ describe('SidebarSessionRow', () => {
     const avatar = handoffAvatar(container)
     expect(avatar).toBeTruthy()
     expect(tipTrigger(avatar as HTMLElement)).toBeTruthy()
+  })
+})
+
+describe('Inbox-style session card', () => {
+  it('gives truncated card lines room for glyph ink instead of clipping them', () => {
+    renderRow(
+      makeSession({
+        cwd: '/Users/tomek/pursuit-support-agent',
+        message_count: 133,
+        model: 'gpt-4.1',
+        title: 'Ruff lint and pytest verification'
+      }),
+      { card: true }
+    )
+
+    const workspace = screen.getByText('pursuit-support-agent')
+    const title = screen.getByText('Ruff lint and pytest verification').parentElement
+    const footer = screen.getByText('GPT-4.1').parentElement
+
+    expect(title).toBeTruthy()
+    expect(footer).toBeTruthy()
+
+    for (const el of [workspace, title!, footer!]) {
+      expect(el.className).not.toMatch(/\bleading-none\b/)
+      expect(el.className).toMatch(/leading-\[1\.35\]/)
+    }
+
+    expect(workspace.className).toMatch(/\btruncate\b/)
+    expect(screen.getByText('133 messages')).toBeTruthy()
   })
 })
