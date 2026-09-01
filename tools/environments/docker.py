@@ -633,13 +633,39 @@ def _critical_egress_env_names(env_overrides: dict[str, str]) -> set[str]:
     return critical
 
 
+_NETWORK_FLAGS = frozenset({"--network", "--net"})
+
+
+def _extra_args_network_mode(extra_args: Optional[list[str]]) -> Optional[str]:
+    """Return the network mode requested by ``docker_extra_args``, if any.
+
+    Recognises ``--network none`` / ``--network=none`` and the ``--net``
+    aliases. Returns ``None`` when the operator set no network flag, else the
+    requested mode (``"none"``, ``"host"``, a named network, ...).
+
+    Docker rejects a repeated ``--network`` outright ("network ... is
+    specified multiple times", exit 125), so the implicit flag added for
+    ``docker_network: false`` and an operator-supplied one can never both be
+    emitted. Callers use this to reconcile the two before building the
+    command line.
+    """
+    args = [a for a in (extra_args or []) if isinstance(a, str)]
+    for i, arg in enumerate(args):
+        for flag in _NETWORK_FLAGS:
+            if arg == flag:
+                return args[i + 1] if i + 1 < len(args) else ""
+            if arg.startswith(f"{flag}="):
+                return arg.split("=", 1)[1]
+    return None
+
+
 def _extra_args_egress_collisions(
     extra_args: list[str], critical_names: set[str],
 ) -> list[str]:
     """Return docker_extra_args entries that can override egress controls."""
     collisions: list[str] = []
     env_flags = {"-e", "--env", "--env-file"}
-    network_flags = {"--network", "--net"}
+    network_flags = _NETWORK_FLAGS
     i = 0
     while i < len(extra_args):
         arg = extra_args[i]
@@ -976,7 +1002,30 @@ class DockerEnvironment(BaseEnvironment):
                     "(requires overlay2 on XFS with pquota). Container will run without disk quota."
                 )
         if not network:
-            resource_args.append("--network=none")
+            extra_network = _extra_args_network_mode(extra_args)
+            if extra_network is None:
+                resource_args.append("--network=none")
+            elif extra_network == "none":
+                # Same intent stated twice. Emit it once — Docker rejects a
+                # repeated --network with exit 125.
+                logger.info(
+                    "Docker: docker_network is false and docker_extra_args "
+                    "also requests --network=none; emitting the flag once."
+                )
+            else:
+                # Contradictory intent. Honouring the extra arg would hand the
+                # agent a networked container despite the configured lockdown,
+                # and the reuse guard (which requires NetworkMode == "none")
+                # would churn that container on every startup. Fail closed and
+                # name both keys rather than silently picking a winner.
+                raise RuntimeError(
+                    f"terminal.docker_network is false (air-gapped) but "
+                    f"terminal.docker_extra_args requests "
+                    f"--network={extra_network!r}. These contradict; Docker "
+                    f"would also reject the duplicate flag (exit 125). Remove "
+                    f"the --network entry from docker_extra_args, or set "
+                    f"docker_network: true to opt into that network."
+                )
 
         # Persistent workspace via bind mounts from a configurable host directory
         # (TERMINAL_SANDBOX_DIR, default ~/.hermes/sandboxes/). Non-persistent
