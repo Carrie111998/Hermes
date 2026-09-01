@@ -38,6 +38,7 @@ test('atomic spawn script: write-lock via stdin pipe parses and executes cleanly
     ],
     { encoding: 'utf8', timeout: 60000 }
   )
+
   assert.match(parseCheck, /PARSE_OK/)
 
   // 2. The lock must be piped into the helper's stdin, not passed as argv
