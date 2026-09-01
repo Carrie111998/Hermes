@@ -33,6 +33,14 @@ class TestBlocksMutationsInSourceRepo:
         assert hit is True
         assert "parser safety limit" in msg
 
+    def test_command_substitution_parser_limit_fails_closed(self, repo):
+        payload = "$(" * 257 + "printf safe" + ")" * 257 + "; git reset --hard"
+
+        hit, msg = _detect(payload, repo, repo)
+
+        assert hit is True
+        assert "parser safety limit" in msg
+
     @pytest.mark.parametrize(
         "sub",
         [

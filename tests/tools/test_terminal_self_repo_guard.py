@@ -91,6 +91,18 @@ class TestSelfRepoGuardWiring:
         assert "parser safety limit" in result["error"]
         env.execute.assert_not_called()
 
+    def test_force_cannot_bypass_command_substitution_limit(
+        self, repo, monkeypatch
+    ):
+        config = _make_env_config(cwd=str(repo))
+        payload = "$(" * 257 + "printf safe" + ")" * 257 + "; git reset --hard"
+
+        result, env = _run(payload, config, monkeypatch, repo, force=True)
+
+        assert result["status"] == "blocked"
+        assert "parser safety limit" in result["error"]
+        env.execute.assert_not_called()
+
     def test_force_cannot_bypass_configured_alias_parser_limit(
         self, repo, monkeypatch
     ):

@@ -744,6 +744,22 @@ def test_excessive_parameter_expansion_nesting_fails_closed(
     assert list(_iter_shell_command_starts(command)) == []
 
 
+def test_excessive_command_substitution_nesting_fails_closed(
+    clean_session, monkeypatch
+):
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    command = "$(" * 257 + "printf safe" + ")" * 257
+
+    assert detect_hardline_command(command) == (
+        True,
+        "command parser limit exceeded",
+    )
+    result = check_all_command_guards(command, "local")
+    assert result["approved"] is False
+    assert result.get("hardline") is True
+    assert list(_iter_shell_command_starts(command)) == []
+
+
 def test_valid_quoted_grep_passes_yolo_and_approvals_off_guards(
     clean_session, monkeypatch
 ):
