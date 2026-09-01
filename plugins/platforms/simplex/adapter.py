@@ -20,11 +20,10 @@ Required environment variables:
                                (default: ws://127.0.0.1:5225)
 
 Optional environment variables:
-    SIMPLEX_ALLOWED_USERS      Comma-separated allowlist. Each entry may be
-                               either a numeric contactId (stable across
-                               renames; visible via `/contacts` in the CLI)
-                               or a contact display name (what the SimpleX
-                               UI shows). Both forms are accepted.
+    SIMPLEX_ALLOWED_USERS      Comma-separated numeric contactId allowlist
+                               (stable across renames; visible via
+                               `/contacts` in the CLI). Display names are
+                               deliberately not authorization identities.
     SIMPLEX_ALLOW_ALL_USERS    Set 'true' to allow all contacts
     SIMPLEX_AUTO_ACCEPT        Set 'false' to disable contact-request auto-accept
                                (default: 'true')
@@ -818,7 +817,10 @@ class SimplexAdapter(BasePlatformAdapter):
             # XFTP-backed files can arrive before the download completes.
             # Accept exactly once from rcvFileDescrReady; accepting here can
             # race the descriptor and leave the transfer parked indefinitely.
-            if file_id is not None and file_status_type != "rcvComplete":
+            if file_id is not None and (
+                not file_path
+                or file_status_type not in (None, "rcvComplete")
+            ):
                 logger.info(
                     "SimpleX: file %d pending descriptor/completion",
                     file_id,
@@ -1211,24 +1213,30 @@ class SimplexAdapter(BasePlatformAdapter):
 
         delivered_ids: List[str] = []
         if content:
-            queue = list(self.truncate_message(content, MAX_MESSAGE_LENGTH))
-            first = True
+            initial_chunks = list(self.truncate_message(content, MAX_MESSAGE_LENGTH))
+            queue = [
+                (chunk, index == 0)
+                for index, chunk in enumerate(initial_chunks)
+            ]
             while queue:
-                chunk = queue.pop(0)
+                chunk, carries_reply = queue.pop(0)
                 result = await self._send_composed(
                     chat_id,
                     {"type": "text", "text": chunk},
-                    reply_to=reply_to if first else None,
+                    reply_to=reply_to if carries_reply else None,
                 )
-                first = False
                 if (
                     not result.success
                     and result.error_kind == "too_long"
                     and len(chunk) > 512
                 ):
-                    queue = self.truncate_message(
+                    retry_chunks = self.truncate_message(
                         chunk, max(256, len(chunk) // 2)
-                    ) + queue
+                    )
+                    queue = [
+                        (retry_chunk, carries_reply and index == 0)
+                        for index, retry_chunk in enumerate(retry_chunks)
+                    ] + queue
                     continue
                 if not result.success:
                     result.message_id = delivered_ids[-1] if delivered_ids else None
@@ -1338,18 +1346,21 @@ class SimplexAdapter(BasePlatformAdapter):
         ImageMagick ``convert``.
         """
         import subprocess
-        import tempfile
-
         p = Path(file_path)
         png_path = file_path
         thumb_uri = ""
+
+        def _temp_path(suffix: str) -> str:
+            fd, path = tempfile.mkstemp(prefix="hermes-simplex-", suffix=suffix)
+            os.close(fd)
+            return path
 
         try:
             from PIL import Image
 
             img = Image.open(file_path)
             if p.suffix.lower() not in (".png", ".jpg", ".jpeg"):
-                png_path = str(p.with_suffix(".png"))
+                png_path = _temp_path(".png")
                 img.save(png_path, "PNG")
             thumb = img.copy()
             thumb.thumbnail((128, 128))
@@ -1364,7 +1375,7 @@ class SimplexAdapter(BasePlatformAdapter):
         except ImportError:
             try:
                 if p.suffix.lower() not in (".png", ".jpg", ".jpeg"):
-                    png_path = str(p.with_suffix(".png"))
+                    png_path = _temp_path(".png")
                     subprocess.run(
                         ["convert", file_path, png_path],
                         check=True,
@@ -1460,7 +1471,13 @@ class SimplexAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send a video file via SimpleX (as a file attachment)."""
-        return await self.send_document(chat_id, video_path, caption=caption)
+        return await self.send_document(
+            chat_id,
+            video_path,
+            caption=caption,
+            reply_to=reply_to,
+            **kwargs,
+        )
 
     async def send_document(
         self,
@@ -1468,6 +1485,7 @@ class SimplexAdapter(BasePlatformAdapter):
         file_path: str,
         caption: Optional[str] = None,
         filename: Optional[str] = None,
+        reply_to: Optional[str] = None,
         **kwargs,
     ) -> SendResult:
         """Send a document/file attachment."""
@@ -1477,7 +1495,7 @@ class SimplexAdapter(BasePlatformAdapter):
         return await self._send_composed(
             chat_id,
             {"type": "file", "text": caption or ""},
-            reply_to=kwargs.get("reply_to"),
+            reply_to=reply_to,
             file_source=file_path,
         )
 
@@ -2076,7 +2094,10 @@ def interactive_setup() -> None:
             save_env_value(var, value)
 
     _prompt("SIMPLEX_WS_URL", "Daemon WebSocket URL (default ws://127.0.0.1:5225)")
-    _prompt("SIMPLEX_ALLOWED_USERS", "Allowed contactIds or display names (comma-separated; blank=skip)")
+    _prompt(
+        "SIMPLEX_ALLOWED_USERS",
+        "Allowed numeric contactIds (comma-separated; blank=skip)",
+    )
     _prompt(
         "SIMPLEX_GROUP_ALLOWED",
         "Allowed group IDs (comma-separated, or '*' for any; blank=disable groups)",
@@ -2122,8 +2143,8 @@ def register(ctx) -> None:
             "You are chatting via SimpleX Chat, a private decentralised "
             "messenger. Contacts are identified by opaque internal IDs, "
             "not phone numbers or usernames. SimpleX supports standard "
-            "markdown formatting. There is no typing indicator and no "
-            "hard message length limit, but keep responses conversational. "
+            "markdown formatting. There is no typing indicator; long "
+            "messages are split safely by the adapter. "
             "You can attach native images, voice notes, and arbitrary "
             "files; the adapter handles MEDIA:<path> tags by sending them "
             "as inline voice notes (audio extensions) or documents."

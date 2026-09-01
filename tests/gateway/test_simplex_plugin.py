@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -29,6 +31,21 @@ _guess_extension = _simplex._guess_extension
 _is_image_ext = _simplex._is_image_ext
 _is_audio_ext = _simplex._is_audio_ext
 _CORR_PREFIX = _simplex._CORR_PREFIX
+
+
+def _send_ack(item_id: int = 101) -> dict:
+    return {
+        "type": "newChatItems",
+        "chatItems": [
+            {
+                "chatInfo": {"type": "direct"},
+                "chatItem": {
+                    "meta": {"itemId": item_id},
+                    "chatDir": {"type": "directSnd"},
+                },
+            }
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -148,19 +165,18 @@ async def test_send_dm():
     cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
     adapter = SimplexAdapter(cfg)
 
-    mock_ws = AsyncMock()
-    adapter._ws = mock_ws
+    adapter._send_command = AsyncMock(return_value=_send_ack())
 
     result = await adapter.send("contact-42", "Hello, SimpleX!")
-    mock_ws.send.assert_called_once()
-    payload = json.loads(mock_ws.send.call_args[0][0])
-    assert payload["cmd"].startswith("/_send @contact-42 json ")
-    msg_content = json.loads(payload["cmd"].split(" json ", 1)[1])[0][
+    adapter._send_command.assert_awaited_once()
+    command = adapter._send_command.await_args.args[0]
+    assert command.startswith("/_send @contact-42 json ")
+    msg_content = json.loads(command.split(" json ", 1)[1])[0][
         "msgContent"
     ]
     assert msg_content == {"type": "text", "text": "Hello, SimpleX!"}
-    assert payload["corrId"].startswith(_CORR_PREFIX)
     assert result.success is True
+    assert result.message_id == "101"
 
 
 
@@ -178,13 +194,12 @@ async def test_send_group():
     cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
     adapter = SimplexAdapter(cfg)
 
-    mock_ws = AsyncMock()
-    adapter._ws = mock_ws
+    adapter._send_command = AsyncMock(return_value=_send_ack())
 
     result = await adapter.send("group:grp-99", "Hello, group!")
-    payload = json.loads(mock_ws.send.call_args[0][0])
-    assert payload["cmd"].startswith("/_send #grp-99 json ")
-    msg_content = json.loads(payload["cmd"].split(" json ", 1)[1])[0][
+    command = adapter._send_command.await_args.args[0]
+    assert command.startswith("/_send #grp-99 json ")
+    msg_content = json.loads(command.split(" json ", 1)[1])[0][
         "msgContent"
     ]
     assert msg_content == {"type": "text", "text": "Hello, group!"}
@@ -230,8 +245,8 @@ async def test_list_channels_contacts_and_groups():
     adapter._send_command = fake_send_command
     channels = await adapter.list_channels()
 
-    assert {"id": "alice", "name": "alice", "type": "dm"} in channels
-    assert {"id": "bob", "name": "bob", "type": "dm"} in channels
+    assert {"id": "1", "name": "alice", "type": "dm"} in channels
+    assert {"id": "2", "name": "bob", "type": "dm"} in channels
     assert {"id": "group:7", "name": "friends", "type": "group"} in channels
     assert {"id": "group:9", "name": "work", "type": "group"} in channels
 
@@ -264,11 +279,10 @@ async def test_send_short_content_single_send():
     cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
     adapter = SimplexAdapter(cfg)
 
-    mock_ws = AsyncMock()
-    adapter._ws = mock_ws
+    adapter._send_command = AsyncMock(return_value=_send_ack())
 
     result = await adapter.send("contact-42", "short message")
-    mock_ws.send.assert_called_once()
+    adapter._send_command.assert_awaited_once()
     assert result.success is True
 
 
@@ -280,8 +294,14 @@ async def test_send_long_content_chunks_into_ordered_sends():
     cfg = PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
     adapter = SimplexAdapter(cfg)
 
-    mock_ws = AsyncMock()
-    adapter._ws = mock_ws
+    counter = 0
+
+    async def send_command(_command, timeout=30.0):
+        nonlocal counter
+        counter += 1
+        return _send_ack(counter)
+
+    adapter._send_command = AsyncMock(side_effect=send_command)
 
     max_len = _simplex.MAX_MESSAGE_LENGTH
     # Plain text (no code fences) longer than the limit -> several chunks.
@@ -290,15 +310,15 @@ async def test_send_long_content_chunks_into_ordered_sends():
 
     result = await adapter.send("contact-42", long_text)
     assert result.success is True
-    assert mock_ws.send.call_count > 1
+    assert adapter._send_command.await_count > 1
 
-    total = mock_ws.send.call_count
+    total = adapter._send_command.await_count
     bodies = []
-    for i, call in enumerate(mock_ws.send.call_args_list):
-        payload = json.loads(call[0][0])
+    for i, call in enumerate(adapter._send_command.await_args_list):
+        command = call.args[0]
         # Every chunk is addressed to the same contact, in order.
-        assert payload["cmd"].startswith("/_send @contact-42 json ")
-        chunk = json.loads(payload["cmd"].split(" json ", 1)[1])[0][
+        assert command.startswith("/_send @contact-42 json ")
+        chunk = json.loads(command.split(" json ", 1)[1])[0][
             "msgContent"
         ]["text"]
         # Each chunk body must respect the per-message limit.
@@ -389,6 +409,10 @@ async def test_standalone_send_defaults_to_local_daemon(monkeypatch):
         async def send(self, payload):
             sent_payloads.append(json.loads(payload))
 
+        async def recv(self):
+            corr_id = sent_payloads[-1]["corrId"]
+            return json.dumps({"corrId": corr_id, "resp": _send_ack()})
+
     def fake_connect(url, **kwargs):
         assert url == "ws://127.0.0.1:5225"
         assert kwargs["open_timeout"] == 10
@@ -399,7 +423,12 @@ async def test_standalone_send_defaults_to_local_daemon(monkeypatch):
     monkeypatch.setattr(websockets, "connect", fake_connect)
 
     result = await _standalone_send(pconfig, "contact-42", "hi")
-    assert result == {"success": True, "platform": "simplex", "chat_id": "contact-42"}
+    assert result == {
+        "success": True,
+        "platform": "simplex",
+        "chat_id": "contact-42",
+        "message_id": "101",
+    }
     assert sent_payloads[0]["cmd"].startswith("/_send @contact-42 json ")
     msg_content = json.loads(
         sent_payloads[0]["cmd"].split(" json ", 1)[1]
@@ -608,3 +637,400 @@ async def test_handle_event_new_chat_items_nested_elements():
     assert batches[0].text == "first\nsecond"
     for task in adapter._pending_text_batch_tasks.values():
         task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Correlated commands, lifecycle, transfers, edits, and reactions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_send_command_correlates_response_and_cleans_state():
+    from gateway.config import PlatformConfig
+
+    class RecordingWs:
+        def __init__(self):
+            self.payloads = []
+
+        async def send(self, payload):
+            self.payloads.append(json.loads(payload))
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    ws = RecordingWs()
+    adapter._ws = ws
+    adapter._ws_ready.set()
+
+    pending = asyncio.create_task(adapter._send_command("/contacts", timeout=1))
+    await asyncio.sleep(0)
+    corr_id = ws.payloads[0]["corrId"]
+    response = {"type": "contacts", "contacts": []}
+    await adapter._handle_event({"corrId": corr_id, "resp": response})
+
+    assert await pending == response
+    assert corr_id not in adapter._pending_responses
+    assert corr_id not in adapter._pending_corr_ids
+
+
+@pytest.mark.asyncio
+async def test_large_message_retry_preserves_reply_on_first_retry_only():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    calls = []
+
+    async def reply(command, timeout=30.0):
+        calls.append(command)
+        if len(calls) == 1:
+            return {
+                "type": "chatCmdError",
+                "chatError": {"type": "error", "errorType": "largeMsg"},
+            }
+        return _send_ack(100 + len(calls))
+
+    adapter._send_command = AsyncMock(side_effect=reply)
+    text = "x" * 1200
+    result = await adapter.send("42", text, reply_to="77")
+
+    assert result.success is True
+    assert len(calls) >= 3
+    retry_payloads = [json.loads(command.split(" json ", 1)[1])[0] for command in calls]
+    assert retry_payloads[0]["quotedItemId"] == 77
+    assert retry_payloads[1]["quotedItemId"] == 77
+    assert all("quotedItemId" not in item for item in retry_payloads[2:])
+    retried_text = "".join(
+        re.sub(r" \(\d+/\d+\)$", "", item["msgContent"]["text"])
+        for item in retry_payloads[1:]
+    )
+    assert retried_text == text
+
+
+@pytest.mark.asyncio
+async def test_contact_request_acceptance_uses_protocol_command():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._send_command = AsyncMock(return_value={"type": "contactRequestAccepted"})
+
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "receivedContactRequest",
+                "contactRequest": {"contactRequestId": 19},
+            }
+        }
+    )
+    await asyncio.gather(*adapter._command_tasks)
+
+    adapter._send_command.assert_awaited_once_with("/_accept 19", timeout=30.0)
+
+
+@pytest.mark.asyncio
+async def test_inbound_edit_keeps_item_id_and_bypasses_text_batch():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    wrapper = _make_direct_text_wrapper("corrected")
+    wrapper["chatItem"]["meta"]["itemId"] = 505
+    await adapter._handle_event(
+        {"resp": {"type": "chatItemUpdated", "chatItem": wrapper}}
+    )
+
+    assert len(captured) == 1
+    assert captured[0].message_id == "505"
+    assert captured[0].source.message_id == "505"
+    assert captured[0].metadata == {"is_edit": True}
+    assert adapter._pending_text_batches == {}
+
+
+def test_group_text_batches_are_scoped_by_sender():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    first = MagicMock()
+    first.source.platform.value = "simplex"
+    first.source.chat_id = "group:7"
+    first.source.user_id = "member-1"
+    second = MagicMock()
+    second.source.platform.value = "simplex"
+    second.source.chat_id = "group:7"
+    second.source.user_id = "member-2"
+
+    assert adapter._text_batch_key(first) != adapter._text_batch_key(second)
+
+
+@pytest.mark.asyncio
+async def test_file_descriptor_acceptance_and_completion_dispatch(tmp_path):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.base import MessageType
+
+    receive_dir = tmp_path / "incoming"
+    receive_dir.mkdir()
+    adapter = SimplexAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "ws_url": "ws://localhost:5225",
+                "files_folder": str(receive_dir),
+            },
+        )
+    )
+    adapter._receive_file = AsyncMock()
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    wrapper = _make_file_chat_item("", "../../report.pdf")
+    wrapper["chatItem"]["file"].pop("fileSource")
+    wrapper["chatItem"]["file"]["fileStatus"] = {"type": "rcvInvitation"}
+
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "rcvFileDescrReady",
+                "rcvFileTransfer": {"fileId": 7, "fileName": "../../report.pdf"},
+                "chatItem": wrapper,
+            }
+        }
+    )
+    await asyncio.gather(*adapter._command_tasks)
+    target = Path(adapter._receive_file.await_args.args[1])
+    assert adapter._receive_file.await_args.args[0] == 7
+    assert target.parent == receive_dir
+    assert ".." not in target.name
+
+    completed = receive_dir / "report.pdf"
+    completed.write_bytes(b"%PDF-1.7\n")
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "rcvFileComplete",
+                "chatItem": {
+                    "chatItem": {
+                        "file": {
+                            "fileId": 7,
+                            "fileSource": {"filePath": "report.pdf"},
+                        }
+                    }
+                },
+            }
+        }
+    )
+
+    assert len(captured) == 1
+    assert captured[0].message_type == MessageType.DOCUMENT
+    assert captured[0].media_urls == [str(completed)]
+    assert adapter._pending_file_transfers == {}
+
+
+@pytest.mark.asyncio
+async def test_receive_file_enables_approved_relays():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._send_command = AsyncMock(return_value={"type": "rcvFileAccepted"})
+
+    await adapter._receive_file(9, "/tmp/safe-name.pdf")
+
+    adapter._send_command.assert_awaited_once_with(
+        "/freceive 9 approved_relays=on /tmp/safe-name.pdf",
+        timeout=30.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_media_send_uses_structured_file_source_and_reply(tmp_path):
+    from gateway.config import PlatformConfig
+
+    document = tmp_path / "evidence.txt"
+    document.write_text("proof")
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._send_command = AsyncMock(return_value=_send_ack(601))
+
+    result = await adapter.send_document(
+        "42", str(document), caption="attached", reply_to="55"
+    )
+    command = adapter._send_command.await_args.args[0]
+    composed = json.loads(command.split(" json ", 1)[1])[0]
+
+    assert result.success is True
+    assert result.message_id == "601"
+    assert composed["fileSource"] == {"filePath": str(document)}
+    assert composed["quotedItemId"] == 55
+    assert composed["msgContent"] == {"type": "file", "text": "attached"}
+
+
+@pytest.mark.asyncio
+async def test_streaming_edit_and_final_overflow_lifecycle():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._send_command = AsyncMock(return_value={"type": "chatItemUpdated"})
+
+    interim = await adapter.edit_message("42", "700", "working", finalize=False)
+    assert interim.success is True
+    assert " 700 live=on json " in adapter._send_command.await_args.args[0]
+
+    adapter._send_composed = AsyncMock(
+        side_effect=[
+            _simplex.SendResult(success=True, message_id="701"),
+            _simplex.SendResult(success=True, message_id="702"),
+        ]
+    )
+    final_text = "a" * (_simplex.MAX_MESSAGE_LENGTH * 2 + 100)
+    final = await adapter.edit_message("42", "700", final_text, finalize=True)
+
+    final_command = adapter._send_command.await_args.args[0]
+    assert " live=on" not in final_command
+    assert adapter._send_composed.await_count == 2
+    assert final.message_id == "702"
+    assert final.continuation_message_ids == ("701", "702")
+
+
+@pytest.mark.asyncio
+async def test_delete_and_error_diagnostics_are_truthful():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._send_command = AsyncMock(
+        return_value={
+            "type": "chatCmdError",
+            "chatError": {"type": "error", "errorType": "notFound"},
+        }
+    )
+
+    assert await adapter.delete_message("42", "99") is False
+    diagnostics = adapter.get_runtime_diagnostics()
+    assert diagnostics["command_errors"] == 1
+    assert diagnostics["ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_reaction_hook_and_direct_approval_resolution(monkeypatch):
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter.send = AsyncMock(
+        return_value=_simplex.SendResult(success=True, message_id="800")
+    )
+    spawned = []
+
+    def close_background(coroutine):
+        spawned.append(coroutine)
+        coroutine.close()
+        return MagicMock()
+
+    adapter._spawn_command_task = close_background
+    hook_events = []
+
+    async def reaction_hook(event):
+        hook_events.append(event)
+
+    adapter._reaction_handler = reaction_hook
+    import tools.approval as approval
+
+    resolved = []
+    monkeypatch.setattr(
+        approval,
+        "resolve_gateway_approval",
+        lambda session_key, choice: resolved.append((session_key, choice)) or 1,
+    )
+
+    await adapter.send_exec_approval("42", "rm harmless", "session-1")
+    reaction = {
+        "type": "chatItemReaction",
+        "added": True,
+        "reaction": {
+            "chatInfo": {
+                "type": "direct",
+                "contact": {"contactId": 42, "localDisplayName": "operator"},
+            },
+            "chatReaction": {
+                "chatDir": {"type": "directRcv"},
+                "chatItem": {"meta": {"itemId": 800}},
+                "reaction": {"type": "emoji", "emoji": "✅"},
+            },
+        },
+    }
+    await adapter._handle_event({"resp": reaction})
+
+    assert resolved == [("session-1", "once")]
+    assert hook_events[0]["event_name"] == "reaction:added"
+    assert hook_events[0]["item_id"] == "800"
+    assert adapter._approval_prompts_by_item == {}
+
+
+@pytest.mark.asyncio
+async def test_connect_waits_for_real_socket_and_disconnect_clears_state(monkeypatch):
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"ws_url": "ws://localhost:5225", "connect_timeout": 0.5},
+        )
+    )
+    listener_stop = asyncio.Event()
+
+    async def fake_listener():
+        adapter._ws = AsyncMock()
+        adapter._ws_ready.set()
+        await listener_stop.wait()
+
+    monkeypatch.setattr(adapter, "_ws_listener", fake_listener)
+    assert await adapter.connect() is True
+    assert adapter.get_runtime_diagnostics()["ready"] is True
+
+    pending = asyncio.get_running_loop().create_future()
+    adapter._pending_responses["corr"] = pending
+    adapter._approval_prompts_by_item["1"] = {"session_key": "s"}
+    await adapter.disconnect()
+
+    assert isinstance(pending.exception(), ConnectionError)
+    assert adapter.get_runtime_diagnostics()["ready"] is False
+    assert adapter._approval_prompts_by_item == {}
+
+
+def test_prepare_image_uses_temp_output_without_overwriting_peer_file(tmp_path):
+    from PIL import Image
+
+    source = tmp_path / "picture.webp"
+    existing = tmp_path / "picture.png"
+    Image.new("RGB", (4, 4), color="red").save(source, "WEBP")
+    existing.write_bytes(b"preserve-me")
+
+    converted, thumbnail = SimplexAdapter._prepare_image(str(source))
+    try:
+        assert Path(converted) != existing
+        assert Path(converted).is_file()
+        assert existing.read_bytes() == b"preserve-me"
+        assert thumbnail.startswith("data:image/jpg;base64,")
+    finally:
+        Path(converted).unlink(missing_ok=True)
