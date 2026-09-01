@@ -35,6 +35,7 @@ interface ChatZSubmitDeps {
   activeProfile: string
   createDesktopSession: (cwd: string) => Promise<{ runtimeSessionId: string; storedSessionId: string } | null>
   getSelectedStoredSessionId: () => null | string
+  prepareExistingDesktopSession: (storedSessionId: string) => Promise<string>
   requestGateway: (method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<unknown>
   submitText: (
     text: string,
@@ -50,7 +51,15 @@ export async function submitChatZRequest(
   request: ChatZSubmitRequest,
   deps: ChatZSubmitDeps
 ): Promise<ChatZSubmitReceipt> {
-  const { activeProfile, createDesktopSession, getSelectedStoredSessionId, requestGateway, submitText } = deps
+  const {
+    activeProfile,
+    createDesktopSession,
+    getSelectedStoredSessionId,
+    prepareExistingDesktopSession,
+    requestGateway,
+    submitText
+  } = deps
+
   const requestId = typeof request?.requestId === 'string' ? request.requestId : ''
   const text = typeof request?.text === 'string' ? request.text.trim() : ''
   const profile = normalizeProfileKey(request?.profile)
@@ -157,7 +166,9 @@ export async function submitChatZRequest(
   }
 
   try {
-    if (!(await submitText(text, { attachments: [], fromQueue: true, storedSessionId }))) {
+    const runtimeSessionId = await prepareExistingDesktopSession(storedSessionId)
+
+    if (!(await submitText(text, { attachments: [], fromQueue: true, sessionId: runtimeSessionId, storedSessionId }))) {
       return errorReceipt(requestId, 'submit-rejected', 'Desktop did not accept the prompt')
     }
   } catch (error) {

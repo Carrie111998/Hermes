@@ -16,6 +16,7 @@ function deps() {
     activeProfile: 'default',
     createDesktopSession: vi.fn(async () => ({ runtimeSessionId: 'runtime-1', storedSessionId: 'stored-1' })),
     getSelectedStoredSessionId: vi.fn(() => null),
+    prepareExistingDesktopSession: vi.fn(async () => 'runtime-existing'),
     requestGateway: vi.fn(async () => ({})),
     submitText: vi.fn(async () => true)
   }
@@ -59,6 +60,7 @@ describe('submitChatZRequest', () => {
     expect(d.submitText).toHaveBeenCalledWith('Do the work', {
       attachments: [],
       fromQueue: true,
+      sessionId: 'runtime-existing',
       storedSessionId: 'stored-2'
     })
     expect(receipt).toMatchObject({ status: 'accepted', storedSessionId: 'stored-2', title: 'Receiver' })

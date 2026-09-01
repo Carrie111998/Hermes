@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 
 import { submitChatZRequest } from '@/store/chat-z'
+import { sessionTileDelegate } from '@/store/session-states'
 import { isAuxiliaryWindow } from '@/store/windows'
 
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
@@ -48,6 +49,15 @@ export function useChatZBridge({
               activeProfile: activeProfileRef.current,
               createDesktopSession: createDesktopSessionRef.current,
               getSelectedStoredSessionId: getSelectedStoredSessionIdRef.current,
+              prepareExistingDesktopSession: async storedSessionId => {
+                const delegate = sessionTileDelegate()
+
+                if (!delegate) {
+                  throw new Error('Desktop session bridge is not ready')
+                }
+
+                return delegate.resumeTile(storedSessionId, { refreshTranscript: true })
+              },
               requestGateway: requestGatewayRef.current,
               submitText: submitTextRef.current
             })
