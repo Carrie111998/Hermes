@@ -60,6 +60,9 @@ type BotsMessages = {
     botsAndGroups: string
     botsOnly: string
     groupsOnly: string
+    /** View toggle in the filter menu: one foldable section per gateway (on)
+     *  or one flat list with a gateway chip on each row (off). */
+    groupByGateway: string
     /** The activity filter's four options, in menu order. */
     anyActivity: string
     activeNow: string
@@ -269,6 +272,7 @@ const en: BotsMessages = {
     botsAndGroups: 'Bots and group chats',
     botsOnly: 'Bots only',
     groupsOnly: 'Group chats only',
+    groupByGateway: 'Group by gateway',
     anyActivity: 'Any activity',
     activeNow: 'Active now',
     recentlyActive: 'Recently active',
@@ -464,6 +468,7 @@ const ja: BotsMessages = {
     botsAndGroups: 'ボットとグループチャット',
     botsOnly: 'ボットのみ',
     groupsOnly: 'グループチャットのみ',
+    groupByGateway: 'ゲートウェイごとにグループ化',
     anyActivity: 'すべてのアクティビティ',
     activeNow: '現在アクティブ',
     recentlyActive: '最近アクティブ',
@@ -658,6 +663,7 @@ const zh: BotsMessages = {
     botsAndGroups: '机器人和群聊',
     botsOnly: '仅机器人',
     groupsOnly: '仅群聊',
+    groupByGateway: '按网关分组',
     anyActivity: '任何活动',
     activeNow: '正在活动',
     recentlyActive: '最近活跃',
@@ -851,6 +857,7 @@ const zhHant: BotsMessages = {
     botsAndGroups: '機器人和群組聊天',
     botsOnly: '僅機器人',
     groupsOnly: '僅群組聊天',
+    groupByGateway: '依閘道器分組',
     anyActivity: '任何活動',
     activeNow: '目前活躍',
     recentlyActive: '最近活躍',

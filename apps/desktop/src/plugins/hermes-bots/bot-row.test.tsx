@@ -58,8 +58,8 @@ vi.mock('./roster-actions', () => ({ openRosterBot }))
 
 const noop = () => undefined
 
-function renderRow(bot: RosterRow) {
-  render(<BotRow bot={bot} onDelete={noop} onEdit={noop} onGroup={noop} />)
+function renderRow(bot: RosterRow, props: { showGateway?: boolean } = {}) {
+  render(<BotRow bot={bot} onDelete={noop} onEdit={noop} onGroup={noop} {...props} />)
 
   return screen.getByRole('button')
 }
@@ -173,5 +173,58 @@ describe('context-menu mutations hydrate the alias first', () => {
 
     expect(route.profile).toBe('worker')
     expect(params).toMatchObject({ name: 'backend-worker', ui_meta: { 'hermes-bots': { pinned: false } } })
+  })
+})
+
+describe('the gateway chip only appears when the pane asks for it', () => {
+  it('names the gateway on the row when the roster is a flat multi-gateway list', () => {
+    const row = renderRow(
+      {
+        connectionId: 'work',
+        connectionKind: 'ssh',
+        connectionLabel: 'Work',
+        name: 'research',
+        remoteSource: true,
+        sourceScoped: true
+      } as RosterRow,
+      { showGateway: true }
+    )
+
+    const chip = row.querySelector('[data-slot="badge"]')
+
+    expect(chip?.textContent).toBe('Work')
+    expect(chip?.querySelector('[data-connection-kind="ssh"]')).not.toBeNull()
+  })
+
+  it('stays off a grouped or single-gateway roster, where the heading already says it', () => {
+    const row = renderRow({
+      connectionId: 'work',
+      connectionLabel: 'Work',
+      name: 'research',
+      remoteSource: true,
+      sourceScoped: true
+    } as RosterRow)
+
+    expect(row.querySelector('[data-slot="badge"]')).toBeNull()
+    expect(row.textContent).not.toContain('Work')
+  })
+
+  it('flags an unreachable gateway on the chip, in words as well as tone', () => {
+    const row = renderRow(
+      {
+        connectionId: 'work',
+        connectionLabel: 'Work',
+        name: 'research',
+        remoteSource: true,
+        sourceReachable: false,
+        sourceScoped: true
+      } as RosterRow,
+      { showGateway: true }
+    )
+
+    const chip = row.querySelector('[data-slot="badge"]')
+
+    expect(chip?.className).toContain('amber')
+    expect(chip?.textContent).toContain('Unavailable')
   })
 })

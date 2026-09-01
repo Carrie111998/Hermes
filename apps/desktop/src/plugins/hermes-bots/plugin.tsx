@@ -59,7 +59,7 @@ import { annotateOrphanedGroupChatMembers } from './hygiene'
 import { BOTS_LOCALES } from './i18n'
 import { displayName } from './labels'
 import { startBotRelay, stopBotRelay } from './relay'
-import { $activityToasts } from './roster-actions'
+import { $activityToasts, $rosterGroupedByGateway } from './roster-actions'
 import {
   botChatOwnsWorkspace,
   BotsPane,
@@ -213,6 +213,20 @@ export default {
         .catch(() => undefined)
     } catch {
       /* no storage — default (silent) stays */
+    }
+
+    // Hydrate the group-by-gateway roster pref (default ON).
+    try {
+      // @ts-expect-error TODO(bot-mode-types): PluginStorage.get requires a fallback argument.
+      Promise.resolve(ctx.storage?.get?.('roster-group-by-gateway'))
+        .then(value => {
+          if (typeof value === 'boolean') {
+            $rosterGroupedByGateway.set(value)
+          }
+        })
+        .catch(() => undefined)
+    } catch {
+      /* no storage — default (grouped) stays */
     }
 
     // Hydrate persisted group-chat room logs (epoch/running are runtime-only

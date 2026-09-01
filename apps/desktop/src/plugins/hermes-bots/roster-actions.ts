@@ -43,6 +43,24 @@ export function setActivityToasts(enabled: boolean) {
   }
 }
 
+/** User pref: bucket the roster under one foldable heading per gateway
+ *  (default ON — the shape a multi-gateway roster has always had). OFF lists
+ *  every bot in one flat, activity-sorted list and each row carries a
+ *  gateway chip instead. Presentation only: it never filters a row out.
+ *  Persisted via ctx.storage. */
+export const $rosterGroupedByGateway = atom(true)
+
+/** Flip the group-by-gateway pref and persist it. */
+export function setRosterGroupedByGateway(enabled: boolean) {
+  $rosterGroupedByGateway.set(enabled)
+
+  try {
+    Promise.resolve(getPluginCtx()?.storage?.set?.('roster-group-by-gateway', enabled)).catch(() => undefined)
+  } catch {
+    /* storage unavailable — pref holds for this window only */
+  }
+}
+
 /** Detect new inbound activity from a fresh roster: last_active moved past
  *  the watermark for a bot whose chat isn't on screen -> unread + toast.
  *  Watermarks follow botActivitySession (canonical Bot Chat included) —

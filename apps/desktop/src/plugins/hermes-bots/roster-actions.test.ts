@@ -211,3 +211,21 @@ describe('the toast preference', () => {
     expect($activityToasts.get()).toBe(false)
   })
 })
+
+describe('the group-by-gateway preference', () => {
+  it('defaults to grouped and persists through the plugin storage without throwing', async () => {
+    const { $rosterGroupedByGateway, setRosterGroupedByGateway } = await loadActions()
+
+    expect($rosterGroupedByGateway.get()).toBe(true)
+
+    setRosterGroupedByGateway(false)
+    expect($rosterGroupedByGateway.get()).toBe(false)
+    expect(storageMock.set).toHaveBeenCalledWith('roster-group-by-gateway', false)
+
+    storageMock.set.mockImplementation(() => {
+      throw new Error('storage unavailable')
+    })
+    expect(() => setRosterGroupedByGateway(true)).not.toThrow()
+    expect($rosterGroupedByGateway.get()).toBe(true)
+  })
+})

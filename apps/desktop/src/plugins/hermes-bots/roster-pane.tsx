@@ -63,7 +63,13 @@ import { $groupMainTabsRev, shouldRenderGroupChatInPane } from './group-panes'
 import { $showHiddenBots, isBotHidden, isBotPinned } from './hidden-bots'
 import { useBots } from './i18n'
 import { deleteBot, mergeServerMeta, pullServerAvatars } from './profile-ops'
-import { $activityToasts, setActivityToasts, trackInboundActivity } from './roster-actions'
+import {
+  $activityToasts,
+  $rosterGroupedByGateway,
+  setActivityToasts,
+  setRosterGroupedByGateway,
+  trackInboundActivity
+} from './roster-actions'
 import {
   botNeedsHandleLabel,
   filterBotsByGateway,
@@ -259,6 +265,7 @@ export function BotsPane() {
   const [collapsedRosterSections, setCollapsedRosterSections] = useState<Set<string>>(() => new Set())
   const hiddenSectionRef = useRef<null | HTMLDivElement>(null)
   const activityToasts = useValue($activityToasts)
+  const groupedByGateway = useValue($rosterGroupedByGateway)
   const groupChatName = useValue($groupChatWorkspace)
   // Main-tab ownership is a module Map; this rev subscription makes the
   // shouldRenderGroupChatInPane gate below reactive to tab open/close
@@ -405,8 +412,12 @@ export function BotsPane() {
 
   const rosterRows = sortRosterRows([...botRows, ...groupRows])
   const sortedGroupRows = sortRosterRows(groupRows)
-  const gatewaySections = rosterGatewaySections(botRows, gatewayOptions, gatewayFilter)
+  const gatewaySections = rosterGatewaySections(botRows, gatewayOptions, gatewayFilter, groupedByGateway)
   const showGatewaySections = gatewaySections.sectioned && botRows.length > 0
+  // Flat multi-gateway list: the heading no longer says which gateway a row
+  // belongs to, so each row carries a gateway chip instead. A filtered view
+  // already names the gateway in the picker; a single gateway needs no label.
+  const showGatewayChips = !groupedByGateway && gatewayFilter === 'all' && gatewayOptions.length > 1
 
   const activeFilterCount =
     (rowKindFilter === 'all' ? 0 : 1) + (activityFilter === 'all' ? 0 : 1) + (gatewayFilter === 'all' ? 0 : 1)
@@ -438,7 +449,8 @@ export function BotsPane() {
       bot
     })),
     gatewayOptions,
-    gatewayFilter
+    gatewayFilter,
+    groupedByGateway
   )
 
   const toggleRosterSection = (id: string): void => {
@@ -533,6 +545,7 @@ export function BotsPane() {
       onDelete={setDeleting}
       onEdit={setEditing}
       onGroup={setGrouping}
+      showGateway={showGatewayChips}
       showHandle={botNeedsHandleLabel(bot, roster, allMeta)}
     />
   )
@@ -737,6 +750,17 @@ export function BotsPane() {
                       )
                     })
                   : []}
+                {gatewayOptions.length > 1 ? <DropdownMenuSeparator /> : null}
+                {gatewayOptions.length > 1 ? (
+                  // A view preference, not a filter: it never hides a row, so it
+                  // neither counts toward the active-filter badge nor resets
+                  // with "Clear filters".
+                  <DropdownMenuItem onSelect={() => setRosterGroupedByGateway(!groupedByGateway)}>
+                    <Codicon className="mr-1.5" name="group-by-ref-type" />
+                    <span className="min-w-0 flex-1">{b.roster.groupByGateway}</span>
+                    {groupedByGateway ? <Codicon name="check" /> : null}
+                  </DropdownMenuItem>
+                ) : null}
                 {activeFilterCount ? <DropdownMenuSeparator /> : null}
                 {activeFilterCount ? (
                   <DropdownMenuItem

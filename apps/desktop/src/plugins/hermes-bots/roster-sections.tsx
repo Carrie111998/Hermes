@@ -127,15 +127,21 @@ export function rosterGatewayOptions(sources: GatewaySource[], roster: RosterRow
   )
 }
 
+/** Bucket bot rows under one section per gateway. Sectioning only happens
+ *  when it can tell rows apart: the filter is "all gateways", more than one
+ *  gateway is known, and the user has not switched the roster to a flat list
+ *  (`grouped`). Otherwise every row comes back in a single unlabeled
+ *  section, in the order it was given. */
 export function rosterGatewaySections<TRow extends RosterGatewayRow>(
   botRows: TRow[],
   gatewayOptions: RosterGatewayOption[],
-  gatewayFilter = 'all'
+  gatewayFilter = 'all',
+  grouped = true
 ): { sectioned: boolean; sections: RosterGatewaySection<TRow>[] } {
   const rows = Array.isArray(botRows) ? botRows : []
   const options = Array.isArray(gatewayOptions) ? gatewayOptions : []
 
-  if (gatewayFilter !== 'all' || options.length <= 1) {
+  if (!grouped || gatewayFilter !== 'all' || options.length <= 1) {
     return {
       sectioned: false,
       sections: [
