@@ -354,9 +354,10 @@ class TestResolveAnthropicToken:
 
 
     def test_pool_resolution_is_read_only(self, monkeypatch, tmp_path):
-        """The resolver must enumerate the pool read-only — clear_expired and
-        refresh must both be False so a bare resolve never writes auth.json or
-        triggers a network refresh from diagnostic call sites (#50108 MED)."""
+        """Diagnostic pool resolution must enumerate read-only — clear_expired
+        and refresh must both be False so a bare resolve never writes auth.json
+        or triggers a network refresh (#50108 MED). Runtime init uses
+        ``refresh_expired=True`` instead (#100339)."""
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
@@ -373,8 +374,11 @@ class TestResolveAnthropicToken:
         pool = SimpleNamespace(_available_entries=_available_entries)
         monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
 
-        assert resolve_anthropic_token() == "pool-oauth-token"
+        from agent.anthropic_credentials import _resolve_anthropic_pool_token
+
+        assert _resolve_anthropic_pool_token() == "pool-oauth-token"
         assert captured == {"clear_expired": False, "refresh": False}
+        assert resolve_anthropic_token() == "pool-oauth-token"
 
     def test_prefers_refreshable_claude_code_credentials_over_static_anthropic_token(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)

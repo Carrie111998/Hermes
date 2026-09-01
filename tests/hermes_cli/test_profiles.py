@@ -192,6 +192,42 @@ class TestCreateProfile:
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
 
+    def test_clone_all_does_not_fork_single_use_oauth(self, profile_env):
+        """--clone-all must not copy Anthropic OAuth refresh tokens (#100339)."""
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "config.yaml").write_text("model:\n  provider: anthropic\n")
+        (default_home / ".anthropic_oauth.json").write_text(
+            json.dumps({"accessToken": "sk-ant-oat01-src", "refreshToken": "rt-src"})
+        )
+        (default_home / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [{
+                    "id": "pkce-1",
+                    "auth_type": "oauth",
+                    "source": "hermes_pkce",
+                    "access_token": "sk-ant-oat01-src",
+                    "refresh_token": "rt-src",
+                    "expires_at_ms": 9_999_999_999,
+                }],
+                "openrouter": [{
+                    "id": "or-1",
+                    "auth_type": "api_key",
+                    "source": "manual",
+                    "access_token": "sk-or-static",
+                }],
+            },
+        }))
+
+        profile_dir = create_profile("coder", clone_all=True, no_alias=True)
+
+        assert not (profile_dir / ".anthropic_oauth.json").exists()
+        cloned = json.loads((profile_dir / "auth.json").read_text())
+        assert "anthropic" not in cloned.get("credential_pool", {})
+        assert cloned["credential_pool"]["openrouter"][0]["access_token"] == "sk-or-static"
+
+
 
 
 

@@ -104,6 +104,116 @@ def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):
     assert read_credential_pool("anthropic") == []
 
 
+def test_stale_cloned_anthropic_oauth_defers_to_fresher_global(profile_env):
+    """A cloned single-use OAuth row must not shadow a newer root rotation.
+
+    Profile copies of credential_pool.anthropic used to win unconditionally,
+    so after one profile rotated the grant, every sibling kept the spent
+    refresh token (#100339).
+    """
+    from hermes_cli.auth import read_credential_pool
+
+    shared_id = "pkce-1"
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "anthropic": [{
+            "id": shared_id,
+            "label": "root",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "hermes_pkce",
+            "access_token": "sk-ant-oat01-fresh",
+            "refresh_token": "rt-fresh",
+            "expires_at_ms": 9_000,
+        }],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "anthropic": [{
+            "id": shared_id,
+            "label": "stale-clone",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "hermes_pkce",
+            "access_token": "sk-ant-oat01-stale",
+            "refresh_token": "rt-stale",
+            "expires_at_ms": 1_000,
+        }],
+    }))
+
+    rows = read_credential_pool("anthropic")
+    assert len(rows) == 1
+    assert rows[0]["access_token"] == "sk-ant-oat01-fresh"
+    assert rows[0]["refresh_token"] == "rt-fresh"
+
+
+def test_independent_profile_oauth_is_not_replaced_by_global(profile_env):
+    """A profile that authenticated itself must keep its own grant."""
+    from hermes_cli.auth import read_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "anthropic": [{
+            "id": "root-pkce",
+            "auth_type": "oauth",
+            "access_token": "sk-ant-oat01-root",
+            "refresh_token": "rt-root",
+            "expires_at_ms": 9_000,
+        }],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "anthropic": [{
+            "id": "profile-pkce",
+            "auth_type": "oauth",
+            "access_token": "sk-ant-oat01-profile",
+            "refresh_token": "rt-profile",
+            "expires_at_ms": 1_000,
+        }],
+    }))
+
+    rows = read_credential_pool("anthropic")
+    assert [row["id"] for row in rows] == ["profile-pkce"]
+    assert rows[0]["access_token"] == "sk-ant-oat01-profile"
+
+
+def test_load_pool_does_not_clone_global_anthropic_oauth_into_profile(
+    profile_env, monkeypatch
+):
+    """First load_pool() in a named profile must not persist a local shadow copy."""
+    from agent.credential_pool import load_pool
+
+    monkeypatch.setattr(
+        "hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.read_claude_code_credentials", lambda: None
+    )
+
+    expires_at = int(time.time() * 1000) + 3_600_000
+    (profile_env["global"] / ".anthropic_oauth.json").write_text(json.dumps({
+        "accessToken": "sk-ant-oat01-root",
+        "refreshToken": "rt-root",
+        "expiresAt": expires_at,
+    }))
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "anthropic": [{
+            "id": "pkce-1",
+            "label": "root",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "hermes_pkce",
+            "access_token": "sk-ant-oat01-root",
+            "refresh_token": "rt-root",
+            "expires_at_ms": expires_at,
+        }],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+
+    pool = load_pool("anthropic")
+    assert any(entry.access_token == "sk-ant-oat01-root" for entry in pool._entries)
+
+    profile_store = json.loads((profile_env["profile"] / "auth.json").read_text())
+    local_pool = profile_store.get("credential_pool") or {}
+    assert not local_pool.get("anthropic")
+
+
 # ---------------------------------------------------------------------------
 # read_credential_pool — whole-pool reads (provider_id=None)
 # ---------------------------------------------------------------------------

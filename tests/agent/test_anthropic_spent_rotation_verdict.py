@@ -136,6 +136,26 @@ def _add_independent_pool_entry(home):
     path.write_text(json.dumps(store), encoding="utf-8")
 
 
+def _add_expired_pool_owned_entry(home):
+    """Persist an expired Anthropic OAuth row whose refresh token the pool owns."""
+    path = home / "auth.json"
+    store = json.loads(path.read_text(encoding="utf-8"))
+    pool = store.setdefault("credential_pool", {})
+    pool.setdefault("anthropic", []).append(
+        {
+            "id": "anthropic-pool-owned",
+            "label": "profile oauth",
+            "auth_type": AUTH_TYPE_OAUTH,
+            "priority": 0,
+            "source": "manual:hermes_pkce",
+            "access_token": _STALE_ACCESS,
+            "refresh_token": _STALE_REFRESH,
+            "expires_at_ms": _EXPIRED_MS,
+        }
+    )
+    path.write_text(json.dumps(store), encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # The registry itself
 # ---------------------------------------------------------------------------
@@ -252,6 +272,32 @@ def test_successful_commit_leaves_the_credential_usable(
 
     assert AA.resolve_anthropic_token() == _ROTATED_ACCESS
     assert AA._SPENT_ROTATION_FINGERPRINTS == {}
+
+
+def test_resolve_refreshes_expired_pool_owned_oauth_entry(hermes_home, monkeypatch):
+    """Agent init must refresh an expired pool row before API-call recovery exists."""
+    _add_expired_pool_owned_entry(hermes_home)
+    monkeypatch.setattr(AA, "read_claude_code_credentials", lambda: None)
+    monkeypatch.setattr(AA, "refresh_anthropic_oauth_pure", _rotating_refresh)
+
+    assert AA.resolve_anthropic_token() == _ROTATED_ACCESS
+
+    pool = load_pool("anthropic")
+    refreshed = next(e for e in pool._entries if e.id == "anthropic-pool-owned")
+    assert refreshed.access_token == _ROTATED_ACCESS
+    assert refreshed.refresh_token == _ROTATED_REFRESH
+
+
+def test_pool_resolver_keeps_read_only_mode_for_diagnostics(hermes_home, monkeypatch):
+    """Bare pool resolution must not spend a refresh token unless requested."""
+    _add_expired_pool_owned_entry(hermes_home)
+
+    def _fail_refresh(*_args, **_kwargs):
+        raise AssertionError("read-only resolution must not refresh")
+
+    monkeypatch.setattr(AA, "refresh_anthropic_oauth_pure", _fail_refresh)
+
+    assert AA._resolve_anthropic_pool_token() == _STALE_ACCESS
 
 
 # ---------------------------------------------------------------------------

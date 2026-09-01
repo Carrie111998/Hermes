@@ -427,3 +427,56 @@ def test_manual_hermes_pkce_refresh_does_not_create_duplicate_singleton(
     assert matching[0].source == "manual:hermes_pkce"
     assert matching[0].refresh_token == "manual-rt-1"
 
+
+def test_anthropic_pool_refresh_writes_through_to_global_root(
+    profile_and_root, monkeypatch
+):
+    """A cloned Anthropic pool row must write the rotated pair back to root.
+
+    Otherwise siblings that still hold the pre-rotation refresh token die
+    with invalid_grant / refresh_token_reused (#100339).
+    """
+    profile_path, root_path = profile_and_root
+    shared = {
+        "id": "pkce-1",
+        "label": "shared",
+        "auth_type": AUTH_TYPE_OAUTH,
+        "priority": 0,
+        "source": "hermes_pkce",
+        "access_token": "sk-ant-oat01-old",
+        "refresh_token": "rt-old",
+        "expires_at_ms": 1_000,
+    }
+    _write_store(
+        root_path,
+        {"version": 1, "providers": {}, "credential_pool": {"anthropic": [shared]}},
+    )
+    _write_store(
+        profile_path,
+        {"version": 1, "providers": {}, "credential_pool": {"anthropic": [dict(shared)]}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.read_claude_code_credentials", lambda: None
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
+        lambda refresh_token, use_json=False: {
+            "access_token": "sk-ant-oat01-new",
+            "refresh_token": "rt-new",
+            "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+        },
+    )
+
+    entry = PooledCredential.from_dict("anthropic", shared)
+    pool = CredentialPool("anthropic", [entry])
+    updated = pool._refresh_entry(entry, force=True)
+    assert updated is not None
+    assert updated.refresh_token == "rt-new"
+
+    root_pool = _read_store(root_path)["credential_pool"]["anthropic"]
+    assert root_pool[0]["refresh_token"] == "rt-new"
+    assert root_pool[0]["access_token"] == "sk-ant-oat01-new"
+
