@@ -1067,6 +1067,77 @@ class TestChatCompletionsEndpoint:
         assert '"completed": false' in body
         assert '"partial": false' in body
 
+    @pytest.mark.asyncio
+    async def test_stream_preserves_interrupt_text_when_result_is_not_interrupted(self, adapter):
+        sentinel = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}2.0s elapsed)."
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            kwargs["stream_delta_callback"](sentinel)
+            return (
+                {
+                    "final_response": sentinel,
+                    "completed": True,
+                    "interrupted": False,
+                    "partial": False,
+                    "messages": [{"role": "assistant", "content": sentinel}],
+                },
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert response.status == 200
+                body = await response.text()
+
+        assert sentinel in body
+
+    @pytest.mark.asyncio
+    async def test_stream_hides_split_interrupt_sentinel_when_interrupted(self, adapter):
+        sentinel = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}2.0s elapsed)."
+        split = len(INTERRUPT_WAITING_FOR_MODEL_PREFIX) + 1
+        app = _create_app(adapter)
+
+        async def _mock_run_agent(**kwargs):
+            callback = kwargs["stream_delta_callback"]
+            callback(sentinel[:split])
+            callback(sentinel[split:])
+            return (
+                {
+                    "final_response": sentinel,
+                    "completed": False,
+                    "interrupted": True,
+                    "partial": False,
+                    "messages": [{"role": "assistant", "content": sentinel}],
+                },
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+                assert response.status == 200
+                body = await response.text()
+
+        assert sentinel not in body
+        assert sentinel[:split] not in body
+        assert sentinel[split:] not in body
+
 
     @pytest.mark.asyncio
     async def test_chat_completions_stream_passes_request_model_provider_options(self, adapter):

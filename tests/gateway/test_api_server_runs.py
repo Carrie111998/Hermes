@@ -454,6 +454,85 @@ class TestRunEvents:
         assert sentinel not in body
         assert '"interrupted": true' in body
 
+    @pytest.mark.asyncio
+    async def test_events_stream_preserves_interrupt_text_when_not_interrupted(self, adapter):
+        app = _create_runs_app(adapter)
+        sentinel = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}2.0s elapsed)."
+        callback_ready = threading.Event()
+        release_agent = threading.Event()
+
+        def _create_with_delta(**kwargs):
+            kwargs["stream_delta_callback"](sentinel)
+            callback_ready.set()
+            release_agent.wait(timeout=3)
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": sentinel,
+                "completed": True,
+                "interrupted": False,
+                "partial": False,
+            }
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_with_delta):
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                data = await response.json()
+                assert await asyncio.to_thread(callback_ready.wait, 1)
+                release_task = asyncio.create_task(asyncio.to_thread(release_agent.set))
+                events_response = await cli.get(f"/v1/runs/{data['run_id']}/events")
+                await release_task
+                body = await events_response.text()
+
+        assert events_response.status == 200
+        assert "message.delta" in body
+        assert sentinel in body
+
+    @pytest.mark.asyncio
+    async def test_events_stream_hides_split_interrupt_sentinel_delta(self, adapter):
+        app = _create_runs_app(adapter)
+        sentinel = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}2.0s elapsed)."
+        split = len(INTERRUPT_WAITING_FOR_MODEL_PREFIX) + 1
+        callback_ready = threading.Event()
+        release_agent = threading.Event()
+
+        def _create_with_delta(**kwargs):
+            callback = kwargs["stream_delta_callback"]
+            callback(sentinel[:split])
+            callback(sentinel[split:])
+            callback_ready.set()
+            release_agent.wait(timeout=3)
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {
+                "final_response": sentinel,
+                "completed": False,
+                "interrupted": True,
+                "partial": False,
+            }
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            return mock_agent
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent", side_effect=_create_with_delta):
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                data = await response.json()
+                assert await asyncio.to_thread(callback_ready.wait, 1)
+                release_task = asyncio.create_task(asyncio.to_thread(release_agent.set))
+                events_response = await cli.get(f"/v1/runs/{data['run_id']}/events")
+                await release_task
+                body = await events_response.text()
+
+        assert events_response.status == 200
+        assert "message.delta" not in body
+        assert sentinel[:split] not in body
+        assert sentinel[split:] not in body
+        assert '"interrupted": true' in body
+
 
     @pytest.mark.asyncio
     async def test_approval_resolve_all_is_scoped_to_target_run(self, auth_adapter):

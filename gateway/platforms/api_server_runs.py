@@ -425,6 +425,7 @@ async def _handle_runs(
     _api_interrupt_status = _api_server._api_interrupt_status
     _api_final_response_text = _api_server._api_final_response_text
     _is_api_interrupt_text = _api_server._is_api_interrupt_text
+    _is_api_interrupt_text_prefix = _api_server._is_api_interrupt_text_prefix
 
     # Long-term memory scope header (see chat_completions for details).
     gateway_session_key, key_err = self._parse_session_key_header(request)
@@ -642,10 +643,9 @@ async def _handle_runs(
         if self._run_streams.get(run_id) is q:
             q.put_nowait(event)
 
-    # Also wire stream_delta_callback so message.delta events flow through.
-    def _text_cb(delta: Optional[str]) -> None:
-        if delta is None or _is_api_interrupt_text(delta):
-            return
+    pending_interrupt_text = ""
+
+    def _put_text_delta(delta: str) -> None:
         if run_id not in self._run_streams:
             return
         try:
@@ -657,6 +657,21 @@ async def _handle_runs(
             })
         except Exception:
             pass
+
+    # Also wire stream_delta_callback so message.delta events flow through.
+    def _text_cb(delta: Optional[str]) -> None:
+        nonlocal pending_interrupt_text
+        if delta is None or not isinstance(delta, str):
+            return
+        candidate = pending_interrupt_text + delta
+        if _is_api_interrupt_text_prefix(candidate):
+            pending_interrupt_text = candidate
+            return
+        if pending_interrupt_text:
+            buffered = pending_interrupt_text
+            pending_interrupt_text = ""
+            _put_text_delta(buffered)
+        _put_text_delta(delta)
 
     initial_status = self._set_run_status(
         run_id,
@@ -718,6 +733,7 @@ async def _handle_runs(
     )
 
     async def _run_and_close():
+        nonlocal pending_interrupt_text
         try:
             self._set_run_status(run_id, "running")
             if run_id in self._stopping_run_ids:
@@ -922,6 +938,16 @@ async def _handle_runs(
                 completed, interrupted, partial = (
                     _api_interrupt_status(result) if isinstance(result, dict) else (True, False, False)
                 )
+                if pending_interrupt_text:
+                    buffered = pending_interrupt_text
+                    pending_interrupt_text = ""
+                    if not (interrupted and _is_api_interrupt_text(buffered)):
+                        _put_event_if_active({
+                            "event": "message.delta",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "delta": buffered,
+                        })
                 # Undelivered steer text (accepted after the final response;
                 # see turn_finalizer) rides on the terminal event/status so
                 # the client can replay it as the next user turn.

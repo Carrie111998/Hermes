@@ -1225,6 +1225,23 @@ def _is_api_interrupt_text(text: Any) -> bool:
     return re.fullmatch(r"\d+(?:\.\d+)?s elapsed\)\.", suffix) is not None
 
 
+def _is_api_interrupt_text_prefix(text: Any) -> bool:
+    """Match a complete sentinel or a prefix split across stream deltas."""
+    if not isinstance(text, str):
+        return False
+    value = text.strip()
+    if not value.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX):
+        return False
+    suffix = value[len(INTERRUPT_WAITING_FOR_MODEL_PREFIX):]
+    return (
+        re.fullmatch(
+            r"\d+(?:\.\d*)?(?:s(?: e(?:lapsed(?:\)\.?)?)?)?)?", suffix
+        )
+        is not None
+        or suffix == ""
+    )
+
+
 def _is_api_interrupt_history_message(message: Dict[str, Any]) -> bool:
     """Return true only for a pure assistant interrupt row.
 
@@ -5681,22 +5698,32 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(_sse_frame(role_chunk))
             last_activity = time.monotonic()
 
-            # Helper — route a queue item to the correct SSE event.
-            async def _emit(item):
-                """Write a single queue item to the SSE stream.
+            # Hold text that could be the internal interrupt sentinel until the
+            # result metadata is available. The sentinel may arrive split across
+            # several deltas, and normal completion must preserve literal text.
+            pending_interrupt_text = ""
 
-                Plain strings are sent as normal ``delta.content`` chunks.
-                Tagged tuples ``("__tool_progress__", payload)`` are sent
-                as a custom ``event: hermes.tool.progress`` SSE event so
-                frontends can display them without storing the markers in
-                conversation history.  See #6972 for the original event,
-                #16588 for the ``toolCallId``/``status`` lifecycle fields.
-                """
+            # Helper — route a queue item to the correct SSE event.
+            async def _emit(item, *, force=False):
+                """Write one queue item, deferring ambiguous interrupt text."""
+                nonlocal pending_interrupt_text
+                if isinstance(item, str) and not force:
+                    candidate = pending_interrupt_text + item
+                    if _is_api_interrupt_text_prefix(candidate):
+                        pending_interrupt_text = candidate
+                        return time.monotonic()
+                    if pending_interrupt_text:
+                        buffered = pending_interrupt_text
+                        pending_interrupt_text = ""
+                        await _emit(buffered, force=True)
+                        return await _emit(item)
+                elif pending_interrupt_text:
+                    buffered = pending_interrupt_text
+                    pending_interrupt_text = ""
+                    await _emit(buffered, force=True)
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
                 else:
-                    if isinstance(item, str) and _is_api_interrupt_text(item):
-                        return time.monotonic()
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -5763,6 +5790,14 @@ class APIServerAdapter(BasePlatformAdapter):
             if agent_error is not None:
                 is_failed = True
                 err_msg = err_msg or str(agent_error)
+
+            # Resolve any text held because it could be a split sentinel only
+            # after the result envelope tells us whether the turn interrupted.
+            if pending_interrupt_text:
+                buffered = pending_interrupt_text
+                pending_interrupt_text = ""
+                if not (interrupted and _is_api_interrupt_text(buffered)):
+                    last_activity = await _emit(buffered, force=True)
 
             # Decide finish_reason, matching the non-streaming logic: "length"
             # for truncation, "error" for failure, "stop" for normal completion.
