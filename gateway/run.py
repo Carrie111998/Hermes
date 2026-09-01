@@ -8469,7 +8469,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # ``GatewayRunner.__new__`` fixtures. An explicit profile still
             # fails closed; only an unprofiled source on a runner that has
             # never been initialized may use the legacy defaults.
-            if source.profile or hasattr(self, "config"):
+            if source.profile:
                 raise RuntimeError(
                     "no gateway config registered for session source profile "
                     f"{source.profile!r}"
@@ -23142,7 +23142,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not canonical_cmd:
             return None
         config = self._session_config_for_source(source)
-        if config is None:
+        if config is None and source.profile:
             logger.warning(
                 "Slash command /%s denied: no config registered for profile %r",
                 canonical_cmd,
