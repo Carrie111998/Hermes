@@ -13670,10 +13670,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         empty session, a session whose last message is any other role, or a
         session whose last assistant message has no ``tool_calls``.
         """
-        with self._lock:
-            conn = self._conn
-            if conn is None:
-                return False
+        with self._read_ctx() as conn:
             cursor = conn.execute(
                 "SELECT role, tool_calls FROM messages "
                 "WHERE session_id = ? AND active = 1 "
