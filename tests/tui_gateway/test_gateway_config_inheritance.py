@@ -14,6 +14,7 @@ of one file, only some of them applying the rules.
 """
 
 import textwrap
+import threading
 from pathlib import Path
 
 import pytest
@@ -94,3 +95,50 @@ def test_inheriting_profile_does_not_fall_back_to_the_silent_default(
     monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
 
     assert server._resolve_model() == "claude-opus-5"
+
+
+def test_concurrent_profile_reads_keep_their_own_inherited_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent cache update must not redirect another profile's inheritance."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tui_gateway import server
+
+    profiles: dict[str, Path] = {}
+    for name in ("A", "B"):
+        root = tmp_path / name
+        profile = root / "profiles" / "bot"
+        profile.mkdir(parents=True)
+        (root / "config.yaml").write_text(f"model:\n  default: model-{name}\n")
+        (profile / "config.yaml").write_text("inherit: true\n")
+        profiles[name] = profile
+
+    monkeypatch.setattr(server, "_cfg_cache", None, raising=False)
+    monkeypatch.setattr(server, "_cfg_mtime", None, raising=False)
+    monkeypatch.setattr(server, "_cfg_path", None, raising=False)
+
+    barrier = threading.Barrier(2)
+    apply_managed = server._apply_managed
+
+    def synchronize_after_raw_read(cfg: dict) -> dict:
+        barrier.wait(timeout=5)
+        return apply_managed(cfg)
+
+    monkeypatch.setattr(server, "_apply_managed", synchronize_after_raw_read)
+    results: dict[str, str] = {}
+
+    def load(name: str) -> None:
+        token = set_hermes_home_override(profiles[name])
+        try:
+            results[name] = server._load_cfg()["model"]["default"]
+        finally:
+            reset_hermes_home_override(token)
+
+    threads = [threading.Thread(target=load, args=(name,)) for name in profiles]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert results == {"A": "model-A", "B": "model-B"}
