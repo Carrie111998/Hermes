@@ -11,13 +11,19 @@ and the provider falls back to its single configured ``default_model``. The
 user sees ONE model and cannot tell that apart from an endpoint that genuinely
 serves one — inference itself keeps working, because that path mints correctly.
 
+The same gap existed in the ``hermes model`` setup flow
+(``_model_flow_named_custom``), which builds its own ``Authorization: Bearer``
+header from the same incomplete resolution — same bug class, sibling path.
+
 These tests pin:
 
 * a ``key_cmd`` entry probes with the minted token, so the full catalog shows;
 * the cache fingerprint is keyed on the COMMAND, not the minted token (which
   rotates every refresh — keying on it would re-probe on every open);
 * a broken/interactive helper degrades to the pre-existing empty-key behaviour
-  rather than taking the whole picker down.
+  rather than taking the whole picker down;
+* a minted token is NEVER persisted back into ``config.yaml`` — it would be
+  stale within the hour and would shadow the ``key_cmd`` meant to re-mint it.
 """
 
 from __future__ import annotations
@@ -183,3 +189,54 @@ class TestCacheFingerprintStability:
         assert (row(first)[0].get("models") or []) == (
             row(second)[0].get("models") or []
         )
+
+
+class TestMintedTokenIsNeverPersisted:
+    """A key_cmd token must not be written back into config.yaml.
+
+    ``_model_flow_named_custom`` computes the value to persist from the
+    STATICALLY configured credential. Resolving key_cmd into ``api_key`` before
+    that call would persist a short-lived bearer, which is stale within the
+    hour and shadows the key_cmd that exists to re-mint it.
+    """
+
+    def test_key_cmd_provider_persists_no_credential(self):
+        from hermes_cli.main import _custom_provider_api_key_config_value
+
+        assert _custom_provider_api_key_config_value(
+            {"key_cmd": "printf 'tok-secret'"}, ""
+        ) == ""
+
+    def test_static_key_still_persists(self):
+        from hermes_cli.main import _custom_provider_api_key_config_value
+
+        assert _custom_provider_api_key_config_value(
+            {"api_key": "sk-static"}, "sk-static"
+        ) == "sk-static"
+
+    def test_key_env_persists_as_reference(self):
+        """key_env persists as ${VAR}, never the resolved secret."""
+        from hermes_cli.main import _custom_provider_api_key_config_value
+
+        assert _custom_provider_api_key_config_value(
+            {"key_env": "MY_KEY"}, "resolved-secret-value"
+        ) == "${MY_KEY}"
+
+
+class TestSetupFlowHonoursKeyCmd:
+    """`hermes model`'s named-custom flow is the picker's sibling path."""
+
+    def test_setup_flow_resolves_key_cmd_for_its_probe(self, monkeypatch):
+        """The flow builds `Authorization: Bearer <api_key>` by hand, so an
+        unresolved key_cmd sends no auth header and the endpoint 401s."""
+        import hermes_cli.model_setup_flows as flows
+
+        assert flows._model_flow_named_custom is not None
+        src = __import__("inspect").getsource(flows._model_flow_named_custom)
+        assert "_picker_key_cmd_token" in src, (
+            "setup flow must resolve key_cmd, or its /models probe goes out "
+            "unauthenticated"
+        )
+        # Persisted value is computed BEFORE the mint, so the token cannot
+        # leak into config.yaml.
+        assert src.index("config_api_key") < src.index("_picker_key_cmd_token")
