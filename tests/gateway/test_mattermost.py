@@ -98,6 +98,72 @@ def _make_adapter():
     return adapter
 
 
+class TestMattermostTypedCommandPrefix:
+    def test_rewrites_only_registered_commands(self):
+        from plugins.platforms.mattermost.adapter import _rewrite_known_typed_command
+
+        assert _rewrite_known_typed_command("!status", "!") == "/status"
+        assert _rewrite_known_typed_command("!approve session", "!") == "/approve session"
+        assert _rewrite_known_typed_command("!important", "!") == "!important"
+
+    def test_supports_custom_and_disabled_prefixes(self):
+        from plugins.platforms.mattermost.adapter import (
+            MattermostAdapter,
+            _rewrite_known_typed_command,
+        )
+
+        assert _rewrite_known_typed_command("?status", "?") == "/status"
+        assert _rewrite_known_typed_command("!status", "") == "!status"
+        assert _rewrite_known_typed_command("! status", "!") == "! status"
+
+        disabled = MattermostAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={"url": "https://mm.example.com", "command_prefix": ""},
+            )
+        )
+        assert disabled._command_prefix == ""
+        assert disabled.typed_command_prefix == "/"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("message", "expected_text", "expected_type"),
+        [
+            ("!new", "/new", MessageType.COMMAND),
+            ("!important", "!important", MessageType.TEXT),
+        ],
+    )
+    async def test_dm_event_normalizes_only_known_commands(
+        self, message, expected_text, expected_type
+    ):
+        adapter = _make_adapter()
+        adapter._bot_user_id = "bot_user_id"
+        adapter._bot_username = "hermes-bot"
+        adapter.handle_message = AsyncMock()
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(
+                    {
+                        "id": "post_cmd",
+                        "user_id": "user_123",
+                        "channel_id": "chan_dm",
+                        "message": message,
+                    }
+                ),
+                "channel_type": "D",
+                "sender_name": "@bob",
+            },
+        }
+
+        await adapter._handle_ws_event(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == expected_text
+        assert msg_event.message_type is expected_type
+
+
 class TestMattermostFormatMessage:
     def setup_method(self):
         self.adapter = _make_adapter()
