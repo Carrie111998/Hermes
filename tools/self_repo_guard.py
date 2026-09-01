@@ -35,6 +35,7 @@ _WORKTREE_MUTATIONS = frozenset({
 _WORKTREE_TARGET_ACTIONS = frozenset({"move", "remove"})
 _STASH_SAFE_ACTIONS = frozenset({"list", "show", "create", "store", "drop", "clear"})
 _RESET_WORKTREE_MODES = frozenset({"--hard", "--merge", "--keep"})
+_PARSER_LIMIT_OPERATION = "__parser_limit__"
 _KNOWN_GIT_BUILTINS = frozenset({
     "add",
     "am",
@@ -644,6 +645,8 @@ def _inspect_github_cli(
 def _find_mutation(command: str, cwd: Path, root: Path, depth: int = 0) -> str | None:
     if depth > _MAX_RECURSION:
         return None
+    if _command_parser_limit_exceeded(command):
+        return _PARSER_LIMIT_OPERATION
 
     masked_command, heredoc_scripts = _mask_heredocs(command)
     for script in heredoc_scripts:
@@ -720,16 +723,16 @@ def detect_self_repo_git_mutation(
         return False, None
 
     root = _resolve(str(root), Path("/"))
-    if _command_parser_limit_exceeded(command):
+    base = _resolve(cwd, Path("/")) if cwd else Path("/")
+    operation = _find_mutation(command, base, root)
+    if operation is None:
+        return False, None
+    if operation == _PARSER_LIMIT_OPERATION:
         return True, (
             "Blocked: command exceeded the parser safety limit while checking "
             f"whether it would rewrite Hermes's live source checkout ({root}). "
             "Split the command into smaller operations and retry."
         )
-    base = _resolve(cwd, Path("/")) if cwd else Path("/")
-    operation = _find_mutation(command, base, root)
-    if operation is None:
-        return False, None
     return True, _block_message(operation, root)
 
 

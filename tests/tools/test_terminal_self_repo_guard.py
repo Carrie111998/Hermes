@@ -1,6 +1,7 @@
 """terminal_tool wiring tests for the self-repo git mutation guard."""
 
 import json
+import subprocess
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
@@ -85,6 +86,23 @@ class TestSelfRepoGuardWiring:
         payload = "${x:-a}" * 257 + "; git reset --hard"
 
         result, env = _run(payload, config, monkeypatch, repo, force=True)
+
+        assert result["status"] == "blocked"
+        assert "parser safety limit" in result["error"]
+        env.execute.assert_not_called()
+
+    def test_force_cannot_bypass_configured_alias_parser_limit(
+        self, repo, monkeypatch
+    ):
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        payload = "${x:-a}" * 257 + "; git reset --hard"
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "alias.boom", f"!{payload}"],
+            check=True,
+        )
+        config = _make_env_config(cwd=str(repo))
+
+        result, env = _run("git boom", config, monkeypatch, repo, force=True)
 
         assert result["status"] == "blocked"
         assert "parser safety limit" in result["error"]
