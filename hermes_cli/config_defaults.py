@@ -3603,16 +3603,14 @@ DEFAULT_CONFIG = {
         #                         never conflicts — so desktop/gateway/cron
         #                         updates always land on current code.
         #   "update_in_place"   — for a deliberately maintained custom branch
-        #                         (local patches on top of main): merge
-        #                         origin/<target> INTO the branch instead.
-        #                         The checkout never moves and local commits
-        #                         survive; a conflict stops the update
-        #                         cleanly with nothing changed. A safety tag
-        #                         (pre-update-<stamp>) is left before the
-        #                         merge. `hermes update --switch-branch`
-        #                         overrides back to the switch path for one
-        #                         run (e.g. a deep feature branch that must
-        #                         not accumulate update merge commits).
+        #                         (local patches on top of main): stash any
+        #                         tracked/untracked edits, then rebase the proven
+        #                         local commit range onto origin/<target> without
+        #                         switching branches. Conflicts abort back to the
+        #                         original committed HEAD; the stash is restored
+        #                         or preserved under the normal update policy.
+        #                         `hermes update --switch-branch` overrides back
+        #                         to the switch path for one run.
         "parked_branch_strategy": "switch",
         # Refresh an already-installed cua-driver during `hermes update`.
         # The refresh is best-effort and macOS-only. Turn this off if the

@@ -11,9 +11,12 @@ stale branch with none of main's new code. Two sessions burned time on
 The guard (``_assess_parked_branch_switch``):
 - clean tree + branch fully merged into origin/<target>  → safe to
   auto-switch back to the target (and STAY there — no switch-back).
-- dirty tree, unmerged commits, git failure, or the
-  ``updates.auto_switch_parked_branch: false`` opt-out → do NOT touch the
-  branch; warn loudly and mark the code update SKIPPED.
+- clean tree + unmerged commits → either switch while preserving the branch,
+  or rebase in place when ``updates.parked_branch_strategy`` requests it.
+- dirty maintained branch + unmerged commits → stash tracked/untracked edits,
+  rebase in place, then restore them under the normal update policy.
+- dirty branch without a committed overlay, unfinished Git state, config opt-out,
+  or unverifiable history → do NOT switch; warn and fail closed.
 
 These tests run the guard against REAL git repositories (init, commit,
 branch, clone) — not mocked subprocess.run — so they exercise the actual
@@ -21,6 +24,7 @@ branch, clone) — not mocked subprocess.run — so they exercise the actual
 """
 
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -393,6 +397,83 @@ def test_update_updates_unmerged_branch_in_place_when_configured(
     # ...and the branch's own commit survived it.
     assert (repo_pair / "feature.txt").read_text() == "unmerged work\n"
     assert "feature work" in _git(repo_pair, "log", "--oneline").stdout
+
+
+def test_update_stashes_and_restores_dirty_maintained_branch_on_late_failure(
+    repo_pair, monkeypatch, capsys
+):
+    """A maintained custom branch keeps committed overlays while tracked and
+    untracked edits are parked before the in-place rebase and restored if a
+    later update phase fails."""
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"updates": {"parked_branch_strategy": "update_in_place"}},
+    )
+    (repo_pair / "feature.txt").write_text("committed overlay\n")
+    _git(repo_pair, "add", "feature.txt")
+    _git(repo_pair, "commit", "-qm", "feature work")
+    (repo_pair / "feature.txt").write_text("dirty tracked edit\n")
+    (repo_pair / "scratch.txt").write_text("dirty untracked edit\n")
+    _patch_update_flow(monkeypatch, repo_pair)
+
+    class _StopFlow(Exception):
+        pass
+
+    monkeypatch.setattr(
+        hermes_main,
+        "_abort_dependency_sync_if_self_locked",
+        lambda *a, **k: (_ for _ in ()).throw(_StopFlow()),
+    )
+
+    with pytest.raises(_StopFlow):
+        hermes_main.cmd_update(
+            SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+        )
+
+    out = capsys.readouterr().out
+    assert "updating it in place" in out
+    assert "CODE UPDATE SKIPPED" not in out
+    assert _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip() == "old-feature"
+    assert (repo_pair / "b.txt").exists()
+    # The updater's failure cleanup restores the parked edits onto the updated
+    # custom branch, so the user's working state is not stranded in a stash.
+    assert (repo_pair / "feature.txt").read_text() == "dirty tracked edit\n"
+    assert (repo_pair / "scratch.txt").read_text() == "dirty untracked edit\n"
+    assert _git(repo_pair, "stash", "list").stdout.strip() == ""
+
+
+def test_update_in_place_refuses_unfinished_git_operation(
+    repo_pair, monkeypatch, capsys
+):
+    """The dirty-branch convenience must never erase conflict state."""
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"updates": {"parked_branch_strategy": "update_in_place"}},
+    )
+    (repo_pair / "feature.txt").write_text("committed overlay\n")
+    _git(repo_pair, "add", "feature.txt")
+    _git(repo_pair, "commit", "-qm", "feature work")
+    git_dir = Path(_git(repo_pair, "rev-parse", "--git-dir").stdout.strip())
+    if not git_dir.is_absolute():
+        git_dir = repo_pair / git_dir
+    (git_dir / "MERGE_HEAD").write_text("deadbeef\n")
+    _patch_update_flow(monkeypatch, repo_pair)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(
+            SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
+        )
+
+    assert exc_info.value.code == 1
+    assert "unfinished Git operation (MERGE_HEAD)" in capsys.readouterr().out
+    assert _git(repo_pair, "stash", "list").stdout.strip() == ""
+    assert (git_dir / "MERGE_HEAD").exists()
 
 
 def test_switch_branch_flag_overrides_in_place_strategy(
