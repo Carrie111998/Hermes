@@ -354,6 +354,72 @@ class TestRain:
         assert drops[0].row < 1
 
 
+class TestFit:
+    def test_always_returns_exactly_the_requested_width(self):
+        for text in ("", "short", "x" * 500):
+            for width in (1, 7, 40):
+                assert len(busy_terminal.fit(text, width)) == width
+
+    def test_zero_or_negative_width_collapses_to_empty(self):
+        assert busy_terminal.fit("anything", 0) == ""
+        assert busy_terminal.fit("anything", -3) == ""
+
+
+class TestWarroomLayout:
+    SIZES = [(w, h) for w in (40, 60, 80, 100, 140, 200) for h in (10, 16, 24, 40, 60)]
+
+    @pytest.mark.parametrize("width,height", SIZES)
+    def test_every_window_stays_inside_the_terminal(self, width, height):
+        for name, rect in busy_terminal.warroom_layout(width, height).items():
+            assert rect.top >= 1 and rect.left >= 1, name
+            assert rect.bottom <= height, name
+            assert rect.right <= width, name
+
+    @pytest.mark.parametrize("width,height", SIZES)
+    def test_panes_never_overlap_each_other(self, width, height):
+        """Only the dialog may float — nothing re-stamps on the panes' cadence."""
+        layout = busy_terminal.warroom_layout(width, height)
+        layout.pop("dialog")
+        panes = list(layout.items())
+        for i, (name_a, rect_a) in enumerate(panes):
+            for name_b, rect_b in panes[i + 1:]:
+                assert not rect_a.overlaps(rect_b), f"{name_a} overlaps {name_b}"
+
+    @pytest.mark.parametrize("width,height", SIZES)
+    def test_the_dialog_is_always_present_and_readable(self, width, height):
+        dialog = busy_terminal.warroom_layout(width, height)["dialog"]
+        assert dialog.width >= 30
+        assert dialog.height == 5
+
+    def test_a_generous_terminal_gets_all_three_panes(self):
+        assert set(busy_terminal.warroom_layout(120, 35)) == {
+            "memdump", "uplink", "intercept", "dialog",
+        }
+
+
+class TestRainAvoidance:
+    MOVE = re.compile(r"\033\[(\d+);(\d+)H")
+
+    def test_rain_never_writes_inside_an_avoided_window(self):
+        rng = random.Random(40)
+        window = busy_terminal.Rect(top=5, left=5, width=20, height=10)
+        drops = [busy_terminal.spawn_drop(col, 30, rng) for col in range(1, 60, 2)]
+
+        for _ in range(300):
+            frame = busy_terminal.rain_step(drops, height=30, rng=rng, avoid=[window])
+            for row, col in self.MOVE.findall(frame):
+                assert not window.contains(int(row), int(col))
+
+    def test_the_drops_keep_falling_behind_the_window(self):
+        """Avoidance blocks the writes, not the motion."""
+        rng = random.Random(41)
+        window = busy_terminal.Rect(top=1, left=1, width=60, height=30)
+        drops = [busy_terminal.spawn_drop(col, 30, rng) for col in (1, 3)]
+        rows = [drop.row for drop in drops]
+        busy_terminal.rain_step(drops, height=30, rng=rng, avoid=[window])
+        assert all(drop.row > row for drop, row in zip(drops, rows))
+
+
 class TestSceneArcs:
     """Each hacker scene must reach its climax — that IS the scene."""
 
@@ -383,6 +449,27 @@ class TestSceneArcs:
         lines = [line for line in rec.text.splitlines() if line]
         assert lines
         assert all(len(line) <= console.width for line in lines)
+
+    def test_the_warroom_dialog_always_finishes_matching(self):
+        console, rec = make_console(color=True)
+        busy_terminal.scene_warroom(console, random.Random(33))
+        assert "MATCHING PASSWORD" in rec.text
+        assert "ACCESS GRANTED" in rec.text
+        assert rec.text.index("MATCHING PASSWORD") < rec.text.index("ACCESS GRANTED")
+
+    def test_the_warroom_opens_every_pane_the_layout_grants(self):
+        console, rec = make_console(color=True)
+        busy_terminal.scene_warroom(console, random.Random(34))
+        layout = busy_terminal.warroom_layout(console.width, console.height)
+        layout.pop("dialog")
+        for name in layout:
+            assert name in rec.text
+
+    def test_the_warroom_fallback_still_tells_the_story(self):
+        console, rec = make_console(color=False)
+        busy_terminal.scene_warroom(console, random.Random(35))
+        assert "password matched" in rec.text
+        assert not ANSI.search(rec.text)
 
 
 # ── Launching a visible window ───────────────────────────────────────────────

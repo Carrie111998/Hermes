@@ -1,7 +1,7 @@
 ---
 name: busy-terminal
 description: "Joke screensaver: fake coding or Hollywood hacking."
-version: 1.1.0
+version: 1.2.0
 author: "Luke The Dev (@iamlukethedev), Hermes Agent"
 license: MIT
 platforms: [linux, macos, windows]
@@ -15,9 +15,10 @@ metadata:
 
 Fills a terminal with invented activity, cycling scenes at random until
 stopped. Two profiles: `developer` fakes honest work (editor, build, tests,
-git) and `hacker` fakes the movie kind (digital rain, an intrusion ending in
-ACCESS GRANTED, a key crack). `mixed` interleaves both. It is a screensaver in
-the `cmatrix` / `genact` / Hollywood-hacker tradition.
+git) and `hacker` fakes the movie kind (digital rain, a multi-window war room
+with a password-matching dialog, an intrusion ending in ACCESS GRANTED, a key
+crack). `mixed` interleaves both. It is a screensaver in the `cmatrix` /
+`genact` / Hollywood-hacker tradition.
 
 Nothing it prints is real. It reads no files, runs no commands, and opens no
 sockets; every path, SHA, and byte count is generated, and the hacker
@@ -94,6 +95,7 @@ The user can also run it themselves in any terminal, without `--window`.
 | `tests` | developer | Pytest-style dots, pass–fail summary, occasional flake retry |
 | `git` | developer | Commit, push with delta compression, CI checks going green |
 | `matrix` | hacker | Digital rain with bright heads and dimming trails |
+| `warroom` | hacker | Rain behind several live panes, password dialog floating on top |
 | `intrusion` | hacker | Port scan, brute-force, ACCESS GRANTED banner, exfil bar |
 | `crack` | hacker | Hex spray, then an AES key locking in byte by byte |
 
@@ -126,8 +128,10 @@ played, so the cycle reads as varied rather than random-looking.
   floors the width at 40, but a genuinely tiny terminal still looks cramped.
 - `--speed` scales pauses, not content. Very high values (>10) reduce it to a
   wall of text with no rhythm.
-- The matrix rain needs ANSI cursor addressing; piped or `--no-color` output
-  degrades it to scrolling glyph lines on purpose.
+- The matrix rain and the war room need ANSI cursor addressing; piped or
+  `--no-color` output degrades them to scrolling lines on purpose.
+- The war room shines at generous sizes — panes that would come out under
+  14×4 cells are dropped, so a tiny terminal shows fewer windows.
 - The hacker profile is theatre, not technique — keep targets and loot inside
   the shipped fictional pools if you ever extend the pools.
 

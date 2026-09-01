@@ -35,11 +35,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence, TextIO
 
-SCENES = ("code", "build", "tests", "git", "matrix", "intrusion", "crack")
+SCENES = ("code", "build", "tests", "git", "matrix", "warroom", "intrusion", "crack")
 
 PROFILES: dict[str, tuple[str, ...]] = {
     "developer": ("code", "build", "tests", "git"),
-    "hacker": ("matrix", "intrusion", "crack"),
+    "hacker": ("matrix", "warroom", "intrusion", "crack"),
     "mixed": SCENES,
 }
 
@@ -419,6 +419,8 @@ LOOT = (
     "/opt/mainframe/schematics.zip",
 )
 
+PASSWORDS = ("Tr1n1ty-1999", "sw0rdf1sh", "Z10N-4cc3ss", "m0rph3us#7")
+
 
 # ── Scenes ───────────────────────────────────────────────────────────────────
 
@@ -611,6 +613,43 @@ def move_to(row: int, col: int) -> str:
     return f"\033[{row};{col}H"
 
 
+def fit(text: str, width: int) -> str:
+    """Clip or pad to exactly `width` — pane content must never spill out."""
+    if width <= 0:
+        return ""
+
+    return text[:width].ljust(width)
+
+
+@dataclass(frozen=True)
+class Rect:
+    """A window rectangle in 1-based terminal cells, borders included."""
+
+    top: int
+    left: int
+    width: int
+    height: int
+
+    @property
+    def bottom(self) -> int:
+        return self.top + self.height - 1
+
+    @property
+    def right(self) -> int:
+        return self.left + self.width - 1
+
+    def contains(self, row: int, col: int) -> bool:
+        return self.top <= row <= self.bottom and self.left <= col <= self.right
+
+    def overlaps(self, other: "Rect") -> bool:
+        return not (
+            self.right < other.left
+            or other.right < self.left
+            or self.bottom < other.top
+            or other.bottom < self.top
+        )
+
+
 @dataclass
 class Drop:
     """One falling column of digital rain."""
@@ -635,12 +674,22 @@ def spawn_drop(col: int, height: int, rng: random.Random) -> Drop:
     )
 
 
-def rain_step(drops: list[Drop], height: int, rng: random.Random) -> str:
+def rain_step(
+    drops: list[Drop],
+    height: int,
+    rng: random.Random,
+    avoid: Sequence[Rect] = (),
+) -> str:
     """Advance every drop one tick and return the whole frame as one string.
 
     One write per frame is the point: per-cell writes flicker and swamp the
-    terminal with flushes.
+    terminal with flushes. Cells inside `avoid` are never touched, so the rain
+    flows around the war-room windows instead of scribbling through them.
     """
+
+    def open_cell(row: int, col: int) -> bool:
+        return 1 <= row <= height and not any(rect.contains(row, col) for rect in avoid)
+
     parts = [MATRIX_BODY]
     for index, drop in enumerate(drops):
         prev = int(drop.row)
@@ -648,16 +697,16 @@ def rain_step(drops: list[Drop], height: int, rng: random.Random) -> str:
         head = int(drop.row)
 
         if head != prev:
-            if 1 <= head <= height:
+            if open_cell(head, drop.col):
                 parts.append(
                     move_to(head, drop.col)
                     + MATRIX_HEAD + rng.choice(MATRIX_GLYPHS) + RESET + MATRIX_BODY
                 )
             # The old head dims into the trail body.
-            if 1 <= prev <= height:
+            if open_cell(prev, drop.col):
                 parts.append(move_to(prev, drop.col) + rng.choice(MATRIX_GLYPHS))
             tail = head - drop.trail
-            if 1 <= tail <= height:
+            if open_cell(tail, drop.col):
                 parts.append(move_to(tail, drop.col) + " ")
 
         if drop.row - drop.trail > height:
@@ -700,6 +749,225 @@ def scene_matrix(console: Console, rng: random.Random) -> None:
         console.pause(0.9)
     console.paint(RESET)
     console.pause(1.2)
+
+
+# ── The war room: several live windows over the rain ────────────────────────
+
+
+def warroom_layout(width: int, height: int) -> dict[str, Rect]:
+    """Window rectangles scaled to the terminal.
+
+    Panes never overlap each other — none of them re-stamps on the others'
+    cadence, so overlap would scribble. The dialog is the one exception: it
+    floats over everything because it is re-stamped into every frame, last.
+    Panes that would come out too small to read are dropped rather than
+    squeezed.
+    """
+    rects: dict[str, Rect] = {}
+    left_w = (width - 6) // 2
+    right_w = width - 6 - left_w
+    top_h = (height - 5) // 2
+    bottom_h = height - 5 - top_h
+
+    candidates = {
+        "memdump": Rect(top=2, left=2, width=left_w, height=top_h),
+        "uplink": Rect(top=2, left=left_w + 4, width=right_w, height=height - 3),
+        "intercept": Rect(top=top_h + 3, left=2, width=left_w, height=bottom_h),
+    }
+    for name, rect in candidates.items():
+        if rect.width >= 14 and rect.height >= 4:
+            rects[name] = rect
+
+    dialog_width = min(36, width - 4)
+    rects["dialog"] = Rect(
+        top=max(1, height // 2 - 2),
+        left=max(1, (width - dialog_width) // 2),
+        width=dialog_width,
+        height=5,
+    )
+
+    return rects
+
+
+@dataclass
+class Pane:
+    """One live window: a box, a text tone, and a feed that fills it."""
+
+    rect: Rect
+    title: str
+    tone: str
+    feed: Callable[[random.Random, int], str]
+    period: int
+    reveal: int
+    lines: list[str]
+
+
+def feed_hex(rng: random.Random, width: int) -> str:
+    """A memdump row: offset, then as many hex pairs as fit."""
+    pairs = max(1, (width - 7) // 3)
+    body = " ".join(f"{rng.randrange(256):02x}" for _ in range(pairs))
+
+    return f"{rng.randrange(0x10000):04x}: {body}"
+
+
+def feed_intercept(rng: random.Random, width: int) -> str:
+    return (
+        f"pkt {rng.randrange(10000):04d} ▸ 203.0.113.{rng.randrange(1, 255)}:443"
+        f" · TLS1.3 · {rng.uniform(0.2, 9.9):.1f} KiB"
+    )
+
+
+def feed_trace(rng: random.Random, width: int) -> str:
+    return (
+        f"hop {rng.randrange(2, 15):02d}  {rng.uniform(4.0, 240.0):6.1f} ms"
+        f"  relay-{rng.randrange(10):02d}.example.net"
+    )
+
+
+def box_stamp(console: Console, rect: Rect, title: str, tone: str) -> str:
+    """Paint a window frame with a blank interior, in one string."""
+    label = title[: max(0, rect.width - 6)]
+    top = "┌─ " + label + " " + "─" * (rect.width - len(label) - 5) + "┐"
+    parts = [move_to(rect.top, rect.left) + console.tint(top, tone)]
+    for row in range(rect.top + 1, rect.bottom):
+        parts.append(
+            move_to(row, rect.left)
+            + console.tint("│" + " " * (rect.width - 2) + "│", tone)
+        )
+    parts.append(
+        move_to(rect.bottom, rect.left)
+        + console.tint("└" + "─" * (rect.width - 2) + "┘", tone)
+    )
+
+    return "".join(parts)
+
+
+def interior_stamp(console: Console, pane: Pane) -> str:
+    """Repaint a pane's content area, bottom-aligned like a scrolling log."""
+    inner_rows = pane.rect.height - 2
+    inner_width = pane.rect.width - 4
+    visible = pane.lines[-inner_rows:]
+    padded = [""] * (inner_rows - len(visible)) + visible
+
+    parts = []
+    for offset, line in enumerate(padded):
+        parts.append(
+            move_to(pane.rect.top + 1 + offset, pane.rect.left + 2)
+            + console.tint(fit(line, inner_width), pane.tone)
+        )
+
+    return "".join(parts)
+
+
+def dialog_stamp(
+    console: Console,
+    rect: Rect,
+    password: str,
+    locked: int,
+    rng: random.Random,
+) -> str:
+    """The floating centerpiece: masked characters locking in one by one."""
+    granted = locked >= len(password)
+    tone = GREEN if granted else CYAN
+    title = "ACCESS GRANTED" if granted else "MATCHING PASSWORD"
+
+    cells = []
+    for index, char in enumerate(password):
+        if index < locked:
+            cells.append(console.tint(char, BOLD + GREEN))
+        elif rng.random() < 0.14:
+            cells.append(console.tint(rng.choice("0123456789ABCDEF"), CYAN))
+        else:
+            cells.append(console.tint("▪", GREY))
+
+    inner_width = rect.width - 4
+    row = " ".join(cells)
+    pad = max(0, (inner_width - (len(password) * 2 - 1)) // 2)
+    status = f"{locked}/{len(password)} matched" if not granted else "session key accepted"
+
+    return (
+        box_stamp(console, rect, title, BOLD + tone if granted else tone)
+        + move_to(rect.top + 2, rect.left + 2) + " " * pad + row
+        + move_to(rect.top + 3, rect.left + 2)
+        + console.tint(fit(status.center(inner_width), inner_width), GREY)
+    )
+
+
+def scene_warroom(console: Console, rng: random.Random) -> None:
+    """The full movie set: rain behind several live panes, dialog on top."""
+    if not console.color:
+        # No cursor addressing — interleave the feeds as a flat log instead.
+        for _ in range(rng.randint(24, 40)):
+            roll = rng.random()
+            if roll < 0.4:
+                console.line(feed_intercept(rng, console.width - 2))
+            elif roll < 0.7:
+                console.line(feed_hex(rng, console.width - 2))
+            else:
+                console.line(feed_trace(rng, console.width - 2))
+            console.pause(0.06)
+        console.line(f"[dialog] password matched ({rng.randint(6, 14)} candidates)")
+        console.pause(1.0)
+
+        return
+
+    console.clear()
+    layout = warroom_layout(console.width, console.height)
+    dialog_rect = layout.pop("dialog")
+
+    dressing = {
+        "memdump": (feed_hex, GREY),
+        "uplink": (feed_intercept, GREEN),
+        "intercept": (feed_trace, CYAN),
+    }
+    panes = []
+    for index, name in enumerate(sorted(layout)):
+        feed, tone = dressing[name]
+        panes.append(
+            Pane(
+                rect=layout[name],
+                title=name,
+                tone=tone,
+                feed=feed,
+                period=rng.randint(3, 6),
+                reveal=6 + index * rng.randint(6, 10),
+                lines=[],
+            )
+        )
+
+    drops = [spawn_drop(col, console.height, rng) for col in range(1, console.width, 2)]
+    password = rng.choice(PASSWORDS)
+    dialog_at = rng.randint(40, 60)
+    lock_every = rng.randint(7, 11)
+    locked = 0
+    total = dialog_at + lock_every * len(password) + 24
+
+    for tick in range(total):
+        parts = []
+        shown = [pane.rect for pane in panes if tick >= pane.reveal]
+        if tick >= dialog_at:
+            shown.append(dialog_rect)
+        parts.append(rain_step(drops, console.height, rng, avoid=shown))
+
+        for pane in panes:
+            if tick == pane.reveal:
+                parts.append(box_stamp(console, pane.rect, pane.title, pane.tone))
+            elif tick > pane.reveal and (tick - pane.reveal) % pane.period == 0:
+                pane.lines.append(pane.feed(rng, pane.rect.width - 4))
+                pane.lines = pane.lines[-(pane.rect.height - 2):]
+                parts.append(interior_stamp(console, pane))
+
+        if tick >= dialog_at:
+            if locked < len(password) and tick > dialog_at and (tick - dialog_at) % lock_every == 0:
+                locked += 1
+            # Stamped last, every tick — that is what lets it float over panes.
+            parts.append(dialog_stamp(console, dialog_rect, password, locked, rng))
+
+        console.paint("".join(parts))
+        console.pause(0.05)
+
+    console.clear()
+    console.pause(0.5)
 
 
 def scene_intrusion(console: Console, rng: random.Random) -> None:
@@ -812,6 +1080,7 @@ SCENE_RUNNERS: dict[str, Callable[[Console, random.Random], None]] = {
     "tests": scene_tests,
     "git": scene_git,
     "matrix": scene_matrix,
+    "warroom": scene_warroom,
     "intrusion": scene_intrusion,
     "crack": scene_crack,
 }
