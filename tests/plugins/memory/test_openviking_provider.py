@@ -1308,8 +1308,7 @@ def test_concurrent_providers_claim_unlocked_pending_owner_once(
 
 
 # ---------------------------------------------------------------------------
-# on_memory_write: explicit memory writes use content/write and stay outside
-# the session transcript/commit boundary.
+# on_memory_write: successful built-in memory mutations use the native mirror.
 # ---------------------------------------------------------------------------
 
 
@@ -1358,7 +1357,6 @@ def test_shutdown_waits_for_memory_write_worker(monkeypatch):
 
     assert not returned_before_worker_finished
     assert worker_finished.is_set()
-    assert provider._memory_write_threads == set()
 
 
 def test_memory_write_uses_one_connection_for_identity_uri_and_post(monkeypatch):
@@ -1403,8 +1401,6 @@ def test_memory_write_uses_one_connection_for_identity_uri_and_post(monkeypatch)
     release_identity.set()
 
     assert write_finished.wait(timeout=2.0), "memory write did not finish"
-    for worker in list(provider._memory_write_threads):
-        worker.join(timeout=2.0)
 
     assert len(writes) == 1
     user, agent, path, payload = writes[0]
@@ -1412,7 +1408,6 @@ def test_memory_write_uses_one_connection_for_identity_uri_and_post(monkeypatch)
     assert payload["uri"].startswith(
         "viking://user/alice/peers/alice-agent/memories/preferences/mem_"
     )
-    assert provider._memory_write_threads == set()
 
 
 def _make_prefetch_provider() -> OpenVikingMemoryProvider:
