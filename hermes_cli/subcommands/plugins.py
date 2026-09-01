@@ -28,7 +28,7 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
         "identifier",
         help=(
             "Git URL, owner/repo shorthand (e.g. anpicasso/hermes-plugin-chrome-profiles), "
-            "or a bare plugin name resolved through the community index "
+            "or a bare plugin catalog entry name "
             "(see `hermes plugins search`)"
         ),
     )
@@ -43,6 +43,11 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
         metavar="COMMIT_SHA",
         help="Install exactly one immutable 40-character Git commit SHA",
     )
+    plugins_install.add_argument(
+        "--allow-removed",
+        action="store_true",
+        help="DANGEROUS: bypass the catalog removed-plugin blocklist check",
+    )
     _install_enable_group = plugins_install.add_mutually_exclusive_group()
     _install_enable_group.add_argument(
         "--enable",
@@ -56,29 +61,34 @@ def build_plugins_parser(subparsers, *, cmd_plugins: Callable) -> None:
     )
 
     plugins_search = plugins_subparsers.add_parser(
-        "search", help="Search the community plugin index"
+        "search", help="Search the Hermes plugin catalog"
     )
     plugins_search.add_argument(
         "term",
         nargs="?",
         default="",
-        help="Search term matched fuzzily against name, description, and tags "
-        "(omit to browse the full index)",
+        help="Query matched against entry names, descriptions, and declared "
+        "tools (omit to list the whole catalog)",
     )
     plugins_search.add_argument(
         "--json",
         action="store_true",
         help="Print machine-readable JSON",
     )
-    plugins_search.add_argument(
-        "--capability",
-        metavar="CAP",
-        help="Filter by declared capability (e.g. tools, platform, commands)",
+
+    plugins_subparsers.add_parser(
+        "browse", help="Browse every curated plugin catalog entry"
     )
-    plugins_search.add_argument(
-        "--refresh",
+
+    plugins_validate = plugins_subparsers.add_parser(
+        "validate",
+        help="Validate a plugin directory for catalog admission (CI gate)",
+    )
+    plugins_validate.add_argument("path", help="Path to the plugin directory")
+    plugins_validate.add_argument(
+        "--json",
         action="store_true",
-        help="Bypass the local cache and re-fetch the index",
+        help="Print machine-readable JSON (for CI)",
     )
 
     plugins_update = plugins_subparsers.add_parser(

@@ -108,6 +108,93 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Hermes version gate (manifest ``requires_hermes``)
+# ---------------------------------------------------------------------------
+
+_VERSION_COMPARATOR_RE = re.compile(r"^\s*(>=|<=|==|!=|>|<)\s*(.+?)\s*$")
+
+
+def _running_hermes_version() -> str:
+    """Return the running Hermes version string.
+
+    Prefers installed package metadata (matches ``hermes_cli/main.py``'s
+    version reporting), falling back to ``hermes_cli.__version__`` for
+    source checkouts, then ``"0.0.0"`` as a last resort.
+    """
+    try:
+        return importlib.metadata.version("hermes-agent")
+    except Exception:
+        pass
+    try:
+        from hermes_cli import __version__
+        return __version__
+    except Exception:
+        return "0.0.0"
+
+
+def _version_tuple(v: str) -> Optional[tuple]:
+    """Parse ``major.minor.patch`` into a comparable tuple.
+
+    Leading ``v`` and pre-release/build metadata (``-rc1``, ``+abc``) are
+    stripped; missing segments default to 0. Returns ``None`` when any
+    segment is non-numeric.
+    """
+    s = str(v).strip().lstrip("v")
+    s = re.split(r"[-+]", s, 1)[0]
+    parts = s.split(".")
+    while len(parts) < 3:
+        parts.append("0")
+    try:
+        return tuple(int(p) for p in parts[:3])
+    except ValueError:
+        return None
+
+
+def _version_satisfies(spec: str, current: str) -> bool:
+    """Return True when *current* satisfies *spec*.
+
+    *spec* supports ``>=``, ``>``, ``<=``, ``<``, ``==``, ``!=`` and
+    comma-separated combinations (all must hold). A bare version is treated
+    as ``>=``. Non-numeric version segments fall back to permissive True
+    (with a debug log) — no new dependency, so no full PEP 440 handling.
+    """
+    if not spec or not spec.strip():
+        return True
+    cur = _version_tuple(current)
+    if cur is None:
+        logger.debug(
+            "requires_hermes: unparseable running version %r — allowing", current,
+        )
+        return True
+    for clause in spec.split(","):
+        clause = clause.strip()
+        if not clause:
+            continue
+        m = _VERSION_COMPARATOR_RE.match(clause)
+        if m:
+            op, target = m.group(1), m.group(2)
+        else:
+            op, target = ">=", clause
+        tgt = _version_tuple(target)
+        if tgt is None:
+            logger.debug(
+                "requires_hermes: unparseable version spec %r — allowing", clause,
+            )
+            continue
+        ok = {
+            ">=": cur >= tgt,
+            "<=": cur <= tgt,
+            "==": cur == tgt,
+            "!=": cur != tgt,
+            ">": cur > tgt,
+            "<": cur < tgt,
+        }[op]
+        if not ok:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Plugin developer debug logging
 # ---------------------------------------------------------------------------
 #
@@ -722,6 +809,8 @@ _KNOWN_MANIFEST_FIELDS: Set[str] = {
     "python_dependencies", "config_schema", "license", "homepage", "tags",
     # owned by sibling sub-issues but reserved so their manifests don't warn
     "capabilities", "emits", "listens", "hermes", "depends",
+    # plugin catalog (#69446)
+    "requires_hermes",
 }
 
 # Highest manifest schema version this Hermes understands.
@@ -1125,6 +1214,10 @@ class PluginManifest:
     # category plugin at ``plugins/image_gen/openai/`` the key is
     # ``image_gen/openai``. When empty, falls back to ``name``.
     key: str = ""
+    # Minimum/exact Hermes version requirement, e.g. ``">=0.19"``. Empty =
+    # no requirement. Checked at load time; unsatisfied plugins are recorded
+    # with an error and skipped (no register() call, no traceback).
+    requires_hermes: str = ""
     portable: bool = False
     skill_namespace: str = ""
     # Declared capability ids from the manifest ``capabilities:`` list
@@ -4833,6 +4926,7 @@ class PluginManager:
                 path=str(plugin_dir),
                 kind=kind,
                 key=key,
+                requires_hermes=str(data.get("requires_hermes") or "").strip(),
                 capabilities=_parse_declared_capabilities(
                     data.get("capabilities"), name
                 ),
@@ -5223,6 +5317,24 @@ class PluginManager:
     def _load_plugin_scoped(self, manifest: PluginManifest) -> None:
         """Load one plugin with the manager's home bound as current."""
         loaded = LoadedPlugin(manifest=manifest)
+
+        # requires_hermes gate — skip cleanly (no import, no traceback) when
+        # the running Hermes version doesn't satisfy the manifest spec.
+        if manifest.requires_hermes:
+            current = _running_hermes_version()
+            if not _version_satisfies(manifest.requires_hermes, current):
+                loaded.enabled = False
+                loaded.error = (
+                    f"requires hermes {manifest.requires_hermes}, "
+                    f"running {current}"
+                )
+                self._plugins[manifest.key or manifest.name] = loaded
+                logger.warning(
+                    "Plugin '%s' skipped: %s",
+                    manifest.key or manifest.name, loaded.error,
+                )
+                return
+
         logger.debug(
             "Loading plugin '%s' (source=%s, kind=%s, path=%s)",
             manifest.key or manifest.name, manifest.source, manifest.kind, manifest.path,
