@@ -214,6 +214,17 @@ See `hermes claw migrate --help` for all options, or use the `openclaw-migration
 
 ---
 
+## Gateway process identity
+
+Gateway startup registers its authoritative `(pid, create_time)` identity in
+`spawn-ledger.json` after winning the PID/runtime-lock claim. The registration
+also records the install and active profile for update and reaper consumers;
+ledger failures are best-effort and never prevent gateway startup. The behavior
+is covered by `tests/gateway/test_gateway_spawn_ledger_registration.py` using an
+isolated ledger.
+
+---
+
 ## Contributing
 
 We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process.
