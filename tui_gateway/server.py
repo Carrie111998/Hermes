@@ -1215,9 +1215,17 @@ def _close_session_by_id(
     else:
         with _sessions_lock:
             current = _sessions.get(sid)
-            if current is None or not predicate(current):
-                return False
-            session = _pop_session_by_id(sid)
+        if current is None:
+            return False
+        with _queued_dispatch_gate(current):
+            with _sessions_lock:
+                current = _sessions.get(sid)
+                if current is None or not predicate(current):
+                    return False
+                current["_closing"] = True
+                _sessions.pop(sid, None)
+            current["_sid"] = sid
+            session = current
     return _teardown_popped_session(session, end_reason=end_reason)
 
 
@@ -1254,16 +1262,19 @@ def _interrupt_session_turn(
     dead client gets the same partial-history and queued-prompt semantics as an
     explicit user interrupt.
     """
-    use_compute_host = _session_uses_compute_host(session)
-    should_interrupt = bool(session.get("running"))
-    run_thread_alive = False
-
-    if not use_compute_host:
-        run_thread = session.get("_run_thread")
-        run_thread_alive = run_thread is not None and run_thread.is_alive()
-
     with _queued_dispatch_gate(session):
+        # Queue admission may have won while Stop waited for this gate. Read
+        # ownership only now so local and compute-host interruption targets the
+        # admitted turn rather than a stale pre-admission snapshot.
+        use_compute_host = _session_uses_compute_host(session)
         with session["history_lock"]:
+            should_interrupt = bool(session.get("running"))
+            run_thread = session.get("_run_thread")
+            run_thread_alive = (
+                not use_compute_host
+                and run_thread is not None
+                and run_thread.is_alive()
+            )
             session["_turn_cancel_requested"] = True
             session.pop("_queued_prompt_claimed", None)
             session["queued_prompt"] = None

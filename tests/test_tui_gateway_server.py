@@ -380,6 +380,47 @@ def test_compute_host_stop_publishes_cancel_before_interrupt(monkeypatch):
     ]
 
 
+def test_local_stop_rechecks_turn_after_waiting_for_queue_gate(monkeypatch):
+    started = threading.Event()
+    finished = threading.Event()
+    interrupted = []
+
+    class _RunThread:
+        def is_alive(self):
+            return True
+
+    session = _session(
+        agent=types.SimpleNamespace(
+            interrupt=lambda: interrupted.append("interrupted")
+        ),
+        running=False,
+        _run_thread=_RunThread(),
+    )
+    gate = server._queued_dispatch_gate(session)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(server, "_clear_pending", lambda _sid: None)
+
+    def _stop():
+        started.set()
+        server._interrupt_session_turn("local-stop", session)
+        finished.set()
+
+    stop_thread = threading.Thread(target=_stop)
+    gate.acquire()
+    try:
+        stop_thread.start()
+        assert started.wait(timeout=1)
+        assert not finished.wait(timeout=0.05)
+        session["running"] = True
+    finally:
+        gate.release()
+    stop_thread.join(timeout=1)
+
+    assert finished.is_set()
+    assert interrupted == ["interrupted"]
+    assert session["_turn_cancel_requested"] is True
+
+
 def test_compute_host_rejects_queued_submit_after_stop(monkeypatch):
     submitted = []
     session = _session(
@@ -12432,6 +12473,55 @@ def test_close_does_not_wait_for_running_queued_turn(monkeypatch):
         drain_thread.join(timeout=1)
         close_thread.join(timeout=1)
         server._sessions.pop("queue-gated-close", None)
+
+
+def test_predicate_reaper_and_dispatch_gate_have_one_lock_order(monkeypatch):
+    gate_owned = threading.Event()
+    let_dispatch_take_sessions = threading.Event()
+    dispatch_done = threading.Event()
+    reaper_done = threading.Event()
+    session = _session()
+    server._sessions["predicate-lock-order"] = session
+    monkeypatch.setattr(
+        server,
+        "_teardown_popped_session",
+        lambda *args, **kwargs: True,
+    )
+
+    def _dispatch_side():
+        with server._queued_dispatch_gate(session):
+            gate_owned.set()
+            assert let_dispatch_take_sessions.wait(timeout=1)
+            with server._sessions_lock:
+                pass
+        dispatch_done.set()
+
+    def _reaper_side():
+        server._close_session_by_id(
+            "predicate-lock-order",
+            predicate=lambda _session: True,
+        )
+        reaper_done.set()
+
+    dispatch_thread = threading.Thread(target=_dispatch_side)
+    reaper_thread = threading.Thread(target=_reaper_side)
+    try:
+        dispatch_thread.start()
+        assert gate_owned.wait(timeout=1)
+        reaper_thread.start()
+        let_dispatch_take_sessions.set()
+
+        dispatch_thread.join(timeout=1)
+        reaper_thread.join(timeout=1)
+
+        assert dispatch_done.is_set()
+        assert reaper_done.is_set()
+        assert "predicate-lock-order" not in server._sessions
+    finally:
+        let_dispatch_take_sessions.set()
+        dispatch_thread.join(timeout=1)
+        reaper_thread.join(timeout=1)
+        server._sessions.pop("predicate-lock-order", None)
 
 
 def test_session_redirect_queues_during_agent_build_window(monkeypatch):
