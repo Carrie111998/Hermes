@@ -35,6 +35,10 @@ from agent.auxiliary_client import (
     call_llm,
     extract_content_or_reasoning,
 )
+from agent.compression_static_fallback import (
+    static_summary_fallback,
+    static_summary_fallback_reason,
+)
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_sanitization import tool_result_id_variants
@@ -81,13 +85,6 @@ def _safe_int(value: Any) -> int | None:
 # compaction attempt makes (#96603) — there are no sibling digest calls.
 _SUMMARY_ROUTE_PIN: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
     contextvars.ContextVar("hermes_summary_route_pin", default=None)
-)
-
-# A host timeout fences the remote worker before it can publish.  Its local
-# retry must bypass the LLM without mutating shared compressor attributes that
-# the detached worker can still see, so keep the decision attempt-local.
-_STATIC_SUMMARY_FALLBACK_REASON: contextvars.ContextVar[Optional[str]] = (
-    contextvars.ContextVar("hermes_static_summary_fallback_reason", default=None)
 )
 
 # call_llm kwargs a pinned route may set. ``timeout`` lets a fallback entry
@@ -142,23 +139,6 @@ def _pinned_summary_call_kwargs() -> Dict[str, Any]:
         for field in _PINNED_ROUTE_FIELDS
         if route.get(field) not in (None, "")
     }
-
-
-@contextlib.contextmanager
-def static_summary_fallback(reason: str):
-    """Force one built-in compaction to use its deterministic handoff."""
-    token = _STATIC_SUMMARY_FALLBACK_REASON.set(
-        str(reason or "summary unavailable")
-    )
-    try:
-        yield
-    finally:
-        _STATIC_SUMMARY_FALLBACK_REASON.reset(token)
-
-
-def static_summary_fallback_reason() -> Optional[str]:
-    """Return the attempt-local reason for bypassing the summary LLM."""
-    return _STATIC_SUMMARY_FALLBACK_REASON.get()
 
 
 _SUMMARY_PERMANENT_QUOTA_MARKERS: tuple[str, ...] = (
@@ -5349,26 +5329,39 @@ This compaction should PRIORITISE preserving all information related to the focu
                 with aux_interrupt_protection():
                     response = call_llm(**call_kwargs)
             finally:
-                route_known = bool(_aux_route.get("provider") and _aux_route.get("model"))
-                _aux_provider = _aux_route.get("provider") or self.provider or ""
-                _aux_model = _aux_route.get("model") or self.summary_model or self.model or ""
-                _aux_context = (
-                    self.context_length
-                    if route_known and _aux_model == self.model
-                    else None
-                )
-                self._record_aux_compression_call(
-                    prompt_messages=call_kwargs["messages"],
-                    # Current main intentionally omits max_tokens from the aux
-                    # call (summary_budget is prompt-level guidance only) —
-                    # use .get() so the telemetry hook never breaks the call.
-                    max_tokens=call_kwargs.get("max_tokens"),
-                    duration_ms=int((time.monotonic() - _aux_call_start) * 1000),
-                    aux_provider=_aux_provider,
-                    aux_model=_aux_model,
-                    effective_aux_context=_aux_context,
-                    phase_timings=_latency_info,
-                )
+                # A host-fenced call may wake only after a newer local fallback
+                # owns this shared compressor. Do not let the stale worker write
+                # into the successor's active telemetry during its unwind.
+                if not self._compression_cancelled():
+                    route_known = bool(
+                        _aux_route.get("provider") and _aux_route.get("model")
+                    )
+                    _aux_provider = _aux_route.get("provider") or self.provider or ""
+                    _aux_model = (
+                        _aux_route.get("model")
+                        or self.summary_model
+                        or self.model
+                        or ""
+                    )
+                    _aux_context = (
+                        self.context_length
+                        if route_known and _aux_model == self.model
+                        else None
+                    )
+                    self._record_aux_compression_call(
+                        prompt_messages=call_kwargs["messages"],
+                        # Current main intentionally omits max_tokens from the aux
+                        # call (summary_budget is prompt-level guidance only) —
+                        # use .get() so the telemetry hook never breaks the call.
+                        max_tokens=call_kwargs.get("max_tokens"),
+                        duration_ms=int(
+                            (time.monotonic() - _aux_call_start) * 1000
+                        ),
+                        aux_provider=_aux_provider,
+                        aux_model=_aux_model,
+                        effective_aux_context=_aux_context,
+                        phase_timings=_latency_info,
+                    )
             if self._compression_cancelled():
                 raise AuxiliaryExplicitCancellation()
             # Dict/object/str messages + reasoning-field fallback (DeepSeek /
@@ -5441,6 +5434,12 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_truncated_failure = False
             return self._with_summary_prefix(summary)
         except Exception as e:
+            # A provider can raise only after the host has fenced this attempt
+            # and a deterministic fallback has committed on the same compressor.
+            # Exit before exception-path fallback, cooldown, iterative-summary,
+            # model-selection, or telemetry writes can clobber successor state.
+            if self._compression_cancelled():
+                raise AuxiliaryExplicitCancellation() from e
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
             #   1. No provider configured ("No LLM provider configured ...") —
             #      a permanent misconfiguration, long cooldown is correct.

@@ -149,8 +149,12 @@ class TestResolveContextCompressionTimeouts:
 
 
 class TestRunCompressContextWithProgressTimeout:
-    def test_total_ceiling_commits_builtin_static_fallback(self, monkeypatch):
-        """A wedged summary must still yield a committed local handoff."""
+    @pytest.mark.parametrize("timeout_path", ["total_ceiling", "no_progress"])
+    def test_static_fallback_fences_late_real_compressor_writes(
+        self, monkeypatch, timeout_path
+    ):
+        """A stale provider exception cannot mutate fallback-owned state."""
+        from agent.compression_static_fallback import static_summary_fallback_reason
         from agent.context_compressor import ContextCompressor
 
         with monkeypatch.context() as scoped:
@@ -158,59 +162,123 @@ class TestRunCompressContextWithProgressTimeout:
                 "agent.context_compressor.get_model_context_length",
                 lambda *_a, **_kw: 100_000,
             )
-            compressor = ContextCompressor(model="test/model", quiet_mode=True)
+            compressor = ContextCompressor(
+                model="test/model",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=1,
+            )
+            compressor.summary_model = "test/summary-model"
+            compressor._summary_model_fallen_back = False
+            original = [
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": f"message {i}: " + ("context " * 300),
+                }
+                for i in range(20)
+            ]
+            remote_started = threading.Event()
+            release_remote = threading.Event()
+            remote_worker_finished = threading.Event()
+            stop_progress = threading.Event()
+            llm_calls = []
+            committed_session = []
 
-        compressor.record_timeout_failure = MagicMock()
-        agent = SimpleNamespace(
-            context_compressor=compressor,
-            _hard_interrupt_requested=threading.Event(),
-            _emit_warning=MagicMock(),
-            _touch_activity=MagicMock(),
-        )
-        original = [{"role": "user", "content": "keep-me"}]
-        compressed = [{"role": "user", "content": "local handoff"}]
-        remote_started = threading.Event()
-        release_remote = threading.Event()
-        calls = []
+            def blocked_summary(**_kwargs):
+                llm_calls.append("summary")
+                remote_started.set()
+                assert release_remote.wait(timeout=15)
+                raise RuntimeError("late provider failure")
 
-        def worker(fence: CompressionCommitFence):
-            from agent.context_compressor import static_summary_fallback_reason
+            scoped.setattr("agent.context_compressor.call_llm", blocked_summary)
+            agent = SimpleNamespace(
+                context_compressor=compressor,
+                _hard_interrupt_requested=threading.Event(),
+                _emit_warning=MagicMock(),
+            )
 
-            reason = static_summary_fallback_reason()
-            calls.append(reason)
-            if reason:
-                assert fence.begin_commit()
+            def worker(fence: CompressionCommitFence):
+                is_fallback = bool(static_summary_fallback_reason())
+                progress_thread = None
+                if not is_fallback and timeout_path == "total_ceiling":
+                    def keep_progressing():
+                        while not stop_progress.wait(0.01):
+                            fence.touch_progress()
+
+                    progress_thread = threading.Thread(
+                        target=keep_progressing,
+                        name="compression-test-progress",
+                        daemon=True,
+                    )
+                    progress_thread.start()
                 try:
-                    return compressed, "fallback-prompt"
+                    if not is_fallback:
+                        compressor._compression_cancelled_check = lambda: fence.is_cancelled
+                    candidate = compressor.compress(
+                        list(original), current_tokens=999_999, force=True
+                    )
+                    if not fence.begin_commit():
+                        return original, "late"
+                    try:
+                        committed_session[:] = candidate
+                        return candidate, "fallback" if is_fallback else "remote"
+                    finally:
+                        fence.finish_commit()
                 finally:
-                    fence.finish_commit()
-            remote_started.set()
-            release_remote.wait(timeout=5)
-            if not fence.begin_commit():
-                return original, "late"
-            try:
-                return original, "late"
-            finally:
-                fence.finish_commit()
+                    if not is_fallback:
+                        stop_progress.set()
+                        if progress_thread is not None:
+                            progress_thread.join(timeout=1)
+                        remote_worker_finished.set()
 
-        try:
+            idle = 1.0
+            ceiling = 3.0 if timeout_path == "total_ceiling" else 4.0
             result = run_compress_context_with_progress_timeout(
                 worker=worker,
                 messages=original,
                 system_prompt_fallback="system",
-                idle_timeout_seconds=0.5,
-                total_ceiling_seconds=0.5,
+                idle_timeout_seconds=idle,
+                total_ceiling_seconds=ceiling,
                 telemetry_agent=agent,
             )
-        finally:
-            release_remote.set()
 
-        assert remote_started.wait(timeout=1)
-        assert result == (compressed, "fallback-prompt")
-        assert "total ceiling" in calls[-1]
-        assert calls[0] is None
-        compressor.record_timeout_failure.assert_called_once()
-        assert "local fallback" in agent._emit_warning.call_args.args[0].lower()
+            try:
+                assert remote_started.is_set()
+                assert not remote_worker_finished.is_set()
+                assert result[0] == committed_session
+                assert result[0] != original
+                assert compressor._last_summary_fallback_used is True
+                fallback_state = {
+                    "committed": list(committed_session),
+                    "previous_summary": compressor._previous_summary,
+                    "summary_model": compressor.summary_model,
+                    "model_fallen_back": compressor._summary_model_fallen_back,
+                    "aux_error": compressor._last_aux_model_failure_error,
+                    "aux_model": compressor._last_aux_model_failure_model,
+                    "last_error": compressor._last_summary_error,
+                    "cooldown": compressor._summary_failure_cooldown_until,
+                    "fallback_used": compressor._last_summary_fallback_used,
+                    "telemetry": dict(compressor._last_compression_telemetry or {}),
+                }
+            finally:
+                release_remote.set()
+                assert remote_worker_finished.wait(timeout=2)
+
+        assert llm_calls == ["summary"], "stale attempt launched a provider fallback"
+        assert compressor.summary_model == "test/summary-model"
+        assert compressor._summary_model_fallen_back is False
+        assert {
+            "committed": list(committed_session),
+            "previous_summary": compressor._previous_summary,
+            "summary_model": compressor.summary_model,
+            "model_fallen_back": compressor._summary_model_fallen_back,
+            "aux_error": compressor._last_aux_model_failure_error,
+            "aux_model": compressor._last_aux_model_failure_model,
+            "last_error": compressor._last_summary_error,
+            "cooldown": compressor._summary_failure_cooldown_until,
+            "fallback_used": compressor._last_summary_fallback_used,
+            "telemetry": dict(compressor._last_compression_telemetry or {}),
+        } == fallback_state
 
     def test_deadline_before_worker_start_uses_timeout_fallback(self, monkeypatch):
         original = [{"role": "user", "content": "keep-me"}]
