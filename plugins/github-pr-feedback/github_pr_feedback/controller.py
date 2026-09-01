@@ -1039,9 +1039,7 @@ class ScanController:
                     )
                 )
             else:
-                pull_requests = newest_pull_requests[:]
-                if len(newest_pull_requests) > MAX_PARALLEL_PR_READS:
-                    pull_requests = newest_pull_requests
+                pull_requests = newest_pull_requests
             required_local_ci_backlog += _required_local_ci_backlog_count(
                 self._policy,
                 self._ledger,
