@@ -8005,15 +8005,14 @@ class AIAgent:
             "ollama-launch",
             "local",
         }:
-            try:
-                from plugins.model_providers.custom import _looks_like_ollama_endpoint
-
-                if _looks_like_ollama_endpoint(self.base_url):
-                    return self._ollama_supports_thinking_cached()
-            except Exception:
-                # Capability discovery is advisory and must not make startup
-                # fail. The custom profile treats False as fail-closed.
-                return False
+            # Keep this detector self-contained: bundled model-provider
+            # plugins are loaded dynamically from a hyphenated directory and
+            # are not importable by their discovery alias before discovery
+            # has run. These are the same explicit Ollama signatures used by
+            # the custom profile (default port or an Ollama hostname).
+            base_url_lower = (self.base_url or "").strip().lower()
+            if ":11434" in base_url_lower or "ollama" in base_url_lower:
+                return self._ollama_supports_thinking_cached()
         # Ollama Cloud (and any Ollama-compatible server): the native
         # /api/show capabilities list is authoritative — emit reasoning_effort
         # only for models that declare the "thinking" capability. deepseek-v4
