@@ -664,8 +664,8 @@ class PlatformConfig:
     # noise; keep True for back-channels where the operator wants them.
     gateway_restart_notification: bool = True
 
-    # Whether the gateway sends the generic "Gateway online" announcement to
-    # this platform's configured home channel after a planned restart. This is
+    # Whether the gateway sends generic restart lifecycle announcements to
+    # this platform's configured home channel. This is
     # deliberately separate from gateway_restart_notification so disabling
     # operator-facing home-channel noise does not suppress the requester-facing
     # completion message for a direct /restart. Default True preserves prior

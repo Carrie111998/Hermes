@@ -881,6 +881,43 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
 
 
 @pytest.mark.asyncio
+async def test_home_channel_setting_suppresses_shutdown_broadcast():
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    platform_cfg = runner.config.platforms[Platform.TELEGRAM]
+    platform_cfg.home_channel_startup_notification = False
+    platform_cfg.gateway_restart_notification = True
+    platform_cfg.home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="group-home",
+        name="Shared Group",
+    )
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_home_channel_setting_keeps_active_direct_shutdown_notice():
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    platform_cfg = runner.config.platforms[Platform.TELEGRAM]
+    platform_cfg.home_channel_startup_notification = False
+    platform_cfg.gateway_restart_notification = True
+    platform_cfg.home_channel = HomeChannel(
+        platform=Platform.TELEGRAM,
+        chat_id="group-home",
+        name="Shared Group",
+    )
+    runner._running_agents["agent:main:telegram:dm:direct-chat"] = MagicMock()
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert [call[0] for call in adapter.sent_calls] == ["direct-chat"]
+
+
+@pytest.mark.asyncio
 async def test_restart_home_channel_notification_not_deduped_across_threads():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True

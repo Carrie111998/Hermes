@@ -11680,6 +11680,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             platform_cfg = self.config.platforms.get(platform)
+            if (
+                platform_cfg is not None
+                and not platform_cfg.home_channel_startup_notification
+            ):
+                logger.info(
+                    "Shutdown notification suppressed for home channel: %s has home_channel_startup_notification=false",
+                    platform.value,
+                )
+                continue
             if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                 logger.info(
                     "Shutdown notification suppressed for home channel: %s has gateway_restart_notification=false",
