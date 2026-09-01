@@ -2951,6 +2951,22 @@ class TestNewEndpoints:
         from tools.web_tools import _get_extract_backend
         assert _get_extract_backend() == "firecrawl"
 
+        # The config endpoint reports the *stored* pin, not the dispatch
+        # remap — "firecrawl" here would light the picker pill on the BYOK
+        # rows too (they share the vendor web_backend).
+        data = self.client.get("/api/tools/toolsets/web/config").json()
+        assert data["active_extract_backend"] == "nous"
+        # And the managed row is flagged so the GUI can match the pin on it
+        # (vendor rows carry no such flag).
+        nous_row = next(
+            r for r in data["providers"] if r["name"] == "Nous Subscription"
+        )
+        assert nous_row["managed_nous_feature"] == "web"
+        byok_row = next(
+            r for r in data["providers"] if r["name"] == "Firecrawl Self-Hosted"
+        )
+        assert "managed_nous_feature" not in byok_row
+
 
     def test_select_web_extract_on_selfhosted_row_still_writes_vendor(self):
         """The BYOK/self-hosted firecrawl rows keep writing their vendor
@@ -2964,6 +2980,11 @@ class TestNewEndpoints:
         from hermes_cli.config import load_config
         cfg = load_config()
         assert cfg["web"]["extract_backend"] == "firecrawl"
+
+        # A vendor pin keeps the dispatch value in the config endpoint too
+        # (no remap involved — stored value and resolved backend agree).
+        data = self.client.get("/api/tools/toolsets/web/config").json()
+        assert data["active_extract_backend"] == "firecrawl"
 
 
     # -- Terminal execution backend picker ---------------------------------

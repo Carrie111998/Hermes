@@ -309,6 +309,12 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
                         # the GUI can offer per-capability selection.
                         row["web_backend"] = prov["web_backend"]
                         row["capabilities"] = web_provider_capabilities(prov["web_backend"])
+                        if prov.get("managed_nous_feature"):
+                            # The managed row's web_backend is the vendor string
+                            # ("firecrawl"), shared with BYOK rows — this flag is
+                            # what lets the GUI pills tell the two apart when a
+                            # stored "nous" pin is active.
+                            row["managed_nous_feature"] = prov["managed_nous_feature"]
                     if name == "tts" and prov.get("tts_provider"):
                         # The provider key written to tts.provider on selection.
                         # Doubles as the config section holding the provider's
@@ -320,12 +326,34 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
                 # Resolve the per-capability active backends exactly the way the
                 # web_search / web_extract dispatchers do (per-capability key →
                 # shared web.backend → credential auto-detect), so the GUI badges
-                # reflect what a tool call would actually hit right now.
+                # reflect what a tool call would actually hit right now. The one
+                # exception is a stored "nous" pin: dispatch remaps it onto the
+                # firecrawl provider, but the picker pills need the pin itself to
+                # distinguish the managed Nous row from a BYOK firecrawl pick
+                # (both rows carry web_backend="firecrawl").
                 try:
-                    from tools.web_tools import _get_extract_backend, _get_search_backend
+                    from tools.tool_backend_helpers import NOUS_MANAGED_PROVIDER
+                    from tools.web_tools import (
+                        _get_extract_backend,
+                        _get_search_backend,
+                        _load_web_config,
+                    )
 
-                    active_search_backend = _get_search_backend()
-                    active_extract_backend = _get_extract_backend()
+                    def _gui_capability_backend(capability: str, resolved: str) -> str:
+                        try:
+                            stored = (
+                                _load_web_config().get(f"{capability}_backend") or ""
+                            ).lower().strip()
+                        except Exception:
+                            return resolved
+                        return stored if stored == NOUS_MANAGED_PROVIDER else resolved
+
+                    active_search_backend = _gui_capability_backend(
+                        "search", _get_search_backend()
+                    )
+                    active_extract_backend = _gui_capability_backend(
+                        "extract", _get_extract_backend()
+                    )
                 except Exception:
                     active_search_backend = None
                     active_extract_backend = None
