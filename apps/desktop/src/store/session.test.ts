@@ -719,6 +719,10 @@ describe('workspaceCwdForNewSession', () => {
     $currentCwd.set('')
     $activeSessionId.set(null)
     window.localStorage.removeItem('hermes.desktop.workspace-cwd')
+    // setCurrentCwd() now persists the per-profile local key
+    // (hermes.desktop.workspace-cwd.local.<profile>) — clear it too, or a
+    // remembered workspace leaks into the next test (#95194 review).
+    window.localStorage.removeItem('hermes.desktop.workspace-cwd.local.default')
     window.localStorage.removeItem('hermes.desktop.workspace-cwd.remote.http%3A%2F%2Fbackend-a.default')
     window.localStorage.removeItem('hermes.desktop.workspace-cwd.remote.http%3A%2F%2Fbackend-b.default')
     delete (window as { hermesDesktop?: unknown }).hermesDesktop
@@ -786,8 +790,25 @@ describe('workspaceCwdForNewSession', () => {
 
     applyConfiguredDefaultProjectDir('/home/user/configured')
 
-    expect(workspaceCwdForNewSession()).toBe('/home/user/configured')
+    // A remembered local-profile workspace is now honored for a new session
+    // (per-profile scoping, #81492) — it wins over the configured default.
+    expect(workspaceCwdForNewSession()).toBe('/home/user/repo/.worktrees/feature')
     expect($currentCwd.get()).toBe('/home/user/repo/.worktrees/feature')
+  })
+
+  it('does not leak a local profile workspace across profile switches', () => {
+    // Per-profile scoping of the local workspace key (#81492): profile A's
+    // remembered cwd must not become profile B's, and vice versa.
+    $connection.set({ mode: 'local', profile: 'profile-a' } as never)
+    setCurrentCwd('/home/user/a/repo')
+
+    expect(workspaceCwdForNewSession()).toBe('/home/user/a/repo')
+
+    $connection.set({ mode: 'local', profile: 'profile-b' } as never)
+    expect(workspaceCwdForNewSession()).toBe('')
+
+    $connection.set({ mode: 'local', profile: 'profile-a' } as never)
+    expect(workspaceCwdForNewSession()).toBe('/home/user/a/repo')
   })
 
   it('starts detached (no inherited cwd) when no default project dir is configured', () => {
