@@ -930,6 +930,8 @@ def _ci_receipt_payload(receipt: CIAuditReceipt) -> dict[str, object]:
 
 def _audit_pr(ctx: Any, args: argparse.Namespace) -> int:
     handoff_completed = False
+    handoff_blocked = False
+    handoff_blockers: list[str] = []
     merge_handoff: dict[str, object] | None = None
     try:
         policy = _load_policy_from_context(ctx)
@@ -991,9 +993,29 @@ def _audit_pr(ctx: Any, args: argparse.Namespace) -> int:
                     receipt.identity.pr_number,
                     github=github,
                 )
-            _complete_current_ci_task(receipt)
-            handoff_completed = True
+                handoff_status = str(merge_handoff.get("status", ""))
+                if handoff_status == "blocked":
+                    raw_blockers = merge_handoff.get("blockers", [])
+                    if isinstance(raw_blockers, list):
+                        handoff_blockers = [str(blocker) for blocker in raw_blockers]
+                    _block_current_ci_task(receipt, handoff_blockers)
+                    handoff_blocked = True
+                elif handoff_status != "merged":
+                    raise RuntimeError(
+                        "merge handoff did not produce a durable successor: "
+                        f"{handoff_status}"
+                    )
+            if not handoff_blocked:
+                _complete_current_ci_task(receipt)
+                handoff_completed = True
         except (CIValidationError, GitHubClientError, RuntimeError):
+            if not handoff_blocked:
+                try:
+                    _block_current_ci_task(
+                        receipt, ["transient_handoff_failure"], kind="transient"
+                    )
+                except RuntimeError:
+                    pass
             print(
                 json.dumps(
                     {
@@ -1007,8 +1029,21 @@ def _audit_pr(ctx: Any, args: argparse.Namespace) -> int:
             )
             return_code = 1
         else:
-            return_code = 0 if receipt.status == "passed" else 1
-        if merge_handoff is not None:
+            return_code = 1 if handoff_blocked else (0 if receipt.status == "passed" else 1)
+        if handoff_blocked:
+            print(
+                json.dumps(
+                    {
+                        "status": "audit_handoff_blocked",
+                        "receipt_id": receipt.receipt_id,
+                        "blockers": handoff_blockers,
+                        "retryable": False,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        if merge_handoff is not None and not handoff_blocked:
             print(
                 json.dumps(
                     {
@@ -1086,6 +1121,42 @@ def _complete_current_ci_task(receipt: CIAuditReceipt) -> None:
         raise RuntimeError("Hermes runtime unavailable for Kanban audit completion") from exc
     if completed.returncode != 0:
         raise RuntimeError("Kanban audit completion failed")
+
+
+def _block_current_ci_task(
+    receipt: CIAuditReceipt,
+    blockers: list[str],
+    *,
+    kind: str | None = None,
+) -> None:
+    """Persist a blocked or transient handoff on the current Kanban task."""
+
+    task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
+    if not task_id:
+        return
+    board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+    reason = f"Exact-head CI receipt {receipt.receipt_id}: "
+    reason += ", ".join(blockers) if blockers else "handoff did not complete"
+    argv = [sys.executable, "-m", "hermes_cli.main", "kanban"]
+    if board:
+        argv.extend(["--board", board])
+    argv.extend(["block", task_id])
+    if kind is not None:
+        argv.extend(["--kind", kind])
+    argv.append(reason)
+    try:
+        completed = subprocess.run(
+            argv,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+        )
+    except OSError as exc:
+        raise RuntimeError("Hermes runtime unavailable for Kanban audit block") from exc
+    if completed.returncode != 0:
+        raise RuntimeError("Kanban audit block failed")
 
 
 def _terminate_current_ci_worker() -> None:

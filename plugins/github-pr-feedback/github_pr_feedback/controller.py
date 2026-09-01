@@ -51,6 +51,8 @@ LOCAL_CI_FEEDBACK_ID = "local-ci-audit-v2"
 _ADDITIONAL_GOVERNED_VENV_ROOTS = (Path("/Users/mikedemott/TradingBotV18/.venv"),)
 _SHA = re.compile(r"^[0-9a-fA-F]{40,64}$")
 DEFAULT_CLAIM_LEASE = timedelta(minutes=5)
+LOCAL_CI_RETRY_BACKOFF = timedelta(minutes=5)
+LOCAL_CI_RETRY_MAX_ATTEMPTS = 8
 _SELF_RESOLUTION_PREFIXES = (
     "addressed ",
     "implemented in ",
@@ -1191,7 +1193,7 @@ class ScanController:
                         pass
                     elif feedback_pending:
                         skipped["feedback_pending"] += 1
-                    elif local_ci_receipt_status is not None:
+                    elif local_ci_receipt_status in {"claimed", "completed"}:
                         skipped["local_ci_exact_head_seen"] += 1
                     elif actions_state_unavailable:
                         skipped["github_ci_state_unavailable"] += 1
@@ -1203,7 +1205,9 @@ class ScanController:
                         skipped["admission_cap"] += 1
                     else:
                         audit_error = self._dispatch_local_ci(
-                            pull_request, current=current
+                            pull_request,
+                            current=current,
+                            retry_failed=local_ci_receipt_status == "failed",
                         )
                         if audit_error != "duplicate":
                             attempted += 1
@@ -1472,7 +1476,11 @@ class ScanController:
 
 
     def _dispatch_local_ci(
-        self, listed: PullRequest, *, current: PullRequest | None = None
+        self,
+        listed: PullRequest,
+        *,
+        current: PullRequest | None = None,
+        retry_failed: bool = False,
     ) -> str | None:
         audit_policy = self._policy.local_ci_audit
         if audit_policy is None:
@@ -1505,16 +1513,25 @@ class ScanController:
             head_sha=current.head_sha,
         )
         claimed_at = self._clock()
-        lease = _claim_with_orphan_recovery(
-            self._ledger,
-            self._kanban,
-            receipt,
-            board=self._policy.board or "",
-            owner=self._claim_owner,
-            claimed_at=claimed_at,
-            stale_before=claimed_at - self._claim_lease,
-            exact_dispatch_only=True,
-        )
+        if retry_failed:
+            lease = self._ledger.retry(
+                receipt,
+                owner=self._claim_owner,
+                claimed_at=claimed_at,
+                retry_after=LOCAL_CI_RETRY_BACKOFF,
+                max_attempts=LOCAL_CI_RETRY_MAX_ATTEMPTS,
+            )
+        else:
+            lease = _claim_with_orphan_recovery(
+                self._ledger,
+                self._kanban,
+                receipt,
+                board=self._policy.board or "",
+                owner=self._claim_owner,
+                claimed_at=claimed_at,
+                stale_before=claimed_at - self._claim_lease,
+                exact_dispatch_only=True,
+            )
         if lease is None:
             return "duplicate"
         self._ledger.record_expected_head(receipt, lease, receipt.head_sha)
@@ -1556,7 +1573,12 @@ class ScanController:
                     file=sys.stderr,
                 )
             try:
-                self._ledger.fail(receipt, str(error) or "task creation failed", lease)
+                self._ledger.fail(
+                    receipt,
+                    str(error) or "task creation failed",
+                    lease,
+                    failed_at=self._clock(),
+                )
             except LedgerStateError:
                 pass
             if isinstance(error, ExactHeadUnavailable):
@@ -2279,12 +2301,12 @@ def _select_local_ci_candidates(
     target: RepositoryTarget,
     pull_requests: tuple[PullRequest, ...],
 ) -> tuple[PullRequest, ...]:
-    """Select a bounded local-CI window without starving old missing heads.
+    """Select a bounded, round-robin local-CI window without starvation.
 
     The primary PR listing has already been fetched, so this performs no
-    additional GitHub reads. Oldest-first applies only to admitted PRs without
-    a passed receipt for the current base/head/manifest; the remaining slots
-    retain the normal newest-first order for timely feedback processing.
+    additional GitHub reads. Failed dispatches are retried before never-tried
+    heads, while a durable per-repository cursor rotates the bounded window
+    across both groups so either group eventually gets selected.
     """
 
     audit_policy = policy.local_ci_audit
@@ -2294,22 +2316,47 @@ def _select_local_ci_candidates(
     if len(pull_requests) <= limit:
         return pull_requests
 
-    backlog = tuple(
-        pull
-        for pull in pull_requests
-        if policy.admit_pull_request(pull).admitted
-        and not _has_current_passed_ci_receipt(ledger, target, pull)
-    )
+    backlog: list[tuple[PullRequest, int, int]] = []
+    for pull in pull_requests:
+        if not policy.admit_pull_request(pull).admitted:
+            continue
+        if _has_current_passed_ci_receipt(ledger, target, pull):
+            continue
+        state = ledger.exact_receipt_state(
+            FeedbackReceipt(
+                repository=pull.base_repository,
+                pr_number=pull.number,
+                feedback_kind="pr_local_ci",
+                feedback_id=_local_ci_feedback_id(pull),
+                head_sha=pull.head_sha,
+            )
+        )
+        if state is not None and state[0] in {"claimed", "completed"}:
+            continue
+        status_rank = 0 if state is not None and state[0] == "failed" else 1
+        attempts = 0 if state is None else state[1]
+        backlog.append((pull, status_rank, attempts))
     backlog = tuple(
         sorted(
             backlog,
-            key=lambda pull: (
-                pull.updated_at or datetime.min.replace(tzinfo=UTC),
-                pull.number,
+            key=lambda item: (
+                item[1],
+                item[0].number,
+                item[2],
             ),
         )
     )
-    selected = list(backlog[:limit])
+    if not backlog:
+        return pull_requests[:limit]
+    cursor = ledger.local_ci_selection_cursor(target.base_repository) % len(backlog)
+    rotated = backlog[cursor:] + backlog[:cursor]
+    selected = [item[0] for item in rotated[:limit]]
+    ledger.advance_local_ci_selection_cursor(
+        target.base_repository,
+        cursor=cursor + limit,
+        candidate_count=len(backlog),
+        updated_at=datetime.now(UTC),
+    )
     selected_keys = {(pull.number, pull.head_sha.casefold()) for pull in selected}
     if len(selected) < limit:
         for pull in pull_requests:
