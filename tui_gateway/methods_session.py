@@ -741,6 +741,7 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 lazy=True,
                 todo_state=_todo_state_from_history(history),
+                explicit_cwd=bool(profile_resume_cwd),
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _reuse_live_response(*live)
@@ -823,6 +824,7 @@ def _(rid, params: dict) -> dict:
                     resume_runtime_overrides=overrides or None,
                     conversation_worktree=resume_conversation_worktree,
                     conversation_root_lease=resume_root_lease,
+                    explicit_cwd=bool(profile_resume_cwd),
                 )
             except Exception as exc:
                 if resume_root_lease is not None:
@@ -940,6 +942,7 @@ def _(rid, params: dict) -> dict:
                     conversation_worktree=resume_conversation_worktree,
                     conversation_root_lease=resume_root_lease,
                     todo_state=_todo_state_from_history(history),
+                    explicit_cwd=bool(profile_resume_cwd),
                 )
             except Exception as exc:
                 if resume_root_lease is not None:
@@ -1031,6 +1034,10 @@ def _(rid, params: dict) -> dict:
                     session_id=target,
                     session_db=db,
                     platform_override=source,
+                    context_cwd_is_launch_artifact=(
+                        source in _LAUNCH_CWD_NOT_A_WORKSPACE
+                        and not profile_resume_cwd
+                    ),
                     conversation_worktree=resume_conversation_worktree or None,
                     **stored_runtime_overrides,
                 )
@@ -1089,6 +1096,7 @@ def _(rid, params: dict) -> dict:
                         cwd=profile_resume_cwd,
                         session_db=db,
                         source=source,
+                        explicit_cwd=bool(profile_resume_cwd),
                         conversation_worktree=resume_conversation_worktree or None,
                         conversation_root_lease=resume_root_lease,
                     )
@@ -3431,11 +3439,13 @@ def _(rid, params: dict) -> dict:
                 cwd=branch_cwd,
                 # The branch stays on its parent's profile. Explicit stamp (not
                 # just the parent-backfill) so it holds even when the parent row
-                # predates the profile_name column.
+                # predates the profile_name column. Launch-profile branches are
+                # stamped explicitly too — NULL rows drop out of profile-keyed
+                # sidebar matching and deep-link resolution (#99222).
                 profile_name=(
                     Path(session["profile_home"]).name
                     if session.get("profile_home")
-                    else None
+                    else _current_profile_name()
                 ),
             )
             # Copy the whole parent history in bounded-chunk transactions —
@@ -3520,6 +3530,9 @@ def _(rid, params: dict) -> dict:
                     session_id=new_key,
                     session_db=branch_db,
                     platform_override=source,
+                    context_cwd_is_launch_artifact=(
+                        _context_cwd_is_launch_artifact(session)
+                    ),
                     conversation_worktree=conversation_worktree or None,
                 )
             finally:
@@ -3534,6 +3547,7 @@ def _(rid, params: dict) -> dict:
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,
+                explicit_cwd=bool(session.get("explicit_cwd")),
                 conversation_worktree=conversation_worktree or None,
                 conversation_root_lease=conversation_root_lease,
             )
