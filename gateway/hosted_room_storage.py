@@ -21,6 +21,7 @@ from gateway.hosted_room_contract import (
     RoomHistoryExpiredError,
     RoomNotFoundError,
     RoomQuarantinedError,
+    _DISBAND_FENCE_SCHEMA_COLUMNS,
     _EVENT_SCHEMA_COLUMNS,
     _EVENT_BUDGET_SCHEMA_COLUMNS,
     _LINK_SCHEMA_COLUMNS,
@@ -172,6 +173,24 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (room_id, member_id)
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS hosted_room_disband_fences (
+            room_id TEXT PRIMARY KEY,
+            authority_gateway_id TEXT NOT NULL,
+            authority_epoch INTEGER NOT NULL CHECK (authority_epoch >= 1),
+            started_at REAL NOT NULL,
+            revocation_complete_at REAL
+        )"""
+    )
+    disband_fence_columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(hosted_room_disband_fences)")
+    }
+    if "revocation_complete_at" not in disband_fence_columns:
+        conn.execute(
+            "ALTER TABLE hosted_room_disband_fences "
+            "ADD COLUMN revocation_complete_at REAL"
+        )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS hosted_room_remote_runs (
             room_id TEXT NOT NULL,
@@ -579,6 +598,49 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
                   )
                 WHERE singleton=1;
            END""",
+        """CREATE TRIGGER IF NOT EXISTS trg_hosted_room_links_reject_fenced_insert
+           BEFORE INSERT ON hosted_room_links
+           WHEN EXISTS (
+               SELECT 1 FROM hosted_room_disband_fences
+                WHERE room_id=NEW.room_id
+           )
+           OR EXISTS (
+               SELECT 1 FROM hosted_rooms
+                WHERE room_id=NEW.room_id AND disbanded_at IS NOT NULL
+           )
+           OR EXISTS (
+               SELECT 1 FROM hosted_room_retired_ids
+                WHERE room_id=NEW.room_id
+           )
+           BEGIN
+               SELECT RAISE(ABORT, 'Group Chat route registration is fenced');
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS trg_hosted_room_links_reject_fenced_update
+           BEFORE UPDATE ON hosted_room_links
+           WHEN EXISTS (
+               SELECT 1 FROM hosted_room_disband_fences
+                WHERE room_id=NEW.room_id
+           )
+           OR EXISTS (
+               SELECT 1 FROM hosted_rooms
+                WHERE room_id=NEW.room_id AND disbanded_at IS NOT NULL
+           )
+           OR EXISTS (
+               SELECT 1 FROM hosted_room_retired_ids
+                WHERE room_id=NEW.room_id
+           )
+           BEGIN
+               SELECT RAISE(ABORT, 'Group Chat route registration is fenced');
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS trg_hosted_room_links_reject_unrevoked_delete
+           BEFORE DELETE ON hosted_room_links
+           WHEN NOT EXISTS (
+               SELECT 1 FROM hosted_room_disband_fences
+                WHERE room_id=OLD.room_id AND revocation_complete_at IS NOT NULL
+           )
+            BEGIN
+                SELECT RAISE(ABORT, 'Group Chat routes are not revoked');
+           END""",
     ):
         conn.execute(trigger)
     _compact_over_budget_replicas_locked(conn)
@@ -598,6 +660,10 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     )
     link_columns = frozenset(
         row[1] for row in conn.execute("PRAGMA table_info(hosted_room_links)")
+    )
+    disband_fence_columns = frozenset(
+        row[1]
+        for row in conn.execute("PRAGMA table_info(hosted_room_disband_fences)")
     )
     remote_run_columns = frozenset(
         row[1] for row in conn.execute("PRAGMA table_info(hosted_room_remote_runs)")
@@ -631,6 +697,8 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     if not _RETIRED_ROOM_SCHEMA_COLUMNS.issubset(retired_room_columns):
         return False
     if not _LINK_SCHEMA_COLUMNS.issubset(link_columns):
+        return False
+    if not _DISBAND_FENCE_SCHEMA_COLUMNS.issubset(disband_fence_columns):
         return False
     if not _REMOTE_RUN_SCHEMA_COLUMNS.issubset(remote_run_columns):
         return False
@@ -666,6 +734,144 @@ def _schema_is_current(conn: sqlite3.Connection) -> bool:
     return index is not None and _ROOM_SAFETY_TRIGGERS.issubset(triggers)
 
 
+def room_link_record(
+    db_path: Path | str,
+    *,
+    room_id: str,
+    member_id: str,
+) -> dict[str, Any] | None:
+    """Return one private RoomLink record by its exact identity."""
+
+    with _transaction(db_path) as conn:
+        row = conn.execute(
+            """SELECT room_id, member_id, target_url, target_profile, grant,
+                      catalog_json, cancellation_scope_id, trace_id,
+                      transport_security, status, updated_at
+                 FROM hosted_room_links
+                WHERE room_id=? AND member_id=?""",
+            (room_id, member_id),
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def begin_room_link_retirement(
+    db_path: Path | str,
+    *,
+    room_id: str,
+    authority_gateway_id: str,
+    authority_epoch: int,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Fence new route writes before remote revocation and room disband."""
+
+    room_id = _validate_identifier(
+        room_id,
+        label="room_id",
+        max_chars=MAX_ROOM_ID_CHARS,
+    )
+    authority_gateway_id = _validate_identifier(
+        authority_gateway_id,
+        label="authority_gateway_id",
+        max_chars=MAX_ACTOR_ID_CHARS,
+    )
+    if (
+        isinstance(authority_epoch, bool)
+        or not isinstance(authority_epoch, int)
+        or authority_epoch < 1
+    ):
+        raise HostedRoomError("authority_epoch must be a positive integer")
+    timestamp = float(time.time() if now is None else now)
+    with _transaction(db_path, immediate=True) as conn:
+        room = conn.execute(
+            """SELECT authority_gateway_id, authority_epoch
+                 FROM hosted_rooms
+                WHERE room_id=?""",
+            (room_id,),
+        ).fetchone()
+        lineage = (authority_gateway_id, authority_epoch)
+        if (
+            room is not None
+            and (str(room["authority_gateway_id"]), int(room["authority_epoch"]))
+            != lineage
+        ):
+            raise AuthorityConflictError("Group Chat route fence authority changed")
+        existing = conn.execute(
+            """SELECT authority_gateway_id, authority_epoch, started_at,
+                      revocation_complete_at
+                 FROM hosted_room_disband_fences WHERE room_id=?""",
+            (room_id,),
+        ).fetchone()
+        if existing is not None:
+            if (
+                str(existing["authority_gateway_id"]),
+                int(existing["authority_epoch"]),
+            ) != lineage:
+                raise AuthorityConflictError("Group Chat route fence authority changed")
+            return dict(existing)
+        conn.execute(
+            """INSERT INTO hosted_room_disband_fences(
+                   room_id, authority_gateway_id, authority_epoch, started_at
+               ) VALUES (?, ?, ?, ?)""",
+            (room_id, *lineage, timestamp),
+        )
+        return {
+            "room_id": room_id,
+            "authority_gateway_id": lineage[0],
+            "authority_epoch": lineage[1],
+            "started_at": timestamp,
+            "revocation_complete_at": None,
+        }
+
+
+def room_link_retirement_started(db_path: Path | str, *, room_id: str) -> bool:
+    """Return whether this room has crossed the no-new-route boundary."""
+
+    with _transaction(db_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM hosted_room_disband_fences WHERE room_id=?",
+            (room_id,),
+        ).fetchone()
+    return row is not None
+
+
+def complete_room_link_retirement(
+    db_path: Path | str,
+    *,
+    room_id: str,
+    authority_gateway_id: str,
+    authority_epoch: int,
+    now: float | None = None,
+) -> None:
+    """Allow route deletion only after every remote grant was revoked."""
+
+    room_id = _validate_identifier(
+        room_id,
+        label="room_id",
+        max_chars=MAX_ROOM_ID_CHARS,
+    )
+    authority_gateway_id = _validate_identifier(
+        authority_gateway_id,
+        label="authority_gateway_id",
+        max_chars=MAX_ACTOR_ID_CHARS,
+    )
+    if (
+        isinstance(authority_epoch, bool)
+        or not isinstance(authority_epoch, int)
+        or authority_epoch < 1
+    ):
+        raise HostedRoomError("authority_epoch must be a positive integer")
+    timestamp = float(time.time() if now is None else now)
+    with _transaction(db_path, immediate=True) as conn:
+        cursor = conn.execute(
+            """UPDATE hosted_room_disband_fences
+                  SET revocation_complete_at=COALESCE(revocation_complete_at, ?)
+                WHERE room_id=? AND authority_gateway_id=? AND authority_epoch=?""",
+            (timestamp, room_id, authority_gateway_id, authority_epoch),
+        )
+        if cursor.rowcount != 1:
+            raise AuthorityConflictError("Group Chat route fence authority changed")
+
+
 def list_room_link_records(db_path: Path | str) -> list[dict[str, Any]]:
     """Return private RoomLink records without logging or formatting grants."""
     with _transaction(db_path) as conn:
@@ -687,6 +893,12 @@ def upsert_room_link_record(
 ) -> None:
     """Atomically insert or replace one private RoomLink record."""
     with _transaction(db_path, immediate=True) as conn:
+        fenced = conn.execute(
+            "SELECT 1 FROM hosted_room_disband_fences WHERE room_id=?",
+            (record["room_id"],),
+        ).fetchone()
+        if fenced is not None:
+            raise HostedRoomError("Group Chat route registration is fenced")
         existing = conn.execute(
             "SELECT 1 FROM hosted_room_links WHERE room_id=? AND member_id=?",
             (record["room_id"], record["member_id"]),

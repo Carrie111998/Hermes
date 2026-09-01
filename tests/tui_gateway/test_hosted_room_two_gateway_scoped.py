@@ -113,9 +113,9 @@ async def test_in_process_scoped_transport_contract_finishes_headlessly(
     home = HostedRoomService(
         _server_module(),
         db_path=tmp_path / "home-state.db",
-        peer_routes={("room-1", "member-peer"): route},
-        peer_clients={catalog["installation_id"]: client},
     )
+    home.peer_routes[("room-1", "member-peer")] = route
+    home.peer_clients[("room-1", "member-peer")] = client
     home.rpc = _LocalRPC()
     home.runtime.rpc = home.rpc
     home.local_profiles = lambda: ("local",)

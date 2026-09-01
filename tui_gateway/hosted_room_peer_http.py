@@ -981,33 +981,43 @@ class PeerRunsHTTPClient:
         replacement = str(refreshed.get("grant") or "")
         if not replacement:
             raise PeerRunsHTTPError("peer returned no refreshed room grant")
-        # Persist only after the target proves the replacement can authorize
-        # the same scoped capability endpoint.
-        probe = self.probe(grant=replacement)
-        from gateway.hosted_room_peer import GatewayRoomCatalog
+        try:
+            # Persist only after the target proves the replacement can authorize
+            # the same scoped capability endpoint.
+            probe = self.probe(grant=replacement)
+            from gateway.hosted_room_peer import GatewayRoomCatalog
 
-        catalog = GatewayRoomCatalog.from_mapping(probe.get("catalog"))
-        if (
-            execution_policy_digest is not None
-            and catalog.execution_policy.policy_digest
-            != execution_policy_digest
-        ):
-            raise PeerRunsHTTPError(
-                "peer room execution policy needs reauthorization",
-                status_code=403,
-                error_code="room_execution_policy_changed",
-                not_admitted=True,
-            )
-        if (
-            capability_digest is not None
-            and catalog.catalog_digest != capability_digest
-        ):
-            raise PeerRunsHTTPError(
-                "peer room capabilities need reauthorization",
-                status_code=403,
-                error_code="room_capability_catalog_changed",
-                not_admitted=True,
-            )
+            catalog = GatewayRoomCatalog.from_mapping(probe.get("catalog"))
+            if (
+                execution_policy_digest is not None
+                and catalog.execution_policy.policy_digest
+                != execution_policy_digest
+            ):
+                raise PeerRunsHTTPError(
+                    "peer room execution policy needs reauthorization",
+                    status_code=403,
+                    error_code="room_execution_policy_changed",
+                    not_admitted=True,
+                )
+            if (
+                capability_digest is not None
+                and catalog.catalog_digest != capability_digest
+            ):
+                raise PeerRunsHTTPError(
+                    "peer room capabilities need reauthorization",
+                    status_code=403,
+                    error_code="room_capability_catalog_changed",
+                    not_admitted=True,
+                )
+        except Exception:
+            try:
+                self.revoke_grant(grant=replacement)
+            except Exception:
+                logger.warning(
+                    "Could not revoke an unpublished refreshed room grant",
+                    exc_info=True,
+                )
+            raise
         return {**refreshed, "catalog": probe.get("catalog")}
 
     def revoke_grant(self, *, grant: str) -> Mapping[str, Any]:

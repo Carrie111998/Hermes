@@ -909,11 +909,16 @@ def test_grant_refresh_rejects_catalog_or_policy_drift(
         api_key="",
     )
 
+    requests = []
+
     def request(path, **_kwargs):
+        requests.append(path)
         if path == "/v1/room-members/grants/refresh":
             return {"grant": "replacement.room.grant"}
-        assert path == "/v1/room-members/capabilities"
-        return {"catalog": refreshed}
+        if path == "/v1/room-members/capabilities":
+            return {"catalog": refreshed}
+        assert path == "/v1/room-members/grants/revoke"
+        return {"revoked": True}
 
     client._request = request
     with pytest.raises(PeerRunsHTTPError) as caught:
@@ -926,6 +931,7 @@ def test_grant_refresh_rejects_catalog_or_policy_drift(
     assert caught.value.error_code == error_code
     assert caught.value.needs_reauthorization is True
     assert caught.value.not_admitted is True
+    assert requests[-1] == "/v1/room-members/grants/revoke"
 
 
 def test_grant_refresh_preserves_unchanged_catalog_and_policy():
