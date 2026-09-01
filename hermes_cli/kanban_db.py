@@ -3710,7 +3710,13 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
+def assign_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    profile: Optional[str],
+    *,
+    reason: Optional[str] = None,
+) -> bool:
     """Assign or reassign a task.  Returns True on success.
 
     Refuses to reassign a task that's currently running (claim_lock set).
@@ -3719,14 +3725,23 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     profile = _canonical_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, block_kind FROM tasks WHERE id = ?",
+            (task_id,),
         ).fetchone()
         if not row:
             return False
-        if row["claim_lock"] is not None and row["status"] == "running":
+        if row["status"] in {"done", "archived"}:
+            raise RuntimeError(
+                f"cannot reassign {task_id}: status is {row['status']}"
+            )
+        if row["status"] == "running" or row["claim_lock"] is not None:
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
-                "Wait for completion or reclaim the stale lock first."
+                "Reclaim or stop the worker first."
+            )
+        if row["status"] == "blocked" and row["block_kind"] == "needs_input":
+            raise RuntimeError(
+                f"cannot reassign {task_id}: blocked on a real human action"
             )
         if row["assignee"] != profile:
             # The retry guard is scoped to the task/profile combination. A
@@ -3739,7 +3754,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             )
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        _append_event(conn, task_id, "assigned", {"assignee": profile})
+        payload = {"assignee": profile}
+        if reason:
+            payload["reason"] = reason
+        _append_event(conn, task_id, "assigned", payload)
     # Task-mutation observer (RFC #58548), fired AFTER the assignment txn
     # has committed so subscribers always observe durable board state.
     notify_task_updated(conn, task_id, ("assignee",))
@@ -7547,6 +7565,195 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # Reap the workspace on archive too — tasks archived without ever
     # completing previously kept their scratch dir / worktree forever.
     _cleanup_workspace(conn, task_id)
+    return True
+
+
+def supersede_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    replacement_task_id: Optional[str] = None,
+) -> dict:
+    """Archive obsolete work without accidentally releasing its children."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("reason is required")
+    replacement_task_id = (replacement_task_id or "").strip() or None
+
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, claim_lock, block_kind FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not task:
+            raise ValueError(f"unknown task: {task_id}")
+        if task["status"] in {"done", "archived"}:
+            raise RuntimeError(
+                f"cannot supersede {task_id}: status is {task['status']}"
+            )
+        if task["status"] == "running" or task["claim_lock"] is not None:
+            raise RuntimeError(f"cannot supersede {task_id}: task is running")
+        if task["status"] == "blocked" and task["block_kind"] == "needs_input":
+            raise RuntimeError(
+                f"cannot supersede {task_id}: blocked on a real human action"
+            )
+
+        children = child_ids(conn, task_id)
+        open_parents = [
+            row["parent_id"]
+            for row in conn.execute(
+                "SELECT l.parent_id FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') "
+                "ORDER BY l.parent_id",
+                (task_id,),
+            ).fetchall()
+        ]
+        if children and not replacement_task_id:
+            raise RuntimeError(
+                f"cannot supersede {task_id}: {len(children)} child task(s) "
+                "require an active replacement"
+            )
+
+        if replacement_task_id:
+            if replacement_task_id == task_id:
+                raise RuntimeError(f"task {task_id} cannot replace itself")
+            replacement = conn.execute(
+                "SELECT status, claim_lock FROM tasks WHERE id = ?",
+                (replacement_task_id,),
+            ).fetchone()
+            if not replacement:
+                raise ValueError(f"unknown replacement task: {replacement_task_id}")
+            if replacement["status"] in {"done", "archived"}:
+                raise RuntimeError(
+                    "replacement task must be active so it continues blocking children"
+                )
+            if replacement["status"] == "running" or replacement["claim_lock"] is not None:
+                raise RuntimeError("replacement task is running; stop or reclaim it first")
+            for child_id in children:
+                if replacement_task_id == child_id or _would_cycle(
+                    conn, replacement_task_id, child_id
+                ):
+                    raise RuntimeError(
+                        f"replacement {replacement_task_id} cannot safely parent {child_id}"
+                    )
+
+            relinked_parent_ids = []
+            for parent_id in open_parents:
+                if parent_id == replacement_task_id:
+                    continue
+                if _would_cycle(conn, parent_id, replacement_task_id):
+                    raise RuntimeError(
+                        f"parent {parent_id} cannot safely parent replacement "
+                        f"{replacement_task_id}"
+                    )
+                inserted = conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                    (parent_id, replacement_task_id),
+                )
+                if inserted.rowcount != 1:
+                    continue
+                relinked_parent_ids.append(parent_id)
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                    (replacement_task_id,),
+                )
+                _append_event(
+                    conn,
+                    replacement_task_id,
+                    "linked",
+                    {"parent": parent_id, "child": replacement_task_id},
+                )
+                _inherit_notify_subs(conn, replacement_task_id, (parent_id,))
+
+            relinked_children = []
+            for child_id in children:
+                inserted = conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                    (replacement_task_id, child_id),
+                )
+                if inserted.rowcount != 1:
+                    continue
+                relinked_children.append(child_id)
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                    (child_id,),
+                )
+                _append_event(
+                    conn,
+                    child_id,
+                    "linked",
+                    {"parent": replacement_task_id, "child": child_id},
+                )
+                _inherit_notify_subs(conn, child_id, (replacement_task_id,))
+        else:
+            relinked_parent_ids = []
+            relinked_children = []
+
+        conn.execute(
+            "UPDATE tasks SET status = 'archived', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+            (task_id,),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "superseded",
+            {
+                "reason": reason,
+                "replacement_task_id": replacement_task_id,
+                "relinked_parent_ids": relinked_parent_ids,
+                "relinked_children": relinked_children,
+                "open_parent_ids": open_parents,
+            },
+        )
+
+    recompute_ready(conn)
+    _cleanup_workspace(conn, task_id)
+    notify_task_updated(conn, task_id, ("status",))
+    if relinked_parent_ids:
+        notify_task_updated(conn, replacement_task_id, ("parents", "status"))
+    for child_id in relinked_children:
+        notify_task_updated(conn, child_id, ("parents", "status"))
+    return {
+        "replacement_task_id": replacement_task_id,
+        "relinked_parent_ids": relinked_parent_ids,
+        "relinked_children": relinked_children,
+        "open_parent_ids": open_parents,
+    }
+
+
+def move_task_to_triage(
+    conn: sqlite3.Connection, task_id: str, *, reason: str
+) -> bool:
+    """Park deferred work without masking blockers or terminating live runs."""
+    reason = (reason or "").strip()
+    if not reason:
+        raise ValueError("reason is required")
+    changed = False
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        old_status = row["status"]
+        if old_status not in {"todo", "ready", "scheduled", "triage"}:
+            raise RuntimeError(
+                f"cannot move {task_id} to triage from {old_status}; "
+                "resolve active runs, reviews, or blocked human actions first"
+            )
+        if old_status != "triage":
+            conn.execute("UPDATE tasks SET status = 'triage' WHERE id = ?", (task_id,))
+            changed = True
+        _append_event(
+            conn,
+            task_id,
+            "moved_to_triage",
+            {"from_status": old_status, "reason": reason},
+        )
+    if changed:
+        notify_task_updated(conn, task_id, ("status",))
     return True
 
 

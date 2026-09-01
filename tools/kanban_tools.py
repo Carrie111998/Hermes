@@ -62,6 +62,18 @@ def _profile_has_kanban_toolset() -> bool:
         return False
 
 
+def _kanban_profile_exists(name: str) -> bool:
+    from hermes_cli.profiles import profile_exists
+
+    return profile_exists(name)
+
+
+def _canonical_kanban_profile(name: str) -> str:
+    from hermes_cli.profiles import normalize_profile_name
+
+    return normalize_profile_name(name)
+
+
 def _is_delegated_child_context() -> bool:
     try:
         from agent.delegation_context import is_delegated_child_context
@@ -1609,6 +1621,75 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         return False
 
 
+def _handle_update(args: dict, **kw) -> str:
+    """Apply graph-safe backlog maintenance from an orchestrator session."""
+    if not _check_kanban_orchestrator_mode():
+        return tool_error(
+            "kanban_update is orchestrator-only; enable the kanban toolset in "
+            "a non-worker, non-delegated profile session."
+        )
+    guard = _require_orchestrator_tool("kanban_update")
+    if guard:
+        return guard
+    action = str(args.get("action") or "").strip().lower()
+    tid = str(args.get("task_id") or "").strip()
+    reason = str(args.get("reason") or "").strip()
+    if action not in {"reassign", "triage", "supersede"}:
+        return tool_error("action must be one of: reassign, triage, supersede")
+    if not tid:
+        return tool_error("task_id is required")
+    if not reason:
+        return tool_error("reason is required for the audit trail")
+
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            task = kb.get_task(conn, tid)
+            if not task:
+                return tool_error(f"unknown task: {tid}")
+
+            if action == "reassign":
+                assignee = str(args.get("assignee") or "").strip()
+                if not assignee or assignee.casefold() == "default":
+                    return tool_error("assignee must name a real profile, not default")
+                assignee = _canonical_kanban_profile(assignee)
+                if not _kanban_profile_exists(assignee):
+                    return tool_error(f"unknown profile: {assignee}")
+                if task.status in {"done", "archived"}:
+                    return tool_error(
+                        f"cannot reassign {tid}: status is {task.status}"
+                    )
+                if not kb.assign_task(conn, tid, assignee, reason=reason):
+                    return tool_error(f"unknown task: {tid}")
+                return json.dumps(
+                    {"ok": True, "task_id": tid, "assignee": assignee}
+                )
+
+            if action == "triage":
+                if not kb.move_task_to_triage(conn, tid, reason=reason):
+                    return tool_error(f"unknown task: {tid}")
+                return json.dumps(
+                    {"ok": True, "task_id": tid, "status": "triage"}
+                )
+
+            result = kb.supersede_task(
+                conn,
+                tid,
+                reason=reason,
+                replacement_task_id=args.get("replacement_task_id"),
+            )
+            return json.dumps(
+                {"ok": True, "task_id": tid, "status": "archived", **result}
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_update: {e}")
+    except Exception as e:
+        logger.exception("kanban_update failed")
+        return tool_error(f"kanban_update: {e}")
+
+
 def _handle_unblock(args: dict, **kw) -> str:
     """Transition a blocked task to ready, or todo while parents remain open."""
     delegated_err = _reject_delegated_child_mutation("kanban_unblock")
@@ -2309,6 +2390,44 @@ KANBAN_CREATE_SCHEMA = {
     },
 }
 
+KANBAN_UPDATE_SCHEMA = {
+    "name": "kanban_update",
+    "description": (
+        "Orchestrator-only safe backlog maintenance: reassign active work, park "
+        "deferred work in triage, or supersede obsolete work without marking it "
+        "done. Superseding a task with children requires an active replacement; "
+        "the children are atomically linked to it. Blocked human actions and "
+        "running tasks are never silently moved or closed."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["reassign", "triage", "supersede"],
+            },
+            "task_id": {"type": "string", "description": "Task to update."},
+            "reason": {
+                "type": "string",
+                "description": "Required explanation stored in the audit event.",
+            },
+            "assignee": {
+                "type": "string",
+                "description": "Real profile name; required for reassign.",
+            },
+            "replacement_task_id": {
+                "type": "string",
+                "description": (
+                    "Active replacement; required when superseding a task with children."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["action", "task_id", "reason"],
+    },
+}
+
+
 KANBAN_UNBLOCK_SCHEMA = {
     "name": "kanban_unblock",
     "description": (
@@ -2459,6 +2578,15 @@ registry.register(
     handler=_handle_create,
     check_fn=_check_kanban_mode,
     emoji="➕",
+)
+
+registry.register(
+    name="kanban_update",
+    toolset="kanban",
+    schema=KANBAN_UPDATE_SCHEMA,
+    handler=_handle_update,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="🧹",
 )
 
 registry.register(
