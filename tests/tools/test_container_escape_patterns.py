@@ -45,9 +45,42 @@ class TestDockerEscapeVerbs:
             is_dangerous, _key, _description = detect_dangerous_command(cmd)
             assert is_dangerous is True, cmd
 
+    def test_compose_spellings_detected(self):
+        # `docker compose exec` / legacy `docker-compose exec` reach the same
+        # root shell in another container as the plain `docker exec`.
+        for cmd in (
+            "docker compose exec forge sh",
+            "docker-compose exec forge sh",
+            "docker compose run --rm x",
+            "docker-compose cp forge:/etc/shadow /tmp/shadow",
+        ):
+            is_dangerous, _key, description = detect_dangerous_command(cmd)
+            assert is_dangerous is True, cmd
+            assert ESCAPE_KEY in description, cmd
+
+    def test_global_flags_before_verb_detected(self):
+        # Global flags between `docker`/`compose` and the verb must not let
+        # the verb slip past (same shape the lifecycle rules tolerate).
+        for cmd in (
+            "docker --log-level debug exec forge sh",
+            "docker compose -f prod.yml run --rm x",
+            "docker compose --project-name p -f prod.yml exec forge sh",
+            "docker --config /tmp/cfg cp forge:/etc/shadow /tmp/shadow",
+        ):
+            is_dangerous, _key, description = detect_dangerous_command(cmd)
+            assert is_dangerous is True, cmd
+            assert ESCAPE_KEY in description, cmd
+
     def test_readonly_docker_verbs_not_detected(self):
         for cmd in ("docker ps", "docker logs web", "docker inspect web",
-                    "docker images"):
+                    "docker images", "docker logs x"):
+            is_dangerous, _key, _description = detect_dangerous_command(cmd)
+            assert is_dangerous is False, cmd
+
+    def test_readonly_compose_verbs_not_detected(self):
+        for cmd in ("docker compose ps", "docker compose logs",
+                    "docker-compose ps", "docker compose -f prod.yml ps",
+                    "docker --log-level debug ps"):
             is_dangerous, _key, _description = detect_dangerous_command(cmd)
             assert is_dangerous is False, cmd
 
@@ -59,8 +92,16 @@ class TestS6Primitives:
         assert is_dangerous is True
         assert "s6-svc" in description
 
+    def test_s6_svc_once_down_flag_detected(self):
+        # `-o` (once-down: bring up, don't restart when it exits) is a down
+        # flag too and must not slip through the class.
+        is_dangerous, _key, description = detect_dangerous_command(
+            "s6-svc -o /run/service/main-hermes")
+        assert is_dangerous is True
+        assert "s6-svc" in description
+
     def test_s6_svc_signal_flags_detected(self):
-        for flag in ("-t", "-k", "-h", "-i", "-q", "-p", "-r"):
+        for flag in ("-o", "-t", "-k", "-h", "-i", "-q", "-p", "-r"):
             is_dangerous, _key, _description = detect_dangerous_command(
                 f"s6-svc {flag} /run/service/main-hermes")
             assert is_dangerous is True, flag
@@ -80,7 +121,11 @@ class TestS6Primitives:
 
     def test_readonly_s6_siblings_not_detected(self):
         for cmd in ("s6-svstat /run/service/main-hermes",
-                    "s6-svwait -u /run/service/main-hermes"):
+                    "s6-svwait -u /run/service/main-hermes",
+                    "s6-svstat /run/service/x",
+                    "s6-svwait -u /run/service/x",
+                    # -d/-o only count as s6-svc flags, not on the siblings
+                    "s6-svwait -d /run/service/x"):
             is_dangerous, _key, _description = detect_dangerous_command(cmd)
             assert is_dangerous is False, cmd
 
@@ -97,6 +142,6 @@ class TestKillPidOne:
             assert is_dangerous is True, cmd
 
     def test_kill_of_ordinary_pids_not_detected(self):
-        for cmd in ("kill 1234", "kill -9 4321", "kill 12"):
+        for cmd in ("kill 1234", "kill -9 4321", "kill 12", "killall foo"):
             is_dangerous, _key, _description = detect_dangerous_command(cmd)
             assert is_dangerous is False, cmd

@@ -1140,7 +1140,13 @@ DANGEROUS_PATTERNS = [
     # the same escape shape (spin up or hijack a container, or move data
     # in/out of one). Read-only verbs (`ps`, `logs`, `inspect`, `images`,
     # ...) are not in this alternation and stay auto-approved.
-    (r'\bdocker\s+(exec|run|cp|create|commit|start)\b', "docker exec/run/cp/create/commit/start (cross-container / container escape — root in the target container)"),
+    # `docker compose exec <svc> sh` and legacy `docker-compose exec` are the
+    # same escape, and global flags may sit between `docker`/`compose` and
+    # the verb (`docker --log-level debug exec ...`, `docker compose -f
+    # prod.yml run ...`), so mirror the lifecycle rules above: optional
+    # compose spelling, the same interleaved-flag loop, then the verb.
+    (r'\bdocker(?:-compose|\s+compose)?\s+(?:-{1,2}\S+(?:[=\s]\S+)?\s+)*(exec|run|cp|create|commit|start)\b',
+     "docker exec/run/cp/create/commit/start (cross-container / container escape — root in the target container)"),
     # Gateway protection: never start gateway outside systemd management
     (r'gateway\s+run\b.*(&\s*$|&\s*;|\bdisown\b|\bsetsid\b)', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
@@ -1190,7 +1196,7 @@ DANGEROUS_PATTERNS = [
     # combos). s6-svc is write-only by design, so gating the whole command
     # unconditionally is safe; the read-only s6-svstat/s6-svwait siblings do
     # not share the "s6-svc" token and are unaffected.
-    (r'\bs6-svc\b.*\s-[a-z0-9]*[dtkhiqrp]', "s6-svc down/signal flag (supervised service lifecycle)"),
+    (r'\bs6-svc\b.*\s-[a-z0-9]*[dtkhioqrp]', "s6-svc down/signal flag (supervised service lifecycle)"),
     # s6-svscanctl controls the whole supervision tree (rescan/halt/reload),
     # i.e. every supervised process at once — always gate it.
     (r'\bs6-svscanctl\b', "s6-svscanctl (supervision-tree control)"),
