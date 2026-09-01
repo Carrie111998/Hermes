@@ -63,6 +63,12 @@ DEFAULT_JUDGE_TIMEOUT = 30.0
 DEFAULT_JUDGE_MAX_TOKENS = 4096
 # Cap how much of the last response + recent messages we send to the judge.
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
+# Bounded cross-turn evidence for the judge. This is serialized with the goal
+# state so a WAIT -> wake/reload turn can still connect a terse completion
+# response to the earlier process-start/progress evidence.
+_GOAL_PRIOR_EVIDENCE_MAX_ENTRIES = 4
+_GOAL_PRIOR_EVIDENCE_ENTRY_CHARS = 1200
+_JUDGE_PRIOR_EVIDENCE_CHARS = 3000
 # After this many consecutive judge *parse* failures (empty output / non-JSON),
 # the loop auto-pauses and points the user at the goal_judge config. API /
 # transport errors do NOT count toward this — those are transient. This guards
@@ -198,9 +204,16 @@ JUDGE_BACKGROUND_BLOCK_TEMPLATE = (
 )
 
 
+JUDGE_PRIOR_EVIDENCE_BLOCK_TEMPLATE = (
+    "Relevant evidence from prior turns in this same goal run:\n"
+    "{prior_evidence}\n\n"
+)
+
+
 JUDGE_USER_PROMPT_TEMPLATE = (
     "Goal:\n{goal}\n\n"
     "Agent's most recent response:\n{response}\n\n"
+    "{prior_evidence_block}"
     "{background_block}"
     "Current time: {current_time}\n\n"
     "Is the goal satisfied — done, continue, or wait?"
@@ -213,6 +226,7 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Additional criteria the user added mid-loop (all must also be "
     "satisfied for the goal to be DONE):\n{subgoals_block}\n\n"
     "Agent's most recent response:\n{response}\n\n"
+    "{prior_evidence_block}"
     "{background_block}"
     "Current time: {current_time}\n\n"
     "Decision: For each numbered criterion above, find concrete "
@@ -235,6 +249,7 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Completion contract (the authoritative definition of done):\n"
     "{contract_block}\n\n"
     "Agent's most recent response:\n{response}\n\n"
+    "{prior_evidence_block}"
     "{background_block}"
     "Current time: {current_time}\n\n"
     "Decision rules:\n"
@@ -599,6 +614,11 @@ class GoalState:
     # must ALL pass before the judge may declare the goal done. Empty by
     # default — a goal with no gates behaves exactly as before.
     gates: List[GoalGate] = field(default_factory=list)
+    # Bounded snippets from earlier goal turns in this run. This is
+    # judge-only context: it is never appended to the agent's continuation
+    # prompt or conversation history, preserving prompt-cache and transcript
+    # shape while still letting the judge evaluate evidence across WAIT/reload.
+    prior_turn_evidence: List[str] = field(default_factory=list)
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -612,6 +632,14 @@ class GoalState:
         subgoals: List[str] = []
         if isinstance(raw_subgoals, list):
             subgoals = [str(s).strip() for s in raw_subgoals if str(s).strip()]
+        raw_evidence = data.get("prior_turn_evidence") or []
+        prior_turn_evidence: List[str] = []
+        if isinstance(raw_evidence, list):
+            prior_turn_evidence = [
+                str(e).strip()[:_GOAL_PRIOR_EVIDENCE_ENTRY_CHARS]
+                for e in raw_evidence[-_GOAL_PRIOR_EVIDENCE_MAX_ENTRIES:]
+                if str(e).strip()
+            ]
         return cls(
             goal=data.get("goal", ""),
             status=data.get("status", "active"),
@@ -636,6 +664,7 @@ class GoalState:
                 for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
             ],
+            prior_turn_evidence=prior_turn_evidence,
         )
 
     # --- contract helpers -------------------------------------------------
@@ -651,6 +680,17 @@ class GoalState:
         if not self.subgoals:
             return ""
         return "\n".join(f"- {i}. {text}" for i, text in enumerate(self.subgoals, start=1))
+
+    def render_prior_evidence_block(self) -> str:
+        """Render bounded prior-turn evidence for the judge. Empty when none."""
+        if not self.prior_turn_evidence:
+            return ""
+        lines = [
+            f"- Turn evidence {i}: {text}"
+            for i, text in enumerate(self.prior_turn_evidence, start=1)
+            if text.strip()
+        ]
+        return _truncate("\n".join(lines), _JUDGE_PRIOR_EVIDENCE_CHARS)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -1174,6 +1214,7 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
+    prior_evidence: str = "",
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -1205,6 +1246,9 @@ def judge_goal(
     — a contract, subgoals, and a background-process list can coexist in one
     judge prompt; when none are set, behavior is identical to the original
     free-form judge.
+    ``prior_evidence`` is a bounded judge-only summary of earlier goal turns,
+    used after WAIT/resume so a terse completion turn can be evaluated against
+    evidence already produced in this goal run.
 
     This is deliberately fail-open: transport errors return ``("continue", ..., ..., None, True)``
     — the ``transport_failed=True`` flag lets callers track and auto-pause after
@@ -1234,6 +1278,12 @@ def judge_goal(
     # truth.
     clean_subgoals = [s.strip() for s in (subgoals or []) if s and s.strip()]
     background_block = _render_background_block(background_processes)
+    prior_evidence = _truncate((prior_evidence or "").strip(), _JUDGE_PRIOR_EVIDENCE_CHARS)
+    prior_evidence_block = (
+        JUDGE_PRIOR_EVIDENCE_BLOCK_TEMPLATE.format(prior_evidence=prior_evidence)
+        if prior_evidence
+        else ""
+    )
     current_time = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
     if contract is not None and not contract.is_empty():
@@ -1248,6 +1298,7 @@ def judge_goal(
             goal=_truncate(goal, 2000),
             contract_block=_truncate(contract_block, 2500),
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+            prior_evidence_block=prior_evidence_block,
             background_block=background_block,
             current_time=current_time,
         )
@@ -1259,6 +1310,7 @@ def judge_goal(
             goal=_truncate(goal, 2000),
             subgoals_block=_truncate(subgoals_block, 2000),
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+            prior_evidence_block=prior_evidence_block,
             background_block=background_block,
             current_time=current_time,
         )
@@ -1266,6 +1318,7 @@ def judge_goal(
         prompt = JUDGE_USER_PROMPT_TEMPLATE.format(
             goal=_truncate(goal, 2000),
             response=_truncate(last_response, _JUDGE_RESPONSE_SNIPPET_CHARS),
+            prior_evidence_block=prior_evidence_block,
             background_block=background_block,
             current_time=current_time,
         )
@@ -1741,6 +1794,28 @@ class GoalManager:
         save_goal(self.session_id, state)
         return None
 
+    def _remember_turn_evidence(
+        self,
+        last_response: str,
+        background_processes: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Remember bounded judge-only evidence from this goal turn."""
+        state = self._state
+        if state is None:
+            return
+        response = (last_response or "").strip()[:_GOAL_PRIOR_EVIDENCE_ENTRY_CHARS]
+        background = _render_background_block(background_processes).strip()
+        parts = []
+        if response:
+            parts.append(f"Response: {response}")
+        if background:
+            parts.append(f"Background: {background[:_GOAL_PRIOR_EVIDENCE_ENTRY_CHARS]}")
+        entry = "\n".join(parts).strip()[:_GOAL_PRIOR_EVIDENCE_ENTRY_CHARS]
+        if not entry:
+            return
+        state.prior_turn_evidence.append(entry)
+        state.prior_turn_evidence = state.prior_turn_evidence[-_GOAL_PRIOR_EVIDENCE_MAX_ENTRIES:]
+
     # --- /goal wait barrier -------------------------------------------
 
     def wait_on(self, pid: int, reason: str = "") -> GoalState:
@@ -1952,6 +2027,7 @@ class GoalManager:
             subgoals=state.subgoals or None,
             background_processes=background_processes,
             contract=state.contract if state.has_contract() else None,
+            prior_evidence=state.render_prior_evidence_block(),
         )
         state.last_verdict = verdict
         state.last_reason = reason
@@ -1973,6 +2049,9 @@ class GoalManager:
             state.consecutive_transport_failures += 1
         else:
             state.consecutive_transport_failures = 0
+
+        if verdict != "done":
+            self._remember_turn_evidence(last_response, background_processes)
 
         # WAIT verdict: the judge decided the agent is blocked on async work
         # and re-poking now would be busy-work. Set the barrier and park —
