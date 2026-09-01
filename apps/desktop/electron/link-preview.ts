@@ -496,6 +496,16 @@ export async function resolveLinkPreview(
     return { ok: false, reason: 'private-url' }
   }
 
+  // NOTE (DNS rebinding window): the addresses here are checked, then the
+  // fetch resolves the hostname AGAIN inside io.fetchHtml. An attacker who
+  // controls DNS can flip a public answer to a private one between those two
+  // lookups. Scope of exposure: the fetch is main-process, GET-only,
+  // byte-budget-capped, and renders nothing but og/title strings — this is a
+  // defense-in-depth gap, not a privileged read primitive. Pinning the socket
+  // to a vetted address (custom lookup + request option) is the full fix and
+  // deliberately out of scope here; flagged for a follow-up rather than
+  // shipping a half-tested resolver swap in this PR.
+
   const release = await deps.limiter.acquire(parsed.hostname.toLowerCase())
 
   try {
