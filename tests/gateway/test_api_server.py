@@ -1818,6 +1818,118 @@ class TestEndpointAuth:
             assert resp.status == 401
 
 
+class TestExternalTurnIdContract:
+    """Authenticated callers may supply an exact, bounded correlation ID."""
+
+    _BODY = {
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    _RESULT = (
+        {"final_response": "ok", "messages": [], "api_calls": 1},
+        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+    _AUTH = {"Authorization": "Bearer sk-secret"}
+
+    @pytest.mark.asyncio
+    async def test_authenticated_non_streaming_passes_exact_value_unchanged(self, auth_adapter):
+        turn_id = "basshub.Turn_01:retry-2"
+        app = _create_app(auth_adapter)
+        with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = self._RESULT
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json=self._BODY,
+                    headers={**self._AUTH, "X-Hermes-Turn-Id": turn_id},
+                )
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["external_turn_id"] == turn_id
+
+    @pytest.mark.asyncio
+    async def test_authenticated_streaming_passes_exact_value_unchanged(self, auth_adapter):
+        turn_id = "basshub:stream_01"
+
+        async def run_agent(**kwargs):
+            kwargs["stream_delta_callback"]("ok")
+            return self._RESULT
+
+        app = _create_app(auth_adapter)
+        with patch.object(auth_adapter, "_run_agent", side_effect=run_agent) as mock_run:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={**self._BODY, "stream": True},
+                    headers={**self._AUTH, "X-Hermes-Turn-Id": turn_id},
+                )
+                await resp.text()
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["external_turn_id"] == turn_id
+
+    @pytest.mark.asyncio
+    async def test_header_without_configured_api_key_is_forbidden_before_agent(self, adapter):
+        app = _create_app(adapter)
+        with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json=self._BODY,
+                    headers={"X-Hermes-Turn-Id": "basshub-turn-1"},
+                )
+        assert resp.status == 403
+        mock_run.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "turn_id",
+        ["trailing ", "has/slash", "", "x" * 129],
+        # aiohttp's client normalizes leading header whitespace before it reaches
+        # the server; trailing whitespace is preserved and exercises the exact
+        # (non-stripping) boundary contract over real HTTP.
+        ids=["trailing-space", "slash", "empty", "over-128"],
+    )
+    @pytest.mark.asyncio
+    async def test_malformed_value_is_rejected_before_agent(self, auth_adapter, turn_id):
+        app = _create_app(auth_adapter)
+        with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json=self._BODY,
+                    headers={**self._AUTH, "X-Hermes-Turn-Id": turn_id},
+                )
+        assert resp.status == 400
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_leading_space_is_rejected_at_handler_boundary(self, auth_adapter):
+        # Real HTTP clients normalize leading OWS, so invoke the handler with
+        # the exact header mapping to pin the server-side contract explicitly.
+        request = MagicMock()
+        request.headers = {
+            **self._AUTH,
+            "X-Hermes-Turn-Id": " leading",
+        }
+        request.app = {"api_server_adapter": auth_adapter}
+        with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            resp = await auth_adapter._handle_chat_completions(request)
+        assert resp.status == 400
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_absent_header_preserves_success_and_none_forwarding(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = self._RESULT
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json=self._BODY,
+                    headers=self._AUTH,
+                )
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["external_turn_id"] is None
+
+
 # ---------------------------------------------------------------------------
 # Config integration
 # ---------------------------------------------------------------------------
