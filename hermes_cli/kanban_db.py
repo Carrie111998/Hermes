@@ -98,6 +98,9 @@ _log = logging.getLogger(__name__)
 _GITHUB_PR_FEEDBACK_IDEMPOTENCY_PREFIX = "github-pr-feedback:"
 _GITHUB_PR_INTENT_REVIEW_PREFIX = "github-pr-feedback:intent-review:"
 _RESEARCH_LAB_INTAKE_IDEMPOTENCY_PREFIX = "research-lab-intake-"
+_RESEARCH_LAB_INTAKE_IDEMPOTENCY_RE = re.compile(
+    r"^research-lab-intake-[0-9]{8}-[1-9][0-9]*$"
+)
 _EXACT_HEAD_PR_MARKERS = ("expected_head_sha", "pr_number", "repository")
 _PR_WRITE_ACTION_RE = re.compile(
     r"\b(?:repair|fix|push|reply|respond|base[-_ ]?refresh|"
@@ -125,7 +128,7 @@ def is_atomic_pr_automation_task(
 def is_governed_research_intake(*, idempotency_key: Optional[str]) -> bool:
     """Return whether a typed Research Lab intake must retain its specialist owner."""
     key = (idempotency_key or "").strip().casefold()
-    return key.startswith(_RESEARCH_LAB_INTAKE_IDEMPOTENCY_PREFIX)
+    return bool(_RESEARCH_LAB_INTAKE_IDEMPOTENCY_RE.fullmatch(key))
 
 
 def _task_requires_pr_write_authority(
@@ -760,6 +763,32 @@ def get_current_board() -> str:
     except OSError:
         pass
     return DEFAULT_BOARD
+
+
+def _lifecycle_board(conn: sqlite3.Connection, board: Optional[str] = None) -> str:
+    """Resolve lifecycle attribution from an explicit board or DB connection.
+
+    Lifecycle hooks run after their write transaction and cannot safely rely on
+    the process-global current-board pointer: callers may have opened an
+    explicit board connection, and another request may have switched the
+    pointer in the meantime.  The SQLite filename is the durable fallback.
+    """
+    explicit = _normalize_board_slug(board)
+    if explicit:
+        return explicit
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        filename = Path(str(row[2])).resolve() if row is not None else None
+        named_root = boards_root().resolve()
+        if filename is not None and named_root in filename.parents:
+            candidate = _normalize_board_slug(filename.parent.name)
+            if candidate:
+                return candidate
+        if filename == kanban_db_path(board=DEFAULT_BOARD).resolve():
+            return DEFAULT_BOARD
+    except Exception:  # pragma: no cover - hook attribution is best effort
+        pass
+    return get_current_board()
 
 
 def set_current_board(slug: str) -> Path:
@@ -4792,6 +4821,7 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -4901,7 +4931,7 @@ def claim_task(
     _fire_kanban_lifecycle_hook(
         "kanban_task_claimed",
         task_id,
-        board=get_current_board(),
+        board=_lifecycle_board(conn, board),
         assignee=claimed.assignee if claimed else None,
         run_id=run_id,
     )
@@ -5120,6 +5150,7 @@ def release_stale_claims(
     conn: sqlite3.Connection,
     *,
     signal_fn=None,
+    board: Optional[str] = None,
 ) -> int:
     """Reset any ``running`` task whose claim has expired.
 
@@ -5276,7 +5307,7 @@ def release_stale_claims(
             _fire_kanban_lifecycle_hook(
                 "on_kanban_worker_stale_claim",
                 row["id"],
-                board=get_current_board(),
+                board=_lifecycle_board(conn, board),
                 assignee=row["assignee"],
                 run_id=run_id,
                 worker_pid=(
@@ -5654,6 +5685,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    board: Optional[str] = None,
 ) -> bool:
     """Transition ``running|ready|blocked|review -> done`` and record ``result``.
 
@@ -5941,7 +5973,7 @@ def complete_task(
         _fire_kanban_lifecycle_hook(
             "kanban_task_completed",
             task_id,
-            board=get_current_board(),
+            board=_lifecycle_board(conn, board),
             assignee=_done_task.assignee if _done_task else None,
             run_id=run_id,
             summary=(summary if summary is not None else result),
@@ -6607,6 +6639,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    board: Optional[str] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6703,7 +6736,7 @@ def block_task(
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
                 task_id,
-                board=get_current_board(),
+                board=_lifecycle_board(conn, board),
                 assignee=_blocked_task.assignee if _blocked_task else None,
                 run_id=run_id,
                 reason=reason,
@@ -6820,7 +6853,7 @@ def block_task(
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
         task_id,
-        board=get_current_board(),
+        board=_lifecycle_board(conn, board),
         assignee=_blocked_task.assignee if _blocked_task else None,
         run_id=run_id,
         reason=reason,

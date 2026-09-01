@@ -2884,14 +2884,23 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
-    except Exception:
-        default_assignee = None
-        max_in_progress_per_profile = None
-        max_in_progress_per_model = None
-        max_in_progress_by_profile = {}
-        max_in_progress_by_model = {}
-        max_in_progress = None
-        max_spawn = getattr(args, "max", None)
+    except Exception as error:
+        # Dispatch caps are a safety boundary.  Clearing them after a config
+        # read failure turns an unavailable configuration into an unbounded
+        # spawn tick, which can overwhelm the host and strand cards.  Fail
+        # closed so the next governed tick can retry after the config is
+        # readable again.
+        if getattr(args, "json", False):
+            print(json.dumps({
+                "status": "config_unavailable",
+                "error": type(error).__name__,
+            }, sort_keys=True))
+        else:
+            print(
+                f"kanban: dispatch configuration unavailable ({type(error).__name__})",
+                file=sys.stderr,
+            )
+        return 1
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,

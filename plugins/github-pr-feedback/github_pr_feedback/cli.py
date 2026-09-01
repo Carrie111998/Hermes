@@ -904,10 +904,14 @@ def _run_grouped_exact_head_audit(
         worktree=worktree,
         failure_lanes=_required_lanes(manifest_path.read_bytes()),
     )
-    outcome = GroupedCICoordinator(
-        lambda: LocalCIRunner(github, FeedbackLedger.for_current_profile()),
-        max_parallel=4,
-    ).run((job,))[0]
+    grouped_ledger = FeedbackLedger.for_current_profile()
+    try:
+        outcome = GroupedCICoordinator(
+            lambda: LocalCIRunner(github, grouped_ledger),
+            max_parallel=4,
+        ).run((job,))[0]
+    finally:
+        grouped_ledger.close()
     if outcome.error is not None or outcome.receipt is None:
         raise CIValidationError("grouped exact-head CI audit was unavailable")
     return outcome.receipt
