@@ -1145,6 +1145,9 @@ def _auth_file_path() -> Path:
 def _global_auth_file_path() -> Optional[Path]:
     """Return the global-root auth.json when the process is in profile mode.
 
+    Isolated profiles can set ``HERMES_DISABLE_GLOBAL_AUTH_FALLBACK=true`` to
+    prevent inherited root credentials from crossing a trust boundary.
+
     Returns ``None`` when the profile and global root resolve to the same
     directory (classic mode, or custom HERMES_HOME that is not a profile).
     Used by read-only fallback paths so providers authed at the root are
@@ -1152,6 +1155,10 @@ def _global_auth_file_path() -> Optional[Path]:
 
     See issue #18594 follow-up (credential_pool shadowing).
     """
+    if is_truthy_value(
+        os.environ.get("HERMES_DISABLE_GLOBAL_AUTH_FALLBACK"), default=False
+    ):
+        return None
     try:
         from hermes_constants import get_default_hermes_root
         global_root = get_default_hermes_root()

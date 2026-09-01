@@ -10,8 +10,7 @@ with a mocked agent handler.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
+
 import json
 import os
 import socket
@@ -539,6 +538,49 @@ class TestClientTools:
         assert tools._rpc_url("http://base:3", card) == "http://v1:2/"
         assert tools._rpc_url("http://base:3", {"url": "http://legacy:1/"}) == "http://legacy:1/"
         assert tools._rpc_url("http://base:3/", None) == "http://base:3"
+
+    def test_http_post_sets_a2a_client_user_agent(self, monkeypatch):
+        captured = {}
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{}'
+
+        def fake_urlopen(request, timeout):
+            captured["user_agent"] = request.get_header("User-agent")
+            captured["a2a_version"] = request.get_header("A2a-version")
+            return Response()
+
+        monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
+        tools._http_post_json("https://peer.example/", {"jsonrpc": "2.0"}, {}, 5)
+
+        assert captured == {
+            "user_agent": "Hermes-A2A-Client/1.0",
+            "a2a_version": protocol.PROTOCOL_VERSION,
+        }
+
+    def test_auth_header_resolves_bearer_token_from_environment(self, monkeypatch):
+        monkeypatch.setenv("A2A_OUTBOUND_EDGE_TOKEN", "secret-from-bws")
+
+        assert tools._auth_header({
+            "type": "bearer",
+            "token_env": "A2A_OUTBOUND_EDGE_TOKEN",
+        }) == {"Authorization": "Bearer secret-from-bws"}
+
+    def test_auth_header_fails_closed_when_token_environment_is_missing(self, monkeypatch):
+        monkeypatch.delenv("A2A_OUTBOUND_EDGE_TOKEN", raising=False)
+
+        with pytest.raises(ValueError, match="A2A_OUTBOUND_EDGE_TOKEN"):
+            tools._auth_header({
+                "type": "bearer",
+                "token_env": "A2A_OUTBOUND_EDGE_TOKEN",
+            })
 
     def test_list_no_peers(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1248,6 +1290,8 @@ class TestPushNotificationEndToEnd:
                 length = int(self.headers.get("Content-Length", 0))
                 received["body"] = json.loads(self.rfile.read(length).decode())
                 received["signature"] = self.headers.get("X-A2A-Signature", "")
+                received["timestamp"] = self.headers.get("X-A2A-Timestamp", "")
+                received["delivery_id"] = self.headers.get("X-A2A-Delivery", "")
                 self.send_response(200)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
@@ -1281,13 +1325,15 @@ class TestPushNotificationEndToEnd:
             assert su["taskId"] == task["id"]
             assert su["status"]["state"] == "TASK_STATE_COMPLETED"
             assert "ECHO:" in protocol.extract_text(su["status"]["message"])
-            # HMAC signature verifies against the shared secret.
-            expected = hmac.new(
-                b"push-secret-1",
-                json.dumps(payload, sort_keys=True, ensure_ascii=False).encode(),
-                hashlib.sha256,
-            ).hexdigest()
-            assert received["signature"] == expected
+            # HMAC covers body + timestamp + unique delivery id so receivers
+            # can enforce a bounded replay window.
+            assert security.verify_push_payload(
+                payload,
+                received["signature"],
+                timestamp=received["timestamp"],
+                delivery_id=received["delivery_id"],
+                now=int(received["timestamp"]),
+            )
 
             await adapter.disconnect()
 

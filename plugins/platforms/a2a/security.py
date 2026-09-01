@@ -265,18 +265,77 @@ def get_push_secret() -> str:
     return get_bearer_token()
 
 
-def sign_push_payload(payload: dict) -> str:
+def _push_signing_bytes(
+    payload: dict,
+    *,
+    timestamp: Optional[str] = None,
+    delivery_id: Optional[str] = None,
+) -> bytes:
+    """Return canonical bytes for legacy or replay-protected push signing."""
+    body = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    if timestamp is None and delivery_id is None:
+        return body
+    if not timestamp or not delivery_id:
+        raise ValueError("timestamp and delivery_id must be provided together")
+    return f"{timestamp}.{delivery_id}.".encode("utf-8") + body
+
+
+def sign_push_payload(
+    payload: dict,
+    *,
+    timestamp: Optional[str] = None,
+    delivery_id: Optional[str] = None,
+) -> str:
     """HMAC-SHA256 sign a push notification payload.
 
-    Returns hex-encoded signature. Empty string if no secret configured.
-    Receivers verify by HMAC-ing the JSON body (sorted keys) with the shared
-    secret and comparing against the X-A2A-Signature header.
+    Legacy callers may sign only the canonical JSON body. Remote callbacks
+    should also pass ``timestamp`` and ``delivery_id``; those values are then
+    covered by the HMAC and allow a receiver to enforce a replay window.
     """
     secret = get_push_secret()
     if not secret:
         return ""
-    body = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    body = _push_signing_bytes(
+        payload, timestamp=timestamp, delivery_id=delivery_id
+    )
     return hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
+
+
+def verify_push_payload(
+    payload: dict,
+    signature: str,
+    *,
+    timestamp: str,
+    delivery_id: str,
+    max_age_seconds: int = 300,
+    now: Optional[float] = None,
+    seen_delivery_ids: Optional[set[str]] = None,
+) -> bool:
+    """Verify timestamped push HMAC, age, and optional replay cache.
+
+    ``seen_delivery_ids`` is mutated only after all cryptographic and age checks
+    pass. Receivers sharing it across threads must provide their own lock.
+    """
+    secret = get_push_secret()
+    if not secret or not signature or not timestamp or not delivery_id:
+        return False
+    try:
+        sent_at = int(timestamp)
+    except (TypeError, ValueError):
+        return False
+    current = time.time() if now is None else float(now)
+    if max_age_seconds < 0 or abs(current - sent_at) > max_age_seconds:
+        return False
+    expected = sign_push_payload(
+        payload, timestamp=timestamp, delivery_id=delivery_id
+    )
+    if not hmac.compare_digest(signature, expected):
+        return False
+    if seen_delivery_ids is not None:
+        if delivery_id in seen_delivery_ids:
+            return False
+        seen_delivery_ids.add(delivery_id)
+    return True
 
 
 # --------------------------------------------------------------------------

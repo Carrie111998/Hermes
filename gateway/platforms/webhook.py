@@ -888,6 +888,10 @@ class WebhookAdapter(BasePlatformAdapter):
             try:
                 result = await self._direct_deliver(prompt, delivery)
             except Exception:
+                # A 502 asks the provider to retry. Do not leave the failed
+                # delivery ID in the idempotency cache or that retry would be
+                # acknowledged as a duplicate without another delivery attempt.
+                self._seen_deliveries.pop(delivery_id, None)
                 logger.exception(
                     "[webhook] direct-deliver failed route=%s delivery=%s",
                     route_name,
@@ -908,8 +912,9 @@ class WebhookAdapter(BasePlatformAdapter):
                     },
                     status=200,
                 )
-            # Delivery attempted but target rejected it — surface as 502
-            # with a generic error (don't leak adapter-level detail).
+            # Delivery attempted but target rejected it — surface as 502 and
+            # release the delivery ID so the provider can retry the same event.
+            self._seen_deliveries.pop(delivery_id, None)
             logger.warning(
                 "[webhook] direct-deliver target rejected route=%s target=%s error=%s",
                 route_name,

@@ -57,10 +57,23 @@ def _write(path: Path, payload: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_profile_can_disable_global_credential_pool_fallback(profile_env, monkeypatch):
+    from hermes_cli.auth import read_credential_pool
 
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{
+            "id": "glob-1",
+            "label": "global",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "sk-global",
+        }],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+    monkeypatch.setenv("HERMES_DISABLE_GLOBAL_AUTH_FALLBACK", "true")
 
-
-
+    assert read_credential_pool("openrouter") == []
 
 
 def test_missing_global_auth_file_is_safe(profile_env):
@@ -132,6 +145,18 @@ def test_provider_auth_state_returns_none_when_neither_has_it(profile_env):
 
     _write(profile_env["global"] / "auth.json", _make_auth_store(providers={}))
     _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
+
+    assert get_provider_auth_state("nous") is None
+
+
+def test_profile_can_disable_global_provider_state_fallback(profile_env, monkeypatch):
+    from hermes_cli.auth import get_provider_auth_state
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
+        "nous": {"access_token": "nous-global", "refresh_token": "rt-global"},
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
+    monkeypatch.setenv("HERMES_DISABLE_GLOBAL_AUTH_FALLBACK", "1")
 
     assert get_provider_auth_state("nous") is None
 
