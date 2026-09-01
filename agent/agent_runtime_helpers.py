@@ -3572,6 +3572,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 target=target,
                 content=next_args.get("content"),
                 old_text=next_args.get("old_text"),
+                new_text=next_args.get("new_text"),
                 operations=operations,
                 store=agent._memory_store,
             )

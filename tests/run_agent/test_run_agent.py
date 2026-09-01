@@ -1759,6 +1759,34 @@ class TestExecuteToolCalls:
         assert metadata["tool_call_id"] == "mem-1"
         assert messages[-1]["tool_call_id"] == "mem-1"
 
+    def test_sequential_memory_new_text_alias_reaches_handler(self, agent):
+        # The memory_tool handler documents new_text as an accepted alias for
+        # content, but both executor call sites (tool_executor.py and
+        # agent_runtime_helpers.py) dropped it, so an alias-shaped call failed
+        # with "content is required" through the real dispatch path even
+        # though handler-level tests passed.
+        tc = _mock_tool_call(
+            name="memory",
+            arguments=json.dumps({"target": "memory", "new_text": "alias written"}),
+            call_id="mem-2",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        captured = {}
+
+        def _capture_memory_tool(**kwargs):
+            captured.update(kwargs)
+            return json.dumps({"success": True})
+
+        agent._memory_store = object()
+
+        with patch("tools.memory_tool.memory_tool", side_effect=_capture_memory_tool):
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert captured.get("new_text") == "alias written"
+        assert messages[-1]["role"] == "tool"
+        assert messages[-1]["tool_call_id"] == "mem-2"
+
     def test_keyboard_interrupt_emits_cancelled_post_tool_hook(self, agent, monkeypatch):
         tc = _mock_tool_call(name="web_search", arguments='{"q":"test"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
