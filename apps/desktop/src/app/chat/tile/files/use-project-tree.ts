@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { atom } from 'nanostores'
-import { useCallback, useEffect, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 
 import { $connection } from '@/store/session'
 import { $workspaceChangeTick, consumeWorkspaceChange } from '@/store/workspace-events'
@@ -142,8 +142,24 @@ let lastConnectionKey = ''
 const treeStates = new Map<string, ProjectTreeState>()
 const $treeVersion = atom(0)
 
+// Reset generation. `resetProjectTreeState()` (gateway scope change / connection
+// switch) clears every tree state and bumps the root-request id, which makes any
+// in-flight readDir's results stale and drops them. A mounted `useProjectTree`
+// that subscribed before the reset must re-read its root — otherwise the tree
+// strands on the loading/empty state until the user manually refreshes. This
+// generation counter is bumped on every reset, and every hooked tree watches it
+// so it self-heals by force-reloading its root immediately after a reset.
+const $treeResetGeneration = atom(0)
+
 function bumpTreeVersion() {
   $treeVersion.set($treeVersion.get() + 1)
+}
+
+// useSyncExternalStore subscription for the per-cwd tree states. Every
+// setTreeState/clearTreeState bumps $treeVersion, so subscribers re-read their
+// snapshot exactly when the buckets change.
+function subscribeTreeVersion(onStoreChange: () => void): () => void {
+  return $treeVersion.subscribe(onStoreChange)
 }
 
 function treeStateFor(cwd: string): ProjectTreeState {
@@ -226,27 +242,53 @@ async function loadRoot(cwd: string, { force = false }: { force?: boolean } = {}
   }))
 
   let resolvedCwd = cwd
-  let { entries, error } = await readProjectDir(cwd, cwd)
+  let entries: ProjectTreeEntry[] = []
+  let error: string | null | undefined
+
+  // A rejecting readDesktopDir (bridge/preload not yet ready on cold start,
+  // transient IPC failure) must NOT strand the tree on its loading state —
+  // catch it and surface it as a rootError so the self-heal retry re-probes.
+  try {
+    const result = await readProjectDir(cwd, cwd)
+
+    entries = result.entries
+    error = result.error
+  } catch (err) {
+    error = err instanceof Error ? err.message : 'read-error'
+  }
 
   if (error) {
     const fallback = await fallbackRootFor(cwd)
 
     if (fallback) {
-      const retry = await readProjectDir(fallback, fallback)
+      try {
+        const retry = await readProjectDir(fallback, fallback)
 
-      if (!retry.error) {
-        resolvedCwd = fallback
-        entries = retry.entries
-        error = undefined
+        if (!retry.error) {
+          resolvedCwd = fallback
+          entries = retry.entries
+          error = undefined
+        }
+      } catch (err) {
+        // Keep the original primary-cwd error; the fallback read failed too.
+        if (!error) {
+          error = err instanceof Error ? err.message : 'read-error'
+        }
       }
     }
   }
 
   setTreeState(cwd, latest => {
-    if (latest.cwd !== cwd || latest.requestId !== requestId) {
+    // Only the requestId guards staleness here. The `latest.cwd !== cwd` check
+    // is deliberately NOT used: `resetProjectTreeState()` clears `treeStates`,
+    // so a loadRoot that started before a reset resolves against the cleared
+    // bucket (initialState, cwd='') — and the cwd check would then drop a
+    // perfectly fresh result, stranding the tree on its loading state until the
+    // user remounts it. requestId is bumped on every reset, so it alone
+    // distinguishes a stale in-flight read from the current one.
+    if (latest.requestId !== requestId) {
       return latest
     }
-
     return {
       ...latest,
       data: error ? [] : entries.map(e => makeNode(e.path, e.name, e.isDirectory)),
@@ -265,6 +307,9 @@ export function resetProjectTreeState() {
   treeStates.clear()
   clearProjectDirCache()
   bumpTreeVersion()
+  // Every subscribed tree force-reloads its root on the next render so a reset
+  // can never strand a tree on its old (now-dropped) loading/empty state.
+  $treeResetGeneration.set($treeResetGeneration.get() + 1)
 }
 
 // Non-destructive live refresh as the agent edits: preserves expansion + loaded
@@ -357,7 +402,16 @@ async function revalidateTree(cwd: string, change: { dirs: string[]; full: boole
  */
 export function useProjectTree(cwd: string): UseProjectTreeResult {
   useStore($treeVersion)
-  const state = treeStateFor(cwd)
+  // Read the per-cwd bucket through useSyncExternalStore, NOT a plain function
+  // call. The React Compiler memoizes plain helper calls by their arguments
+  // (`t[0]===e ? cached : recompute`), and `treeStateFor` reads the module-level
+  // mutable `treeStates` map — invisible to the compiler, so the FIRST snapshot
+  // taken for a cwd (an empty initialState on cold start, before loadRoot's
+  // bucket exists) gets cached and returned forever while cwd stays unchanged.
+  // The tree then strands on its loading skeleton even though the data layer
+  // applied its result — exactly the cold-start bug. A hook call is never
+  // memoized away, and getSnapshot re-reads the Map on every render.
+  const state = useSyncExternalStore(subscribeTreeVersion, () => treeStateFor(cwd))
   const connection = useStore($connection)
   const workspaceTick = useStore($workspaceChangeTick)
   const connectionKey = `${connection?.mode || 'local'}:${connection?.profile || ''}:${connection?.baseUrl || ''}`
@@ -460,6 +514,24 @@ export function useProjectTree(cwd: string): UseProjectTreeResult {
 
     void loadRoot(cwd)
   }, [connectionKey, cwd])
+
+  // Self-heal across `resetProjectTreeState()`: a reset clears every tree state
+  // and bumps the root-request id, which drops any in-flight readDir result. A
+  // tree mounted before the reset would otherwise strand on its old
+  // loading/empty state until the user manually refreshes. Watch the reset
+  // generation and force-reload the root each time it moves, but skip the very
+  // first value of the current mount (the connectionKey effect already seeds it).
+  const treeResetGeneration = useStore($treeResetGeneration)
+  const lastResetGeneration = useRef($treeResetGeneration.get())
+
+  useEffect(() => {
+    if (treeResetGeneration === lastResetGeneration.current) {
+      return
+    }
+
+    lastResetGeneration.current = treeResetGeneration
+    void loadRoot(cwd, { force: true })
+  }, [cwd, treeResetGeneration])
 
   // Self-heal: an errored root re-probes every few seconds while the tree is
   // mounted. Each attempt bumps requestId, so a persistent error re-arms the

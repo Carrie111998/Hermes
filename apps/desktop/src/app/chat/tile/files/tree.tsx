@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useRef, useState } from 'react'
+import { type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useMemo } from 'react'
 import { type NodeApi, type NodeRendererProps, type RowRendererProps, Tree, type TreeApi } from 'react-arborist'
 
@@ -81,6 +81,40 @@ export function ProjectTree({
   }, [])
 
   useResizeObserver(syncTreeSize, containerRef)
+
+  // The shared ResizeObserver only delivers its initial size the FIRST time an
+  // element is observed. When this tree mounts while its container is still
+  // 0-sized (workspace pane booting / not yet laid out), that one delivery is
+  // 0×0 — and the observer never fires again once the container grows, so
+  // `size` stays {0,0} and the tree renders the skeleton forever. Measure
+  // synchronously on mount AND keep re-measuring on a rAF loop until the
+  // container reports a real size, so the tree appears as soon as the pane
+  // lays out — independent of ResizeObserver's one-shot initial delivery.
+  useLayoutEffect(() => {
+    let raf = 0
+
+    const measure = () => {
+      const el = containerRef.current
+
+      if (!el) {
+        return
+      }
+
+      const rect = projectTreeViewportSize([], el)
+
+      if (rect.height > 0 && rect.width > 0) {
+        setSize(prev => (prev.height === rect.height && prev.width === rect.width ? prev : rect))
+
+        return
+      }
+
+      raf = requestAnimationFrame(measure)
+    }
+
+    measure()
+
+    return () => cancelAnimationFrame(raf)
+  }, [])
 
   const handleToggle = useCallback(
     (id: string) => {
