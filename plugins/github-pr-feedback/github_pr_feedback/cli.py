@@ -437,6 +437,10 @@ def _kanban_create_argv(task: KanbanTask) -> list[str]:
     ]
     if task.max_runtime_seconds is not None:
         argv.extend(["--max-runtime", str(task.max_runtime_seconds)])
+    if task.model_override:
+        argv.extend(["--model", task.model_override])
+        if task.provider_override:
+            argv.extend(["--provider", task.provider_override])
     if task.initial_status not in {"ready", "blocked", "running"}:
         raise ValueError("Kanban task initial status is invalid")
     if task.initial_status != "ready":
