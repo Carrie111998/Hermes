@@ -3206,6 +3206,7 @@ def terminal_tool(
             from tools.self_repo_guard import (
                 detect_self_repo_git_mutation,
                 guard_active,
+                audit_skill_mutating_command,
             )
 
             guard_cwd = _resolve_command_cwd(
@@ -3218,6 +3219,8 @@ def terminal_tool(
                 if guard_active()
                 else (False, None)
             )
+            # Detection-only audit for terminal commands that may mutate skill files.
+            audit_skill_mutating_command(command, guard_cwd)
             if _self_repo_hit:
                 logger.warning(
                     "Blocked self-repo git mutation (command: %s)",
