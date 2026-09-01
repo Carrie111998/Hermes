@@ -4225,11 +4225,36 @@ def divert_session_transcript_jsonl(session_id: str, messages) -> "Optional[Path
 
 
 def _read_sqlite_application_id(db_path: Path) -> "Optional[int]":
-    """Read application_id from the SQLite header without opening a connection."""
+    """Read ``application_id`` only when no connection to the file is live.
+
+    A bare ``open``/``close`` on a live SQLite file cancels every POSIX
+    advisory lock this process holds for that inode.  This probe runs before
+    each write as part of the replacement guard, so opening the header here
+    can otherwise revoke a concurrent SessionDB writer's ``BEGIN IMMEDIATE``
+    lock and admit a second process into the same WAL transaction window.
+
+    ``read_header_bytes_preopen`` makes the no-live-connection check atomic
+    with the raw descriptor lifetime.  Returning ``None`` while a connection
+    is live deliberately leaves replacement detection to the inode guard;
+    preserving SQLite's writer exclusion is the stronger invariant.
+    """
     try:
-        with db_path.open("rb") as handle:
-            header = handle.read(_STATE_DB_APPLICATION_ID_OFFSET + 4)
-    except OSError:
+        from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+
+        header = read_header_bytes_preopen(
+            db_path,
+            length=_STATE_DB_APPLICATION_ID_OFFSET + 4,
+        )
+    except ImportError:
+        # Scaffold/embed installs can ship hermes_state without hermes_cli.
+        # They also lack tracked connections, so retain the legacy offline
+        # probe rather than making application_id unavailable there.
+        try:
+            with db_path.open("rb") as handle:
+                header = handle.read(_STATE_DB_APPLICATION_ID_OFFSET + 4)
+        except OSError:
+            return None
+    if header is None:
         return None
     if len(header) < _STATE_DB_APPLICATION_ID_OFFSET + 4:
         return None

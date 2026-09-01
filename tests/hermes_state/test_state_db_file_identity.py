@@ -7,8 +7,9 @@ The store must fail loudly instead of limping.
 
 import json
 import os
-import shutil
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ import pytest
 from hermes_state import (
     SessionDB,
     StateDbReplacedError,
+    _read_sqlite_application_id,
     classify_persistence_error,
     divert_session_transcript_jsonl,
 )
@@ -148,31 +150,86 @@ def test_fts_scoped_error_on_replaced_file_skips_fts_fail_open(tmp_path):
     db.close()
 
 
-def test_copyfile_same_inode_fails_loudly_without_fts_repair(tmp_path):
-    """``cp`` keeps st_ino; generation stamp must still halt (#89332)."""
+def test_live_identity_probe_does_not_raw_read_same_inode(tmp_path):
+    """The generation probe must not cancel a live SQLite writer lock.
+
+    A same-inode ``cp`` cannot be detected safely by opening and closing the
+    database header while another connection is live: on POSIX that close
+    revokes every advisory lock this process holds for the inode.  The live
+    path therefore keeps the inode guard and declines the raw generation
+    probe; offline callers still get the application_id check.
+    """
     live = tmp_path / "state.db"
-    other = tmp_path / "other.db"
     db = _make_db(live, "live-sess", "original")
-    alt = _make_db(other, "other-sess", "replacement")
-    live_app = db._db_file_application_id
-    other_app = alt._db_file_application_id
-    if not live_app or not other_app:
-        alt.close()
+    application_id = db._db_file_application_id
+    try:
+        assert application_id
+        assert _read_sqlite_application_id(live) is None
+        assert db._db_file_was_replaced() is False
+    finally:
         db.close()
-        pytest.skip("generation stamp not recorded on this filesystem")
-    assert live_app != other_app
-    recorded = db._db_file_identity
-    alt.close()
-    shutil.copyfile(other, live)
-    if recorded is not None:
-        st = os.stat(live)
-        assert (st.st_dev, st.st_ino) == recorded
-    with pytest.raises(StateDbReplacedError, match="replaced underneath"):
-        db.append_message("live-sess", role="user", content="after-cp")
-    assert db._db_replaced is True
-    assert db._fts_enabled is True
-    assert db._fts_stale is False
-    db.close()
+    assert _read_sqlite_application_id(live) == application_id
+
+
+@pytest.mark.linux_only
+def test_identity_probe_preserves_other_sessiondb_writer_lock(tmp_path):
+    """A live identity check cannot admit a foreign process into a WAL write.
+
+    POSIX drops all process-owned advisory locks when *any* descriptor for the
+    inode closes.  Before the regression fix, ``probe._db_file_was_replaced``
+    opened and closed the main DB header, silently revoking ``writer``'s
+    ``BEGIN IMMEDIATE`` lock.  A second process could then acquire the write
+    lock while the first connection still believed its transaction was
+    exclusive — the documented SQLite corruption mechanism.
+    """
+    live = tmp_path / "state.db"
+    writer = _make_db(live, "writer", "before")
+    probe = SessionDB(db_path=live)
+    try:
+        # Run two transactions: a cancelled POSIX lock can leave SQLite's
+        # process-local lock bookkeeping stale and surface on the *next*
+        # acquisition rather than the transaction during which close() ran.
+        for _ in range(2):
+            with writer._lock:
+                writer._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    assert probe._db_file_was_replaced() is False
+                    contender = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            (
+                                "import sqlite3,sys; "
+                                "c=sqlite3.connect(sys.argv[1], timeout=0); "
+                                "\ntry:\n c.execute('BEGIN IMMEDIATE')\n"
+                                "except sqlite3.OperationalError as e:\n"
+                                " print('locked' if 'locked' in str(e).lower() else e); "
+                                "sys.exit(0 if 'locked' in str(e).lower() else 2)\n"
+                                "else:\n c.rollback(); print('acquired'); sys.exit(3)"
+                            ),
+                            str(live),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    assert contender.returncode == 0, (
+                        contender.stdout + contender.stderr
+                    )
+                    assert contender.stdout.strip() == "locked"
+                finally:
+                    writer._conn.rollback()
+
+        writer.append_message("writer", role="assistant", content="after")
+        check = sqlite3.connect(live)
+        try:
+            assert check.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        finally:
+            check.close()
+    finally:
+        probe.close()
+        writer.close()
 
 
 def test_divert_session_transcript_jsonl_appends(tmp_path, monkeypatch):
