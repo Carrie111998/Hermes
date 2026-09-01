@@ -1505,6 +1505,16 @@ class FeishuAdapter(BasePlatformAdapter):
         self._settings = self._load_settings(config.extra or {})
         self._apply_settings(self._settings)
         self._client: Optional[Any] = None
+        # Generation of this adapter's current tool-client binding, allocated
+        # by the binding registry's per-profile monotonic counter (NOT a local
+        # count), so a replacement adapter instance for the same profile can
+        # never collide with a stale instance's generation. Retained for the
+        # compare-and-remove teardown in ``_unpublish_tool_clients``.
+        self._tool_binding_generation = 0
+        # Profile key captured at publication time: disconnect() may run under
+        # a different contextvar scope than connect(), and teardown must target
+        # the registry entry this adapter actually published.
+        self._tool_binding_profile_key: Optional[str] = None
         # Adapter-owned thread pool for blocking Feishu SDK calls. Routing SDK
         # work through this pool (instead of asyncio's shared default executor)
         # means a torn-down default executor can no longer wedge sends with
@@ -1829,6 +1839,13 @@ class FeishuAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Disconnect from Feishu/Lark."""
         self._running = False
+        # Retract the tool-client binding FIRST, before any await: a
+        # mid-teardown failure (webhook runner cleanup raising, a hard
+        # cancellation at an await point) must never leave this adapter's
+        # credential-bearing client discoverable in the registry.
+        # Compare-and-remove: only this adapter's generation is removed, so a
+        # stale adapter tearing down cannot clear a newer adapter's binding.
+        self._unpublish_tool_clients()
         await self._cancel_pending_tasks(self._pending_text_batch_tasks)
         await self._cancel_pending_tasks(self._pending_media_batch_tasks)
         self._reset_batch_buffers()
@@ -1904,6 +1921,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_thread_loop = None
         self._loop = None
         self._event_handler = None
+        self._client = None
         self._shutdown_sdk_executor()
         self._persist_seen_message_ids()
         await self._release_app_lock()
@@ -4977,6 +4995,10 @@ class FeishuAdapter(BasePlatformAdapter):
             self._ws_client,
             self,
         )
+        # Publish only after every step above succeeded — a failed connect
+        # attempt must never expose a tool client with no live adapter behind
+        # it (see tools/feishu_client_binding.py).
+        self._publish_tool_clients()
 
     async def _connect_webhook(self) -> None:
         if not FEISHU_WEBHOOK_AVAILABLE:
@@ -4996,6 +5018,10 @@ class FeishuAdapter(BasePlatformAdapter):
         await self._webhook_runner.setup()
         self._webhook_site = web.TCPSite(self._webhook_runner, self._webhook_host, self._webhook_port)
         await self._webhook_site.start()
+        # Publish only after every step above succeeded — a failed connect
+        # attempt must never expose a tool client with no live adapter behind
+        # it (see tools/feishu_client_binding.py).
+        self._publish_tool_clients()
 
     def _build_lark_client(self, domain: Any) -> Any:
         return (
@@ -5006,6 +5032,35 @@ class FeishuAdapter(BasePlatformAdapter):
             .log_level(lark.LogLevel.WARNING)
             .build()
         )
+
+    def _publish_tool_clients(self) -> None:
+        """Publish this adapter's client into the profile-qualified binding
+        registry so Feishu doc/drive tools work in DM/gateway sessions where no
+        comment-thread client is injected.
+
+        Called only after a connection fully succeeds. The registry allocates
+        the generation from a per-profile process-wide counter, so a reconnect
+        or replacement adapter supersedes the previous binding, and a stale
+        adapter's compare-and-remove teardown can never erase a newer binding.
+        The profile key is captured here (not re-derived at teardown) because
+        disconnect() may run under a different contextvar scope than connect().
+        """
+        from tools.feishu_client_binding import active_profile_key, publish
+
+        self._tool_binding_profile_key = active_profile_key()
+        self._tool_binding_generation = publish(
+            self._client, self._tool_binding_profile_key
+        )
+
+    def _unpublish_tool_clients(self) -> None:
+        """Remove this adapter's binding (compare-and-remove by generation)."""
+        if self._tool_binding_profile_key is None:
+            return
+
+        from tools.feishu_client_binding import unpublish
+
+        unpublish(self._tool_binding_generation, self._tool_binding_profile_key)
+        self._tool_binding_profile_key = None
 
     async def _feishu_send_with_retry(
         self,
