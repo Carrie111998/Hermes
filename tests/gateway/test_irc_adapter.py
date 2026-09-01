@@ -18,6 +18,8 @@ check_requirements = _irc_mod.check_requirements
 validate_config = _irc_mod.validate_config
 register = _irc_mod.register
 _standalone_send = _irc_mod._standalone_send
+is_connected = _irc_mod.is_connected
+_env_enablement = _irc_mod._env_enablement
 
 
 class TestIRCProtocolHelpers:
@@ -404,5 +406,144 @@ class TestIRCStandaloneSend:
 
         assert "error" in result
         assert "registration" in result["error"].lower() or "timeout" in result["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Multiplex secondary-profile scope
+# ---------------------------------------------------------------------------
+#
+# __init__'s server/port/nickname/channel/use_tls, check_requirements/
+# validate_config/is_connected's server/channel, and _env_enablement's
+# server/channel/port/nickname/use_tls/home_channel, all previously read raw
+# os.getenv unconditionally (only IRC_SERVER_PASSWORD/IRC_NICKSERV_PASSWORD
+# were already scoped). Under multiplex, os.environ holds the DEFAULT
+# profile's YAML-to-env bridge output -- a secondary profile with its own
+# (different or absent) IRC config would silently connect to the default
+# profile's server/channel, or (for _env_enablement) get auto-enabled using
+# the default's channel as its cron home_channel -- a real message-
+# misdelivery risk, not just cosmetic. Mirrors the LINE/Buzz/SimpleX fix for
+# #98738.
+
+@pytest.fixture
+def multiplex_scope():
+    """Install multiplex + a secondary-profile secret scope; restore after."""
+    tokens = []
+
+    def install(scope=None):
+        from agent.secret_scope import set_multiplex_active, set_secret_scope
+
+        set_multiplex_active(True)
+        tokens.append(set_secret_scope(scope or {}))
+        return tokens[-1]
+
+    yield install
+
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active
+
+    for token in reversed(tokens):
+        reset_secret_scope(token)
+    set_multiplex_active(False)
+
+
+@pytest.fixture
+def default_profile_env(monkeypatch):
+    """The default profile's YAML-to-env bridge output in os.environ."""
+    monkeypatch.setenv("IRC_SERVER", "default.example.net")
+    monkeypatch.setenv("IRC_CHANNEL", "#default")
+    monkeypatch.setenv("IRC_PORT", "6667")
+    monkeypatch.setenv("IRC_NICKNAME", "default-bot")
+    monkeypatch.setenv("IRC_USE_TLS", "false")
+
+
+class TestMultiplexProfileScope:
+
+    def test_secondary_extra_wins_over_default_profile_env(
+        self, multiplex_scope, default_profile_env
+    ):
+        """The secondary profile's own config.yaml extra is authoritative,
+        not the default profile's bridged server/channel/port/nick/tls."""
+        from gateway.config import PlatformConfig
+
+        multiplex_scope()
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={
+                "server": "profile.example.net",
+                "channel": "#profile",
+                "port": 6697,
+                "nickname": "profile-bot",
+                "use_tls": True,
+            },
+        )
+        adapter = IRCAdapter(cfg)
+        assert adapter.server == "profile.example.net"
+        assert adapter.channel == "#profile"
+        assert adapter.port == 6697
+        assert adapter.nickname == "profile-bot"
+        assert adapter.use_tls is True
+
+    def test_secondary_missing_keys_fail_closed(
+        self, multiplex_scope, default_profile_env
+    ):
+        """Keys absent from the profile's own scope must NOT borrow the
+        default profile's bridged env values -- that would silently connect
+        the secondary profile's bot to the wrong IRC server/channel."""
+        from gateway.config import PlatformConfig
+
+        multiplex_scope()
+        adapter = IRCAdapter(PlatformConfig(enabled=True, extra={}))
+        assert adapter.server == ""
+        assert adapter.channel == ""
+        assert adapter.port == 6697  # falls through to the hardcoded default
+        assert adapter.nickname == "hermes-bot"
+        assert adapter.use_tls is True  # extra.get("use_tls", True) default
+
+    def test_default_profile_unscoped_keeps_env_precedence(
+        self, monkeypatch, default_profile_env
+    ):
+        """Multiplex ON but no scope (the DEFAULT profile constructs
+        unscoped): env is its own bridge output and still wins."""
+        from agent.secret_scope import set_multiplex_active
+        from gateway.config import PlatformConfig
+
+        set_multiplex_active(True)
+        try:
+            adapter = IRCAdapter(PlatformConfig(enabled=True, extra={}))
+        finally:
+            set_multiplex_active(False)
+        assert adapter.server == "default.example.net"
+        assert adapter.channel == "#default"
+        assert adapter.port == 6667
+        assert adapter.nickname == "default-bot"
+        assert adapter.use_tls is False
+
+    def test_env_enablement_scoped_reads_own_channel_not_default(
+        self, multiplex_scope, default_profile_env
+    ):
+        """A secondary profile's own .env (via the scope) seeds its own
+        server/channel; the default profile's bridged values must not leak
+        in."""
+        multiplex_scope({"IRC_SERVER": "profile.example.net", "IRC_CHANNEL": "#profile"})
+        seeded = _env_enablement()
+        assert seeded["server"] == "profile.example.net"
+        assert seeded["channel"] == "#profile"
+        assert seeded["home_channel"]["chat_id"] == "#profile"
+
+    def test_env_enablement_scoped_without_own_config_returns_none(
+        self, multiplex_scope, default_profile_env
+    ):
+        """A scope with no IRC_SERVER/IRC_CHANNEL of its own must not
+        auto-enable IRC using the default profile's server/channel."""
+        multiplex_scope({"SOMETHING_ELSE": "x"})
+        assert _env_enablement() is None
+
+    def test_check_requirements_and_is_connected_scoped_miss_ignore_default(
+        self, multiplex_scope, default_profile_env
+    ):
+        from gateway.config import PlatformConfig
+
+        multiplex_scope({"SOMETHING_ELSE": "x"})
+        assert check_requirements() is False
+        assert is_connected(PlatformConfig(enabled=True, extra={})) is False
 
 
