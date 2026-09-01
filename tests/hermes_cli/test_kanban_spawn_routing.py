@@ -145,6 +145,74 @@ fallback_model:
     assert "gemma4:e2b-it-qat" not in captured["cmd"]
 
 
+def test_default_spawn_uses_profile_local_first_override(
+    monkeypatch, tmp_path
+) -> None:
+    """A profile-local opt-in must not be lost to the root config."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "researcher-a"
+    profile.mkdir(parents=True)
+    root.joinpath("config.yaml").write_text(
+        "kanban:\n  local_first: false\n", encoding="utf-8"
+    )
+    profile.joinpath("config.yaml").write_text(
+        """
+kanban:
+  local_first: true
+model:
+  provider: nous
+  default: poolside/laguna-xs-2.1:free
+fallback_model:
+  - provider: ollama-launch
+    model: gemma4:e2b-it-qat
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4247
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    task = kb.Task(
+        id="t_profile_local_first",
+        title="profile local route",
+        body=None,
+        assignee="researcher-a",
+        status="running",
+        priority=0,
+        created_by="test",
+        created_at=1,
+        started_at=None,
+        completed_at=None,
+        workspace_kind="dir",
+        workspace_path=None,
+        claim_lock=None,
+        claim_expires=None,
+        tenant=None,
+        model_override=None,
+        provider_override=None,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    assert kb._default_spawn(task, str(workspace)) == 4247
+    model_index = captured["cmd"].index("-m")
+    provider_index = captured["cmd"].index("--provider")
+    assert captured["cmd"][model_index + 1] == "gemma4:e2b-it-qat"
+    assert captured["cmd"][provider_index + 1] == "ollama-launch"
+
+
 def test_default_spawn_honors_explicit_remote_pin_when_local_first_is_enabled(
     monkeypatch, tmp_path
 ) -> None:

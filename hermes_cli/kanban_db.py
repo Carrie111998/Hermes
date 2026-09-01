@@ -12044,8 +12044,14 @@ def _resolve_local_first_route(
     return None
 
 
-def _kanban_local_first_enabled() -> bool:
-    """Read the explicit operator opt-in for local-first Kanban spawning."""
+def _kanban_local_first_enabled(
+    profile_config: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Read local-first, giving an explicit profile value precedence."""
+    if isinstance(profile_config, Mapping):
+        profile_kanban = profile_config.get("kanban")
+        if isinstance(profile_kanban, Mapping) and "local_first" in profile_kanban:
+            return bool(profile_kanban.get("local_first"))
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -12334,7 +12340,7 @@ def _default_spawn(
     has_explicit_task_model = bool(str(task.model_override or "").strip())
     local_first_route = (
         _resolve_local_first_route(parsed_profile)
-        if _kanban_local_first_enabled() and not has_explicit_task_model
+        if _kanban_local_first_enabled(parsed_profile) and not has_explicit_task_model
         else None
     )
     selected_local_route = explicit_local_route or local_first_route
