@@ -47,6 +47,18 @@ def test_fallback_for_toolset_plural_hides_when_canonical_present():
     assert _skill_should_show(conds, set(), set()) is True        # absent -> show
 
 
+def test_non_string_requires_toolsets_element_gates_out():
+    # An empty `requires_toolsets:` value parses to None; malformed frontmatter
+    # may also carry non-string elements. These must gate the skill out (fail
+    # closed), never raise — a crash here aborts the whole index build, which is
+    # a worse failure mode than silently hiding one skill.
+    assert _skill_should_show({"requires_toolsets": [None]}, set(), {"file"}) is False
+    assert _skill_should_show({"requires_toolsets": [123]}, set(), {"file"}) is False
+    assert _skill_should_show({"requires_toolsets": ["files", None]}, set(), {"file"}) is False
+    # fallback_for with a bad element likewise must not raise.
+    assert _skill_should_show({"fallback_for_toolsets": [None]}, set(), {"file"}) is True
+
+
 def test_requires_tools_exact_match_unchanged():
     # Tool names are exact identifiers (no singular/plural form) — behaviour
     # must be untouched by the toolset canonicalization.

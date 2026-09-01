@@ -1710,7 +1710,14 @@ def _canonical_toolset_name(name: str) -> str:
     Reconcile a one-letter singular/plural drift against the known toolset
     registry. Unknown names are returned unchanged, so a genuine typo still
     (correctly) gates the skill out rather than being force-matched.
+
+    A non-string / empty element (an empty ``requires_toolsets:`` value parses
+    to ``None``) is returned unchanged so the caller's membership check fails
+    closed exactly as the pre-canonicalization exact-match did — never raising
+    and crashing the whole snapshot's index build over one malformed skill.
     """
+    if not isinstance(name, str) or not name:
+        return name
     try:
         from toolsets import TOOLSETS
     except Exception:
