@@ -1,6 +1,11 @@
-"""The JobFlow modules must not carry the operator's personal data.
+"""Tracked source must not carry the operator's personal data.
 
-Three separate leaks of the same class landed in tracked source and were only
+Lives under ``tests/graphs/`` for historical reasons -- it began as a JobFlow
+guard -- but its scope is now every module that touches operator data,
+including ``agent/`` and ``ai_usage/``. Add to the tuples below rather than
+starting a second guard elsewhere.
+
+Four separate leaks of the same class landed in tracked source and were only
 found after publication to a public fork, where the parent repository serves
 the objects and retraction is impossible:
 
@@ -13,6 +18,10 @@ the objects and retraction is impossible:
 * ``jobflow_quality/matcher_filter.py`` held the walk-away figure as a live
   constant, plus a citizenship statement and the real employer names from the
   operator's application pipeline.
+* ``agent/account_usage.py`` and ``ai_usage/collector.py`` named the operator's
+  subscription email while explaining a duplicate-account defect -- and three
+  test files repeated it as a bare username, which is why a grep for the full
+  address found only half of them. Match shapes, not the spelling you first saw.
 
 These tests make that class of leak fail the build instead of reaching a remote.
 The values now live beside the master resume in the CV Handler knowledge base
@@ -46,20 +55,27 @@ import pytest
 
 _REPO = Path(__file__).resolve().parents[2]
 
-# Source modules that compose, carry, or filter on candidate data.
+# Source modules that compose, carry, or filter on the operator's data.
 _GUARDED_SOURCE = (
     "graphs/_profile.py",
     "graphs/_prompts.py",
     "graphs/jobflow.py",
     "jobflow_quality/matcher_filter.py",
     "jobflow_quality/qc.py",
+    # Not JobFlow: the account-usage collector narrated a 2026-08-23 duplicate
+    # -account defect and named the operator's subscription address doing it.
+    "agent/account_usage.py",
+    "ai_usage/collector.py",
 )
 
-# Test files whose fixtures stand in for a real person.
+# Test files whose fixtures or prose stand in for a real person.
 _GUARDED_TESTS = (
     "tests/jobflow_quality/test_qc.py",
     "tests/jobflow_quality/test_readiness.py",
     "tests/jobflow_quality/test_semantic_qc.py",
+    "tests/ai_usage/test_contract.py",
+    "tests/ai_usage/test_duplicate_account_guard.py",
+    "tests/agent/test_account_usage_new_providers.py",
 )
 
 _FORBIDDEN_IN_SOURCE = {

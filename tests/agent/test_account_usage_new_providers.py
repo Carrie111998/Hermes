@@ -312,7 +312,7 @@ def test_primary_anthropic_prefers_the_pinned_profile_over_the_ambient_token(
 
     resolve_anthropic_token() ultimately reads ~/.claude, which follows whichever
     account the desktop app is signed into. On 2026-08-23 14:18 the primary flipped
-    from diegodearagao to diegodearagaous and this row silently became a duplicate of
+    to the second subscription's account and this row silently became a duplicate of
     "Claude 2" for ~13 hours. If the ambient token is ever preferred again, this test
     fails: it makes the two sources disagree and pins which one wins.
     """

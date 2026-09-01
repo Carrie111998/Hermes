@@ -12,7 +12,7 @@ def test_providers_grid_order_and_modes():
     ]
     modes = {p[0]: p[2] for p in PROVIDERS}
     assert modes["anthropic"] == "budget" and modes["kimi"] == "budget"
-    # Second Anthropic subscription (diegodearagaous@gmail.com) via its own
+    # Second, separate Anthropic subscription via its own
     # ANTHROPIC2_OAUTH_TOKEN; same oauth usage endpoint, same window labels.
     assert modes["anthropic2"] == "budget"
     assert modes["deepseek"] == "balance"  # pay-as-you-go outstanding-$

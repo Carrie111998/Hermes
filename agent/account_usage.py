@@ -891,9 +891,10 @@ def _fetch_anthropic_account_identity(
 
     Exists so the collector can distinguish two DISTINCT subscriptions from two
     tokens minted against the SAME account -- the 2026-08-23 defect where the
-    tray's "Claude" and "Claude 2" rows both reported diegodearagaous@gmail.com
+    tray's "Claude" and "Claude 2" rows both reported the SAME account email
     (identical percentages) because the isolated ~/.claude-anthropic2 login
-    landed on the already-signed-in browser account.
+    landed on the already-signed-in browser account. Which address it was does
+    not matter to the mechanism and is not recorded here: this file is tracked.
     """
     try:
         response = client.get(
@@ -988,7 +989,7 @@ def _fetch_anthropic_account_usage(
     exists. ``resolve_anthropic_token()`` ultimately reads ``~/.claude``, which
     follows whichever account the desktop app is signed into -- so this row
     used to change subject on every account switch. On 2026-08-23 14:18 the
-    primary flipped from diegodearagao to diegodearagaous and this row silently
+    primary flipped to the second subscription's account and this row silently
     became a duplicate of "Claude 2". Pinning fixes the subject; the fallback
     keeps the row working on a box that has never created the profile.
     """
@@ -1096,7 +1097,7 @@ def _fetch_pinned_profile_usage(
     Pinning is the point: ``~/.claude`` follows whichever account the desktop
     app is currently signed into, so a row sourced from it silently changes
     subject on every account switch (observed 2026-08-23 14:18, when the
-    primary flipped from diegodearagao to diegodearagaous and collapsed onto
+    primary flipped to the second subscription's account and collapsed onto
     the "Claude 2" row). An isolated profile keeps one row on one account.
 
     Expired access tokens are refreshed in place with the profile's own

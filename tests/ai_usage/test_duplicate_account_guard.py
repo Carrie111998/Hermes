@@ -144,8 +144,8 @@ def test_identity_failure_never_costs_the_usage_numbers():
 def test_primary_row_prefers_the_pinned_profile_over_the_live_login(monkeypatch):
     """~/.claude follows the desktop app's current account; the row must not.
 
-    Regression for 2026-08-23 14:18, when the primary profile was switched from
-    diegodearagao to diegodearagaous and the "Claude" row silently became a
+    Regression for 2026-08-23 14:18, when the primary profile was switched to
+    the second subscription's account and the "Claude" row silently became a
     duplicate of "Claude 2".
     """
     from agent import account_usage

@@ -294,7 +294,9 @@ def _flag_duplicate_accounts(providers: list[dict]) -> None:
     minted against ONE account produce two rows with identical numbers and no
     visible symptom -- exactly the 2026-08-23 defect where the isolated
     ``~/.claude-anthropic2`` login landed on the already-signed-in browser
-    account, so "Claude" and "Claude 2" both reported diegodearagaous@gmail.com.
+    account, so "Claude" and "Claude 2" both reported one and the same account
+    email. The address itself is deliberately not written here; the collision
+    is the point, and this file is tracked.
 
     The first row of a colliding group keeps its data (it is the one whose
     numbers are genuinely its own); every later row is flagged so the tray shows
