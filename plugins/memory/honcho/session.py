@@ -160,6 +160,12 @@ class HonchoSessionManager:
         self._auth_failure: str | None = None
         self._auth_notice_emitted = False
 
+        # base_url → True once a peer_perspective search has returned a
+        # non-empty result, proving the filter works on that server. Absent
+        # means unproven: empty perspective results keep paying the peer_id
+        # retry until proven otherwise.
+        self._perspective_supported: dict[str, bool] = {}
+
         # Write frequency state
         write_frequency = (config.write_frequency if config else "async")
         self._write_frequency = write_frequency
@@ -1462,6 +1468,14 @@ class HonchoSessionManager:
             logger.debug("Failed to fetch peer card from Honcho: %s", e)
             return []
 
+    def _honcho_base_url(self) -> str:
+        """Base URL of the bound Honcho client, or "" when unknown (tests)."""
+        try:
+            base = getattr(self.honcho, "base_url", "")
+        except Exception:
+            return ""
+        return base if isinstance(base, str) else ""
+
     def search_context(
         self,
         session_key: str,
@@ -1506,6 +1520,8 @@ class HonchoSessionManager:
         char_budget = max(200, int(max_tokens) * 4)
         limit = max(3, min(20, char_budget // 300))
 
+        base_url = self._honcho_base_url()
+
         try:
             messages = self._authed_call(
                 "message search",
@@ -1521,7 +1537,14 @@ class HonchoSessionManager:
             logger.debug("Honcho message search failed (peer_perspective=%s): %s", peer_id, e)
             messages = []
 
-        if not messages:
+        if messages:
+            # A non-empty perspective result proves the filter works on this
+            # server. Remember it per base_url so genuinely-empty queries stop
+            # paying the peer_id double-probe (review note on #92262).
+            if base_url:
+                with self._cache_lock:
+                    self._perspective_supported[base_url] = True
+        elif not self._perspective_supported.get(base_url, False):
             # Some API builds (e.g. self-hosted from source) silently return
             # empty for the peer_perspective filter because the column is not
             # filterable in their schema. Retry with the peer_id column filter
