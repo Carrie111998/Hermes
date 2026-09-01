@@ -9907,6 +9907,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
             return False
 
+        # BasePlatformAdapter owns a short queue-mode debounce buffer in
+        # addition to the runner's pending slot and overflow FIFO.  Search it
+        # first so an edit cannot miss the exact message merely because its
+        # debounce timer has not fired yet.
+        replace_debounced = getattr(adapter, "replace_text_debounce_message", None)
+        if callable(replace_debounced) and replace_debounced(
+            session_key, message_id, new_text
+        ):
+            return True
+
         # Primary slot
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if isinstance(pending_slot, dict):
@@ -9966,6 +9976,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _q_state = self._peek_session_state(session_key)
         if _q_state and _q_state.turn.active_message_id == _msg_id:
             running_agent = _q_state.turn.agent
+            if running_agent is _AGENT_PENDING_SENTINEL:
+                logger.info(
+                    "Edit supersede — active turn is still initializing for "
+                    "message_id=%s in session %s; dropping the edit rather "
+                    "than misrouting it as a new turn",
+                    _msg_id,
+                    session_key,
+                )
+                return True
             if running_agent is not None and running_agent is not _AGENT_PENDING_SENTINEL:
                 _framing = f'[User edited their earlier message. Corrected message: "{event.text}"]'
                 _handled = False

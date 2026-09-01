@@ -47,6 +47,7 @@ Add these to `~/.hermes/.env`:
 SIMPLEX_WS_URL=ws://127.0.0.1:5225
 SIMPLEX_ALLOWED_USERS=<contact-id-1>,<contact-id-2>
 SIMPLEX_HOME_CHANNEL=<contact-id>
+SIMPLEX_AUTO_ACCEPT=false
 ```
 
 | Variable | Required | Description |
@@ -54,13 +55,15 @@ SIMPLEX_HOME_CHANNEL=<contact-id>
 | `SIMPLEX_WS_URL` | Yes | WebSocket URL of the simplex-chat daemon |
 | `SIMPLEX_ALLOWED_USERS` | Recommended | Comma-separated numeric `contactId` allowlist. Display names are mutable labels and are not authorization identities. |
 | `SIMPLEX_ALLOW_ALL_USERS` | Optional | Set `true` to allow every contact (use carefully) |
-| `SIMPLEX_AUTO_ACCEPT` | Optional | Auto-accept incoming contact requests (default: `true`) |
+| `SIMPLEX_AUTO_ACCEPT` | Optional | Auto-accept incoming contact requests (default: `true`). Keep this `false` for production identities unless unattended enrollment is intentional. |
 | `SIMPLEX_GROUP_ALLOWED` | Optional | Comma-separated group IDs the bot participates in, or `*` for any group. Omit to ignore group messages entirely |
 | `SIMPLEX_HOME_CHANNEL` | Optional | Default contact/group ID for cron job delivery |
 | `SIMPLEX_HOME_CHANNEL_NAME` | Optional | Human label for the home channel |
 | `HERMES_SIMPLEX_TEXT_BATCH_DELAY` | Optional | Quiet-period seconds (default: `0.8`) used to concatenate rapid-fire inbound text messages into one event |
 | `platforms.simplex.extra.files_folder` | Optional | Absolute daemon `--files-folder` path used to resolve relative received-file paths |
 | `platforms.simplex.extra.file_transfer_timeout` | Optional | Seconds before a stalled inbound transfer is discarded and its caption is delivered without the attachment (default: `300`) |
+| `platforms.simplex.extra.retain_received_files` | Optional | Keep adapter-created inbound transfer files after the turn. Defaults to `false`; unrelated daemon/user files are never removed. |
+| `platforms.simplex.extra.media_cleanup_timeout` | Optional | TTL backstop for adapter-created inbound files and converted outbound previews (default: `3600`, minimum: `60`) |
 
 ## Find your contact ID
 
@@ -83,6 +86,11 @@ SIMPLEX_GROUP_ALLOWED=12,34          # specific group IDs
 # or
 SIMPLEX_GROUP_ALLOWED=*              # any group the bot is in
 ```
+
+Group messages still pass the sender allowlist. Hermes uses a member's numeric
+`memberContactId` when the group member is also a direct contact. For an
+unlinked member, add that membership's exact opaque `memberId` to
+`SIMPLEX_ALLOWED_USERS`; a display name never authorizes either form.
 
 Address groups by prefixing the chat ID with `group:`, e.g.
 `simplex:group:12` as a cron `deliver=` target or in a `hermes send` call.
@@ -114,6 +122,10 @@ The adapter supports native SimpleX attachments in both directions:
   appropriate `MessageType` (`PHOTO`, `VOICE`, or `DOCUMENT`). Unknown senders
   cannot trigger a download. Cancelled, failed, or timed-out transfers release
   their state and preserve any text caption without presenting a missing file.
+  A caption-less failure becomes an explicit attachment-unavailable notice.
+  By default Hermes deletes only the unique receive path it created after the
+  consuming turn, with a TTL backstop for dropped/abandoned turns. Set
+  `retain_received_files: true` only when persistent local copies are wanted.
 - **Outbound** — `send_image_file`, `send_voice`, `send_document`, and
   `send_video` all use the structured `/_send` form with `filePath`, so
   the receiving SimpleX client renders images inline and plays voice
@@ -145,6 +157,7 @@ hermes send simplex:<contact-id> "Done!"
 - SimpleX never reveals phone numbers or email addresses — contacts use opaque IDs
 - The connection between Hermes and the daemon is local WebSocket (`ws://127.0.0.1:5225`) — no data leaves your machine
 - Messages are end-to-end encrypted by the SimpleX protocol before reaching the daemon
+- For a long-lived production identity, disable automatic contact acceptance and approve new contacts deliberately
 
 ## Troubleshooting
 

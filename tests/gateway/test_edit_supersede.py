@@ -73,6 +73,7 @@ def _make_adapter() -> MagicMock:
     adapter.config = MagicMock()
     adapter.config.extra = {}
     adapter.platform = MagicMock(value="telegram")
+    adapter.replace_text_debounce_message.return_value = False
     return adapter
 
 
@@ -216,6 +217,38 @@ class TestReplaceQueuedMessage:
         assert replaced is True
         assert adapter._pending_messages[sk].text == "first\ncorrected second"
         assert adapter._pending_messages[sk].message_id == "msg_1"
+
+    def test_replace_busy_debounce_before_queue_slots(self):
+        """Edits also search BasePlatformAdapter's pre-flush debounce state."""
+        runner = _make_runner()
+        adapter = _make_adapter()
+        adapter.replace_text_debounce_message.return_value = True
+
+        replaced = runner._replace_queued_message(
+            "test_session", adapter, "msg_2", "latest"
+        )
+
+        assert replaced is True
+        adapter.replace_text_debounce_message.assert_called_once_with(
+            "test_session", "msg_2", "latest"
+        )
+
+    def test_rapid_batched_edits_are_latest_wins(self):
+        runner = _make_runner()
+        adapter = _make_adapter()
+        sk = "test_session"
+        batched = _make_event(text="first\nsecond", message_id="msg_1")
+        batched.metadata = {
+            "simplex_batch_items": [
+                {"message_id": "msg_1", "text": "first"},
+                {"message_id": "msg_2", "text": "second"},
+            ]
+        }
+        adapter._pending_messages[sk] = batched
+
+        assert runner._replace_queued_message(sk, adapter, "msg_2", "third")
+        assert runner._replace_queued_message(sk, adapter, "msg_2", "final")
+        assert batched.text == "first\nfinal"
 
 
 # ===================================================================

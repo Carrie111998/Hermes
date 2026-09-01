@@ -154,7 +154,7 @@ def _response_error(resp: Optional[dict]) -> Optional[str]:
     if not isinstance(resp, dict):
         return "SimpleX daemon did not answer"
     resp_type = _response_type(resp)
-    if resp_type == "localCommandOutcomeUnknown":
+    if resp_type in {"localCommandOutcomeUnknown", "localCommandNotSubmitted"}:
         return str(resp.get("error") or "SimpleX command outcome is unknown")[:1000]
     if resp_type not in {"chatCmdError", "chatError", "chatErrors"}:
         return None
@@ -226,6 +226,10 @@ class SimplexAdapter(BasePlatformAdapter):
         self._file_transfer_timeout = max(
             1.0, float(extra.get("file_transfer_timeout", 300.0))
         )
+        self.retain_received_files = bool(extra.get("retain_received_files", False))
+        self._media_cleanup_timeout = max(
+            60.0, float(extra.get("media_cleanup_timeout", 3600.0))
+        )
 
         allow_entries = _parse_comma_list(os.getenv("SIMPLEX_ALLOWED_USERS", ""))
         ignored_allow_entries = [
@@ -233,8 +237,10 @@ class SimplexAdapter(BasePlatformAdapter):
         ]
         if ignored_allow_entries:
             logger.warning(
-                "SimpleX: %d non-numeric SIMPLEX_ALLOWED_USERS entries are "
-                "ignored; migrate to stable contactIds from /contacts",
+                "SimpleX: %d non-numeric SIMPLEX_ALLOWED_USERS entries do not "
+                "authorize DMs; display names are ignored. Keep an entry only "
+                "if it is an exact group memberId, otherwise migrate to a "
+                "stable contactId from /contacts",
                 len(ignored_allow_entries),
             )
 
@@ -264,6 +270,10 @@ class SimplexAdapter(BasePlatformAdapter):
         # consumed when the file finishes downloading.
         self._pending_file_transfers: Dict[int, dict] = {}
         self._file_transfer_tasks: Dict[int, asyncio.Task] = {}
+        self._file_receive_targets: Dict[int, str] = {}
+        self._terminal_file_transfers: Dict[int, dict] = {}
+        self._owned_media_cleanup_tasks: Dict[str, asyncio.Task] = {}
+        self._outbound_temp_by_item: Dict[str, str] = {}
 
         # Correlation tracking for ``_send_command``. Separate from
         # ``_pending_corr_ids`` (which is the upstream cosmetic echo filter)
@@ -283,6 +293,7 @@ class SimplexAdapter(BasePlatformAdapter):
             "file_rejections": 0,
             "file_failures": 0,
             "file_timeouts": 0,
+            "late_file_completions": 0,
         }
 
         # Direct-message reaction approvals. State is intentionally ephemeral:
@@ -415,6 +426,15 @@ class SimplexAdapter(BasePlatformAdapter):
             )
         self._file_transfer_tasks.clear()
         self._pending_file_transfers.clear()
+        self._file_receive_targets.clear()
+        self._terminal_file_transfers.clear()
+        for path in list(self._owned_media_cleanup_tasks):
+            self._cleanup_owned_media_path(path)
+        for task in list(self._owned_media_cleanup_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._owned_media_cleanup_tasks.clear()
+        self._outbound_temp_by_item.clear()
         self._ws_ready.clear()
         self._approval_prompts_by_item.clear()
         self._approval_prompt_by_session.clear()
@@ -492,8 +512,18 @@ class SimplexAdapter(BasePlatformAdapter):
                         )
                     self._pending_responses.pop(corr_id, None)
                     self._pending_corr_ids.discard(corr_id)
-                if hasattr(self, "_mark_disconnected"):
-                    self._mark_disconnected()
+                # Do not call ``_mark_disconnected`` here: the base helper
+                # sets ``_running = False`` and would terminate this listener's
+                # own reconnect loop after the first socket drop. Keep the
+                # adapter alive while publishing transient disconnected state;
+                # explicit ``disconnect()`` owns the terminal state change.
+                if self._running and hasattr(self, "_write_runtime_status_safe"):
+                    self._write_runtime_status_safe(
+                        "disconnected",
+                        platform_state="disconnected",
+                        error_code=None,
+                        error_message=None,
+                    )
 
             if self._running:
                 self._diagnostics["reconnects"] += 1
@@ -577,6 +607,12 @@ class SimplexAdapter(BasePlatformAdapter):
             file_id = rcv_file.get("fileId") if isinstance(rcv_file, dict) else None
             if file_id is not None:
                 file_id = int(file_id)
+                if file_id in self._terminal_file_transfers:
+                    logger.debug(
+                        "SimpleX: ignoring descriptor for terminal fileId=%s",
+                        file_id,
+                    )
+                    return
                 wrapper = self._normalize_chat_item_wrapper(resp.get("chatItem", {}))
                 if not wrapper:
                     wrapper = self._pending_file_transfers.get(file_id, {})
@@ -605,6 +641,8 @@ class SimplexAdapter(BasePlatformAdapter):
                         target_dir,
                         f"simplex-rcv-{uuid.uuid4().hex}-{_sanitize_filename(file_name)}",
                     )
+                self._file_receive_targets[file_id] = target
+                self._schedule_owned_media_cleanup(target)
                 logger.debug(
                     "SimpleX: rcvFileDescrReady for fileId=%s — accepting transfer",
                     file_id,
@@ -644,10 +682,23 @@ class SimplexAdapter(BasePlatformAdapter):
             return
 
         if resp_type == "chatItemReaction":
-            try:
-                await self._handle_reaction_event(resp)
-            except Exception:
-                logger.exception("SimpleX: error processing reaction event")
+            self._spawn_dispatch_task(self._handle_reaction_event(resp))
+            return
+
+        if resp_type in {
+            "sndFileComplete",
+            "sndFileCompleteXFTP",
+            "sndFileError",
+            "sndFileWarning",
+        }:
+            wrapper = self._normalize_chat_item_wrapper(
+                resp.get("chatItem") or resp.get("chatItem_") or {}
+            )
+            item_id = self._item_id_from_wrapper(wrapper)
+            if item_id is not None:
+                temp_path = self._outbound_temp_by_item.pop(str(item_id), None)
+                if temp_path:
+                    self._cleanup_owned_media_path(temp_path)
             return
 
         if resp_type in {"rcvFileSndCancelled", "rcvFileError"}:
@@ -679,6 +730,24 @@ class SimplexAdapter(BasePlatformAdapter):
             file_info = chat_item_data.get("file", {}) or {}
             file_id = self._file_id_from_wrapper(chat_item)
             if file_id is not None:
+                if file_id in self._terminal_file_transfers:
+                    self._diagnostics["late_file_completions"] += 1
+                    late_source = file_info.get("fileSource", {}) or {}
+                    late_path = (
+                        late_source.get("filePath")
+                        if isinstance(late_source, dict)
+                        else None
+                    )
+                    target = self._terminal_file_target(file_id)
+                    if late_path and target:
+                        resolved = self._resolve_file_path(late_path)
+                        if os.path.abspath(resolved) == os.path.abspath(target):
+                            self._cleanup_owned_media_path(target)
+                    logger.info(
+                        "SimpleX: ignored late/duplicate completion for fileId=%s",
+                        file_id,
+                    )
+                    return
                 pending = self._pending_file_transfers.pop(file_id, None) or chat_item
                 self._cancel_file_timeout(file_id)
                 if not self._file_sender_is_authorized(pending):
@@ -692,6 +761,7 @@ class SimplexAdapter(BasePlatformAdapter):
                 )
                 if file_path:
                     file_path = self._resolve_file_path(file_path)
+                    self._mark_file_terminal(file_id, "completed")
                     pending_item_data = pending.get("chatItem", {}) or {}
                     pending_file = pending_item_data.setdefault("file", {})
                     pending_file["fileSource"] = {"filePath": file_path}
@@ -703,6 +773,8 @@ class SimplexAdapter(BasePlatformAdapter):
                         logger.exception(
                             "SimpleX: error processing deferred file message"
                         )
+                else:
+                    self._mark_file_terminal(file_id, "completed-without-path")
             return
 
         if resp_type in {"chatError", "chatErrors", "messageError"}:
@@ -763,6 +835,14 @@ class SimplexAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _item_id_from_wrapper(wrapper: dict) -> Optional[str]:
+        normalized = SimplexAdapter._normalize_chat_item_wrapper(wrapper)
+        inner = normalized.get("chatItem", {}) if normalized else {}
+        meta = inner.get("meta", {}) if isinstance(inner, dict) else {}
+        item_id = meta.get("itemId") if isinstance(meta, dict) else None
+        return str(item_id) if item_id is not None else None
+
     def _file_sender_context(
         self, wrapper: dict
     ) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -781,8 +861,16 @@ class SimplexAdapter(BasePlatformAdapter):
             group = chat_info.get("groupInfo", {}) or {}
             group_id = group.get("groupId")
             member = chat_dir.get("groupMember", {}) if isinstance(chat_dir, dict) else {}
+            member_contact_id = (
+                member.get("memberContactId") if isinstance(member, dict) else None
+            )
             member_id = member.get("memberId") if isinstance(member, dict) else None
-            user_id = str(member_id) if member_id is not None else None
+            stable_member_id = (
+                member_contact_id if member_contact_id is not None else member_id
+            )
+            user_id = (
+                str(stable_member_id) if stable_member_id is not None else None
+            )
             chat_id = f"group:{group_id}" if group_id is not None else None
             if (
                 group_id is None
@@ -806,6 +894,78 @@ class SimplexAdapter(BasePlatformAdapter):
         task = self._file_transfer_tasks.pop(file_id, None)
         if task and not task.done() and task is not asyncio.current_task():
             task.cancel()
+
+    def _prune_terminal_files(self) -> None:
+        now = time.monotonic()
+        for file_id, terminal in list(self._terminal_file_transfers.items()):
+            if float(terminal.get("expires_at", 0.0)) <= now:
+                self._terminal_file_transfers.pop(file_id, None)
+        while len(self._terminal_file_transfers) > 4096:
+            self._terminal_file_transfers.pop(next(iter(self._terminal_file_transfers)))
+
+    def _mark_file_terminal(self, file_id: int, reason: str) -> Optional[str]:
+        """Remember a terminal transfer long enough to reject late duplicates."""
+        target = self._file_receive_targets.pop(file_id, None)
+        prior = self._terminal_file_transfers.get(file_id, {})
+        if target is None:
+            target = prior.get("target")
+        self._terminal_file_transfers[file_id] = {
+            "target": target,
+            "reason": reason,
+            "expires_at": time.monotonic() + 86400.0,
+        }
+        self._prune_terminal_files()
+        return target
+
+    def _terminal_file_target(self, file_id: int) -> Optional[str]:
+        self._prune_terminal_files()
+        terminal = self._terminal_file_transfers.get(file_id)
+        if terminal:
+            return terminal.get("target")
+        return self._file_receive_targets.get(file_id)
+
+    def _cleanup_owned_media_path(self, path: str) -> None:
+        """Remove only an exact temporary path minted by this adapter."""
+        normalized = os.path.abspath(path)
+        task = self._owned_media_cleanup_tasks.pop(normalized, None)
+        if task and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+        try:
+            if os.path.isfile(normalized) or os.path.islink(normalized):
+                os.remove(normalized)
+        except OSError:
+            logger.debug(
+                "SimpleX: failed to remove owned temporary media %s",
+                os.path.basename(normalized),
+                exc_info=True,
+            )
+
+    async def _expire_owned_media_path(self, path: str) -> None:
+        try:
+            await asyncio.sleep(self._media_cleanup_timeout)
+            self._cleanup_owned_media_path(path)
+        except asyncio.CancelledError:
+            return
+
+    def _schedule_owned_media_cleanup(self, path: str) -> None:
+        """Install a TTL backstop for an adapter-created media path."""
+        normalized = os.path.abspath(path)
+        existing = self._owned_media_cleanup_tasks.get(normalized)
+        if existing and not existing.done():
+            return
+        task = asyncio.create_task(self._expire_owned_media_path(normalized))
+        self._owned_media_cleanup_tasks[normalized] = task
+
+        def _done(done: asyncio.Task) -> None:
+            if self._owned_media_cleanup_tasks.get(normalized) is done:
+                self._owned_media_cleanup_tasks.pop(normalized, None)
+            if not done.cancelled():
+                try:
+                    done.result()
+                except Exception:
+                    logger.exception("SimpleX: temporary media cleanup failed")
+
+        task.add_done_callback(_done)
 
     def _track_pending_file(self, file_id: int, wrapper: dict) -> None:
         self._pending_file_transfers[file_id] = wrapper
@@ -837,7 +997,13 @@ class SimplexAdapter(BasePlatformAdapter):
         msg_content = content.get("msgContent", {}) if isinstance(content, dict) else {}
         text = msg_content.get("text", "") if isinstance(msg_content, dict) else ""
         if not text:
-            return
+            if not isinstance(content, dict):
+                content = {}
+                inner["content"] = content
+            content["msgContent"] = {
+                "type": "text",
+                "text": f"[Attachment unavailable: {reason}]",
+            }
         logger.info("SimpleX: delivering file caption without attachment (%s)", reason)
         await self._handle_chat_item(fallback)
 
@@ -846,12 +1012,18 @@ class SimplexAdapter(BasePlatformAdapter):
         wrapper = self._pending_file_transfers.pop(file_id, None)
         if not wrapper:
             return
+        target = self._mark_file_terminal(file_id, "transfer timed out")
+        if target:
+            self._cleanup_owned_media_path(target)
         self._diagnostics["file_timeouts"] += 1
         await self._dispatch_file_fallback(wrapper, "transfer timed out")
 
     async def _fail_file_transfer(self, file_id: int, reason: str) -> None:
         wrapper = self._pending_file_transfers.pop(file_id, None)
         self._cancel_file_timeout(file_id)
+        target = self._mark_file_terminal(file_id, reason)
+        if target:
+            self._cleanup_owned_media_path(target)
         self._diagnostics["file_failures"] += 1
         if wrapper:
             await self._dispatch_file_fallback(wrapper, reason)
@@ -943,7 +1115,10 @@ class SimplexAdapter(BasePlatformAdapter):
             is_group = True
 
             member = item_direction.get("groupMember", {}) or {}
-            sender_id = str(member.get("memberId", ""))
+            sender_identity = member.get("memberContactId")
+            if sender_identity is None:
+                sender_identity = member.get("memberId", "")
+            sender_id = str(sender_identity)
             sender_name = member.get("localDisplayName", "") or member.get(
                 "memberProfile", {}
             ).get("displayName", "")
@@ -977,6 +1152,7 @@ class SimplexAdapter(BasePlatformAdapter):
         media_urls: List[str] = []
         media_types: List[str] = []
         file_info = chat_item_data.get("file")
+        owned_media_path: Optional[str] = None
 
         if file_info and isinstance(file_info, dict):
             file_source = file_info.get("fileSource", {}) or {}
@@ -1025,6 +1201,20 @@ class SimplexAdapter(BasePlatformAdapter):
                     return
 
             if file_info and file_path:
+                try:
+                    normalized_file_id = int(file_id) if file_id is not None else None
+                except (TypeError, ValueError):
+                    normalized_file_id = None
+                receive_target = (
+                    self._terminal_file_target(normalized_file_id)
+                    if normalized_file_id is not None
+                    else None
+                )
+                if (
+                    receive_target
+                    and os.path.abspath(file_path) == os.path.abspath(receive_target)
+                ):
+                    owned_media_path = receive_target
                 ext = Path(file_name).suffix.lower() or Path(file_path).suffix.lower()
                 if not _is_image_ext(ext) and not _is_audio_ext(ext):
                     try:
@@ -1120,6 +1310,17 @@ class SimplexAdapter(BasePlatformAdapter):
             reply_to_is_own_message=quoted_dir_type in {"directSnd", "groupSnd"},
             metadata={"is_edit": True} if is_edit else {},
         )
+        if owned_media_path and not self.retain_received_files:
+            self._schedule_owned_media_cleanup(owned_media_path)
+            setattr(
+                msg_event,
+                "_post_turn_cleanup_callbacks",
+                [
+                    lambda path=owned_media_path: self._cleanup_owned_media_path(
+                        path
+                    )
+                ],
+            )
 
         logger.debug(
             "SimpleX: message from %s in %s: %s",
@@ -1294,6 +1495,18 @@ class SimplexAdapter(BasePlatformAdapter):
 
         try:
             await ws.send(payload)
+        except Exception as e:
+            logger.warning(
+                "SimpleX: command was not submitted: %s — %s",
+                command.split(" ", 1)[0],
+                e,
+            )
+            return {
+                "type": "localCommandNotSubmitted",
+                "error": "SimpleX command was not submitted to the daemon",
+            }
+
+        try:
             result = await asyncio.wait_for(fut, timeout=timeout)
             return result
         except asyncio.TimeoutError:
@@ -1396,6 +1609,14 @@ class SimplexAdapter(BasePlatformAdapter):
                     retryable=False,
                     raw_response=resp,
                 )
+            if _response_type(resp) == "localCommandNotSubmitted":
+                return SendResult(
+                    success=False,
+                    error=error,
+                    error_kind="transient",
+                    retryable=True,
+                    raw_response=resp,
+                )
             kind, retryable = self._error_kind(error)
             return SendResult(
                 success=False,
@@ -1459,6 +1680,40 @@ class SimplexAdapter(BasePlatformAdapter):
         resp = await self._send_command(command, timeout=timeout)
         return self._send_result_from_response(resp, expected={"newChatItems"})
 
+    @staticmethod
+    def _split_utf8_payload(text: str, byte_budget: int = 12000) -> List[str]:
+        """Split by serialized UTF-8 bytes, never through a code point.
+
+        ``simplex-chat`` limits the encoded command envelope rather than
+        Python character count.  A margin below the protocol ceiling leaves
+        room for the JSON wrapper, chat reference, and quoting expansion.
+        """
+        if not text:
+            return [""]
+        chunks: List[str] = []
+        start = 0
+        while start < len(text):
+            used = 0
+            end = start
+            last_break: Optional[int] = None
+            while end < len(text):
+                char_cost = len(
+                    json.dumps(text[end], ensure_ascii=False).encode("utf-8")
+                ) - 2
+                if used + char_cost > byte_budget and end > start:
+                    break
+                used += char_cost
+                end += 1
+                if text[end - 1].isspace():
+                    last_break = end
+            if end < len(text) and last_break and last_break > start:
+                end = last_break
+            if end == start:
+                end += 1
+            chunks.append(text[start:end])
+            start = end
+        return chunks
+
     # ------------------------------------------------------------------
     # Outbound — text
     # ------------------------------------------------------------------
@@ -1478,7 +1733,9 @@ class SimplexAdapter(BasePlatformAdapter):
 
         delivered_ids: List[str] = []
         if content:
-            initial_chunks = list(self.truncate_message(content, MAX_MESSAGE_LENGTH))
+            initial_chunks: List[str] = []
+            for logical_chunk in self.truncate_message(content, MAX_MESSAGE_LENGTH):
+                initial_chunks.extend(self._split_utf8_payload(logical_chunk))
             queue = [
                 (chunk, index == 0)
                 for index, chunk in enumerate(initial_chunks)
@@ -1489,6 +1746,7 @@ class SimplexAdapter(BasePlatformAdapter):
                     chat_id,
                     {"type": "text", "text": chunk},
                     reply_to=reply_to if carries_reply else None,
+                    live=bool((metadata or {}).get("expect_edits")),
                 )
                 if (
                     not result.success
@@ -1711,8 +1969,13 @@ class SimplexAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Image file not found")
 
         png_path, thumb_uri = self._prepare_image(file_path)
+        owned_temp = (
+            os.path.abspath(png_path) != os.path.abspath(file_path)
+        )
+        if owned_temp:
+            self._schedule_owned_media_cleanup(png_path)
 
-        return await self._send_composed(
+        result = await self._send_composed(
             chat_id,
             {
                 "type": "image",
@@ -1722,6 +1985,12 @@ class SimplexAdapter(BasePlatformAdapter):
             reply_to=kwargs.get("reply_to"),
             file_source=png_path,
         )
+        if owned_temp:
+            if result.success and result.message_id:
+                self._outbound_temp_by_item[str(result.message_id)] = png_path
+            elif result.error_kind != "delivery_unknown":
+                self._cleanup_owned_media_path(png_path)
+        return result
 
     async def send_image_file(
         self,
@@ -1816,7 +2085,9 @@ class SimplexAdapter(BasePlatformAdapter):
         finalize: bool = False,
     ) -> SendResult:
         """Update a streaming preview and finalize it with complete text."""
-        chunks = self.truncate_message(content, MAX_MESSAGE_LENGTH)
+        chunks: List[str] = []
+        for logical_chunk in self.truncate_message(content, MAX_MESSAGE_LENGTH):
+            chunks.extend(self._split_utf8_payload(logical_chunk))
         first_chunk = chunks[0] if chunks else ""
         updated = {
             "msgContent": {"type": "text", "text": first_chunk},
@@ -2079,7 +2350,10 @@ class SimplexAdapter(BasePlatformAdapter):
             group = chat_info.get("groupInfo", {}) or {}
             chat_id = f"group:{group.get('groupId', '')}"
             member = chat_dir.get("groupMember", {}) if isinstance(chat_dir, dict) else {}
-            user_id = str(member.get("memberId", ""))
+            member_identity = member.get("memberContactId")
+            if member_identity is None:
+                member_identity = member.get("memberId", "")
+            user_id = str(member_identity)
             user_name = member.get("localDisplayName", "")
         else:
             return None

@@ -151,6 +151,46 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.media_types == ["image/png"]
 
 
+def test_merge_pending_message_event_preserves_transport_sidecars():
+    pending = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="u1",
+    )
+    first = MessageEvent(
+        text="first",
+        message_type=MessageType.TEXT,
+        source=source,
+        metadata={
+            "simplex_batch_items": [{"message_id": "1", "text": "first"}]
+        },
+    )
+    second = MessageEvent(
+        text="second",
+        message_type=MessageType.TEXT,
+        source=source,
+        metadata={
+            "simplex_batch_items": [{"message_id": "2", "text": "second"}]
+        },
+    )
+    cleanup_one = lambda: None
+    cleanup_two = lambda: None
+    first._post_turn_cleanup_callbacks = [cleanup_one]
+    second._post_turn_cleanup_callbacks = [cleanup_two]
+
+    merge_pending_message_event(pending, "session", first, merge_text=True)
+    merge_pending_message_event(pending, "session", second, merge_text=True)
+
+    merged = pending["session"]
+    assert merged.metadata["simplex_batch_items"] == [
+        {"message_id": "1", "text": "first"},
+        {"message_id": "2", "text": "second"},
+    ]
+    assert merged._post_turn_cleanup_callbacks == [cleanup_one, cleanup_two]
+
+
 @pytest.mark.asyncio
 async def test_recent_telegram_followups_append_in_pending_queue():
     runner = _make_runner()

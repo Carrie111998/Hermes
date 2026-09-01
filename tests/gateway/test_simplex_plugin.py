@@ -993,6 +993,8 @@ async def test_reaction_hook_and_direct_approval_resolution(monkeypatch):
         },
     }
     await adapter._handle_event({"resp": reaction})
+    if adapter._dispatch_tasks:
+        await asyncio.gather(*list(adapter._dispatch_tasks))
 
     assert resolved == [("session-1", "once")]
     assert hook_events[0]["event_name"] == "reaction:added"
@@ -1249,3 +1251,310 @@ async def test_partial_delivery_is_never_retried_or_fallback_duplicated():
     assert result.error_kind == "partial_delivery"
     assert result.retryable is False
     assert adapter._send_command.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_listener_reconnects_after_clean_socket_end(monkeypatch):
+    """A dropped socket must not clear the adapter's reconnect run flag."""
+    from gateway.config import PlatformConfig
+    import websockets
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._running = True
+    adapter._write_runtime_status_safe = MagicMock()
+    second_connected = asyncio.Event()
+    attempts = 0
+
+    class FakeSocket:
+        def __init__(self, *, hold: bool):
+            self.hold = hold
+
+        async def __aenter__(self):
+            if self.hold:
+                second_connected.set()
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        def __aiter__(self):
+            async def messages():
+                if self.hold:
+                    while adapter._running:
+                        await asyncio.sleep(0.01)
+                if False:
+                    yield ""
+
+            return messages()
+
+    def fake_connect(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return FakeSocket(hold=attempts > 1)
+
+    monkeypatch.setattr(websockets, "connect", fake_connect)
+    monkeypatch.setattr(_simplex, "WS_RETRY_DELAY_INITIAL", 0.0)
+    task = asyncio.create_task(adapter._ws_listener())
+    await asyncio.wait_for(second_connected.wait(), timeout=1)
+
+    assert attempts >= 2
+    assert adapter._running is True
+    assert adapter.get_runtime_diagnostics()["reconnects"] >= 1
+
+    adapter._running = False
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_pre_submit_failure_is_retryable_but_unknown_outcome_is_not():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._ws_ready.set()
+
+    class FlakySocket:
+        def __init__(self):
+            self.calls = 0
+
+        async def send(self, payload):
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionError("not submitted")
+            corr_id = json.loads(payload)["corrId"]
+            asyncio.create_task(
+                adapter._handle_event({"corrId": corr_id, "resp": _send_ack(44)})
+            )
+
+    socket = FlakySocket()
+    adapter._ws = socket
+    delivered = await adapter._send_with_retry(
+        "42", "retry once", max_retries=1, base_delay=0
+    )
+    assert delivered.success is True
+    assert socket.calls == 2
+
+    adapter._send_command = AsyncMock(
+        return_value={
+            "type": "localCommandOutcomeUnknown",
+            "error": "submitted but confirmation was lost",
+        }
+    )
+    unknown = await adapter._send_with_retry("42", "do not duplicate", max_retries=3)
+    assert unknown.error_kind == "delivery_unknown"
+    assert adapter._send_command.await_count == 1
+
+
+def test_utf8_payload_split_respects_serialized_byte_budget():
+    text = "🙂" * 4000
+    chunks = SimplexAdapter._split_utf8_payload(text)
+
+    assert len(chunks) > 1
+    assert "".join(chunks) == text
+    assert all(
+        len(json.dumps(chunk, ensure_ascii=False).encode("utf-8")) - 2 <= 12000
+        for chunk in chunks
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_stream_preview_uses_simplex_live_item():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._send_command = AsyncMock(return_value=_send_ack(77))
+
+    await adapter.send("42", "draft", metadata={"expect_edits": True})
+    assert " live=on json " in adapter._send_command.await_args.args[0]
+
+    await adapter.send("42", "final", metadata={"notify": True})
+    assert " live=on json " not in adapter._send_command.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_group_sender_prefers_member_contact_id():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"ws_url": "ws://localhost:5225", "group_allowed": "*"},
+        )
+    )
+    adapter.group_allow_from = {"*"}
+    adapter.set_authorization_check(lambda *_args: True)
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    wrapper = _make_file_chat_item("/tmp/report.pdf", "report.pdf")
+    wrapper["chatInfo"] = {
+        "type": "group",
+        "groupInfo": {"groupId": 9, "localDisplayName": "review"},
+    }
+    wrapper["chatItem"]["chatDir"] = {
+        "type": "groupRcv",
+        "groupMember": {
+            "memberId": "opaque-member",
+            "memberContactId": 42,
+            "localDisplayName": "operator",
+        },
+    }
+
+    await adapter._handle_chat_item(wrapper)
+    await _drain_dispatches(adapter)
+
+    assert captured[0].source.user_id == "42"
+    assert adapter._file_sender_context(wrapper)[0] == "42"
+
+
+@pytest.mark.asyncio
+async def test_late_file_completion_is_ignored_and_owned_target_removed(tmp_path):
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "ws_url": "ws://localhost:5225",
+                "files_folder": str(tmp_path),
+                "file_transfer_timeout": 0.01,
+            },
+        )
+    )
+    adapter.set_authorization_check(lambda *_args: True)
+    adapter._file_transfer_timeout = 0.01
+    adapter._text_batch_delay = 0
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    wrapper = _make_file_chat_item("", "late.pdf")
+    wrapper["chatItem"]["file"].pop("fileSource")
+    wrapper["chatItem"]["file"]["fileStatus"] = {"type": "rcvInvitation"}
+    target = tmp_path / "simplex-rcv-owned-late.pdf"
+    target.write_bytes(b"%PDF")
+    adapter._file_receive_targets[7] = str(target)
+
+    await adapter._handle_chat_item(wrapper)
+    await asyncio.sleep(0.03)
+    if adapter._pending_text_batch_tasks:
+        await asyncio.gather(*list(adapter._pending_text_batch_tasks.values()))
+    before = len(captured)
+
+    complete = _make_file_chat_item(str(target), "late.pdf")
+    await adapter._handle_event(
+        {"resp": {"type": "rcvFileComplete", "chatItem": complete}}
+    )
+    await _drain_dispatches(adapter)
+
+    assert len(captured) == before
+    assert not target.exists()
+    assert adapter.get_runtime_diagnostics()["late_file_completions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_outbound_converted_image_removed_after_send_completion(tmp_path):
+    from gateway.config import PlatformConfig
+
+    source = tmp_path / "source.webp"
+    source.write_bytes(b"RIFFxxxxWEBP")
+    converted = tmp_path / "converted.png"
+    converted.write_bytes(b"\x89PNG")
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter._prepare_image = MagicMock(return_value=(str(converted), "data:image/jpg;base64,"))
+    adapter._send_composed = AsyncMock(
+        return_value=_simplex.SendResult(success=True, message_id="88")
+    )
+
+    result = await adapter.send_image("42", f"file://{source}")
+    assert result.success is True
+    assert converted.exists()
+
+    await adapter._handle_event(
+        {
+            "resp": {
+                "type": "sndFileCompleteXFTP",
+                "chatItem": {
+                    "chatInfo": {"type": "direct"},
+                    "chatItem": {"meta": {"itemId": 88}},
+                },
+            }
+        }
+    )
+    assert not converted.exists()
+
+
+@pytest.mark.asyncio
+async def test_successful_owned_receive_attaches_post_turn_cleanup(tmp_path):
+    from gateway.config import PlatformConfig
+
+    target = tmp_path / "simplex-rcv-owned.pdf"
+    target.write_bytes(b"%PDF")
+    adapter = SimplexAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={"ws_url": "ws://localhost:5225", "files_folder": str(tmp_path)},
+        )
+    )
+    adapter.set_authorization_check(lambda *_args: True)
+    adapter._file_receive_targets[7] = str(target)
+    pending = _make_file_chat_item("", "owned.pdf")
+    pending["chatItem"]["file"].pop("fileSource")
+    adapter._pending_file_transfers[7] = pending
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    complete = _make_file_chat_item(str(target), "owned.pdf")
+    await adapter._handle_event(
+        {"resp": {"type": "rcvFileComplete", "chatItem": complete}}
+    )
+    await _drain_dispatches(adapter)
+
+    assert target.exists()
+    callbacks = captured[0]._post_turn_cleanup_callbacks
+    assert len(callbacks) == 1
+    callbacks[0]()
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_captionless_failed_attachment_is_not_silent():
+    from gateway.config import PlatformConfig
+
+    adapter = SimplexAdapter(
+        PlatformConfig(enabled=True, extra={"ws_url": "ws://localhost:5225"})
+    )
+    adapter.set_authorization_check(lambda *_args: True)
+    adapter._text_batch_delay = 0
+    captured = []
+
+    async def capture(event):
+        captured.append(event)
+
+    adapter.handle_message = capture
+    wrapper = _make_file_chat_item("", "missing.pdf")
+    wrapper["chatItem"]["file"].pop("fileSource")
+    wrapper["chatItem"]["content"]["msgContent"]["text"] = ""
+    adapter._pending_file_transfers[7] = wrapper
+
+    await adapter._fail_file_transfer(7, "sender cancelled")
+    if adapter._pending_text_batch_tasks:
+        await asyncio.gather(*list(adapter._pending_text_batch_tasks.values()))
+
+    assert captured[0].text == "[Attachment unavailable: sender cancelled]"
