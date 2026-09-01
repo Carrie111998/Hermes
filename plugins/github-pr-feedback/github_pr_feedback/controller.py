@@ -236,6 +236,7 @@ class ScanResult:
     skipped: Mapping[str, int]
     degraded: bool = False
     required_local_ci_backlog: int = 0
+    local_ci_catalogue_deferred: int = 0
 
 
 def _bind_pooled_worktree_task(
@@ -916,6 +917,7 @@ class ScanController:
         created = 0
         attempted = 0
         required_local_ci_backlog = 0
+        local_ci_catalogue_deferred = 0
         if not self._policy.enabled or self._policy.not_before is None:
             return _scan_result(
                 created,
@@ -997,7 +999,7 @@ class ScanController:
                 and len(pull_requests)
                 > self._policy.local_ci_audit.max_open_prs_per_scan
             ):
-                skipped["local_ci_open_pr_scan_cap"] += (
+                local_ci_catalogue_deferred += (
                     len(pull_requests)
                     - self._policy.local_ci_audit.max_open_prs_per_scan
                 )
@@ -1235,6 +1237,7 @@ class ScanController:
             created,
             skipped,
             required_local_ci_backlog=required_local_ci_backlog,
+            local_ci_catalogue_deferred=local_ci_catalogue_deferred,
         )
 
     def _apply_agent_label(
@@ -2926,6 +2929,7 @@ def _scan_result(
     skipped: Mapping[str, int],
     *,
     required_local_ci_backlog: int = 0,
+    local_ci_catalogue_deferred: int = 0,
 ) -> ScanResult:
     values = dict(skipped)
     degraded = any(values.get(reason, 0) > 0 for reason in _DEGRADED_REASONS)
@@ -2934,4 +2938,5 @@ def _scan_result(
         values,
         degraded,
         required_local_ci_backlog=required_local_ci_backlog,
+        local_ci_catalogue_deferred=local_ci_catalogue_deferred,
     )
