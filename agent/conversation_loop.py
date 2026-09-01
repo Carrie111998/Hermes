@@ -5002,6 +5002,7 @@ def run_conversation(
                     max_retries=max_retries,
                     retryable=classified.retryable,
                     reason=classified.reason.value,
+                    error_context=error_context,
                 )
 
                 if (
@@ -7098,6 +7099,11 @@ def run_conversation(
             # No-op for ordinary providers; see agent/provider_projection.py.
             splice_provider_projection(agent, response, messages)
 
+            # A recovered transient failure must not be reported as the turn's
+            # terminal error if this normalized response later fails for an
+            # unrelated reason (for example persistence or output validation).
+            agent._last_api_error_context = None
+
             try:
                 from hermes_cli.lifecycle import (
                     has_hook,
@@ -7141,6 +7147,7 @@ def run_conversation(
                             finish_reason=finish_reason,
                         ),
                         usage=agent._usage_summary_for_api_request_hook(response),
+                        rate_limit_state=agent._rate_limit_state_for_hook(),
                         assistant_message=assistant_message,
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),

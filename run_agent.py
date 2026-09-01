@@ -3213,10 +3213,27 @@ class AIAgent:
         max_retries: Optional[int] = None,
         retryable: Optional[bool] = None,
         reason: Optional[str] = None,
+        error_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         # Lazy module import (not from-import) so tests can replace lifecycle
         # dispatch at this call site. After first call the import is a
         # ``sys.modules`` dict lookup, so retries don't repay any real cost.
+        rate_limit: Dict[str, Any] = {}
+        if isinstance(error_context, dict):
+            reset_at = error_context.get("reset_at")
+            if reset_at is not None:
+                rate_limit["reset_at"] = self._hook_jsonable(reset_at)
+        rate_limit_state = self._rate_limit_state_for_hook()
+        if rate_limit_state is not None:
+            rate_limit["state"] = rate_limit_state
+        self._last_api_error_context = {
+            "error_type": error_type,
+            "status_code": status_code,
+            "retry_count": retry_count,
+            "max_retries": max_retries,
+            "rate_limit": rate_limit or None,
+        }
+
         try:
             from hermes_cli import lifecycle as _lifecycle
 
@@ -3247,6 +3264,7 @@ class AIAgent:
                     "type": error_type,
                     "message": error_message,
                 },
+                rate_limit=rate_limit or None,
                 request=self._api_request_payload_for_hook(api_kwargs),
             )
         except Exception:
@@ -4523,6 +4541,14 @@ class AIAgent:
     def get_rate_limit_state(self):
         """Return the last captured RateLimitState, or None."""
         return self._rate_limit_state
+
+    def _rate_limit_state_for_hook(self) -> Optional[Dict[str, Any]]:
+        """Return the current rate-limit snapshot in JSON-safe dict form."""
+        state = getattr(self, "_rate_limit_state", None)
+        if state is None:
+            return None
+        value = self._hook_jsonable(state)
+        return value if isinstance(value, dict) else None
 
     def _capture_anthropic_response_headers(self, http_response: Any) -> None:
         """Capture out-of-band state from Anthropic Messages response headers.
@@ -9545,6 +9571,7 @@ class AIAgent:
                         durable_turn_lease_thread.start()
                         if durable_turn_liveness_thread is not None:
                             durable_turn_liveness_thread.start()
+                    self._last_api_error_context = None
                     result = run_conversation(
                         self,
                         user_message,
@@ -9568,6 +9595,9 @@ class AIAgent:
                     # outer finally: a refresher firing between stop and join
                     # would otherwise set an interrupt that survives the clear.
             terminal = result if isinstance(result, dict) else {}
+            if terminal.get("failed") is True and self._last_api_error_context:
+                for key, value in self._last_api_error_context.items():
+                    terminal.setdefault(key, value)
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
             elif terminal.get("failed") is True:

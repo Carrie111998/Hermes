@@ -179,9 +179,14 @@ async def test_agent_end_hook_includes_model_and_provider(monkeypatch, tmp_path)
         "history_offset": 0,
         "last_prompt_tokens": 0,
         "api_calls": 1,
-        "failed": False,
+        "failed": True,
         "model": "gpt-5.6-terra",
         "provider": "openai-codex",
+        "error_type": "RateLimitError",
+        "status_code": 429,
+        "retry_count": 3,
+        "max_retries": 3,
+        "rate_limit": {"reset_at": 2_000_000_000.0},
     })
 
     await runner._handle_message_with_agent(
@@ -195,3 +200,8 @@ async def test_agent_end_hook_includes_model_and_provider(monkeypatch, tmp_path)
     )
     assert end_context["model"] == "gpt-5.6-terra"
     assert end_context["provider"] == "openai-codex"
+    assert end_context["error_type"] == "RateLimitError"
+    assert end_context["status_code"] == 429
+    assert end_context["retry_count"] == 3
+    assert end_context["max_retries"] == 3
+    assert end_context["rate_limit"] == {"reset_at": 2_000_000_000.0}

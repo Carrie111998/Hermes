@@ -32,6 +32,11 @@ Context dict passed to ``agent:start`` / ``agent:end`` handlers:
   response     -- agent response text (truncated to 500 chars)
   model        -- model name that handled the turn
   provider     -- provider that handled the turn
+  error_type   -- provider exception class on failed turns, otherwise None
+  status_code  -- provider HTTP status on failed turns, otherwise None
+  retry_count  -- retry attempt count on failed turns, otherwise None
+  max_retries  -- configured retry ceiling on failed turns, otherwise None
+  rate_limit   -- parsed reset metadata and last header snapshot when available
 
 Handlers posting a follow-up into the same Telegram forum-topic should
 include ``message_thread_id=int(thread_id)`` when ``chat_type == "forum"``

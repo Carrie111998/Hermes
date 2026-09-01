@@ -3239,6 +3239,16 @@ class TestRunConversation:
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
+        from agent.rate_limit_tracker import parse_rate_limit_headers
+
+        agent._rate_limit_state = parse_rate_limit_headers(
+            {
+                "x-ratelimit-limit-requests": "10",
+                "x-ratelimit-remaining-requests": "7",
+                "x-ratelimit-reset-requests": "12.5",
+            },
+            provider="openai",
+        )
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
         resp2 = _mock_response(content="Done searching", finish_reason="stop")
@@ -3281,6 +3291,8 @@ class TestRunConversation:
         assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
+        assert all(isinstance(c["rate_limit_state"], dict) for c in post_request_calls)
+        assert all(c["rate_limit_state"]["requests_min"]["remaining"] == 7 for c in post_request_calls)
 
     def test_terminal_task_closes_logical_calls_before_metrics_scope(self, agent):
         from agent import relay_runtime
@@ -3317,6 +3329,36 @@ class TestRunConversation:
         assert result is failed_result
         assert order == ["logical", "metrics"]
 
+    def test_failed_turn_carries_last_structured_api_error(self, agent):
+        failed_result = {
+            "final_response": "provider failed",
+            "messages": [],
+            "completed": False,
+            "failed": True,
+        }
+
+        def _fail_with_context(*_args, **_kwargs):
+            agent._last_api_error_context = {
+                "error_type": "RateLimitError",
+                "status_code": 429,
+                "retry_count": 3,
+                "max_retries": 3,
+                "rate_limit": {"reset_at": 2_000_000_000.0},
+            }
+            return failed_result
+
+        with (
+            patch("agent.conversation_loop.run_conversation", side_effect=_fail_with_context),
+            patch("hermes_cli.observability.relay_shared_metrics.start_task_run"),
+            patch("hermes_cli.observability.relay_shared_metrics.finish_task_run"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["error_type"] == "RateLimitError"
+        assert result["status_code"] == 429
+        assert result["retry_count"] == 3
+        assert result["rate_limit"] == {"reset_at": 2_000_000_000.0}
+
     def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
         payload_built = False
         hook_called = False
@@ -3344,10 +3386,21 @@ class TestRunConversation:
             api_kwargs={"messages": [{"role": "user", "content": "hi"}]},
             error_type="RuntimeError",
             error_message="boom",
+            status_code=503,
+            retry_count=2,
+            max_retries=3,
+            error_context={"reset_at": 2_000_000_000.0},
         )
 
         assert payload_built is False
         assert hook_called is False
+        assert agent._last_api_error_context == {
+            "error_type": "RuntimeError",
+            "status_code": 503,
+            "retry_count": 2,
+            "max_retries": 3,
+            "rate_limit": {"reset_at": 2_000_000_000.0},
+        }
 
     def test_request_scoped_api_hooks_skip_payload_work_without_listeners(self, agent, monkeypatch):
         self._setup_agent(agent)

@@ -3208,6 +3208,17 @@ DEFAULT_CONFIG = {
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
     "gateway": {
+        # User-facing provider failure replies for messaging surfaces. Override
+        # individual categories to match a product's voice; empty values retain
+        # the safe built-in text. Raw provider bodies are never interpolated.
+        "provider_error_replies": {
+            "authentication": "",
+            "policy": "",
+            "rate_limit": "",
+            "connection": "",
+            "generic": "",
+        },
+
         # Optional named-profile allowlist for multiplex mode. None preserves
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
