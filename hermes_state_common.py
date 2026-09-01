@@ -858,6 +858,59 @@ _FTS_REBUILD_LOCK_POLL_SECONDS = 0.1
 _IS_WINDOWS = sys.platform == "win32"
 
 
+def _lock_holder_is_live(db_path) -> bool:
+    """Best-effort probe: does ANY process hold *db_path* open right now?
+
+    The FTS-rebuild deferral loop (#100108) can spin forever when the flock
+    leaked to a wedged/zombie process that no longer owns the DB: every
+    admission attempt times out at 120s, defers, and the search index never
+    rebuilds — for hours in the reported incident.  Before deferring a
+    THIRD consecutive time, callers consult this probe: if no process has
+    the DB file open, the flock holder is provably not doing FTS work and
+    the lock is broken with prejudice.
+
+    Uses ``fuser`` on POSIX (procfs fallback: scan /proc/*/fd for the inode)
+    and ``handle.exe``-free best-effort on Windows (open-files enumeration is
+    not available without admin; returns True — fail safe, never breaks a
+    live lock on Windows).  A probe failure also returns True: breaking a
+    live lock is corruption-class risk, a missed rebuild is only degraded
+    search.
+    """
+    try:
+        db = str(db_path)
+        if _IS_WINDOWS:
+            # No reliable unprivileged open-files enumeration — fail safe.
+            return True
+        import subprocess as _sp
+
+        r = _sp.run(
+            ["fuser", "-s", db],
+            capture_output=True,
+            timeout=5,
+        )
+        if r.returncode == 0:
+            return True  # at least one live process holds it open
+        if r.returncode == 1:
+            return False  # fuser ran, no process holds it
+        # fuser missing (returncode 127) or errored — procfs fallback
+        import os as _os
+
+        if _os.path.isdir("/proc"):
+            import glob as _glob
+
+            target = _os.path.realpath(db)
+            for fd_path in _glob.glob("/proc/[0-9]*/fd/*"):
+                try:
+                    if _os.path.realpath(fd_path) == target:
+                        return True
+                except OSError:
+                    continue
+            return False
+        return True  # cannot probe — fail safe
+    except Exception:
+        return True  # probe failure must never authorize breaking a lock
+
+
 @contextlib.contextmanager
 def fts_rebuild_admission(db_path):
     """Serialize full structural FTS rebuilds on *db_path* across processes.
@@ -909,12 +962,44 @@ def fts_rebuild_admission(db_path):
                     break
                 time.sleep(_FTS_REBUILD_LOCK_POLL_SECONDS)
         if not acquired:
-            logger.warning(
-                "FTS rebuild lock %s held by another process for more than "
-                "%.0fs — deferring this rebuild to avoid racing the holder "
-                "(the stale-FTS breadcrumb keeps it retryable).",
-                lock_path, _FTS_REBUILD_LOCK_TIMEOUT_SECONDS,
-            )
+            # Dead-holder reclamation (#100108): a wedged/zombie holder can
+            # keep the flock while no longer doing FTS work, wedging every
+            # future rebuild into the defer path for hours. Before accepting
+            # the defer, probe whether ANY live process still has the DB
+            # open: none does => the holder is provably dead weight and the
+            # lock is broken with prejudice (POSIX flock on a file nobody
+            # holds open can only be a leaked kernel lock from a process
+            # that no longer references the DB). Probe failure keeps the
+            # defer — breaking a LIVE lock risks the concurrent-rebuild
+            # corruption this authority exists to prevent.
+            if not _lock_holder_is_live(db_path):
+                try:
+                    if _IS_WINDOWS:
+                        import msvcrt
+
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    logger.warning(
+                        "FTS rebuild lock %s was held with NO live process "
+                        "holding %s open — reclaimed the leaked lock and "
+                        "proceeding with the rebuild (#100108).",
+                        lock_path,
+                        db_path,
+                    )
+                except (BlockingIOError, OSError):
+                    pass  # re-acquire raced a genuine late holder — keep deferring
+            if not acquired:
+                logger.warning(
+                    "FTS rebuild lock %s held by another process for more than "
+                    "%.0fs — deferring this rebuild to avoid racing the holder "
+                    "(the stale-FTS breadcrumb keeps it retryable).",
+                    lock_path, _FTS_REBUILD_LOCK_TIMEOUT_SECONDS,
+                )
         yield acquired
     finally:
         try:
