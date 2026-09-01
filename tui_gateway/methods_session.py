@@ -41,6 +41,16 @@ def _(rid, params: dict) -> dict:
     # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
+    if profile is not None and profile_home is None:
+        try:
+            from hermes_cli import profiles as _profiles_mod
+
+            _req_home = Path(_profiles_mod.get_profile_dir(profile)).resolve()
+            _launch_home = Path(_hermes_home).resolve()
+            if _req_home != _launch_home:
+                return _err(rid, 4007, f"unknown profile: {profile}")
+        except Exception:
+            return _err(rid, 4007, f"unknown profile: {profile}")
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
@@ -389,6 +399,20 @@ def _(rid, params: dict) -> dict:
     # local profile's state.db. None/own profile → the launch profile (unchanged).
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
+    # Fail closed when an explicit profile was requested but didn't resolve.
+    # The old code silently fell back to the launch profile's store, which let
+    # a turn for profile B write into default's DB and reuse a default live
+    # session with the same bare session id (#100029).
+    if profile is not None and profile_home is None:
+        try:
+            from hermes_cli import profiles as _profiles_mod
+
+            _req_home = Path(_profiles_mod.get_profile_dir(profile)).resolve()
+            _launch_home = Path(_hermes_home).resolve()
+            if _req_home != _launch_home:
+                return _err(rid, 4007, f"unknown profile: {profile}")
+        except Exception:
+            return _err(rid, 4007, f"unknown profile: {profile}")
     defer_history = is_truthy_value(params.get("defer_history", False))
     # Desktop hydrates persisted transcripts through the authenticated REST
     # route in parallel. Suppress the duplicate WebSocket transcript only when
@@ -660,7 +684,7 @@ def _(rid, params: dict) -> dict:
 
         # Fast path: if the session is already live, reuse it under the lock.
         with _session_resume_lock:
-            live = _find_live_session_by_key(target)
+            live = _find_live_session_by_key_scoped(target, profile_home)
         if live is not None:
             return _reuse_live_response(*live)
 
@@ -983,7 +1007,7 @@ def _(rid, params: dict) -> dict:
         # live session while we were building. Re-check under the lock; if it won,
         # discard our just-built agent and reuse theirs (no worker/poller wired yet).
         with _session_resume_lock:
-            live = _find_live_session_by_key(target)
+            live = _find_live_session_by_key_scoped(target, profile_home)
             if live is not None:
                 try:
                     if hasattr(agent, "close"):

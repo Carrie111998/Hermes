@@ -142,6 +142,10 @@ except Exception:
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
 _sessions: dict[str, dict] = {}
+# Sentinel for profile-scoped live lookups — bare lookup keeps legacy behaviour
+# for callers that haven't been migrated; scoped callers pass an explicit
+# profile_home (str|Path|None) and get an exact (profile_home, session_key) match.
+_PROFILE_LOOKUP_SENTINEL = object()
 _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
@@ -2239,10 +2243,30 @@ def _db_for_profile(profile: str | None = None):
     ``_get_db()`` handle (left open). Non-launch profile → a dedicated handle
     the caller should ``close()`` (see :func:`_profile_db` contextmanager).
 
-    Returns (db, owns_handle). ``db`` is None when unavailable.
+    Returns (db, owns_handle). ``db`` is None when unavailable or when an
+    explicit non-launch profile was requested but does not exist — callers
+    treat None as unavailable and must fail closed instead of falling back to
+    the launch store (#100029).
     """
     profile_home = _profile_home(profile)
     if profile_home is None:
+        # An explicit profile that didn't resolve to a real home must NOT
+        # silently fall back to the launch DB — that hid #100029 cross-profile
+        # leaks. Distinguish \"own profile\" (which legitimately maps to None)
+        # from an unknown profile.
+        if profile is not None and (str(profile).strip() != ""):
+            try:
+                from hermes_cli import profiles as _profiles_mod
+
+                _req = Path(_profiles_mod.get_profile_dir(str(profile).strip())).resolve()
+                _launch = Path(_hermes_home).resolve()
+                if _req != _launch:
+                    logger.warning(
+                        "Unknown profile requested for DB access: %s", profile
+                    )
+                    return None, False
+            except Exception:
+                return None, False
         return _get_db(), False
     try:
         from hermes_state import SessionDB
@@ -6566,16 +6590,23 @@ def _apply_model_switch(
 
 
 def _sync_bot_capabilities(sid: str, session: dict) -> None:
-    """Rebuild a Bot Chat session's agent when its capability surface changed.
+    """Rebuild a Bot Chat or Bot Mode group session's agent when capability surface changed.
 
-    Bot Chats are eternal sessions; toolsets/MCP tool definitions are baked
-    into the live agent at construction, so a capability edit (Settings →
-    Capabilities, skill install, MCP toggle) would otherwise not apply until
-    /new. At turn start, hash the profile's capability surface
-    (tools/bot_mode_probe.capability_fingerprint) and, on change, swap in a
-    freshly built agent for the SAME session — history is session/DB-backed,
-    and the prompt-restore epoch check rebuilds the system prompt to match.
-    One rebuild per user-initiated change; identical state is a no-op.
+    Bot Chats and hidden Group plumbing sessions are eternal Bot Mode sessions;
+    toolsets/MCP tool definitions are baked into the live agent at construction,
+    so a capability edit (Settings → Capabilities, skill install, MCP toggle)
+    would otherwise not apply until /new. At turn start, hash the profile's
+    capability surface (tools/bot_mode_probe.capability_fingerprint) and, on
+    change, swap in a freshly built agent for the SAME session — history is
+    session/DB-backed, and the prompt-restore epoch check rebuilds the system
+    prompt to match. One rebuild per user-initiated change; identical state is
+    a no-op.
+
+    Group chats must stay consistent with direct Bot Chat sessions (#100026)
+    so they never retain stale tool/runtime claims or diverge on tool
+    availability (e.g. hallucinated terminal execution). Hence both
+    "Bot Chat" and "Group: <name>" titles are covered; other sessions are
+    untouched to preserve prompt-cache sacredness.
     """
     agent = session.get("agent")
     if agent is None:
@@ -6586,7 +6617,10 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
             db = getattr(agent, "_session_db", None)
             key = session.get("session_key") or ""
             title = str((db.get_session_title(key) if (db and key) else None) or "").strip()
-        if title != "Bot Chat":
+        # Bot Mode group chats must stay in sync with direct profile sessions
+        # (#100026): stale group plumbing that kept an old provider/toolset
+        # diverged from the Bot Chat and stalled on dead routes.
+        if title != "Bot Chat" and not title.startswith("Group:"):
             return
         from tools.bot_mode_probe import capability_fingerprint
 
@@ -6615,7 +6649,7 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
             )
         finally:
             _clear_session_context(tokens)
-        new_agent._session_title_hint = "Bot Chat"
+        new_agent._session_title_hint = title
         session["agent"] = new_agent
         session["config_model_seen"] = _config_model_target()
         _emit(
@@ -10663,8 +10697,11 @@ def _claim_or_reuse_live(
     """Register ``record`` as the live session for ``session_key`` under the
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
+    # Scope the live check to the record's profile so the same bare session_key
+    # in two profiles doesn't collide (issue #100029).
+    want_home = record.get("profile_home") if isinstance(record, dict) else None
     with _session_resume_lock:
-        live = _find_live_session_by_key(session_key)
+        live = _find_live_session_by_key_scoped(session_key, want_home)
         if live is not None:
             if lease is not None:
                 lease.release()
@@ -10682,7 +10719,7 @@ def _claim_or_reuse_live(
         # those quietly so the reap doesn't later broadcast session.reclaimed
         # for a session the client just re-resumed (auto-re-resume storm).
         _cancel_ws_orphan_reap(sid)
-        stale = _claim_parked_runtimes(session_key, keep_sid=sid)
+        stale = _claim_parked_runtimes(session_key, keep_sid=sid, profile_home=want_home)
     # Slow finalization work stays OUTSIDE _session_resume_lock (see
     # _pop_session_by_id) — the stale records are already claimed above.
     _finalize_superseded_runtimes(stale)
@@ -10690,7 +10727,7 @@ def _claim_or_reuse_live(
 
 
 def _claim_parked_runtimes(
-    session_key: str, *, keep_sid: str
+    session_key: str, *, keep_sid: str, profile_home=_PROFILE_LOOKUP_SENTINEL
 ) -> list[tuple[str, dict]]:
     """Claim sentinel-parked stale runtimes of ``session_key`` for supersession.
 
@@ -10703,14 +10740,25 @@ def _claim_parked_runtimes(
     """
     stale: list[tuple[str, dict]] = []
     with _sessions_lock:
-        candidates = [
-            (old_sid, old)
-            for old_sid, old in list(_sessions.items())
-            if old_sid != keep_sid
-            and not old.get("_finalized")
-            and _session_lookup_key(old, fallback=old_sid) == session_key
-            and old.get("transport") is _detached_ws_transport
-        ]
+        if profile_home is _PROFILE_LOOKUP_SENTINEL:
+            candidates = [
+                (old_sid, old)
+                for old_sid, old in list(_sessions.items())
+                if old_sid != keep_sid
+                and not old.get("_finalized")
+                and _session_lookup_key(old, fallback=old_sid) == session_key
+                and old.get("transport") is _detached_ws_transport
+            ]
+        else:
+            candidates = [
+                (old_sid, old)
+                for old_sid, old in list(_sessions.items())
+                if old_sid != keep_sid
+                and not old.get("_finalized")
+                and _session_lookup_key(old, fallback=old_sid) == session_key
+                and old.get("transport") is _detached_ws_transport
+                and _profile_home_matches(profile_home, old.get("profile_home") or None)
+            ]
     for old_sid, _old in candidates:
         _cancel_ws_orphan_reap(old_sid)
         popped = _pop_session_by_id(old_sid)
@@ -10906,13 +10954,59 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
-def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+def _profile_home_matches(want: str | Path | None, have: str | None) -> bool:
+    """True iff ``want`` and ``have`` name the same profile home."""
+    want_norm = str(want) if want is not None else None
+    have_norm = have or None
+    if want_norm is None and have_norm is None:
+        return True
+    if want_norm is None or have_norm is None:
+        return False
+    try:
+        return Path(want_norm).resolve() == Path(have_norm).resolve()
+    except Exception:
+        return want_norm == have_norm
+
+
+def _find_live_session_by_key(
+    session_key: str, profile_home=_PROFILE_LOOKUP_SENTINEL
+) -> tuple[str, dict] | None:
+    # Legacy bare path — keep for non-profile callers (notifications, child mirror)
+    # that intentionally search across profiles.
+    if profile_home is _PROFILE_LOOKUP_SENTINEL:
+        for sid, session in list(_sessions.items()):
+            if session.get("_finalized"):
+                continue
+            if _session_lookup_key(session, fallback=sid) == session_key:
+                return sid, session
+        return None
+    # Profile-scoped path — key is (profile_home, session_key). Both the
+    # bare session_key and the session's profile_home must match exactly, so
+    # a session that exists in two profiles' stores never cross-delivers.
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
             continue
-        if _session_lookup_key(session, fallback=sid) == session_key:
+        if _session_lookup_key(session, fallback=sid) != session_key:
+            continue
+        if _profile_home_matches(profile_home, session.get("profile_home") or None):
             return sid, session
     return None
+
+
+def _find_live_session_by_key_scoped(
+    session_key: str, profile_home
+) -> tuple[str, dict] | None:
+    """Profile-scoped lookup tolerant of test mocks.
+
+    Production code passes ``profile_home`` explicitly; some unit tests
+    monkeypatch ``_find_live_session_by_key`` with a 1-arg lambda. Try the
+    scoped path and fall back to bare on TypeError so those tests keep
+    working without cross-profile leakage in real use.
+    """
+    try:
+        return _find_live_session_by_key(session_key, profile_home)
+    except TypeError:
+        return _find_live_session_by_key(session_key)
 
 
 def _fallback_session_info(session: dict) -> dict:
