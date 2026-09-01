@@ -3533,11 +3533,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        embed=(embed if i == 0 else None),
-                        reference=chunk_reference,
-                    )
+                    send_kwargs = {
+                        "content": chunk,
+                        "reference": chunk_reference,
+                    }
+                    if embed is not None and i == 0:
+                        send_kwargs["embed"] = embed
+                    msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -3556,11 +3558,13 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            embed=(embed if i == 0 else None),
-                            reference=None,
-                        )
+                        send_kwargs = {
+                            "content": chunk,
+                            "reference": None,
+                        }
+                        if embed is not None and i == 0:
+                            send_kwargs["embed"] = embed
+                        msg = await channel.send(**send_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -3823,7 +3827,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 self._last_overflow_preview.pop(_preview_key, None)
 
             try:
-                await msg.edit(content=edit_content, embed=embed)
+                edit_kwargs = {"content": edit_content}
+                if embed is not None:
+                    edit_kwargs["embed"] = embed
+                await msg.edit(**edit_kwargs)
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = formatted
             except Exception as edit_err:
@@ -3907,13 +3914,19 @@ class DiscordAdapter(BasePlatformAdapter):
         if len(chunks) <= 1:
             # Defensive: caller's pre-flight should guarantee >1 chunk, but if
             # not, just edit normally.
-            await msg.edit(content=chunks[0] if chunks else formatted, embed=embed)
+            edit_kwargs = {"content": chunks[0] if chunks else formatted}
+            if embed is not None:
+                edit_kwargs["embed"] = embed
+            await msg.edit(**edit_kwargs)
             return SendResult(success=True, message_id=message_id)
 
         # Step 1 — edit the existing message with the first chunk (the embed
         # rides on it, mirroring send()).
         try:
-            await msg.edit(content=chunks[0], embed=embed)
+            edit_kwargs = {"content": chunks[0]}
+            if embed is not None:
+                edit_kwargs["embed"] = embed
+            await msg.edit(**edit_kwargs)
         except Exception as e:
             logger.error(
                 "[%s] Overflow split: first-chunk edit failed: %s",
