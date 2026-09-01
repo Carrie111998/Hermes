@@ -1,0 +1,185 @@
+"""The model picker must probe with a ``key_cmd``-minted credential.
+
+``key_cmd`` (#86891) lets a provider authenticate with a SHORT-LIVED bearer
+minted by a command — SSO/OIDC brokers, cloud IAM, internal auth proxies. The
+request path has honoured it since it landed, but the picker resolved probe
+credentials from ``api_key``/``key_env`` ONLY.
+
+The failure is quiet and easy to misread. The picker probes ``/v1/models`` with
+an EMPTY key, an authenticated endpoint answers 401, discovery returns nothing,
+and the provider falls back to its single configured ``default_model``. The
+user sees ONE model and cannot tell that apart from an endpoint that genuinely
+serves one — inference itself keeps working, because that path mints correctly.
+
+These tests pin:
+
+* a ``key_cmd`` entry probes with the minted token, so the full catalog shows;
+* the cache fingerprint is keyed on the COMMAND, not the minted token (which
+  rotates every refresh — keying on it would re-probe on every open);
+* a broken/interactive helper degrades to the pre-existing empty-key behaviour
+  rather than taking the whole picker down.
+"""
+
+from __future__ import annotations
+
+from hermes_cli.model_switch import _picker_key_cmd_token
+
+
+class TestPickerKeyCmdToken:
+    """The credential helper the picker's probe sites call."""
+
+    def test_bare_token_stdout(self):
+        assert _picker_key_cmd_token(
+            {"key_cmd": "printf 'tok-abc'", "name": "gw"}
+        ) == "tok-abc"
+
+    def test_json_access_token(self):
+        """The OAuth 2.0 token-endpoint response shape."""
+        entry = {
+            "key_cmd": """printf '{"access_token":"tok-json","expires_in":3600}'""",
+            "name": "gw",
+        }
+        assert _picker_key_cmd_token(entry) == "tok-json"
+
+    def test_absent_key_cmd_is_empty(self):
+        """No key_cmd — the caller falls through to api_key/key_env."""
+        assert _picker_key_cmd_token({"name": "gw"}) == ""
+
+    def test_blank_key_cmd_is_empty(self):
+        assert _picker_key_cmd_token({"key_cmd": "   ", "name": "gw"}) == ""
+
+    def test_failing_helper_degrades_to_empty(self):
+        """A helper that needs an interactive sign-in (or is simply broken)
+        must not take down the picker: every other provider's row still
+        renders, and this one degrades to the old empty-key behaviour."""
+        assert _picker_key_cmd_token({"key_cmd": "exit 1", "name": "gw"}) == ""
+
+    def test_silent_helper_is_empty(self):
+        assert _picker_key_cmd_token({"key_cmd": "true", "name": "gw"}) == ""
+
+    def test_multiline_output_is_rejected(self):
+        """command_token_source refuses to guess which line is the token."""
+        assert _picker_key_cmd_token(
+            {"key_cmd": "printf 'a\\nb'", "name": "gw"}
+        ) == ""
+
+
+class TestPickerProbesWithMintedCredential:
+    """End-to-end: a key_cmd provider lists its full catalog, not just one."""
+
+    def _probe_capture(self, monkeypatch):
+        """Record the api_key the picker hands the live /models probe."""
+        seen: dict = {}
+
+        # The real callee takes keyword extras (headers, timeout, api_mode);
+        # the probe is wrapped in `except Exception: pass`, so a stub with a
+        # narrower signature would be silently swallowed and look like "the
+        # probe never ran".
+        #
+        # Behave like a real authenticated endpoint: no credential -> no
+        # catalog. A stub that returns models regardless would still pass
+        # unpatched (the caller falls back to default_model), so the
+        # model-count assertions below would prove nothing.
+        def fake_fetch(api_key, api_url, provider, preserve_native_models, **kwargs):
+            seen["api_key"] = api_key
+            seen["api_url"] = api_url
+            if not api_key:
+                return None  # what a 401 looks like to the picker
+            return ["model-a", "model-b", "model-c"]
+
+        monkeypatch.setattr(
+            "hermes_cli.model_switch._fetch_picker_live_models", fake_fetch
+        )
+        return seen
+
+    def test_probe_receives_the_minted_token(self, monkeypatch):
+        from hermes_cli.model_switch import list_authenticated_providers
+
+        seen = self._probe_capture(monkeypatch)
+        rows = list_authenticated_providers(
+            user_providers={
+                "gw": {
+                    "base_url": "https://gw.example.test/v1",
+                    "api_mode": "chat_completions",
+                    "key_cmd": "printf 'tok-minted'",
+                    "default_model": "model-a",
+                }
+            },
+            refresh=True,
+            for_picker=True,
+        )
+
+        assert seen.get("api_key") == "tok-minted", (
+            "picker probed with an empty key — a key_cmd endpoint 401s and "
+            "collapses to its single default_model"
+        )
+        gw = [r for r in rows if isinstance(r, dict) and r.get("slug") == "gw"]
+        assert gw, "key_cmd provider missing from the picker entirely"
+        # The user-visible symptom: unpatched this is 1 (just default_model).
+        assert len(gw[0].get("models") or []) == 3
+
+    def test_static_api_key_still_wins(self, monkeypatch):
+        """key_cmd is a FALLBACK here: an explicit api_key is used as-is, so
+        this change cannot alter behaviour for existing static-key configs."""
+        from hermes_cli.model_switch import list_authenticated_providers
+
+        seen = self._probe_capture(monkeypatch)
+        list_authenticated_providers(
+            user_providers={
+                "gw": {
+                    "base_url": "https://gw.example.test/v1",
+                    "api_key": "sk-static",
+                    "key_cmd": "printf 'tok-minted'",
+                    "default_model": "model-a",
+                }
+            },
+            refresh=True,
+            for_picker=True,
+        )
+
+        assert seen.get("api_key") == "sk-static"
+
+
+class TestCacheFingerprintStability:
+    """The picker's cache key must not rotate with the token."""
+
+    def test_fingerprint_keys_on_command_not_token(self, monkeypatch):
+        """A helper minting a DIFFERENT token each call must still produce a
+        stable cache fingerprint. Keying on the minted value would change the
+        fingerprint on every refresh and force a re-probe on every open."""
+        from hermes_cli.model_switch import list_authenticated_providers
+
+        calls = {"n": 0}
+
+        def fake_fetch(api_key, api_url, provider, preserve_native_models, **kwargs):
+            calls["n"] += 1
+            return ["model-a", "model-b"]
+
+        monkeypatch.setattr(
+            "hermes_cli.model_switch._fetch_picker_live_models", fake_fetch
+        )
+
+        # $RANDOM would vary per call; use a counter file-free equivalent that
+        # is deterministic per call but different between calls.
+        providers = {
+            "gw": {
+                "base_url": "https://gw.example.test/v1",
+                "key_cmd": "printf 'tok-%s' $$",  # PID: differs per invocation
+                "default_model": "model-a",
+            }
+        }
+
+        first = list_authenticated_providers(
+            user_providers=providers, refresh=True, for_picker=True
+        )
+        second = list_authenticated_providers(
+            user_providers=providers, refresh=True, for_picker=True
+        )
+
+        def row(rows):
+            return [r for r in rows if isinstance(r, dict) and r.get("slug") == "gw"]
+
+        assert row(first) and row(second)
+        assert (row(first)[0].get("models") or []) == (
+            row(second)[0].get("models") or []
+        )
