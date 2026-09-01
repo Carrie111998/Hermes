@@ -5170,10 +5170,10 @@ def test_compressed_bot_tip_inherits_root_disconnect_policy(monkeypatch):
     root_reads = []
 
     class _DB:
-        def get_conversation_root(self, session_id):
+        def get_compression_lineage(self, session_id):
             assert session_id == "tip-sid"
             root_reads.append(session_id)
-            return "root-sid"
+            return ["root-sid", "tip-sid"]
 
         def get_session_title(self, session_id):
             assert session_id == "root-sid"
@@ -5198,6 +5198,34 @@ def test_compressed_bot_tip_inherits_root_disconnect_policy(monkeypatch):
     assert session["preserve_running_on_disconnect"] is True
     assert session["_canonical_bot_chat"] is True
     assert root_reads == ["tip-sid"]
+
+
+def test_ordinary_branch_does_not_inherit_bot_disconnect_policy(monkeypatch):
+    lineage_reads = []
+
+    class _DB:
+        def get_compression_lineage(self, session_id):
+            lineage_reads.append(session_id)
+            return [session_id]
+
+        def get_session_title(self, session_id):
+            raise AssertionError("ordinary branch must not consult its parent root")
+
+    session = _session(
+        agent=types.SimpleNamespace(
+            _session_db=_DB(),
+            _session_title_hint="Research branch",
+        ),
+        session_key="branch-sid",
+        preserve_running_on_disconnect=False,
+    )
+
+    server._sync_bot_capabilities("branch-ui", session)
+    server._sync_bot_capabilities("branch-ui", session)
+
+    assert session["preserve_running_on_disconnect"] is False
+    assert session.get("_canonical_bot_chat") is not True
+    assert lineage_reads == ["branch-sid"]
 
 
 def test_non_bot_turn_keeps_default_disconnect_policy():
@@ -18603,8 +18631,8 @@ def test_old_client_cold_bot_resume_adopts_disconnect_policy_before_build(monkey
         def get_compression_tip(self, target):
             return target
 
-        def get_conversation_root(self, target):
-            return target
+        def get_compression_lineage(self, target):
+            return [target]
 
         def get_session_title(self, target):
             return "Bot Chat"
@@ -18633,6 +18661,47 @@ def test_old_client_cold_bot_resume_adopts_disconnect_policy_before_build(monkey
         sid = response["result"]["session_id"]
         assert server._sessions[sid]["agent"] is None
         assert server._sessions[sid]["preserve_running_on_disconnect"] is True
+    finally:
+        server._sessions.clear()
+
+
+def test_cold_resume_does_not_inherit_policy_from_noncompression_parent(monkeypatch):
+    class FakeDB:
+        def get_session(self, target):
+            return {"id": target, "title": "Research branch", "message_count": 0}
+
+        def resolve_resume_session_id(self, target):
+            return target
+
+        def get_compression_lineage(self, target):
+            return [target]
+
+        def get_session_title(self, target):
+            raise AssertionError("branch parent title must not be consulted")
+
+        def assert_resume_safe(self, target):
+            return None
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_schedule_resume_hydration", lambda *args, **kwargs: None)
+    server._sessions.clear()
+    try:
+        response = server.handle_request(
+            {
+                "id": "branch-resume",
+                "method": "session.resume",
+                "params": {
+                    "session_id": "branch-sid",
+                    "defer_history": True,
+                },
+            }
+        )
+
+        assert "error" not in response
+        sid = response["result"]["session_id"]
+        assert server._sessions[sid]["preserve_running_on_disconnect"] is False
     finally:
         server._sessions.clear()
 

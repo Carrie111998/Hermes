@@ -613,11 +613,12 @@ def _(rid, params: dict) -> dict:
             try:
                 from tools.bot_mode_probe import BOT_CHAT_TITLE
 
-                root = db.get_conversation_root(target)
-                canonical_bot_chat = (
-                    str(db.get_session_title(root) or "").strip()
-                    == BOT_CHAT_TITLE
-                )
+                lineage = db.get_compression_lineage(target)
+                if len(lineage) > 1:
+                    canonical_bot_chat = (
+                        str(db.get_session_title(lineage[0]) or "").strip()
+                        == BOT_CHAT_TITLE
+                    )
             except Exception:
                 pass
         if canonical_bot_chat:

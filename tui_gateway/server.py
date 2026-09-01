@@ -6604,20 +6604,30 @@ def _sync_bot_capabilities(sid: str, session: dict) -> None:
             title = str(getattr(agent, "_session_title_hint", "") or "").strip()
             db = getattr(agent, "_session_db", None)
             key = session.get("session_key") or ""
+            identity = (str(key), title)
+            if session.get("_bot_identity_checked") == identity:
+                return
             if title != "Bot Chat" and db and key:
                 # Compression retitles the live continuation tip. Bot identity
                 # belongs to the lineage root, which keeps the canonical title;
                 # checking only the tip makes an old/compressed Bot Chat lose its
                 # background-work policy exactly when long work needs it most.
-                root = db.get_conversation_root(key)
-                title = str(db.get_session_title(root) or "").strip()
+                lineage = db.get_compression_lineage(key)
+                if len(lineage) > 1:
+                    title = str(db.get_session_title(lineage[0]) or "").strip()
             if title != "Bot Chat":
+                # Avoid a lineage read at every ordinary turn boundary. A
+                # rename or compression rotation changes this identity tuple
+                # and re-opens classification; explicit branches/delegates
+                # never inherit Bot identity from a generic conversation root.
+                session["_bot_identity_checked"] = identity
                 return
             # Canonical identity cannot change during one live runtime. Cache
             # the positive proof so compressed tips do not repeat two SQLite
             # lookups at every turn boundary. Do not cache a negative result:
             # legacy callers may still attach the canonical title later.
             session["_canonical_bot_chat"] = True
+            session.pop("_bot_identity_checked", None)
         # Canonical Bot work is backend-resident by definition. Mark it here,
         # at every turn boundary, so older Desktop clients that do not know the
         # optional create/resume flag still cannot turn navigation or app exit
