@@ -14,21 +14,23 @@ source: https://github.com/sweetrb/apple-notes-mcp
 # auditable); bump the pin via PR after validating a new release.
 #
 # How this pin was validated (catalog policy: "version validated on macOS").
-# On macOS, `npx -y apple-notes-mcp@2.7.5`:
+# On macOS, `npx -y apple-notes-mcp@2.8.0`:
 #   - completes an MCP `initialize` handshake reporting serverInfo.version
-#     2.7.5 — i.e. the bytes npx resolved are the bytes pinned here;
+#     2.8.0 — i.e. the bytes npx resolved are the bytes pinned here;
 #   - returns a full `tools/list` of 36 tools, every one carrying a description;
 #   - resolves all 20 `tools.default_enabled` entries below against that
 #     list, so no allow-listed name went stale across the bump.
 # Tools added since the previous pin are deliberately left OUT of
 # default_enabled — widening the default surface is the maintainers' call.
-# Re-run all three checks before moving this pin.
+# Re-run all three checks before moving this pin. (2.7.5 -> 2.8.0: no tools
+# added or renamed — 2.8.0 hardened note-mutation write paths only, which
+# this catalog entry doesn't default-enable.)
 transport:
   type: stdio
   command: "npx"
   args:
     - "-y"
-    - "apple-notes-mcp@2.7.5"
+    - "apple-notes-mcp@2.8.0"
 
 # Drives Apple Notes locally via AppleScript; no credentials.
 auth:
