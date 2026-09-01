@@ -625,16 +625,21 @@ if [ "$CODE" -ne 0 ] && [ "$CODE" -ne 2 ]; then
 fi
 trap 'on_signal TERM' TERM
 
-# Truthful completion: `hermes update` calls a GUI build failure non-fatal
-# (exit 0). For a Desktop-driven update that would relaunch the OLD build
-# and call it success -- retry the build once, propagate honestly.
-if [ "$CODE" -eq 0 ] && printf '%s' "$OUT" | grep -q "Desktop build failed"; then
-  log "desktop build failed inside hermes update; retrying build"
+# A successful code update does not prove the release/ app matches the checked
+# out source. In particular, the "Already up to date" path skips the Desktop
+# build check entirely, yet mac_swap would still install whatever stale bundle
+# happened to be under release/. Always drive the content-stamp gate before the
+# install. It is fast when current and rebuilds when stale; one forced retry
+# covers a corrupt/partial artifact without ever shipping it.
+if [ "$CODE" -eq 0 ]; then
   publish_stage "Rebuilding Desktop"
-  "$HERMES_BIN" desktop --force-build --build-only >> "$LOG" 2>&1 || {
-    FINAL_CODE=6 FINAL_MSG="Code and dependencies updated, but the Desktop app rebuild failed - you are running the previous build. Run hermes desktop --force-build from a terminal to retry."
-    exit 6
-  }
+  if ! "$HERMES_BIN" desktop --build-only >> "$LOG" 2>&1; then
+    log "desktop artifact check/build failed; retrying forced build"
+    "$HERMES_BIN" desktop --force-build --build-only >> "$LOG" 2>&1 || {
+      FINAL_CODE=6 FINAL_MSG="Code and dependencies updated, but the Desktop app rebuild failed - the installed app was kept. Run hermes desktop --force-build from a terminal to retry."
+      exit 6
+    }
+  fi
 fi
 
 if [ "$CODE" -eq 0 ]; then FINAL_CODE=0 FINAL_MSG="Update complete."
