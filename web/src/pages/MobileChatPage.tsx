@@ -182,7 +182,8 @@ function isInjectedSystemNote(text: string): boolean {
    no longer dumps the user into an empty new chat. */
 const SS_SESSION_KEY = "hermes.m.activeSession";
 const SS_TITLE_KEY = "hermes.m.activeTitle";
-const BUILD_TAG = "build 2026-08-30.24 · settings";
+const SS_MOBILE_SESSION_KEY = "hermes.m.mobileSession";
+const BUILD_TAG = "build 2026-08-31.5 · drawer-all-fix";
 
 function ssGet(key: string): string {
   try {
@@ -619,7 +620,9 @@ export default function MobileChatPage() {
         setState("open");
         // Refresh persistence: if this tab had an active session, resume it
         // (loads full history) instead of silently starting an empty chat.
-        const prevSid = ssGet(SS_SESSION_KEY);
+        // Cold boot re-attaches ONLY to the phone's own last session. Sessions opened
+// from the drawer that belong to Telegram/desktop/TUI are volatile on purpose.
+const prevSid = ssGet(SS_MOBILE_SESSION_KEY);
         if (prevSid) {
           try {
             const res = await gw.request<{ session_id?: string; messages?: unknown[] }>(
@@ -652,7 +655,7 @@ export default function MobileChatPage() {
             // Resume failed (session gone, gateway hiccup) — fall through to a
             // fresh session so the page is still usable.
             console.warn("[m] boot resume failed:", (e as Error)?.message);
-            ssSet(SS_SESSION_KEY, "");
+            ssSet(SS_MOBILE_SESSION_KEY, "");
           }
         }
         try {
@@ -859,7 +862,7 @@ export default function MobileChatPage() {
     });
 
     // Persist the active session so a refresh resumes it instead of wiping.
-    ssSet(SS_SESSION_KEY, sid);
+    ssSet(SS_MOBILE_SESSION_KEY, sid);
     ssSet(SS_TITLE_KEY, activeTitle);
 
     setComposer("");
@@ -950,7 +953,7 @@ export default function MobileChatPage() {
     setPendingImages([]);
     setBusy(false);
     setActiveTitle("");
-    ssSet(SS_SESSION_KEY, "");
+    ssSet(SS_MOBILE_SESSION_KEY, "");
     ssSet(SS_TITLE_KEY, "");
     try {
       const res = await gwRef.current?.request<{ session_id?: string }>(
@@ -983,7 +986,10 @@ export default function MobileChatPage() {
       if (!gw) return;
       setHistoryOpen(false);
       setActiveTitle(title);
-      ssSet(SS_SESSION_KEY, id);
+      // Persist only phone-owned sessions across launches. Opening a session from another
+// surface (Telegram/desktop/TUI) stays volatile: it renders now, but the next cold
+// boot re-attaches to the phone's own last session instead of hijacking that chat.
+ssSet(SS_MOBILE_SESSION_KEY, id);
       ssSet(SS_TITLE_KEY, title);
       setBusy(false);
       setMessages([]);
@@ -1218,7 +1224,7 @@ export default function MobileChatPage() {
       {/* Messages */}
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto overflow-x-hidden overscroll-contain py-4"
+        className="flex-1 overflow-y-auto overflow-x-hidden overscroll-contain [touch-action:pan-y] py-4"
         style={{ WebkitOverflowScrolling: "touch" }}
       >
         {showEmpty ? (
