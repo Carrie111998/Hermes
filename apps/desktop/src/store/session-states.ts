@@ -89,14 +89,15 @@ export function recordSessionEventScope(event: { connectionId?: string; profile?
   }
 }
 
-/** Composite scopes of registry-sourced sessions that are live (busy or
- * waiting on input) — the (connectionId, profile) half of the gateway
- * keep-set. Local-source live work keeps flowing through profile names. */
+/** Composite scopes of registry-sourced sessions that are live (busy,
+ * awaiting the backend's first response, or waiting on input) — the
+ * (connectionId, profile) half of the gateway keep-set. Local-source live
+ * work keeps flowing through profile names. */
 export function liveSessionScopes(): Set<string> {
   const scopes = new Set<string>()
 
   for (const [runtimeId, state] of Object.entries($sessionStates.get())) {
-    if (!state || (!state.busy && !state.needsInput)) {
+    if (!state || (!state.busy && !state.awaitingResponse && !state.needsInput)) {
       continue
     }
 
@@ -646,7 +647,7 @@ export const $workingSessionIds = computed(
   (states, sessions) =>
     (workingIds = stableArray(
       workingIds,
-      storedIds(states, sessions, s => s.busy)
+      storedIds(states, sessions, s => s.busy || s.awaitingResponse)
     ))
 )
 
