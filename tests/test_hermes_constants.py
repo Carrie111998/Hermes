@@ -372,6 +372,88 @@ class TestIsContainer:
         assert is_container() is True
 
 
+class TestRootMountIndicatesContainer:
+    """Tests for _root_mount_indicates_container() — rootfs inspection."""
+
+    # A bare-metal host running Docker: btrfs root on a real device, with
+    # containerd/docker daemon paths scattered through the rest of the mount
+    # table (the old whole-blob substring scan false-positived on this).
+    HOST_MOUNTINFO = """\
+33 2 0:30 /@ / rw,relatime shared:1 - btrfs /dev/mapper/root rw,compress=zstd:3,ssd,space_cache=v2,subvolid=256,subvol=/@
+409 33 0:89 / /var/lib/docker/rootfs/overlayfs/1d61659cb2d9b624432f8aed5d7033de7348d05eb0e8575a5f3b009d6d6ba234 rw,relatime shared:454 - overlay overlay rw,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/14/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/15/fs
+424 29 0:5 net:[4026533479] /run/docker/netns/e5f8dbe4d34e rw shared:469 - nsfs nsfs rw
+"""
+
+    # A real Docker/Podman/K8s container: root / is an overlay backed by
+    # containerd snapshots (cgroup v2 + private cgroup ns masks /proc/1/cgroup).
+    CONTAINER_MOUNTINFO = """\
+947 912 0:91 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/19/fs,upperdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/20/fs,workdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/20/work
+948 947 0:95 / /etc/resolv.conf rw,relatime - ext4 /dev/vda1 rw
+"""
+
+    def test_host_btrfs_root_not_container(self):
+        """Host mountinfo with containerd/docker paths but btrfs root → False."""
+        assert hermes_constants._root_mount_indicates_container(self.HOST_MOUNTINFO) is False
+
+    def test_container_overlay_root_is_container(self):
+        """Container mountinfo with overlay root → True."""
+        assert hermes_constants._root_mount_indicates_container(self.CONTAINER_MOUNTINFO) is True
+
+    def test_empty_mountinfo_is_not_container(self):
+        """Empty or malformed mountinfo never claims a container."""
+        assert hermes_constants._root_mount_indicates_container("") is False
+        assert hermes_constants._root_mount_indicates_container("garbage\nno separator here\n") is False
+
+
+class TestIsContainerRootMountFallback:
+    """is_container() via the root-mount fallback (cgroup v2, no .dockerenv)."""
+
+    def _install_mountinfo(self, monkeypatch, mountinfo_text: str):
+        """Monkeypatch builtins.open so /proc/1/cgroup and mountinfo are faked."""
+        import builtins
+
+        real_open = builtins.open
+
+        def fake_open(path, *a, **kw):
+            if path == "/proc/1/cgroup":
+                return _FakeFile("0::/\n")  # cgroup v2, masked — no markers
+            if path == "/proc/self/mountinfo":
+                return _FakeFile(mountinfo_text)
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr(builtins, "open", fake_open)
+        monkeypatch.setattr(os.path, "exists", lambda p: False)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+
+    def test_host_with_containerd_paths_is_not_container(self, monkeypatch):
+        """Bare-metal host (btrfs root + docker daemon paths) → False."""
+        self._install_mountinfo(monkeypatch, TestRootMountIndicatesContainer.HOST_MOUNTINFO)
+        monkeypatch.setattr(hermes_constants, "_container_detected", None)
+        assert is_container() is False
+
+    def test_container_overlay_root_is_container(self, monkeypatch):
+        """Real container (overlay root, cgroup v2 masked) → True."""
+        self._install_mountinfo(monkeypatch, TestRootMountIndicatesContainer.CONTAINER_MOUNTINFO)
+        monkeypatch.setattr(hermes_constants, "_container_detected", None)
+        assert is_container() is True
+
+
+class _FakeFile:
+    """Minimal file-like object so builtins.open fakes behave under .read()."""
+
+    def __init__(self, text: str):
+        self._text = text
+
+    def read(self, *a, **kw):
+        return self._text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
 class TestParseReasoningEffort:
     """Tests for parse_reasoning_effort() — string → reasoning config dict."""
 
