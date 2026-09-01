@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -25,9 +26,23 @@ logger = logging.getLogger(__name__)
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 _skill_commands_home: Optional[str] = None
-# Guards the (map, platform-tag, home-tag) triple so publication and the
-# freshness lookup always see a consistent snapshot. Scanning itself stays
-# outside this lock.
+_skill_commands_archived: frozenset[str] = frozenset()
+_skill_commands_project: tuple[Optional[str], tuple[str, ...]] | None = None
+_project_context_cache: dict[
+    tuple[str, str, Optional[int], Optional[int]],
+    tuple[
+        float,
+        tuple[tuple[str, Optional[int]], ...],
+        tuple[Optional[str], tuple[str, ...]],
+        list[Path],
+    ],
+] = {}
+_project_context_lock = threading.Lock()
+_PROJECT_CONTEXT_CACHE_TTL_SECONDS = 1.0
+# Guards the (map, platform-tag, home-tag, archive-state, project-context)
+# snapshot so
+# publication and the freshness lookup always see a consistent view. Scanning
+# itself stays outside this lock.
 _publish_lock = threading.Lock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
@@ -227,6 +242,86 @@ def _resolve_skill_commands_home() -> str:
     from hermes_constants import get_hermes_home
 
     return str(get_hermes_home())
+
+
+def _archived_skill_names() -> frozenset[str]:
+    """Return profile-local skill names whose lifecycle state is archived."""
+    try:
+        from tools.skill_usage import archived_skill_names
+
+        return archived_skill_names()
+    except Exception:
+        return frozenset()
+
+
+def _resolve_skill_commands_project_context() -> tuple[
+    tuple[Optional[str], tuple[str, ...]], list[Path]
+]:
+    """Return project identity and skill dirs with a cheap cache-hit path."""
+    try:
+        from agent.skill_utils import find_project_root, get_project_skills_dirs
+
+        effective_cwd = os.path.abspath(
+            os.environ.get("TERMINAL_CWD") or os.getcwd()
+        )
+        home = _resolve_skill_commands_home()
+        config_path = Path(home) / "config.yaml"
+        try:
+            config_stat = config_path.stat()
+            config_mtime = config_stat.st_mtime_ns
+            config_size = config_stat.st_size
+        except OSError:
+            config_mtime = None
+            config_size = None
+        cache_key = (effective_cwd, home, config_mtime, config_size)
+
+        with _project_context_lock:
+            cached = _project_context_cache.get(cache_key)
+        if cached is not None:
+            cached_at, old_watch, identity, project_dirs = cached
+            current_watch = tuple(
+                (path, _path_mtime_ns(Path(path))) for path, _ in old_watch
+            )
+            if (
+                current_watch == old_watch
+                and time.monotonic() - cached_at
+                < _PROJECT_CONTEXT_CACHE_TTL_SECONDS
+            ):
+                return identity, list(project_dirs)
+
+        root = find_project_root()
+        project_dirs = list(get_project_skills_dirs())
+        identity = (
+            str(root.resolve()) if root is not None else None,
+            tuple(str(path.resolve()) for path in project_dirs),
+        )
+        watch_paths: list[Path] = []
+        if root is not None:
+            watch_paths = [
+                root / ".git",
+                root / ".hermes" / "skills",
+                root / ".agents" / "skills",
+            ]
+        watch = tuple((str(path), _path_mtime_ns(path)) for path in watch_paths)
+        with _project_context_lock:
+            _project_context_cache.clear()
+            _project_context_cache[cache_key] = (
+                time.monotonic(),
+                watch,
+                identity,
+                list(project_dirs),
+            )
+        return identity, project_dirs
+    except Exception:
+        return (None, ()), []
+
+
+def _path_mtime_ns(path: Path) -> Optional[int]:
+    """Return a cheap change token for a project marker or skill directory."""
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
 
 
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
@@ -431,8 +526,11 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
     global _skill_commands, _skill_commands_platform, _skill_commands_home
+    global _skill_commands_archived, _skill_commands_project
     platform = _resolve_skill_commands_platform()
     home = _resolve_skill_commands_home()
+    archived = _archived_skill_names()
+    project_context, project_dirs = _resolve_skill_commands_project_context()
     # Build into a local map and publish once, at the end. Writing straight
     # into the global made a scan's partial results visible to everything
     # else in the process: a second, overlapping scan deduped against its own
@@ -441,23 +539,22 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     # each naming the same skill as its own incumbent (#74574).
     commands: Dict[str, Dict[str, Any]] = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
+        from tools.skills_tool import _skills_dir, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import (
             get_external_skills_dirs,
-            get_project_skills_dirs,
             iter_project_skill_files,
             iter_skill_index_files,
         )
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
         seen_names: set = set()
+        active_skills_dir = _skills_dir()
 
         # Scan project dirs first (highest precedence), then local, then external.
         # Project dirs iterate through the quarantine chokepoint.
-        project_dirs = list(get_project_skills_dirs())
         dirs_to_scan = list(project_dirs)
-        if SKILLS_DIR.exists():
-            dirs_to_scan.append(SKILLS_DIR)
+        if active_skills_dir.exists():
+            dirs_to_scan.append(active_skills_dir)
         dirs_to_scan.extend(get_external_skills_dirs())
 
         for scan_dir in dirs_to_scan:
@@ -481,6 +578,11 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                         continue
                     name = frontmatter.get('name', skill_md.parent.name)
                     if name in seen_names:
+                        continue
+                    # Archive state belongs to the profile-local copy only.
+                    # A same-named project skill has independent precedence and
+                    # remains available, matching tools.skills_tool discovery.
+                    if scan_dir == active_skills_dir and name in archived:
                         continue
                     # Respect user's disabled skills config
                     if name in disabled:
@@ -531,6 +633,11 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
+                        "source_tier": (
+                            "project" if scan_dir in project_dirs
+                            else "profile" if scan_dir == active_skills_dir
+                            else "external"
+                        ),
                     }
                 except Exception:
                     continue
@@ -547,6 +654,8 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         _skill_commands = commands
         _skill_commands_platform = platform
         _skill_commands_home = home
+        _skill_commands_archived = archived
+        _skill_commands_project = project_context
     return commands
 
 
@@ -557,10 +666,14 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     process serving Telegram and Discord concurrently) so each platform
     sees its own ``skills.platform_disabled`` view (#14536), and when the
     active profile's Hermes home changes (e.g. Desktop switching profiles
-    mid-session) so each profile sees its own ``skills.external_dirs`` (#88023).
+    mid-session) so each profile sees its own ``skills.external_dirs`` (#88023),
+    and when cwd/project discovery changes so a long-lived CLI selects the
+    current project's highest-precedence skill copy.
     """
     current_platform = _resolve_skill_commands_platform()
     current_home = _resolve_skill_commands_home()
+    current_archived = _archived_skill_names()
+    current_project, _ = _resolve_skill_commands_project_context()
     # Read the map and its tags under the same lock that publishes them, so
     # the freshness decision is made against a consistent snapshot.
     with _publish_lock:
@@ -569,6 +682,8 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
             bool(commands)
             and _skill_commands_platform == current_platform
             and _skill_commands_home == current_home
+            and _skill_commands_archived == current_archived
+            and _skill_commands_project == current_project
         )
     if is_fresh:
         return commands

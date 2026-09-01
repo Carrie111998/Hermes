@@ -11171,6 +11171,234 @@ def test_commands_catalog_surfaces_quick_commands(monkeypatch):
     assert resp["result"]["canon"]["/notes"] == "/notes"
 
 
+def test_commands_catalog_omits_archived_resurrected_skill(tmp_path, monkeypatch):
+    """The TUI/Desktop catalog must not advertise an archived local copy."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import skill_usage
+
+    home = tmp_path / "profile"
+    skills_dir = home / "skills"
+    skill_dir = skills_dir / "lifecycle-x"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: lifecycle-x\ndescription: Lifecycle test.\n---\n\nBody.\n",
+        encoding="utf-8",
+    )
+
+    token = set_hermes_home_override(home)
+    try:
+        skill_usage.save_usage(
+            {"lifecycle-x": {"state": skill_usage.STATE_ARCHIVED}}
+        )
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", skills_dir)
+
+        resp = server.handle_request(
+            {"id": "1", "method": "commands.catalog", "params": {}}
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert "/lifecycle-x" not in dict(resp["result"]["pairs"])
+    assert "/lifecycle-x" not in resp["result"]["skills"]
+
+
+def test_commands_catalog_tracks_profile_local_archive_state(tmp_path):
+    """Profile switches must pair lifecycle state with that profile's files."""
+    import agent.skill_commands as sc_mod
+    from agent.skill_commands import get_skill_commands, scan_skill_commands
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import skill_usage
+
+    def write_skill(home: Path, body: str) -> Path:
+        skill_dir = home / "skills" / "shared-lifecycle"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: shared-lifecycle\n"
+            "description: Profile lifecycle test.\n"
+            "---\n\n"
+            f"{body}\n",
+            encoding="utf-8",
+        )
+        return skill_dir
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    skill_a = write_skill(profile_a, "Profile A copy.")
+    skill_b = write_skill(profile_b, "Profile B copy.")
+
+    token_a = set_hermes_home_override(profile_a)
+    try:
+        skill_usage.save_usage(
+            {"shared-lifecycle": {"state": skill_usage.STATE_ARCHIVED}}
+        )
+    finally:
+        reset_hermes_home_override(token_a)
+
+    token_b = set_hermes_home_override(profile_b)
+    try:
+        skill_usage.save_usage(
+            {"shared-lifecycle": {"state": skill_usage.STATE_ACTIVE}}
+        )
+        with patch.object(sc_mod, "_skill_commands", {}):
+            fresh = scan_skill_commands()
+            cached = get_skill_commands()
+            resp = server.handle_request(
+                {"id": "1", "method": "commands.catalog", "params": {}}
+            )
+
+            assert fresh["/shared-lifecycle"]["skill_dir"] == str(skill_b)
+            assert cached["/shared-lifecycle"]["skill_dir"] == str(skill_b)
+            assert "/shared-lifecycle" in dict(resp["result"]["pairs"])
+            assert str(skill_a) not in {
+                command["skill_dir"] for command in fresh.values()
+            }
+
+            skill_usage.save_usage(
+                {"shared-lifecycle": {"state": skill_usage.STATE_ARCHIVED}}
+            )
+            assert "/shared-lifecycle" not in get_skill_commands()
+            archived_resp = server.handle_request(
+                {"id": "2", "method": "commands.catalog", "params": {}}
+            )
+            assert "/shared-lifecycle" not in dict(
+                archived_resp["result"]["pairs"]
+            )
+            assert "/shared-lifecycle" not in archived_resp["result"]["skills"]
+    finally:
+        reset_hermes_home_override(token_b)
+
+
+def test_commands_catalog_project_override_has_independent_metadata(
+    tmp_path, monkeypatch
+):
+    """A trusted project copy must not inherit an archived local identity."""
+    import agent.skill_commands as sc_mod
+    from agent import skill_utils
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from tools import skill_usage
+
+    home = tmp_path / "profile"
+    profile_skill = home / "skills" / "shared-lifecycle"
+    profile_skill.mkdir(parents=True)
+    profile_skill.joinpath("SKILL.md").write_text(
+        "---\nname: shared-lifecycle\ndescription: Profile copy.\n---\n\nBody.\n",
+        encoding="utf-8",
+    )
+    home.joinpath("skills", ".bundled_history").write_text(
+        "shared-lifecycle\n", encoding="utf-8"
+    )
+
+    project = tmp_path / "project"
+    (project / ".git").mkdir(parents=True)
+    project_skill = project / ".hermes" / "skills" / "shared-lifecycle"
+    project_skill.mkdir(parents=True)
+    project_skill.joinpath("SKILL.md").write_text(
+        "---\nname: shared-lifecycle\ndescription: Project copy.\n---\n\nBody.\n",
+        encoding="utf-8",
+    )
+    home.joinpath("config.yaml").write_text(
+        "skills:\n"
+        "  external_dirs: []\n"
+        f"  trusted_project_dirs: ['{project.as_posix()}']\n",
+        encoding="utf-8",
+    )
+
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.chdir(project)
+        skill_utils._external_dirs_cache_clear()
+        skill_usage.save_usage(
+            {
+                "shared-lifecycle": {
+                    "state": skill_usage.STATE_ARCHIVED,
+                    "use_count": 172,
+                }
+            }
+        )
+        with patch.object(sc_mod, "_skill_commands", {}):
+            commands = sc_mod.scan_skill_commands()
+            response = server.handle_request(
+                {"id": "1", "method": "commands.catalog", "params": {}}
+            )
+    finally:
+        reset_hermes_home_override(token)
+        skill_utils._external_dirs_cache_clear()
+
+    selected = commands["/shared-lifecycle"]
+    assert selected["skill_dir"] == str(project_skill)
+    assert selected["source_tier"] == "project"
+    assert response["result"]["skills"]["/shared-lifecycle"] == {
+        "usage": 0,
+        "origin": "local",
+    }
+
+
+def test_slash_cache_follows_same_profile_project_cwd_transition(tmp_path, monkeypatch):
+    """Cached slash discovery must follow supported in-process cwd changes."""
+    import agent.skill_commands as sc_mod
+    from agent import skill_utils
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    home = tmp_path / "profile"
+    profile_skill = home / "skills" / "cwd-shadow"
+    profile_skill.mkdir(parents=True)
+    profile_skill.joinpath("SKILL.md").write_text(
+        "---\nname: cwd-shadow\ndescription: Profile command.\n---\n\nProfile body.\n",
+        encoding="utf-8",
+    )
+
+    project_a = tmp_path / "project-a"
+    project_a.joinpath(".git").mkdir(parents=True)
+    project_b = tmp_path / "project-b"
+    project_b.joinpath(".git").mkdir(parents=True)
+    project_skill = project_b / ".hermes" / "skills" / "cwd-shadow"
+    project_skill.mkdir(parents=True)
+    project_skill.joinpath("SKILL.md").write_text(
+        "---\nname: cwd-shadow\ndescription: Project command.\n---\n\nProject body.\n",
+        encoding="utf-8",
+    )
+    home.joinpath("config.yaml").write_text(
+        "skills:\n"
+        "  external_dirs: []\n"
+        f"  trusted_project_dirs: ['{project_b.as_posix()}']\n",
+        encoding="utf-8",
+    )
+
+    token = set_hermes_home_override(home)
+    try:
+        monkeypatch.chdir(project_a)
+        monkeypatch.setenv("TERMINAL_CWD", str(project_a))
+        skill_utils._external_dirs_cache_clear()
+        with patch.object(sc_mod, "_skill_commands", {}):
+            primed = sc_mod.get_skill_commands()
+            assert primed["/cwd-shadow"]["skill_dir"] == str(profile_skill)
+
+            monkeypatch.chdir(project_b)
+            monkeypatch.setenv("TERMINAL_CWD", str(project_b))
+            selected = sc_mod.get_skill_commands()
+            invocation = sc_mod.build_skill_invocation_message("/cwd-shadow")
+            completion = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "complete.slash",
+                    "params": {"text": "/cwd-shadow"},
+                }
+            )
+    finally:
+        reset_hermes_home_override(token)
+        skill_utils._external_dirs_cache_clear()
+
+    assert selected["/cwd-shadow"]["skill_dir"] == str(project_skill)
+    assert selected["/cwd-shadow"]["source_tier"] == "project"
+    assert invocation is not None and "Project body." in invocation
+    skill_items = [
+        item for item in completion["result"]["items"] if item["kind"] == "skill"
+    ]
+    assert any(item["text"].strip().lstrip("/") == "cwd-shadow" for item in skill_items)
+    assert any("Project command." in item["meta"] for item in skill_items)
+
+
 def test_commands_catalog_ranks_skill_commands_by_recorded_usage(monkeypatch):
     """Skill entries carry the usage + origin the `/` menu ranks on.
 
