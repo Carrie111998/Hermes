@@ -107,7 +107,6 @@ _KNOWN_GIT_BUILTINS = frozenset({
     "worktree",
 })
 
-_SHELL_EXECUTABLES = frozenset({"bash", "dash", "ksh", "sh", "zsh"})
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=(.*)", re.DOTALL)
 _SUDO_OPTIONS_WITH_ARG = frozenset({
     "-C",
