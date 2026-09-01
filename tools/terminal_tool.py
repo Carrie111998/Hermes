@@ -706,6 +706,22 @@ _SUDO_NON_INTERACTIVE_FLAGS = {"-n", "--non-interactive"}
 # ``-nv`` without misreading option+argument shapes (``-un root`` is
 # ``-u`` with user ``n``, not a non-interactive cluster).
 _SUDO_NO_ARG_SHORT_FLAGS = "nvkKlVeisbhEP"
+# sudo options whose value arrives as a separate token; the value is
+# consumed verbatim (even when it looks like a flag) so scanning reaches
+# a later ``-n``: ``sudo -u janet-admin -n id``.
+_SUDO_ARG_SHORT_FLAGS = "CcgpRrTtUu"
+_SUDO_ARG_LONG_FLAGS = {
+    "--close-from",
+    "--command-timeout",
+    "--group",
+    "--login-class",
+    "--other-user",
+    "--prompt",
+    "--restart-timeout",
+    "--role",
+    "--type",
+    "--user",
+}
 
 
 def _sudo_invocation_is_non_interactive(command: str, start: int) -> bool:
@@ -715,11 +731,15 @@ def _sudo_invocation_is_non_interactive(command: str, start: int) -> bool:
     (without consuming them) and reports whether one asks sudo to fail
     immediately instead of prompting: ``-n`` / ``--non-interactive``, or a
     merged argument-less short cluster containing ``n`` (e.g. ``-nv``).
-    Stops at the first non-flag token (the command sudo would run), at
-    ``--`` (end of sudo options), or at a shell/line separator.
+    An option whose value comes as a separate token (``-u janet-admin``,
+    ``--user janet-admin``) consumes that token, so scanning continues at
+    the following flag instead of stopping at the value. Stops at the
+    first non-flag token (the command sudo would run), at ``--`` (end of
+    sudo options), or at a shell/line separator.
     """
     i = start
     n = len(command)
+    skip_value = False
     while i < n:
         ch = command[i]
         if ch.isspace():
@@ -730,18 +750,29 @@ def _sudo_invocation_is_non_interactive(command: str, start: int) -> bool:
         if ch in ";|&()":
             return False
         token, next_i = _read_shell_token(command, i)
+        if skip_value:
+            skip_value = False
+            i = next_i
+            continue
         if token == "--":
             return False
         if token.startswith("-"):
             if token in _SUDO_NON_INTERACTIVE_FLAGS:
                 return True
-            body = token[1:]
-            if (
-                len(body) > 1
-                and "n" in body
-                and all(c in _SUDO_NO_ARG_SHORT_FLAGS for c in body)
-            ):
-                return True
+            if token in _SUDO_ARG_LONG_FLAGS:
+                skip_value = True
+            elif not token.startswith("--"):
+                body = token[1:]
+                for pos, c in enumerate(body):
+                    if c == "n":
+                        return True
+                    if c not in _SUDO_NO_ARG_SHORT_FLAGS:
+                        # An argument-taking flag ends the flag part: the
+                        # rest of the cluster is its value (``-un`` is
+                        # user ``n``); a trailing one takes the next token.
+                        if c in _SUDO_ARG_SHORT_FLAGS and pos == len(body) - 1:
+                            skip_value = True
+                        break
         else:
             return False
         i = next_i

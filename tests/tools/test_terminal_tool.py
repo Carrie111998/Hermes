@@ -75,6 +75,10 @@ def test_non_interactive_sudo_probe_passes_through_unchanged(monkeypatch):
         "sudo -n true",
         "sudo --non-interactive id",
         "sudo -nv true",
+        "sudo -u janet-admin -n id",
+        "sudo --user janet-admin --non-interactive id",
+        "sudo --user=janet-admin -n id",
+        "sudo -g wheel -n id",
     ):
         transformed, sudo_stdin = terminal_tool._transform_sudo_command(command)
         assert transformed == command
@@ -126,6 +130,39 @@ def test_sudo_flag_like_argument_of_child_command_is_not_non_interactive(monkeyp
     )
 
     assert transformed == "sudo -S -p '' rm -n /tmp/thing"
+    assert sudo_stdin == "testpass\n"
+
+
+def test_non_interactive_sudo_probe_with_option_values_keeps_scanning(monkeypatch):
+    """Option-order cases from #94534 review: an option whose value arrives
+    as a separate token (``-u janet-admin``, ``--user janet-admin``) must
+    not stop the flag scan — sudo still sees a later ``-n``, so the
+    invocation passes through verbatim. Without a ``-n`` the same shapes
+    take the normal rewrite, and the separate value is consumed verbatim
+    even when it looks like a flag (getopt takes the next argv element as
+    the option's argument)."""
+    monkeypatch.setenv("SUDO_PASSWORD", "testpass")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+
+    for command in (
+        "sudo -u janet-admin -n id",
+        "sudo --user janet-admin --non-interactive id",
+        "sudo -u 'janet admin' -n id",
+    ):
+        transformed, sudo_stdin = terminal_tool._transform_sudo_command(command)
+        assert transformed == command
+        assert sudo_stdin is None
+
+    transformed, sudo_stdin = terminal_tool._transform_sudo_command(
+        "sudo -u janet-admin id"
+    )
+    assert transformed == "sudo -S -p '' -u janet-admin id"
+    assert sudo_stdin == "testpass\n"
+
+    transformed, sudo_stdin = terminal_tool._transform_sudo_command(
+        "sudo -u -n id"
+    )
+    assert transformed == "sudo -S -p '' -u -n id"
     assert sudo_stdin == "testpass\n"
 
 
