@@ -8401,6 +8401,54 @@ def schedule_task(
     human action, or automation can later call ``unblock_task`` to re-gate them
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
+    row = conn.execute(
+        "SELECT status, current_run_id, claim_lock, worker_pid "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+
+    # Scheduling is also an operator stop operation when a caller targets a
+    # running (or partially-cleared) task.  Do not clear the claim fields
+    # first: doing so leaves the worker alive with no durable owner and lets a
+    # later dispatch start a duplicate.  A claim is considered active even if
+    # the task status has already drifted away from ``running``.
+    has_active_claim = (
+        row["status"] == "running"
+        or row["claim_lock"] is not None
+        or row["worker_pid"] is not None
+    )
+    termination: dict[str, Any] = {}
+    if has_active_claim:
+        termination = _terminate_reclaimed_worker(
+            row["worker_pid"],
+            row["claim_lock"],
+            task_id=task_id,
+        )
+        if not termination.get("terminated"):
+            if row["status"] == "running" and row["claim_lock"] is not None:
+                _defer_reclaim_for_live_worker(
+                    conn,
+                    task_id,
+                    row["claim_lock"],
+                    int(time.time()),
+                    termination,
+                    reason="schedule_termination_unverified",
+                )
+            else:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        task_id,
+                        "schedule_deferred",
+                        {
+                            "reason": "worker_termination_unverified",
+                            "termination": termination,
+                        },
+                    )
+            return False
+
     with write_txn(conn):
         params: list[Any] = [task_id]
         sql = """
@@ -8412,6 +8460,22 @@ def schedule_task(
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
+        # Fence the snapshot used for worker termination.  If another writer
+        # changed the claim while the process was being stopped, do not clear
+        # that writer's newer ownership.
+        if has_active_claim:
+            sql += " AND status = ? AND current_run_id IS ? "
+            sql += " AND claim_lock IS ? AND worker_pid IS ?"
+            params.extend(
+                [
+                    row["status"],
+                    row["current_run_id"],
+                    row["claim_lock"],
+                    row["worker_pid"],
+                ]
+            )
+        else:
+            sql += " AND claim_lock IS NULL AND worker_pid IS NULL"
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params.append(int(expected_run_id))
@@ -8429,7 +8493,10 @@ def schedule_task(
                 outcome="scheduled",
                 summary=reason,
             )
-        _append_event(conn, task_id, "scheduled", {"reason": reason}, run_id=run_id)
+        event_payload: dict[str, Any] = {"reason": reason}
+        if termination:
+            event_payload["termination"] = termination
+        _append_event(conn, task_id, "scheduled", event_payload, run_id=run_id)
         return True
 
 
