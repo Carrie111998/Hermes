@@ -206,6 +206,34 @@ class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
         raise AssertionError("non-editable adapters should not receive edit_message calls")
 
 
+_USER_LIMIT_MESSAGE = "查看刚才这个会话最近 600 条消息"
+_USER_LIMIT_REFUSAL = "读取请求未执行。请使用明确的 1–500 数字条数后重试。"
+_USER_LIMIT_STATUS = (
+    "⚠️ Tool guardrail halted "
+    "mcp__wechat_reader__wechat_read: user_limit_exceeded"
+)
+
+
+class UserLimitGuardrailAgent:
+    def __init__(self, **kwargs):
+        self.status_callback = kwargs.get("status_callback")
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert message == _USER_LIMIT_MESSAGE
+        self.status_callback("lifecycle", _USER_LIMIT_STATUS)
+        if self.stream_delta_callback is not None:
+            self.stream_delta_callback(_USER_LIMIT_REFUSAL)
+        return {
+            "final_response": _USER_LIMIT_REFUSAL,
+            "messages": [],
+            "api_calls": 0,
+            "tools": [],
+            "turn_exit_reason": "guardrail_halt",
+        }
+
+
 class FakeAgent:
     def __init__(self, **kwargs):
         # Capture anything passed via kwargs (older code path) but don't
@@ -478,6 +506,128 @@ def _make_runner(adapter):
         stt_enabled=False,
     )
     return runner
+
+
+@pytest.mark.parametrize(
+    ("streaming_enabled", "adapter_cls"),
+    [
+        pytest.param(
+            False,
+            NonEditingProgressCaptureAdapter,
+            id="streaming-off",
+        ),
+        pytest.param(
+            True,
+            MetadataEditProgressCaptureAdapter,
+            id="streaming-on",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_weixin_user_limit_refusal_is_single_final_message(
+    monkeypatch,
+    tmp_path,
+    streaming_enabled,
+    adapter_cls,
+):
+    import yaml
+
+    config_data = {
+        "display": {
+            "tool_progress": "off",
+            "interim_assistant_messages": False,
+            "platforms": {
+                "weixin": {
+                    "streaming": streaming_enabled,
+                },
+            },
+        },
+        "streaming": {
+            "enabled": streaming_enabled,
+            "edit_interval": 0.01,
+            "buffer_threshold": 1,
+        },
+    }
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(config_data),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = UserLimitGuardrailAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = adapter_cls(platform=Platform.WEIXIN)
+    runner = _make_runner(adapter)
+    runner.config.streaming = StreamingConfig.from_dict(
+        config_data["streaming"]
+    )
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+
+    source = SessionSource(
+        platform=Platform.WEIXIN,
+        chat_id="user@example.im.wechat",
+        chat_type="dm",
+    )
+    session_key = "agent:main:weixin:dm:user@example.im.wechat"
+    results = []
+
+    async def handler(event):
+        result = await runner._run_agent(
+            message=event.text,
+            context_prompt="",
+            history=[],
+            source=event.source,
+            session_id="guardrail-single-reply",
+            session_key=session_key,
+        )
+        results.append(result)
+        if result.get("already_sent"):
+            return None
+        return result["final_response"]
+
+    adapter.set_message_handler(handler)
+    event = MessageEvent(
+        text=_USER_LIMIT_MESSAGE,
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="synthetic-600",
+    )
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await asyncio.wait_for(
+        adapter._process_message_background(event, session_key),
+        timeout=2.0,
+    )
+    await asyncio.sleep(0)
+
+    assert len(results) == 1
+    result = results[0]
+    assert result["api_calls"] == 0
+    assert result["tools"] == []
+    assert result["final_response"] == _USER_LIMIT_REFUSAL
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["content"] == _USER_LIMIT_REFUSAL
+    assert all(
+        _USER_LIMIT_STATUS not in item["content"]
+        for item in adapter.sent
+    )
+
+    if streaming_enabled:
+        assert result.get("already_sent") is True
+    else:
+        assert not result.get("already_sent")
 
 
 @pytest.mark.asyncio

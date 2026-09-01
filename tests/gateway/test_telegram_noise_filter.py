@@ -134,6 +134,29 @@ def test_programmatic_surfaces_keep_raw_status():
         )
 
 
+@pytest.mark.parametrize(
+    ("platform", "suppress"),
+    [
+        pytest.param(Platform.WEIXIN, True, id="weixin-chat"),
+        pytest.param(Platform.LOCAL, False, id="local-raw"),
+    ],
+)
+def test_tool_guardrail_halt_lifecycle_status_routes_by_surface(
+    platform,
+    suppress,
+):
+    message = (
+        "⚠️ Tool guardrail halted "
+        "mcp__wechat_reader__wechat_read: user_limit_exceeded"
+    )
+    expected = None if suppress else message
+
+    assert (
+        _prepare_gateway_status_message(platform, "lifecycle", message)
+        == expected
+    )
+
+
 @pytest.mark.parametrize("message", ["still on it", "⏳ Working — 3 min"])
 def test_telegram_status_keeps_legitimate_heartbeat_messages(message):
     """The compression filter must not swallow user-facing work heartbeats."""
