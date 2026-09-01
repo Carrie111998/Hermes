@@ -1409,3 +1409,72 @@ class TestApiServerEnvOverride:
         assert config.platforms[Platform.API_SERVER].enabled is False
         # The key is still wired through for the shared listener.
         assert config.platforms[Platform.API_SERVER].extra.get("key") == api_server_key
+
+
+class TestUnknownPlatformLogging:
+    """A configured platform the Platform enum cannot resolve (e.g. one
+    registered via a user plugin) is still dropped from GatewayConfig — the
+    enum-only resolution is the existing contract — but the drop must be
+    visible: before #96747 both `platforms` and `reset_by_platform` entries
+    vanished in a bare `except ValueError: pass`, leaving "No messaging
+    platforms enabled" as the only, nameless symptom."""
+
+    def test_unknown_platform_logs_warning(self, caplog):
+        import logging as _logging
+
+        config = GatewayConfig.from_dict(
+            {
+                "platforms": {
+                    "my_user_plugin_platform": {"enabled": True},
+                },
+            }
+        )
+        assert not any(
+            p.value == "my_user_plugin_platform" for p in config.platforms
+        )
+        assert any(
+            "my_user_plugin_platform" in rec.getMessage()
+            and rec.levelno == _logging.WARNING
+            for rec in caplog.records
+        ), "dropped platform must be named in a warning"
+        assert any(
+            "not a built-in platform or malformed config" in rec.getMessage()
+            for rec in caplog.records
+        ), "both drop warnings must share the same reason wording"
+
+    def test_unknown_reset_by_platform_logs_warning(self, caplog):
+        import logging as _logging
+
+        config = GatewayConfig.from_dict(
+            {
+                "reset_by_platform": {
+                    "my_user_plugin_platform": {"after_turn": "always"},
+                },
+            }
+        )
+        assert not any(
+            p.value == "my_user_plugin_platform" for p in config.reset_by_platform
+        )
+        assert any(
+            "my_user_plugin_platform" in rec.getMessage()
+            and rec.levelno == _logging.WARNING
+            for rec in caplog.records
+        ), "dropped reset policy must be named in a warning"
+        assert any(
+            "not a built-in platform or malformed config" in rec.getMessage()
+            for rec in caplog.records
+        ), "both drop warnings must share the same reason wording"
+
+    def test_known_platform_still_silent(self, caplog):
+        """Legitimate built-in entries keep loading without noise."""
+        config = GatewayConfig.from_dict(
+            {
+                "platforms": {
+                    "telegram": {"enabled": False},
+                },
+            }
+        )
+        assert Platform.TELEGRAM in config.platforms
+        assert not [
+            rec for rec in caplog.records if "telegram" in rec.getMessage()
+        ]

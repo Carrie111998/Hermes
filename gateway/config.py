@@ -1179,20 +1179,33 @@ class GatewayConfig:
             try:
                 platform = Platform(platform_name)
                 platforms[platform] = PlatformConfig.from_dict(platform_data)
-            except ValueError:
-                pass  # Skip unknown platforms
-        
+            except ValueError as exc:
+                # Skip, but never silently: a platform configured and expected
+                # to run (e.g. registered via a user plugin, which the Platform
+                # enum does not resolve) would otherwise vanish with no log
+                # line naming it, leaving "No messaging platforms enabled" as
+                # the only symptom (#96747).
+                logger.warning(
+                    "gateway config: dropping platforms entry %r (%s: %s) — "
+                    "not a built-in platform or malformed config",
+                    platform_name, type(exc).__name__, exc,
+                )
+
         reset_by_type = {}
         for type_name, policy_data in _coerce_dict(data.get("reset_by_type", {})).items():
             reset_by_type[type_name] = SessionResetPolicy.from_dict(policy_data)
-        
+
         reset_by_platform = {}
         for platform_name, policy_data in _coerce_dict(data.get("reset_by_platform", {})).items():
             try:
                 platform = Platform(platform_name)
                 reset_by_platform[platform] = SessionResetPolicy.from_dict(policy_data)
-            except ValueError:
-                pass
+            except ValueError as exc:
+                logger.warning(
+                    "gateway config: dropping reset_by_platform entry %r (%s: %s) — "
+                    "not a built-in platform or malformed config",
+                    platform_name, type(exc).__name__, exc,
+                )
         
         default_policy = SessionResetPolicy()
         if "default_reset_policy" in data:
