@@ -22,6 +22,7 @@ from .controller import (
     ScanController,
     _bind_pooled_worktree_task,
     _claim_with_orphan_recovery,
+    _governed_pr_identity_command,
     _prepare_receipt_worktree_with_overflow,
     _receipt_idempotency_key,
     _worker_capability_preflight,
@@ -599,9 +600,8 @@ def _repair_task(
     if configured is None:
         raise ValueError("repair steward is disabled")
     trigger_text = ", ".join(triggers)
-    identity_command = (
-        f"gh pr view {pull.number} --repo {shlex.quote(pull.repository)} --json "
-        "baseRefName,baseRefOid,headRefName,headRefOid,headRepository"
+    identity_command = _governed_pr_identity_command(
+        control_home, pull.repository, pull.number
     )
     identity_preflight = (
         _worker_capability_preflight(identity_command)

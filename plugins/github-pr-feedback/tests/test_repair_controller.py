@@ -289,10 +289,10 @@ def test_repair_controller_dedupes_exact_head_and_preserves_merge_authority(
     assert task.evidence["expected_head_repository"] == "acme/widgets"
     assert task.evidence["expected_head_sha"] == SHA
     identity_command = (
-        "gh pr view 17 --repo acme/widgets --json "
-        "baseRefName,baseRefOid,headRefName,headRefOid,headRepository"
+        "github-pr-feedback inspect-pr --repository acme/widgets --pr-number 17"
     )
     assert task.instructions.count(identity_command) == 1
+    assert "gh pr view" not in task.instructions
     assert "before any fetch, checkout, edit, test, commit, push, or reply" in (
         task.instructions
     )
