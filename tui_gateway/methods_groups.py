@@ -8,6 +8,7 @@ machine-readable so older clients stay on the renderer-owned room path.
 from .method_ctx import HandlerRegistry
 
 import os
+from pathlib import Path
 import threading
 
 _registry = HandlerRegistry()
@@ -43,6 +44,7 @@ def bind_server(server) -> None:
     global _bound_server
     _bound_server = server
     server._profile_execution_policy = _profile_execution_policy
+    server._profile_state_db_paths = _profile_state_db_paths
 
 
 def start_hosted_room_service():
@@ -114,6 +116,23 @@ def _requested_profile(params: dict) -> str:
     if home is None:
         raise ValueError(f"profile '{requested}' is unavailable")
     return str(_bound_server._response_profile_name(requested) or requested)
+
+
+def _profile_state_db_paths(profile: str) -> tuple[Path, ...]:
+    """Resolve shared and profile-local DBs that enforce RoomLink grants."""
+
+    from gateway.hosted_room_grant_state import grant_state_db_paths
+    from hermes_constants import get_hermes_home
+
+    if _bound_server is None:
+        return grant_state_db_paths()
+    current = str(_bound_server._current_profile_name() or "").strip()
+    home = _bound_server._profile_home(profile)
+    if home is None:
+        if profile not in {current, _profile_name()}:
+            raise ValueError(f"profile '{profile}' is unavailable")
+        home = get_hermes_home()
+    return grant_state_db_paths(home)
 
 
 def _api_server_key(profile: str | None = None) -> str:
@@ -314,10 +333,14 @@ def _(rid, params: dict) -> dict:
             ttl_seconds=ttl,
         )
         claims = decode_room_grant(grant_secret, token, permission="status")
-        hosted_rooms.reserve_peer_room(
-            hosted_rooms.default_db_path(),
+        from gateway.hosted_room_grant_state import reserve_grant_state
+
+        reserve_grant_state(
+            _profile_state_db_paths(profile),
             claims=claims,
-            expires_at=float(claims.get("status_expires_at", claims["expires_at"])),
+            expires_at=float(
+                claims.get("status_expires_at", claims["expires_at"])
+            ),
         )
         catalog = local_catalog_mapping(
             installation_id=installation_id,
@@ -362,8 +385,10 @@ def _(rid, params: dict) -> dict:
             or claims["target_install_id"] != hosted_rooms.local_authority_gateway_id()
         ):
             raise ValueError("room grant target does not match this profile")
-        hosted_rooms.revoke_room_grant_scope(
-            hosted_rooms.default_db_path(),
+        from gateway.hosted_room_grant_state import revoke_grant_state
+
+        revoke_grant_state(
+            _profile_state_db_paths(profile),
             claims=claims,
             expires_at=float(claims.get("status_expires_at", claims["expires_at"])),
         )
@@ -403,6 +428,7 @@ def _(rid, params: dict) -> dict:
         client = PeerRunsHTTPClient(
             base_url=target_url,
             api_key="",
+            target_profile=target_profile,
             receipt_db_path=service.db_path,
         )
         probe = client.probe(grant=grant)

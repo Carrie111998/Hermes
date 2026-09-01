@@ -123,6 +123,7 @@ _PEER_RESERVATION_SCHEMA_COLUMNS = frozenset({
     "revoked_at",
     "created_at",
     "updated_at",
+    "mutation_id",
 })
 _QUARANTINE_SCHEMA_COLUMNS = frozenset({"room_id", "reason", "detected_at"})
 _ROOM_RESERVATION_SCHEMA_COLUMNS = frozenset({
@@ -161,6 +162,8 @@ _ROOM_SAFETY_TRIGGERS = frozenset({
     "trg_hosted_room_links_reject_fenced_insert",
     "trg_hosted_room_links_reject_fenced_update",
     "trg_hosted_room_links_reject_unrevoked_delete",
+    "trg_hosted_peer_reservation_nonce_insert",
+    "trg_hosted_peer_reservation_nonce_update",
 })
 
 _EVENT_KINDS_BY_ACTOR = {

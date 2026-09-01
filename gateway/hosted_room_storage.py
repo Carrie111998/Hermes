@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -231,9 +232,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             revoked_at REAL,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
+            mutation_id TEXT NOT NULL DEFAULT 'legacy',
             PRIMARY KEY (room_id, member_id, target_profile)
         )"""
     )
+    peer_reservation_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(hosted_room_peer_reservations)")
+    }
+    if "mutation_id" not in peer_reservation_columns:
+        conn.execute(
+            "ALTER TABLE hosted_room_peer_reservations "
+            "ADD COLUMN mutation_id TEXT NOT NULL DEFAULT 'legacy'"
+        )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS hosted_room_quarantine (
             room_id TEXT PRIMARY KEY,
@@ -640,6 +650,24 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
            )
             BEGIN
                 SELECT RAISE(ABORT, 'Group Chat routes are not revoked');
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS trg_hosted_peer_reservation_nonce_insert
+           AFTER INSERT ON hosted_room_peer_reservations
+           WHEN NEW.mutation_id='legacy'
+           BEGIN
+               UPDATE hosted_room_peer_reservations
+                  SET mutation_id=lower(hex(randomblob(16)))
+                WHERE room_id=NEW.room_id AND member_id=NEW.member_id
+                  AND target_profile=NEW.target_profile;
+           END""",
+        """CREATE TRIGGER IF NOT EXISTS trg_hosted_peer_reservation_nonce_update
+           AFTER UPDATE ON hosted_room_peer_reservations
+           WHEN NEW.mutation_id=OLD.mutation_id
+           BEGIN
+               UPDATE hosted_room_peer_reservations
+                  SET mutation_id=lower(hex(randomblob(16)))
+                WHERE room_id=NEW.room_id AND member_id=NEW.member_id
+                  AND target_profile=NEW.target_profile;
            END""",
     ):
         conn.execute(trigger)
@@ -1049,10 +1077,11 @@ def reserve_peer_room(
     claims: Mapping[str, Any],
     expires_at: float,
     now: float | None = None,
-) -> None:
+) -> dict[str, Any]:
     """Fence direct Desktop prompts before the first peer run is admitted."""
 
     timestamp = float(now if now is not None else time.time())
+    mutation_id = secrets.token_hex(16)
     expiry = float(expires_at)
     if expiry <= timestamp:
         raise HostedRoomError("peer room reservation must expire in the future")
@@ -1085,6 +1114,14 @@ def reserve_peer_room(
             "DELETE FROM hosted_room_peer_reservations WHERE expires_at<=?",
             (timestamp,),
         )
+        previous_rows = [
+            dict(row)
+            for row in conn.execute(
+                """SELECT * FROM hosted_room_peer_reservations
+                    WHERE room_id=? AND target_profile=?""",
+                (values[0], values[2]),
+            ).fetchall()
+        ]
         authority_rows = conn.execute(
             """SELECT authority_gateway_id, authority_epoch
                  FROM hosted_room_peer_reservations
@@ -1103,10 +1140,17 @@ def reserve_peer_room(
             raise AuthorityConflictError("peer room reservation authority changed")
         conn.execute(
             """UPDATE hosted_room_peer_reservations
-                  SET revoked_at=?, updated_at=?
+                  SET revoked_at=?, updated_at=?, mutation_id=?
                 WHERE room_id=? AND target_profile=?
                   AND authority_epoch<? AND revoked_at IS NULL""",
-            (timestamp, timestamp, values[0], values[2], values[4]),
+            (
+                timestamp,
+                timestamp,
+                mutation_id,
+                values[0],
+                values[2],
+                values[4],
+            ),
         )
         existing = conn.execute(
             """SELECT authority_gateway_id, authority_epoch
@@ -1125,16 +1169,90 @@ def reserve_peer_room(
         conn.execute(
             """INSERT INTO hosted_room_peer_reservations(
                    room_id, member_id, target_profile, authority_gateway_id,
-                   authority_epoch, expires_at, revoked_at, created_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                   authority_epoch, expires_at, revoked_at, created_at, updated_at,
+                   mutation_id
+               ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
                ON CONFLICT(room_id, member_id, target_profile) DO UPDATE SET
                    authority_gateway_id=excluded.authority_gateway_id,
                    authority_epoch=excluded.authority_epoch,
                    expires_at=MAX(hosted_room_peer_reservations.expires_at,
                                   excluded.expires_at),
                    revoked_at=NULL,
-                   updated_at=excluded.updated_at""",
-            (*values, expiry, timestamp, timestamp),
+                   updated_at=excluded.updated_at,
+                   mutation_id=excluded.mutation_id""",
+            (*values, expiry, timestamp, timestamp, mutation_id),
+        )
+        expected_rows = [
+            dict(row)
+            for row in conn.execute(
+                """SELECT * FROM hosted_room_peer_reservations
+                    WHERE room_id=? AND target_profile=?""",
+                (values[0], values[2]),
+            ).fetchall()
+        ]
+    return {
+        "rows": previous_rows,
+        "expected_rows": expected_rows,
+    }
+
+
+def restore_peer_room_reservations(
+    db_path: Path | str,
+    *,
+    claims: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+) -> None:
+    """Restore one failed reservation attempt without clobbering a later writer."""
+
+    room_id = _validate_identifier(
+        claims.get("room_id"), label="room_id", max_chars=MAX_ROOM_ID_CHARS
+    )
+    target_profile = _validate_identifier(
+        claims.get("target_profile"),
+        label="target_profile",
+        max_chars=MAX_ACTOR_ID_CHARS,
+    )
+    rows = snapshot.get("rows")
+    expected_rows = snapshot.get("expected_rows")
+    if not isinstance(rows, list) or not isinstance(expected_rows, list):
+        raise HostedRoomError("peer room reservation snapshot is invalid")
+    columns = (
+        "room_id",
+        "member_id",
+        "target_profile",
+        "authority_gateway_id",
+        "authority_epoch",
+        "expires_at",
+        "revoked_at",
+        "created_at",
+        "updated_at",
+        "mutation_id",
+    )
+    with _transaction(db_path, immediate=True) as conn:
+        current = [
+            dict(row)
+            for row in conn.execute(
+                """SELECT * FROM hosted_room_peer_reservations
+                    WHERE room_id=? AND target_profile=?""",
+                (room_id, target_profile),
+            ).fetchall()
+        ]
+        if current != expected_rows:
+            raise AuthorityConflictError(
+                "peer room reservation changed during rollback"
+            )
+        conn.execute(
+            """DELETE FROM hosted_room_peer_reservations
+                WHERE room_id=? AND target_profile=?""",
+            (room_id, target_profile),
+        )
+        conn.executemany(
+            """INSERT INTO hosted_room_peer_reservations(
+                   room_id, member_id, target_profile, authority_gateway_id,
+                   authority_epoch, expires_at, revoked_at, created_at, updated_at,
+                   mutation_id
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [tuple(row[column] for column in columns) for row in rows],
         )
 
 

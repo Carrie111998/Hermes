@@ -194,6 +194,46 @@ def test_scoped_peer_runs_client_stops_exact_run(peer_server):
     assert FakePeer.runs["run-1"]["status"] == "cancelled"
 
 
+def test_named_profile_prefixes_every_roomlink_request(monkeypatch):
+    captured = {}
+
+    class Response:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size=-1):
+            if captured.get("read"):
+                return b""
+            captured["read"] = True
+            return b'{"ok":true}'
+
+    def opened(request, **_kwargs):
+        captured["url"] = request.full_url
+        captured["read"] = False
+        return Response()
+
+    monkeypatch.setattr(
+        "hermes_cli.urllib_security.open_credentialed_url",
+        opened,
+    )
+    client = PeerRunsHTTPClient(
+        base_url="https://peer.example.test/hermes",
+        api_key="",
+        target_profile="reviewer:west",
+    )
+
+    assert client.probe(grant="signed.room.grant") == {"ok": True}
+    assert captured["url"] == (
+        "https://peer.example.test/hermes/p/reviewer%3Awest/"
+        "v1/room-members/capabilities"
+    )
+
+
 def test_remote_run_receipt_survives_home_restart(peer_server, tmp_path):
     db = tmp_path / "state.db"
     first = PeerRunsHTTPClient(

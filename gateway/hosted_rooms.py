@@ -104,6 +104,7 @@ from gateway.hosted_room_storage import (
     room_link_record,
     room_link_retirement_started,
     reserve_peer_room,
+    restore_peer_room_reservations,
     revoke_room_grant_scope,
     room_grant_is_revoked,
     update_room_link_status,

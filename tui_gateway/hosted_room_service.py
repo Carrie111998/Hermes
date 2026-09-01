@@ -96,6 +96,7 @@ class HostedRoomService:
                 client = PeerRunsHTTPClient(
                     base_url=stored.target_url,
                     api_key="",
+                    target_profile=stored.target_profile,
                     receipt_db_path=self.db_path,
                 )
                 route = PeerMemberRoute(
@@ -369,6 +370,7 @@ class HostedRoomService:
             client = PeerRunsHTTPClient(
                 base_url=stored.target_url,
                 api_key="",
+                target_profile=stored.target_profile,
                 receipt_db_path=self.db_path,
             )
             route = PeerMemberRoute(
