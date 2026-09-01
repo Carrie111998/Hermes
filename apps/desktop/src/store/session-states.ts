@@ -1359,9 +1359,20 @@ export function openSessionTile(
   dir: TileDock = 'right',
   anchor?: string,
   before?: null | string,
-  workspaceScope: SessionTileWorkspaceScope = { workspaceMode: 'sessions' }
+  workspaceScope?: SessionTileWorkspaceScope
 ) {
   const tiles = $sessionTiles.get()
+  const existingTile = tiles.find(tile => tile.storedSessionId === storedSessionId)
+  const effectiveWorkspaceScope =
+    workspaceScope ??
+    (existingTile
+      ? {
+          ownerRoute: existingTile.ownerRoute,
+          workspaceMode: existingTile.workspaceMode ?? 'sessions',
+          workspaceOwnerKey: existingTile.workspaceOwnerKey,
+          workspaceTabTitle: existingTile.workspaceTabTitle
+        }
+      : { workspaceMode: 'sessions' })
 
   // Opening a session in a tab/tile is "reading" it — clear its unread dot
   // exactly like main-thread resume does. Previously only
@@ -1371,26 +1382,28 @@ export function openSessionTile(
   markSessionRead(storedSessionId)
   ackStoredSessionId(storedSessionId)
 
-  if (workspaceScope.workspaceMode === 'sessions' && storedSessionId === $selectedStoredSessionId.get()) {
+  if (effectiveWorkspaceScope.workspaceMode === 'sessions' && storedSessionId === $selectedStoredSessionId.get()) {
     return
   }
 
   const dock = anchor ?? focusedSessionTabAnchor() ?? undefined
 
-  const workspaceOwnerKey = workspaceScope.workspaceMode === 'bots' ? workspaceScope.workspaceOwnerKey : undefined
+  const workspaceOwnerKey =
+    effectiveWorkspaceScope.workspaceMode === 'bots' ? effectiveWorkspaceScope.workspaceOwnerKey : undefined
 
-  if (!tiles.some(t => t.storedSessionId === storedSessionId)) {
+  if (!existingTile) {
     saveTiles([
       ...tiles,
       {
         anchor: dock,
         before,
         dir,
-        ownerRoute: workspaceScope.workspaceMode === 'bots' ? workspaceScope.ownerRoute : undefined,
+        ownerRoute: effectiveWorkspaceScope.workspaceMode === 'bots' ? effectiveWorkspaceScope.ownerRoute : undefined,
         storedSessionId,
-        workspaceMode: workspaceScope.workspaceMode,
+        workspaceMode: effectiveWorkspaceScope.workspaceMode,
         workspaceOwnerKey,
-        workspaceTabTitle: workspaceScope.workspaceMode === 'bots' ? workspaceScope.workspaceTabTitle : undefined
+        workspaceTabTitle:
+          effectiveWorkspaceScope.workspaceMode === 'bots' ? effectiveWorkspaceScope.workspaceTabTitle : undefined
       }
     ])
     // Adoption is async via the registry — order sync runs after the move path
@@ -1399,7 +1412,7 @@ export function openSessionTile(
     return
   }
 
-  setSessionTileWorkspaceScope(storedSessionId, workspaceScope)
+  setSessionTileWorkspaceScope(storedSessionId, effectiveWorkspaceScope)
 
   // Already open: relocate the existing pane to the drop target (pane-mirror
   // only docks on first adoption, so a re-drag must move the tree pane itself).

@@ -317,6 +317,36 @@ describe('SessionTile workspace scope', () => {
     })
   })
 
+  it('preserves an existing Bot tile scope when moving it without an explicit scope', () => {
+    const scope = {
+      ownerRoute: {
+        connectionId: 'connection-a',
+        mode: 'remote' as const,
+        profile: 'default',
+        targetProfile: 'default'
+      },
+      workspaceMode: 'bots' as const,
+      workspaceOwnerKey: 'bot:connection-a::default',
+      workspaceTabTitle: 'Bot chat'
+    }
+
+    openSessionTile('bot-chat', 'right', undefined, undefined, scope)
+    $layoutTree.set(group(['workspace', 'session-tile:bot-chat'], { id: 'workspace-group' }))
+    openSessionTile('bot-chat', 'left', 'workspace')
+
+    expect($sessionTiles.get()).toEqual([
+      expect.objectContaining({
+        anchor: 'workspace',
+        dir: 'left',
+        ownerRoute: scope.ownerRoute,
+        storedSessionId: 'bot-chat',
+        workspaceMode: 'bots',
+        workspaceOwnerKey: scope.workspaceOwnerKey,
+        workspaceTabTitle: 'Bot chat'
+      })
+    ])
+  })
+
   it('preserves workspace scope while dropping a stale runtime binding', () => {
     $sessionTiles.set([
       {
