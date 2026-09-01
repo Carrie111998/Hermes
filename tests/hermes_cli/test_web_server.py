@@ -628,6 +628,93 @@ class TestWebServerEndpoints:
 
         assert opens == [True]
 
+    def test_get_sessions_retries_transient_read_only_io_error(self, monkeypatch):
+        """A one-shot SQLITE_IOERR during the read-only probe must not 500."""
+        import sqlite3
+
+        import hermes_state
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_path = get_hermes_home() / "state.db"
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session("io-retry", source="cli")
+        finally:
+            seed.close()
+
+        original_session_db = hermes_state.SessionDB
+        read_only_opens = 0
+
+        def flaky_open(*args, **kwargs):
+            nonlocal read_only_opens
+            if kwargs.get("read_only", False):
+                read_only_opens += 1
+                if read_only_opens == 1:
+                    exc = sqlite3.OperationalError("disk I/O error")
+                    exc.sqlite_errorcode = 10  # SQLITE_IOERR
+                    raise exc
+            return original_session_db(*args, **kwargs)
+
+        monkeypatch.setattr(hermes_state, "SessionDB", flaky_open)
+
+        response = self.client.get("/api/sessions?limit=50&offset=0")
+
+        assert response.status_code == 200
+        assert [row["id"] for row in response.json()["sessions"]] == ["io-retry"]
+        assert read_only_opens == 2
+
+    def test_persistent_read_only_io_error_is_bounded_and_propagated(
+        self, tmp_path, monkeypatch
+    ):
+        """Retrying a read must not mask a persistent storage failure."""
+        import sqlite3
+
+        import hermes_state
+        from hermes_cli import web_server
+
+        db_path = tmp_path / "state.db"
+        db_path.write_bytes(b"not-empty")
+        opens = []
+        sleeps = []
+
+        def io_error(*_args, **kwargs):
+            opens.append(kwargs.get("read_only", False))
+            exc = sqlite3.OperationalError("disk I/O error")
+            exc.sqlite_errorcode = 10  # SQLITE_IOERR
+            raise exc
+
+        monkeypatch.setattr(hermes_state, "SessionDB", io_error)
+        monkeypatch.setattr(web_server.time, "sleep", sleeps.append)
+
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            web_server._open_session_db_at_path(db_path, read_only=True)
+
+        assert opens == [True, True, True]
+        assert sleeps == [0.05, 0.05]
+
+    def test_non_io_read_error_is_not_retried(self, tmp_path, monkeypatch):
+        """The retry classifier must stay narrower than generic read failures."""
+        import sqlite3
+
+        import hermes_state
+        from hermes_cli import web_server
+
+        db_path = tmp_path / "state.db"
+        db_path.write_bytes(b"not-empty")
+        opens = []
+
+        def full_disk(*_args, **kwargs):
+            opens.append(kwargs.get("read_only", False))
+            raise sqlite3.OperationalError("database or disk is full")
+
+        monkeypatch.setattr(hermes_state, "SessionDB", full_disk)
+
+        with pytest.raises(sqlite3.OperationalError, match="disk is full"):
+            web_server._open_session_db_at_path(db_path, read_only=True)
+
+        assert opens == [True]
+
     def test_decode_error_triggers_writable_heal(self, tmp_path, monkeypatch):
         """UnicodeDecodeError — pysqlite failing to decode SQLite's own error
         message over corrupt file bytes (#98924) — must route through the

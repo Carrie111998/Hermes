@@ -12410,6 +12410,12 @@ from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-e
 # query raises "no such table: sessions".
 _session_db_bootstrap_lock = threading.Lock()
 
+# Read-only opens can briefly surface SQLITE_IOERR during concurrent writer
+# activity. Reopen the whole handle twice so a cleared transition succeeds,
+# while a persistent storage failure still reaches the caller after 100 ms.
+_SESSION_DB_READ_IO_RETRIES = 2
+_SESSION_DB_READ_IO_BACKOFF_S = 0.05
+
 
 def _session_db_read_probe_statements() -> tuple:
     """Stale-schema probes for read-only opens, derived from SCHEMA_SQL.
@@ -12463,6 +12469,21 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
     if not read_only:
         return SessionDB(db_path=db_path, read_only=False)
 
+    def _is_retryable_read_io_error(exc: BaseException) -> bool:
+        error_code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(error_code, int):
+            # Extended SQLite result codes retain the primary code in the low
+            # byte. Use the numeric fallback for Python builds that do not
+            # export SQLITE_IOERR as a module constant.
+            return error_code & 0xFF == getattr(sqlite3, "SQLITE_IOERR", 10)
+        # Older pysqlite builds expose no result code. Keep the compatibility
+        # path exact so disk-full, permissions, corruption, and generic read
+        # failures are never retried as if they were a WAL transition.
+        return (
+            isinstance(exc, sqlite3.OperationalError)
+            and str(exc).strip().lower() == "disk i/o error"
+        )
+
     def _needs_bootstrap() -> bool:
         try:
             return db_path.stat().st_size == 0
@@ -12490,8 +12511,20 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
                 raise
         return db
 
+    def _open_probed_with_io_retry():
+        for attempt in range(_SESSION_DB_READ_IO_RETRIES + 1):
+            try:
+                return _open_probed()
+            except sqlite3.DatabaseError as exc:
+                if (
+                    not _is_retryable_read_io_error(exc)
+                    or attempt == _SESSION_DB_READ_IO_RETRIES
+                ):
+                    raise
+                time.sleep(_SESSION_DB_READ_IO_BACKOFF_S)
+
     try:
-        return _open_probed()
+        return _open_probed_with_io_retry()
     except (sqlite3.DatabaseError, UnicodeDecodeError) as exc:
         message = str(exc).lower()
         stale_schema = "no such table" in message or "no such column" in message
@@ -12505,7 +12538,7 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
             raise
         SessionDB(db_path=db_path, read_only=False).close()
         try:
-            return _open_probed()
+            return _open_probed_with_io_retry()
         except (sqlite3.DatabaseError, UnicodeDecodeError) as still_stale:
             message = str(still_stale).lower()
             if "no such table" not in message and "no such column" not in message:
@@ -12525,7 +12558,7 @@ def _open_session_db_at_path(db_path: Path, *, read_only: bool):
                     db_path,
                     still_stale,
                 )
-            return _open_probed()
+            return _open_probed_with_io_retry()
 
 
 def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
