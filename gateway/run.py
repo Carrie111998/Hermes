@@ -14039,6 +14039,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # transcription is forwarded without requiring /voice join.
                 if hasattr(adapter, "_voice_input_callback"):
                     adapter._voice_input_callback = self._handle_voice_channel_input
+                if hasattr(adapter, "_on_voice_disconnect"):
+                    adapter._on_voice_disconnect = self._handle_voice_timeout_cleanup
+                if hasattr(adapter, "_on_voice_joined"):
+                    adapter._on_voice_joined = self._handle_voice_joined
+                if hasattr(adapter, "_voice_mode_getter"):
+                    adapter._voice_mode_getter = lambda chat_id: self._voice_mode.get(
+                        self._voice_key(Platform.DISCORD, str(chat_id)), "off"
+                    )
                 connected_count += 1
                 self._update_platform_runtime_status(
                     platform.value, platform_state="connected", error_code=None, error_message=None,
@@ -23911,6 +23919,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if hasattr(adapter, "_voice_input_callback"):
             adapter._voice_input_callback = None
         return "Left voice channel."
+
+    def _handle_voice_joined(self, chat_id: str, guild_id: int | None = None) -> None:
+        """Enable persisted voice replies after an engagement auto-join."""
+        key = self._voice_key(Platform.DISCORD, chat_id)
+        if self._voice_mode.get(key) != "all":
+            self._voice_mode[key] = "all"
+            self._save_voice_modes()
+        adapter = self.adapters.get(Platform.DISCORD)
+        if adapter is not None and hasattr(adapter, "_voice_input_callback"):
+            adapter._voice_input_callback = self._handle_voice_channel_input
+        self._set_adapter_auto_tts_enabled(adapter, chat_id, enabled=True)
+        logger.debug("Voice mode enabled for chat %s (guild=%s)", chat_id, guild_id)
 
     def _handle_voice_timeout_cleanup(self, chat_id: str) -> None:
         """Called by the adapter when a voice channel times out.

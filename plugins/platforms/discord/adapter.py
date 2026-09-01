@@ -432,6 +432,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_ALLOWED_ROLES",
     "DISCORD_ALLOWED_CHANNELS",
     "DISCORD_IGNORED_CHANNELS",
+    "DISCORD_VOICE_AUTO_JOIN",
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
@@ -1102,6 +1103,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
+        self._on_voice_joined: Optional[Callable] = None  # set by run.py
         # Resolves the current voice-reply mode ("off"|"voice_only"|"all") for a
         # linked text-channel id; set by run.py. Lets the inactivity timer leave
         # the bot in the channel when the user deliberately picked text-only
@@ -4753,6 +4755,67 @@ class DiscordAdapter(BasePlatformAdapter):
         if not member or not member.voice:
             return None
         return member.voice.channel
+
+    def _voice_auto_join_enabled(self) -> bool:
+        """Return the profile-scoped engagement auto-join policy."""
+        extra = getattr(self.config, "extra", {})
+        if isinstance(extra, dict) and "voice_auto_join" in extra:
+            raw = extra["voice_auto_join"]
+        else:
+            raw = self._gate_env("DISCORD_VOICE_AUTO_JOIN")
+        if isinstance(raw, bool):
+            return raw
+        return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    async def maybe_auto_join_voice(
+        self,
+        *,
+        guild_id: int,
+        user_id: str,
+        text_channel_id: int,
+        source_dict: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Join the engaged user's current VC when explicitly enabled."""
+        if not self._voice_auto_join_enabled():
+            return False
+        if not guild_id or not user_id or not text_channel_id:
+            return False
+
+        try:
+            voice_channel = await self.get_user_voice_channel(guild_id, user_id)
+        except Exception as exc:
+            logger.debug("Voice auto-join lookup failed: %s", exc)
+            return False
+        if voice_channel is None:
+            return False
+
+        try:
+            join_kwargs: Dict[str, Any] = {"text_channel_id": text_channel_id}
+            if source_dict is not None:
+                join_kwargs["source"] = source_dict
+            success = await self.join_voice_channel(voice_channel, **join_kwargs)
+        except Exception as exc:
+            logger.warning("Voice auto-join failed: %s", exc)
+            return False
+        if not success:
+            return False
+
+        # Re-bind even when join_voice_channel returned early for an existing
+        # connection in this guild.
+        self._voice_text_channels[guild_id] = int(text_channel_id)
+        if source_dict is not None:
+            self._voice_sources[guild_id] = source_dict
+        self._reset_voice_timeout(guild_id)
+
+        callback = self._on_voice_joined
+        if callback is not None:
+            try:
+                result = callback(str(text_channel_id), guild_id=guild_id)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                logger.debug("Voice auto-join callback failed: %s", exc)
+        return True
 
     def _cancel_voice_timeout(self, guild_id: int) -> None:
         task = self._voice_timeout_tasks.pop(guild_id, None)
@@ -8573,6 +8636,24 @@ class DiscordAdapter(BasePlatformAdapter):
         if thread_id:
             self._threads.mark(thread_id)
 
+        # Only an admitted, live guild message may trigger this opt-in path.
+        # Recovered backlog must never move the bot into a voice channel.
+        guild = getattr(message, "guild", None)
+        if (
+            not recovered
+            and guild is not None
+            and self._voice_auto_join_enabled()
+        ):
+            try:
+                await self.maybe_auto_join_voice(
+                    guild_id=int(guild.id),
+                    user_id=str(message.author.id),
+                    text_channel_id=int(message.channel.id),
+                    source_dict=source.to_dict(),
+                )
+            except Exception as exc:
+                logger.debug("Voice auto-join skipped: %s", exc)
+
         # Only live plain text messages use split-message batching. Recovery
         # candidates are already complete historical messages; coalescing them
         # would lose constituent IDs and make later restarts replay them.
@@ -10570,6 +10651,11 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             seeded_extra[primary_key] = value
             if env_key and not os.getenv(env_key):
                 os.environ[env_key] = str(value)
+    voice_auto_join = _websocket_liveness_cfg.get("voice_auto_join")
+    if voice_auto_join is not None:
+        seeded_extra["voice_auto_join"] = voice_auto_join
+        if not _skip_env_bridge and not os.getenv("DISCORD_VOICE_AUTO_JOIN"):
+            os.environ["DISCORD_VOICE_AUTO_JOIN"] = str(voice_auto_join).lower()
     return seeded_extra or None
 
 

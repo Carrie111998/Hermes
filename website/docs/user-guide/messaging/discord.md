@@ -745,6 +745,19 @@ Hermes Agent supports Discord voice messages:
 - **Text-to-speech**: Use `/voice tts` to have the bot send spoken audio responses alongside text replies.
 - **Discord voice channels**: Hermes can also join a voice channel, listen to users speaking, and talk back in the channel.
 
+Voice-channel joining is explicit by default (`/voice join`). To have an admitted
+live guild message automatically join the sender's current voice channel and
+enable spoken replies for that text chat, opt in per profile:
+
+```yaml
+discord:
+  voice_auto_join: true
+```
+
+Recovered message backlogs never trigger auto-join. The legacy
+`DISCORD_VOICE_AUTO_JOIN=true` environment variable remains supported when the
+profile setting is absent; the profile setting takes precedence.
+
 For the full setup and operational guide, see:
 - [Voice Mode](/user-guide/features/voice-mode)
 - [Use Voice Mode with Hermes](/guides/use-voice-mode-with-hermes)
