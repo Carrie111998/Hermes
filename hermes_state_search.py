@@ -856,12 +856,39 @@ class SessionSearchMixin:
 
         # Phase 1b: backfill the CJK-bigram index (its own marker pair; a
         # no-op when the tokenizer isn't loadable or nothing is pending).
-        while True:
-            _t0 = time.monotonic()
-            if not self.fts_cjk_rebuild_step():
+        # A tokenizer-less process that opens the DB mid-run self-heals:
+        # it drops the freshly-installed cjk triggers and re-stales the
+        # breadcrumb, throwing this run's rebuild away while it still
+        # reports success (#100204). Detect that and run one more
+        # reset+backfill pass so a single invocation converges instead of
+        # leaving the reset→rebuild→re-stale loop for every re-run.
+        cjk_stale_final = False
+        for cjk_pass in range(2):
+            if cjk_pass:
+                self._fts_cjk_reset_if_stale()
+            while True:
+                _t0 = time.monotonic()
+                if not self.fts_cjk_rebuild_step():
+                    break
+                _emit("backfill")
+                _pause(time.monotonic() - _t0)
+            if not self._fts_cjk_loaded:
                 break
-            _emit("backfill")
-            _pause(time.monotonic() - _t0)
+            with self._lock:
+                cjk_stale_final = self._conn.execute(
+                    "SELECT 1 FROM state_meta WHERE key = ?",
+                    (FTS_CJK_STALE_KEY,),
+                ).fetchone() is not None
+            if not cjk_stale_final:
+                break
+            logger.warning(
+                "CJK index re-staled mid-backfill by a tokenizer-less "
+                "process (%s)",
+                "retrying the rebuild once"
+                if cjk_pass == 0 else
+                "leaving it stale; run optimize-storage again on a host "
+                "where the resident process can load the tokenizer",
+            )
 
         # Phase 2: tear down the demoted legacy shadow tables in chunks.
         _emit("teardown")
@@ -973,7 +1000,14 @@ class SessionSearchMixin:
         logger.info(
             "FTS storage optimization complete (layout v%d).", FTS_STORAGE_VERSION
         )
-        return {"ok": True, "vacuumed": vacuum_ok}
+        result = {"ok": True, "vacuumed": vacuum_ok}
+        if cjk_stale_final:
+            # Not a failure of the base index — the cjk surface stayed
+            # stale through the retry pass (a resident tokenizer-less
+            # process kept self-healing). Surface it so callers/CLI runs
+            # can tell a converged optimize from a still-looping one.
+            result["cjk_stale"] = True
+        return result
 
     def get_anchored_view(
         self,
