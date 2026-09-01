@@ -3648,7 +3648,7 @@ def _strip_stale_thinking_for_estimate(
 # Because the api_messages build shallow-copies history dicts each iteration,
 # the copies share the same content strings — so unchanged history messages
 # hit the memo even though the outer dicts are fresh objects every turn.
-_MSG_TOKENS_CACHE: Dict[Any, Tuple[list, int]] = {}
+_MSG_TOKENS_CACHE: Dict[Any, int] = {}
 _MSG_TOKENS_CACHE_MAX = 4096
 
 
@@ -3685,12 +3685,12 @@ def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
         )
     cached = _MSG_TOKENS_CACHE.get(key)
     if cached is not None:
-        return cached[1]
+        return cached
     tokens = (
         _estimate_message_tokens_without_images(msg)
         + _count_image_tokens(msg, image_cost)
     )
-    _MSG_TOKENS_CACHE[key] = (pins, tokens)
+    _MSG_TOKENS_CACHE[key] = tokens
     while len(_MSG_TOKENS_CACHE) > _MSG_TOKENS_CACHE_MAX:
         try:
             _MSG_TOKENS_CACHE.pop(next(iter(_MSG_TOKENS_CACHE)))
